@@ -1,0 +1,34 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#undef __GXX_ABI_VERSION
+#define __GXX_ABI_VERSION 1011
+
+#include <torch/csrc/utils/pybind.h>
+
+#include "processgroup.h"
+
+#include <pybind11/chrono.h>
+#include <pybind11/pybind11.h>
+
+// __pybind11_internals_v4_gcc_libstdcpp_cxxabi1013
+// __pybind11_internals_v4_gcc_libstdcpp_cxxabi1011
+
+namespace py = pybind11;
+
+using MoodistProcessGroup = moodist::ProcessGroup;
+
+PYBIND11_MODULE(_C, m) {
+  py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>, c10d::ProcessGroup>(
+      m, "MoodistProcessGroup", R"d(
+    A moodist process group :D
+  )d")
+      .def(py::init<int, int>())
+      .def("get_address", &MoodistProcessGroup::getAddress)
+      .def("init", &MoodistProcessGroup::init);
+}
