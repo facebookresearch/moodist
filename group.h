@@ -44,6 +44,8 @@ struct Group {
   // std::vector<uintptr_t> rankCudaStepDoneBase;
   // std::array<size_t, 8> peerMyRemoteIndex;
 
+  int allocationNode = -1;
+
   static constexpr size_t dataChunks = 4;
 
   Group(size_t rank, size_t size);

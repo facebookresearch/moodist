@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include <numa.h>
+
 namespace moodist {
 
 static std::string readBootId() {
@@ -131,6 +133,42 @@ void Group::init() {
     }
   }
 
+  unsigned long nodeSet = 0;
+  CHECK_NVML(nvmlDeviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
+
+  for (unsigned int i = 0; i != 64; ++i) {
+    if (nodeSet & (1ull << i)) {
+      allocationNode = i;
+      fmt::printf("allocationNode is %d\n", i);
+      break;
+    }
+  }
+
+  // auto* numaMask = numa_bitmask_alloc(64);
+  // for (unsigned i = 0; i != 64; ++i) {
+  //   if (nodeSet & (1ull << i)) {
+  //     numa_bitmask_setbit(numaMask, i);
+  //   }
+  // }
+  // numa_bind(numaMask);
+  // numa_bitmask_free(numaMask);
+
+  // auto* membind = numa_get_membind();
+  // for (unsigned int i = 0; i != membind->size; ++i) {
+  //   if (numa_bitmask_isbitset(membind, i)) {
+  //     fmt::printf(" pre bit %d is set!\n", i);
+  //   }
+  // }
+
+  // fmt::printf("set cpu affinity: %d\n", nvmlDeviceSetCpuAffinity(nvmlDevice));
+
+  // membind = numa_get_membind();
+  // for (unsigned int i = 0; i != membind->size; ++i) {
+  //   if (numa_bitmask_isbitset(membind, i)) {
+  //     fmt::printf(" post bit %d is set!\n", i);
+  //   }
+  // }
+
   std::vector<std::unordered_map<size_t, int>> allRanksNvlink = setupComms->allgather(localNvlink);
 
   ipcRanks.clear();
@@ -185,19 +223,38 @@ AllocatedBuffer Group::allocateDevice(size_t bytes) {
   fmt::printf("allocated device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
+
+void* numaAllocate(size_t bytes, int node) {
+  void* r;
+  if (node != -1) {
+    r = numa_alloc_onnode(bytes, node);
+  } else {
+    r = numa_alloc_local(bytes);
+  }
+  if (!r) {
+    fmt::fprintf(stderr, "ERROR: Failed to allocate %d bytes of host memory on NUMA node %d\n", bytes, node);
+    fflush(stderr);
+    throw std::bad_alloc();
+  }
+  return r;
+}
+
 AllocatedBuffer Group::allocateHostMapped(size_t bytes) {
   if (bytes < 4096) {
     bytes = 4096;
   }
   AllocatedBuffer r;
   r.bytes = bytes;
-  CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP));
+  r.cpuPointer = numaAllocate(bytes, allocationNode);
+  CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
+  //CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP));
   std::memset(r.cpuPointer, 0, bytes);
-  r.hostAllocated = true;
+  //r.hostAllocated = true;
+  r.numaAllocated = true;
   CUdeviceptr ptr;
   CHECK_CU(cuMemHostGetDevicePointer(&ptr, r.cpuPointer, 0));
   r.cudaPointer = ptr;
-  fmt::printf("allocated device mapped host memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  fmt::printf("allocated device mapped host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer, r.bytes, allocationNode);
   return r;
 }
 AllocatedBuffer Group::allocateHost(size_t bytes) {
@@ -206,11 +263,14 @@ AllocatedBuffer Group::allocateHost(size_t bytes) {
   }
   AllocatedBuffer r;
   r.bytes = bytes;
-  CHECK_CU(cuMemHostAlloc(&r.cpuPointer, r.bytes, 0));
+  r.cpuPointer = numaAllocate(bytes, allocationNode);
+  CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, 0));
+  //CHECK_CU(cuMemHostAlloc(&r.cpuPointer, r.bytes, 0));
   std::memset(r.cpuPointer, 0, bytes);
-  r.hostAllocated = true;
+  //r.hostAllocated = true;
+  r.numaAllocated = true;
   r.cudaPointer = (uintptr_t)r.cpuPointer;
-  fmt::printf("allocated host memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  fmt::printf("allocated host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer, r.bytes, allocationNode);
   return r;
 }
 AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
@@ -219,6 +279,7 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   }
   AllocatedBuffer r;
   r.bytes = bytes;
+  r.cpuPointer = numaAllocate(bytes, allocationNode);
   CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_WRITECOMBINED));
   std::memset(r.cpuPointer, 0, bytes);
   r.hostAllocated = true;

@@ -2,12 +2,14 @@
 #include "processgroup.h"
 #include "clock.h"
 // #include "cputhread.h"
+#include "common.h"
 #include "cputhread.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "serialization.h"
 #include "setup_comms.h"
 // #include "util.h"
+#include "synchronization.h"
 #include "vector.h"
 
 #include <c10/core/Device.h>
@@ -119,11 +121,33 @@ c10::intrusive_ptr<tccl_work::Work> makeFuture(std::shared_ptr<Op> op, std::vect
   return c10::make_intrusive<OpFutureWrappingWork>(op, std::move(outputs));
 }
 
+struct MemoryManager {
+  Group* group;
+  std::vector<AllocatedBuffer> free;
+  AllocatedBuffer allocate(size_t bytes) {
+    for (auto i = free.end(); i != free.begin();) {
+      --i;
+      if (i->bytes >= bytes) {
+        AllocatedBuffer r = std::move(*i);
+        free.erase(i);
+        return r;
+      }
+    }
+    return group->allocateHost(bytes);
+  }
+  void deallocate(AllocatedBuffer buffer) {
+    free.push_back(std::move(buffer));
+  }
+};
+
 struct ProcessGroupImpl {
   size_t rank = 0;
   size_t size = 0;
 
   std::shared_ptr<Group> group;
+
+  MemoryManager inputMemory;
+  MemoryManager outputMemory;
 
   SpinMutex mutex;
   std::vector<std::shared_ptr<Op>> allOps;
@@ -133,6 +157,10 @@ struct ProcessGroupImpl {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
 
     group = std::make_shared<Group>(rank, size);
+
+    for (auto& v : {&inputMemory, &outputMemory}) {
+      v->group = &*group;
+    }
   }
 
   ~ProcessGroupImpl() {}
@@ -216,7 +244,6 @@ struct ProcessGroupImpl {
   }
 
   std::shared_ptr<Op> getOp() {
-    std::unique_lock l(mutex);
     for (auto& v : allOps) {
       if (v->busy.load(std::memory_order_relaxed)) {
         continue;
@@ -242,6 +269,7 @@ struct ProcessGroupImpl {
 
   c10::intrusive_ptr<tccl_work::Work>
   _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
+    std::lock_guard l(mutex);
 
     size_t size = this->size;
 
@@ -259,11 +287,18 @@ struct ProcessGroupImpl {
     TORCH_CHECK(output.device().index() == group->deviceIndex);
 
     size_t bytes = input.numel() * input.itemsize();
+    size_t outputBytes = bytes * size;
+
+    TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
+
+    AllocatedBuffer cpuInput = inputMemory.allocate(bytes);
+    AllocatedBuffer cpuOutput = outputMemory.allocate(outputBytes);
 
     e->outputAddresses.clear();
     e->inputAddress = (uintptr_t)input.data_ptr();
     e->outputAddress = (uintptr_t)output.data_ptr();
     e->bytes = bytes;
+    e->inputBytesReady = 0;
 
     TORCH_CHECK((e->inputAddress & 0xf) == 0);
     TORCH_CHECK((e->outputAddress & 0xf) == 0);
@@ -298,8 +333,6 @@ struct ProcessGroupImpl {
 
     uintptr_t inputAddress = e->inputAddress;
 
-    group->cputhread->enqueue(e);
-
     if (group->extraStreams[0] == nullptr) {
       for (auto& v : group->extraStreams) {
         CHECK_CU(cuStreamCreate(&v, CU_STREAM_NON_BLOCKING));
@@ -309,53 +342,84 @@ struct ProcessGroupImpl {
       }
     }
 
-    CHECK(!peerIndices.empty());
+    // for (size_t i : peerIndices) {
+    //   std::atomic_uint32_t* peerStepCounter = peerStepCounters[i];
+    //   auto stream = group->extraStreams[1 + i];
+    //   CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    //   Function<void()> f = [myStepCounter, peerStepCounter, e, i]() {
+    //     fmt::printf("allgather function 1 enter for i %d\n", i);
+    //     if (i == 0) {
+    //       myStepCounter->store(e->stepValue, std::memory_order_relaxed);
+    //       futexWakeAll(myStepCounter);
+    //     }
+    //     futexWaitWhileLess(peerStepCounter, e->stepValue);
+    //     fmt::printf("allgather function 1 leave for i %d\n", i);
+    //   };
+    //   CHECK_CU(cuLaunchHostFunc(
+    //       stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
+    //   fmt::printf("peerInputAddresses[i] is %#x\n", e->peerInputAddresses[i]);
+    //   CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * i, e->peerInputAddresses[i], bytes, stream));
 
-    for (size_t i : peerIndices) {
-      std::atomic_uint32_t* peerStepCounter = peerStepCounters[i];
-      auto stream = group->extraStreams[1 + i];
-      CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-      Function<void()> f = [myStepCounter, peerStepCounter, e, i]() {
-        fmt::printf("allgather function 1 enter for i %d\n", i);
-        if (i == 0) {
-          myStepCounter->store(e->stepValue, std::memory_order_relaxed);
-          futexWakeAll(myStepCounter);
-        }
-        futexWaitWhileLess(peerStepCounter, e->stepValue);
-        fmt::printf("allgather function 1 leave for i %d\n", i);
-      };
-      CHECK_CU(cuLaunchHostFunc(
-          stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
-      fmt::printf("peerInputAddresses[i] is %#x\n", e->peerInputAddresses[i]);
-      CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * i, e->peerInputAddresses[i], bytes, stream));
+    //   f = [myStepCounter, peerStepCounter, e, i, size]() {
+    //     fmt::printf("allgather function 2 enter for i %d\n", i);
+    //     if (i != 0) {
+    //       futexWaitWhileLess(myStepCounter, e->stepValue);
+    //     }
+    //     myStepCounter->fetch_add(1, std::memory_order_relaxed);
+    //     futexWakeAll(myStepCounter);
+    //     futexWaitWhileLess(peerStepCounter, e->stepValue + size);
+    //     myStepCounter->fetch_add(1, std::memory_order_relaxed);
+    //     futexWakeAll(myStepCounter);
+    //     fmt::printf("allgather function 2 leave for i %d\n", i);
+    //   };
+    //   CHECK_CU(cuLaunchHostFunc(
+    //       stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
 
-      f = [myStepCounter, peerStepCounter, e, i, size]() {
-        fmt::printf("allgather function 2 enter for i %d\n", i);
-        if (i != 0) {
-          futexWaitWhileLess(myStepCounter, e->stepValue);
-        }
-        myStepCounter->fetch_add(1, std::memory_order_relaxed);
-        futexWakeAll(myStepCounter);
-        futexWaitWhileLess(peerStepCounter, e->stepValue + size);
-        myStepCounter->fetch_add(1, std::memory_order_relaxed);
-        futexWakeAll(myStepCounter);
-        fmt::printf("allgather function 2 leave for i %d\n", i);
-      };
-      CHECK_CU(cuLaunchHostFunc(
-          stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
+    //   auto event = group->extraEvents[1 + i];
 
-      auto event = group->extraEvents[1 + i];
+    //   CHECK_CU(cuEventRecord(event, stream));
+    //   CHECK_CU(cuStreamWaitEvent(group->stream, event, CU_EVENT_WAIT_DEFAULT));
+    // }
 
-      CHECK_CU(cuEventRecord(event, stream));
-      CHECK_CU(cuStreamWaitEvent(group->stream, event, CU_EVENT_WAIT_DEFAULT));
-    }
+    size_t inputChunks = 8;
+
+    group->cputhread->enqueue(e);
 
     CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    // CHECK_CU(cuMemcpyDtoHAsync(cpuInput.cpuPointer, inputAddress, bytes, group->extraStreams[0]));
+    for (size_t i = 0; i != inputChunks; ++i) {
+      size_t n = bytes / inputChunks;
+      size_t offset = n * i;
+      if (i == inputChunks - 1) {
+        n = bytes - offset;
+      }
+      CHECK_CU(cuMemcpyDtoHAsync(
+          (void*)((uintptr_t)cpuInput.cpuPointer + offset), inputAddress + offset, n, group->extraStreams[0]));
+
+      CHECK_CU(cuLaunchHostFunc(
+          group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+          Function<void()>([this, offset, n, e]() {
+            e->inputBytesReady.store(offset + n, std::memory_order_relaxed);
+          }).release()));
+
+      // CHECK_CU(cuEventRecord(group->extraEvents[1 + i], group->extraStreams[1 + i]));
+      // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1 + i], CU_EVENT_WAIT_DEFAULT));
+    }
     CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
     CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
-
     CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
+
     CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
+
+    Function<void()> f = [this, cpuInput = std::move(cpuInput), cpuOutput = std::move(cpuOutput), myStepCounter, e,
+                          size]() mutable {
+      inputMemory.deallocate(std::move(cpuInput));
+      outputMemory.deallocate(std::move(cpuOutput));
+      myStepCounter->store(e->stepValue + size * 2, std::memory_order_relaxed);
+      futexWakeAll(myStepCounter);
+    };
+    CHECK_CU(cuLaunchHostFunc(
+        group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
 
     c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
         c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));

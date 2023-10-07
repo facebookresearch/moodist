@@ -50,7 +50,7 @@ target_link_libraries(
   ${TorchPath}/lib/libtorch_python${CMAKE_SHARED_LIBRARY_SUFFIX}
   Threads::Threads
   fmt
-  anl
+  anl numa
   CUDA::cudart CUDA::nvml
 )
 target_include_directories(_C SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})

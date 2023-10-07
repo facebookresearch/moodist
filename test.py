@@ -4,25 +4,25 @@ import subprocess
 import time
 import sys
 
-# os.environ["RANK"] = os.environ["SLURM_PROCID"]
-# os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+os.environ["RANK"] = os.environ["SLURM_PROCID"]
+os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-# # define master address and master port
-# hostnames = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]])
-# master_addr = hostnames.split()[0].decode("utf-8")
-# master_port = 8195
-# # print(PREFIX + f"Master address: {params.master_addr}")
-# # print(PREFIX + f"Master port   : {params.master_port}")
+# define master address and master port
+hostnames = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]])
+master_addr = hostnames.split()[0].decode("utf-8")
+master_port = 8195
+# print(PREFIX + f"Master address: {params.master_addr}")
+# print(PREFIX + f"Master port   : {params.master_port}")
 
-# # set environment variables for 'env://'
-# os.environ["MASTER_ADDR"] = master_addr
-# os.environ["MASTER_PORT"] = str(master_port)
-
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+# set environment variables for 'env://'
+os.environ["MASTER_ADDR"] = master_addr
+os.environ["MASTER_PORT"] = str(master_port)
 
 
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+
+
+#os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
 def f(n):
     import torch
@@ -132,7 +132,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             #dist._all_gather_base(result, tmp)
-            if True:
+            if True and False:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print("%d: result[%d].data_ptr is %#x" % (rank, i, result[i].data_ptr()))
@@ -222,7 +222,7 @@ def f(n):
                 now = time.monotonic()
                 #a = dist.all_gather(result, tmp, async_op=True)
                 a = dist._all_gather_base(result0, tmp, async_op=True)
-                print("a took %f" % ((time.monotonic() - now) * 1000))
+                #print("a took %f" % ((time.monotonic() - now) * 1000))
                 #now = time.monotonic()
                 #b = dist.all_gather(result, tmp, async_op=True)
                 #print("b took %f" % ((time.monotonic() - now) * 1000))
@@ -233,7 +233,7 @@ def f(n):
                 #dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-                print("synchronize took %f" % ((time.monotonic() - now) * 1000))
+                #print("synchronize took %f" % ((time.monotonic() - now) * 1000))
         # for _ in range(100):
         #     tmp.copy_(data)
         #     for v in result:
@@ -386,11 +386,11 @@ def f(n):
 
 
 if 1 == 1:
-    f("nccl")
+    f("moolib")
     sys.exit(0)
 
 #for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moolib",):
+for n in ("nccl",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

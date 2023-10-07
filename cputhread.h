@@ -35,7 +35,7 @@ struct QueueEntryAllGather : QueueEntry {
 
   std::vector<uintptr_t> proxyIpcOutputAddresses2;
 
-  AllocatedBuffer extraKernelParameters;
+  std::atomic_size_t inputBytesReady = 0;
 
   // std::atomic_uint32_t cpuOutStepValue = 0;
   // std::atomic_uint32_t cpuInStepValue = 0;

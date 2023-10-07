@@ -13,6 +13,7 @@
 #include <nvrtc.h>
 #include <torch/cuda.h>
 #include <torch/types.h>
+#include <numa.h>
 
 #include <random>
 #include <stdexcept>
@@ -70,6 +71,7 @@ struct AllocatedBuffer {
   uintptr_t cudaPointer = 0;
   size_t bytes = 0;
   bool hostAllocated = false;
+  bool numaAllocated = false;
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
@@ -88,7 +90,11 @@ struct AllocatedBuffer {
   }
 
   ~AllocatedBuffer() {
-    if (hostAllocated) {
+    if (numaAllocated) {
+      if (cpuPointer) {
+        numa_free(cpuPointer, bytes);
+      }
+    } else if (hostAllocated) {
       if (cpuPointer) {
         // fmt::printf("free host memory %p\n", cpuPointer);
         cuMemFreeHost(cpuPointer);

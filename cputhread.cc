@@ -89,15 +89,15 @@ void CpuThread::entry() {
       if (queueEntry.task == taskAllgather) {
         QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
 
-        fmt::printf("cpu thread got all gather\n");
+        //fmt::printf("cpu thread got all gather\n");
 
         futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size);
 
-        fmt::printf("cpu thread all gather step 1 done!\n");
+        //fmt::printf("cpu thread all gather step 1 done!\n");
 
         futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size * 2);
 
-        fmt::printf("cpu thread all gather all done!\n");
+        //fmt::printf("cpu thread all gather all done!\n");
 
         freelistAllGather.push(&params);
       } else if (queueEntry.task == taskTerminate) {
