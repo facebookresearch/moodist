@@ -148,7 +148,11 @@ void CpuThread::entry() {
     devices.reserve(0x100);
 
     fi_info* info = nullptr;
+    fi_info* hints = fi_allocinfo();
+    std::memset(hints, 0, sizeof(*hints));
+    hints->caps = FI_RMA | FI_HMEM | FI_FENCE;
     CHECK_FI(fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, nullptr, &info));
+    fi_freeinfo(hints);
 
     for (fi_info* i = info; i; i = i->next) {
       fmt::printf(" interface caps %#x\n", i->caps);
@@ -156,8 +160,12 @@ void CpuThread::entry() {
         continue;
       }
 
+      //if ((i->caps & FI_RMA) && (i->caps & FI_HMEM)) {
       if (i->caps & FI_RMA) {
         fmt::printf("   we can use this one!\n");
+
+        //CHECK((i->caps & FI_HMEM) != 0);
+        //CHECK((i->caps & FI_FENCE) != 0);
 
         devices.emplace_back();
         Device& dev = devices.back();
@@ -204,10 +212,6 @@ void CpuThread::entry() {
         fmt::printf("addrformat is %#x\n", i->addr_format);
 
         fmt::printf("i->domain_attr->mr_mode is %#x\n", i->domain_attr->mr_mode);
-
-        if (devices.size() >= 1) {
-          break;
-        }
       }
     }
 
@@ -274,6 +278,7 @@ void CpuThread::entry() {
     std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)group->ipcMapper->getMySharedMem(0x100, 4);
 
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMap;
+    HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMapCuda;
 
     auto regMr = [&](uintptr_t address, size_t bytes) {
       auto i = mrMap.find(address);
@@ -289,6 +294,36 @@ void CpuThread::entry() {
       }
       MemoryRegion* r = &*ptr;
       mrMap[address] = std::move(ptr);
+      return r;
+    };
+
+    auto regMrCuda = [&](uintptr_t address, size_t bytes) {
+      auto i = mrMapCuda.find(address);
+      if (i != mrMapCuda.end()) {
+        return &*i->second;
+      }
+      auto ptr = std::make_unique<MemoryRegion>();
+      ptr->mrs.fill(nullptr);
+      CHECK(devices.size() <= ptr->mrs.size());
+      for (size_t i = 0; i != devices.size(); ++i) {
+        iovec iov;
+        fi_mr_attr attr;
+        std::memset(&attr, 0, sizeof(attr));
+        iov.iov_base = (void*)address;
+        iov.iov_len = bytes;
+        attr.access = FI_WRITE | FI_REMOTE_WRITE;
+        attr.iface = FI_HMEM_CUDA;
+        attr.device.cuda = group->cuDevice;
+        fmt::printf("doing cuda register\n");
+
+        // int fd;
+        // CHECK_CU(cuMemGetHandleForAddressRange(&fd, address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
+
+        CHECK_FI(fi_mr_regattr(devices[i].domain, &attr, FI_HMEM | FI_HMEM_DEVICE_ONLY, &ptr->mrs[i]));
+        fmt::printf("cuda register ok!\n");
+      }
+      MemoryRegion* r = &*ptr;
+      mrMapCuda[address] = std::move(ptr);
       return r;
     };
 
@@ -418,7 +453,8 @@ void CpuThread::entry() {
         msg.rma_iov_count = 1;
         msg.context = nullptr;
         msg.data = 0;
-        int err = fi_writemsg(ep, &msg, FI_INJECT | FI_FENCE);
+        // int err = fi_writemsg(ep, &msg, FI_INJECT | FI_FENCE);
+        int err = fi_writemsg(ep, &msg, FI_INJECT);
         if (err == -FI_EAGAIN) {
           poll();
           continue;
@@ -486,14 +522,14 @@ void CpuThread::entry() {
 
         fmt::printf("cpu thread got all gather (step %d)\n", params.stepValue);
 
-        auto* inputMr = regMr(params.cpuInput, params.bytes);
-        auto* outputMr = regMr(params.cpuOutput, params.bytes * size);
+        auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
+        auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
 
         DynamicAddresses* mydyn = &localDyns[rank];
         for (size_t i = 0; i != devices.size(); ++i) {
           mydyn->gatherKey[i] = outputMr->mrs[i]->key;
         }
-        mydyn->gatherAddress = (uintptr_t)params.cpuOutput;
+        mydyn->gatherAddress = (uintptr_t)params.outputAddress;
 
         // fmt::printf("mydyn->gatherAddress is %#x\n", mydyn->gatherAddress);
         // fmt::printf("mydyn->gatherKey is %#s\n", tostr(&mydyn->gatherKey, sizeof(mydyn->gatherKey)));
@@ -544,12 +580,14 @@ void CpuThread::entry() {
           size_t offset = bytesSent;
           size_t n = std::min(bytesReady - bytesSent, maxSize);
 
-          uintptr_t srcAddr = (uintptr_t)params.cpuInput + offset;
+          uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
 
           bytesSent += n;
 
           for (size_t i : sendRanks) {
-            writeData(i, srcAddr, n, inputMr, localDyns[i].gatherAddress + offset, localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
+            writeData(
+                i, srcAddr, n, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+                localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
           }
           poll();
           // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
@@ -564,7 +602,8 @@ void CpuThread::entry() {
           bytesSentOffset[i] += bytesSent;
         }
 
-        fmt::printf("%fG/s\n", bytesSent / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f / 1024.0f);
+        fmt::printf(
+            "%fG/s\n", bytesSent / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f / 1024.0f);
 
         fmt::printf("sent all data!\n");
 

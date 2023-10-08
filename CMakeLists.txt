@@ -31,10 +31,13 @@ find_package(Threads REQUIRED)
 add_subdirectory(pybind11)
 add_subdirectory(fmt EXCLUDE_FROM_ALL)
 
-find_package(PkgConfig)
-pkg_check_modules(FABRIC REQUIRED libfabric)
+# find_package(PkgConfig)
+# pkg_check_modules(FABRIC REQUIRED libfabric)
 
-find_library(FABRIC_LIBRARY NAMES fabric HINTS ${FABRIC_LIBRARY_DIRS})
+# find_library(FABRIC_LIBRARY NAMES fabric HINTS ${FABRIC_LIBRARY_DIRS})
+
+set(FABRIC_LIBRARY "/data/home/vegardmella/libfabric-install/lib/libfabric.so")
+set(FABRIC_INCLUDE_DIRS "/data/home/vegardmella/libfabric-install/include/")
 
 pybind11_add_module(_C
   processgroup.cc
