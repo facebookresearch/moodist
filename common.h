@@ -9,11 +9,11 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <numa.h>
 #include <nvml.h>
 #include <nvrtc.h>
 #include <torch/cuda.h>
 #include <torch/types.h>
-#include <numa.h>
 
 #include <random>
 #include <stdexcept>
@@ -173,6 +173,11 @@ inline std::string randomName() {
     r += "0123456789abcdef"[std::uniform_int_distribution<int>(0, 15)(getRng())];
   }
   return r;
+}
+
+template<typename Duration>
+float seconds(Duration duration) {
+  return std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(duration).count();
 }
 
 } // namespace moodist

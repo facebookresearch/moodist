@@ -299,6 +299,8 @@ struct ProcessGroupImpl {
     e->outputAddress = (uintptr_t)output.data_ptr();
     e->bytes = bytes;
     e->inputBytesReady = 0;
+    e->cpuInput = (uintptr_t)cpuInput.cpuPointer;
+    e->cpuOutput = (uintptr_t)cpuOutput.cpuPointer;
 
     TORCH_CHECK((e->inputAddress & 0xf) == 0);
     TORCH_CHECK((e->outputAddress & 0xf) == 0);
@@ -393,8 +395,8 @@ struct ProcessGroupImpl {
       if (i == inputChunks - 1) {
         n = bytes - offset;
       }
-      CHECK_CU(cuMemcpyDtoHAsync(
-          (void*)((uintptr_t)cpuInput.cpuPointer + offset), inputAddress + offset, n, group->extraStreams[0]));
+      // CHECK_CU(cuMemcpyDtoHAsync(
+      //     (void*)((uintptr_t)cpuInput.cpuPointer + offset), inputAddress + offset, n, group->extraStreams[0]));
 
       CHECK_CU(cuLaunchHostFunc(
           group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
@@ -405,7 +407,7 @@ struct ProcessGroupImpl {
       // CHECK_CU(cuEventRecord(group->extraEvents[1 + i], group->extraStreams[1 + i]));
       // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1 + i], CU_EVENT_WAIT_DEFAULT));
     }
-    CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
+    //CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
     CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
     CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
 
@@ -413,9 +415,10 @@ struct ProcessGroupImpl {
 
     Function<void()> f = [this, cpuInput = std::move(cpuInput), cpuOutput = std::move(cpuOutput), myStepCounter, e,
                           size]() mutable {
+      futexWaitWhileLess(myStepCounter, e->stepValue + 1);
       inputMemory.deallocate(std::move(cpuInput));
       outputMemory.deallocate(std::move(cpuOutput));
-      myStepCounter->store(e->stepValue + size * 2, std::memory_order_relaxed);
+      myStepCounter->store(e->stepValue + 2, std::memory_order_relaxed);
       futexWakeAll(myStepCounter);
     };
     CHECK_CU(cuLaunchHostFunc(

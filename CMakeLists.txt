@@ -31,6 +31,10 @@ find_package(Threads REQUIRED)
 add_subdirectory(pybind11)
 add_subdirectory(fmt EXCLUDE_FROM_ALL)
 
+find_package(PkgConfig)
+pkg_check_modules(FABRIC REQUIRED libfabric)
+
+find_library(FABRIC_LIBRARY NAMES fabric HINTS ${FABRIC_LIBRARY_DIRS})
 
 pybind11_add_module(_C
   processgroup.cc
@@ -50,9 +54,9 @@ target_link_libraries(
   ${TorchPath}/lib/libtorch_python${CMAKE_SHARED_LIBRARY_SUFFIX}
   Threads::Threads
   fmt
-  anl numa
+  anl numa ${FABRIC_LIBRARY}
   CUDA::cudart CUDA::nvml
 )
-target_include_directories(_C SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+target_include_directories(_C SYSTEM PRIVATE ${FABRIC_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 

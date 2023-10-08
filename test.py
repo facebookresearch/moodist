@@ -4,25 +4,26 @@ import subprocess
 import time
 import sys
 
-os.environ["RANK"] = os.environ["SLURM_PROCID"]
-os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+if "LOCAL_RANK" not in os.environ:
+    os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-# define master address and master port
-hostnames = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]])
-master_addr = hostnames.split()[0].decode("utf-8")
-master_port = 8195
-# print(PREFIX + f"Master address: {params.master_addr}")
-# print(PREFIX + f"Master port   : {params.master_port}")
+    # define master address and master port
+    hostnames = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]])
+    master_addr = hostnames.split()[0].decode("utf-8")
+    master_port = 8195
+    # print(PREFIX + f"Master address: {params.master_addr}")
+    # print(PREFIX + f"Master port   : {params.master_port}")
 
-# set environment variables for 'env://'
-os.environ["MASTER_ADDR"] = master_addr
-os.environ["MASTER_PORT"] = str(master_port)
-
-
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    # set environment variables for 'env://'
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
 
 
-#os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
 def f(n):
     import torch
@@ -386,7 +387,7 @@ def f(n):
 
 
 if 1 == 1:
-    f("moolib")
+    f("moodist")
     sys.exit(0)
 
 #for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):

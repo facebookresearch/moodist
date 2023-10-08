@@ -37,6 +37,9 @@ struct QueueEntryAllGather : QueueEntry {
 
   std::atomic_size_t inputBytesReady = 0;
 
+  uintptr_t cpuInput = 0;
+  uintptr_t cpuOutput = 0;
+
   // std::atomic_uint32_t cpuOutStepValue = 0;
   // std::atomic_uint32_t cpuInStepValue = 0;
 };
