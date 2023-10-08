@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
+# Copyright (c) 2019, Mellanox Technologies. All rights reserved. See COPYING file
+
+rdma_python_test(tests
+  __init__.py
+  args_parser.py
+  base.py
+  base_rdmacm.py
+  cuda_utils.py
+  efa_base.py
+  irdma_base.py
+  mlx5_base.py
+  mlx5_prm_structs.py
+  rdmacm_utils.py
+  test_addr.py
+  test_atomic.py
+  test_cq.py
+  test_cq_events.py
+  test_cqex.py
+  test_cuda_dmabuf.py
+  test_device.py
+  test_efa_srd.py
+  test_efadv.py
+  test_flow.py
+  test_fork.py
+  test_mlx5_cq.py
+  test_mlx5_crypto.py
+  test_mlx5_cuda_umem.py
+  test_mlx5_dc.py
+  test_mlx5_devx.py
+  test_mlx5_dm_ops.py
+  test_mlx5_dma_memcpy.py
+  test_mlx5_dr.py
+  test_mlx5_flow.py
+  test_mlx5_huge_page.py
+  test_mlx5_lag_affinity.py
+  test_mlx5_mkey.py
+  test_mlx5_pp.py
+  test_mlx5_query_port.py
+  test_mlx5_raw_wqe.py
+  test_mlx5_rdmacm.py
+  test_mlx5_sched.py
+  test_mlx5_timestamp.py
+  test_mlx5_uar.py
+  test_mlx5_udp_sport.py
+  test_mlx5_var.py
+  test_mlx5_vfio.py
+  test_mr.py
+  test_odp.py
+  test_pd.py
+  test_parent_domain.py
+  test_qp.py
+  test_qpex.py
+  test_rdmacm.py
+  test_relaxed_ordering.py
+  test_rss_traffic.py
+  test_shared_pd.py
+  test_tag_matching.py
+  utils.py
+  )
+
+rdma_python_test(tests
+  run_tests.py
+  )
+
+rdma_internal_binary(
+  run_tests.py
+  )

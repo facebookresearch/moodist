@@ -275,7 +275,7 @@ struct ProcessGroupImpl {
 
     uint32_t stepValue = nextStepValue.fetch_add(256);
 
-    QueueEntryAllGather* e = group->cputhread->freelistAllGather.pop();
+    QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
     e->task = taskAllgather;
     e->stepValue = stepValue;
 
@@ -383,12 +383,12 @@ struct ProcessGroupImpl {
     //   CHECK_CU(cuStreamWaitEvent(group->stream, event, CU_EVENT_WAIT_DEFAULT));
     // }
 
-    size_t inputChunks = 8;
+    size_t inputChunks = 1;
 
-    group->cputhread->enqueue(e);
+    group->cpuThread->enqueue(e);
 
-    CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-    // CHECK_CU(cuMemcpyDtoHAsync(cpuInput.cpuPointer, inputAddress, bytes, group->extraStreams[0]));
+    // CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    //  CHECK_CU(cuMemcpyDtoHAsync(cpuInput.cpuPointer, inputAddress, bytes, group->extraStreams[0]));
     for (size_t i = 0; i != inputChunks; ++i) {
       size_t n = bytes / inputChunks;
       size_t offset = n * i;
@@ -407,11 +407,9 @@ struct ProcessGroupImpl {
       // CHECK_CU(cuEventRecord(group->extraEvents[1 + i], group->extraStreams[1 + i]));
       // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1 + i], CU_EVENT_WAIT_DEFAULT));
     }
-    //CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
-    CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
-    CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
-
-    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
+    CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->stream));
+    //CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
+    //CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
 
     Function<void()> f = [this, cpuInput = std::move(cpuInput), cpuOutput = std::move(cpuOutput), myStepCounter, e,
                           size]() mutable {
@@ -423,6 +421,8 @@ struct ProcessGroupImpl {
     };
     CHECK_CU(cuLaunchHostFunc(
         group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));
+
+    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
 
     c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
         c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));

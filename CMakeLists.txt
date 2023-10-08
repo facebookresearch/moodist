@@ -31,13 +31,11 @@ find_package(Threads REQUIRED)
 add_subdirectory(pybind11)
 add_subdirectory(fmt EXCLUDE_FROM_ALL)
 
-# find_package(PkgConfig)
-# pkg_check_modules(FABRIC REQUIRED libfabric)
+set(ENABLE_STATIC ON CACHE BOOL "")
+set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
+set(RDMA_STATIC_PROVIDERS "all" CACHE STRING "")
+add_subdirectory(rdma-core EXCLUDE_FROM_ALL)
 
-# find_library(FABRIC_LIBRARY NAMES fabric HINTS ${FABRIC_LIBRARY_DIRS})
-
-set(FABRIC_LIBRARY "/data/home/vegardmella/libfabric-install/lib/libfabric.so")
-set(FABRIC_INCLUDE_DIRS "/data/home/vegardmella/libfabric-install/include/")
 
 pybind11_add_module(_C
   processgroup.cc
@@ -49,6 +47,8 @@ pybind11_add_module(_C
   ipc_mapper.cc
   cputhread.cc
   pybind.cc
+  ib_common.cc
+  allgather.cc
 )
 target_link_libraries(
   _C
@@ -60,6 +60,9 @@ target_link_libraries(
   anl numa ${FABRIC_LIBRARY}
   CUDA::cudart CUDA::nvml
 )
-target_include_directories(_C SYSTEM PRIVATE ${FABRIC_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+target_include_directories(_C SYSTEM PRIVATE rdma-core ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
+
+target_link_libraries(_C PUBLIC ibverbs-static bnxt_re cxgb4 efa-static erdma hns irdma mana-static mlx4-static mlx5-static mthca ocrdma qedr vmw_pvrdma hfi1verbs ipathverbs rxe siw ibverbs-static)
+
 

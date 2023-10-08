@@ -7,6 +7,8 @@ namespace moodist {
 struct SetupComms;
 struct IpcMapper;
 struct CpuThread;
+struct IbCommon;
+struct AllGather;
 
 struct Group {
   size_t rank;
@@ -24,7 +26,9 @@ struct Group {
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
-  std::unique_ptr<CpuThread> cputhread;
+  std::unique_ptr<CpuThread> cpuThread;
+  std::vector<std::unique_ptr<IbCommon>> ibDevs;
+  std::unique_ptr<AllGather> allGather;
 
   // AllocatedBuffer temporaryBuffer;
   // AllocatedBuffer cudaStepDoneBuffer;
@@ -38,15 +42,15 @@ struct Group {
 
   std::vector<size_t> ipcRanks;
   std::vector<size_t> peerIndices;
-  // std::vector<uint8_t> ipcAccess;
-  // std::vector<std::vector<uint8_t>> peerIpcAccess;
+  std::vector<uint8_t> ipcAccess;
+  std::vector<std::vector<uint8_t>> peerIpcAccess;
+  std::array<size_t, 8> peerMyRemoteIndex;
 
-  // std::vector<uintptr_t> rankCudaStepDoneBase;
-  // std::array<size_t, 8> peerMyRemoteIndex;
+  std::vector<std::vector<size_t>> nodeRanks;
 
   int allocationNode = -1;
 
-  static constexpr size_t dataChunks = 4;
+  //static constexpr size_t dataChunks = 4;
 
   Group(size_t rank, size_t size);
   ~Group();
