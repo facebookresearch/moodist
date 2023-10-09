@@ -449,28 +449,55 @@ struct ProcessGroupImpl {
 
       CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
       CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].first, bytes, stream));
+
+      for (auto& v : allGather.proxyDestinationInfo) {
+        if (v.proxyPeerIndex != i) {
+          continue;
+        }
+        size_t i = v.proxyPeerIndex;
+        size_t source = v.source;
+        auto stream = group->extraStreams[1];
+        CHECK_CU(cuLaunchHostFunc(
+            stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+            Function<void()>([group, i, e, source, proxy = v.proxy]() {
+              // auto start = std::chrono::steady_clock::now();
+              // fmt::printf("%d: waiting for proxy recv from %d -> %d\n", group->rank, source, proxy);
+              uint32_t& ref = group->getPeerVar(i, group->localProgress)[source].stepValue;
+              uint32_t stepValue = e->stepValue;
+              while (ref < stepValue) {
+                __sync_synchronize();
+              }
+              // fmt::printf(
+              //     "%d: got recv from %d -> %d in %fms\n", group->rank, source, proxy,
+              //     seconds(std::chrono::steady_clock::now() - start) * 1000);
+            }).release()));
+        auto& peerAddrs = *group->peerAddrs;
+        CHECK_CU(
+            cuMemcpyDtoDAsync(outputAddress + bytes * source, peerAddrs[i].second + bytes * source, bytes, stream));
+      }
     }
-    for (auto& v : allGather.proxyDestinationInfo) {
-      size_t i = v.proxyPeerIndex;
-      size_t source = v.source;
-      auto stream = group->extraStreams[1];
-      CHECK_CU(cuLaunchHostFunc(
-          stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
-          Function<void()>([group, i, e, source, proxy = v.proxy]() {
-            // auto start = std::chrono::steady_clock::now();
-            // fmt::printf("%d: waiting for proxy recv from %d -> %d\n", group->rank, source, proxy);
-            uint32_t& ref = group->getPeerVar(i, group->localProgress)[source].stepValue;
-            uint32_t stepValue = e->stepValue;
-            while (ref < stepValue) {
-              __sync_synchronize();
-            }
-            // fmt::printf(
-            //     "%d: got recv from %d -> %d in %fms\n", group->rank, source, proxy,
-            //     seconds(std::chrono::steady_clock::now() - start) * 1000);
-          }).release()));
-      auto& peerAddrs = *group->peerAddrs;
-      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * source, peerAddrs[i].second + bytes * source, bytes, stream));
-    }
+    // for (auto& v : allGather.proxyDestinationInfo) {
+    //   size_t i = v.proxyPeerIndex;
+    //   size_t source = v.source;
+    //   auto stream = group->extraStreams[1];
+    //   CHECK_CU(cuLaunchHostFunc(
+    //       stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+    //       Function<void()>([group, i, e, source, proxy = v.proxy]() {
+    //         // auto start = std::chrono::steady_clock::now();
+    //         // fmt::printf("%d: waiting for proxy recv from %d -> %d\n", group->rank, source, proxy);
+    //         uint32_t& ref = group->getPeerVar(i, group->localProgress)[source].stepValue;
+    //         uint32_t stepValue = e->stepValue;
+    //         while (ref < stepValue) {
+    //           __sync_synchronize();
+    //         }
+    //         // fmt::printf(
+    //         //     "%d: got recv from %d -> %d in %fms\n", group->rank, source, proxy,
+    //         //     seconds(std::chrono::steady_clock::now() - start) * 1000);
+    //       }).release()));
+    //   auto& peerAddrs = *group->peerAddrs;
+    //   CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * source, peerAddrs[i].second + bytes * source, bytes,
+    //   stream));
+    // }
     for (size_t i : peerIndices) {
       auto stream = group->extraStreams[1];
       auto event = group->extraEvents[1];
