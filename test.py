@@ -238,11 +238,17 @@ def f(n):
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
             ) as prof:
-                loopcount = 1000
+                loopcount = 100
                 for _ in range(loopcount):
                     dist._all_gather_base(result0, tmp)
-                    torch.cuda.synchronize()
+                    #torch.cuda.synchronize()
+            torch.cuda.synchronize()
             prof.export_chrome_trace(f"trace-{rank}.json")
+        elif 1 == 1:
+            loopcount = 1000
+            for _ in range(loopcount):
+                dist._all_gather_base(result0, tmp)
+            torch.cuda.synchronize()
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000

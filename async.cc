@@ -184,6 +184,9 @@ struct SchedulerFifoImpl {
     for (auto& t : pool.threads) {
       t.terminate = true;
       if (outgoing[t.n].sleeping) {
+        // fixme: since we don't actually modify req here, the futexWait below may not return.
+        //        workaround is to let the wait below be short (1 second), such that on exit
+        //        there is an upper bound to how long it might wait.
         futexWakeAll(&incoming[t.n].req);
       }
     }
@@ -203,7 +206,7 @@ struct SchedulerFifoImpl {
           return;
         }
         o.sleeping = true;
-        futexWait(&i.req, req, std::chrono::seconds(120));
+        futexWait(&i.req, req, std::chrono::seconds(1));
         o.sleeping = false;
       }
 

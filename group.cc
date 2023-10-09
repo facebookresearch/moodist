@@ -527,6 +527,13 @@ void Group::init() {
 
   ipcMapper->getMySharedMem(0, offset);
 
+  cudaStepDoneBuffer = allocateDevice(size * 8);
+  cpuStepDoneBuffer = allocateHost(size * 8);
+
+  cpuOutBuffer = allocateManaged(4096 + 16 * size);
+  CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
+  cpuInBuffer = allocateHost(4096 + 16 * size);
+
   allGather->init();
 
   fmt::printf("%d: init ok!\n", rank);

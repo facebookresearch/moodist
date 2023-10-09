@@ -1,5 +1,6 @@
 #pragma once
 
+#include "collective_base.h"
 #include "common.h"
 
 #include <cstdint>
@@ -20,16 +21,12 @@ struct ProxyDestinationInfo {
   size_t proxyPeerIndex;
 };
 
-struct AllGatherComms {
-  uint32_t stepValue;
-  size_t bytesReady;
-};
+// struct AllGatherComms {
+//   uint32_t stepValue;
+//   size_t bytesReady;
+// };
 
-struct Group;
-
-struct AllGather {
-
-  Group* group = nullptr;
+struct AllGather : CollectiveBase {
 
   std::vector<size_t> sendRanks;
   std::vector<size_t> recvRanks;
@@ -37,7 +34,21 @@ struct AllGather {
   std::vector<ProxyInfo> proxyInfo;
   std::vector<ProxyDestinationInfo> proxyDestinationInfo;
 
-  AllocatedBuffer commsBuffer;
+  // AllocatedBuffer commsBuffer;
+  AllocatedBuffer cudaStepValue;
+  std::array<uintptr_t, 8> peerCudaStepValue;
+
+  AllocatedBuffer cudaCopyDone;
+  std::array<uintptr_t, 8> peerCudaCopyDone;
+
+  int computeMajor = 0;
+  int computeMinor = 0;
+
+  CUmodule cuModule = nullptr;
+  CUfunction cuAllgatherEntry = nullptr;
+  CUfunction cuAllgatherExit = nullptr;
+  std::array<CUfunction, 8> cuAllgatherCopyDone{};
+  CUfunction cuAllgatherCopyAllDone = nullptr;
 
   // std::vector<std::vector<std::pair<size_t, size_t>>> peerProxies;
   // std::vector<std::pair<size_t, size_t>> ipcProxies;
@@ -53,6 +64,7 @@ struct AllGather {
   AllGather(Group* group);
   ~AllGather();
   void init();
+  void compile();
 };
 
 } // namespace moodist

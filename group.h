@@ -38,11 +38,11 @@ struct Group {
   std::unique_ptr<CpuThread> cpuThread;
 
   // AllocatedBuffer temporaryBuffer;
-  // AllocatedBuffer cudaStepDoneBuffer;
-  // AllocatedBuffer cpuStepDoneBuffer;
+  AllocatedBuffer cudaStepDoneBuffer;
+  AllocatedBuffer cpuStepDoneBuffer;
 
-  // AllocatedBuffer cpuOutBuffer;
-  // AllocatedBuffer cpuInBuffer;
+  AllocatedBuffer cpuOutBuffer;
+  AllocatedBuffer cpuInBuffer;
 
   // AllocatedBuffer peerInBuffer;
   // std::array<uintptr_t, 8> peerOut;

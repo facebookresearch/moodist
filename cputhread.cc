@@ -434,10 +434,13 @@ void CpuThread::entry() {
       //     sizeof(stepValue));
     };
 
-    std::vector<size_t> bytesReadyOffset;
-    bytesReadyOffset.resize(size);
-    std::vector<size_t> bytesSentOffset;
-    bytesSentOffset.resize(size);
+    volatile uint32_t* cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
+    volatile uint32_t* cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
+
+    // std::vector<size_t> bytesReadyOffset;
+    // bytesReadyOffset.resize(size);
+    // std::vector<size_t> bytesSentOffset;
+    // bytesSentOffset.resize(size);
 
     while (true) {
 
@@ -559,7 +562,10 @@ void CpuThread::entry() {
           for (size_t i : sendRanks) {
             writeDataDistributed(
                 i, srcAddr, n, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
-                localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
+                localDyns[i].gatherKey, bytesSent);
+            // writeDataDistributed(
+            //     i, srcAddr, n, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+            //     localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
           }
           poll();
           // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
@@ -622,8 +628,8 @@ void CpuThread::entry() {
 
         // fmt::printf("cpu thread all gather step 1 done!\n");
 
-        params.threadStepValue.store(params.stepValue + 1, std::memory_order_relaxed);
-        futexWakeAll(&params.threadStepValue);
+        // params.threadStepValue.store(params.stepValue + 1, std::memory_order_relaxed);
+        // futexWakeAll(&params.threadStepValue);
         // myStepCounter->store(params.stepValue + 1, std::memory_order_relaxed);
         // futexWakeAll(myStepCounter);
 
@@ -635,7 +641,12 @@ void CpuThread::entry() {
 
         // fmt::printf("cpu thread all gather all done!\n");
 
-        // freelistAllGather.push(&params);
+        cpuOut[0] = queueEntry.stepValue;
+        while (cpuIn[0] < queueEntry.stepValue + 1) {
+          poll();
+        }
+
+        freelistAllGather.push(&params);
       } else if (queueEntry.task == taskTerminate) {
         freelistTerminate.push(&queueEntry);
         break;
