@@ -1,14 +1,13 @@
 
 #include "processgroup.h"
+#include "allgather.h"
 #include "clock.h"
-// #include "cputhread.h"
 #include "common.h"
 #include "cputhread.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "serialization.h"
 #include "setup_comms.h"
-// #include "util.h"
 #include "synchronization.h"
 #include "vector.h"
 
@@ -156,6 +155,8 @@ struct ProcessGroupImpl {
   ProcessGroupImpl(int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
 
+    scheduler.setMaxThreads(1);
+
     group = std::make_shared<Group>(rank, size);
 
     for (auto& v : {&inputMemory, &outputMemory}) {
@@ -291,16 +292,11 @@ struct ProcessGroupImpl {
 
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
 
-    AllocatedBuffer cpuInput = inputMemory.allocate(bytes);
-    AllocatedBuffer cpuOutput = outputMemory.allocate(outputBytes);
-
     e->outputAddresses.clear();
     e->inputAddress = (uintptr_t)input.data_ptr();
     e->outputAddress = (uintptr_t)output.data_ptr();
     e->bytes = bytes;
     e->inputBytesReady = 0;
-    e->cpuInput = (uintptr_t)cpuInput.cpuPointer;
-    e->cpuOutput = (uintptr_t)cpuOutput.cpuPointer;
 
     TORCH_CHECK((e->inputAddress & 0xf) == 0);
     TORCH_CHECK((e->outputAddress & 0xf) == 0);
@@ -325,15 +321,23 @@ struct ProcessGroupImpl {
           i, e->outputAddress, bytes, [ptr = &e->peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
     }
 
-    std::array<std::atomic_uint32_t*, 8> peerStepCounters;
-    for (size_t i : peerIndices) {
-      peerStepCounters[i] = (std::atomic_uint32_t*)ipcMapper->getPeerSharedMem(i, 0x100, 4);
-    }
-    std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)ipcMapper->getMySharedMem(0x100, 4);
+    // std::array<std::atomic_uint32_t*, 8> peerStepCounters;
+    // for (size_t i : peerIndices) {
+    //   peerStepCounters[i] = (std::atomic_uint32_t*)ipcMapper->getPeerSharedMem(i, 0x100, 4);
+    // }
+    // std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)ipcMapper->getMySharedMem(0x100, 4);
+
+    // using AddressPairs = std::array<std::pair<uintptr_t, uintptr_t>, 8>;
+    // using PeerStepValues = std::array<std::atomic_uint32_t, 8>;
+    // AddressPairs& peerAddrs = *(AddressPairs*)ipcMapper->getMySharedMem(0x110, sizeof(AddressPairs));
+    // PeerStepValues& peerCopyDone = *(PeerStepValues*)ipcMapper->getMySharedMem(0x40, 4);
 
     ipcMapper->wait();
 
+    Group* group = &*this->group;
+
     uintptr_t inputAddress = e->inputAddress;
+    uintptr_t outputAddress = e->outputAddress;
 
     if (group->extraStreams[0] == nullptr) {
       for (auto& v : group->extraStreams) {
@@ -386,38 +390,139 @@ struct ProcessGroupImpl {
     size_t inputChunks = 1;
 
     group->cpuThread->enqueue(e);
-
     // CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
     //  CHECK_CU(cuMemcpyDtoHAsync(cpuInput.cpuPointer, inputAddress, bytes, group->extraStreams[0]));
-    for (size_t i = 0; i != inputChunks; ++i) {
-      size_t n = bytes / inputChunks;
-      size_t offset = n * i;
-      if (i == inputChunks - 1) {
-        n = bytes - offset;
-      }
-      // CHECK_CU(cuMemcpyDtoHAsync(
-      //     (void*)((uintptr_t)cpuInput.cpuPointer + offset), inputAddress + offset, n, group->extraStreams[0]));
+    // for (size_t i = 0; i != inputChunks; ++i) {
+    //   size_t n = bytes / inputChunks;
+    //   size_t offset = n * i;
+    //   if (i == inputChunks - 1) {
+    //     n = bytes - offset;
+    //   }
+    //   // CHECK_CU(cuMemcpyDtoHAsync(
+    //   //     (void*)((uintptr_t)cpuInput.cpuPointer + offset), inputAddress + offset, n, group->extraStreams[0]));
 
+    //   CHECK_CU(cuLaunchHostFunc(
+    //       group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+    //       Function<void()>([this, offset, n, e]() {
+    //         e->inputBytesReady.store(offset + n, std::memory_order_relaxed);
+    //       }).release()));
+
+    //   // CHECK_CU(cuEventRecord(group->extraEvents[1 + i], group->extraStreams[1 + i]));
+    //   // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1 + i], CU_EVENT_WAIT_DEFAULT));
+    // }
+
+    AllGather& allGather = *group->allGather;
+
+    for (size_t i : peerIndices) {
+      // auto& addrs = *(AddressPairs*)ipcMapper->getPeerSharedMem(i, 0x110, sizeof(AddressPairs));
+      (*group->getPeerVar(i, group->peerAddrs))[group->peerMyRemoteIndex[i]] = {
+          e->peerInputAddresses[i], e->peerOutputAddresses[i]};
+    }
+    group->myStepCounter->store(stepValue, std::memory_order_relaxed);
+    futexWakeAll(group->myStepCounter);
+
+    CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+
+    CHECK_CU(cuLaunchHostFunc(
+        group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+        Function<void()>([this, e, group]() {
+          group->myStepCounter->store(e->stepValue + 1, std::memory_order_relaxed);
+          futexWakeAll(group->myStepCounter);
+          for (size_t i : group->peerIndices) {
+            futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), e->stepValue + 1);
+          }
+        }).release()));
+    CHECK_CU(cuEventRecord(op->inputEvent, group->stream));
+
+    CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
+    CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
+    CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
+
+    for (size_t i : peerIndices) {
+      auto stream = group->extraStreams[1];
+      auto event = group->extraEvents[1];
+
+      futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
+      // futexWaitWhileLess(peerStepCounters[i], stepValue);
+      auto& peerAddrs = *group->peerAddrs;
+      CHECK(peerAddrs[i].first && peerAddrs[i].second);
+
+      CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].first, bytes, stream));
+    }
+    for (auto& v : allGather.proxyDestinationInfo) {
+      size_t i = v.proxyPeerIndex;
+      size_t source = v.source;
+      auto stream = group->extraStreams[1];
       CHECK_CU(cuLaunchHostFunc(
-          group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
-          Function<void()>([this, offset, n, e]() {
-            e->inputBytesReady.store(offset + n, std::memory_order_relaxed);
+          stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+          Function<void()>([group, i, e, source, proxy = v.proxy]() {
+            // auto start = std::chrono::steady_clock::now();
+            // fmt::printf("%d: waiting for proxy recv from %d -> %d\n", group->rank, source, proxy);
+            uint32_t& ref = group->getPeerVar(i, group->localProgress)[source].stepValue;
+            uint32_t stepValue = e->stepValue;
+            while (ref < stepValue) {
+              __sync_synchronize();
+            }
+            // fmt::printf(
+            //     "%d: got recv from %d -> %d in %fms\n", group->rank, source, proxy,
+            //     seconds(std::chrono::steady_clock::now() - start) * 1000);
+          }).release()));
+      auto& peerAddrs = *group->peerAddrs;
+      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * source, peerAddrs[i].second + bytes * source, bytes, stream));
+    }
+    for (size_t i : peerIndices) {
+      auto stream = group->extraStreams[1];
+      auto event = group->extraEvents[1];
+      CHECK_CU(cuLaunchHostFunc(
+          stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); },
+          Function<void()>([group, i, e, ipcMapper]() {
+            // auto* v = &(*(PeerStepValues*)ipcMapper->getPeerSharedMem(
+            //     i, 0x40, sizeof(AddressPairs)))[group->peerMyRemoteIndex[i]];
+            auto* v = &(*group->getPeerVar(i, group->peerCopyDone))[group->peerMyRemoteIndex[i]];
+            v->store(e->stepValue, std::memory_order_relaxed);
+            futexWakeAll(v);
           }).release()));
 
-      // CHECK_CU(cuEventRecord(group->extraEvents[1 + i], group->extraStreams[1 + i]));
-      // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1 + i], CU_EVENT_WAIT_DEFAULT));
+      CHECK_CU(cuEventRecord(event, stream));
+      CHECK_CU(cuStreamWaitEvent(group->stream, event, CU_EVENT_WAIT_DEFAULT));
     }
-    CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->stream));
-    //CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
-    //CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
 
-    Function<void()> f = [this, cpuInput = std::move(cpuInput), cpuOutput = std::move(cpuOutput), myStepCounter, e,
-                          size]() mutable {
-      futexWaitWhileLess(myStepCounter, e->stepValue + 1);
-      inputMemory.deallocate(std::move(cpuInput));
-      outputMemory.deallocate(std::move(cpuOutput));
-      myStepCounter->store(e->stepValue + 2, std::memory_order_relaxed);
-      futexWakeAll(myStepCounter);
+    // CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->stream));
+    // // CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
+    // // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
+
+    Function<void()> f = [this, e, size, group = &*group]() mutable {
+      uint32_t stepValue = e->stepValue;
+
+      AllGather& allGather = *group->allGather;
+      Progress* localProgress = group->localProgress;
+      for (size_t i : allGather.recvRanks) {
+        // auto start = std::chrono::steady_clock::now();
+        // fmt::printf("waiting for recv from %d\n", i);
+        while (group->localProgress[i].stepValue < stepValue + 1) {
+          __sync_synchronize();
+        }
+        // fmt::printf("got recv from %d! in %fms\n", i, seconds(std::chrono::steady_clock::now() - start) * 1000);
+      }
+
+      for (size_t i : group->peerIndices) {
+        // auto start = std::chrono::steady_clock::now();
+        // fmt::printf("waiting on peer copy done from %d\n", i);
+        futexWaitWhileLess(&(*group->peerCopyDone)[i], e->stepValue);
+        // fmt::printf("got peer copy done from %d! in %fms\n", i, seconds(std::chrono::steady_clock::now() - start) *
+        // 1000);
+      }
+
+      // auto start = std::chrono::steady_clock::now();
+      // fmt::printf("waiting for thread\n");
+      futexWaitWhileLess(&e->threadStepValue, stepValue + 1);
+      // fmt::printf("got thread in %fms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+
+      // myStepCounter->store(stepValue + 2, std::memory_order_relaxed);
+      // futexWakeAll(myStepCounter);
+
+      group->cpuThread->freelistAllGather.push(e);
     };
     CHECK_CU(cuLaunchHostFunc(
         group->stream, [](void* userdata) { Function<void()>((FunctionPointer)userdata)(); }, f.release()));

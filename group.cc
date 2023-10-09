@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include <numa.h>
+#include <type_traits>
 
 namespace moodist {
 
@@ -250,6 +251,10 @@ void Group::init() {
     if (i == rank) {
       continue;
     }
+    if (allRanksDeviceNodes[i].bootId == bootId && allRanksCudaPciBus.at(i) == std::string(cudaPciBus.data())) {
+      throw std::runtime_error(
+          fmt::sprintf("Rank %d and %d share the same CUDA device! (%s)", rank, i, std::string(cudaPciBus.data())));
+    }
     nvmlDevice_t peerDevice;
     if (nvmlDeviceGetHandleByPciBusId_v2(allRanksCudaPciBus.at(i).c_str(), &peerDevice) == NVML_SUCCESS) {
       nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
@@ -470,7 +475,6 @@ void Group::init() {
     peerIpcAccess[i].resize(size);
     for (size_t n : peerIpcRanks[i]) {
       TORCH_CHECK(std::find(peerIpcRanks[n].begin(), peerIpcRanks[n].end(), i) != peerIpcRanks[n].end());
-      fmt::printf("%d: peer ipc true %d %d\n", rank, i, n);
       peerIpcAccess[i][n] = true;
     }
   }
@@ -484,9 +488,46 @@ void Group::init() {
     v = (uint32_t)-1;
   }
 
+  for (size_t i : ipcRanks) {
+    size_t peerIndex = getPeerIndex(i);
+    setupComms->sendTo(i, peerIndex);
+  }
+  for (size_t i : ipcRanks) {
+    auto remoteIndex = setupComms->recvFrom<size_t>(i);
+    peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
+  }
+
   ipcMapper->init();
+
+  mySharedMem = ipcMapper->getMySharedMem(0, 0);
+  peerSharedMem.fill(nullptr);
+  for (size_t i : peerIndices) {
+    peerSharedMem[i] = ipcMapper->getPeerSharedMem(i, 0, 0);
+  }
+
+  size_t offset = 0;
+  uintptr_t addr = (uintptr_t)mySharedMem;
+  CHECK(addr % 64 == 0);
+  auto get = [&](auto*& ptr, size_t n) {
+    using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
+    if (offset % alignof(T) != 0) {
+      offset += alignof(T) - offset % alignof(T);
+    }
+    CHECK((addr + offset) % alignof(T) == 0);
+    ptr = (T*)(addr + offset);
+    offset += sizeof(T) * n;
+  };
+  get(localDyns, size);
+  get(localProgress, size);
+  get(myStepCounter, 1);
+  get(peerAddrs, 1);
+  get(peerCopyDone, 1);
+
+  mySharedMemSize = offset;
+
+  ipcMapper->getMySharedMem(0, offset);
+
   allGather->init();
-  cpuThread->start();
 
   fmt::printf("%d: init ok!\n", rank);
 
@@ -494,6 +535,9 @@ void Group::init() {
   setupComms->allgather(0);
 
   fmt::printf("%d: init synchronized!\n", rank);
+
+  // cpuThread takes over setupComms from here
+  cpuThread->start();
 }
 
 AllocatedBuffer Group::allocateManaged(size_t bytes) {

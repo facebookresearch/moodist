@@ -10,6 +10,13 @@ struct CpuThread;
 struct IbCommon;
 struct AllGather;
 
+struct DynamicAddresses;
+
+struct alignas(64) Progress {
+  uint32_t stepValue;
+  size_t bytesReady;
+};
+
 struct Group {
   size_t rank;
   size_t size;
@@ -26,9 +33,9 @@ struct Group {
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
-  std::unique_ptr<CpuThread> cpuThread;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
   std::unique_ptr<AllGather> allGather;
+  std::unique_ptr<CpuThread> cpuThread;
 
   // AllocatedBuffer temporaryBuffer;
   // AllocatedBuffer cudaStepDoneBuffer;
@@ -50,7 +57,33 @@ struct Group {
 
   int allocationNode = -1;
 
-  //static constexpr size_t dataChunks = 4;
+  //AllocatedBuffer commsBuffer;
+  void* mySharedMem = nullptr;
+  size_t mySharedMemSize = 0;
+  std::array<void*, 8> peerSharedMem;
+  DynamicAddresses* localDyns = nullptr;
+  Progress* localProgress = nullptr;
+
+  std::atomic_uint32_t* myStepCounter = nullptr;
+
+  using AddressPairs = std::array<std::pair<uintptr_t, uintptr_t>, 8>;
+  using PeerStepValues = std::array<std::atomic_uint32_t, 8>;
+  AddressPairs* peerAddrs = nullptr;
+  PeerStepValues* peerCopyDone = nullptr;
+
+  template<typename T>
+  size_t getSharedOffset(T* myVar) const {
+    size_t offset = (uintptr_t)(void*)myVar - (uintptr_t)mySharedMem;
+    CHECK(offset + sizeof(T) <= mySharedMemSize);
+    return offset;
+  }
+
+  template<typename T>
+  T* getPeerVar(size_t peerIndex, T* myVar) const {
+    return (T*)((uintptr_t)peerSharedMem[peerIndex] + getSharedOffset(myVar));
+  }
+
+  // static constexpr size_t dataChunks = 4;
 
   Group(size_t rank, size_t size);
   ~Group();

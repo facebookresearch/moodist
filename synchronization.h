@@ -62,6 +62,20 @@ inline void futexWaitWhileLess(std::atomic_uint32_t* futex, uint32_t target) {
   }
 }
 
+inline void futexWaitWhileLessDebug(const char* fn, int line, std::atomic_uint32_t* futex, uint32_t target) {
+  auto start = std::chrono::steady_clock::now();
+  uint32_t value = futex->load(std::memory_order_relaxed);
+  while (value < target) {
+    futexWait(futex, value, std::chrono::milliseconds(1));
+    value = futex->load(std::memory_order_relaxed);
+    if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(500)) {
+      printf("deadlocked on futex wait at %s:%d\n", fn, line);
+    }
+  }
+}
+
+#define futexWaitWhileLess(a, b) futexWaitWhileLessDebug(__FILE__, __LINE__, a, b)
+
 #if 0
 using SpinMutex = std::mutex;
 #elif 0

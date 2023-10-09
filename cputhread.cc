@@ -100,11 +100,6 @@ struct MemoryRegion {
 //   uintptr_t gatherAddress;
 // };
 
-struct alignas(64) Progress {
-  uint32_t stepValue;
-  std::array<size_t, 32> bytesReady;
-};
-
 struct Device {
   IbCommon* ib;
   ibv_pd* protectionDomain;
@@ -277,9 +272,9 @@ void CpuThread::entry() {
 
         ibv_qp_ex* qp = dev.ib->qpexs.at(i);
 
-        fmt::printf(
-            "rdma write %d bytes (%p -> %p) (dev %d, i %d)\n", bytes, localAddress, remoteAddress,
-            &dev - devices.data(), i);
+        // fmt::printf(
+        //     "rdma write %d bytes (%p -> %p) (dev %d, i %d)\n", bytes, localAddress, remoteAddress,
+        //     &dev - devices.data(), i);
 
         ibv_wr_start(qp);
         qp->wr_id = wr.wr_id;
@@ -335,10 +330,12 @@ void CpuThread::entry() {
       }
     };
 
-    std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)group->ipcMapper->getMySharedMem(0x100, 4);
+    // std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)group->ipcMapper->getMySharedMem(0x100, 4);
 
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMap;
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMapCuda;
+
+    std::vector<IbvMr> localMrs;
 
     auto regMr = [&](uintptr_t address, size_t bytes) {
       auto i = mrMap.find(address);
@@ -349,8 +346,15 @@ void CpuThread::entry() {
       ptr->mrs.fill(nullptr);
       CHECK(devices.size() <= ptr->mrs.size());
       for (size_t i = 0; i != devices.size(); ++i) {
-        ptr->mrs[i] = ibv_reg_mr(
+        IbvMr mr = ibv_reg_mr(
             devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr) {
+          fmt::printf("rank %d failed to CPU register %#x size %#x\n", group->rank, address, bytes);
+          perror("ibv_reg_mr");
+          TORCH_CHECK(false);
+        }
+        ptr->mrs[i] = mr;
+        localMrs.push_back(std::move(mr));
       }
       MemoryRegion* r = &*ptr;
       mrMap[address] = std::move(ptr);
@@ -376,13 +380,10 @@ void CpuThread::entry() {
       return r;
     };
 
-    AllocatedBuffer commsBuffer = group->allocateHost(0x100 * size);
-    auto* commsMr = regMr((uintptr_t)commsBuffer.cpuPointer, commsBuffer.bytes);
+    auto* commsMr = regMr((uintptr_t)group->mySharedMem, group->mySharedMemSize);
 
-    DynamicAddresses* localDyns = (DynamicAddresses*)commsBuffer.cpuPointer;
-
-    size_t progressOffset = sizeof(DynamicAddresses) * size;
-    Progress* localProgress = (Progress*)(void*)((uintptr_t)commsBuffer.cpuPointer + progressOffset);
+    DynamicAddresses* localDyns = group->localDyns;
+    Progress* localProgress = group->localProgress;
 
     std::vector<std::vector<uint32_t>> peerCommsKeys;
     std::vector<uintptr_t> peerCommsAddrs;
@@ -393,7 +394,7 @@ void CpuThread::entry() {
         localCommsKeys.push_back(commsMr->mrs.at(i)->rkey);
       }
       peerCommsKeys = setupComms->allgather(localCommsKeys);
-      peerCommsAddrs = setupComms->allgather((uintptr_t)commsBuffer.cpuPointer);
+      peerCommsAddrs = setupComms->allgather((uintptr_t)group->mySharedMem);
 
       for (auto& v : peerCommsKeys) {
         CHECK(v.size() == devices.size());
@@ -421,7 +422,8 @@ void CpuThread::entry() {
 
     auto writeStep = [&](size_t deviceIndex, size_t dst, uint32_t stepValue) {
       Device& dev = devices[deviceIndex];
-      uintptr_t dstOffset = (uintptr_t)(void*)&localProgress[rank].stepValue - (uintptr_t)commsBuffer.cpuPointer;
+      // uintptr_t dstOffset = (uintptr_t)(void*)&localProgress[rank].stepValue - (uintptr_t)commsBuffer.cpuPointer;
+      uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].stepValue);
       localProgress[rank].stepValue = stepValue;
       forceSignalNext = true;
       writeData(
@@ -470,7 +472,7 @@ void CpuThread::entry() {
         auto& sendRanks = allGather.sendRanks;
         auto& recvRanks = allGather.recvRanks;
 
-        fmt::printf("cpu thread got all gather (step %d)\n", params.stepValue);
+        // fmt::printf("cpu thread got all gather (step %d)\n", params.stepValue);
 
         auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
         auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
@@ -523,7 +525,7 @@ void CpuThread::entry() {
         //   ++n;
         // }
 
-        fmt::printf("sent dyns\n");
+        // fmt::printf("sent dyns\n");
 
         for (size_t i : sendRanks) {
           while (localProgress[i].stepValue < params.stepValue) {
@@ -534,7 +536,7 @@ void CpuThread::entry() {
           //     "localDyns[i].gatherKey is %#s\n", tostr(&localDyns[i].gatherKey, sizeof(localDyns[i].gatherKey)));
         }
 
-        fmt::printf("got all dyns!\n");
+        // fmt::printf("got all dyns!\n");
 
         auto start = std::chrono::steady_clock::now();
 
@@ -542,10 +544,11 @@ void CpuThread::entry() {
         // size_t maxSize = std::max(params.bytes / 4, (size_t)(1024 * 1024));
         size_t maxSize = params.bytes;
         while (bytesSent < params.bytes) {
-          size_t bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
-          while (bytesReady == bytesSent) {
-            bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
-          }
+          // size_t bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
+          // while (bytesReady == bytesSent) {
+          //   bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
+          // }
+          size_t bytesReady = params.bytes;
           size_t offset = bytesSent;
           size_t n = std::min(bytesReady - bytesSent, maxSize);
 
@@ -559,7 +562,7 @@ void CpuThread::entry() {
                 localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
           }
           poll();
-          fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
+          // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
         }
         CHECK(bytesSent == params.bytes);
 
@@ -573,21 +576,22 @@ void CpuThread::entry() {
           // bytesSentOffset[i] += bytesSent;
         }
 
-        fmt::printf(
-            "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f / 1024.0f);
-        bytesWritten = 0;
+        // fmt::printf(
+        //     "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f /
+        //     1024.0f);
+        // bytesWritten = 0;
 
-        fmt::printf("sent all data!\n");
+        // fmt::printf("sent all data!\n");
 
         for (size_t i : sendRanks) {
           size_t di = (rank + n) % devices.size();
           auto& dev = devices[di];
-          writeStep(di, i, params.stepValue);
+          writeStep(di, i, params.stepValue + 1);
         }
         for (size_t i : recvRanks) {
           size_t di = (rank + n) % devices.size();
           auto& dev = devices[di];
-          while (localProgress[i].stepValue < params.stepValue) {
+          while (localProgress[i].stepValue < params.stepValue + 1) {
             poll();
           }
         }
@@ -616,10 +620,12 @@ void CpuThread::entry() {
 
         // futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size);
 
-        fmt::printf("cpu thread all gather step 1 done!\n");
+        // fmt::printf("cpu thread all gather step 1 done!\n");
 
-        myStepCounter->store(params.stepValue + 1, std::memory_order_relaxed);
-        futexWakeAll(myStepCounter);
+        params.threadStepValue.store(params.stepValue + 1, std::memory_order_relaxed);
+        futexWakeAll(&params.threadStepValue);
+        // myStepCounter->store(params.stepValue + 1, std::memory_order_relaxed);
+        // futexWakeAll(myStepCounter);
 
         // for (size_t i : recvRanks) {
         //   bytesReadyOffset[i] += params.bytes;
@@ -627,9 +633,9 @@ void CpuThread::entry() {
 
         // futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size * 2);
 
-        fmt::printf("cpu thread all gather all done!\n");
+        // fmt::printf("cpu thread all gather all done!\n");
 
-        freelistAllGather.push(&params);
+        // freelistAllGather.push(&params);
       } else if (queueEntry.task == taskTerminate) {
         freelistTerminate.push(&queueEntry);
         break;

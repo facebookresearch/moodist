@@ -42,6 +42,8 @@ struct QueueEntryAllGather : QueueEntry {
 
   // std::atomic_uint32_t cpuOutStepValue = 0;
   // std::atomic_uint32_t cpuInStepValue = 0;
+
+  std::atomic_uint32_t threadStepValue = 0;
 };
 
 struct QueueEntryAllReduce : QueueEntry {

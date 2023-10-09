@@ -207,7 +207,7 @@ def f(n):
                 #dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 14:
+        elif 1 == 11:
             #result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
@@ -278,6 +278,8 @@ def f(n):
         #     # #print("rank %d result %d: %s" % (rank, _, s))
         #     # print("rank %d result %d: %s (should be %f)" % (rank, _, s, data.sum()))
 
+        print("rank %d all done!" % rank)
+        dist.barrier()
         torch.cuda.synchronize()
         t = time.time() - start
         if rank == 0:
@@ -391,7 +393,7 @@ if 1 == 1:
     sys.exit(0)
 
 #for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("nccl",):
+for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

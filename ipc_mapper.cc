@@ -73,7 +73,7 @@ struct Memfd {
 
 struct IpcMapperImpl : IpcMapper {
 
-  struct SharedStruct {
+  struct alignas(64) SharedStruct {
     std::atomic_uint32_t count = 0;
 
     struct Slot {
