@@ -90,7 +90,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-        data = torch.randn(1024 * 1024 * 20).cuda() + 1
+        data = torch.randn(1024 * 1024 * 2).cuda() + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
         # data = torch.randn(128 * 4).cuda() + 1
         if rank == 0:
@@ -234,7 +234,7 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 11:
+        elif 1 == 1:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
 

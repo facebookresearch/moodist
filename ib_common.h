@@ -129,9 +129,8 @@ struct IbCommon {
   IbvPtr<ibv_context, ibv_close_device> context;
   IbvPtr<ibv_pd, ibv_dealloc_pd> protectionDomain;
   IbvCq cq;
-  //IbvQp qp;
-  std::vector<IbvQp> qps;
-  std::vector<ibv_qp_ex*> qpexs;
+  IbvQp qp;
+  ibv_qp_ex* qpex = nullptr;
   std::vector<IbvAh> ahs;
   std::vector<IbAddress> remoteAddresses;
 

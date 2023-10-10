@@ -15,6 +15,7 @@
 #include <libibverbs/verbs.h>
 #include <memory>
 #include <numa.h>
+#include <random>
 #include <utility>
 
 namespace moodist {
@@ -105,7 +106,7 @@ struct Device {
   IbCommon* ib;
   ibv_pd* protectionDomain;
   ibv_cq* cq;
-  std::vector<ibv_qp*> qps;
+  ibv_qp* qp;
   size_t currentCqEntries = 0;
   // std::vector<size_t> currentWr;
   // std::vector<size_t> signaledWr;
@@ -114,6 +115,21 @@ struct Device {
 struct Callback {
   int partsLeft = 0;
   Function<void()> onComplete;
+};
+
+template<typename F>
+struct CallbackWrapper {
+  Callback* callback;
+  F decref;
+  CallbackWrapper(Callback* callback, F decref) : callback(callback), decref(decref) {
+    ++callback->partsLeft;
+  }
+  ~CallbackWrapper() {
+    decref(callback);
+  }
+  operator Callback*() {
+    return callback;
+  }
 };
 
 template<typename T, size_t poolSize = 0x1000>
@@ -173,9 +189,7 @@ void CpuThread::entry() {
       dev.ib = &*v;
       dev.protectionDomain = v->protectionDomain;
       dev.cq = v->cq;
-      for (auto& qp : v->qps) {
-        dev.qps.push_back(&*qp);
-      }
+      dev.qp = v->qp;
     }
 
     const size_t maxWr = IbCommon::maxWr;
@@ -183,6 +197,14 @@ void CpuThread::entry() {
 
     PoolAllocatorReused<Callback, 0x100> callbackAllocator;
     std::vector<Callback*> callbackFreeList;
+
+    auto callbackDecref = [&](Callback* callback) {
+      CHECK(callback->partsLeft >= 1);
+      if (--callback->partsLeft == 0) {
+        std::move(callback->onComplete)();
+        callbackFreeList.push_back(callback);
+      }
+    };
 
     auto makeCallback = [&](Function<void()> f) {
       Callback* callback;
@@ -194,15 +216,8 @@ void CpuThread::entry() {
       }
       CHECK(callback->partsLeft == 0);
       callback->onComplete = std::move(f);
-      return callback;
-    };
-
-    auto callbackDecref = [&](Callback* callback) {
-      CHECK(callback->partsLeft >= 1);
-      if (--callback->partsLeft == 0) {
-        std::move(callback->onComplete)();
-        callbackFreeList.push_back(callback);
-      }
+      // return callback;
+      return CallbackWrapper(callback, callbackDecref);
     };
 
     auto poll = [&]() {
@@ -306,11 +321,11 @@ void CpuThread::entry() {
 
         preSend(dev, i, wr);
 
-        ibv_qp_ex* qp = dev.ib->qpexs.at(i);
+        ibv_qp_ex* qp = dev.ib->qpex;
 
-        fmt::printf(
-            "%d: rdma write %d bytes (%p -> %p) (dev %d, i %d)\n", rank, bytes, localAddress, remoteAddress,
-            &dev - devices.data(), i);
+        // fmt::printf(
+        //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
+        //     remoteAddress, rkey, &dev - devices.data(), i);
 
         wr.wr_id = (uint64_t)(void*)callback;
 
@@ -326,6 +341,19 @@ void CpuThread::entry() {
           std::fflush(stderr);
           CHECK(false);
         }
+
+        // while (true) {
+        //   bool stop = true;
+        //   for (auto& dev : devices) {
+        //     while (dev.currentCqEntries) {
+        //       poll();
+        //       stop = false;
+        //     }
+        //   }
+        //   if (stop) {
+        //     break;
+        //   }
+        // }
       };
 
       if (bytes >= 1024ull * 1024 * 896) {
@@ -381,8 +409,14 @@ void CpuThread::entry() {
       unsigned long long bufferId = -1;
       CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
       CHECK(bufferId != -1);
+      unsigned long long bufferId2 = -1;
+      CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + bytes - 1));
+      CHECK(bufferId == bufferId2);
       auto i = mrMapCuda.find(bufferId);
       if (i != mrMapCuda.end()) {
+        CHECK(
+            (uintptr_t)(*i->second).mrs[0]->addr <= address &&
+            (uintptr_t)(*i->second).mrs[0]->addr + (*i->second).mrs[0]->length >= address + bytes);
         return &*i->second;
       }
       auto ptr = std::make_unique<MemoryRegion>();
@@ -470,6 +504,50 @@ void CpuThread::entry() {
     volatile uint32_t* cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
     volatile uint32_t* cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
 
+    fmt::printf("rank %d starting test!\n", rank);
+
+    AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
+    auto* testMr = regMr((uintptr_t)testBuffer.cpuPointer, testBuffer.bytes);
+    auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cpuPointer, testMr);
+    uint64_t* testPtr = (uint64_t*)testBuffer.cpuPointer;
+    std::mt19937_64 rng;
+    rng.seed(rank);
+    for (size_t i = 0; i != 512; ++i) {
+      testPtr[512 * rank + i] = rng();
+    }
+    size_t remaining = 0;
+    for (size_t i = 0; i != size; ++i) {
+      if (i == rank) {
+        continue;
+      }
+      size_t offset = 512 * rank;
+      for (size_t di = 0; di != devices.size(); ++di) {
+        auto& dev = devices[di];
+        size_t n = 512 / devices.size();
+        ++remaining;
+        writeData(
+            dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
+            testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+        offset += n;
+      }
+    }
+    while (remaining) {
+      poll();
+    }
+    setupComms->allgather(0);
+    for (size_t i = 0; i != size; ++i) {
+      rng.seed(i);
+      for (size_t j = 0; j != 512; ++j) {
+        uint64_t v = rng();
+        if (testPtr[512 * i + j] != v) {
+          fmt::printf("i %d j %d expected %#x, but got %#x\n", i, j, v, testPtr[512 * i + j]);
+        }
+        CHECK(testPtr[512 * i + j] == v);
+      }
+    }
+
+    fmt::printf("rank %d test done!\n", rank);
+
     std::vector<uint32_t> dynReady;
 
     while (true) {
@@ -504,7 +582,11 @@ void CpuThread::entry() {
         auto& sendRanks = allGather.sendRanks;
         auto& recvRanks = allGather.recvRanks;
 
-        // fmt::printf("cpu thread got all gather (step %#x)\n", stepValue);
+        // fmt::printf("rank %d cpu thread got all gather (step %#x)\n", rank, stepValue);
+
+        // fmt::printf(
+        //     "rank %d inputAddress %#x outputAddress %#x bytes %d\n", rank, params.inputAddress, params.outputAddress,
+        //     params.bytes);
 
         auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
         auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
@@ -561,52 +643,46 @@ void CpuThread::entry() {
           while (localProgress[i].stepValue < stepValue) {
             poll();
           }
-          size_t bytesSent = 0;
+          size_t offset = 0;
           size_t liveSends = 0;
           size_t liveStepValues = 0;
           size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
-          size_t chunkIndex = 0;
-          while (bytesSent < params.bytes) {
-            CHECK(chunkIndex < Group::dataChunks);
-            size_t offset = bytesSent;
-            size_t nbytes = std::min(params.bytes - bytesSent, chunkSize);
+          for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
+            size_t nbytes = std::min(params.bytes - offset, chunkSize);
 
             if (nbytes > 0) {
               uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
 
-              bytesSent += nbytes;
               ++liveSends;
               writeDataDistributed(
                   i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
-                  localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() {
-                    --liveSends;
-                    while (liveStepValues) {
-                      poll();
-                    }
-                    // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
-                    for (size_t di = 0; di != devices.size(); ++di) {
-                      Device& dev = devices[di];
-                      ++liveStepValues;
-                      writeData(
-                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
-                          makeCallback([&]() { --liveStepValues; }));
-                    }
-
-                    CHECK(localProgress[rank].stepValue == stepValue);
-                  }));
+                  localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+              offset += nbytes;
             }
-            ++chunkIndex;
             while (liveSends) {
               poll();
+            }
+            while (liveStepValues) {
+              poll();
+            }
+            // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
+            for (size_t di = 0; di != devices.size(); ++di) {
+              Device& dev = devices[di];
+              ++liveStepValues;
+              writeData(
+                  dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                  (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                  remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+                  makeCallback([&]() { --liveStepValues; }));
             }
           }
           while (liveStepValues) {
             poll();
           }
           // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
-          CHECK(bytesSent == params.bytes);
+          CHECK(offset == params.bytes);
+          CHECK(liveSends == 0);
+          CHECK(liveStepValues == 0);
         }
 
         //   0, 0 -> 1, 0 -> 1, 1
@@ -638,7 +714,7 @@ void CpuThread::entry() {
         //     1024.0f);
         // bytesWritten = 0;
 
-        // fmt::printf("cpu thread all gather all done! %d\n", stepValue);
+        // fmt::printf("rank %d cpu thread all gather all done! (step %#x)\n", rank, stepValue);
 
         cpuOut[0] = stepValue;
         while (cpuIn[0] < stepValue + 1) {

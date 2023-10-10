@@ -89,7 +89,7 @@ struct IpcMapperImpl : IpcMapper {
   IpcMapperImpl(Group* group) {
     this->group = group;
 
-    memsize = 4096 * 16 + 512 * group->size;
+    memsize = 4096 * 16 + 1024 * group->size;
   }
   virtual ~IpcMapperImpl() override {
     if (thread.joinable()) {
