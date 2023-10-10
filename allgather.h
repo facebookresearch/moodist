@@ -35,11 +35,6 @@ struct AllGather : CollectiveBase {
   std::vector<ProxyDestinationInfo> proxyDestinationInfo;
 
   // AllocatedBuffer commsBuffer;
-  AllocatedBuffer cudaStepValue;
-  std::array<uintptr_t, 8> peerCudaStepValue;
-
-  AllocatedBuffer cudaCopyDone;
-  std::array<uintptr_t, 8> peerCudaCopyDone;
 
   int computeMajor = 0;
   int computeMinor = 0;
@@ -49,6 +44,8 @@ struct AllGather : CollectiveBase {
   CUfunction cuAllgatherExit = nullptr;
   std::array<CUfunction, 8> cuAllgatherCopyDone{};
   CUfunction cuAllgatherCopyAllDone = nullptr;
+  CUfunction cuAllgatherForwardProxies = nullptr;
+  std::vector<CUfunction> cuAllgatherWaitForProxy{};
 
   // std::vector<std::vector<std::pair<size_t, size_t>>> peerProxies;
   // std::vector<std::pair<size_t, size_t>> ipcProxies;

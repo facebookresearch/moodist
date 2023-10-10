@@ -138,7 +138,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True and False:
+            if True:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -148,19 +148,20 @@ def f(n):
                         print("%d: data.data_ptr() is %#x" % (rank, data.data_ptr()))
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         print("%d: should be %f" % (rank, v.sum()))
+                        indices = ((result[i] - v).abs() >= 1e-3).nonzero(as_tuple=True)[0]
                         print(
                             "%d: indices " % rank,
-                            ((result[i] - v).abs() >= 1e-3).nonzero(as_tuple=True)[0],
+                            indices,
                         )
-                        print(result[i])
-                        print(v)
+                        print(result[i][indices])
+                        print(v[indices])
                         print(
                             "allclose 1 ",
                             torch.allclose(result[i], v, 1e-3, 1e-2),
                             torch.allclose(result[i], v, 1e-3, 1e-2),
                             torch.allclose(result[i], v, 1e-3, 1e-2),
                         )
-                        # time.sleep(4)
+                        time.sleep(1)
                         print(
                             "allclose 2 ",
                             torch.allclose(result[i], v, 1e-3, 1e-2),
@@ -231,7 +232,7 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 11:
+        elif 1 == 1:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
 

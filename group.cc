@@ -527,12 +527,46 @@ void Group::init() {
 
   ipcMapper->getMySharedMem(0, offset);
 
-  cudaStepDoneBuffer = allocateDevice(size * 8);
-  cpuStepDoneBuffer = allocateHost(size * 8);
+  // cudaStepDoneBuffer = allocateDevice(size * 8);
+  // cpuStepDoneBuffer = allocateHost(size * 8);
 
   cpuOutBuffer = allocateManaged(4096 + 16 * size);
   CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
   cpuInBuffer = allocateHost(4096 + 16 * size);
+
+  auto mapPeerAddrs = [&](AllocatedBuffer& localBuffer, std::array<uintptr_t, 8>& peerPtrs) {
+    peerPtrs.fill(0);
+
+    std::array<uintptr_t, 8> peerMapping;
+
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(
+          i, localBuffer.cudaPointer, localBuffer.bytes, [&, i](uintptr_t address) { peerMapping[i] = address; });
+    }
+    ipcMapper->wait();
+    for (size_t i : peerIndices) {
+      setupComms->sendTo(ipcRanks[i], std::tuple(rank, i, peerMapping[i]));
+    }
+    for (size_t i : peerIndices) {
+      auto [sourceRank, sourcePeerIndex, address] =
+          setupComms->recvFrom<std::tuple<size_t, size_t, uintptr_t>>(ipcRanks[i]);
+      CHECK(sourceRank == ipcRanks[i]);
+      CHECK(sourcePeerIndex == peerMyRemoteIndex[i]);
+      peerPtrs[i] = address;
+    }
+    setupComms->allgather(0);
+  };
+
+  cudaStepValue = allocateDevice(sizeof(uint64_t) * size);
+  mapPeerAddrs(cudaStepValue, peerCudaStepValue);
+
+  cudaCommsDeviceDataSent = allocateDevice(sizeof(uint32_t) * size * 32);
+
+  cudaProxyReady = allocateDevice(sizeof(uint32_t) * size);
+  mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
+
+  cudaCopyDone = allocateDevice(sizeof(uint64_t) * 8);
+  mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
 
   allGather->init();
 

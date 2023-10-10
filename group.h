@@ -38,11 +38,22 @@ struct Group {
   std::unique_ptr<CpuThread> cpuThread;
 
   // AllocatedBuffer temporaryBuffer;
-  AllocatedBuffer cudaStepDoneBuffer;
-  AllocatedBuffer cpuStepDoneBuffer;
+  // AllocatedBuffer cudaStepDoneBuffer;
+  // AllocatedBuffer cpuStepDoneBuffer;
 
   AllocatedBuffer cpuOutBuffer;
   AllocatedBuffer cpuInBuffer;
+
+  AllocatedBuffer cudaStepValue;
+  std::array<uintptr_t, 8> peerCudaStepValue;
+
+  AllocatedBuffer cudaCommsDeviceDataSent;
+
+  AllocatedBuffer cudaProxyReady;
+  std::array<uintptr_t, 8> peerCudaProxyReady;
+
+  AllocatedBuffer cudaCopyDone;
+  std::array<uintptr_t, 8> peerCudaCopyDone;
 
   // AllocatedBuffer peerInBuffer;
   // std::array<uintptr_t, 8> peerOut;
@@ -57,7 +68,7 @@ struct Group {
 
   int allocationNode = -1;
 
-  //AllocatedBuffer commsBuffer;
+  // AllocatedBuffer commsBuffer;
   void* mySharedMem = nullptr;
   size_t mySharedMemSize = 0;
   std::array<void*, 8> peerSharedMem;
