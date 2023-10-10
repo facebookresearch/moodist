@@ -153,17 +153,11 @@ void CpuThread::entry() {
 
     async::setCurrentThreadName("moodist-cputhread");
 
-    // CHECK_CU(cuCtxSetCurrent(group->cuContext));
-
-    // CpuProcess& process = *group->cpuprocess;
-
     if (group->allocationNode != -1) {
       numa_run_on_node(group->allocationNode);
     }
 
     CUcontext cuCtx;
-    // cuCtxCreate(&cuCtx, 0, group->cuDevice);
-    // CHECK_CU(cuCtxSetCurrent(cuCtx));
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
 
     CUstream stream;
@@ -182,15 +176,7 @@ void CpuThread::entry() {
       for (auto& qp : v->qps) {
         dev.qps.push_back(&*qp);
       }
-      // dev.currentWr.resize(size);
-      // dev.signaledWr.resize(size);
     }
-
-    // ibv_pd* protectionDomain = ib->protectionDomain;
-    // ibv_cq* cq = ib->cq;
-    // ibv_qp* qp = ib->qp;
-
-    // fmt::printf("rank %d got all syncs\n", rank);
 
     const size_t maxWr = IbCommon::maxWr;
     const size_t maxCqEntries = IbCommon::maxCqEntries;
@@ -240,14 +226,6 @@ void CpuThread::entry() {
             std::fflush(stderr);
             CHECK(false);
           } else {
-            // size_t index = wc.wr_id / maxWr;
-            // size_t wrCount = wc.wr_id % maxWr;
-            // fflush(stdout);
-            // CHECK(dev.currentWr[index] >= wrCount);
-            // CHECK(dev.signaledWr[index] >= wrCount);
-            // dev.currentWr[index] -= wrCount;
-            // dev.signaledWr[index] -= wrCount;
-            // CHECK(dev.currentCqEntries > 0);
             --dev.currentCqEntries;
 
             if (wc.wr_id) {
@@ -284,27 +262,10 @@ void CpuThread::entry() {
     // #define poll() debugPoll(__LINE__)
 
     auto preSend = [&](Device& dev, size_t index, auto& wr) {
-      // while (dev.currentWr[index] == maxWr || dev.currentCqEntries == maxCqEntries) {
       while (dev.currentCqEntries == maxCqEntries) {
         poll();
       }
       ++dev.currentCqEntries;
-      // size_t n = ++dev.currentWr[index];
-      // wr.wr_id = index * maxWr;
-      // if (n == (maxWr + 1) / 2 - 1) {
-      //   wr.send_flags |= IBV_SEND_SIGNALED;
-      // }
-      // if (wr.send_flags & IBV_SEND_SIGNALED) {
-      //   n -= dev.signaledWr[index];
-      //   wr.wr_id += n;
-      //   dev.signaledWr[index] += n;
-      //   ++dev.currentCqEntries;
-
-      //   // fmt::printf(
-      //   //     "%p (size %d) :: preSend n %d currentWr[%d] %d, signaledWr[%d] %d, currentCqEntries %d\n",
-      //   (void*)this,
-      //   //     group->size, n, index, currentWr[index], index, signaledWr[index], currentCqEntries);
-      // }
     };
 
     size_t bytesWritten = 0;
@@ -347,9 +308,9 @@ void CpuThread::entry() {
 
         ibv_qp_ex* qp = dev.ib->qpexs.at(i);
 
-        // fmt::printf(
-        //     "rdma write %d bytes (%p -> %p) (dev %d, i %d)\n", bytes, localAddress, remoteAddress,
-        //     &dev - devices.data(), i);
+        fmt::printf(
+            "%d: rdma write %d bytes (%p -> %p) (dev %d, i %d)\n", rank, bytes, localAddress, remoteAddress,
+            &dev - devices.data(), i);
 
         wr.wr_id = (uint64_t)(void*)callback;
 
@@ -357,9 +318,6 @@ void CpuThread::entry() {
         qp->wr_id = wr.wr_id;
         qp->wr_flags = wr.send_flags;
         ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-        // if (wr.send_flags & IBV_SEND_INLINE) {
-        //   ibv_wr_set_inline_data(qp, localAddress, bytes);
-        // }
         ibv_wr_set_sge_list(qp, 1, &sge);
         ibv_wr_set_ud_addr(qp, dev.ib->ahs.at(i), dev.ib->remoteAddresses.at(i).qpNum, 0x4242);
         int error = ibv_wr_complete(qp);
@@ -368,23 +326,6 @@ void CpuThread::entry() {
           std::fflush(stderr);
           CHECK(false);
         }
-
-        // fmt::printf(
-        //     "%p (size %d) :: rank %d -> %d (signal %d) write %sdata of %#x bytes from local %#x (lkey %#x) to remote
-        //     "
-        //     "%#x (rkey %#x)\n",
-        //     (void*)this, group->size, rank, i, (wr.send_flags & IBV_SEND_SIGNALED) ? 1 : 0,
-        //     wr.send_flags & IBV_SEND_INLINE ? "INLINE " : "", sge.length, sge.addr, sge.lkey, wr.wr.rdma.remote_addr,
-        //     wr.wr.rdma.rkey);
-
-        // preSend(dev, i, wr);
-        // ibv_send_wr* bad = nullptr;
-        // int error = ibv_post_send(dev.qps[i], &wr, &bad);
-        // if (error) {
-        //   fmt::fprintf(stderr, "ibv_post_send failed with error %d: %s\n", error, std::strerror(error));
-        //   std::fflush(stderr);
-        //   CHECK(false);
-        // }
       };
 
       if (bytes >= 1024ull * 1024 * 896) {
@@ -406,8 +347,6 @@ void CpuThread::entry() {
         post();
       }
     };
-
-    // std::atomic_uint32_t* myStepCounter = (std::atomic_uint32_t*)group->ipcMapper->getMySharedMem(0x100, 4);
 
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMap;
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMapCuda;
@@ -497,8 +436,12 @@ void CpuThread::entry() {
     auto remoteCudaCommsDeviceDataSent =
         distributeAddressAndKeys(group->cudaCommsDeviceDataSent.cudaPointer, cudaCommsDeviceDataSentMr);
 
+    AllocatedBuffer sendStepValuesStorage = group->allocateHost(sizeof(uint32_t) * Group::dataChunks);
+    auto* sendStepValuesStorageMr = regMr((uintptr_t)sendStepValuesStorage.cpuPointer, sendStepValuesStorage.bytes);
+    uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.cpuPointer;
+
     auto writeDataDistributed = [&](size_t dst, uintptr_t srcAddr, size_t len, MemoryRegion* mr, uint64_t dstAddr,
-                                    const std::array<uint32_t, 32>& key, size_t bytesReady, Callback* callback) {
+                                    const std::array<uint32_t, 32>& key, Callback* callback) {
       CHECK(len > 0);
       size_t offset = 0;
       const size_t chunks = devices.size();
@@ -511,25 +454,17 @@ void CpuThread::entry() {
               dev, dst, (void*)(srcAddr + offset), mr->mrs[i]->lkey, (void*)(dstAddr + offset), key[i], n, callback);
         }
         offset += n;
-        // uintptr_t dstOffset = (uintptr_t)(void*)&localProgress[rank].bytesReady[i] -
-        // (uintptr_t)commsBuffer.cpuPointer; injectWriteFenced(
-        //     dev.ep, (uintptr_t)&bytesReady, sizeof(bytesReady), dev.peerAddresses[dst], peerCommsAddrs[dst] +
-        //     dstOffset, peerCommsKeys[dst][i]);
       }
     };
 
     auto writeStep = [&](size_t deviceIndex, size_t dst, uint32_t stepValue) {
       Device& dev = devices[deviceIndex];
-      // uintptr_t dstOffset = (uintptr_t)(void*)&localProgress[rank].stepValue - (uintptr_t)commsBuffer.cpuPointer;
       uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].stepValue);
       localProgress[rank].stepValue = stepValue;
       forceSignalNext = true;
       writeData(
           dev, dst, &localProgress[rank].stepValue, commsMr->mrs.at(deviceIndex)->lkey,
           (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
-      // writeData(
-      //     dev, dst, &stepValue, 0, (void*)(peerCommsAddrs[dst] + dstOffset), peerCommsKeys[dst][deviceIndex],
-      //     sizeof(stepValue));
     };
 
     volatile uint32_t* cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
@@ -539,9 +474,6 @@ void CpuThread::entry() {
 
     while (true) {
 
-      // if (op.queueSize != 0) {
-      //   fmt::printf("another op queued immediately!\n");
-      // }
       while (queueSize == 0) {
         poll();
         int sum = 0;
@@ -620,53 +552,62 @@ void CpuThread::entry() {
 
         auto start = std::chrono::steady_clock::now();
 
-        localProgress[rank].stepValue = stepValue;
+        for (size_t i = 0; i != Group::dataChunks; ++i) {
+          sendStepValues[i] = stepValue + i;
+        }
 
-        size_t liveSends = 0;
-        size_t bytesSent = 0;
-        // size_t maxSize = std::max(params.bytes / 4, (size_t)(1024 * 1024));
-        size_t maxSize = params.bytes;
-        while (bytesSent < params.bytes) {
-          // size_t bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
-          // while (bytesReady == bytesSent) {
-          //   bytesReady = params.inputBytesReady.load(std::memory_order_relaxed);
-          // }
-          size_t bytesReady = params.bytes;
-          size_t offset = bytesSent;
-          size_t n = std::min(bytesReady - bytesSent, maxSize);
+        for (size_t i : sendRanks) {
+          // wait for dyns
+          while (localProgress[i].stepValue < stepValue) {
+            poll();
+          }
+          size_t bytesSent = 0;
+          size_t liveSends = 0;
+          size_t liveStepValues = 0;
+          size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
+          size_t chunkIndex = 0;
+          while (bytesSent < params.bytes) {
+            CHECK(chunkIndex < Group::dataChunks);
+            size_t offset = bytesSent;
+            size_t nbytes = std::min(params.bytes - bytesSent, chunkSize);
 
-          uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
+            if (nbytes > 0) {
+              uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
 
-          bytesSent += n;
+              bytesSent += nbytes;
+              ++liveSends;
+              writeDataDistributed(
+                  i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+                  localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() {
+                    --liveSends;
+                    while (liveStepValues) {
+                      poll();
+                    }
+                    // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
+                    for (size_t di = 0; di != devices.size(); ++di) {
+                      Device& dev = devices[di];
+                      ++liveStepValues;
+                      writeData(
+                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+                          makeCallback([&]() { --liveStepValues; }));
+                    }
 
-          for (size_t i : sendRanks) {
-            while (localProgress[i].stepValue < stepValue) {
-              poll();
+                    CHECK(localProgress[rank].stepValue == stepValue);
+                  }));
             }
-            ++liveSends;
-            writeDataDistributed(
-                i, srcAddr, n, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
-                localDyns[i].gatherKey, bytesSent, makeCallback([&, i, stepValue]() {
-                  --liveSends;
-                  // fmt::printf("%d: stepValue %#x sent to %d\n", rank, stepValue, i);
-                  for (size_t di = 0; di != devices.size(); ++di) {
-                    Device& dev = devices[di];
-                    writeData(
-                        dev, i, &localProgress[rank].stepValue, commsMr->mrs.at(di)->lkey,
-                        (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                        remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-                  }
-
-                  CHECK(localProgress[rank].stepValue == stepValue);
-                }));
+            ++chunkIndex;
             while (liveSends) {
               poll();
             }
           }
-          poll();
+          while (liveStepValues) {
+            poll();
+          }
           // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
+          CHECK(bytesSent == params.bytes);
         }
-        CHECK(bytesSent == params.bytes);
 
         //   0, 0 -> 1, 0 -> 1, 1
         //   0, 0 -> 2, 0 -> 2, 1
@@ -691,66 +632,11 @@ void CpuThread::entry() {
         for (auto& dev : devices) {
           CHECK(dev.currentCqEntries == 0);
         }
-        for (size_t i : sendRanks) {
-          // writeData(i, 0, 0, inputMr, 0, localDyns[i].gatherKey, bytesSentOffset[i] + bytesSent);
-          // bytesSentOffset[i] += bytesSent;
-        }
 
         // fmt::printf(
-        //     "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f / 1024.0f);
-        bytesWritten = 0;
-
-        // fmt::printf("sent all data!\n");
-
-        // for (size_t i : sendRanks) {
-        //   size_t di = (rank + n) % devices.size();
-        //   auto& dev = devices[di];
-        //   writeStep(di, i, stepValue + 1);
-        // }
-        // for (size_t i : recvRanks) {
-        //   size_t di = (rank + n) % devices.size();
-        //   auto& dev = devices[di];
-        //   while (localProgress[i].stepValue < stepValue + 1) {
-        //     poll();
-        //   }
-        // }
-
-        // while (true) {
-        //   poll();
-        //   bool done = true;
-        //   for (size_t i : recvRanks) {
-        //     for (size_t di = 0; di != devices.size(); ++di) {
-        //       // size_t bytesReceived = localProgress[i].bytesReady[di] - bytesReadyOffset[i];
-        //       // if (bytesReceived > params.bytes) {
-        //       //   fmt::printf("localProgress[%d].bytesReady[%d] is %d\n", i, di, localProgress[i].bytesReady[di]);
-        //       //   fmt::printf("bytesReadyOffset[%d] is %d\n", i, bytesReadyOffset[i]);
-        //       // }
-        //       // CHECK(bytesReceived <= params.bytes);
-        //       // // fmt::printf("[%d, %d] received %d/%d\n", i, di, bytesReceived, params.bytes);
-        //       // if (bytesReceived < params.bytes) {
-        //       //   done = false;
-        //       // }
-        //     }
-        //   }
-        //   if (done) {
-        //     break;
-        //   }
-        // }
-
-        // futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size);
-
-        // fmt::printf("cpu thread all gather step 1 done!\n");
-
-        // params.threadStepValue.store(stepValue + 1, std::memory_order_relaxed);
-        // futexWakeAll(&params.threadStepValue);
-        // myStepCounter->store(stepValue + 1, std::memory_order_relaxed);
-        // futexWakeAll(myStepCounter);
-
-        // for (size_t i : recvRanks) {
-        //   bytesReadyOffset[i] += params.bytes;
-        // }
-
-        // futexWaitWhileLess(myStepCounter, queueEntry.stepValue + size * 2);
+        //     "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f /
+        //     1024.0f);
+        // bytesWritten = 0;
 
         // fmt::printf("cpu thread all gather all done! %d\n", stepValue);
 

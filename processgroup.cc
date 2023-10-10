@@ -385,10 +385,19 @@ struct ProcessGroupImpl {
       size_t i = v.proxyPeerIndex;
       size_t source = v.source;
       auto stream = group->stream;
-      CHECK_CU(cuLaunchKernel(
-          allGather.cuAllgatherWaitForProxy.at(n), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
       auto& peerAddrs = *group->peerAddrs;
-      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * source, peerAddrs[i].second + bytes * source, bytes, stream));
+      size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
+      size_t offset = 0;
+      for (size_t c = 0; c != Group::dataChunks; ++c) {
+        size_t nbytes = std::min(bytes - offset, chunkSize);
+        if (nbytes > 0) {
+          CHECK_CU(cuLaunchKernel(
+              allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+          CHECK_CU(cuMemcpyDtoDAsync(
+              outputAddress + bytes * source + offset, peerAddrs[i].second + bytes * source + offset, nbytes, stream));
+        }
+        offset += nbytes;
+      }
     }
 
     // if (!allGather.proxyInfo.empty()) {

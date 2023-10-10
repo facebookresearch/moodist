@@ -299,51 +299,44 @@ extern "C" __global__ void allgather_copy_done_$i(uint32_t stepValue) {
         "$i", i, "$ptr", cudaCopyDone.cudaPointer + sizeof(uint32_t) * i);
   }
 
-  auto waitForRecv = [&](size_t i) {
+  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
     std::string s;
-    s = replace("// wait for recv from $i\n", "$i", i);
+    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
+      s += waitFor32(
+          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
+          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
     }
     return s;
   };
 
   std::string waitForRecvs;
   for (size_t i : recvRanks) {
-    waitForRecvs += waitForRecv(i);
+    waitForRecvs += waitForRecv(i, Group::dataChunks - 1);
   }
 
-  std::string forwardProxiesCode;
   std::string waitForProxyFunctions;
-  for (auto& v : proxyInfo) {
-    forwardProxiesCode += waitForRecv(v.source);
-    forwardProxiesCode += replace(
-        R"(
-          // forward source $source destination $destination (peer index $destinationPeerIndex)
-      *(volatile uint32_t*)$ptr = stepValue;
-    )",
-        "$ptr", peerCudaProxyReady[v.destinationPeerIndex] + sizeof(uint32_t) * v.source, "$source", v.source,
-        "$destination", v.destination, "$destinationPeerIndex", v.destinationPeerIndex);
-  }
   CHECK(proxyInfo.size() == proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     auto& pi = proxyInfo[i];
     auto& pdi = proxyDestinationInfo[i];
-    waitForProxyFunctions += replace(
-        R"(
-extern "C" __global__ void allgather_wait_for_proxy_$i(uint32_t stepValue) {
-  $wait
-  // forward source $forwardSource destination $forwardDestination (peer index $forwardDestinationPeerIndex)
-  *(volatile uint32_t*)$forwardPtr = stepValue;
-  // wait for ready source $proxySource proxy $proxyProxy (peer index $proxyProxyPeerIndex)
-  while (*(volatile uint32_t*)$readyPtr < stepValue);
-}
-    )",
-        "$i", i, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$wait",
-        waitForRecv(pi.source), "$forwardPtr",
-        peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$proxySource", pdi.source,
-        "$proxyProxy", pdi.proxy, "$proxyProxyPeerIndex", pdi.proxyPeerIndex, "$forwardSource", pi.source,
-        "$forwardDestination", pi.destination, "$forwardDestinationPeerIndex", pi.destinationPeerIndex);
+    for (size_t c = 0; c != Group::dataChunks; ++c) {
+      waitForProxyFunctions += replace(
+          R"(
+  extern "C" __global__ void allgather_wait_for_proxy_$i_$c(uint32_t stepValue) {
+    $wait
+    // forward source $forwardSource destination $forwardDestination (peer index $forwardDestinationPeerIndex)
+    *(volatile uint32_t*)$forwardPtr = stepValue + $c;
+    // wait for ready source $proxySource proxy $proxyProxy (peer index $proxyProxyPeerIndex)
+    while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+  }
+      )",
+          "$i", i, "$c", c, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$wait",
+          waitForRecv(pi.source, c), "$forwardPtr",
+          peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$proxySource", pdi.source,
+          "$proxyProxy", pdi.proxy, "$proxyProxyPeerIndex", pdi.proxyPeerIndex, "$forwardSource", pi.source,
+          "$forwardDestination", pi.destination, "$forwardDestinationPeerIndex", pi.destinationPeerIndex);
+    }
   }
 
   std::string source = replace(
@@ -378,17 +371,13 @@ extern "C" __global__ void allgather_copy_all_done(uint32_t stepValue) {
   $copyDoneAllCode
 }
 
-extern "C" __global__ void allgather_forward_proxies(uint32_t stepValue) {
-  $forwardProxiesCode
-}
-
 $waitForProxyFunctions
 
   )zz",
       "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",
       cast("volatile uint32_t*", cpuInBuffer.cudaPointer), "$writes", writes, "$waits", waits, "$copyDoneFunctions",
       copyDoneFunctions, "$waitForCopyDones", waitForCopyDones, "$waitForRecvs", waitForRecvs, "$copyDoneAllCode",
-      copyDoneAllCode, "$forwardProxiesCode", forwardProxiesCode, "$waitForProxyFunctions", waitForProxyFunctions);
+      copyDoneAllCode, "$waitForProxyFunctions", waitForProxyFunctions);
 
   source = replace(source, "$rank", rank);
 
@@ -507,11 +496,14 @@ $waitForProxyFunctions
         cuModuleGetFunction(&cuAllgatherCopyDone[i], cuModule, replace("allgather_copy_done_$i", "$i", i).c_str()));
   }
   CHECK_CU(cuModuleGetFunction(&cuAllgatherCopyAllDone, cuModule, "allgather_copy_all_done"));
-  CHECK_CU(cuModuleGetFunction(&cuAllgatherForwardProxies, cuModule, "allgather_forward_proxies"));
   cuAllgatherWaitForProxy.resize(proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-    CHECK_CU(cuModuleGetFunction(
-        &cuAllgatherWaitForProxy[i], cuModule, replace("allgather_wait_for_proxy_$i", "$i", i).c_str()));
+    cuAllgatherWaitForProxy[i].resize(Group::dataChunks);
+    for (size_t c = 0; c != Group::dataChunks; ++c) {
+      CHECK_CU(cuModuleGetFunction(
+          &cuAllgatherWaitForProxy[i][c], cuModule,
+          replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c).c_str()));
+    }
   }
 
   // for (size_t i = 0; i != ipcRanks.size(); ++i) {

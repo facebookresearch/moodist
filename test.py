@@ -127,7 +127,7 @@ def f(n):
 
         # result = torch.stack(result)
 
-        for _ in range(100):
+        for _ in range(10):
             # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
@@ -138,7 +138,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if False:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -173,6 +173,8 @@ def f(n):
             torch.cuda.synchronize()
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
+
+        print("rank %d warmup done" % (rank))
 
         warmup_result = [t.clone() for t in result]
         dist.barrier()
@@ -232,7 +234,7 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 11:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
 
