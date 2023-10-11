@@ -168,6 +168,8 @@ struct ProcessGroupImpl {
 
   void init(std::string rank0Address) {
 
+    fmt::printf("%d: init\n", rank);
+
     std::unique_lock l(mutex);
 
     if (rank != 0) {
@@ -200,11 +202,11 @@ struct ProcessGroupImpl {
       }
     }
 
-    fmt::printf("Waiting for setupComms\n");
+    fmt::printf("%d: Waiting for setupComms\n", rank);
     std::fflush(stdout);
     group->setupComms->waitForConnections();
 
-    fmt::printf("Waiting for connections\n");
+    fmt::printf("%d: Waiting for connections\n", rank);
     std::fflush(stdout);
     for (size_t i = 0; i != size; ++i) {
       if (i == rank) {
@@ -317,7 +319,7 @@ struct ProcessGroupImpl {
           i, e->inputAddress, bytes, [ptr = &e->peerInputAddresses[i]](uintptr_t address) { *ptr = address; });
 
       ipcMapper->requestAddress(
-          i, e->outputAddress, bytes, [ptr = &e->peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
+          i, e->outputAddress, outputBytes, [ptr = &e->peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
     }
 
     ipcMapper->wait();
@@ -347,10 +349,14 @@ struct ProcessGroupImpl {
     group->cpuThread->enqueue(e);
 
     for (size_t i : peerIndices) {
-      (*group->getPeerVar(i, group->peerAddrs))[group->peerMyRemoteIndex[i]] = {
-          e->peerInputAddresses[i], e->peerOutputAddresses[i]};
+      AddressPair ad;
+      ad.inputAddress = e->peerInputAddresses[i];
+      ad.inputBytes = bytes;
+      ad.outputAddress = e->peerOutputAddresses[i];
+      ad.outputBytes = outputBytes;
+      (*group->getPeerVar(i, group->peerAddrs))[group->peerMyRemoteIndex[i]] = ad;
     }
-    group->myStepCounter->store(stepValue, std::memory_order_relaxed);
+    group->myStepCounter->store(stepValue);
     futexWakeAll(group->myStepCounter);
 
     std::array<void*, 1> params = {&stepValue};
@@ -366,10 +372,12 @@ struct ProcessGroupImpl {
 
       futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
       auto& peerAddrs = *group->peerAddrs;
-      CHECK(peerAddrs[i].first && peerAddrs[i].second);
+      CHECK(peerAddrs[i].inputAddress && peerAddrs[i].outputAddress);
+      CHECK(peerAddrs[i].inputBytes == bytes);
+      CHECK(peerAddrs[i].outputBytes == outputBytes);
 
       CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].first, bytes, stream));
+      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes, stream));
     }
     // if (!allGather.proxyInfo.empty()) {
     //   // We run this on another stream in the hope that it will run side-by-side with the proxy wait below.
@@ -392,12 +400,31 @@ struct ProcessGroupImpl {
         size_t nbytes = std::min(bytes - offset, chunkSize);
         if (nbytes > 0) {
           CHECK_CU(cuLaunchKernel(
-              allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
-          CHECK_CU(cuMemcpyDtoDAsync(
-              outputAddress + bytes * source + offset, peerAddrs[i].second + bytes * source + offset, nbytes, stream));
+              allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+              nullptr));
+          CHECK(bytes * source + offset + nbytes <= outputBytes);
+          auto e = cuMemcpyDtoDAsync(
+              outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset, nbytes,
+              stream);
+          if (e != CUDA_SUCCESS) {
+            fmt::printf(
+                "memcpy failed. i %d source %d c %d offset %#x nbytes %#x outputAddress %#x peerAddrs[i].outputAddress "
+                "%#x\n",
+                i, source, c, offset, nbytes, outputAddress, peerAddrs[i].outputAddress);
+            CHECK_CU(e);
+          }
+          // CHECK_CU(cuMemcpyDtoDAsync(
+          //     outputAddress + bytes * source + offset, peerAddrs[i].second + bytes * source + offset, nbytes,
+          //     stream));
         }
         offset += nbytes;
       }
+    }
+
+    group->myStepCounter->store(stepValue + 1);
+    futexWakeAll(group->myStepCounter);
+    for (size_t i : peerIndices) {
+      futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue + 1);
     }
 
     // if (!allGather.proxyInfo.empty()) {

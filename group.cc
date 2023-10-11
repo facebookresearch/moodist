@@ -147,6 +147,9 @@ void Group::init() {
         continue;
       }
 
+      fmt::printf("max_mr_size is %d\n", attributes.max_mr_size);
+      fmt::printf("max_mr is %d\n", attributes.max_mr);
+
       int portNum = -1;
       ibv_port_attr portAttributes;
       int bestSpeed = -1;

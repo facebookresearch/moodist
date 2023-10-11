@@ -324,8 +324,8 @@ void CpuThread::entry() {
         ibv_qp_ex* qp = dev.ib->qpex;
 
         // fmt::printf(
-        //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
-        //     remoteAddress, rkey, &dev - devices.data(), i);
+        //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress, remoteAddress,
+        //     rkey, &dev - devices.data(), i);
 
         wr.wr_id = (uint64_t)(void*)callback;
 
@@ -356,12 +356,14 @@ void CpuThread::entry() {
         // }
       };
 
-      if (bytes >= 1024ull * 1024 * 896) {
+      const size_t threshold = 1024ull * 1024 * 896;
+      const size_t chunkSize = 1024ull * 1024 * 768;
+      if (bytes >= threshold) {
         size_t remaining = bytes;
-        bytes = 1024ull * 1024 * 768;
+        bytes = chunkSize;
         bool signal = forceSignalNext;
         while (remaining > 0) {
-          if (remaining < 1024ull * 1024 * 896) {
+          if (remaining < threshold) {
             bytes = remaining;
           }
           forceSignalNext = signal;
@@ -376,8 +378,14 @@ void CpuThread::entry() {
       }
     };
 
+    struct CudaMapping {
+      uint64_t bufferId;
+      size_t bytes;
+      MemoryRegion mr;
+    };
+
     HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMap;
-    HashMap<uintptr_t, std::unique_ptr<MemoryRegion>> mrMapCuda;
+    HashMap<uintptr_t, std::unique_ptr<CudaMapping>> mrMapCuda;
 
     std::vector<IbvMr> localMrs;
 
@@ -412,23 +420,56 @@ void CpuThread::entry() {
       unsigned long long bufferId2 = -1;
       CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + bytes - 1));
       CHECK(bufferId == bufferId2);
-      auto i = mrMapCuda.find(bufferId);
+      auto i = mrMapCuda.find(address);
       if (i != mrMapCuda.end()) {
-        CHECK(
-            (uintptr_t)(*i->second).mrs[0]->addr <= address &&
-            (uintptr_t)(*i->second).mrs[0]->addr + (*i->second).mrs[0]->length >= address + bytes);
-        return &*i->second;
+        if (i->second->bufferId == bufferId && i->second->bytes >= bytes) {
+          return &i->second->mr;
+        }
       }
-      auto ptr = std::make_unique<MemoryRegion>();
-      ptr->mrs.fill(nullptr);
-      CHECK(devices.size() <= ptr->mrs.size());
+      auto ptr = std::make_unique<CudaMapping>();
+      ptr->bufferId = bufferId;
+      ptr->bytes = bytes;
+      ptr->mr.mrs.fill(nullptr);
+      CHECK(devices.size() <= ptr->mr.mrs.size());
       for (size_t i = 0; i != devices.size(); ++i) {
-        ptr->mrs[i] = devices[i].ib->getMr(address, bytes);
+        // ptr->mr.mrs[i] = devices[i].ib->getMr(address, bytes);
+        auto* mr = ibv_reg_mr(
+            devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        localMrs.push_back(std::move(mr));
+        ptr->mr.mrs[i] = mr;
+        fmt::printf(
+            "new mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
+            mr->lkey, mr->rkey);
       }
-      MemoryRegion* r = &*ptr;
-      mrMapCuda[bufferId] = std::move(ptr);
+      MemoryRegion* r = &ptr->mr;
+      mrMapCuda[address] = std::move(ptr);
       return r;
     };
+
+    // auto regMrCuda = [&](uintptr_t address, size_t bytes) {
+    //   unsigned long long bufferId = -1;
+    //   CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
+    //   CHECK(bufferId != -1);
+    //   unsigned long long bufferId2 = -1;
+    //   CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + bytes - 1));
+    //   CHECK(bufferId == bufferId2);
+    //   auto i = mrMapCuda.find(bufferId);
+    //   if (i != mrMapCuda.end()) {
+    //     CHECK(
+    //         (uintptr_t)(*i->second).mrs[0]->addr <= address &&
+    //         (uintptr_t)(*i->second).mrs[0]->addr + (*i->second).mrs[0]->length >= address + bytes);
+    //     return &*i->second;
+    //   }
+    //   auto ptr = std::make_unique<MemoryRegion>();
+    //   ptr->mrs.fill(nullptr);
+    //   CHECK(devices.size() <= ptr->mrs.size());
+    //   for (size_t i = 0; i != devices.size(); ++i) {
+    //     ptr->mrs[i] = devices[i].ib->getMr(address, bytes);
+    //   }
+    //   MemoryRegion* r = &*ptr;
+    //   mrMapCuda[bufferId] = std::move(ptr);
+    //   return r;
+    // };
 
     auto* commsMr = regMr((uintptr_t)group->mySharedMem, group->mySharedMemSize);
 
@@ -548,6 +589,10 @@ void CpuThread::entry() {
 
     fmt::printf("rank %d test done!\n", rank);
 
+    AllocatedBuffer outDynsBuffer = group->allocateHost(sizeof(DynamicAddresses) * size);
+    DynamicAddresses* outDyns = (DynamicAddresses*)outDynsBuffer.cpuPointer;
+    MemoryRegion* outDynsMr = regMr((uintptr_t)outDynsBuffer.cpuPointer, outDynsBuffer.bytes);
+
     std::vector<uint32_t> dynReady;
 
     while (true) {
@@ -589,13 +634,23 @@ void CpuThread::entry() {
         //     params.bytes);
 
         auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
-        auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
+        // auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
 
-        DynamicAddresses* mydyn = &localDyns[rank];
-        for (size_t i = 0; i != devices.size(); ++i) {
-          mydyn->gatherKey[i] = outputMr->mrs[i]->rkey;
+        // DynamicAddresses* mydyn = &localDyns[rank];
+        // for (size_t i = 0; i != devices.size(); ++i) {
+        //   mydyn->gatherKey[i] = outputMr->mrs[i]->rkey;
+        // }
+        // mydyn->gatherAddress = (uintptr_t)params.outputAddress;
+
+        // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+        // Thus, we register each ranks output address independently, so they get different MRs.
+        for (size_t i : recvRanks) {
+          auto* mr = regMrCuda(params.outputAddress + params.bytes * i, params.bytes);
+          outDyns[i].gatherAddress = params.outputAddress;
+          for (size_t di = 0; di != devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+          }
         }
-        mydyn->gatherAddress = (uintptr_t)params.outputAddress;
 
         // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
         // until kernel entry, such that we don't receive data until we're ready.
@@ -605,9 +660,9 @@ void CpuThread::entry() {
           size_t di = (rank + n) % devices.size();
           auto& dev = devices[di];
           writeData(
-              dev, i, mydyn, commsMr->mrs[di]->lkey, (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank),
-              remoteComms[i].keys[di], sizeof(*mydyn),
-              makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
+              dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
+              (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
+              sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
           ++n;
         }
 
@@ -623,7 +678,7 @@ void CpuThread::entry() {
         // Now we can signal remote peers
         n = 0;
         for (size_t i : recvRanks) {
-          while (!dynReady[n]) {
+          while (dynReady[n] < stepValue) {
             poll();
           }
           size_t di = (rank + n) % devices.size();
@@ -652,6 +707,10 @@ void CpuThread::entry() {
 
             if (nbytes > 0) {
               uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
+
+              // fmt::printf(
+              //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
+              //     localDyns[i].gatherAddress, rank * params.bytes, offset);
 
               ++liveSends;
               writeDataDistributed(

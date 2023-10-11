@@ -456,6 +456,13 @@ $waitForProxyFunctions
     CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
     log.resize(logSize);
     CHECK_NVRTC(nvrtcGetProgramLog(program, log.data()));
+    for (char& c : log) {
+      if (c < 32 || c >= 127) {
+        if (c != 10 && c != 13) {
+          c = 32;
+        }
+      }
+    }
     fmt::printf("compile log\n---\n%s\n", log);
   }
 

@@ -17,6 +17,13 @@ struct alignas(64) Progress {
   size_t bytesReady;
 };
 
+struct AddressPair {
+  uintptr_t inputAddress;
+  size_t inputBytes;
+  uintptr_t outputAddress;
+  size_t outputBytes;
+};
+
 struct Group {
   size_t rank;
   size_t size;
@@ -77,7 +84,7 @@ struct Group {
 
   std::atomic_uint32_t* myStepCounter = nullptr;
 
-  using AddressPairs = std::array<std::pair<uintptr_t, uintptr_t>, 8>;
+  using AddressPairs = std::array<AddressPair, 8>;
   using PeerStepValues = std::array<std::atomic_uint32_t, 8>;
   AddressPairs* peerAddrs = nullptr;
   PeerStepValues* peerCopyDone = nullptr;
@@ -94,7 +101,7 @@ struct Group {
     return (T*)((uintptr_t)peerSharedMem[peerIndex] + getSharedOffset(myVar));
   }
 
-  static constexpr size_t dataChunks = 2;
+  static constexpr size_t dataChunks = 4;
 
   Group(size_t rank, size_t size);
   ~Group();

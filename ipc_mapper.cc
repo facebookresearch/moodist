@@ -80,6 +80,8 @@ struct IpcMapperImpl : IpcMapper {
       std::atomic_size_t sourceRank = -1;
       std::atomic_int stage = 0;
       CUipcMemHandle request;
+      size_t requestBytes;
+      uintptr_t requestUnmapAddress;
       CUdeviceptr response;
     };
 
@@ -158,9 +160,17 @@ struct IpcMapperImpl : IpcMapper {
           if (stage == 2) {
             size_t sourceRank = v.sourceRank;
             TORCH_CHECK(sourceRank < group->size);
-            fmt::printf("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
-            CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
-            fmt::printf("%d: mapped to %#x\n", group->rank, v.response);
+            if (v.requestUnmapAddress) {
+              v.response = 1;
+              fmt::printf(
+                  "%d: got ipc unmap (address %#x size %#x) request from rank %d!\n", group->rank,
+                  v.requestUnmapAddress, v.requestBytes, sourceRank);
+              CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
+            } else {
+              fmt::printf("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
+              CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
+              fmt::printf("%d: mapped %#x bytes to %#x\n", group->rank, v.requestBytes, v.response);
+            }
             v.stage = 3;
 
             SharedStruct* nshared = peershared.at(group->getPeerIndex(sourceRank));
@@ -179,7 +189,8 @@ struct IpcMapperImpl : IpcMapper {
     }
   }
 
-  void sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, Function<void(uintptr_t)> callback) {
+  void
+  sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
     size_t slotIndex = 0;
     SharedStruct* nshared = peershared.at(peerIndex);
     TORCH_CHECK(nshared != nullptr);
@@ -210,6 +221,47 @@ struct IpcMapperImpl : IpcMapper {
     auto& slot = nshared->slots[slotIndex];
     slot.sourceRank = group->rank;
     slot.request = handle;
+    slot.requestBytes = size;
+    slot.requestUnmapAddress = 0;
+    slot.stage = 2;
+    ++nshared->count;
+    futexWakeAll(&nshared->count);
+  }
+
+  void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback) {
+    size_t slotIndex = 0;
+    SharedStruct* nshared = peershared.at(peerIndex);
+    TORCH_CHECK(nshared != nullptr);
+    while (true) {
+      if (hasException) {
+        std::lock_guard l(mutex);
+        std::rethrow_exception(*exception);
+      }
+      int zero = 0;
+      if (nshared->slots[slotIndex].stage.compare_exchange_strong(zero, 1)) {
+        break;
+      }
+      if (slotIndex == nshared->slots.size() - 1) {
+        slotIndex = 0;
+      } else {
+        ++slotIndex;
+      }
+    }
+    fmt::printf("sending ipc request using slot %d\n", slotIndex);
+    std::unique_lock l(mutex);
+    outgoing.emplace_back();
+    OutgoingRequest& req = outgoing.back();
+    req.peerIndex = peerIndex;
+    req.slotIndex = slotIndex;
+    req.callback = std::move(callback);
+    l.unlock();
+
+    auto& slot = nshared->slots[slotIndex];
+    slot.sourceRank = group->rank;
+    slot.request = {};
+    slot.requestBytes = size;
+    slot.requestUnmapAddress = base;
+    CHECK(base != 0);
     slot.stage = 2;
     ++nshared->count;
     futexWakeAll(&nshared->count);
@@ -348,8 +400,13 @@ void IpcMapper::init() {
   ((IpcMapperImpl*)this)->init();
 }
 
-void IpcMapper::sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, Function<void(uintptr_t)> callback) {
-  ((IpcMapperImpl*)this)->sendRequestAddress(peerIndex, handle, std::move(callback));
+void IpcMapper::sendRequestAddress(
+    size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
+  ((IpcMapperImpl*)this)->sendRequestAddress(peerIndex, handle, size, std::move(callback));
+}
+
+void IpcMapper::sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback) {
+  ((IpcMapperImpl*)this)->sendRequestUnmap(peerIndex, base, size, std::move(callback));
 }
 
 void* IpcMapper::getMySharedMem(size_t offset, size_t size) {

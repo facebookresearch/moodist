@@ -72,7 +72,7 @@ struct SmallVector {
 
 int main() {
 
-  size_t size = 2048;
+  size_t size = 64;
 
   size_t ranksPerNode = 8;
 

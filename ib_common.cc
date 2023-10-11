@@ -319,12 +319,12 @@ ibv_mr* IbCommon::getMr(uintptr_t address, size_t length) {
       TORCH_CHECK(false);
     }
 
-    // fmt::printf(
-    //     "new mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", size, base, bufferId, mri.mr->lkey,
-    //     mri.mr->rkey);
-    // for (auto [address, bufferId] : mri.buffers) {
-    //   fmt::printf("  also spans buffer %d at %#x\n", bufferId, address);
-    // }
+    fmt::printf(
+        "new mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", size, base, bufferId, mri.mr->lkey,
+        mri.mr->rkey);
+    for (auto [address, bufferId] : mri.buffers) {
+      fmt::printf("  also spans buffer %d at %#x\n", bufferId, address);
+    }
 
     ibv_mr* r = mri.mr;
 

@@ -90,7 +90,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-        data = torch.randn(1024 * 1024 * 2).cuda() + 1
+        #data = torch.randn(1024 * 1024 * 2).cuda() + 1
+        #data = torch.randn(1024 * 1024 * 800).cuda() + 1
+        data = torch.randn(1536024 // 2, device="cuda")
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
         # data = torch.randn(128 * 4).cuda() + 1
         if rank == 0:
@@ -102,6 +104,7 @@ def f(n):
         # tmp2 = data2.clone()
 
         result0 = torch.cat(result)
+        #result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
         print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
@@ -127,8 +130,10 @@ def f(n):
 
         # result = torch.stack(result)
 
+        print("result0 is at %#x" % result0.data_ptr())
+
         for _ in range(10):
-            # print("rank %d warmup %d" % (rank, _))
+            print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
             result0 -= 1
@@ -171,10 +176,44 @@ def f(n):
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         raise RuntimeError("%d: wrong result for index %d" % (rank, i))
             torch.cuda.synchronize()
-            # print("rank %d warmup %d done" % (rank, _))
+            print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
         print("rank %d warmup done" % (rank))
+
+        if False:
+            tmpz = []
+            for x in range(10):
+                print("rank %d enter test2 %d\n" % (rank, x))
+                test2_data = torch.randn(3072048, device="cuda")
+                test2_result = torch.zeros(3072048 * size, device="cuda")
+
+                for i in range(10):
+                    dist._all_gather_base(test2_result, test2_data)
+                torch.cuda.synchronize()
+                print("rank %d test2 done" % rank)
+                
+                tmpz.append(test2_data)
+                tmpz.append(test2_result)
+
+                print("rank %d exit test2 %d\n" % (rank, x))
+
+            tmpz = None
+
+            import random
+            random.seed(42)
+            for x in range(100):
+                print("rank %d enter test3 %d\n" % (rank, x))
+                s = random.randint(1024, 1024 * 10) * 4
+                test3_data = torch.randn(s, device="cuda")
+                test3_result = torch.zeros(s * size, device="cuda")
+
+                for i in range(10):
+                    dist._all_gather_base(test3_result, test3_data)
+                torch.cuda.synchronize()
+                print("rank %d test3 done" % rank)
+
+                print("rank %d exit test3 %d\n" % (rank, x))
 
         warmup_result = [t.clone() for t in result]
         dist.barrier()
@@ -234,7 +273,7 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 11:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -458,7 +497,6 @@ def f(n):
     #     print("bad!!")
     # diff = data - correct
     # print(diff.abs().max())
-
 
 if len(sys.argv) < 2:
     f("moodist")
