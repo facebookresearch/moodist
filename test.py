@@ -36,7 +36,7 @@ def f(n):
         # sys.path.append("/home/vegardmella/moolib/py")
         # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
-        moodist.enable_profiling(True)
+        #moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
 
@@ -91,9 +91,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 2).cuda() + 1
+        data = torch.randn(1024 * 1024 * 2).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
-        data = torch.randn(1536024 // 2, device="cuda")
+        #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
         # data = torch.randn(128 * 4).cuda() + 1
         if rank == 0:
@@ -144,7 +144,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if False:
+            if True:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -486,7 +486,7 @@ def f(n):
     # dist.barrier()
     torch.cuda.synchronize()
 
-    moodist.enable_profiling(False)
+    #moodist.enable_profiling(False)
 
     # correct = torch.zeros_like(data)
 

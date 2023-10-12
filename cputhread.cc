@@ -652,6 +652,7 @@ void CpuThread::entry() {
       currentTraceBegin = now;
       currentTraceName = std::move(name);
     };
+#define trace(name)
 
     while (true) {
 
