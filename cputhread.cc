@@ -11,7 +11,6 @@
 #include "fmt/printf.h"
 
 #include <atomic>
-#include <infiniband/verbs.h>
 #include <libibverbs/verbs.h>
 #include <memory>
 #include <numa.h>
@@ -19,6 +18,8 @@
 #include <utility>
 
 namespace moodist {
+
+extern bool profilingEnabled;
 
 CpuThread::CpuThread(Group* group) {
   this->group = group;
@@ -169,9 +170,9 @@ void CpuThread::entry() {
 
     async::setCurrentThreadName("moodist-cputhread");
 
-    if (group->allocationNode != -1) {
-      numa_run_on_node(group->allocationNode);
-    }
+    // if (group->allocationNode != -1) {
+    //   numa_run_on_node(group->allocationNode);
+    // }
 
     CUcontext cuCtx;
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
@@ -324,8 +325,8 @@ void CpuThread::entry() {
         ibv_qp_ex* qp = dev.ib->qpex;
 
         // fmt::printf(
-        //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress, remoteAddress,
-        //     rkey, &dev - devices.data(), i);
+        //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
+        //     remoteAddress, rkey, &dev - devices.data(), i);
 
         wr.wr_id = (uint64_t)(void*)callback;
 
@@ -595,6 +596,63 @@ void CpuThread::entry() {
 
     std::vector<uint32_t> dynReady;
 
+    size_t opCount = 0;
+
+    struct TraceEvent {
+      std::string name;
+      std::chrono::system_clock::time_point begin;
+      std::chrono::system_clock::time_point end;
+    };
+    std::vector<TraceEvent> traceEvents;
+
+    std::chrono::system_clock::time_point beginning = std::chrono::system_clock::now();
+
+    std::string currentTraceName = "";
+    std::chrono::system_clock::time_point currentTraceBegin = beginning;
+    int threadId = gettid();
+
+    auto trace = [&](std::string name) {
+      // if (opCount < 1000 || opCount >= 1200) {
+      if (!profilingEnabled) {
+        if (!traceEvents.empty()) {
+          std::string fn = fmt::sprintf("moodist-trace-%d.json", rank);
+          FILE* f = fopen(fn.c_str(), "wb");
+          CHECK(f != nullptr);
+          fmt::fprintf(f, R"({"traceEvents": [)" "\n");
+          bool first = true;
+          for (auto& e : traceEvents) {
+            if (!first) {
+              fmt::fprintf(f, ",\n");
+            } else {
+              first = false;
+            }
+            fmt::fprintf(
+                f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
+                std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), threadId);
+          }
+          fmt::fprintf(f, "]}\n");
+          fclose(f);
+          fmt::printf("Chrome trace dumped to %s\n", fn);
+          traceEvents.clear();
+        }
+        return;
+      }
+      auto now = std::chrono::system_clock::now();
+      if (traceEvents.empty() && currentTraceName.empty()) {
+        beginning = now;
+      }
+      if (!currentTraceName.empty()) {
+        traceEvents.emplace_back();
+        TraceEvent& e = traceEvents.back();
+        e.name = std::move(currentTraceName);
+        e.begin = currentTraceBegin;
+        e.end = now;
+      }
+      currentTraceBegin = now;
+      currentTraceName = std::move(name);
+    };
+
     while (true) {
 
       while (queueSize == 0) {
@@ -604,10 +662,12 @@ void CpuThread::entry() {
           sum += dev.currentCqEntries;
         }
         if (sum == 0) {
-          futexWait(&queueSize, 0, std::chrono::seconds(1));
+          futexWait(&queueSize, 0, std::chrono::seconds(100));
         }
       }
       --queueSize;
+
+      ++opCount;
 
       std::unique_lock l(mutex);
       CHECK(!queue.empty());
@@ -626,6 +686,8 @@ void CpuThread::entry() {
 
         auto& sendRanks = allGather.sendRanks;
         auto& recvRanks = allGather.recvRanks;
+
+        trace(fmt::sprintf("op_%d_setup_%d", opCount - 1, params.bytes));
 
         // fmt::printf("rank %d cpu thread got all gather (step %#x)\n", rank, stepValue);
 
@@ -670,10 +732,14 @@ void CpuThread::entry() {
 
         // fmt::printf("got all dyns!\n");
 
+        trace("enter_wait_for_kernel");
+
         // wait for kernel
         while (cpuIn[0] < stepValue) {
           poll();
         }
+
+        trace("dyn_ready");
 
         // Now we can signal remote peers
         n = 0;
@@ -681,9 +747,9 @@ void CpuThread::entry() {
           while (dynReady[n] < stepValue) {
             poll();
           }
-          size_t di = (rank + n) % devices.size();
-          auto& dev = devices[di];
-          writeStep(di, i, stepValue);
+          // size_t di = (rank + n) % devices.size();
+          // auto& dev = devices[di];
+          // writeStep(di, i, stepValue);
           ++n;
         }
 
@@ -693,9 +759,21 @@ void CpuThread::entry() {
           sendStepValues[i] = stepValue + i;
         }
 
-        for (size_t i : sendRanks) {
+        CHECK(recvRanks.size() == sendRanks.size());
+
+        // for (size_t i : sendRanks) {
+        for (size_t index = 0; index != sendRanks.size(); ++index) {
+          if (true) {
+            size_t i = recvRanks[index];
+            trace(fmt::sprintf("%d_write_step_%d", i, stepValue + index));
+            size_t di = (rank + index) % devices.size();
+            auto& dev = devices[di];
+            writeStep(di, i, stepValue + index);
+          }
+          size_t i = sendRanks[index];
           // wait for dyns
-          while (localProgress[i].stepValue < stepValue) {
+          trace(fmt::sprintf("%d_wait_for_step_%d", i, stepValue + index));
+          while (localProgress[i].stepValue < stepValue + index) {
             poll();
           }
           size_t offset = 0;
@@ -712,18 +790,22 @@ void CpuThread::entry() {
               //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
               //     localDyns[i].gatherAddress, rank * params.bytes, offset);
 
+              trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
               ++liveSends;
               writeDataDistributed(
                   i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
                   localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
               offset += nbytes;
             }
+            trace(fmt::sprintf("%d_wait_for_liveSends", i));
             while (liveSends) {
               poll();
             }
+            trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
             while (liveStepValues) {
               poll();
             }
+            trace(fmt::sprintf("%d_send_stepValues", i));
             // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
             for (size_t di = 0; di != devices.size(); ++di) {
               Device& dev = devices[di];
@@ -735,6 +817,7 @@ void CpuThread::entry() {
                   makeCallback([&]() { --liveStepValues; }));
             }
           }
+          trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
           while (liveStepValues) {
             poll();
           }
@@ -744,13 +827,7 @@ void CpuThread::entry() {
           CHECK(liveStepValues == 0);
         }
 
-        //   0, 0 -> 1, 0 -> 1, 1
-        //   0, 0 -> 2, 0 -> 2, 1
-        //   0, 0 -> 3, 0 -> 3, 1
-
-        //   0, 1 -> 2, 1 -> 2, 0
-        //   0, 1 -> 3, 1 -> 3, 0
-        //   0, 1 -> 1, 1 -> 1, 0
+        trace("wait_for_cq_entries");
 
         while (true) {
           bool stop = true;
@@ -775,10 +852,14 @@ void CpuThread::entry() {
 
         // fmt::printf("rank %d cpu thread all gather all done! (step %#x)\n", rank, stepValue);
 
+        trace("exit_wait_for_kernel");
+
         cpuOut[0] = stepValue;
         while (cpuIn[0] < stepValue + 1) {
           poll();
         }
+
+        trace("");
 
         freelistAllGather.push(&params);
       } else if (queueEntry.task == taskTerminate) {
@@ -788,6 +869,8 @@ void CpuThread::entry() {
         throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
       }
     }
+
+    trace("");
 
   } catch (const std::exception& e) {
     fmt::fprintf(stderr, "Error: %s\n", e.what());

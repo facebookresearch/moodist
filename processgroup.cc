@@ -399,8 +399,14 @@ struct ProcessGroupImpl {
       for (size_t c = 0; c != Group::dataChunks; ++c) {
         size_t nbytes = std::min(bytes - offset, chunkSize);
         if (nbytes > 0) {
+          // CHECK_CU(cuLaunchKernel(
+          //     allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+          //     nullptr));
           CHECK_CU(cuLaunchKernel(
-              allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+              allGather.cuAllgatherWaitForRecv.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+              nullptr));
+          CHECK_CU(cuLaunchKernel(
+              allGather.cuAllgatherWaitForReady.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
               nullptr));
           CHECK(bytes * source + offset + nbytes <= outputBytes);
           auto e = cuMemcpyDtoDAsync(

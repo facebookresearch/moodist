@@ -36,6 +36,7 @@ def f(n):
         # sys.path.append("/home/vegardmella/moolib/py")
         # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
+        moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
 
@@ -484,6 +485,8 @@ def f(n):
 
     # dist.barrier()
     torch.cuda.synchronize()
+
+    moodist.enable_profiling(False)
 
     # correct = torch.zeros_like(data)
 
