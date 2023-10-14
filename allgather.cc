@@ -325,6 +325,16 @@ extern "C" __global__ void allgather_copy_done_$i() {
     for (size_t c = 0; c != Group::dataChunks; ++c) {
       waitForProxyFunctions += replace(
           R"(
+  extern "C" __global__ void allgather_wait_for_recv_no_forward_$source_$c() {
+    uint32_t stepValue = globalStepValue;
+    $wait
+  }
+        )",
+          "$source", pi.source, "$c", c, "$wait", waitForRecv(pi.source, c));
+    }
+    for (size_t c = 0; c != Group::dataChunks; ++c) {
+      waitForProxyFunctions += replace(
+          R"(
   extern "C" __global__ void allgather_wait_for_proxy_$i_$c() {
     uint32_t stepValue = globalStepValue;
     $wait
@@ -334,7 +344,7 @@ extern "C" __global__ void allgather_copy_done_$i() {
     while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
   }
 
-  extern "C" __global__ void allgather_wait_for_recv_$forwardSource_$c_$i() {
+  extern "C" __global__ void allgather_wait_for_recv_forward_$forwardSource_$c_$i() {
     uint32_t stepValue = globalStepValue;
     $wait
     // forward source $forwardSource destination $forwardDestination (peer index $forwardDestinationPeerIndex)
@@ -535,15 +545,24 @@ $waitForProxyFunctions
     }
   }
 
-  cuAllgatherWaitForRecv.resize(proxyDestinationInfo.size());
+  cuAllgatherWaitForRecvForward.resize(proxyDestinationInfo.size());
+  cuAllgatherWaitForRecvNoForward.resize(size);
   cuAllgatherWaitForReady.resize(proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-    cuAllgatherWaitForRecv[i].resize(Group::dataChunks);
+    cuAllgatherWaitForRecvForward[i].resize(Group::dataChunks);
     cuAllgatherWaitForReady[i].resize(Group::dataChunks);
+    size_t recvSource = proxyInfo[i].source;
     for (size_t c = 0; c != Group::dataChunks; ++c) {
       CHECK_CU(cuModuleGetFunction(
-          &cuAllgatherWaitForRecv[i][c], cuModule,
-          replace("allgather_wait_for_recv_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source).c_str()));
+          &cuAllgatherWaitForRecvForward[i][c], cuModule,
+          replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source)
+              .c_str()));
+      if (cuAllgatherWaitForRecvNoForward[recvSource].empty()) {
+        cuAllgatherWaitForRecvNoForward[recvSource].resize(size);
+        CHECK_CU(cuModuleGetFunction(
+            &cuAllgatherWaitForRecvNoForward[recvSource][c], cuModule,
+            replace("allgather_wait_for_recv_no_forward_$source_$c", "$c", c, "$source", recvSource).c_str()));
+      }
       CHECK_CU(cuModuleGetFunction(
           &cuAllgatherWaitForReady[i][c], cuModule,
           replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c).c_str()));

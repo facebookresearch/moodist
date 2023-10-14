@@ -46,7 +46,8 @@ struct AllGather : CollectiveBase {
   CUfunction cuAllgatherCopyAllDone = nullptr;
   std::vector<std::vector<CUfunction>> cuAllgatherWaitForProxy{};
 
-  std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecv{};
+  std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecvForward{};
+  std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecvNoForward{};
   std::vector<std::vector<CUfunction>> cuAllgatherWaitForReady{};
 
   // std::vector<std::vector<std::pair<size_t, size_t>>> peerProxies;
