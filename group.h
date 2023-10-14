@@ -8,6 +8,7 @@ struct SetupComms;
 struct IpcMapper;
 struct CpuThread;
 struct IbCommon;
+struct Kernels;
 struct AllGather;
 
 struct DynamicAddresses;
@@ -41,6 +42,7 @@ struct Group {
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
+  std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<CpuThread> cpuThread;
 

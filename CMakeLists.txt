@@ -49,6 +49,7 @@ pybind11_add_module(_C
   pybind.cc
   ib_common.cc
   allgather.cc
+  kernels.cc
 )
 target_link_libraries(
   _C

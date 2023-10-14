@@ -276,7 +276,7 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 11:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
 

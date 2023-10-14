@@ -6,6 +6,7 @@
 #include "cputhread.h"
 #include "group.h"
 #include "ipc_mapper.h"
+#include "kernels.h"
 #include "serialization.h"
 #include "setup_comms.h"
 #include "synchronization.h"
@@ -183,7 +184,7 @@ struct ProcessGroupImpl {
     // if (opCount < 1000 || opCount >= 1200) {
     if (!profilingEnabled) {
       if (!traceEvents.empty()) {
-        std::string fn = fmt::sprintf("moodist-trace-%d.json", rank);
+        std::string fn = fmt::sprintf("moodist-trace-pg-%d.json", rank);
         FILE* f = fopen(fn.c_str(), "wb");
         CHECK(f != nullptr);
         fmt::fprintf(
@@ -523,20 +524,20 @@ struct ProcessGroupImpl {
     uintptr_t inputAddress = e->inputAddress;
     uintptr_t outputAddress = e->outputAddress;
 
-    if (group->extraStreams[0] == nullptr) {
-      for (auto& v : group->extraStreams) {
-        CHECK_CU(cuStreamCreate(&v, CU_STREAM_NON_BLOCKING));
-        // CHECK_CU(cuStreamCreateWithPriority(&v, CU_STREAM_NON_BLOCKING, -100));
-      }
-      for (auto& v : group->extraEvents) {
-        CHECK_CU(cuEventCreate(&v, CU_EVENT_DISABLE_TIMING));
-      }
-    }
+    // if (group->extraStreams[0] == nullptr) {
+    //   for (auto& v : group->extraStreams) {
+    //     CHECK_CU(cuStreamCreate(&v, CU_STREAM_NON_BLOCKING));
+    //     // CHECK_CU(cuStreamCreateWithPriority(&v, CU_STREAM_NON_BLOCKING, -100));
+    //   }
+    //   for (auto& v : group->extraEvents) {
+    //     CHECK_CU(cuEventCreate(&v, CU_EVENT_DISABLE_TIMING));
+    //   }
+    // }
 
     AllGather& allGather = *group->allGather;
 
-    if (!allGather.cuModule) {
-      allGather.compile();
+    if (!allGather.cuAllgatherEntry) {
+      group->kernels->compile();
     }
 
     size_t inputChunks = 1;
@@ -588,7 +589,8 @@ struct ProcessGroupImpl {
         for (size_t c = 0; c != Group::dataChunks; ++c) {
           size_t nbytes = std::min(bytes - offset, chunkSize);
           if (nbytes > 0) {
-            if (true) {
+            //if (true) {
+            if (false) {
               prev = builder.addKernel(prev, allGather.cuAllgatherWaitForProxy.at(n).at(c));
             } else {
               // for debugging, it can be useful to split the wait for proxy kernel into two parts

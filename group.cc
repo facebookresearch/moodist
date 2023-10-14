@@ -5,6 +5,7 @@
 #include "cputhread.h"
 #include "ib_common.h"
 #include "ipc_mapper.h"
+#include "kernels.h"
 #include "setup_comms.h"
 
 #include <algorithm>
@@ -59,6 +60,7 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(this);
   ipcMapper = createIpcMapper(this);
   cpuThread = std::make_unique<CpuThread>(this);
+  kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
 }
 
@@ -84,8 +86,8 @@ void Group::init() {
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   fmt::printf("device async engines: %d\n", asyncEngines);
 
-  CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-  //CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
+  //CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+  CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
 
   // // temporaryBuffer = allocateDevice(temporaryBytes);
   // cudaStepDoneBuffer = allocateDevice(size * 8);

@@ -615,7 +615,7 @@ void CpuThread::entry() {
       // if (opCount < 1000 || opCount >= 1200) {
       if (!profilingEnabled) {
         if (!traceEvents.empty()) {
-          std::string fn = fmt::sprintf("moodist-trace-%d.json", rank);
+          std::string fn = fmt::sprintf("moodist-trace-cpu-%d.json", rank);
           FILE* f = fopen(fn.c_str(), "wb");
           CHECK(f != nullptr);
           fmt::fprintf(f, R"({"traceEvents": [)" "\n");
@@ -652,7 +652,7 @@ void CpuThread::entry() {
       currentTraceBegin = now;
       currentTraceName = std::move(name);
     };
-#define trace(name)
+//#define trace(name)
 
     while (true) {
 
