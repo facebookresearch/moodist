@@ -10,6 +10,7 @@ struct CpuThread;
 struct IbCommon;
 struct Kernels;
 struct AllGather;
+struct ReduceScatter;
 
 struct DynamicAddresses;
 
@@ -44,6 +45,7 @@ struct Group {
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
   std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
+  std::unique_ptr<ReduceScatter> reduceScatter;
   std::unique_ptr<CpuThread> cpuThread;
 
   // AllocatedBuffer temporaryBuffer;

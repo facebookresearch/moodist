@@ -3,6 +3,7 @@
 #include "allgather.h"
 #include "common.h"
 #include "group.h"
+#include "reduce_scatter.h"
 
 namespace moodist {
 
@@ -48,8 +49,25 @@ void Kernels::compile() {
   fmt::printf("warp size: %d\nmax shared memory: %d\n", cudaWarpSize, cudaMaxSharedMemory);
   fmt::printf("multiprocessor count: %d\nmax threads per multiprocessor: %d\n", smCount, maxThreadsPerSm);
 
+  const auto& cpuInBuffer = group->cpuInBuffer;
+  const auto& cpuOutBuffer = group->cpuOutBuffer;
+
   std::string source;
   std::vector<std::pair<CUfunction*, std::string>> functions;
+
+  source = R"(
+typedef unsigned long uintptr_t;
+typedef unsigned int uint32_t;
+typedef unsigned long uint64_t;
+
+__device__ uint32_t globalStepValue = 1;
+
+extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
+  printf("reduce to be implemented!");
+  __trap();
+}
+
+  )";
 
   auto add = [&](auto&& v) {
     source += v.first;
@@ -57,9 +75,18 @@ void Kernels::compile() {
   };
 
   add(group->allGather->generate());
+  add(group->reduceScatter->generate());
 
-  if (group->rank == 0 || true) {
-    std::string fn = fmt::sprintf("moodist-kernels-rank%d.cu", group->rank);
+  source = replace(
+      source, "$rank", rank, "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",
+      cast("volatile uint32_t*", cpuInBuffer.cudaPointer));
+
+  source = replace(source, "%%", "%");
+  source = autoindent(source);
+  source = addLineCountComments(source);
+
+  if (rank == 0 || true) {
+    std::string fn = fmt::sprintf("moodist-kernels-rank%d.cu", rank);
     FILE* f = fopen(fn.c_str(), "wb");
     if (f) {
       fwrite(source.data(), source.size(), 1, f);
@@ -152,8 +179,8 @@ void Kernels::compile() {
   fmt::printf("cubin size is %d\n", cubin.size());
   CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
 
-  if (group->rank == 0 || true) {
-    FILE* f = fopen(fmt::sprintf("moodist-kernels-rank%d.o", group->rank).c_str(), "wb");
+  if (rank == 0 || true) {
+    FILE* f = fopen(fmt::sprintf("moodist-kernels-rank%d.o", rank).c_str(), "wb");
     if (f) {
       fwrite(cubin.data(), cubin.size(), 1, f);
       fclose(f);

@@ -8,11 +8,7 @@
 
 namespace moodist {
 
-AllGather::AllGather(Group* group) : CollectiveBase(group) {
-  if (cuModule) {
-    cuModuleUnload(cuModule);
-  }
-}
+AllGather::AllGather(Group* group) : CollectiveBase(group) {}
 
 AllGather::~AllGather() {}
 
@@ -210,38 +206,7 @@ void AllGather::init() {
   fmt::printf("%d: proxy copy order %s\n", rank, proxyCopyOrder);
 }
 
-void AllGather::compile() {
-  CUdevice& cuDevice = group->cuDevice;
-  CUcontext& cuContext = group->cuContext;
-
-  int major = 6;
-  int minor = 0;
-  CHECK_NVRTC(nvrtcVersion(&major, &minor));
-  fmt::printf("nvrtc version is %d %d\n", major, minor);
-
-  int driverVersion = 5000;
-  CHECK_CU(cuDriverGetVersion(&driverVersion));
-
-  fmt::printf("cuda driver version is %d\n", driverVersion);
-
-  CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
-  CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
-
-  fmt::printf("cuda device compute capability is %d.%d\n", computeMajor, computeMinor);
-
-  int cudaWarpSize = 0;
-  int cudaMaxSharedMemory = 0;
-  int maxThreadsPerSm = 0;
-  int smCount = 0;
-
-  CHECK_CU(cuDeviceGetAttribute(&cudaWarpSize, CU_DEVICE_ATTRIBUTE_WARP_SIZE, cuDevice));
-  CHECK_CU(cuDeviceGetAttribute(&cudaMaxSharedMemory, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, cuDevice));
-
-  CHECK_CU(cuDeviceGetAttribute(&maxThreadsPerSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, cuDevice));
-  CHECK_CU(cuDeviceGetAttribute(&smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDevice));
-
-  fmt::printf("warp size: %d\nmax shared memory: %d\n", cudaWarpSize, cudaMaxSharedMemory);
-  fmt::printf("multiprocessor count: %d\nmax threads per multiprocessor: %d\n", smCount, maxThreadsPerSm);
+std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGather::generate() {
 
   // allgatherBlocksize = group->ipcRanks.size() == group->size - 1 ? 256 : 64;
   // allgatherGridsize = group->ipcRanks.size() == group->size - 1 ? smCount / 4 : smCount / 4;
@@ -325,16 +290,6 @@ extern "C" __global__ void allgather_copy_done_$i() {
     for (size_t c = 0; c != Group::dataChunks; ++c) {
       waitForProxyFunctions += replace(
           R"(
-  extern "C" __global__ void allgather_wait_for_recv_no_forward_$source_$c() {
-    uint32_t stepValue = globalStepValue;
-    $wait
-  }
-        )",
-          "$source", pi.source, "$c", c, "$wait", waitForRecv(pi.source, c));
-    }
-    for (size_t c = 0; c != Group::dataChunks; ++c) {
-      waitForProxyFunctions += replace(
-          R"(
   extern "C" __global__ void allgather_wait_for_proxy_$i_$c() {
     uint32_t stepValue = globalStepValue;
     $wait
@@ -368,12 +323,6 @@ extern "C" __global__ void allgather_copy_done_$i() {
   std::string source = replace(
       R"zz(
 
-typedef unsigned long uintptr_t;
-typedef unsigned int uint32_t;
-typedef unsigned long uint64_t;
-
-__device__ uint32_t globalStepValue = 1;
-
 extern "C" __global__ void allgather_entry() {
   uint32_t stepValue = globalStepValue;
   // printf("enter %#x\n", stepValue);
@@ -406,168 +355,49 @@ extern "C" __global__ void allgather_copy_all_done() {
 $waitForProxyFunctions
 
   )zz",
-      "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",
-      cast("volatile uint32_t*", cpuInBuffer.cudaPointer), "$writes", writes, "$waits", waits, "$copyDoneFunctions",
-      copyDoneFunctions, "$waitForCopyDones", waitForCopyDones, "$waitForRecvs", waitForRecvs, "$copyDoneAllCode",
-      copyDoneAllCode, "$waitForProxyFunctions", waitForProxyFunctions);
-
-  source = replace(source, "$rank", rank);
-
-  source = replace(source, "%%", "%");
-  source = autoindent(source);
-  source = addLineCountComments(source);
+      "$writes", writes, "$waits", waits, "$copyDoneFunctions", copyDoneFunctions, "$waitForCopyDones",
+      waitForCopyDones, "$waitForRecvs", waitForRecvs, "$copyDoneAllCode", copyDoneAllCode, "$waitForProxyFunctions",
+      waitForProxyFunctions);
 
   // if (rank == 0) {
   //   fmt::printf("code\n----\n%s\n", source);
   // }
 
-  if (rank == 0 || true) {
-    std::string fn = fmt::sprintf("allgather_kernel-rank%d.cu", rank);
-    FILE* f = fopen(fn.c_str(), "wb");
-    if (f) {
-      fwrite(source.data(), source.size(), 1, f);
-      fclose(f);
-      fmt::printf("source dumped to %s\n", fn);
-    }
-  }
+  std::vector<std::pair<CUfunction*, std::string>> functions;
 
-  nvrtcProgram program;
-  CHECK_NVRTC(nvrtcCreateProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
+  auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
-  std::vector<std::pair<int, std::string>> archOptions;
-  archOptions.emplace_back(9000, "--gpu-architecture=sm_90");
-  archOptions.emplace_back(8090, "--gpu-architecture=sm_89");
-  archOptions.emplace_back(8070, "--gpu-architecture=sm_87");
-  archOptions.emplace_back(8000, "--gpu-architecture=sm_80");
-  archOptions.emplace_back(7050, "--gpu-architecture=sm_75");
-  archOptions.emplace_back(7020, "--gpu-architecture=sm_72");
-  archOptions.emplace_back(7000, "--gpu-architecture=sm_70");
-  archOptions.emplace_back(6020, "--gpu-architecture=sm_62");
-  archOptions.emplace_back(6010, "--gpu-architecture=sm_61");
-  archOptions.emplace_back(6000, "--gpu-architecture=sm_60");
-  archOptions.emplace_back(5030, "--gpu-architecture=sm_53");
-  archOptions.emplace_back(5020, "--gpu-architecture=sm_52");
-  archOptions.emplace_back(0, "--gpu-architecture=sm_50");
+  fn(cuAllgatherEntry, "allgather_entry");
+  fn(cuAllgatherExit, "allgather_exit");
 
-  std::vector<std::string> options;
-  options.push_back("<gpu-architecture>");
-  options.push_back("--use_fast_math");
-  options.push_back("--std=c++17");
-  options.push_back("-lineinfo");
-  // options.push_back("--maxrregcount=32");
-  //    options.push_back("-G");
-  //     options.push_back("--dopt=on");
-  nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
-  for (size_t i = 0; i != archOptions.size() && error == NVRTC_ERROR_INVALID_OPTION; ++i) {
-    if (computeMajor * 1000 + computeMinor * 10 < archOptions[i].first) {
-      continue;
-    }
-    options[0] = archOptions[i].second;
-    std::vector<const char*> options2;
-    for (auto& v : options) {
-      options2.push_back(v.c_str());
-    }
-    error = nvrtcCompileProgram(program, options2.size(), options2.data());
-    if (error == NVRTC_SUCCESS) {
-      fmt::printf("success with %s\n", archOptions[i].second);
-    }
-  }
-  if (error != NVRTC_SUCCESS) {
-    fmt::printf("Failed to compile--\n%s\n", source.c_str());
-    size_t logSize = 0;
-    std::string log;
-    CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
-    log.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, log.data()));
-    fmt::printf("%s\n", log);
-
-    CHECK_NVRTC(error);
-  } else {
-    size_t logSize = 0;
-    std::string log;
-    CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
-    log.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, log.data()));
-    for (char& c : log) {
-      if (c < 32 || c >= 127) {
-        if (c != 10 && c != 13) {
-          c = 32;
-        }
-      }
-    }
-    fmt::printf("compile log\n---\n%s\n", log);
-  }
-
-  // size_t ptxSize = 0;
-  // CHECK_NVRTC(nvrtcGetPTXSize(program, &ptxSize));
-  // std::vector<char> ptx;
-  // ptx.resize(ptxSize);
-  // CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
-
-  // CHECK_NVRTC(nvrtcDestroyProgram(&program));
-
-  // CHECK_CU(cuModuleLoadDataEx(&op.cuModule, ptx.data(), 0, nullptr, nullptr));
-  // CHECK_CU(cuModuleGetFunction(&op.cuAllgather, op.cuModule, "allgather"));
-
-  size_t cubinSize = 0;
-  CHECK_NVRTC(nvrtcGetCUBINSize(program, &cubinSize));
-  std::vector<char> cubin;
-  cubin.resize(cubinSize);
-  fmt::printf("cubin size is %d\n", cubin.size());
-  CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
-
-  if (rank == 0 || true) {
-    FILE* f = fopen(fmt::sprintf("allgather_kernel-rank%d.o", rank).c_str(), "wb");
-    if (f) {
-      fwrite(cubin.data(), cubin.size(), 1, f);
-      fclose(f);
-      fmt::printf("cubin dumped to allgather_kernel.o\n");
-    }
-  }
-
-  CHECK_NVRTC(nvrtcDestroyProgram(&program));
-
-  CHECK_CU(cuModuleLoadDataEx(&cuModule, cubin.data(), 0, nullptr, nullptr));
-  CHECK_CU(cuModuleGetFunction(&cuAllgatherEntry, cuModule, "allgather_entry"));
-  CHECK_CU(cuModuleGetFunction(&cuAllgatherExit, cuModule, "allgather_exit"));
   for (size_t i : group->peerIndices) {
-    CHECK_CU(
-        cuModuleGetFunction(&cuAllgatherCopyDone[i], cuModule, replace("allgather_copy_done_$i", "$i", i).c_str()));
+    fn(cuAllgatherCopyDone[i], replace("allgather_copy_done_$i", "$i", i));
   }
-  CHECK_CU(cuModuleGetFunction(&cuAllgatherCopyAllDone, cuModule, "allgather_copy_all_done"));
+  fn(cuAllgatherCopyAllDone, "allgather_copy_all_done");
+
   cuAllgatherWaitForProxy.resize(proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     cuAllgatherWaitForProxy[i].resize(Group::dataChunks);
     for (size_t c = 0; c != Group::dataChunks; ++c) {
-      CHECK_CU(cuModuleGetFunction(
-          &cuAllgatherWaitForProxy[i][c], cuModule,
-          replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c).c_str()));
+      fn(cuAllgatherWaitForProxy[i][c], replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c));
     }
   }
 
   cuAllgatherWaitForRecvForward.resize(proxyDestinationInfo.size());
-  cuAllgatherWaitForRecvNoForward.resize(size);
   cuAllgatherWaitForReady.resize(proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     cuAllgatherWaitForRecvForward[i].resize(Group::dataChunks);
     cuAllgatherWaitForReady[i].resize(Group::dataChunks);
     size_t recvSource = proxyInfo[i].source;
     for (size_t c = 0; c != Group::dataChunks; ++c) {
-      CHECK_CU(cuModuleGetFunction(
-          &cuAllgatherWaitForRecvForward[i][c], cuModule,
-          replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source)
-              .c_str()));
-      if (cuAllgatherWaitForRecvNoForward[recvSource].empty()) {
-        cuAllgatherWaitForRecvNoForward[recvSource].resize(size);
-        CHECK_CU(cuModuleGetFunction(
-            &cuAllgatherWaitForRecvNoForward[recvSource][c], cuModule,
-            replace("allgather_wait_for_recv_no_forward_$source_$c", "$c", c, "$source", recvSource).c_str()));
-      }
-      CHECK_CU(cuModuleGetFunction(
-          &cuAllgatherWaitForReady[i][c], cuModule,
-          replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c).c_str()));
+      fn(cuAllgatherWaitForRecvForward[i][c],
+         replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source));
+      fn(cuAllgatherWaitForReady[i][c],
+         replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c));
     }
   }
+
+  return std::make_pair(source, functions);
 }
 
 } // namespace moodist

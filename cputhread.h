@@ -14,6 +14,7 @@ constexpr uint8_t taskTerminate = 0;
 constexpr uint8_t taskBarrier = 1;
 constexpr uint8_t taskAllreduce = 2;
 constexpr uint8_t taskAllgather = 3;
+constexpr uint8_t taskReduceScatter = 3;
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
@@ -40,9 +41,6 @@ struct QueueEntryAllGather : QueueEntry {
   uintptr_t cpuInput = 0;
   uintptr_t cpuOutput = 0;
 
-  // std::atomic_uint32_t cpuOutStepValue = 0;
-  // std::atomic_uint32_t cpuInStepValue = 0;
-
   std::atomic_uint32_t threadStepValue = 0;
 };
 
@@ -54,6 +52,16 @@ struct QueueEntryAllReduce : QueueEntry {
   std::vector<uintptr_t> proxyIpcOutputAddresses;
 
   AllocatedBuffer recvBuffers;
+};
+
+struct QueueEntryReduceScatter : QueueEntry {
+  std::vector<uintptr_t> outputAddresses;
+  uintptr_t inputAddress = 0;
+  uintptr_t outputAddress = 0;
+  size_t bytes = 0;
+
+  std::array<uintptr_t, 8> peerInputAddresses;
+  std::array<uintptr_t, 8> peerOutputAddresses;
 };
 
 template<typename T>
@@ -93,6 +101,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntry> freelistTerminate;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
   QueueEntryFreeList<QueueEntryAllReduce> freelistAllReduce;
+  QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
 
   CpuThread(Group*);
   ~CpuThread();

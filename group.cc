@@ -7,6 +7,7 @@
 #include "ipc_mapper.h"
 #include "kernels.h"
 #include "setup_comms.h"
+#include "reduce_scatter.h"
 
 #include <algorithm>
 #include <cstring>
@@ -62,6 +63,7 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   cpuThread = std::make_unique<CpuThread>(this);
   kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
+  reduceScatter = std::make_unique<ReduceScatter>(this);
 }
 
 Group::~Group() {}

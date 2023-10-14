@@ -11,6 +11,18 @@
 
 namespace moodist {
 
+struct ProxyInfo {
+  size_t source;
+  size_t destination;
+  size_t destinationPeerIndex;
+};
+
+struct ProxyDestinationInfo {
+  size_t source;
+  size_t proxy;
+  size_t proxyPeerIndex;
+};
+
 struct Group;
 
 struct CollectiveBase {

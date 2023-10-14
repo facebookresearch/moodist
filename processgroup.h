@@ -73,9 +73,7 @@ public:
 
   c10::intrusive_ptr<tccl_work::Work> _reduce_scatter_base(
       at::Tensor& outputTensor, at::Tensor& inputTensor,
-      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
-    TORCH_CHECK(false, "_reduce_scatter_base called");
-  }
+      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
 
   c10::intrusive_ptr<tccl_work::Work> barrier(const c10d::BarrierOptions& opts = c10d::BarrierOptions()) override;
 

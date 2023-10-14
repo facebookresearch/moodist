@@ -50,6 +50,7 @@ pybind11_add_module(_C
   ib_common.cc
   allgather.cc
   kernels.cc
+  reduce_scatter.cc
 )
 target_link_libraries(
   _C

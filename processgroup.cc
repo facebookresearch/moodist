@@ -7,6 +7,7 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
 #include "synchronization.h"
@@ -17,6 +18,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cstring>
 #include <random>
+#include <torch/types.h>
 
 namespace moodist {
 
@@ -223,7 +225,7 @@ struct ProcessGroupImpl {
     currentTraceBegin = now;
     currentTraceName = std::move(name);
   };
-//#define trace(name)
+  // #define trace(name)
 
   ~ProcessGroupImpl() {
     trace("");
@@ -340,14 +342,22 @@ struct ProcessGroupImpl {
     size_t bytes;
   };
 
+  struct ReduceNodeInfo {
+    CUgraphNode node;
+    uintptr_t dst;
+    uintptr_t src;
+    size_t numel;
+  };
+
   struct AllGatherParameters {};
 
-  struct AllGatherGraph {
+  struct Graph {
     CUgraph graph = nullptr;
     CUgraphExec graphExec = nullptr;
 
     std::vector<CUgraphNode> nodes;
     std::vector<CopyNodeInfo> copyNodes;
+    std::vector<ReduceNodeInfo> reduceNodes;
   };
 
   template<typename Graph>
@@ -373,6 +383,30 @@ struct ProcessGroupImpl {
       CUgraphNode node;
       CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &kernelParams));
       graph.nodes.push_back(node);
+      return node;
+    }
+
+    CUgraphNode addReduce(CUgraphNode dependency, uintptr_t dst, uintptr_t src, size_t numel) {
+      CUDA_KERNEL_NODE_PARAMS kernelParams;
+      std::memset(&kernelParams, 0, sizeof(kernelParams));
+      kernelParams.func = group->kernels->cuReduce;
+      kernelParams.gridDimX = group->kernels->reduceGridSize;
+      kernelParams.gridDimY = 1;
+      kernelParams.gridDimZ = 1;
+      kernelParams.blockDimX = group->kernels->reduceBlockSize;
+      kernelParams.blockDimY = 1;
+      kernelParams.blockDimZ = 1;
+      std::array<void*, 3> params = {&dst, &src, &numel};
+      kernelParams.kernelParams = params.data();
+      CUgraphNode node;
+      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &kernelParams));
+      graph.nodes.push_back(node);
+      graph.reduceNodes.emplace_back();
+      auto& n = graph.reduceNodes.back();
+      n.node = node;
+      n.dst = dst;
+      n.src = src;
+      n.numel = numel;
       return node;
     }
 
@@ -419,10 +453,34 @@ struct ProcessGroupImpl {
     Group* group;
     ProcessGroupImpl& impl;
     size_t copyIndex = 0;
+    size_t reduceIndex = 0;
 
     GraphUpdater(Graph& graph, Group* group, ProcessGroupImpl& impl) : graph(graph), group(group), impl(impl) {}
 
     void* addKernel(void*, CUfunction function) {
+      return nullptr;
+    }
+
+    void* addReduce(void*, uintptr_t dst, uintptr_t src, size_t numel) {
+      auto& n = graph.reduceNodes.at(reduceIndex);
+      ++reduceIndex;
+      if (n.dst != dst || n.src != src || n.numel != numel) {
+        n.dst = dst;
+        n.src = src;
+        n.numel = numel;
+        CUDA_KERNEL_NODE_PARAMS kernelParams;
+        std::memset(&kernelParams, 0, sizeof(kernelParams));
+        kernelParams.func = group->kernels->cuReduce;
+        kernelParams.gridDimX = group->kernels->reduceGridSize;
+        kernelParams.gridDimY = 1;
+        kernelParams.gridDimZ = 1;
+        kernelParams.blockDimX = group->kernels->reduceBlockSize;
+        kernelParams.blockDimY = 1;
+        kernelParams.blockDimZ = 1;
+        std::array<void*, 3> params = {&dst, &src, &numel};
+        kernelParams.kernelParams = params.data();
+        CHECK_CU(cuGraphExecKernelNodeSetParams(graph.graphExec, n.node, &kernelParams));
+      }
       return nullptr;
     }
 
@@ -458,7 +516,8 @@ struct ProcessGroupImpl {
     }
   };
 
-  AllGatherGraph allGatherGraph;
+  Graph allGatherGraph;
+  Graph reduceScatterGraph;
 
   c10::intrusive_ptr<tccl_work::Work>
   _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
@@ -481,6 +540,9 @@ struct ProcessGroupImpl {
     TORCH_CHECK(output.is_cuda());
     TORCH_CHECK(output.device().index() == group->deviceIndex);
 
+    TORCH_CHECK(input.dtype() == torch::Dtype::Float);
+    TORCH_CHECK(output.dtype() == torch::Dtype::Float);
+
     size_t bytes = input.numel() * input.itemsize();
     size_t outputBytes = bytes * size;
 
@@ -491,10 +553,6 @@ struct ProcessGroupImpl {
     e->outputAddress = (uintptr_t)output.data_ptr();
     e->bytes = bytes;
     e->inputBytesReady = 0;
-
-    TORCH_CHECK((e->inputAddress & 0xf) == 0);
-    TORCH_CHECK((e->outputAddress & 0xf) == 0);
-    TORCH_CHECK((bytes & 0xf) == 0);
 
     std::shared_ptr<Op> op = getOp();
     CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
@@ -523,16 +581,6 @@ struct ProcessGroupImpl {
 
     uintptr_t inputAddress = e->inputAddress;
     uintptr_t outputAddress = e->outputAddress;
-
-    // if (group->extraStreams[0] == nullptr) {
-    //   for (auto& v : group->extraStreams) {
-    //     CHECK_CU(cuStreamCreate(&v, CU_STREAM_NON_BLOCKING));
-    //     // CHECK_CU(cuStreamCreateWithPriority(&v, CU_STREAM_NON_BLOCKING, -100));
-    //   }
-    //   for (auto& v : group->extraEvents) {
-    //     CHECK_CU(cuEventCreate(&v, CU_EVENT_DISABLE_TIMING));
-    //   }
-    // }
 
     AllGather& allGather = *group->allGather;
 
@@ -589,7 +637,7 @@ struct ProcessGroupImpl {
         for (size_t c = 0; c != Group::dataChunks; ++c) {
           size_t nbytes = std::min(bytes - offset, chunkSize);
           if (nbytes > 0) {
-            //if (true) {
+            // if (true) {
             if (false) {
               prev = builder.addKernel(prev, allGather.cuAllgatherWaitForProxy.at(n).at(c));
             } else {
@@ -639,6 +687,141 @@ struct ProcessGroupImpl {
       const c10d::AllgatherOptions& opts) {
     TORCH_CHECK(false, "allgather impl");
   }
+
+  c10::intrusive_ptr<tccl_work::Work>
+  _reduce_scatter_base(at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
+    trace("_reduce_scatter_base");
+    std::lock_guard l(mutex);
+
+    CHECK(opts.reduceOp == c10d::ReduceOp::SUM);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = nextStepValue.fetch_add(256);
+    CHECK(stepValue < 0x10000000);
+
+    QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();
+    e->task = taskReduceScatter;
+    e->stepValue = stepValue;
+
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(input.is_cuda());
+    TORCH_CHECK(input.device().index() == group->deviceIndex);
+    TORCH_CHECK(output.is_contiguous());
+    TORCH_CHECK(output.is_cuda());
+    TORCH_CHECK(output.device().index() == group->deviceIndex);
+
+    size_t bytes = output.numel() * output.itemsize();
+    size_t inputBytes = bytes * size;
+
+    TORCH_CHECK(input.numel() * input.itemsize() == inputBytes);
+
+    e->outputAddresses.clear();
+    e->inputAddress = (uintptr_t)input.data_ptr();
+    e->outputAddress = (uintptr_t)output.data_ptr();
+    e->bytes = bytes;
+
+    std::shared_ptr<Op> op = getOp();
+    CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
+    CHECK_CU(cuStreamWaitEvent(group->stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    const auto& ipcRanks = group->ipcRanks;
+    const auto& peerIndices = group->peerIndices;
+
+    trace("ipcMapper");
+
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(
+          i, e->inputAddress, inputBytes, [ptr = &e->peerInputAddresses[i]](uintptr_t address) { *ptr = address; });
+
+      ipcMapper->requestAddress(
+          i, e->outputAddress, bytes, [ptr = &e->peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
+    }
+
+    ipcMapper->wait();
+
+    trace("enqueue");
+
+    Group* group = &*this->group;
+
+    uintptr_t inputAddress = e->inputAddress;
+    uintptr_t outputAddress = e->outputAddress;
+
+    ReduceScatter& reduceScatter = *group->reduceScatter;
+
+    if (!reduceScatter.cuReduceScatterEntry) {
+      group->kernels->compile();
+    }
+
+    size_t inputChunks = 1;
+
+    group->cpuThread->enqueue(e);
+
+    trace("sync");
+
+    for (size_t i : peerIndices) {
+      AddressPair ad;
+      ad.inputAddress = e->peerInputAddresses[i];
+      ad.inputBytes = inputBytes;
+      ad.outputAddress = e->peerOutputAddresses[i];
+      ad.outputBytes = bytes;
+      (*group->getPeerVar(i, group->peerAddrs))[group->peerMyRemoteIndex[i]] = ad;
+    }
+    group->myStepCounter->store(stepValue);
+    futexWakeAll(group->myStepCounter);
+
+    for (size_t i : peerIndices) {
+      futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
+      auto& peerAddrs = *group->peerAddrs;
+      CHECK(peerAddrs[i].inputAddress && peerAddrs[i].outputAddress);
+      CHECK(peerAddrs[i].inputBytes == inputBytes);
+      CHECK(peerAddrs[i].outputBytes == bytes);
+    }
+
+    trace("launch");
+
+    auto graph = [&](auto&& builder) {
+      builder.addCopy({}, e->outputAddress + bytes * rank, inputAddress, bytes);
+
+      auto* prev = builder.addKernel({}, reduceScatter.cuReduceScatterEntry);
+      auto* entry = prev;
+
+      for (size_t i : peerIndices) {
+        auto& peerAddrs = *group->peerAddrs;
+        prev = builder.addReduce(prev, outputAddress, peerAddrs[i].inputAddress + bytes * rank, bytes);
+        // prev = builder.addCopy(prev, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+      }
+
+      prev = builder.addKernel(prev, reduceScatter.cuReduceScatterExit);
+
+      builder.launch();
+    };
+
+    if (!reduceScatterGraph.graph) {
+      graph(GraphBuilder(reduceScatterGraph, group));
+    } else {
+      graph(GraphUpdater(reduceScatterGraph, group, *this));
+    }
+
+    trace("post");
+
+    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
+
+    group->myStepCounter->store(stepValue + 1);
+    futexWakeAll(group->myStepCounter);
+    for (size_t i : peerIndices) {
+      futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue + 1);
+    }
+
+    c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
+        c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));
+    c10::cuda::CUDACachingAllocator::recordStream(input.data().storage().data_ptr(), sg.current_stream());
+    c10::cuda::CUDACachingAllocator::recordStream(output.data().storage().data_ptr(), sg.current_stream());
+    trace("");
+    return makeFuture(op, {output});
+  }
 };
 
 ProcessGroup::ProcessGroup(int rank, int size) : c10d::ProcessGroup(rank, size) {
@@ -674,6 +857,11 @@ c10::intrusive_ptr<tccl_work::Work> ProcessGroup::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
   return impl->allgather(outputTensors, inputTensors, opts);
+}
+
+c10::intrusive_ptr<tccl_work::Work> ProcessGroup::_reduce_scatter_base(
+    at::Tensor& outputTensor, at::Tensor& inputTensor, const c10d::ReduceScatterOptions& opts) {
+  return impl->_reduce_scatter_base(outputTensor, inputTensor, opts);
 }
 
 c10::intrusive_ptr<tccl_work::Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
