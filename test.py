@@ -91,7 +91,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-        data = torch.randn(1024 * 1024 * 2).cuda() + 1
+        data = torch.randn(1024 * 1024 * 1).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -138,6 +138,8 @@ def f(n):
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
             result0 -= 1
+            if _ % 3 == 0:
+                tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             # dist.all_gather(result, tmp)
             dist._all_gather_base(result0, tmp)
@@ -182,7 +184,7 @@ def f(n):
 
         print("rank %d warmup done" % (rank))
 
-        if False:
+        if True:
             tmpz = []
             for x in range(10):
                 print("rank %d enter test2 %d\n" % (rank, x))
@@ -274,9 +276,11 @@ def f(n):
                 # dist._all_gather_base(result, tmp)
                 ##tmp.copy_(data)
                 torch.cuda.synchronize()
-        elif 1 == 11:
+        elif 1 == 1:
             # result = [torch.zeros_like(data) for _ in range(size)]
             from torch.profiler import profile, record_function, ProfilerActivity
+
+            moodist.enable_profiling(True)
 
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -287,6 +291,9 @@ def f(n):
                     #torch.cuda.synchronize()
             torch.cuda.synchronize()
             prof.export_chrome_trace(f"trace-{rank}.json")
+            moodist.enable_profiling(False)
+
+            dist._all_gather_base(result0, tmp)
         elif 1 == 1:
             loopcount = 1000
             for _ in range(loopcount):

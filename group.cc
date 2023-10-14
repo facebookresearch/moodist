@@ -85,6 +85,7 @@ void Group::init() {
   fmt::printf("device async engines: %d\n", asyncEngines);
 
   CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+  //CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
 
   // // temporaryBuffer = allocateDevice(temporaryBytes);
   // cudaStepDoneBuffer = allocateDevice(size * 8);

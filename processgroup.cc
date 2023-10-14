@@ -19,6 +19,8 @@
 
 namespace moodist {
 
+extern bool profilingEnabled;
+
 void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
 }
@@ -164,7 +166,67 @@ struct ProcessGroupImpl {
     }
   }
 
-  ~ProcessGroupImpl() {}
+  struct TraceEvent {
+    std::string name;
+    std::chrono::system_clock::time_point begin;
+    std::chrono::system_clock::time_point end;
+  };
+  std::vector<TraceEvent> traceEvents;
+
+  std::chrono::system_clock::time_point beginning = std::chrono::system_clock::now();
+
+  std::string currentTraceName = "";
+  std::chrono::system_clock::time_point currentTraceBegin = beginning;
+  int threadId = gettid();
+
+  void trace(std::string name) {
+    // if (opCount < 1000 || opCount >= 1200) {
+    if (!profilingEnabled) {
+      if (!traceEvents.empty()) {
+        std::string fn = fmt::sprintf("moodist-trace-%d.json", rank);
+        FILE* f = fopen(fn.c_str(), "wb");
+        CHECK(f != nullptr);
+        fmt::fprintf(
+            f, R"({"traceEvents": [)"
+               "\n");
+        bool first = true;
+        for (auto& e : traceEvents) {
+          if (!first) {
+            fmt::fprintf(f, ",\n");
+          } else {
+            first = false;
+          }
+          fmt::fprintf(
+              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
+              std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
+              std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), threadId);
+        }
+        fmt::fprintf(f, "]}\n");
+        fclose(f);
+        fmt::printf("Chrome trace dumped to %s\n", fn);
+        traceEvents.clear();
+      }
+      return;
+    }
+    auto now = std::chrono::system_clock::now();
+    if (traceEvents.empty() && currentTraceName.empty()) {
+      beginning = now;
+    }
+    if (!currentTraceName.empty()) {
+      traceEvents.emplace_back();
+      TraceEvent& e = traceEvents.back();
+      e.name = std::move(currentTraceName);
+      e.begin = currentTraceBegin;
+      e.end = now;
+    }
+    currentTraceBegin = now;
+    currentTraceName = std::move(name);
+  };
+//#define trace(name)
+
+  ~ProcessGroupImpl() {
+    trace("");
+  }
 
   void init(std::string rank0Address) {
 
@@ -270,8 +332,136 @@ struct ProcessGroupImpl {
     TORCH_CHECK(false, "barrier");
   }
 
+  struct CopyNodeInfo {
+    CUgraphNode node;
+    uintptr_t dst;
+    uintptr_t src;
+    size_t bytes;
+  };
+
+  struct AllGatherParameters {};
+
+  struct AllGatherGraph {
+    CUgraph graph = nullptr;
+    CUgraphExec graphExec = nullptr;
+
+    std::vector<CUgraphNode> nodes;
+    std::vector<CopyNodeInfo> copyNodes;
+  };
+
+  template<typename Graph>
+  struct GraphBuilder {
+    Graph& graph;
+    Group* group;
+
+    GraphBuilder(Graph& graph, Group* group) : graph(graph), group(group) {
+      CHECK_CU(cuGraphCreate(&graph.graph, 0));
+    }
+
+    CUgraphNode addKernel(CUgraphNode dependency, CUfunction function) {
+      CUDA_KERNEL_NODE_PARAMS kernelParams;
+      std::memset(&kernelParams, 0, sizeof(kernelParams));
+      kernelParams.func = function;
+      kernelParams.gridDimX = 1;
+      kernelParams.gridDimY = 1;
+      kernelParams.gridDimZ = 1;
+      kernelParams.blockDimX = 1;
+      kernelParams.blockDimY = 1;
+      kernelParams.blockDimZ = 1;
+      kernelParams.kernelParams = nullptr;
+      CUgraphNode node;
+      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &kernelParams));
+      graph.nodes.push_back(node);
+      return node;
+    }
+
+    CUgraphNode addCopy(CUgraphNode dependency, uintptr_t dst, uintptr_t src, size_t bytes) {
+      CUDA_MEMCPY3D copyParams;
+      std::memset(&copyParams, 0, sizeof(copyParams));
+
+      TORCH_CHECK(dst != 0);
+      TORCH_CHECK(src != 0);
+      TORCH_CHECK(bytes != 0);
+
+      copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copyParams.dstDevice = dst;
+      copyParams.srcDevice = src;
+      copyParams.WidthInBytes = bytes;
+      copyParams.Height = 1;
+      copyParams.Depth = 1;
+      fmt::printf("add copy node dst %#x src %#x bytes %d\n", dst, src, bytes);
+      CUgraphNode node;
+      CHECK_CU(
+          cuGraphAddMemcpyNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &copyParams, group->cuContext));
+      graph.nodes.push_back(node);
+      graph.copyNodes.emplace_back();
+      auto& n = graph.copyNodes.back();
+      n.node = node;
+      n.dst = dst;
+      n.src = src;
+      n.bytes = bytes;
+      return node;
+    };
+
+    void launch() {
+      CHECK_CU(cuGraphInstantiateWithFlags(&graph.graphExec, graph.graph, 0));
+      CHECK_CU(cuGraphDebugDotPrint(graph.graph, fmt::sprintf("graph-%d.dot", group->rank).c_str(), 0));
+
+      CHECK_CU(cuGraphLaunch(graph.graphExec, group->stream));
+    }
+  };
+
+  template<typename Graph>
+  struct GraphUpdater {
+    Graph& graph;
+    Group* group;
+    ProcessGroupImpl& impl;
+    size_t copyIndex = 0;
+
+    GraphUpdater(Graph& graph, Group* group, ProcessGroupImpl& impl) : graph(graph), group(group), impl(impl) {}
+
+    void* addKernel(void*, CUfunction function) {
+      return nullptr;
+    }
+
+    void* addCopy(void*, uintptr_t dst, uintptr_t src, size_t bytes) {
+      auto& n = graph.copyNodes.at(copyIndex);
+      ++copyIndex;
+      if (n.dst != dst || n.src != src || n.bytes != bytes) {
+        n.dst = dst;
+        n.src = src;
+        n.bytes = bytes;
+        CUDA_MEMCPY3D copyParams;
+        std::memset(&copyParams, 0, sizeof(copyParams));
+        copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        copyParams.dstDevice = 0;
+        copyParams.srcDevice = 0;
+        copyParams.WidthInBytes = 0;
+        copyParams.Height = 1;
+        copyParams.Depth = 1;
+        copyParams.dstDevice = n.dst;
+        copyParams.srcDevice = n.src;
+        copyParams.WidthInBytes = n.bytes;
+        // fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
+        CHECK_CU(cuGraphExecMemcpyNodeSetParams(graph.graphExec, n.node, &copyParams, group->cuContext));
+      }
+      return nullptr;
+    }
+
+    void launch() {
+      impl.trace("cuGraphLaunch");
+      CHECK_CU(cuGraphLaunch(graph.graphExec, group->stream));
+      impl.trace("post-cuGraphLaunch");
+    }
+  };
+
+  AllGatherGraph allGatherGraph;
+
   c10::intrusive_ptr<tccl_work::Work>
   _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
+    trace("_allgather_base");
     std::lock_guard l(mutex);
 
     size_t size = this->size;
@@ -314,6 +504,8 @@ struct ProcessGroupImpl {
     const auto& ipcRanks = group->ipcRanks;
     const auto& peerIndices = group->peerIndices;
 
+    trace("ipcMapper");
+
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
           i, e->inputAddress, bytes, [ptr = &e->peerInputAddresses[i]](uintptr_t address) { *ptr = address; });
@@ -324,6 +516,8 @@ struct ProcessGroupImpl {
 
     ipcMapper->wait();
 
+    trace("enqueue");
+
     Group* group = &*this->group;
 
     uintptr_t inputAddress = e->inputAddress;
@@ -332,6 +526,7 @@ struct ProcessGroupImpl {
     if (group->extraStreams[0] == nullptr) {
       for (auto& v : group->extraStreams) {
         CHECK_CU(cuStreamCreate(&v, CU_STREAM_NON_BLOCKING));
+        // CHECK_CU(cuStreamCreateWithPriority(&v, CU_STREAM_NON_BLOCKING, -100));
       }
       for (auto& v : group->extraEvents) {
         CHECK_CU(cuEventCreate(&v, CU_EVENT_DISABLE_TIMING));
@@ -348,6 +543,8 @@ struct ProcessGroupImpl {
 
     group->cpuThread->enqueue(e);
 
+    trace("sync");
+
     for (size_t i : peerIndices) {
       AddressPair ad;
       ad.inputAddress = e->peerInputAddresses[i];
@@ -359,73 +556,264 @@ struct ProcessGroupImpl {
     group->myStepCounter->store(stepValue);
     futexWakeAll(group->myStepCounter);
 
-    std::array<void*, 1> params = {&stepValue};
-    CHECK_CU(cuLaunchKernel(allGather.cuAllgatherEntry, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
-    CHECK_CU(cuEventRecord(op->inputEvent, group->stream));
-
-    CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-    CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
-    CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
-
     for (size_t i : peerIndices) {
-      auto stream = group->stream;
-
       futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
       auto& peerAddrs = *group->peerAddrs;
       CHECK(peerAddrs[i].inputAddress && peerAddrs[i].outputAddress);
       CHECK(peerAddrs[i].inputBytes == bytes);
       CHECK(peerAddrs[i].outputBytes == outputBytes);
+    }
 
-      CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-      CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes, stream));
-    }
-    // if (!allGather.proxyInfo.empty()) {
-    //   // We run this on another stream in the hope that it will run side-by-side with the proxy wait below.
-    //   // In case they are in fact scheduled sequentially, the proxy wait kernel also does the forward work,
-    //   // such that we avoid deadlocks.
-    //   CHECK_CU(cuStreamWaitEvent(group->extraStreams[1], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
-    //   CHECK_CU(cuLaunchKernel(
-    //       allGather.cuAllgatherForwardProxies, 1, 1, 1, 1, 1, 1, 0, group->extraStreams[1], params.data(), nullptr));
-    //   CHECK_CU(cuEventRecord(group->extraEvents[1], group->extraStreams[1]));
+    trace("launch");
+
+    // if (!allGatherGraph.graph) {
+    //   auto& graph = allGatherGraph;
+
+    //   std::array<void*, 1> params = {nullptr};
+
+    //   CHECK_CU(cuGraphCreate(&graph.graph, 0));
+    //   CUDA_KERNEL_NODE_PARAMS kernelParams;
+    //   std::memset(&kernelParams, 0, sizeof(kernelParams));
+    //   kernelParams.func = nullptr;
+    //   kernelParams.gridDimX = 1;
+    //   kernelParams.gridDimY = 1;
+    //   kernelParams.gridDimZ = 1;
+    //   kernelParams.blockDimX = 1;
+    //   kernelParams.blockDimY = 1;
+    //   kernelParams.blockDimZ = 1;
+    //   kernelParams.kernelParams = params.data();
+
+    //   auto addKernel = [&](std::vector<CUgraphNode> dependencies, CUfunction function) {
+    //     kernelParams.func = function;
+    //     CUgraphNode node;
+    //     CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, dependencies.data(), dependencies.size(), &kernelParams));
+    //     graph.nodes.push_back(node);
+    //     return node;
+    //   };
+
+    //   auto addCopy = [&](std::vector<CUgraphNode> dependencies, uintptr_t dst, uintptr_t src, size_t bytes) {
+    //     CUDA_MEMCPY3D copyParams;
+    //     std::memset(&copyParams, 0, sizeof(copyParams));
+
+    //     TORCH_CHECK(dst != 0);
+    //     TORCH_CHECK(src != 0);
+    //     TORCH_CHECK(bytes != 0);
+
+    //     copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    //     copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    //     copyParams.dstDevice = dst;
+    //     copyParams.srcDevice = src;
+    //     copyParams.WidthInBytes = bytes;
+    //     copyParams.Height = 1;
+    //     copyParams.Depth = 1;
+    //     fmt::printf("add copy node dst %#x src %#x bytes %d\n", dst, src, bytes);
+    //     CUgraphNode node;
+    //     CHECK_CU(cuGraphAddMemcpyNode(
+    //         &node, graph.graph, dependencies.data(), dependencies.size(), &copyParams, group->cuContext));
+    //     graph.nodes.push_back(node);
+    //     graph.copyNodes.emplace_back();
+    //     auto& n = graph.copyNodes.back();
+    //     n.node = node;
+    //     n.dst = dst;
+    //     n.src = src;
+    //     n.bytes = bytes;
+    //     return node;
+    //   };
+
+    //   addCopy({}, e->outputAddress + bytes * rank, inputAddress, bytes);
+
+    //   auto* prev = addKernel({}, allGather.cuAllgatherEntry);
+    //   auto* entry = prev;
+
+    //   for (size_t i : peerIndices) {
+    //     auto& peerAddrs = *group->peerAddrs;
+    //     prev = addCopy({prev}, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+    //   }
+
+    //   for (auto& v : allGather.proxyDestinationInfo) {
+    //     size_t n = &v - allGather.proxyDestinationInfo.data();
+    //     size_t i = v.proxyPeerIndex;
+    //     size_t source = v.source;
+    //     size_t recvSource = allGather.proxyInfo.at(n).source;
+    //     auto stream = group->stream;
+    //     auto& peerAddrs = *group->peerAddrs;
+    //     size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
+    //     size_t offset = 0;
+    //     for (size_t c = 0; c != Group::dataChunks; ++c) {
+    //       size_t nbytes = std::min(bytes - offset, chunkSize);
+    //       if (nbytes > 0) {
+    //         // CHECK_CU(cuLaunchKernel(
+    //         //     allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //         //     nullptr));
+    //         CHECK_CU(cuLaunchKernel(
+    //             allGather.cuAllgatherWaitForRecv.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //             nullptr));
+    //         CHECK_CU(cuLaunchKernel(
+    //             allGather.cuAllgatherWaitForReady.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //             nullptr));
+    //         CHECK(bytes * source + offset + nbytes <= outputBytes);
+    //         auto e = cuMemcpyDtoDAsync(
+    //             outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset,
+    //             nbytes, stream);
+    //         if (e != CUDA_SUCCESS) {
+    //           fmt::printf(
+    //               "memcpy failed. i %d source %d c %d offset %#x nbytes %#x outputAddress %#x
+    //               peerAddrs[i]
+    //                   .outputAddress "
+    //                                  "%#x\n",
+    //               i, source, c, offset, nbytes, outputAddress, peerAddrs[i].outputAddress);
+    //           CHECK_CU(e);
+    //         }
+    //       }
+    //       offset += nbytes;
+    //     }
+    //   }
+
+    //   prev = addKernel({prev}, allGather.cuAllgatherExit);
+
+    //   CHECK_CU(cuGraphInstantiateWithFlags(&graph.graphExec, graph.graph, 0));
+
+    //   CHECK_CU(cuGraphDebugDotPrint(graph.graph, fmt::sprintf("graph-%d.dot", rank).c_str(), 0));
     // }
-    for (auto& v : allGather.proxyDestinationInfo) {
-      size_t n = &v - allGather.proxyDestinationInfo.data();
-      size_t i = v.proxyPeerIndex;
-      size_t source = v.source;
-      auto stream = group->stream;
-      auto& peerAddrs = *group->peerAddrs;
-      size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
-      size_t offset = 0;
-      for (size_t c = 0; c != Group::dataChunks; ++c) {
-        size_t nbytes = std::min(bytes - offset, chunkSize);
-        if (nbytes > 0) {
-          // CHECK_CU(cuLaunchKernel(
-          //     allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
-          //     nullptr));
-          CHECK_CU(cuLaunchKernel(
-              allGather.cuAllgatherWaitForRecv.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
-              nullptr));
-          CHECK_CU(cuLaunchKernel(
-              allGather.cuAllgatherWaitForReady.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
-              nullptr));
-          CHECK(bytes * source + offset + nbytes <= outputBytes);
-          auto e = cuMemcpyDtoDAsync(
-              outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset, nbytes,
-              stream);
-          if (e != CUDA_SUCCESS) {
-            fmt::printf(
-                "memcpy failed. i %d source %d c %d offset %#x nbytes %#x outputAddress %#x peerAddrs[i].outputAddress "
-                "%#x\n",
-                i, source, c, offset, nbytes, outputAddress, peerAddrs[i].outputAddress);
-            CHECK_CU(e);
-          }
-          // CHECK_CU(cuMemcpyDtoDAsync(
-          //     outputAddress + bytes * source + offset, peerAddrs[i].second + bytes * source + offset, nbytes,
-          //     stream));
-        }
-        offset += nbytes;
+
+    // CUDA_MEMCPY3D copyParams;
+    // std::memset(&copyParams, 0, sizeof(copyParams));
+    // copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    // copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    // copyParams.dstDevice = 0;
+    // copyParams.srcDevice = 0;
+    // copyParams.WidthInBytes = 0;
+    // copyParams.Height = 1;
+    // copyParams.Depth = 1;
+
+    // size_t copyIndex = 0;
+    // auto checkCopy = [&](uintptr_t dst, uintptr_t src, size_t bytes) {
+    //   auto& n = allGatherGraph.copyNodes.at(copyIndex);
+    //   ++copyIndex;
+    //   if (n.dst != dst || n.src != src || n.bytes != bytes) {
+    //     n.dst = dst;
+    //     n.src = src;
+    //     n.bytes = bytes;
+    //     copyParams.dstDevice = n.dst;
+    //     copyParams.srcDevice = n.src;
+    //     copyParams.WidthInBytes = n.bytes;
+    //     fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
+    //     CHECK_CU(cuGraphExecMemcpyNodeSetParams(allGatherGraph.graphExec, n.node, &copyParams, group->cuContext));
+    //   }
+    // };
+
+    // checkCopy(e->outputAddress + bytes * rank, inputAddress, bytes);
+    // for (size_t i : peerIndices) {
+    //   auto& peerAddrs = *group->peerAddrs;
+    //   checkCopy(outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+    // }
+
+    // CHECK_CU(cuGraphLaunch(allGatherGraph.graphExec, group->stream));
+
+    auto graph = [&](auto&& builder) {
+      builder.addCopy({}, e->outputAddress + bytes * rank, inputAddress, bytes);
+
+      auto* prev = builder.addKernel({}, allGather.cuAllgatherEntry);
+      auto* entry = prev;
+
+      for (size_t i : peerIndices) {
+        auto& peerAddrs = *group->peerAddrs;
+        prev = builder.addCopy(prev, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
       }
+
+      for (auto& v : allGather.proxyDestinationInfo) {
+        size_t n = &v - allGather.proxyDestinationInfo.data();
+        size_t i = v.proxyPeerIndex;
+        size_t source = v.source;
+        size_t recvSource = allGather.proxyInfo.at(n).source;
+        auto stream = group->stream;
+        auto& peerAddrs = *group->peerAddrs;
+        size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
+        size_t offset = 0;
+        for (size_t c = 0; c != Group::dataChunks; ++c) {
+          size_t nbytes = std::min(bytes - offset, chunkSize);
+          if (nbytes > 0) {
+            prev = builder.addKernel(prev, allGather.cuAllgatherWaitForRecv.at(n).at(c));
+            prev = builder.addKernel(prev, allGather.cuAllgatherWaitForReady.at(n).at(c));
+            prev = builder.addCopy(
+                prev, outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset,
+                nbytes);
+          }
+          offset += nbytes;
+        }
+      }
+
+      prev = builder.addKernel(prev, allGather.cuAllgatherExit);
+
+      builder.launch();
+    };
+
+    if (!allGatherGraph.graph) {
+      graph(GraphBuilder(allGatherGraph, group));
+    } else {
+      graph(GraphUpdater(allGatherGraph, group, *this));
     }
+
+    // std::array<void*, 1> params = {&stepValue};
+    // CHECK_CU(cuLaunchKernel(allGather.cuAllgatherEntry, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+    // CHECK_CU(cuEventRecord(op->inputEvent, group->stream));
+
+    // CHECK_CU(cuStreamWaitEvent(group->extraStreams[0], op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    // CHECK_CU(cuMemcpyDtoDAsync(e->outputAddress + bytes * rank, inputAddress, bytes, group->extraStreams[0]));
+    // CHECK_CU(cuEventRecord(group->extraEvents[0], group->extraStreams[0]));
+
+    // for (size_t i : peerIndices) {
+    //   auto stream = group->stream;
+    //   auto& peerAddrs = *group->peerAddrs;
+    //   CHECK_CU(cuStreamWaitEvent(stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    //   CHECK_CU(cuMemcpyDtoDAsync(outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes, stream));
+    // }
+
+    // for (auto& v : allGather.proxyDestinationInfo) {
+    //   size_t n = &v - allGather.proxyDestinationInfo.data();
+    //   size_t i = v.proxyPeerIndex;
+    //   size_t source = v.source;
+    //   size_t recvSource = allGather.proxyInfo.at(n).source;
+    //   auto stream = group->stream;
+    //   auto& peerAddrs = *group->peerAddrs;
+    //   size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
+    //   size_t offset = 0;
+    //   for (size_t c = 0; c != Group::dataChunks; ++c) {
+    //     size_t nbytes = std::min(bytes - offset, chunkSize);
+    //     if (nbytes > 0) {
+    //       // CHECK_CU(cuLaunchKernel(
+    //       //     allGather.cuAllgatherWaitForProxy.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //       //     nullptr));
+    //       CHECK_CU(cuLaunchKernel(
+    //           allGather.cuAllgatherWaitForRecv.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //           nullptr));
+    //       CHECK_CU(cuLaunchKernel(
+    //           allGather.cuAllgatherWaitForReady.at(n).at(c), 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(),
+    //           nullptr));
+    //       CHECK(bytes * source + offset + nbytes <= outputBytes);
+    //       auto e = cuMemcpyDtoDAsync(
+    //           outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset, nbytes,
+    //           stream);
+    //       if (e != CUDA_SUCCESS) {
+    //         fmt::printf(
+    //             "memcpy failed. i %d source %d c %d offset %#x nbytes %#x outputAddress %#x
+    //             peerAddrs[i].outputAddress "
+    //             "%#x\n",
+    //             i, source, c, offset, nbytes, outputAddress, peerAddrs[i].outputAddress);
+    //         CHECK_CU(e);
+    //       }
+    //     }
+    //     offset += nbytes;
+    //   }
+    // }
+    // CHECK_CU(cuLaunchKernel(allGather.cuAllgatherExit, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+
+    // // wait for the local input -> output copy
+    // CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
+
+    trace("post");
+
+    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
 
     group->myStepCounter->store(stepValue + 1);
     futexWakeAll(group->myStepCounter);
@@ -433,26 +821,11 @@ struct ProcessGroupImpl {
       futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue + 1);
     }
 
-    // if (!allGather.proxyInfo.empty()) {
-    //   // wait for forward proxies
-    //   CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[1], CU_EVENT_WAIT_DEFAULT));
-    // }
-
-    // todo: inline this into exit
-    CHECK_CU(
-        cuLaunchKernel(allGather.cuAllgatherCopyAllDone, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
-
-    CHECK_CU(cuLaunchKernel(allGather.cuAllgatherExit, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
-
-    // wait for the local input -> output copy
-    CHECK_CU(cuStreamWaitEvent(group->stream, group->extraEvents[0], CU_EVENT_WAIT_DEFAULT));
-
-    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
-
     c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
         c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));
     c10::cuda::CUDACachingAllocator::recordStream(input.data().storage().data_ptr(), sg.current_stream());
     c10::cuda::CUDACachingAllocator::recordStream(output.data().storage().data_ptr(), sg.current_stream());
+    trace("");
     return makeFuture(op, {output});
   }
 

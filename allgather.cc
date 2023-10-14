@@ -260,7 +260,7 @@ void AllGather::compile() {
 
   auto waitFor32 = [&](uintptr_t address, std::string value) {
     return replace(
-        R"(while (*(volatile uint32_t*)$ptr < $value) __threadfence_system();
+        R"(while (*(volatile uint32_t*)$ptr < $value);
     )",
         "$ptr", address, "$value", value);
   };
@@ -282,7 +282,8 @@ void AllGather::compile() {
   for (size_t i : group->peerIndices) {
     copyDoneFunctions += replace(
         R"(
-extern "C" __global__ void allgather_copy_done_$i(uint32_t stepValue) {
+extern "C" __global__ void allgather_copy_done_$i() {
+  uint32_t stepValue = globalStepValue;
   *(volatile uint32_t*)$ptr = stepValue;
 }
       )",
@@ -316,6 +317,7 @@ extern "C" __global__ void allgather_copy_done_$i(uint32_t stepValue) {
   }
 
   std::string waitForProxyFunctions;
+  size_t prevRecvSource = -1;
   CHECK(proxyInfo.size() == proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     auto& pi = proxyInfo[i];
@@ -323,35 +325,34 @@ extern "C" __global__ void allgather_copy_done_$i(uint32_t stepValue) {
     for (size_t c = 0; c != Group::dataChunks; ++c) {
       waitForProxyFunctions += replace(
           R"(
-  extern "C" __global__ void allgather_wait_for_proxy_$i_$c(uint32_t stepValue) {
-    __threadfence_system();
+  extern "C" __global__ void allgather_wait_for_proxy_$i_$c() {
+    uint32_t stepValue = globalStepValue;
     $wait
-    __threadfence_system();
     // forward source $forwardSource destination $forwardDestination (peer index $forwardDestinationPeerIndex)
     *(volatile uint32_t*)$forwardPtr = stepValue + $c;
-    __threadfence_system();
     // wait for ready source $proxySource proxy $proxyProxy (peer index $proxyProxyPeerIndex)
-    while (*(volatile uint32_t*)$readyPtr < stepValue + $c) __threadfence_system();
+    while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
   }
 
-  extern "C" __global__ void allgather_wait_for_recv_$forwardSource_$c_$i(uint32_t stepValue) {
-    __threadfence_system();
+  extern "C" __global__ void allgather_wait_for_recv_$forwardSource_$c_$i() {
+    uint32_t stepValue = globalStepValue;
     $wait
-    __threadfence_system();
     // forward source $forwardSource destination $forwardDestination (peer index $forwardDestinationPeerIndex)
     *(volatile uint32_t*)$forwardPtr = stepValue + $c;
   }
-  extern "C" __global__ void allgather_wait_for_ready_$proxySource_$c(uint32_t stepValue) {
+  extern "C" __global__ void allgather_wait_for_ready_$proxySource_$c() {
+    uint32_t stepValue = globalStepValue;
     // wait for ready source $proxySource proxy $proxyProxy (peer index $proxyProxyPeerIndex)
-    while (*(volatile uint32_t*)$readyPtr < stepValue + $c) __threadfence_system();
+    while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
   }
       )",
           "$i", i, "$c", c, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$wait",
-          waitForRecv(pi.source, c), "$forwardPtr",
+          pi.source == prevRecvSource ? "// same recv source as previous" : waitForRecv(pi.source, c), "$forwardPtr",
           peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$proxySource", pdi.source,
           "$proxyProxy", pdi.proxy, "$proxyProxyPeerIndex", pdi.proxyPeerIndex, "$forwardSource", pi.source,
           "$forwardDestination", pi.destination, "$forwardDestinationPeerIndex", pi.destinationPeerIndex);
     }
+    prevRecvSource = pi.source;
   }
 
   std::string source = replace(
@@ -361,30 +362,34 @@ typedef unsigned long uintptr_t;
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
 
+__device__ uint32_t globalStepValue = 1;
 
-extern "C" __global__ void allgather_entry(uint32_t stepValue) {
+extern "C" __global__ void allgather_entry() {
+  uint32_t stepValue = globalStepValue;
   // printf("enter %#x\n", stepValue);
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   cpuIn[0] = stepValue;
   $writes
-  __threadfence_system();
   $waits
 }
 
-extern "C" __global__ void allgather_exit(uint32_t stepValue) {
+extern "C" __global__ void allgather_exit() {
+  uint32_t stepValue = globalStepValue;
+  $copyDoneAllCode
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   cpuIn[0] = stepValue + 1;
-  __threadfence_system();
   while (cpuOut[0] < stepValue);
   $waitForCopyDones
   $waitForRecvs
-  __threadfence_system();
+
+  globalStepValue += 256;
 }
 
 $copyDoneFunctions
 
-extern "C" __global__ void allgather_copy_all_done(uint32_t stepValue) {
+extern "C" __global__ void allgather_copy_all_done() {
+  uint32_t stepValue = globalStepValue;
   $copyDoneAllCode
 }
 
@@ -544,20 +549,6 @@ $waitForProxyFunctions
           replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c).c_str()));
     }
   }
-
-  // for (size_t i = 0; i != ipcRanks.size(); ++i) {
-  //   CHECK_CU(cuModuleGetFunction(
-  //       &cuAllgatherWaitForPeer[i], cuModule, fmt::sprintf("allgather_wait_for_peer_%d", i).c_str()));
-  // }
-  // cuAllgatherWaitForPeerData.resize(size);
-  // for (size_t i : recvRanks) {
-  //   CHECK_CU(cuModuleGetFunction(
-  //       &cuAllgatherWaitForPeerData[i], cuModule, fmt::sprintf("allgather_wait_for_data_%d", i).c_str()));
-  // }
-
-  // size_t globalStepValueSize = 0;
-  // CHECK_CU(cuModuleGetGlobal(&cuGlobalStepValue, &globalStepValueSize, cuModule, "globalStepValue"));
-  // TORCH_CHECK(globalStepValueSize == 4);
 }
 
 } // namespace moodist
