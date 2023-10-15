@@ -577,6 +577,7 @@ void Group::init() {
   mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
 
   allGather->init();
+  reduceScatter->init();
 
   fmt::printf("%d: init ok!\n", rank);
 

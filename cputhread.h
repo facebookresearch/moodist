@@ -14,7 +14,7 @@ constexpr uint8_t taskTerminate = 0;
 constexpr uint8_t taskBarrier = 1;
 constexpr uint8_t taskAllreduce = 2;
 constexpr uint8_t taskAllgather = 3;
-constexpr uint8_t taskReduceScatter = 3;
+constexpr uint8_t taskReduceScatter = 4;
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
@@ -78,6 +78,7 @@ struct QueueEntryFreeList {
       return r;
     }
     ++nAllocated;
+    fmt::printf("QueueEntryFreeList %s allocated -> %d\n", typeid(T).name(), nAllocated);
     all.emplace_front();
     return &all.front();
   }

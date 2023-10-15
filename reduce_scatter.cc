@@ -13,7 +13,22 @@ ReduceScatter::ReduceScatter(Group* group) : CollectiveBase(group) {}
 
 ReduceScatter::~ReduceScatter() {}
 
-void ReduceScatter::init() {}
+void ReduceScatter::init() {
+  sendRanks = group->allGather->sendRanks;
+  recvRanks = group->allGather->recvRanks;
+
+  CHECK(recvRanks.size() == sendRanks.size());
+  auto allSendRanks = group->setupComms->allgather(sendRanks);
+  for (auto& v : allSendRanks) {
+    if (&v - allSendRanks.data() == rank) {
+      continue;
+    }
+    CHECK(v.size() == sendRanks.size());
+    for (size_t i = 0; i != sendRanks.size(); ++i) {
+      CHECK(v[i] != sendRanks[i]);
+    }
+  }
+}
 
 std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceScatter::generate() {
 
@@ -37,6 +52,17 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
         R"(while (*(volatile uint32_t*)$ptr < $value);
     )",
         "$ptr", address, "$value", value);
+  };
+
+  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
+    std::string s;
+    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
+    for (size_t di = 0; di != group->ibDevs.size(); ++di) {
+      s += waitFor32(
+          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
+          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
+    }
+    return s;
   };
 
   std::string writes;
@@ -68,6 +94,19 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   std::string source = replace(
       R"zz(
 
+extern "C" __global__ void local_reduce_scatter_entry() {
+  uint32_t stepValue = globalStepValue;
+  $writes
+  $waits
+}
+
+extern "C" __global__ void local_reduce_scatter_exit() {
+  uint32_t stepValue = globalStepValue;
+  $copyDoneAllCode
+  $waitForCopyDones
+  globalStepValue += 256;
+}
+
 extern "C" __global__ void reduce_scatter_entry() {
   uint32_t stepValue = globalStepValue;
   // printf("enter %#x\n", stepValue);
@@ -82,6 +121,8 @@ extern "C" __global__ void reduce_scatter_exit() {
   $copyDoneAllCode
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
+  cpuIn[2] = 0;
+  cpuIn[1] = 0;
   cpuIn[0] = stepValue + 1;
   while (cpuOut[0] < stepValue);
   $waitForCopyDones
@@ -95,12 +136,49 @@ extern "C" __global__ void reduce_scatter_exit() {
       cast("volatile uint32_t*", cpuInBuffer.cudaPointer), "$writes", writes, "$waits", waits, "$waitForCopyDones",
       waitForCopyDones, "$copyDoneAllCode", copyDoneAllCode);
 
+  for (size_t n = 0; n != sendRanks.size(); ++n) {
+    size_t i = sendRanks[n];
+    source += replace(
+        R"(
+extern "C" __global__ void reduce_scatter_send_ready_$n() {
+  //printf("$rank: send ready $i $n !\n");
+  $cpuIn[1] = $n + 1;
+}
+    )",
+        "$n", n, "$i", i);
+  }
+  for (size_t n = 0; n != recvRanks.size(); ++n) {
+    size_t i = recvRanks[n];
+    source += replace(
+        R"(
+extern "C" __global__ void reduce_scatter_wait_for_recv_$i_$n() {
+  //printf("$rank: enter wait for recv $i $n\n");
+  uint32_t stepValue = globalStepValue;
+  $wait
+  //printf("$rank: leave wait for recv $i $n\n");
+}
+    )",
+        "$n", n, "$i", i, "$wait", waitForRecv(i, Group::dataChunks - 1));
+  }
+
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
+  fn(cuLocalReduceScatterEntry, "local_reduce_scatter_entry");
+  fn(cuLocalReduceScatterExit, "local_reduce_scatter_exit");
   fn(cuReduceScatterEntry, "reduce_scatter_entry");
   fn(cuReduceScatterExit, "reduce_scatter_exit");
+
+  cuSendReady.resize(sendRanks.size());
+  for (size_t n = 0; n != sendRanks.size(); ++n) {
+    fn(cuSendReady[n], replace("reduce_scatter_send_ready_$n", "$n", n));
+  }
+  cuWaitForRecv.resize(recvRanks.size());
+  for (size_t n = 0; n != recvRanks.size(); ++n) {
+    size_t i = recvRanks[n];
+    fn(cuWaitForRecv[n], replace("reduce_scatter_wait_for_recv_$i_$n", "$i", i, "$n", n));
+  }
 
   return std::make_pair(source, functions);
 }

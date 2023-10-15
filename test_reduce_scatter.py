@@ -36,7 +36,8 @@ def f(n):
         # sys.path.append("/home/vegardmella/moolib/py")
         # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
-        #moodist.enable_profiling(True)
+
+        # moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
 
@@ -63,18 +64,16 @@ def f(n):
     device = torch.device("cuda:0")
     world_size = size
 
-
-
     test_gather = True
-
 
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 40).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    data = torch.randn(1024 * 1024 * 1).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 800).cuda() + 1
-    #data = torch.randn(1536024 // 2, device="cuda") + 1
+    #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
+    data = torch.randn((1024 + 32) * size).cuda() + 1
+    # data = torch.randn(1024 * 1024 * 800).cuda() + 1
+    # data = torch.randn(1536024 // 2, device="cuda") + 1
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
     # data = torch.randn(128 * 4).cuda() + 1
     if rank == 0:
@@ -82,7 +81,7 @@ def f(n):
     tmp = data.clone()
 
     result0 = torch.zeros(data.numel() // size).cuda()
-    #result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
+    # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
@@ -91,7 +90,9 @@ def f(n):
         torch.manual_seed(42 + r)
         rdata = torch.randn(data.numel()).cuda() + 1
         all_inputs.append(rdata)
-    
+
+        # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
+
     correct_result = sum(all_inputs).chunk(size)[rank]
 
     print("sum(all_inputs) shape ", sum(all_inputs).shape)
@@ -101,12 +102,17 @@ def f(n):
 
     print("result0 is at %#x" % result0.data_ptr())
 
-    for _ in range(10):
+    x = torch.randn(1024 * 1024).cuda()
+    y = torch.zeros(x.numel() * size).cuda()
+
+    for _ in range(100):
         print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result0 -= 1
         if _ % 3 == 0:
             tmp = torch.zeros_like(tmp)
+        if _ % 9 <= 4:
+            dist.all_gather_into_tensor(y, x)
         tmp.copy_(data)
         # dist.all_gather(result, tmp)
         print("result0 numel is ", result0.numel())
@@ -120,8 +126,7 @@ def f(n):
             v = correct_result
             if not torch.allclose(result[i], v, 1e-3, 1e-2):
                 print(
-                    "%d: result[%d].data_ptr is %#x"
-                    % (rank, i, result[i].data_ptr())
+                    "%d: result[%d].data_ptr is %#x" % (rank, i, result[i].data_ptr())
                 )
                 print("%d: data.data_ptr() is %#x" % (rank, data.data_ptr()))
                 print("%d: result %d sum %f" % (rank, i, result[i].sum()))
@@ -148,12 +153,48 @@ def f(n):
                 )
                 print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                 raise RuntimeError("%d: wrong result for index %d" % (rank, i))
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         print("rank %d warmup %d done" % (rank, _))
     tmp.copy_(data)
 
     print("rank %d warmup done" % (rank))
 
+    if True:
+        tmpz = []
+        for x in range(10):
+            print("rank %d enter test2 %d\n" % (rank, x))
+            test2_data = torch.randn(3072048, device="cuda")
+            test2_result = torch.zeros(3072048 * size, device="cuda")
+
+            for i in range(10):
+                dist._all_gather_base(test2_result, test2_data)
+                dist.reduce_scatter_tensor(test2_data, test2_result)
+            torch.cuda.synchronize()
+            print("rank %d test2 done" % rank)
+
+            tmpz.append(test2_data)
+            tmpz.append(test2_result)
+
+            print("rank %d exit test2 %d\n" % (rank, x))
+
+        tmpz = None
+
+        import random
+
+        random.seed(42)
+        for x in range(100):
+            print("rank %d enter test3 %d\n" % (rank, x))
+            s = random.randint(1024, 1024 * 10) * 4
+            test3_data = torch.randn(s, device="cuda")
+            test3_result = torch.zeros(s * size, device="cuda")
+
+            for i in range(10):
+                dist._all_gather_base(test3_result, test3_data)
+                dist.reduce_scatter_tensor(test3_data, test3_result)
+            torch.cuda.synchronize()
+            print("rank %d test3 done" % rank)
+
+            print("rank %d exit test3 %d\n" % (rank, x))
 
     warmup_result = [t.clone() for t in result]
     dist.barrier()
@@ -162,7 +203,27 @@ def f(n):
     torch.cuda.synchronize()
     start = time.time()
 
-    loopcount = 0
+    if 1 == 11:
+        # result = [torch.zeros_like(data) for _ in range(size)]
+        from torch.profiler import profile, record_function, ProfilerActivity
+
+        moodist.enable_profiling(True)
+
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            loopcount = 100
+            for _ in range(loopcount):
+                dist.reduce_scatter_tensor(result0, tmp)
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        prof.export_chrome_trace(f"trace-{rank}.json")
+        moodist.enable_profiling(False)
+
+        dist.reduce_scatter_tensor(result0, tmp)
+    elif True:
+        loopcount = 1000
+        for i in range(loopcount):
+            dist.reduce_scatter_tensor(result0, tmp)
+            torch.cuda.synchronize()
 
     print("rank %d all done!" % rank)
     dist.barrier()
@@ -175,6 +236,7 @@ def f(n):
                 t,
                 loopcount / t,
                 data.numel()
+                // size
                 * data.element_size()
                 / 1024
                 / 1024
@@ -194,7 +256,7 @@ def f(n):
     # dist.barrier()
     torch.cuda.synchronize()
 
-    #moodist.enable_profiling(False)
+    # moodist.enable_profiling(False)
 
 
 if len(sys.argv) < 2:

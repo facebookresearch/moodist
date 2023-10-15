@@ -77,6 +77,9 @@ struct Group {
 
   std::vector<std::vector<size_t>> nodeRanks;
 
+  AllocatedBuffer sendBuffer;
+  AllocatedBuffer recvBuffer;
+
   int allocationNode = -1;
 
   // AllocatedBuffer commsBuffer;

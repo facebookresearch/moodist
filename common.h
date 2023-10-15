@@ -56,7 +56,9 @@ inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
 
 #undef CHECK
 #define CHECK(x)                                                                                                       \
-  (bool(x) ? 0 : (printf("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x), fflush(stderr), fflush(stdout), std::abort(), 0))
+  (bool(x) ? 0                                                                                                         \
+           : (fprintf(stderr, "[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x), fflush(stderr), fflush(stdout),    \
+              std::abort(), 0))
 
 inline std::string removePciPathPrefix(std::string path) {
   std::string_view prefix = "/sys/devices/";

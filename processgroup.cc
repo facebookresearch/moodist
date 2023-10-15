@@ -225,7 +225,7 @@ struct ProcessGroupImpl {
     currentTraceBegin = now;
     currentTraceName = std::move(name);
   };
-  // #define trace(name)
+#define trace(name)
 
   ~ProcessGroupImpl() {
     trace("");
@@ -360,6 +360,30 @@ struct ProcessGroupImpl {
     std::vector<ReduceNodeInfo> reduceNodes;
   };
 
+  struct Dependency {
+    std::vector<CUgraphNode> vec;
+    template<typename... T>
+    Dependency(T... args) : vec({args...}) {
+      for (auto i = vec.begin(); i != vec.end();) {
+        if (!*i) {
+          i = vec.erase(i);
+        } else {
+          ++i;
+        }
+      }
+    }
+    CUgraphNode* data() {
+      return vec.data();
+    }
+    size_t size() {
+      return vec.size();
+    }
+  };
+  struct NopDependency {
+    template<typename... T>
+    NopDependency(T...) {}
+  };
+
   template<typename Graph>
   struct GraphBuilder {
     Graph& graph;
@@ -369,7 +393,7 @@ struct ProcessGroupImpl {
       CHECK_CU(cuGraphCreate(&graph.graph, 0));
     }
 
-    CUgraphNode addKernel(CUgraphNode dependency, CUfunction function) {
+    CUgraphNode addKernel(Dependency dependency, CUfunction function) {
       CUDA_KERNEL_NODE_PARAMS kernelParams;
       std::memset(&kernelParams, 0, sizeof(kernelParams));
       kernelParams.func = function;
@@ -381,12 +405,12 @@ struct ProcessGroupImpl {
       kernelParams.blockDimZ = 1;
       kernelParams.kernelParams = nullptr;
       CUgraphNode node;
-      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &kernelParams));
+      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, dependency.data(), dependency.size(), &kernelParams));
       graph.nodes.push_back(node);
       return node;
     }
 
-    CUgraphNode addReduce(CUgraphNode dependency, uintptr_t dst, uintptr_t src, size_t numel) {
+    CUgraphNode addReduce(Dependency dependency, uintptr_t dst, uintptr_t src, size_t numel) {
       CUDA_KERNEL_NODE_PARAMS kernelParams;
       std::memset(&kernelParams, 0, sizeof(kernelParams));
       kernelParams.func = group->kernels->cuReduce;
@@ -399,7 +423,7 @@ struct ProcessGroupImpl {
       std::array<void*, 3> params = {&dst, &src, &numel};
       kernelParams.kernelParams = params.data();
       CUgraphNode node;
-      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &kernelParams));
+      CHECK_CU(cuGraphAddKernelNode(&node, graph.graph, dependency.data(), dependency.size(), &kernelParams));
       graph.nodes.push_back(node);
       graph.reduceNodes.emplace_back();
       auto& n = graph.reduceNodes.back();
@@ -410,13 +434,13 @@ struct ProcessGroupImpl {
       return node;
     }
 
-    CUgraphNode addCopy(CUgraphNode dependency, uintptr_t dst, uintptr_t src, size_t bytes) {
+    CUgraphNode addCopy(Dependency dependency, uintptr_t dst, uintptr_t src, size_t bytes) {
       CUDA_MEMCPY3D copyParams;
       std::memset(&copyParams, 0, sizeof(copyParams));
 
-      TORCH_CHECK(dst != 0);
-      TORCH_CHECK(src != 0);
-      TORCH_CHECK(bytes != 0);
+      CHECK(dst != 0);
+      CHECK(src != 0);
+      CHECK(bytes != 0);
 
       copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
       copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -427,8 +451,8 @@ struct ProcessGroupImpl {
       copyParams.Depth = 1;
       fmt::printf("add copy node dst %#x src %#x bytes %d\n", dst, src, bytes);
       CUgraphNode node;
-      CHECK_CU(
-          cuGraphAddMemcpyNode(&node, graph.graph, &dependency, dependency ? 1 : 0, &copyParams, group->cuContext));
+      CHECK_CU(cuGraphAddMemcpyNode(
+          &node, graph.graph, dependency.data(), dependency.size(), &copyParams, group->cuContext));
       graph.nodes.push_back(node);
       graph.copyNodes.emplace_back();
       auto& n = graph.copyNodes.back();
@@ -457,11 +481,11 @@ struct ProcessGroupImpl {
 
     GraphUpdater(Graph& graph, Group* group, ProcessGroupImpl& impl) : graph(graph), group(group), impl(impl) {}
 
-    void* addKernel(void*, CUfunction function) {
-      return nullptr;
+    void* addKernel(NopDependency, CUfunction function) {
+      return (void*)1;
     }
 
-    void* addReduce(void*, uintptr_t dst, uintptr_t src, size_t numel) {
+    void* addReduce(NopDependency, uintptr_t dst, uintptr_t src, size_t numel) {
       auto& n = graph.reduceNodes.at(reduceIndex);
       ++reduceIndex;
       if (n.dst != dst || n.src != src || n.numel != numel) {
@@ -481,10 +505,10 @@ struct ProcessGroupImpl {
         kernelParams.kernelParams = params.data();
         CHECK_CU(cuGraphExecKernelNodeSetParams(graph.graphExec, n.node, &kernelParams));
       }
-      return nullptr;
+      return (void*)1;
     }
 
-    void* addCopy(void*, uintptr_t dst, uintptr_t src, size_t bytes) {
+    void* addCopy(NopDependency, uintptr_t dst, uintptr_t src, size_t bytes) {
       auto& n = graph.copyNodes.at(copyIndex);
       ++copyIndex;
       if (n.dst != dst || n.src != src || n.bytes != bytes) {
@@ -495,24 +519,21 @@ struct ProcessGroupImpl {
         std::memset(&copyParams, 0, sizeof(copyParams));
         copyParams.srcMemoryType = CU_MEMORYTYPE_DEVICE;
         copyParams.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-        copyParams.dstDevice = 0;
-        copyParams.srcDevice = 0;
-        copyParams.WidthInBytes = 0;
         copyParams.Height = 1;
         copyParams.Depth = 1;
         copyParams.dstDevice = n.dst;
         copyParams.srcDevice = n.src;
         copyParams.WidthInBytes = n.bytes;
-        // fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
+        //fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
         CHECK_CU(cuGraphExecMemcpyNodeSetParams(graph.graphExec, n.node, &copyParams, group->cuContext));
       }
-      return nullptr;
+      return (void*)1;
     }
 
     void launch() {
-      impl.trace("cuGraphLaunch");
+      // impl.trace("cuGraphLaunch");
       CHECK_CU(cuGraphLaunch(graph.graphExec, group->stream));
-      impl.trace("post-cuGraphLaunch");
+      // impl.trace("post-cuGraphLaunch");
     }
   };
 
@@ -539,9 +560,6 @@ struct ProcessGroupImpl {
     TORCH_CHECK(output.is_contiguous());
     TORCH_CHECK(output.is_cuda());
     TORCH_CHECK(output.device().index() == group->deviceIndex);
-
-    TORCH_CHECK(input.dtype() == torch::Dtype::Float);
-    TORCH_CHECK(output.dtype() == torch::Dtype::Float);
 
     size_t bytes = input.numel() * input.itemsize();
     size_t outputBytes = bytes * size;
@@ -587,8 +605,6 @@ struct ProcessGroupImpl {
     if (!allGather.cuAllgatherEntry) {
       group->kernels->compile();
     }
-
-    size_t inputChunks = 1;
 
     group->cpuThread->enqueue(e);
 
@@ -711,7 +727,11 @@ struct ProcessGroupImpl {
     TORCH_CHECK(output.is_cuda());
     TORCH_CHECK(output.device().index() == group->deviceIndex);
 
-    size_t bytes = output.numel() * output.itemsize();
+    TORCH_CHECK(input.dtype() == torch::Dtype::Float);
+    TORCH_CHECK(output.dtype() == torch::Dtype::Float);
+
+    size_t numel = output.numel();
+    size_t bytes = numel * output.itemsize();
     size_t inputBytes = bytes * size;
 
     TORCH_CHECK(input.numel() * input.itemsize() == inputBytes);
@@ -720,6 +740,10 @@ struct ProcessGroupImpl {
     e->inputAddress = (uintptr_t)input.data_ptr();
     e->outputAddress = (uintptr_t)output.data_ptr();
     e->bytes = bytes;
+
+    TORCH_CHECK((e->inputAddress & 0xf) == 0);
+    TORCH_CHECK((e->outputAddress & 0xf) == 0);
+    TORCH_CHECK((bytes & 0xf) == 0);
 
     std::shared_ptr<Op> op = getOp();
     CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
@@ -751,13 +775,32 @@ struct ProcessGroupImpl {
 
     ReduceScatter& reduceScatter = *group->reduceScatter;
 
-    if (!reduceScatter.cuReduceScatterEntry) {
+    auto& sendRanks = reduceScatter.sendRanks;
+    auto& recvRanks = reduceScatter.recvRanks;
+
+    bool recompile = false;
+    if (group->sendBuffer.bytes < bytes * sendRanks.size()) {
+      CHECK_CU(cuStreamSynchronize(group->stream));
+      group->sendBuffer = {};
+      group->sendBuffer = group->allocateDevice(bytes * sendRanks.size());
+      // recompile = true;
+    }
+    if (group->recvBuffer.bytes < bytes * 2) {
+      CHECK_CU(cuStreamSynchronize(group->stream));
+      group->recvBuffer = {};
+      group->recvBuffer = group->allocateDevice(bytes * 2);
+      // recompile = true;
+    }
+
+    if (!reduceScatter.cuReduceScatterEntry || recompile) {
       group->kernels->compile();
     }
 
-    size_t inputChunks = 1;
+    bool isLocalOnly = reduceScatter.recvRanks.empty();
 
-    group->cpuThread->enqueue(e);
+    if (!isLocalOnly) {
+      group->cpuThread->enqueue(e);
+    }
 
     trace("sync");
 
@@ -782,24 +825,60 @@ struct ProcessGroupImpl {
 
     trace("launch");
 
-    auto graph = [&](auto&& builder) {
-      builder.addCopy({}, e->outputAddress + bytes * rank, inputAddress, bytes);
+    uintptr_t sendAddress = group->sendBuffer.cudaPointer;
+    uintptr_t recvAddress = group->recvBuffer.cudaPointer;
+    CHECK(sendAddress != 0);
+    CHECK(recvAddress != 0);
 
-      auto* prev = builder.addKernel({}, reduceScatter.cuReduceScatterEntry);
-      auto* entry = prev;
+    auto graph = [&](auto&& builder) {
+      CHECK(outputAddress != 0);
+      auto* input = builder.addCopy({}, outputAddress, inputAddress + bytes * rank, bytes);
+
+      auto* entry = builder.addKernel(
+          {}, isLocalOnly ? reduceScatter.cuLocalReduceScatterEntry : reduceScatter.cuReduceScatterEntry);
+      auto* prev = entry;
+
+      if (!isLocalOnly) {
+        auto addRecv = [&](size_t n) {
+          prev = builder.addKernel(prev, reduceScatter.cuWaitForRecv.at(n));
+          prev = builder.addReduce({prev, input}, outputAddress, recvAddress + bytes * (n % 2), numel);
+        };
+
+        size_t n = 0;
+        for (size_t i : reduceScatter.sendRanks) {
+          uintptr_t addr = sendAddress + bytes * n;
+          CHECK(
+              addr >= group->sendBuffer.cudaPointer &&
+              addr + bytes <= group->sendBuffer.cudaPointer + group->sendBuffer.bytes);
+          auto* l = builder.addCopy({}, addr, inputAddress + bytes * i, bytes);
+          for (size_t peerIndex : peerIndices) {
+            auto& peerAddrs = *group->peerAddrs;
+            prev = builder.addReduce({prev, l}, addr, peerAddrs[peerIndex].inputAddress + bytes * i, numel);
+          }
+          prev = builder.addKernel({prev, l}, reduceScatter.cuSendReady.at(n));
+
+          if (n != 0) {
+            addRecv(n - 1);
+          }
+
+          ++n;
+        }
+        addRecv(n - 1);
+      }
 
       for (size_t i : peerIndices) {
         auto& peerAddrs = *group->peerAddrs;
-        prev = builder.addReduce(prev, outputAddress, peerAddrs[i].inputAddress + bytes * rank, bytes);
-        // prev = builder.addCopy(prev, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+        prev = builder.addReduce({prev, input}, outputAddress, peerAddrs[i].inputAddress + bytes * rank, numel);
       }
 
-      prev = builder.addKernel(prev, reduceScatter.cuReduceScatterExit);
+      prev = builder.addKernel(
+          prev, isLocalOnly ? reduceScatter.cuLocalReduceScatterExit : reduceScatter.cuReduceScatterExit);
 
       builder.launch();
     };
 
     if (!reduceScatterGraph.graph) {
+      fmt::printf("build graph!\n");
       graph(GraphBuilder(reduceScatterGraph, group));
     } else {
       graph(GraphUpdater(reduceScatterGraph, group, *this));
@@ -813,6 +892,10 @@ struct ProcessGroupImpl {
     futexWakeAll(group->myStepCounter);
     for (size_t i : peerIndices) {
       futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue + 1);
+    }
+
+    if (isLocalOnly) {
+      group->cpuThread->freelistReduceScatter.push(e);
     }
 
     c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
