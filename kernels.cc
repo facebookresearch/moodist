@@ -323,7 +323,7 @@ void Kernels::compile() {
   std::string source;
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
-  reduceGridSize = 64;
+  reduceGridSize = 128;
   reduceBlockSize = 128;
 
   source = R"(
@@ -344,20 +344,19 @@ __device__ void syncthreads() {
   source += replace(
       R"(
 extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
-//   size_t blockIndex = blockIdx.x;
-//   size_t threadIndex = threadIdx.x;
-// #pragma unroll 16
-//   for (size_t i = blockIndex * $reduceBlockSize + threadIndex; i < numel; i += $reduceGridSize * $reduceBlockSize) {
-//     dst[i] += src[i];
-//   }
-  size_t chunkSize = numel / $reduceGridSize / 1024u * 1024u;
-  size_t offset = blockIdx.x * chunkSize;
-  if (blockIdx.x == $reduceGridSize - 1) {
-    chunkSize = numel - offset;
+  size_t blockIndex = blockIdx.x;
+  size_t threadIndex = threadIdx.x;
+  for (size_t i = blockIndex * $reduceBlockSize + threadIndex; i < numel; i += $reduceGridSize * $reduceBlockSize) {
+    dst[i] += src[i];
   }
-  if (chunkSize > 0) {
-    reduce_float_sum_n2(nullptr, offset, chunkSize, dst, dst, src);
-  }
+  // size_t chunkSize = numel / $reduceGridSize / 1024u * 1024u;
+  // size_t offset = blockIdx.x * chunkSize;
+  // if (blockIdx.x == $reduceGridSize - 1) {
+  //   chunkSize = numel - offset;
+  // }
+  // if (chunkSize > 0) {
+  //   reduce_float_sum_n2(nullptr, offset, chunkSize, dst, dst, src);
+  // }
 }
   )",
       "$reduceGridSize", reduceGridSize, "$reduceBlockSize", reduceBlockSize);

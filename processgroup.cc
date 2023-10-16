@@ -19,6 +19,9 @@
 #include <cstring>
 #include <random>
 #include <torch/types.h>
+#include <variant>
+
+#include <cublas.h>
 
 namespace moodist {
 
@@ -378,10 +381,16 @@ struct ProcessGroupImpl {
     size_t size() {
       return vec.size();
     }
+    template<typename... T>
+    void add(T... v) {
+      ((v && (vec.push_back(v), 0)), ...);
+    }
   };
   struct NopDependency {
     template<typename... T>
     NopDependency(T...) {}
+    template<typename... T>
+    void add(T...) {}
   };
 
   template<typename Graph>
@@ -391,6 +400,10 @@ struct ProcessGroupImpl {
 
     GraphBuilder(Graph& graph, Group* group) : graph(graph), group(group) {
       CHECK_CU(cuGraphCreate(&graph.graph, 0));
+    }
+
+    Dependency dep() {
+      return Dependency();
     }
 
     CUgraphNode addKernel(Dependency dependency, CUfunction function) {
@@ -481,6 +494,10 @@ struct ProcessGroupImpl {
 
     GraphUpdater(Graph& graph, Group* group, ProcessGroupImpl& impl) : graph(graph), group(group), impl(impl) {}
 
+    NopDependency dep() {
+      return NopDependency();
+    }
+
     void* addKernel(NopDependency, CUfunction function) {
       return (void*)1;
     }
@@ -524,7 +541,7 @@ struct ProcessGroupImpl {
         copyParams.dstDevice = n.dst;
         copyParams.srcDevice = n.src;
         copyParams.WidthInBytes = n.bytes;
-        //fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
+        // fmt::printf("change copy node dst %#x src %#x bytes %d\n", n.dst, n.src, n.bytes);
         CHECK_CU(cuGraphExecMemcpyNodeSetParams(graph.graphExec, n.node, &copyParams, group->cuContext));
       }
       return (void*)1;
@@ -743,7 +760,6 @@ struct ProcessGroupImpl {
 
     TORCH_CHECK((e->inputAddress & 0xf) == 0);
     TORCH_CHECK((e->outputAddress & 0xf) == 0);
-    TORCH_CHECK((bytes & 0xf) == 0);
 
     std::shared_ptr<Op> op = getOp();
     CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
@@ -779,18 +795,17 @@ struct ProcessGroupImpl {
     auto& recvRanks = reduceScatter.recvRanks;
 
     bool recompile = false;
-    if (group->sendBuffer.bytes < bytes * sendRanks.size()) {
-      CHECK_CU(cuStreamSynchronize(group->stream));
-      group->sendBuffer = {};
-      group->sendBuffer = group->allocateDevice(bytes * sendRanks.size());
-      // recompile = true;
-    }
-    if (group->recvBuffer.bytes < bytes * 2) {
-      CHECK_CU(cuStreamSynchronize(group->stream));
-      group->recvBuffer = {};
-      group->recvBuffer = group->allocateDevice(bytes * 2);
-      // recompile = true;
-    }
+    auto allocbuffer = [&](auto& buffer, size_t size) {
+      if (buffer.bytes < size) {
+        CHECK_CU(cuStreamSynchronize(group->stream));
+        buffer = {};
+        buffer = group->allocateDevice(size);
+        // recompile = true;
+      }
+    };
+    allocbuffer(group->sendBuffer, bytes * sendRanks.size());
+    allocbuffer(group->recvBuffer, bytes * 2);
+    allocbuffer(group->temporaryBuffer, bytes * peerIndices.size());
 
     if (!reduceScatter.cuReduceScatterEntry || recompile) {
       group->kernels->compile();
@@ -827,12 +842,14 @@ struct ProcessGroupImpl {
 
     uintptr_t sendAddress = group->sendBuffer.cudaPointer;
     uintptr_t recvAddress = group->recvBuffer.cudaPointer;
-    CHECK(sendAddress != 0);
-    CHECK(recvAddress != 0);
+    if (!isLocalOnly) {
+      CHECK(sendAddress != 0);
+      CHECK(recvAddress != 0);
+    }
 
     auto graph = [&](auto&& builder) {
       CHECK(outputAddress != 0);
-      auto* input = builder.addCopy({}, outputAddress, inputAddress + bytes * rank, bytes);
+      auto* outputReduce = builder.addCopy({}, outputAddress, inputAddress + bytes * rank, bytes);
 
       auto* entry = builder.addKernel(
           {}, isLocalOnly ? reduceScatter.cuLocalReduceScatterEntry : reduceScatter.cuReduceScatterEntry);
@@ -841,7 +858,7 @@ struct ProcessGroupImpl {
       if (!isLocalOnly) {
         auto addRecv = [&](size_t n) {
           prev = builder.addKernel(prev, reduceScatter.cuWaitForRecv.at(n));
-          prev = builder.addReduce({prev, input}, outputAddress, recvAddress + bytes * (n % 2), numel);
+          outputReduce = builder.addReduce({outputReduce, prev}, outputAddress, recvAddress + bytes * (n % 2), numel);
         };
 
         size_t n = 0;
@@ -850,12 +867,15 @@ struct ProcessGroupImpl {
           CHECK(
               addr >= group->sendBuffer.cudaPointer &&
               addr + bytes <= group->sendBuffer.cudaPointer + group->sendBuffer.bytes);
-          auto* l = builder.addCopy({}, addr, inputAddress + bytes * i, bytes);
+          auto* sendReduce = builder.addCopy({}, addr, inputAddress + bytes * i, bytes);
           for (size_t peerIndex : peerIndices) {
             auto& peerAddrs = *group->peerAddrs;
-            prev = builder.addReduce({prev, l}, addr, peerAddrs[peerIndex].inputAddress + bytes * i, numel);
+            uintptr_t tempaddr = group->temporaryBuffer.cudaPointer + bytes * peerIndex;
+            prev = builder.addCopy(prev, tempaddr, peerAddrs[peerIndex].inputAddress + bytes * i, bytes);
+            sendReduce = builder.addReduce({prev, sendReduce}, addr, tempaddr, numel);
+            // prev = builder.addReduce({prev, l}, addr, peerAddrs[peerIndex].inputAddress + bytes * i, numel);
           }
-          prev = builder.addKernel({prev, l}, reduceScatter.cuSendReady.at(n));
+          prev = builder.addKernel(sendReduce, reduceScatter.cuSendReady.at(n));
 
           if (n != 0) {
             addRecv(n - 1);
@@ -866,13 +886,16 @@ struct ProcessGroupImpl {
         addRecv(n - 1);
       }
 
-      for (size_t i : peerIndices) {
+      for (size_t peerIndex : peerIndices) {
         auto& peerAddrs = *group->peerAddrs;
-        prev = builder.addReduce({prev, input}, outputAddress, peerAddrs[i].inputAddress + bytes * rank, numel);
+        uintptr_t tempaddr = group->temporaryBuffer.cudaPointer + bytes * peerIndex;
+        prev = builder.addCopy(prev, tempaddr, peerAddrs[peerIndex].inputAddress + bytes * rank, bytes);
+        outputReduce = builder.addReduce({outputReduce, prev}, outputAddress, tempaddr, numel);
+        // prev = builder.addReduce({prev, input}, outputAddress, peerAddrs[i].inputAddress + bytes * rank, numel);
       }
-
       prev = builder.addKernel(
-          prev, isLocalOnly ? reduceScatter.cuLocalReduceScatterExit : reduceScatter.cuReduceScatterExit);
+          {prev, outputReduce},
+          isLocalOnly ? reduceScatter.cuLocalReduceScatterExit : reduceScatter.cuReduceScatterExit);
 
       builder.launch();
     };

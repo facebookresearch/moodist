@@ -79,6 +79,7 @@ struct Group {
 
   AllocatedBuffer sendBuffer;
   AllocatedBuffer recvBuffer;
+  AllocatedBuffer temporaryBuffer;
 
   int allocationNode = -1;
 

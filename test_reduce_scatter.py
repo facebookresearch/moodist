@@ -71,7 +71,7 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 40).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
-    data = torch.randn((1024 + 32) * size).cuda() + 1
+    data = torch.randn(442416 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
     # data = torch.randn(1536024 // 2, device="cuda") + 1
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -209,11 +209,19 @@ def f(n):
 
         moodist.enable_profiling(True)
 
+        test = result0.clone()
+
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            loopcount = 100
-            for _ in range(loopcount):
+            loopcount = 1000
+            events = []
+            for i in range(loopcount):
+                if len(events) >= 2:
+                    events.pop(0).synchronize()
                 dist.reduce_scatter_tensor(result0, tmp)
-                torch.cuda.synchronize()
+                test.add_(result0)
+                e = torch.cuda.Event()
+                e.record()
+                events.append(e)
         torch.cuda.synchronize()
         prof.export_chrome_trace(f"trace-{rank}.json")
         moodist.enable_profiling(False)
@@ -221,9 +229,14 @@ def f(n):
         dist.reduce_scatter_tensor(result0, tmp)
     elif True:
         loopcount = 1000
+        events = []
         for i in range(loopcount):
+            if len(events) >= 2:
+                events.pop(0).synchronize()
             dist.reduce_scatter_tensor(result0, tmp)
-            torch.cuda.synchronize()
+            e = torch.cuda.Event()
+            e.record()
+            events.append(e)
 
     print("rank %d all done!" % rank)
     dist.barrier()
@@ -264,7 +277,7 @@ if len(sys.argv) < 2:
     sys.exit(0)
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist",):
+for n in ("moodist", "nccl"):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
