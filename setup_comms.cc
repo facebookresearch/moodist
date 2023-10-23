@@ -10,15 +10,15 @@ struct SetupCommsImpl : SetupComms {
   static constexpr uint64_t signature = 0x116dc74103a4dc0f;
 
   TcpContext context;
-  std::vector<std::shared_ptr<Listener>> listeners;
-  std::vector<std::shared_ptr<Connection>> connections;
-  std::vector<std::shared_ptr<Connection>> floatingConnections;
+  Vector<std::shared_ptr<Listener>> listeners;
+  Vector<std::shared_ptr<Connection>> connections;
+  Vector<std::shared_ptr<Connection>> floatingConnections;
 
   uint64_t myId;
-  std::vector<uint64_t> connectionIds;
+  Vector<uint64_t> connectionIds;
 
   SpinMutex mutex;
-  std::vector<BufferHandle> incomingData;
+  Vector<BufferHandle> incomingData;
   std::atomic_uint32_t incomingDataCount = 0;
 
   SetupCommsImpl(Group* group) {
@@ -41,6 +41,10 @@ struct SetupCommsImpl : SetupComms {
             if (error) {
               return;
             }
+            fmt::fprintf(
+                stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
+                connection->remoteAddress());
+            std::fflush(stdout);
             std::lock_guard l(mutex);
             floatingConnections.push_back(connection);
             connection->read([this, connection](Error* e, BufferHandle data) {
@@ -100,6 +104,8 @@ struct SetupCommsImpl : SetupComms {
     if (!context.isReachable("no-loopback", address)) {
       return;
     }
+    fmt::printf("Connecting to: %s\n", address);
+    std::fflush(stdout);
     auto connection = context.connect(address);
     auto buffer = serializeToBuffer(signature, myId, (uint32_t)group->rank, ~(uint32_t)0, std::string_view("connect"));
     connection->write(std::move(buffer), nullptr);
@@ -109,6 +115,8 @@ struct SetupCommsImpl : SetupComms {
       if (!e) {
         onRead(std::move(data), connection);
       } else {
+        fmt::fprintf(stderr, "Socket read error: %s\n", e->what());
+        std::fflush(stderr);
         connection->close();
       }
     });
@@ -131,9 +139,13 @@ struct SetupCommsImpl : SetupComms {
         if (connections[destinationRank]) {
           connections[destinationRank]->write(std::move(data), nullptr);
         }
+      } else {
+        CHECK(destinationRank == ~(uint32_t)0);
       }
       std::unique_lock l(mutex);
       if (!connections[sourceRank]) {
+        fmt::printf("Got new connection to rank %d (id %#x) (destination %d)\n", sourceRank, rankId, destinationRank);
+        std::fflush(stdout);
         connections[sourceRank] = connection;
         connectionIds[sourceRank] = rankId;
       }
@@ -146,6 +158,8 @@ struct SetupCommsImpl : SetupComms {
     }
     std::unique_lock l(mutex);
     if (!connections[sourceRank]) {
+      fmt::printf("Got new connection to rank %d (id %#x)\n", sourceRank, rankId);
+      std::fflush(stdout);
       connections[sourceRank] = connection;
       connectionIds[sourceRank] = rankId;
     }
@@ -231,6 +245,7 @@ struct SetupCommsImpl : SetupComms {
   }
 
   void sendBufferTo(size_t destinationRank, BufferHandle data) {
+    CHECK(connections.size() > destinationRank);
     TORCH_CHECK(data->size() > 16);
     auto* ptr = data->data();
     std::memcpy(ptr, &signature, sizeof(uint64_t));

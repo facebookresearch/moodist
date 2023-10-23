@@ -42,6 +42,10 @@ def f(n):
 
     # print(torch.randn(1).cuda())
 
+    import socket
+
+    print("hostname: %s\n" % (socket.gethostname()))
+
     dist.init_process_group(
         backend=n,
     )
@@ -91,7 +95,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-        data = torch.randn(1024 * 1024 * 1).cuda() + 1
+        data = torch.randn(263520).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -133,7 +137,7 @@ def f(n):
 
         print("result0 is at %#x" % result0.data_ptr())
 
-        for _ in range(10):
+        for _ in range(100):
             print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
@@ -294,6 +298,16 @@ def f(n):
             moodist.enable_profiling(False)
 
             dist._all_gather_base(result0, tmp)
+        elif 1 == 1:
+            loopcount = 1000
+            events = []
+            for i in range(loopcount):
+                if len(events) >= 2:
+                    events.pop(0).synchronize()
+                dist._all_gather_base(result0, tmp)
+                e = torch.cuda.Event()
+                e.record()
+                events.append(e)
         elif 1 == 1:
             loopcount = 1000
             for _ in range(loopcount):
@@ -513,7 +527,8 @@ if len(sys.argv) < 2:
     sys.exit(0)
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist",):
+#for n in ("moodist", "nccl"):
+for n in ("nccl", "moodist"):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
@@ -527,6 +542,9 @@ for n in ("moodist",):
             print(n)
         pid = os.fork()
         if pid == 0:
+            fd = os.open("out-%s.txt" % os.environ["RANK"], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
             f(n)
             os._exit(0)
         pids.append(pid)

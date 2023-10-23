@@ -562,9 +562,11 @@ struct ProcessGroupImpl {
     trace("_allgather_base");
     std::lock_guard l(mutex);
 
+    //fmt::printf("pg %p doing all gather\n", (void*)this);
+
     size_t size = this->size;
 
-    uint32_t stepValue = nextStepValue.fetch_add(256);
+    uint32_t stepValue = nextStepValue.fetch_add(4096);
     CHECK(stepValue < 0x10000000);
 
     QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
@@ -726,11 +728,13 @@ struct ProcessGroupImpl {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
 
+    //fmt::printf("pg %p doing reduce scatter\n", (void*)this);
+
     CHECK(opts.reduceOp == c10d::ReduceOp::SUM);
 
     size_t size = this->size;
 
-    uint32_t stepValue = nextStepValue.fetch_add(256);
+    uint32_t stepValue = nextStepValue.fetch_add(4096);
     CHECK(stepValue < 0x10000000);
 
     QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();

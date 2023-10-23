@@ -104,7 +104,7 @@ extern "C" __global__ void local_reduce_scatter_exit() {
   uint32_t stepValue = globalStepValue;
   $copyDoneAllCode
   $waitForCopyDones
-  globalStepValue += 256;
+  globalStepValue += 4096;
 }
 
 extern "C" __global__ void reduce_scatter_entry() {
@@ -128,7 +128,7 @@ extern "C" __global__ void reduce_scatter_exit() {
   $waitForCopyDones
   //$waitForRecvs
 
-  globalStepValue += 256;
+  globalStepValue += 4096;
 }
 
   )zz",

@@ -276,7 +276,7 @@ void CpuThread::entry() {
       poll();
     };
 
-    // #define poll() debugPoll(__LINE__)
+#define poll() debugPoll(__LINE__)
 
     auto preSend = [&](Device& dev, size_t index, auto& wr) {
       while (dev.currentCqEntries == maxCqEntries) {
@@ -403,7 +403,7 @@ void CpuThread::entry() {
         IbvMr mr = ibv_reg_mr(
             devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!mr) {
-          fmt::printf("rank %d failed to CPU register %#x size %#x\n", group->rank, address, bytes);
+          fmt::printf("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
           perror("ibv_reg_mr");
           TORCH_CHECK(false);
         }
@@ -437,6 +437,11 @@ void CpuThread::entry() {
         // ptr->mr.mrs[i] = devices[i].ib->getMr(address, bytes);
         auto* mr = ibv_reg_mr(
             devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr) {
+          fmt::printf("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
+          perror("ibv_reg_mr");
+          TORCH_CHECK(false);
+        }
         localMrs.push_back(std::move(mr));
         ptr->mr.mrs[i] = mr;
         fmt::printf(
@@ -613,6 +618,7 @@ void CpuThread::entry() {
     int threadId = gettid();
 
     auto trace = [&](std::string name) {
+      fmt::printf("trace enter '%s'\n", name);
       // if (opCount < 1000 || opCount >= 1200) {
       if (!profilingEnabled) {
         if (!traceEvents.empty()) {
@@ -657,6 +663,8 @@ void CpuThread::entry() {
     };
 #define trace(name)
 
+    this->ready = true;
+
     while (true) {
 
       while (queueSize == 0) {
@@ -666,7 +674,7 @@ void CpuThread::entry() {
           sum += dev.currentCqEntries;
         }
         if (sum == 0) {
-          futexWait(&queueSize, 0, std::chrono::seconds(100));
+          futexWait(&queueSize, 0, std::chrono::seconds(10));
         }
       }
       --queueSize;

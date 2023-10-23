@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "common.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -93,9 +95,11 @@ struct Vector {
     return endptr;
   }
   T& operator[](size_t index) {
+    CHECK(index < msize);
     return beginptr[index];
   }
   const T& operator[](size_t index) const {
+    CHECK(index < msize);
     return beginptr[index];
   }
   void clear() {
@@ -158,7 +162,7 @@ struct Vector {
       }
     } else {
       move(begin, end, endptr);
-      for (auto* i = end; i != endptr; ++i) {
+      for (auto* i = endptr - n; i != endptr; ++i) {
         i->~T();
       }
       endptr -= n;
@@ -167,6 +171,12 @@ struct Vector {
       beginptr = storagebegin;
       endptr = beginptr;
     }
+  }
+  T* erase(T* at) {
+    size_t index = at - beginptr;
+    CHECK(index < msize);
+    erase(at, at + 1);
+    return beginptr + index;
   }
   void resize(size_t n) {
     if (msize > n) {
@@ -247,17 +257,21 @@ struct Vector {
     ++msize;
   }
   T& front() {
+    CHECK(msize > 0);
     return *beginptr;
   }
   T& back() {
+    CHECK(msize > 0);
     return endptr[-1];
   }
   void pop_back() {
+    CHECK(msize > 0);
     --endptr;
     --msize;
     endptr->~T();
   }
   void pop_front() {
+    CHECK(msize > 0);
     erase(beginptr, beginptr + 1);
   }
   T* insert(T* at, const T& value) {

@@ -342,7 +342,7 @@ extern "C" __global__ void allgather_exit() {
   $waitForCopyDones
   $waitForRecvs
 
-  globalStepValue += 256;
+  globalStepValue += 4096;
 }
 
 $copyDoneFunctions

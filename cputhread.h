@@ -99,6 +99,8 @@ struct CpuThread {
   std::atomic_uint32_t queueSize = 0;
   std::atomic_bool terminate = false;
 
+  std::atomic_bool ready = false;
+
   QueueEntryFreeList<QueueEntry> freelistTerminate;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
   QueueEntryFreeList<QueueEntryAllReduce> freelistAllReduce;

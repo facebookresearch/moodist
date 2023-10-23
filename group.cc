@@ -482,7 +482,7 @@ void Group::init() {
   for (size_t i = 0; i != size; ++i) {
     peerIpcAccess[i].resize(size);
     for (size_t n : peerIpcRanks[i]) {
-      TORCH_CHECK(std::find(peerIpcRanks[n].begin(), peerIpcRanks[n].end(), i) != peerIpcRanks[n].end());
+      CHECK(std::find(peerIpcRanks[n].begin(), peerIpcRanks[n].end(), i) != peerIpcRanks[n].end());
       peerIpcAccess[i][n] = true;
     }
   }
@@ -588,6 +588,9 @@ void Group::init() {
 
   // cpuThread takes over setupComms from here
   cpuThread->start();
+  while (!cpuThread->ready) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 AllocatedBuffer Group::allocateManaged(size_t bytes) {
