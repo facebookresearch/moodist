@@ -32,7 +32,8 @@ for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
-    ngpus = 8
+    #ngpus = 8
+    ngpus = 1
     for i in range(ngpus):
         os.environ["RANK"] = str(int(os.environ["SLURM_PROCID"]) * ngpus + i)
         os.environ["WORLD_SIZE"] = str(int(os.environ["SLURM_NTASKS"]) * ngpus)

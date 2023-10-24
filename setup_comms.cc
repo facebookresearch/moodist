@@ -21,15 +21,12 @@ struct SetupCommsImpl : SetupComms {
   Vector<BufferHandle> incomingData;
   std::atomic_uint32_t incomingDataCount = 0;
 
-  SetupCommsImpl(Group* group) {
-    this->group = group;
+  SetupCommsImpl(size_t rank, size_t size) : SetupComms(rank, size) {
 
-    const size_t rank = group->rank;
-
-    connections.resize(group->size);
+    connections.resize(size);
 
     myId = random<uint64_t>();
-    connectionIds.resize(group->size);
+    connectionIds.resize(size);
 
     if (rank == 0) {
       for (auto& addr : {"0.0.0.0:0", "[::]:0"}) {
@@ -41,10 +38,10 @@ struct SetupCommsImpl : SetupComms {
             if (error) {
               return;
             }
-            fmt::fprintf(
-                stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
-                connection->remoteAddress());
-            std::fflush(stdout);
+            // fmt::fprintf(
+            //     stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
+            //     connection->remoteAddress());
+            // std::fflush(stdout);
             std::lock_guard l(mutex);
             floatingConnections.push_back(connection);
             connection->read([this, connection](Error* e, BufferHandle data) {
@@ -77,8 +74,6 @@ struct SetupCommsImpl : SetupComms {
   }
 
   void waitForConnections() {
-    const size_t rank = group->rank;
-    const size_t size = group->size;
     std::unique_lock l(mutex);
     if (rank == 0) {
       for (size_t i = 0; i != size; ++i) {
@@ -104,10 +99,10 @@ struct SetupCommsImpl : SetupComms {
     if (!context.isReachable("no-loopback", address)) {
       return;
     }
-    fmt::printf("Connecting to: %s\n", address);
-    std::fflush(stdout);
+    // fmt::printf("Connecting to: %s\n", address);
+    // std::fflush(stdout);
     auto connection = context.connect(address);
-    auto buffer = serializeToBuffer(signature, myId, (uint32_t)group->rank, ~(uint32_t)0, std::string_view("connect"));
+    auto buffer = serializeToBuffer(signature, myId, (uint32_t)rank, ~(uint32_t)0, std::string_view("connect"));
     connection->write(std::move(buffer), nullptr);
 
     floatingConnections.push_back(connection);
@@ -115,8 +110,8 @@ struct SetupCommsImpl : SetupComms {
       if (!e) {
         onRead(std::move(data), connection);
       } else {
-        fmt::fprintf(stderr, "Socket read error: %s\n", e->what());
-        std::fflush(stderr);
+        // fmt::fprintf(stderr, "Socket read error: %s\n", e->what());
+        // std::fflush(stderr);
         connection->close();
       }
     });
@@ -131,11 +126,11 @@ struct SetupCommsImpl : SetupComms {
     uint32_t sourceRank;
     uint32_t destinationRank;
     auto view = deserializeBufferPart(data, sig, rankId, sourceRank, destinationRank);
-    if (sig != signature || sourceRank >= group->size) {
+    if (sig != signature || sourceRank >= size) {
       return;
     }
-    if (destinationRank != group->rank) {
-      if (group->rank == 0 && destinationRank < group->size) {
+    if (destinationRank != rank) {
+      if (rank == 0 && destinationRank < size) {
         if (connections[destinationRank]) {
           connections[destinationRank]->write(std::move(data), nullptr);
         }
@@ -144,8 +139,8 @@ struct SetupCommsImpl : SetupComms {
       }
       std::unique_lock l(mutex);
       if (!connections[sourceRank]) {
-        fmt::printf("Got new connection to rank %d (id %#x) (destination %d)\n", sourceRank, rankId, destinationRank);
-        std::fflush(stdout);
+        // fmt::printf("Got new connection to rank %d (id %#x) (destination %d)\n", sourceRank, rankId, destinationRank);
+        // std::fflush(stdout);
         connections[sourceRank] = connection;
         connectionIds[sourceRank] = rankId;
       }
@@ -158,8 +153,8 @@ struct SetupCommsImpl : SetupComms {
     }
     std::unique_lock l(mutex);
     if (!connections[sourceRank]) {
-      fmt::printf("Got new connection to rank %d (id %#x)\n", sourceRank, rankId);
-      std::fflush(stdout);
+      // fmt::printf("Got new connection to rank %d (id %#x)\n", sourceRank, rankId);
+      // std::fflush(stdout);
       connections[sourceRank] = connection;
       connectionIds[sourceRank] = rankId;
     }
@@ -206,8 +201,6 @@ struct SetupCommsImpl : SetupComms {
   std::vector<BufferHandle> allgatherBuffers;
   std::vector<std::string_view> allgatherResult;
   std::vector<std::string_view>& allgather(BufferHandle data) {
-    const size_t rank = group->rank;
-    const size_t size = group->size;
     for (size_t i = 0; i != size; ++i) {
       if (i == rank) {
         continue;
@@ -250,7 +243,7 @@ struct SetupCommsImpl : SetupComms {
     auto* ptr = data->data();
     std::memcpy(ptr, &signature, sizeof(uint64_t));
     std::memcpy(ptr + 8, &myId, sizeof(uint64_t));
-    uint32_t sourceRank = group->rank;
+    uint32_t sourceRank = rank;
     std::memcpy(ptr + 16, &sourceRank, sizeof(uint32_t));
     std::memcpy(ptr + 20, &destinationRank, sizeof(uint32_t));
     if (connections[destinationRank]) {
@@ -301,8 +294,8 @@ std::string_view SetupComms::recvBufferFrom(size_t rank) {
   return ((SetupCommsImpl*)this)->recvBufferFrom(rank);
 }
 
-std::unique_ptr<SetupComms> createSetupComms(Group* group) {
-  return std::make_unique<SetupCommsImpl>(group);
+std::unique_ptr<SetupComms> createSetupComms(size_t rank, size_t size) {
+  return std::make_unique<SetupCommsImpl>(rank, size);
 }
 
 } // namespace moodist

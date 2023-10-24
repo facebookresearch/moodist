@@ -552,49 +552,81 @@ void CpuThread::entry() {
     volatile uint32_t* cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
     volatile uint32_t* cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
 
-    fmt::printf("rank %d starting test!\n", rank);
-
     AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
-    auto* testMr = regMr((uintptr_t)testBuffer.cpuPointer, testBuffer.bytes);
-    auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cpuPointer, testMr);
-    uint64_t* testPtr = (uint64_t*)testBuffer.cpuPointer;
-    std::mt19937_64 rng;
-    rng.seed(rank);
-    for (size_t i = 0; i != 512; ++i) {
-      testPtr[512 * rank + i] = rng();
-    }
-    size_t remaining = 0;
-    for (size_t i = 0; i != size; ++i) {
-      if (i == rank) {
-        continue;
-      }
-      size_t offset = 512 * rank;
-      for (size_t di = 0; di != devices.size(); ++di) {
-        auto& dev = devices[di];
-        size_t n = 512 / devices.size();
-        ++remaining;
-        writeData(
-            dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
-            testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
-        offset += n;
-      }
-    }
-    while (remaining) {
-      poll();
-    }
-    setupComms->allgather(0);
-    for (size_t i = 0; i != size; ++i) {
-      rng.seed(i);
-      for (size_t j = 0; j != 512; ++j) {
-        uint64_t v = rng();
-        if (testPtr[512 * i + j] != v) {
-          fmt::printf("i %d j %d expected %#x, but got %#x\n", i, j, v, testPtr[512 * i + j]);
-        }
-        CHECK(testPtr[512 * i + j] == v);
-      }
-    }
+    for (size_t i = 0; i != 100; ++i) {
+      fmt::printf("rank %d starting CPU test %d!\n", rank, i);
 
-    fmt::printf("rank %d test done!\n", rank);
+      //AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
+      auto* testMr = regMr((uintptr_t)testBuffer.cpuPointer, testBuffer.bytes);
+      auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cpuPointer, testMr);
+      uint64_t* testPtr = (uint64_t*)testBuffer.cpuPointer;
+      std::mt19937_64 rng;
+      rng.seed(rank);
+      for (size_t i = 0; i != 512; ++i) {
+        testPtr[512 * rank + i] = rng();
+      }
+      size_t remaining = 0;
+      for (size_t i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        size_t offset = 512 * rank;
+        for (size_t di = 0; di != devices.size(); ++di) {
+          auto& dev = devices[di];
+          size_t n = 512 / devices.size();
+          ++remaining;
+          writeData(
+              dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
+              testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+          offset += n;
+        }
+      }
+      while (remaining) {
+        poll();
+      }
+      setupComms->allgather(0);
+      for (size_t i = 0; i != size; ++i) {
+        rng.seed(i);
+        for (size_t j = 0; j != 512; ++j) {
+          uint64_t v = rng();
+          if (testPtr[512 * i + j] != v) {
+            fmt::printf("i %d j %d expected %#x, but got %#x\n", i, j, v, testPtr[512 * i + j]);
+          }
+          CHECK(testPtr[512 * i + j] == v);
+        }
+      }
+
+      fmt::printf("rank %d CPU test done!\n", rank);
+    }
+    for (size_t i = 0; i != 100; ++i) {
+      fmt::printf("rank %d starting CUDA test %d!\n", rank, i);
+      AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
+      auto* testMr = regMrCuda((uintptr_t)testBuffer.cudaPointer, testBuffer.bytes);
+      auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cudaPointer, testMr);
+      uint64_t* testPtr = (uint64_t*)testBuffer.cudaPointer;
+      size_t remaining = 0;
+      for (size_t i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        size_t offset = 512 * rank;
+        for (size_t di = 0; di != devices.size(); ++di) {
+          auto& dev = devices[di];
+          size_t n = 512 / devices.size();
+          ++remaining;
+          writeData(
+              dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
+              testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+          offset += n;
+        }
+      }
+      while (remaining) {
+        poll();
+      }
+      setupComms->allgather(0);
+
+      fmt::printf("rank %d CUDA test done!\n", rank);
+    }
 
     AllocatedBuffer outDynsBuffer = group->allocateHost(sizeof(DynamicAddresses) * size);
     DynamicAddresses* outDyns = (DynamicAddresses*)outDynsBuffer.cpuPointer;

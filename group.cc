@@ -58,7 +58,7 @@ static std::string readBootId() {
 }
 
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
-  setupComms = createSetupComms(this);
+  setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
   cpuThread = std::make_unique<CpuThread>(this);
   kernels = std::make_unique<Kernels>(this);

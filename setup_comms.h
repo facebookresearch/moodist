@@ -7,9 +7,10 @@
 namespace moodist {
 
 struct SetupComms {
-  Group* group;
+  const size_t rank;
+  const size_t size;
 
-  SetupComms() {}
+  SetupComms(size_t rank, size_t size) : rank(rank), size(size) {}
   virtual ~SetupComms() {}
 
   void connect(std::string address);
@@ -21,8 +22,6 @@ struct SetupComms {
   template<typename T>
   std::vector<T> allgather(const T& v) {
     try {
-      const size_t rank = group->rank;
-      const size_t size = group->size;
       auto buffer = serializeToBuffer((uint64_t)0, (uint64_t)0, (uint32_t)0, (uint32_t)0, v);
       auto& outputList = allgather(std::move(buffer));
       std::vector<T> r;
@@ -64,6 +63,6 @@ struct SetupComms {
   }
 };
 
-std::unique_ptr<SetupComms> createSetupComms(Group* group);
+std::unique_ptr<SetupComms> createSetupComms(size_t rank, size_t size);
 
 } // namespace moodist
