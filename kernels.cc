@@ -339,7 +339,7 @@ __device__ void syncthreads() {
 
 )";
 
-  source += emitReduceFunction("float", 4, 2, "sum", reduceBlockSize);
+  //source += emitReduceFunction("float", 4, 2, "sum", reduceBlockSize);
 
   source += replace(
       R"(
@@ -381,13 +381,14 @@ extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
   source = autoindent(source);
   source = addLineCountComments(source);
 
+  std::string cuFilename = fmt::sprintf("moodist-kernels-rank%d.cu", rank);
+
   if (rank == 0 || true) {
-    std::string fn = fmt::sprintf("moodist-kernels-rank%d.cu", rank);
-    FILE* f = fopen(fn.c_str(), "wb");
+    FILE* f = fopen(cuFilename.c_str(), "wb");
     if (f) {
       fwrite(source.data(), source.size(), 1, f);
       fclose(f);
-      fmt::printf("source dumped to %s\n", fn);
+      fmt::printf("source dumped to %s\n", cuFilename);
     }
   }
 
@@ -414,6 +415,7 @@ extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
   options.push_back("--use_fast_math");
   options.push_back("--std=c++17");
   options.push_back("-lineinfo");
+  options.push_back("--relocatable-device-code=true");
   // options.push_back("--maxrregcount=32");
   //    options.push_back("-G");
   //     options.push_back("--dopt=on");
@@ -458,11 +460,21 @@ extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
     fmt::printf("compile log\n---\n%s\n", log);
   }
 
-  // size_t ptxSize = 0;
-  // CHECK_NVRTC(nvrtcGetPTXSize(program, &ptxSize));
-  // std::vector<char> ptx;
-  // ptx.resize(ptxSize);
-  // CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
+  size_t ptxSize = 0;
+  CHECK_NVRTC(nvrtcGetPTXSize(program, &ptxSize));
+  std::vector<char> ptx;
+  ptx.resize(ptxSize);
+  CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
+
+  if (rank == 0 || true) {
+    std::string fn = fmt::sprintf("moodist-kernels-rank%d-ptx.s", rank);
+    FILE* f = fopen(fn.c_str(), "wb");
+    if (f) {
+      fwrite(ptx.data(), ptx.size(), 1, f);
+      fclose(f);
+      fmt::printf("ptx dumped to %s\n", fn);
+    }
+  }
 
   // CHECK_NVRTC(nvrtcDestroyProgram(&program));
 
@@ -487,11 +499,29 @@ extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
 
   CHECK_NVRTC(nvrtcDestroyProgram(&program));
 
-  CHECK_CU(cuModuleLoadDataEx(&cuModule, cubin.data(), 0, nullptr, nullptr));
+  // CHECK_CU(cuModuleLoadDataEx(&cuModule, cubin.data(), 0, nullptr, nullptr));
+
+  // for (auto& v : functions) {
+  //   CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
+  // }
+
+  CUlinkState linkState;
+  CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
+  CHECK_CU(cuLinkAddFile(
+      linkState, CU_JIT_INPUT_LIBRARY, "/usr/local/cuda/targets/x86_64-linux/lib/libcudadevrt.a", 0, nullptr, nullptr));
+  CHECK_CU(cuLinkAddData(
+      linkState, CU_JIT_INPUT_CUBIN, cubin.data(), cubin.size(), cuFilename.c_str(), 0, nullptr, nullptr));
+  void* linkedCubin = nullptr;
+  size_t linkedCubinSize = 0;
+  CHECK_CU(cuLinkComplete(linkState, &linkedCubin, &linkedCubinSize));
+
+  CHECK_CU(cuModuleLoadDataEx(&cuModule, linkedCubin, 0, nullptr, nullptr));
 
   for (auto& v : functions) {
     CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
   }
+
+  CHECK_CU(cuLinkDestroy(linkState));
 }
 
 } // namespace moodist

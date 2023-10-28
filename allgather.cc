@@ -215,6 +215,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
   const auto& peerMyRemoteIndex = group->peerMyRemoteIndex;
   const auto& cpuInBuffer = group->cpuInBuffer;
   const auto& cpuOutBuffer = group->cpuOutBuffer;
+  const auto& peerIndices = group->peerIndices;
 
   const auto& cudaStepValue = group->cudaStepValue;
   const auto& peerCudaStepValue = group->peerCudaStepValue;
@@ -230,11 +231,18 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
         "$ptr", address, "$value", value);
   };
 
-  std::string writes;
+  std::string writes1;
+  std::string writes2;
   std::string waits;
   for (size_t i : group->peerIndices) {
     waits += waitFor32(cudaStepValue.cudaPointer + sizeof(uint32_t) * group->ipcRanks[i], "stepValue");
-    writes += replace(
+    writes1 += replace(
+        R"(
+      ((volatile uintptr_t*)$addrPtr)[0] = params.peerInputAddresses[$i];
+      ((volatile uintptr_t*)$addrPtr)[1] = params.peerOutputAddresses[$i];
+    )",
+        "$addrPtr", group->peerCudaPeerAddresses[i] + (sizeof(uintptr_t) * 2 * peerMyRemoteIndex[i]), "$i", i);
+    writes2 += replace(
         R"(
       *(volatile uint32_t*)$ptr = stepValue;
     )",
@@ -320,16 +328,218 @@ extern "C" __global__ void allgather_copy_done_$i() {
     prevRecvSource = pi.source;
   }
 
+  uint32_t gridSize = 128;
+  uint32_t blockSize = 512;
+
+  std::string localCopies;
+  localCopies += R"(
+    allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $rank), (const void*)params.inputAddress);
+  )";
+  for (size_t peerIndex : peerIndices) {
+    size_t i = ipcRanks[peerIndex];
+    localCopies += replace(
+        R"(
+      allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $i), *(const void**)$src);
+    )",
+        "$i", i, "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex));
+
+    // auto& peerAddrs = *group->peerAddrs;
+    // prev = builder.addCopy(prev, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+  }
+
+  std::string cases;
+  for (size_t i : peerIndices) {
+    size_t r = ipcRanks[i];
+
+    std::string wait = waitFor32(cudaStepValue.cudaPointer + sizeof(uint32_t) * group->ipcRanks[i], "stepValue");
+    std::string write1 = replace(
+        R"(
+      ((volatile uintptr_t*)$addrPtr)[0] = params.peerInputAddresses[$i];
+      ((volatile uintptr_t*)$addrPtr)[1] = params.peerOutputAddresses[$i];
+    )",
+        "$addrPtr", group->peerCudaPeerAddresses[i] + (sizeof(uintptr_t) * 2 * peerMyRemoteIndex[i]), "$i", i);
+    std::string write2 = replace(
+        R"(
+      *(volatile uint32_t*)$ptr = stepValue;
+    )",
+        "$ptr", peerCudaStepValue[i] + sizeof(uint32_t) * rank);
+
+    std::string copyDone = replace(
+        R"(
+  *(volatile uint32_t*)$ptr = stepValue;
+      )",
+        "$ptr", peerCudaCopyDone[i] + sizeof(uint32_t) * peerMyRemoteIndex[i]);
+    std::string waitForCopyDone = replace(
+        R"(
+  while (*(volatile uint32_t*)$ptr < stepValue);
+      )",
+        "$ptr", cudaCopyDone.cudaPointer + sizeof(uint32_t) * i);
+
+    cases += replace(
+        R"(
+    case $i: {
+      $write1
+      __threadfence_system();
+      $write2
+      $wait
+
+      allgather_copy_kernel<<<$gridSize, $blockSize, 0, stream>>>((void*)(params.outputAddress + params.bytes * $r), *(const void**)$src, params.bytes);
+
+      $copyDone
+      $waitForCopyDone
+      break;
+    }
+    )",
+        "$i", i, "$r", r, "$write1", write1, "$write2", write2, "$wait", wait, "$copyDone", copyDone,
+        "$waitForCopyDone", waitForCopyDone, "$src",
+        group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * i));
+  }
+
+  std::string localMemcpys;
+  localMemcpys += R"(
+    cudaMemcpyAsync((void*)(params.outputAddress + params.bytes * $rank), (const void*)params.inputAddress, params.bytes, cudaMemcpyDeviceToDevice, 0);
+  )";
+  for (size_t peerIndex : peerIndices) {
+    size_t i = ipcRanks[peerIndex];
+    localMemcpys += replace(
+        R"(
+      cudaMemcpyAsync((void*)(params.outputAddress + params.bytes * $i), *(const void**)$src, params.bytes, cudaMemcpyDeviceToDevice, 0);
+    )",
+        "$i", i, "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex));
+
+    // auto& peerAddrs = *group->peerAddrs;
+    // prev = builder.addCopy(prev, outputAddress + bytes * ipcRanks[i], peerAddrs[i].inputAddress, bytes);
+  }
+
+  std::string recvCopies;
+  prevRecvSource = -1;
+  CHECK(proxyInfo.size() == proxyDestinationInfo.size());
+  for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
+    auto& pi = proxyInfo[i];
+    auto& pdi = proxyDestinationInfo[i];
+
+    if (prevRecvSource != pi.source) {
+      recvCopies += waitForRecv(pi.source, Group::dataChunks - 1);
+      prevRecvSource = pi.source;
+    }
+
+    recvCopies += replace(
+        R"(
+      *(volatile uint32_t*)$forwardPtr = stepValue + $c;
+      while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+      allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $source), (void*)(*(uintptr_t*)$src + params.bytes * $source));
+    )",
+        "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
+        Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$source",
+        pdi.source, "$src",
+        group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)));
+
+    // auto stream = group->stream;
+    // auto& peerAddrs = *group->peerAddrs;
+    // size_t chunkSize = std::max(bytes / Group::dataChunks, (size_t)(1024 * 1024));
+    // size_t offset = 0;
+    // for (size_t c = 0; c != Group::dataChunks; ++c) {
+    //   size_t nbytes = std::min(bytes - offset, chunkSize);
+    //   if (nbytes > 0) {
+    //     // if (true) {
+    //     if (false) {
+    //       prev = builder.addKernel(prev, allGather.cuAllgatherWaitForProxy.at(n).at(c));
+    //     } else {
+    //       // for debugging, it can be useful to split the wait for proxy kernel into two parts
+    //       prev = builder.addKernel(prev, allGather.cuAllgatherWaitForRecvForward.at(n).at(c));
+    //       prev = builder.addKernel(prev, allGather.cuAllgatherWaitForReady.at(n).at(c));
+    //     }
+    //     prev = builder.addCopy(
+    //         prev, outputAddress + bytes * source + offset, peerAddrs[i].outputAddress + bytes * source + offset,
+    //         nbytes);
+    //   }
+    //   offset += nbytes;
+    // }
+  }
+
   std::string source = replace(
       R"zz(
 
-extern "C" __global__ void allgather_entry() {
+struct AllGatherParameters {
+  size_t bytes;
+  uintptr_t inputAddress;
+  uintptr_t outputAddress;
+  uintptr_t peerInputAddresses[8];
+  uintptr_t peerOutputAddresses[8];
+};
+
+template<typename T>
+__device__ void allgather_copy_impl_impl(T* dstp, const T* srcp, size_t numel) {
+  size_t blockIndex = blockIdx.x;
+  size_t threadIndex = threadIdx.x;
+  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+    dstp[i] = srcp[i];
+  }
+}
+
+__device__ void allgather_copy_impl(void* dst, const void* src, size_t bytes) {
+  static_assert(sizeof(uint4) == 16);
+  size_t offset = 0;
+  if (((uintptr_t)dst % 16 == 0) && ((uintptr_t)src % 16 == 0)) {
+    allgather_copy_impl_impl((uint4*)dst, (const uint4*)src, bytes / 16);
+    offset += bytes / 16 * 16;
+  } else {
+    assert(((uintptr_t)dst % 4 == 0));
+    assert(((uintptr_t)src % 4 == 0));
+    allgather_copy_impl_impl((uint32_t*)dst, (const uint32_t*)src, bytes / 4);
+    offset += bytes / 4 * 4;
+  }
+
+  if (blockIdx.x * $blockSize + threadIdx.x < bytes - offset) {
+    char* dstp = (char*)dst + offset + blockIdx.x * $blockSize + threadIdx.x;
+    char* srcp = (char*)src + offset + blockIdx.x * $blockSize + threadIdx.x;
+    *dstp = *srcp;
+  }
+}
+
+constexpr size_t copyQueueSize = 16;
+struct AllGatherCopyParameters {
+  size_t bytes;
+  const void* src[copyQueueSize];
+  void* dst[copyQueueSize];
+  uint32_t n;
+};
+
+__global__ void allgather_copy_kernel(AllGatherCopyParameters params) {
+  assert(params.n > 0);
+  assert(params.n <= copyQueueSize);
+#pragma unroll 1
+  for (uint32_t i = 0; i != params.n; ++i) {
+    syncthreads();
+    allgather_copy_impl((void*)params.dst[i], params.src[i], params.bytes);
+  }
+}
+
+__device__ void allgather_copy_flush(AllGatherCopyParameters& params) {
+  if (params.n) {
+    // work around compiler bug
+    AllGatherCopyParameters params2;
+    memcpy(&params2, &params, sizeof(params2));
+    allgather_copy_kernel<<<$gridSize, $blockSize>>>(params2);
+    params.n = 0;
+  }
+}
+
+__device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, const void* src) {
+  params.dst[params.n] = dst;
+  params.src[params.n] = src;
+  ++params.n;
+  if (params.n == copyQueueSize) {
+    allgather_copy_flush(params);
+  }
+}
+
+extern "C" __global__ void allgather_local_exit() {
   uint32_t stepValue = globalStepValue;
-  // printf("enter %#x\n", stepValue);
-  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
-  cpuIn[0] = stepValue;
-  $writes
-  $waits
+  $copyDoneAllCode
+  $waitForCopyDones
+
+  globalStepValue += 4096;
 }
 
 extern "C" __global__ void allgather_exit() {
@@ -345,19 +555,55 @@ extern "C" __global__ void allgather_exit() {
   globalStepValue += 4096;
 }
 
-$copyDoneFunctions
 
-extern "C" __global__ void allgather_copy_all_done() {
+extern "C" __global__ void allgather_local(AllGatherParameters params) {
   uint32_t stepValue = globalStepValue;
-  $copyDoneAllCode
+  $writes1
+  __threadfence_system();
+  $writes2
+  $waits
+
+  AllGatherCopyParameters copies;
+  copies.bytes = params.bytes;
+  copies.n = 0;
+
+  $localCopies
+
+  allgather_copy_flush(copies);
+
+  allgather_local_exit<<<1, 1>>>();
 }
 
-$waitForProxyFunctions
+extern "C" __global__ void allgather(AllGatherParameters params) {
+  uint32_t stepValue = globalStepValue;
+  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+  cpuIn[0] = stepValue;
+  $writes1
+  __threadfence_system();
+  $writes2
+  $waits
+
+  AllGatherCopyParameters copies;
+  copies.bytes = params.bytes;
+  copies.n = 0;
+
+  $localCopies
+
+  $recvCopies
+
+  allgather_copy_flush(copies);
+
+  allgather_exit<<<1, 1>>>();
+}
+
 
   )zz",
-      "$writes", writes, "$waits", waits, "$copyDoneFunctions", copyDoneFunctions, "$waitForCopyDones",
-      waitForCopyDones, "$waitForRecvs", waitForRecvs, "$copyDoneAllCode", copyDoneAllCode, "$waitForProxyFunctions",
-      waitForProxyFunctions);
+      "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$copyDoneFunctions", copyDoneFunctions,
+      "$waitForCopyDones", waitForCopyDones, "$waitForRecvs", waitForRecvs, "$copyDoneAllCode", copyDoneAllCode,
+      "$waitForProxyFunctions", waitForProxyFunctions, "$localCopies", localCopies, "$cases", cases, "$localMemcpys",
+      localMemcpys, "$recvCopies", recvCopies);
+
+  source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize);
 
   // if (rank == 0) {
   //   fmt::printf("code\n----\n%s\n", source);
@@ -367,35 +613,38 @@ $waitForProxyFunctions
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
-  fn(cuAllgatherEntry, "allgather_entry");
-  fn(cuAllgatherExit, "allgather_exit");
+  // fn(cuAllgatherEntry, "allgather_entry");
+  // fn(cuAllgatherExit, "allgather_exit");
 
-  for (size_t i : group->peerIndices) {
-    fn(cuAllgatherCopyDone[i], replace("allgather_copy_done_$i", "$i", i));
-  }
-  fn(cuAllgatherCopyAllDone, "allgather_copy_all_done");
+  // for (size_t i : group->peerIndices) {
+  //   fn(cuAllgatherCopyDone[i], replace("allgather_copy_done_$i", "$i", i));
+  // }
+  // fn(cuAllgatherCopyAllDone, "allgather_copy_all_done");
 
-  cuAllgatherWaitForProxy.resize(proxyDestinationInfo.size());
-  for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-    cuAllgatherWaitForProxy[i].resize(Group::dataChunks);
-    for (size_t c = 0; c != Group::dataChunks; ++c) {
-      fn(cuAllgatherWaitForProxy[i][c], replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c));
-    }
-  }
+  // cuAllgatherWaitForProxy.resize(proxyDestinationInfo.size());
+  // for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
+  //   cuAllgatherWaitForProxy[i].resize(Group::dataChunks);
+  //   for (size_t c = 0; c != Group::dataChunks; ++c) {
+  //     fn(cuAllgatherWaitForProxy[i][c], replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c));
+  //   }
+  // }
 
-  cuAllgatherWaitForRecvForward.resize(proxyDestinationInfo.size());
-  cuAllgatherWaitForReady.resize(proxyDestinationInfo.size());
-  for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-    cuAllgatherWaitForRecvForward[i].resize(Group::dataChunks);
-    cuAllgatherWaitForReady[i].resize(Group::dataChunks);
-    size_t recvSource = proxyInfo[i].source;
-    for (size_t c = 0; c != Group::dataChunks; ++c) {
-      fn(cuAllgatherWaitForRecvForward[i][c],
-         replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source));
-      fn(cuAllgatherWaitForReady[i][c],
-         replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c));
-    }
-  }
+  // cuAllgatherWaitForRecvForward.resize(proxyDestinationInfo.size());
+  // cuAllgatherWaitForReady.resize(proxyDestinationInfo.size());
+  // for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
+  //   cuAllgatherWaitForRecvForward[i].resize(Group::dataChunks);
+  //   cuAllgatherWaitForReady[i].resize(Group::dataChunks);
+  //   size_t recvSource = proxyInfo[i].source;
+  //   for (size_t c = 0; c != Group::dataChunks; ++c) {
+  //     fn(cuAllgatherWaitForRecvForward[i][c],
+  //        replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source));
+  //     fn(cuAllgatherWaitForReady[i][c],
+  //        replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c));
+  //   }
+  // }
+
+  fn(cuAllGatherLocal, "allgather_local");
+  fn(cuAllGather, "allgather");
 
   return std::make_pair(source, functions);
 }

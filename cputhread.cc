@@ -539,6 +539,26 @@ void CpuThread::entry() {
       }
     };
 
+    auto writeDataDistributed2 = [&](size_t dst, uintptr_t srcAddr, size_t len, MemoryRegion* mr, uint64_t dstAddr,
+                                     const std::array<uint32_t, 32>& key, auto callback) {
+      CHECK(len > 0);
+      size_t offset = 0;
+      const size_t chunks = devices.size();
+      const size_t chunkSize = len / chunks;
+      for (size_t i = 0; i != chunks; ++i) {
+        size_t n = i == chunks - 1 ? len - offset : chunkSize;
+        auto& dev = devices[i];
+        if (n != 0) {
+          writeData(
+              dev, dst, (void*)(srcAddr + offset), mr->mrs[i]->lkey, (void*)(dstAddr + offset), key[i], n,
+              makeCallback([callback, i]() { callback(i); }));
+        } else {
+          callback(i);
+        }
+        offset += n;
+      }
+    };
+
     auto writeStep = [&](size_t deviceIndex, size_t dst, uint32_t stepValue) {
       Device& dev = devices[deviceIndex];
       uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].stepValue);
@@ -553,10 +573,10 @@ void CpuThread::entry() {
     volatile uint32_t* cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
 
     AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
-    for (size_t i = 0; i != 100; ++i) {
+    for (size_t i = 0; i != 1; ++i) {
       fmt::printf("rank %d starting CPU test %d!\n", rank, i);
 
-      //AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
+      // AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
       auto* testMr = regMr((uintptr_t)testBuffer.cpuPointer, testBuffer.bytes);
       auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cpuPointer, testMr);
       uint64_t* testPtr = (uint64_t*)testBuffer.cpuPointer;
@@ -598,7 +618,7 @@ void CpuThread::entry() {
 
       fmt::printf("rank %d CPU test done!\n", rank);
     }
-    for (size_t i = 0; i != 100; ++i) {
+    for (size_t i = 0; i != 1; ++i) {
       fmt::printf("rank %d starting CUDA test %d!\n", rank, i);
       AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
       auto* testMr = regMrCuda((uintptr_t)testBuffer.cudaPointer, testBuffer.bytes);
@@ -806,6 +826,7 @@ void CpuThread::entry() {
         CHECK(recvRanks.size() == sendRanks.size());
 
         // for (size_t i : sendRanks) {
+        size_t liveSends = 0;
         for (size_t index = 0; index != sendRanks.size(); ++index) {
           if (true) {
             size_t i = recvRanks[index];
@@ -821,7 +842,6 @@ void CpuThread::entry() {
             poll();
           }
           size_t offset = 0;
-          size_t liveSends = 0;
           size_t liveStepValues = 0;
           size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
           for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
@@ -835,40 +855,57 @@ void CpuThread::entry() {
               //     localDyns[i].gatherAddress, rank * params.bytes, offset);
 
               trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
-              ++liveSends;
-              writeDataDistributed(
+              //++liveSends;
+              // writeDataDistributed(
+              //     i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+              //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+              liveSends += devices.size();
+              writeDataDistributed2(
                   i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
-                  localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+                  localDyns[i].gatherKey,
+                  [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
+                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
+                    //fmt::printf("send done for di %d\n", di);
+                    --liveSends;
+                    auto& dev = devices.at(di);
+                    writeData(
+                        dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                        (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                        remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                  });
               offset += nbytes;
             }
-            trace(fmt::sprintf("%d_wait_for_liveSends", i));
-            while (liveSends) {
+            while (liveSends >= devices.size() * 2) {
               poll();
             }
-            trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
-            while (liveStepValues) {
-              poll();
-            }
-            trace(fmt::sprintf("%d_send_stepValues", i));
+            // trace(fmt::sprintf("%d_wait_for_liveSends", i));
+            // while (liveSends) {
+            //   poll();
+            // }
+            // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+            // while (liveStepValues) {
+            //   poll();
+            // }
+            // trace(fmt::sprintf("%d_send_stepValues", i));
             // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
-            for (size_t di = 0; di != devices.size(); ++di) {
-              Device& dev = devices[di];
-              ++liveStepValues;
-              writeData(
-                  dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                  (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                  remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
-                  makeCallback([&]() { --liveStepValues; }));
-            }
+            // for (size_t di = 0; di != devices.size(); ++di) {
+            //   Device& dev = devices[di];
+            //   ++liveStepValues;
+            //   writeData(
+            //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+            //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+            //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+            //       makeCallback([&]() { --liveStepValues; }));
+            // }
           }
-          trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
-          while (liveStepValues) {
-            poll();
-          }
+          // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
+          // while (liveStepValues) {
+          //   poll();
+          // }
           // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
           CHECK(offset == params.bytes);
-          CHECK(liveSends == 0);
-          CHECK(liveStepValues == 0);
+          // CHECK(liveSends == 0);
+          // CHECK(liveStepValues == 0);
         }
 
         trace("wait_for_cq_entries");

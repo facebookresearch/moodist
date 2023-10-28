@@ -6,8 +6,8 @@
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "setup_comms.h"
 #include "reduce_scatter.h"
+#include "setup_comms.h"
 
 #include <algorithm>
 #include <cstring>
@@ -88,7 +88,7 @@ void Group::init() {
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   fmt::printf("device async engines: %d\n", asyncEngines);
 
-  //CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+  // CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
   CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
 
   // // temporaryBuffer = allocateDevice(temporaryBytes);
@@ -567,6 +567,9 @@ void Group::init() {
 
   cudaStepValue = allocateDevice(sizeof(uint64_t) * size);
   mapPeerAddrs(cudaStepValue, peerCudaStepValue);
+
+  cudaPeerAddresses = allocateDevice(sizeof(uintptr_t) * 2 * size);
+  mapPeerAddrs(cudaPeerAddresses, peerCudaPeerAddresses);
 
   cudaCommsDeviceDataSent = allocateDevice(sizeof(uint32_t) * size * 32);
 

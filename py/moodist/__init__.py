@@ -57,7 +57,7 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         # return self.moodist.allgather(*args, **kwargs)
 
     def _allgather_base(self, *args, **kwargs):
-        print("size %d _allgather_base %s" % (self.size(), find_tensors(args)))
+        # print("size %d _allgather_base %s" % (self.size(), find_tensors(args)))
         # return self.nccl._allgather_base(*args, **kwargs)
         return self.moodist._allgather_base(*args, **kwargs)
 
@@ -79,8 +79,8 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         return self.nccl.reduce_scatter(*args, **kwargs)
 
     def _reduce_scatter_base(self, *args, **kwargs):
-        print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
-        return self.moodist._reduce_scatter_base(*args, **kwargs)
+        # print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
+        return self.nccl._reduce_scatter_base(*args, **kwargs)
 
     def alltoall_base(self, *args, **kwargs):
         print("size %d alltoall_base %s" % (self.size(), find_tensors(args)))

@@ -32,16 +32,6 @@ struct QueueEntryAllGather : QueueEntry {
 
   std::array<uintptr_t, 8> peerInputAddresses;
   std::array<uintptr_t, 8> peerOutputAddresses;
-  std::vector<uintptr_t> proxyIpcOutputAddresses;
-
-  std::vector<uintptr_t> proxyIpcOutputAddresses2;
-
-  std::atomic_size_t inputBytesReady = 0;
-
-  uintptr_t cpuInput = 0;
-  uintptr_t cpuOutput = 0;
-
-  std::atomic_uint32_t threadStepValue = 0;
 };
 
 struct QueueEntryAllReduce : QueueEntry {

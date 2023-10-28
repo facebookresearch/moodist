@@ -58,6 +58,9 @@ struct Group {
   AllocatedBuffer cudaStepValue;
   std::array<uintptr_t, 8> peerCudaStepValue;
 
+  AllocatedBuffer cudaPeerAddresses;
+  std::array<uintptr_t, 8> peerCudaPeerAddresses;
+
   AllocatedBuffer cudaCommsDeviceDataSent;
 
   AllocatedBuffer cudaProxyReady;

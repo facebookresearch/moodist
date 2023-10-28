@@ -25,6 +25,7 @@ if "LOCAL_RANK" not in os.environ:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
+os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
 def f(n):
     import torch
@@ -94,8 +95,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
-        # data = torch.randn(1024 * 1024 * 64).cuda() + 1
+        #data = torch.randn(1024 * 1024 * 256).cuda() + 1
         data = torch.randn(263520).cuda() + 1
+        #data = torch.randn(1027).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -138,7 +140,7 @@ def f(n):
         print("result0 is at %#x" % result0.data_ptr())
 
         for _ in range(100):
-            print("rank %d warmup %d" % (rank, _))
+            #print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
             result0 -= 1
@@ -183,12 +185,12 @@ def f(n):
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         raise RuntimeError("%d: wrong result for index %d" % (rank, i))
             torch.cuda.synchronize()
-            print("rank %d warmup %d done" % (rank, _))
+            #print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
         print("rank %d warmup done" % (rank))
 
-        if True:
+        if False:
             tmpz = []
             for x in range(10):
                 print("rank %d enter test2 %d\n" % (rank, x))
@@ -522,8 +524,8 @@ def f(n):
     # diff = data - correct
     # print(diff.abs().max())
 
-if len(sys.argv) < 2:
-    f("moodist")
+if len(sys.argv) < 3:
+    f(sys.argv[1])
     sys.exit(0)
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):

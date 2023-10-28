@@ -9,6 +9,13 @@
 
 namespace moodist {
 
+struct AllGatherParameters {
+  size_t bytes;
+  uintptr_t inputAddress;
+  uintptr_t outputAddress;
+  std::array<uintptr_t, 8> peerInputAddresses;
+  std::array<uintptr_t, 8> peerOutputAddresses;
+};
 
 struct AllGather : CollectiveBase {
 
@@ -26,6 +33,9 @@ struct AllGather : CollectiveBase {
 
   std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecvForward{};
   std::vector<std::vector<CUfunction>> cuAllgatherWaitForReady{};
+
+  CUfunction cuAllGatherLocal = nullptr;
+  CUfunction cuAllGather = nullptr;
 
   AllGather(Group* group);
   ~AllGather();
