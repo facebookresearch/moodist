@@ -21,10 +21,6 @@ struct Kernels : CollectiveBase {
   void compile();
 
   std::string emitReduceFunction(std::string type, size_t typesize, size_t nsources, std::string op, size_t blockSize);
-
-  CUfunction cuReduce = nullptr;
-  size_t reduceGridSize = 0;
-  size_t reduceBlockSize = 0;
 };
 
 } // namespace moodist

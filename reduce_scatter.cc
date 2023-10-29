@@ -39,6 +39,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   const auto& peerMyRemoteIndex = group->peerMyRemoteIndex;
   const auto& cpuInBuffer = group->cpuInBuffer;
   const auto& cpuOutBuffer = group->cpuOutBuffer;
+  const auto& peerIndices = group->peerIndices;
 
   const auto& cudaStepValue = group->cudaStepValue;
   const auto& peerCudaStepValue = group->peerCudaStepValue;
@@ -65,120 +66,231 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
     return s;
   };
 
-  std::string writes;
-  std::string waits;
-  for (size_t i : group->peerIndices) {
-    waits += waitFor32(cudaStepValue.cudaPointer + sizeof(uint32_t) * group->ipcRanks[i], "stepValue");
-    writes += replace(
-        R"(
-      *(volatile uint32_t*)$ptr = stepValue;
-    )",
-        "$ptr", peerCudaStepValue[i] + sizeof(uint32_t) * rank);
-  }
+  std::string reduceCode;
 
-  std::string copyDoneAllCode;
-  std::string waitForCopyDones;
-  for (size_t i : group->peerIndices) {
-    copyDoneAllCode += replace(
-        R"(
-  *(volatile uint32_t*)$ptr = stepValue;
+  std::unordered_map<std::string, bool> dstVisited;
+  std::string prevReduceDst;
+  std::string prevReduceSrc;
+  auto reduceFlush = [&]() {
+    if (prevReduceDst != "" && prevReduceSrc != "") {
+      reduceCode +=
+          replace("reduce_add<T>(reduces, $dst, $src, nullptr);\n", "$dst", prevReduceDst, "$src", prevReduceSrc);
+    }
+    prevReduceSrc = "";
+    prevReduceDst = "";
+  };
+  auto reduceAdd = [&](std::string dst, std::string src) {
+    std::string r;
+    if (dst != prevReduceDst) {
+      reduceFlush();
+      if (dstVisited[dst]) {
+        reduceCode += replace("reduce_add<T>(reduces, $dst, $dst, $src);\n", "$dst", dst, "$src", src);
+      } else {
+        prevReduceDst = dst;
+        prevReduceSrc = src;
+        dstVisited[dst] = true;
+      }
+    } else {
+      if (prevReduceSrc == "") {
+        reduceCode += replace("reduce_add<T>(reduces, $dst, $dst, $src);\n", "$dst", dst, "$src", src);
+      } else {
+        reduceCode +=
+            replace("reduce_add<T>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", prevReduceSrc, "$src2", src);
+        prevReduceSrc = "";
+      }
+    }
+  };
+
+  auto addLocals = [&]() {
+    reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.bytes * $rank)");
+    for (size_t peerIndex : peerIndices) {
+      size_t i = ipcRanks[peerIndex];
+      reduceAdd(
+          "(T*)params.outputAddress", replace(
+                                          "(const T*)(*(uintptr_t*)$src + params.bytes * $rank)", "$src",
+                                          group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
+    }
+  };
+
+  if (recvRanks.empty()) {
+    addLocals();
+  } else {
+    auto addRecv = [&](size_t n) {
+      reduceCode += replace(
+          R"(
+        reduce_flush<T>(reduces);
+        reduce_scatter_wait_for_recv_$n<<<1, 1>>>();
+        )",
+          "$n", n);
+      reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.bytes * $n)", "$n", n));
+    };
+
+    size_t n = 0;
+    for (size_t i : sendRanks) {
+      std::string addr = replace("(T*)(params.sendAddress + params.bytes * $n)", "$n", n);
+      reduceAdd(addr, replace("(const T*)(params.inputAddress + params.bytes * $i)", "$i", i));
+      for (size_t peerIndex : peerIndices) {
+        reduceAdd(
+            addr, replace(
+                      "(const T*)(*(uintptr_t*)$src + params.bytes * $i)", "$i", i, "$src",
+                      group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
+      }
+
+      reduceFlush();
+      reduceCode += replace(
+          R"(
+        reduce_flush<T>(reduces);
+        reduce_scatter_send_ready<<<1, 1>>>(stepValue + $n + 1);
       )",
-        "$ptr", peerCudaCopyDone[i] + sizeof(uint32_t) * peerMyRemoteIndex[i]);
-    waitForCopyDones += replace(
+          "$n", n);
+
+      if (n != 0) {
+        addRecv(n - 1);
+      }
+
+      ++n;
+    }
+    addLocals();
+    addRecv(n - 1);
+  }
+  reduceFlush();
+
+  std::string waitFunctions;
+  for (size_t n = 0; n != recvRanks.size(); ++n) {
+    waitFunctions += replace(
         R"(
-  while (*(volatile uint32_t*)$ptr < stepValue);
-      )",
-        "$i", i, "$ptr", cudaCopyDone.cudaPointer + sizeof(uint32_t) * i);
+      __global__ void reduce_scatter_wait_for_recv_$n() {
+        uint32_t stepValue = globalStepValue;
+        $code
+      }
+    )",
+        "$code", waitForRecv(recvRanks.at(n), Group::dataChunks - 1), "$n", n);
   }
 
   std::string source = replace(
       R"zz(
 
-extern "C" __global__ void local_reduce_scatter_entry() {
-  uint32_t stepValue = globalStepValue;
-  $writes
-  $waits
+constexpr size_t reduceQueueSize = 16;
+struct ReduceParameters {
+  size_t bytes;
+  const void* src1[reduceQueueSize];
+  const void* src2[reduceQueueSize];
+  void* dst[reduceQueueSize];
+  uint32_t n;
+};
+
+template<typename T>
+__global__ void reduce_kernel(ReduceParameters params) {
+  assert(params.n > 0);
+  assert(params.n <= reduceQueueSize);
+#pragma unroll 1
+  for (uint32_t i = 0; i != params.n; ++i) {
+    syncthreads();
+    if (params.src1[i] == params.dst[i]) {
+      reduce_sum((T*)params.dst[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+    } else if (params.src2[i] != nullptr) {
+      reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+    } else {
+      copy_impl(params.dst[i], params.src1[i], params.bytes);
+    }
+  }
 }
 
-extern "C" __global__ void local_reduce_scatter_exit() {
-  uint32_t stepValue = globalStepValue;
-  $copyDoneAllCode
-  $waitForCopyDones
-  globalStepValue += 4096;
+__global__ void reduce_scatter_send_ready(uint32_t value) {
+  $cpuIn[1] = value;
 }
 
-extern "C" __global__ void reduce_scatter_entry() {
-  uint32_t stepValue = globalStepValue;
-  // printf("enter %#x\n", stepValue);
-  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
-  cpuIn[0] = stepValue;
-  $writes
-  $waits
+$waitFunctions
+
+template<typename T>
+__device__ void reduce_flush(ReduceParameters& params) {
+  if (params.n) {
+    // work around compiler bug
+    ReduceParameters params2;
+    memcpy(&params2, &params, sizeof(params2));
+    reduce_kernel<T><<<$gridSize, $blockSize>>>(params2);
+    params.n = 0;
+  }
+}
+
+template<typename T>
+__device__ void reduce_add(ReduceParameters& params, void* dst, const void* src1, const void* src2) {
+  params.dst[params.n] = dst;
+  params.src1[params.n] = src1;
+  params.src2[params.n] = src2;
+  ++params.n;
+  if (params.n == reduceQueueSize) {
+    reduce_flush<T>(params);
+  }
+}
+
+struct ReduceScatterParameters {
+  size_t bytes;
+  uintptr_t inputAddress;
+  uintptr_t outputAddress;
+  uintptr_t peerInputAddresses[8];
+  uintptr_t peerOutputAddresses[8];
+  uintptr_t sendAddress;
+  uintptr_t recvAddress;
+};
+
+extern "C" __global__ void reduce_scatter_local_exit() {
+  generic_exit_local();
+}
+
+__device__ void reduce_scatter_impl(ReduceScatterParameters& params) {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  ReduceParameters reduces;
+  reduces.bytes = params.bytes;
+  reduces.n = 0;
+
+  using T = float;
+
+  $reduceCode
+
+  reduce_flush<T>(reduces);
+
+  reduce_scatter_local_exit<<<1, 1>>>();
+}
+
+extern "C" __global__ void reduce_scatter_local(ReduceScatterParameters params) {
+  generic_entry_local(params);
+  reduce_scatter_impl(params);
 }
 
 extern "C" __global__ void reduce_scatter_exit() {
-  uint32_t stepValue = globalStepValue;
-  $copyDoneAllCode
-  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
-  volatile uint32_t* __restrict__ cpuOut = $cpuOut;
-  cpuIn[2] = 0;
-  cpuIn[1] = 0;
-  cpuIn[0] = stepValue + 1;
-  while (cpuOut[0] < stepValue);
-  $waitForCopyDones
-  //$waitForRecvs
+  generic_exit();
+}
 
-  globalStepValue += 4096;
+extern "C" __global__ void reduce_scatter(ReduceScatterParameters params) {
+  generic_entry(params);
+  reduce_scatter_impl(params);
 }
 
   )zz",
-      "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",
-      cast("volatile uint32_t*", cpuInBuffer.cudaPointer), "$writes", writes, "$waits", waits, "$waitForCopyDones",
-      waitForCopyDones, "$copyDoneAllCode", copyDoneAllCode);
-
-  for (size_t n = 0; n != sendRanks.size(); ++n) {
-    size_t i = sendRanks[n];
-    source += replace(
-        R"(
-extern "C" __global__ void reduce_scatter_send_ready_$n() {
-  //printf("$rank: send ready $i $n !\n");
-  $cpuIn[1] = $n + 1;
-}
-    )",
-        "$n", n, "$i", i);
-  }
-  for (size_t n = 0; n != recvRanks.size(); ++n) {
-    size_t i = recvRanks[n];
-    source += replace(
-        R"(
-extern "C" __global__ void reduce_scatter_wait_for_recv_$i_$n() {
-  //printf("$rank: enter wait for recv $i $n\n");
-  uint32_t stepValue = globalStepValue;
-  $wait
-  //printf("$rank: leave wait for recv $i $n\n");
-}
-    )",
-        "$n", n, "$i", i, "$wait", waitForRecv(i, Group::dataChunks - 1));
-  }
+      "$reduceCode", reduceCode, "$waitFunctions", waitFunctions);
 
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
-  fn(cuLocalReduceScatterEntry, "local_reduce_scatter_entry");
-  fn(cuLocalReduceScatterExit, "local_reduce_scatter_exit");
-  fn(cuReduceScatterEntry, "reduce_scatter_entry");
-  fn(cuReduceScatterExit, "reduce_scatter_exit");
+  // fn(cuLocalReduceScatterEntry, "local_reduce_scatter_entry");
+  // fn(cuLocalReduceScatterExit, "local_reduce_scatter_exit");
+  // fn(cuReduceScatterEntry, "reduce_scatter_entry");
+  // fn(cuReduceScatterExit, "reduce_scatter_exit");
 
-  cuSendReady.resize(sendRanks.size());
-  for (size_t n = 0; n != sendRanks.size(); ++n) {
-    fn(cuSendReady[n], replace("reduce_scatter_send_ready_$n", "$n", n));
-  }
-  cuWaitForRecv.resize(recvRanks.size());
-  for (size_t n = 0; n != recvRanks.size(); ++n) {
-    size_t i = recvRanks[n];
-    fn(cuWaitForRecv[n], replace("reduce_scatter_wait_for_recv_$i_$n", "$i", i, "$n", n));
-  }
+  // cuSendReady.resize(sendRanks.size());
+  // for (size_t n = 0; n != sendRanks.size(); ++n) {
+  //   fn(cuSendReady[n], replace("reduce_scatter_send_ready_$n", "$n", n));
+  // }
+  // cuWaitForRecv.resize(recvRanks.size());
+  // for (size_t n = 0; n != recvRanks.size(); ++n) {
+  //   size_t i = recvRanks[n];
+  //   fn(cuWaitForRecv[n], replace("reduce_scatter_wait_for_recv_$i_$n", "$i", i, "$n", n));
+  // }
+
+  fn(cuReduceScatterLocal, "reduce_scatter_local");
+  fn(cuReduceScatter, "reduce_scatter");
 
   return std::make_pair(source, functions);
 }

@@ -323,13 +323,13 @@ void Kernels::compile() {
   std::string source;
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
-  reduceGridSize = 128;
-  reduceBlockSize = 128;
-
   source = R"(
 typedef unsigned long uintptr_t;
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
+typedef unsigned char uint8_t;
+
+namespace {
 
 __device__ uint32_t globalStepValue = 1;
 
@@ -337,33 +337,157 @@ __device__ void syncthreads() {
   asm volatile ("barrier.sync 0;" :: );
 }
 
+template<typename T>
+__device__ void copy_impl_impl(T* dstp, const T* srcp, size_t numel) {
+  size_t blockIndex = blockIdx.x;
+  size_t threadIndex = threadIdx.x;
+  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+    dstp[i] = srcp[i];
+  }
+}
+
+__device__ void copy_impl(void* dst, const void* src, size_t bytes) {
+  static_assert(sizeof(uint4) == 16);
+  size_t offset = 0;
+  if (((uintptr_t)dst % 16 == 0) && ((uintptr_t)src % 16 == 0)) {
+    copy_impl_impl((uint4*)dst, (const uint4*)src, bytes / 16);
+    offset += bytes / 16 * 16;
+  } else {
+    assert(((uintptr_t)dst % 4 == 0));
+    assert(((uintptr_t)src % 4 == 0));
+    copy_impl_impl((uint32_t*)dst, (const uint32_t*)src, bytes / 4);
+    offset += bytes / 4 * 4;
+  }
+
+  if (blockIdx.x * $blockSize + threadIdx.x < bytes - offset) {
+    char* dstp = (char*)dst + offset + blockIdx.x * $blockSize + threadIdx.x;
+    char* srcp = (char*)src + offset + blockIdx.x * $blockSize + threadIdx.x;
+    *dstp = *srcp;
+  }
+}
+
+template<typename T>
+__device__ void reduce_sum(T* dst, const T* src, size_t numel) {
+  size_t blockIndex = blockIdx.x;
+  size_t threadIndex = threadIdx.x;
+  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+    dst[i] += src[i];
+  }
+}
+
+template<typename T>
+__device__ void reduce2_sum(T* dst, const T* src1, const T* src2, size_t numel) {
+  size_t blockIndex = blockIdx.x;
+  size_t threadIndex = threadIdx.x;
+  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+    dst[i] = src1[i] + src2[i];
+  }
+}
+
 )";
 
-  //source += emitReduceFunction("float", 4, 2, "sum", reduceBlockSize);
+  auto waitFor32 = [&](uintptr_t address, std::string value) {
+    return replace(
+        R"(while (*(volatile uint32_t*)$ptr < $value);
+    )",
+        "$ptr", address, "$value", value);
+  };
+
+  std::string writes1;
+  std::string writes2;
+  std::string waits;
+  for (size_t i : group->peerIndices) {
+    waits += waitFor32(group->cudaStepValue.cudaPointer + sizeof(uint32_t) * group->ipcRanks[i], "stepValue");
+    writes1 += replace(
+        R"(
+      ((volatile uintptr_t*)$addrPtr)[0] = params.peerInputAddresses[$i];
+      ((volatile uintptr_t*)$addrPtr)[1] = params.peerOutputAddresses[$i];
+    )",
+        "$addrPtr", group->peerCudaPeerAddresses[i] + (sizeof(uintptr_t) * 2 * group->peerMyRemoteIndex[i]), "$i", i);
+    writes2 += replace(
+        R"(
+      *(volatile uint32_t*)$ptr = stepValue;
+    )",
+        "$ptr", group->peerCudaStepValue[i] + sizeof(uint32_t) * rank);
+  }
+
+  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
+    std::string s;
+    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
+    for (size_t di = 0; di != group->ibDevs.size(); ++di) {
+      s += waitFor32(
+          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
+          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
+    }
+    return s;
+  };
+
+  std::string waitForRecvs;
+  for (size_t i : group->allGather->recvRanks) {
+    waitForRecvs += waitForRecv(i, Group::dataChunks - 1);
+  }
+
+  std::string copyDoneAllCode;
+  std::string waitForCopyDones;
+  for (size_t i : group->peerIndices) {
+    copyDoneAllCode += replace(
+        R"(
+  *(volatile uint32_t*)$ptr = stepValue;
+      )",
+        "$ptr", group->peerCudaCopyDone[i] + sizeof(uint32_t) * group->peerMyRemoteIndex[i]);
+    waitForCopyDones += replace(
+        R"(
+  while (*(volatile uint32_t*)$ptr < stepValue);
+      )",
+        "$i", i, "$ptr", group->cudaCopyDone.cudaPointer + sizeof(uint32_t) * i);
+  }
 
   source += replace(
       R"(
-extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
-  size_t blockIndex = blockIdx.x;
-  size_t threadIndex = threadIdx.x;
-  for (size_t i = blockIndex * $reduceBlockSize + threadIndex; i < numel; i += $reduceGridSize * $reduceBlockSize) {
-    dst[i] += src[i];
-  }
-  // size_t chunkSize = numel / $reduceGridSize / 1024u * 1024u;
-  // size_t offset = blockIdx.x * chunkSize;
-  // if (blockIdx.x == $reduceGridSize - 1) {
-  //   chunkSize = numel - offset;
-  // }
-  // if (chunkSize > 0) {
-  //   reduce_float_sum_n2(nullptr, offset, chunkSize, dst, dst, src);
-  // }
+template<typename Params>
+__device__ void generic_entry_local(const Params& params) {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  $writes1
+  __threadfence_system();
+  $writes2
+  $waits
+}
+__device__ void generic_exit_local() {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  $copyDoneAllCode
+  $waitForCopyDones
+
+  globalStepValue += 4096;
+}
+template<typename Params>
+__device__ void generic_entry(const Params& params) {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+  cpuIn[0] = stepValue;
+  $writes1
+  __threadfence_system();
+  $writes2
+  $waits
+}
+__device__ void generic_exit() {
+  uint32_t stepValue = globalStepValue;
+  $copyDoneAllCode
+  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+  volatile uint32_t* __restrict__ cpuOut = $cpuOut;
+  cpuIn[0] = stepValue + 1;
+  while (cpuOut[0] < stepValue);
+  $waitForCopyDones
+  $waitForRecvs
+
+  globalStepValue += 4096;
+}
+
 }
   )",
-      "$reduceGridSize", reduceGridSize, "$reduceBlockSize", reduceBlockSize);
+      "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones, "$waitForRecvs",
+      waitForRecvs, "$copyDoneAllCode", copyDoneAllCode);
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
-
-  fn(cuReduce, "reduce");
 
   auto add = [&](auto&& v) {
     source += v.first;
@@ -372,6 +496,11 @@ extern "C" __global__ void reduce(float* dst, float* src, size_t numel) {
 
   add(group->allGather->generate());
   add(group->reduceScatter->generate());
+
+  uint32_t gridSize = 128;
+  uint32_t blockSize = 512;
+
+  source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize);
 
   source = replace(
       source, "$rank", rank, "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",

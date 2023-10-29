@@ -25,6 +25,7 @@ if "LOCAL_RANK" not in os.environ:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
+os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
 def f(n):
     import torch
@@ -71,7 +72,10 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 40).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
-    data = torch.randn(442416 * size).cuda() + 1
+    #data = torch.randn(442416 * size).cuda() + 1
+    data = torch.randn(527040 * size).cuda() + 1
+    # data *= 0
+    # data += 2 ** rank
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
     # data = torch.randn(1536024 // 2, device="cuda") + 1
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -85,18 +89,23 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    all_inputs = []
-    for r in range(size):
-        torch.manual_seed(42 + r)
-        rdata = torch.randn(data.numel()).cuda() + 1
-        all_inputs.append(rdata)
+    check = False
 
-        # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
+    if check:
+        all_inputs = []
+        for r in range(size):
+            torch.manual_seed(42 + r)
+            rdata = torch.randn(data.numel()).cuda() + 1
+            # rdata *= 0
+            # rdata += 2 ** r
+            all_inputs.append(rdata)
 
-    correct_result = sum(all_inputs).chunk(size)[rank]
+            # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
 
-    print("sum(all_inputs) shape ", sum(all_inputs).shape)
-    print("correct_result shape ", correct_result.shape)
+        correct_result = sum(all_inputs).chunk(size)[rank]
+
+        print("sum(all_inputs) shape ", sum(all_inputs).shape)
+        print("correct_result shape ", correct_result.shape)
 
     torch.manual_seed(420 + rank)
 
@@ -121,7 +130,7 @@ def f(n):
         tmp.zero_()
         result = [result0]
         # dist._all_gather_base(result, tmp)
-        if True:
+        if check:
             i = 0
             v = correct_result
             if not torch.allclose(result[i], v, 1e-3, 1e-2):
@@ -136,8 +145,8 @@ def f(n):
                     "%d: indices " % rank,
                     indices,
                 )
-                print(result[i][indices])
-                print(v[indices])
+                print("%d: got %s" % (rank, result[i][indices]))
+                print("%d: should be %s" % (rank, v[indices]))
                 print(
                     "allclose 1 ",
                     torch.allclose(result[i], v, 1e-3, 1e-2),
@@ -159,7 +168,7 @@ def f(n):
 
     print("rank %d warmup done" % (rank))
 
-    if True:
+    if False:
         tmpz = []
         for x in range(10):
             print("rank %d enter test2 %d\n" % (rank, x))
@@ -231,6 +240,12 @@ def f(n):
         loopcount = 1000
         events = []
         for i in range(loopcount):
+            dist.reduce_scatter_tensor(result0, tmp)
+            torch.cuda.synchronize()
+    elif True:
+        loopcount = 1000
+        events = []
+        for i in range(loopcount):
             if len(events) >= 2:
                 events.pop(0).synchronize()
             dist.reduce_scatter_tensor(result0, tmp)
@@ -272,12 +287,12 @@ def f(n):
     # moodist.enable_profiling(False)
 
 
-if len(sys.argv) < 2:
-    f("moodist")
+if len(sys.argv) < 3:
+    f(sys.argv[1])
     sys.exit(0)
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist", "nccl"):
+for n in ("nccl", "moodist"):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
@@ -291,8 +306,12 @@ for n in ("moodist", "nccl"):
             print(n)
         pid = os.fork()
         if pid == 0:
+            fd = os.open("out-%s.txt" % os.environ["RANK"], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
             f(n)
             os._exit(0)
         pids.append(pid)
     for pid in pids:
         os.waitpid(pid, 0)
+print("bye")

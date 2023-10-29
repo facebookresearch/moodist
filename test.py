@@ -552,3 +552,4 @@ for n in ("nccl", "moodist"):
         pids.append(pid)
     for pid in pids:
         os.waitpid(pid, 0)
+print("bye")

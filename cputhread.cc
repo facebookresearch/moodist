@@ -865,7 +865,7 @@ void CpuThread::entry() {
                   localDyns[i].gatherKey,
                   [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
                    &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
-                    //fmt::printf("send done for di %d\n", di);
+                    // fmt::printf("send done for di %d\n", di);
                     --liveSends;
                     auto& dev = devices.at(di);
                     writeData(
@@ -954,13 +954,13 @@ void CpuThread::entry() {
         auto& recvRanks = reduceScatter.recvRanks;
 
         uintptr_t recvAddress = group->recvBuffer.cudaPointer;
-        CHECK(group->recvBuffer.bytes >= params.bytes * 2);
+        CHECK(group->recvBuffer.bytes >= params.bytes * recvRanks.size());
 
         uintptr_t sendAddress = group->sendBuffer.cudaPointer;
         CHECK(group->sendBuffer.bytes >= params.bytes * sendRanks.size());
 
         auto* sendMr = regMrCuda(sendAddress, params.bytes * sendRanks.size());
-        auto* recvMr = regMrCuda(recvAddress, params.bytes * 2);
+        auto* recvMr = regMrCuda(recvAddress, params.bytes * recvRanks.size());
 
         for (size_t i : recvRanks) {
           outDyns[i].gatherAddress = recvAddress;
@@ -1010,12 +1010,12 @@ void CpuThread::entry() {
 
         CHECK(recvRanks.size() == sendRanks.size());
 
-        // for (size_t i : sendRanks) {
+        size_t liveSends = 0;
         for (size_t index = 0; index != sendRanks.size(); ++index) {
 
           // wait for send ready
           // this also functions as wait for recv ready
-          while (cpuIn[1] < index + 1) {
+          while (cpuIn[1] < stepValue + index + 1) {
             poll();
           }
 
@@ -1034,7 +1034,6 @@ void CpuThread::entry() {
             poll();
           }
           size_t offset = 0;
-          size_t liveSends = 0;
           size_t liveStepValues = 0;
           size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
           for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
@@ -1048,40 +1047,57 @@ void CpuThread::entry() {
               //     localDyns[i].gatherAddress, rank * params.bytes, offset);
 
               trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
-              ++liveSends;
-              writeDataDistributed(
-                  i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + (params.bytes * (index % 2)) + offset,
-                  localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+              // ++liveSends;
+              // writeDataDistributed(
+              //     i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + (params.bytes * (index % 2)) + offset,
+              //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+              liveSends += devices.size();
+              writeDataDistributed2(
+                  i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.bytes + offset,
+                  localDyns[i].gatherKey,
+                  [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
+                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
+                    // fmt::printf("send done for di %d\n", di);
+                    --liveSends;
+                    auto& dev = devices.at(di);
+                    writeData(
+                        dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                        (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                        remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                  });
               offset += nbytes;
             }
-            trace(fmt::sprintf("%d_wait_for_liveSends", i));
-            while (liveSends) {
+            while (liveSends >= devices.size() * 2) {
               poll();
             }
-            trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
-            while (liveStepValues) {
-              poll();
-            }
-            trace(fmt::sprintf("%d_send_stepValues", i));
-            // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
-            for (size_t di = 0; di != devices.size(); ++di) {
-              Device& dev = devices[di];
-              ++liveStepValues;
-              writeData(
-                  dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                  (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                  remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
-                  makeCallback([&]() { --liveStepValues; }));
-            }
+            // trace(fmt::sprintf("%d_wait_for_liveSends", i));
+            // while (liveSends) {
+            //   poll();
+            // }
+            // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+            // while (liveStepValues) {
+            //   poll();
+            // }
+            // trace(fmt::sprintf("%d_send_stepValues", i));
+            // // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
+            // for (size_t di = 0; di != devices.size(); ++di) {
+            //   Device& dev = devices[di];
+            //   ++liveStepValues;
+            //   writeData(
+            //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+            //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+            //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+            //       makeCallback([&]() { --liveStepValues; }));
+            // }
           }
-          trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
-          while (liveStepValues) {
-            poll();
-          }
-          // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
-          CHECK(offset == params.bytes);
-          CHECK(liveSends == 0);
-          CHECK(liveStepValues == 0);
+          // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
+          // while (liveStepValues) {
+          //   poll();
+          // }
+          // // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
+          // CHECK(offset == params.bytes);
+          // CHECK(liveSends == 0);
+          // CHECK(liveStepValues == 0);
         }
 
         trace("wait_for_cq_entries");
