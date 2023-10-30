@@ -96,7 +96,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         #data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        data = torch.randn(263520).cuda() + 1
+        #data = torch.randn(263520).cuda() + 1
+        data = torch.randn(262144).cuda() + 1
+        #data = torch.randn(1024 * 1024).cuda() + 1
         #data = torch.randn(1027).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
@@ -301,12 +303,29 @@ def f(n):
 
             dist._all_gather_base(result0, tmp)
         elif 1 == 1:
+            x = torch.nn.Linear(1024, 1024)
+            y = torch.randn(1024)
+            loopcount = 1000
+            stream1 = torch.cuda.Stream()
+            stream2 = torch.cuda.Stream()
+            for i in range(loopcount):
+                with torch.cuda.stream(stream1):
+                    dist.all_gather_into_tensor(result0, tmp)
+                with torch.cuda.stream(stream2):
+                    x(y)
+            torch.cuda.synchronize()
+        elif 1 == 1:
+            loopcount = 1000
+            for i in range(loopcount):
+                dist.all_gather_into_tensor(result0, tmp)
+                torch.cuda.synchronize()
+        elif 1 == 1:
             loopcount = 1000
             events = []
             for i in range(loopcount):
                 if len(events) >= 2:
                     events.pop(0).synchronize()
-                dist._all_gather_base(result0, tmp)
+                dist.all_gather_into_tensor(result0, tmp)
                 e = torch.cuda.Event()
                 e.record()
                 events.append(e)

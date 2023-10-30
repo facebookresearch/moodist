@@ -13,28 +13,298 @@ Kernels::~Kernels() {
   }
 }
 
-std::string
-Kernels::emitReduceFunction(std::string type, size_t typesize, size_t nsources, std::string op, size_t blockSize) {
+std::string Kernels::emitCopy(
+    std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
+    size_t blockSize, std::string threadIndex, std::string blockIndex) {
+  TORCH_CHECK(sources.size() == destinations.size());
+  size_t stride = gridSize * blockSize;
+  auto genwrites = [&](std::string& writes, std::string type, int typesize,
+                       const std::vector<std::string>& temporaries) {
+    for (size_t i = 0; i != destinations.size(); ++i) {
+      auto& v = destinations[i];
+      writes += fmt::sprintf("__stwt((%s*)(void*)%s, %s);\n", type, v, temporaries[i]);
+      writes += fmt::sprintf("%s = %s + %u;\n", v, v, typesize * stride);
+    }
+  };
+  auto readwrite = [&](std::string& reads, std::string& writes, std::string type, int typesize) {
+    std::vector<std::string> temporaries;
+    for (auto& v : sources) {
+      std::string temp = getVar("temporary");
+      temporaries.push_back(temp);
+      reads += fmt::sprintf("%s %s = __ldcv((%s*)(void*)%s);\n", type, temp, type, v);
+      reads += fmt::sprintf("%s = %s + %u;\n", v, v, typesize * stride);
+    }
+    genwrites(writes, type, typesize, temporaries);
+  };
+  auto addOffset = [&](int typesize) {
+    std::string s;
+    for (auto& v : sources) {
+      s += fmt::sprintf("%s += %d * %%offset;\n", v, typesize);
+    }
+    for (auto& v : destinations) {
+      s += fmt::sprintf("%s += %d * %%offset;\n", v, typesize);
+    }
+    return s;
+  };
+  auto genCopy = [&](std::string type, int typesize, int unroll) {
+    std::string s = R"(
+$pre
+  while (%bytes >= $loopbytes) {
+    size_t %loopcount = %bytes / $loopbytes;
+    $preloop
+#pragma unroll 1
+    for (size_t %i = 0; %i != %loopcount - 1; ++%i) {
+      //__syncwarp();
+      syncthreads();
+      $loop
+    }
+    $postloop
+    %bytes -= $loopbytes * %loopcount;
+  }
+$post
+)";
+    std::string pre = addOffset(typesize);
+    std::string preloop;
+    std::string loop;
+    std::string postloop;
+    // if (typesize == 16 && cg->computeMajor >= 8 && false) {
+    if (false) {
+      std::string sharedinit;
+      size_t sharedOffset = 0;
+      for (size_t n = 0; n != sources.size(); ++n) {
+        for (int i = 0; i != unroll; ++i) {
+          // sharedinit += replace("alignas(128) __shared__ $datatype data_$i_$n[$stride];\n", "$i", i, "$n", n);
+          sharedinit += replace(
+              R"(
+            $datatype* data_$i_$n = ($datatype*)((uintptr_t)sharedptr + $offset);
+          )",
+              "$i", i, "$n", n, "$offset", sharedOffset);
+          sharedOffset += typesize * blockSize;
+        }
+      }
+      // currentFunction->sharedMemSize = std::max(currentFunction->sharedMemSize, sharedOffset);
+      preloop = replace(
+          R"(
+        uintptr_t sharedsrc = (uintptr_t)sharedptr + $datatypesize * %offset;
+        uintptr_t shareddst = (uintptr_t)sharedptr + $datatypesize * %offset;
+      )",
+          "$sharedinit", sharedinit, "$unroll", unroll);
+      loop += "sharedsrc = (uintptr_t)sharedptr + $datatypesize * %offset;\n";
+      postloop += "sharedsrc = (uintptr_t)sharedptr + $datatypesize * %offset;\n";
+      loop += "shareddst = (uintptr_t)sharedptr + $datatypesize * %offset;\n";
+      postloop += "shareddst = (uintptr_t)sharedptr + $datatypesize * %offset;\n";
+
+      for (int i = 0; i != unroll; ++i) {
+        for (size_t n = 0; n != destinations.size(); ++n) {
+          auto& src = sources[n];
+          std::string read = replace(
+              R"(//&data_$i_$n[%offset]
+              asm volatile ("cp.async.cg.shared.global [%0], [%1], 16, 16;" :: "r"((uint32_t)(__cvta_generic_to_shared((void*)shareddst))), "l"((void*)($src)) : "memory");
+              shareddst += $datatypesize * $stride;
+              $src += $datatypesize * $stride;
+          )",
+              "$i", i, "$n", n, "$src", src);
+          preloop += read;
+          std::string reads;
+          reads += read;
+          preloop += R"(asm volatile ("cp.async.commit_group; "::);
+            )";
+          reads += R"(asm volatile ("cp.async.commit_group; "::);
+            )";
+          postloop += replace(
+              R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
+        )",
+              "$N", unroll - i - 1);
+          loop += replace(
+              R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
+        )",
+              "$N", unroll - 1);
+          // std::string read = replace(
+          //     R"($temp = __ldcv(($type*)(void*)$src); $src += $typesize * $stride;
+          //         )",
+          //     "$type", type, "$temp", temp, "$src", src, "$typesize", typesize, "$stride", stride);
+          // preloop += type + " " + read;
+          auto& dst = destinations[n];
+          std::string write = replace(
+              R"(__stwt(($type*)(void*)$dst, *($type*)(void*)sharedsrc); $dst += $typesize * $stride;
+              sharedsrc += $datatypesize * $stride;
+                  )",
+              "$type", type, "$i", i, "$n", n, "$dst", dst, "$typesize", typesize, "$stride", stride);
+          postloop += write;
+          loop += write;
+          loop += reads;
+        }
+      }
+
+      // bool commit = false;
+      // for (int i = 0; i != unrollOuter * unrollInner; ++i) {
+      //   std::string reads;
+      //   for (size_t n = 0; n != sources.size(); ++n) {
+      //     auto& src = sources[n];
+      //     std::string read = replace(
+      //         R"(
+      //         asm volatile ("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::
+      //         "r"((uint32_t)(__cvta_generic_to_shared(&data_$i_$n[%offset]))), "l"((void*)($src)) : "memory"); $src
+      //         += $datatypesize * $stride;
+      //     )",
+      //         "$i", i, "$n", n, "$src", src);
+      //     preloop += read;
+      //     reads += read;
+      //   }
+      //   commit = true || i % 2 == 1;
+      //   if (commit) {
+      //     preloop += R"(asm volatile ("cp.async.commit_group; "::);
+      //     )";
+      //     reads += R"(asm volatile ("cp.async.commit_group; "::);
+      //     )";
+      //   }
+
+      //   std::string settemps;
+      //   std::vector<std::string> tempnames;
+      //   for (size_t n = 0; n != sources.size(); ++n) {
+      //     std::string temp = getVar("temporary");
+      //     preloop += replace("$datatype $temp;\n", "$temp", temp);
+      //     settemps += replace("$temp = data_$i_$n[%offset];\n", "$temp", temp, "$i", i, "$n", n);
+      //     tempnames.push_back(temp);
+      //   }
+      //   std::string result = getVar("result");
+      //   std::string reducecode = getreducecode(datatype, result, tempnames);
+      //   preloop += replace("$datatype $result;\n", "$result", result);
+      //   std::string write = replace(
+      //       R"($settemps
+      //       $reducecode
+      //       __stwt(($datatype*)(void*)$dst, $result); $dst += $datatypesize * $stride;
+      //               )",
+      //       "$result", result, "$dst", dst, "$reducecode", reducecode, "$settemps", settemps);
+      //   if (true || i % 2 == 0) {
+      //     postloop += replace(
+      //         R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
+      //     )",
+      //         "$N", (unroll - i) / 2 - 1);
+      //     loop += replace(
+      //         R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
+      //     )",
+      //         "$N", unroll / 2 - 1);
+      //   }
+      //   postloop += write;
+      //   loop += write;
+      //   loop += reads;
+      // }
+      // TORCH_CHECK(commit);
+
+    } else {
+      for (int i = 0; i != unroll; ++i) {
+        for (size_t n = 0; n != destinations.size(); ++n) {
+          auto& src = sources[n];
+          std::string temp = getVar("temporary");
+          std::string read = replace(
+              R"($temp = __ldcv(($type*)(void*)$src); $src += $typesize * $stride;
+                )",
+              "$type", type, "$temp", temp, "$src", src, "$typesize", typesize, "$stride", stride);
+          preloop += type + " " + read;
+          auto& dst = destinations[n];
+          std::string write = replace(
+              R"(__stwt(($type*)(void*)$dst, $temp); $dst += $typesize * $stride;
+                )",
+              "$type", type, "$temp", temp, "$dst", dst, "$typesize", typesize, "$stride", stride);
+          postloop += write;
+          loop += write;
+          loop += read;
+        }
+      }
+    }
+    std::string post;
+    for (auto& v : sources) {
+      post += fmt::sprintf("%s -= %d * %%offset;\n", v, typesize);
+    }
+    for (auto& v : destinations) {
+      post += fmt::sprintf("%s -= %d * %%offset;\n", v, typesize);
+    }
+    size_t loopbytes = typesize * unroll * stride;
+    s = replace(
+        s, "$loop", loop, "$pre", pre, "$post", post, "$loopbytes", loopbytes, "$preloop", preloop, "$postloop",
+        postloop);
+    s = replace(s, "$datatype", type, "$datatypesize", typesize, "$stride", stride, "$type", type);
+    return s;
+  };
+  std::string s;
+  s += fmt::sprintf(
+      "/* copy  bytes: %s  gridSize: %d  blockSize: %d  threadIndex: %s  blockIndex: %s */\n", bytes, gridSize,
+      blockSize, threadIndex, blockIndex);
+  s += R"(
+  size_t %bytes = $bytes;
+  uint32_t %threadIndex = $threadIndex;
+  uint32_t %blockIndex = $blockIndex;
+  uint32_t %offset = $blockSize * %blockIndex + %threadIndex;
+  $defs
+  $copy1
+  $copy2
+  $copy3
+  if (%offset < (uint32_t)%bytes) {
+    $copylastbyte
+  }
+)";
+
+  std::string defs;
+  for (auto& v : sources) {
+    auto var = getVar(v);
+    defs += fmt::sprintf("uintptr_t %s = (uintptr_t)(void*)(%s);\n", var, v);
+    v = var;
+  }
+  for (auto& v : destinations) {
+    auto var = getVar(v);
+    defs += fmt::sprintf("uintptr_t %s = (uintptr_t)(void*)(%s);\n", var, v);
+    // defs += replace(R"(if (threadIdx.x == 0) printf("rank $rank got dst %%#llx from $v\n", (uintptr_t)$var);
+    // )", "$var", var, "$v", v);
+    v = var;
+  }
+  std::string copy1;
+  // if (cg->computeMajor >= 8 && false) {
+  if (false) {
+    copy1 = genCopy("uint4", 16, 32);
+  } else {
+    // 16 uint4 uses 64 registers. we could go higher to hide more latency,
+    // but it seems to not improve performance
+    copy1 = genCopy("uint4", 16, 32);
+    copy1 += genCopy("uint4", 16, 16);
+    copy1 += genCopy("uint4", 16, 4);
+    copy1 += genCopy("uint4", 16, 1);
+  }
+  std::string copy2 = genCopy("unsigned int", 4, 1);
+  std::string copy3 = genCopy("unsigned char", 1, 1);
+  std::string copylastbyte = addOffset(1);
+  readwrite(copylastbyte, copylastbyte, "unsigned char", 1);
+  s = replace(
+      s, "$bytes", bytes, "$defs", defs, "$copy1", copy1, "$copy2", copy2, "$copy3", copy3, "$copylastbyte",
+      copylastbyte);
+  s = replace(
+      s, "$threadIndex", threadIndex, "$blockIndex", blockIndex, "$copyGridSize", gridSize, "$blockSize", blockSize);
+  s = makeVars(s);
+  return s;
+}
+
+std::string Kernels::emitReduceFunction(
+    std::string type, size_t typesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize) {
   TORCH_CHECK(type != "");
   std::string sourcesargs;
   for (size_t i = 0; i != nsources; ++i) {
     if (!sourcesargs.empty()) {
       sourcesargs += ", ";
     }
-    sourcesargs += replace("$type* source_$i", "$type", type, "$i", i);
+    sourcesargs += replace("const $type* source_$i", "$type", type, "$i", i);
   }
   std::string addressesdefs;
   std::string dst = "dst";
-  addressesdefs += "uintptr_t dst = (uintptr_t)destination + sizeof($type) * offset;\n";
+  addressesdefs += "uintptr_t dst = (uintptr_t)destination;\n";
   // addressesdefs += "printf(\"dst alignment is %d\\n\", dst & 127);\n";
   std::vector<std::string> addresses;
   for (size_t i = 0; i != nsources; ++i) {
     addresses.push_back(fmt::sprintf("src%d", i));
-    addressesdefs += replace("uintptr_t src$i = (uintptr_t)source_$i + sizeof($type) * offset;\n", "$i", i);
+    addressesdefs += replace("uintptr_t src$i = (uintptr_t)source_$i;\n", "$i", i);
     // addressesdefs += replace("printf(\"src$i alignment is %d\\n\", src$i & 127);\n", "$i", i);
   }
   addressesdefs = replace(addressesdefs, "$type", type);
-  size_t stride = blockSize;
+  size_t stride = gridSize * blockSize;
   auto addOffset = [&](int typesize) {
     std::string s;
     s += fmt::sprintf("%s += %d * (int)%%offset;\n", dst, typesize);
@@ -249,13 +519,14 @@ $pre
   };
   std::string reducelastitem = generatelast(type, typesize);
   std::string reduce1 = generate("uint4", 16, 16);
-  // std::string reduce1 = generate("uint4", 16, 5);
+  reduce1 += generate("uint4", 16, 4);
+  reduce1 += generate("uint4", 16, 1);
   std::string reduce2 = generate(type, typesize, 1);
   std::string s = replace(
       R"(
-__device__ __noinline__ void reduce_$typename_$op_n$nsources(void* sharedptr, size_t offset, size_t size, $typename* destination, $sourcesargs) {
+__device__ void reduce_$typename_$op_n$nsources(size_t size, $typename* destination, $sourcesargs) {
   size_t %remaining = size;
-  uint32_t %offset = threadIdx.x;
+  uint32_t %offset = $blockSize * blockIdx.x + threadIdx.x;
   if ((uintptr_t)destination < 0x100000 || (uintptr_t)source_0 < 0x100000) {
     printf("bad reduce with destination %p, source %p, offset %#x\n", destination, source_0, %offset);
     while(1);
@@ -337,19 +608,71 @@ __device__ void syncthreads() {
   asm volatile ("barrier.sync 0;" :: );
 }
 
+// __device__ void copy_impl_async(void* __restrict__ dstp, const void* __restrict__ srcp, size_t bytes) {
+//   size_t blockIndex = blockIdx.x;
+//   size_t threadIndex = threadIdx.x;
+//   if (threadIndex != 0) {
+//     return;
+//   }
+//   extern __shared__ uint8_t data[];
+
+//   uint32_t state;
+
+//   __shared__ uint64_t barrier;
+//   uint32_t barrierAddr = (uint32_t)__cvta_generic_to_shared(&barrier);
+//   asm volatile ("mbarrier.init.shared.b64 [%0], 1;" :: "r"(barrierAddr) : "memory");
+
+//   uintptr_t dst = (uintptr_t)dstp;
+//   uintptr_t src = (uintptr_t)srcp;
+
+//   const uint32_t chunkSize = $sharedMemSize / 2;
+
+//   size_t myOffset = chunkSize * blockIndex;
+
+//   uint32_t i = 0;
+//   for (;myOffset < bytes; ++i) {
+//     size_t offset = i % 2 ? chunkSize : 0;
+//     uint32_t chunk = (uint32_t)min(bytes - myOffset, (size_t)chunkSize);
+
+//     asm volatile ("mbarrier.arrive.expect_tx.shared.b64 %0, [%1], 2;" : "=r"(state) : "r"(barrierAddr), "r"(chunk) : "memory");
+
+//     asm volatile ("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" :: "l"(dstp), "l"(srcp), "r"(chunk), "l"(barrier) : "memory");
+
+//     asm volatile ("{\nloop:\nmbarrier.try_wait.shared.b64 complete, [%1], %2;\n@!complete bra loop;\n}" :: "r"(barrierAddr), "r"(state));
+//   }
+
+
+
+//   //asm volatile ("cp.async.cg.shared.global [%0], [%1], 16, 16;" :: "r"((uint32_t)(__cvta_generic_to_shared(&data_$i_$n[%offset]))), "l"((void*)($src)) : "memory");
+// }
+
+struct Moo {
+  uint4 a[2];
+};
+
 template<typename T>
-__device__ void copy_impl_impl(T* dstp, const T* srcp, size_t numel) {
+__device__ void copy_impl_impl(T* __restrict__ dstp, const T* __restrict__ srcp, size_t numel) {
   size_t blockIndex = blockIdx.x;
   size_t threadIndex = threadIdx.x;
   for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
     dstp[i] = srcp[i];
   }
+  __syncthreads();
 }
 
-__device__ void copy_impl(void* dst, const void* src, size_t bytes) {
+// __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
+//   copy_impl_async(dst, src, bytes);
+// }
+
+__device__ void copy_impl_old(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
   static_assert(sizeof(uint4) == 16);
   size_t offset = 0;
   if (((uintptr_t)dst % 16 == 0) && ((uintptr_t)src % 16 == 0)) {
+    size_t n = bytes / sizeof(Moo) * sizeof(Moo);
+    copy_impl_impl((Moo*)dst, (const Moo*)src, bytes / sizeof(Moo));
+    dst = (void*)((uintptr_t)dst + n);
+    src = (void*)((uintptr_t)src + n);
+    bytes -= n;
     copy_impl_impl((uint4*)dst, (const uint4*)src, bytes / 16);
     offset += bytes / 16 * 16;
   } else {
@@ -366,24 +689,90 @@ __device__ void copy_impl(void* dst, const void* src, size_t bytes) {
   }
 }
 
-template<typename T>
-__device__ void reduce_sum(T* dst, const T* src, size_t numel) {
-  size_t blockIndex = blockIdx.x;
-  size_t threadIndex = threadIdx.x;
-  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
-    dst[i] += src[i];
+__device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
+  uintptr_t a = (uintptr_t)dst | (uintptr_t)src;
+  if (a % 16 == 0) {
+    $copyCode
+  } else {
+    // if (threadIdx.x == 0 && blockIdx.x == 0 && bytes >= 1024) {
+    //   printf("Unaligned copy :(\n");
+    // }
+    copy_impl_old(dst, src, bytes);
   }
 }
 
-template<typename T>
-__device__ void reduce2_sum(T* dst, const T* src1, const T* src2, size_t numel) {
-  size_t blockIndex = blockIdx.x;
-  size_t threadIndex = threadIdx.x;
-  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
-    dst[i] = src1[i] + src2[i];
+__device__ void copy_impl_x(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
+  const size_t blockIndex = blockIdx.x;
+  const size_t threadIndex = threadIdx.x;
+  const size_t chunkSize = 65536 * 16;
+  const size_t numel = (bytes + chunkSize - 1) / chunkSize;
+  for (size_t i = blockIndex; i < numel; i += $gridSize) {
+    copy_impl_x((void*)((uintptr_t)dst + i * chunkSize), (void*)((uintptr_t)src + i * chunkSize), min(chunkSize, bytes - i * chunkSize));
   }
 }
 
+// template<typename Op, typename Dst, typename... Src>
+// __device__ void reduce_impl(Dst* __restrict__ dst, size_t numel, const Src*... __restrict__ src) {
+//   size_t blockIndex = blockIdx.x;
+//   size_t threadIndex = threadIdx.x;
+//   for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+//     Op()(dst[i], src[i]...);
+//   }
+// }
+
+// struct OpAdd {
+//   template<typename T>
+//   operator()(T& dst, const T src) {
+//     dst += src;
+//   }
+//   template<typename T>
+//   operator()(T& dst, const T src1, const T src2) {
+//     dst = src1 + src2;
+//   }
+// };
+
+// template<typename T, size_t N>
+// struct Vec {
+//   T v[N];
+// };
+
+template<typename T>
+__device__ void reduce_sum(T* __restrict__ dst, const T* __restrict__ src, size_t numel) {
+  // uintptr_t a = (uintptr_t)dst | (uintptr_t)src;
+  // if (a % 16 == 0) {
+
+  // }
+}
+
+)";
+
+  uint32_t gridSize = 64;
+  uint32_t blockSize = 128;
+
+  source = replace(
+      source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
+  // source = replace(
+  //     source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", 1, blockSize, "threadIdx.x", "0"));
+
+  source += emitReduceFunction("float", 4, 2, "sum", gridSize, blockSize);
+
+  source += R"(
+template<typename T>
+__device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
+  uintptr_t a = (uintptr_t)dst | (uintptr_t)src1 | (uintptr_t)src2;
+  if (a % 16 == 0) {
+    reduce_float_sum_n2(numel, dst, src1, src2);
+  } else {
+    // if (threadIdx.x == 0 && blockIdx.x == 0 && numel >= 1024) {
+    //   printf("Unaligned reduce :(\n");
+    // }
+    size_t blockIndex = blockIdx.x;
+    size_t threadIndex = threadIdx.x;
+    for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
+      dst[i] = src1[i] + src2[i];
+    }
+  }
+}
 )";
 
   auto waitFor32 = [&](uintptr_t address, std::string value) {
@@ -497,10 +886,9 @@ __device__ void generic_exit() {
   add(group->allGather->generate());
   add(group->reduceScatter->generate());
 
-  uint32_t gridSize = 128;
-  uint32_t blockSize = 512;
-
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize);
+
+  source = replace(source, "$sharedMemSize", 40960);
 
   source = replace(
       source, "$rank", rank, "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",

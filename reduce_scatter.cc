@@ -180,16 +180,19 @@ struct ReduceParameters {
 };
 
 template<typename T>
-__global__ void reduce_kernel(ReduceParameters params) {
+__global__ void __launch_bounds__($blockSize) reduce_kernel(ReduceParameters params) {
   assert(params.n > 0);
   assert(params.n <= reduceQueueSize);
 #pragma unroll 1
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
-    if (params.src1[i] == params.dst[i]) {
-      reduce_sum((T*)params.dst[i], (const T*)params.src2[i], params.bytes / sizeof(T));
-    } else if (params.src2[i] != nullptr) {
+    //if (params.src1[i] == params.dst[i]) {
+    //  reduce_sum((T*)params.dst[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+    //} else if (params.src2[i] != nullptr) {
+    //  reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+    if (params.src2[i] != nullptr) {
       reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+      //reduce_float_sum_n2(params.bytes / sizeof(T), (T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i]);
     } else {
       copy_impl(params.dst[i], params.src1[i], params.bytes);
     }

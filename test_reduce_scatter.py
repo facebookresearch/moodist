@@ -71,9 +71,11 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 40).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
+    data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(442416 * size).cuda() + 1
-    data = torch.randn(527040 * size).cuda() + 1
+    #data = torch.randn(527040 * size).cuda() + 1
+    #data = torch.randn(524284 * size).cuda() + 1
+    #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
     # data *= 0
     # data += 2 ** rank
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
@@ -109,23 +111,23 @@ def f(n):
 
     torch.manual_seed(420 + rank)
 
-    print("result0 is at %#x" % result0.data_ptr())
+    #print("result0 is at %#x" % result0.data_ptr())
 
     x = torch.randn(1024 * 1024).cuda()
     y = torch.zeros(x.numel() * size).cuda()
 
     for _ in range(100):
-        print("rank %d warmup %d" % (rank, _))
+        #print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result0 -= 1
-        if _ % 3 == 0:
-            tmp = torch.zeros_like(tmp)
-        if _ % 9 <= 4:
-            dist.all_gather_into_tensor(y, x)
+        # if _ % 3 == 0:
+        #     tmp = torch.zeros_like(tmp)
+        # if _ % 9 <= 4:
+        #     dist.all_gather_into_tensor(y, x)
         tmp.copy_(data)
         # dist.all_gather(result, tmp)
-        print("result0 numel is ", result0.numel())
-        print("tmp numel is ", tmp.numel())
+        #print("result0 numel is ", result0.numel())
+        #print("tmp numel is ", tmp.numel())
         dist.reduce_scatter_tensor(result0, tmp)
         tmp.zero_()
         result = [result0]
@@ -163,7 +165,7 @@ def f(n):
                 print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                 raise RuntimeError("%d: wrong result for index %d" % (rank, i))
         # torch.cuda.synchronize()
-        print("rank %d warmup %d done" % (rank, _))
+        #print("rank %d warmup %d done" % (rank, _))
     tmp.copy_(data)
 
     print("rank %d warmup done" % (rank))
@@ -236,7 +238,19 @@ def f(n):
         moodist.enable_profiling(False)
 
         dist.reduce_scatter_tensor(result0, tmp)
-    elif True:
+    elif 1 == 1:
+        x = torch.nn.Linear(1024, 1024)
+        y = torch.randn(1024)
+        loopcount = 1000
+        stream1 = torch.cuda.Stream()
+        stream2 = torch.cuda.Stream()
+        for i in range(loopcount):
+            with torch.cuda.stream(stream1):
+                dist.reduce_scatter_tensor(result0, tmp)
+            with torch.cuda.stream(stream2):
+                x(y)
+        torch.cuda.synchronize()
+    elif 1 == 1:
         loopcount = 1000
         events = []
         for i in range(loopcount):

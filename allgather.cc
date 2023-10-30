@@ -300,7 +300,7 @@ struct AllGatherCopyParameters {
   uint32_t n;
 };
 
-__global__ void allgather_copy_kernel(AllGatherCopyParameters params) {
+__global__ void __launch_bounds__($blockSize) allgather_copy_kernel(AllGatherCopyParameters params) {
   assert(params.n > 0);
   assert(params.n <= copyQueueSize);
 #pragma unroll 1
@@ -329,16 +329,16 @@ __device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, c
   }
 }
 
-extern "C" __global__ void allgather_local_exit() {
+extern "C" __global__ void __launch_bounds__(1) allgather_local_exit() {
   generic_exit_local();
 }
 
-extern "C" __global__ void allgather_exit() {
+extern "C" __global__ void __launch_bounds__(1) allgather_exit() {
   generic_exit();
 }
 
 
-extern "C" __global__ void allgather_local(AllGatherParameters params) {
+extern "C" __global__ void  __launch_bounds__(1) allgather_local(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = globalStepValue;
   generic_entry_local(params);
 
@@ -353,7 +353,7 @@ extern "C" __global__ void allgather_local(AllGatherParameters params) {
   allgather_local_exit<<<1, 1>>>();
 }
 
-extern "C" __global__ void allgather(AllGatherParameters params) {
+extern "C" __global__ void __launch_bounds__(1) allgather(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = globalStepValue;
   generic_entry(params);
 

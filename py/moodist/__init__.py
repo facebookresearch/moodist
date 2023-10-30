@@ -20,7 +20,7 @@ def find_tensors(tup):
         if isinstance(v, list) or isinstance(v, tuple):
             s += find_tensors(v)
         elif isinstance(v, torch.Tensor):
-            s += "(tensor numel %d itemsize %d)" % (v.numel(), v.element_size())
+            s += "(tensor numel %d itemsize %d ptr %#x)" % (v.numel(), v.element_size(), v.data_ptr())
         else:
             s += "?"
     return s
