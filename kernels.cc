@@ -833,20 +833,29 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
 
   source += replace(
       R"(
+__device__ uint32_t idCounter = 0;
+
 template<typename Params>
 __device__ void generic_entry_local(const Params& params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
-  $writes1
-  __threadfence_system();
-  $writes2
-  $waits
+  if (threadIdx.x == 0) {
+    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    if (atomicInc(&idCounter, $gridSize - 1) == 0) {
+      $writes1
+      __threadfence_system();
+      $writes2
+    }
+    $waits
+  }
+  syncthreads();
 }
 __device__ void generic_exit_local() {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
-  $copyDoneAllCode
-  $waitForCopyDones
+  if (threadIdx.x == 0 && atomicInc(&idCounter, $gridSize - 1) == $gridSize - 1) {
+    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    $copyDoneAllCode
+    $waitForCopyDones
 
-  globalStepValue += 4096;
+    globalStepValue += 4096;
+  }
 }
 template<typename Params>
 __device__ void generic_entry(const Params& params) {

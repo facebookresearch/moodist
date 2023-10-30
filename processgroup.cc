@@ -800,7 +800,7 @@ struct ProcessGroupImpl {
     std::array<void*, 1> params = {&parameters};
 
     if (isLocalOnly) {
-      CHECK_CU(cuLaunchKernel(allGather.cuAllGatherLocal, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(allGather.cuAllGatherLocal, 64, 1, 1, 128, 1, 1, 0, group->stream, params.data(), nullptr));
     } else {
       CHECK_CU(cuLaunchKernel(allGather.cuAllGather, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
     }

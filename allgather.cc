@@ -244,13 +244,13 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
 
   std::string localCopies;
   localCopies += R"(
-    allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $rank), (const void*)params.inputAddress);
+    copy_impl((void*)(params.outputAddress + params.bytes * $rank), (const void*)params.inputAddress, params.bytes);
   )";
   for (size_t peerIndex : peerIndices) {
     size_t i = ipcRanks[peerIndex];
     localCopies += replace(
         R"(
-      allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $i), *(const void**)$src);
+      copy_impl((void*)(params.outputAddress + params.bytes * $i), *(const void**)$src, params.bytes);
     )",
         "$i", i, "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex));
   }
@@ -338,19 +338,13 @@ extern "C" __global__ void __launch_bounds__(1) allgather_exit() {
 }
 
 
-extern "C" __global__ void  __launch_bounds__(1) allgather_local(AllGatherParameters params) {
+extern "C" __global__ void  __launch_bounds__($blockSize) allgather_local(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = globalStepValue;
   generic_entry_local(params);
 
-  AllGatherCopyParameters copies;
-  copies.bytes = params.bytes;
-  copies.n = 0;
-
   $localCopies
 
-  allgather_copy_flush(copies);
-
-  allgather_local_exit<<<1, 1>>>();
+  generic_exit_local();
 }
 
 extern "C" __global__ void __launch_bounds__(1) allgather(AllGatherParameters params) {
