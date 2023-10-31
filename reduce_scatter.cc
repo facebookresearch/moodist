@@ -71,10 +71,26 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   std::unordered_map<std::string, bool> dstVisited;
   std::string prevReduceDst;
   std::string prevReduceSrc;
+  bool isInGrid = true;
+  auto callMemcpy = [&](std::string dst, std::string src) {
+    if (isInGrid) {
+      reduceCode += replace("copy_impl($dst, $src, params.bytes);", "$dst", dst, "$src", src);
+    } else {
+      reduceCode += replace("reduce_add<T>(reduces, $dst, $src, nullptr);\n", "$dst", dst, "$src", src);
+    }
+  };
+  auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2) {
+    if (isInGrid) {
+      reduceCode += replace(
+          "reduce2_sum((T*)$dst, (const T*)$src1, (const T*)$src2, params.bytes / sizeof(T));\n", "$dst", dst, "$src1",
+          src1, "$src2", src2);
+    } else {
+      reduceCode += replace("reduce_add<T>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
+    }
+  };
   auto reduceFlush = [&]() {
     if (prevReduceDst != "" && prevReduceSrc != "") {
-      reduceCode +=
-          replace("reduce_add<T>(reduces, $dst, $src, nullptr);\n", "$dst", prevReduceDst, "$src", prevReduceSrc);
+      callMemcpy(prevReduceDst, prevReduceSrc);
     }
     prevReduceSrc = "";
     prevReduceDst = "";
@@ -84,7 +100,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
     if (dst != prevReduceDst) {
       reduceFlush();
       if (dstVisited[dst]) {
-        reduceCode += replace("reduce_add<T>(reduces, $dst, $dst, $src);\n", "$dst", dst, "$src", src);
+        callReduceAdd(dst, dst, src);
       } else {
         prevReduceDst = dst;
         prevReduceSrc = src;
@@ -92,14 +108,15 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
       }
     } else {
       if (prevReduceSrc == "") {
-        reduceCode += replace("reduce_add<T>(reduces, $dst, $dst, $src);\n", "$dst", dst, "$src", src);
+        callReduceAdd(dst, dst, src);
       } else {
-        reduceCode +=
-            replace("reduce_add<T>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", prevReduceSrc, "$src2", src);
+        callReduceAdd(dst, prevReduceSrc, src);
         prevReduceSrc = "";
       }
     }
   };
+
+  std::string globaldefs;
 
   auto addLocals = [&]() {
     reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.bytes * $rank)");
@@ -115,15 +132,6 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   if (recvRanks.empty()) {
     addLocals();
   } else {
-    auto addRecv = [&](size_t n) {
-      reduceCode += replace(
-          R"(
-        reduce_flush<T>(reduces);
-        reduce_scatter_wait_for_recv_$n<<<1, 1>>>();
-        )",
-          "$n", n);
-      reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.bytes * $n)", "$n", n));
-    };
 
     size_t n = 0;
     for (size_t i : sendRanks) {
@@ -137,21 +145,41 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
       }
 
       reduceFlush();
+      globaldefs += replace("__device__ uint32_t sendReadyCounter_$n = 0;\n", "$n", n);
       reduceCode += replace(
           R"(
-        reduce_flush<T>(reduces);
-        reduce_scatter_send_ready<<<1, 1>>>(stepValue + $n + 1);
+        syncthreads();
+        __threadfence_system();
+        if (threadIdx.x == 0 && atomicInc(&sendReadyCounter_$n, $gridSize - 1) == $gridSize - 1) {
+          $cpuIn[1] = stepValue + $n + 1;
+        }
       )",
           "$n", n);
-
-      if (n != 0) {
-        addRecv(n - 1);
-      }
-
       ++n;
     }
     addLocals();
-    addRecv(n - 1);
+    reduceFlush();
+
+    isInGrid = false;
+    reduceCode += R"(
+      syncthreads();
+      __threadfence_system();
+      if (threadIdx.x != 0 || atomicInc(&exitCounter, $gridSize - 1) != $gridSize - 1) {
+        return false;
+      }
+      )";
+    
+    n = 0;
+    for (size_t i : recvRanks) {
+      reduceCode += replace(
+          R"(
+        reduce_scatter_wait_for_recv_$n<<<1, 1>>>();
+        )",
+          "$n", n);
+      reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.bytes * $n)", "$n", n));
+
+      ++n;
+    }
   }
   reduceFlush();
 
@@ -180,7 +208,7 @@ struct ReduceParameters {
 };
 
 template<typename T>
-__global__ void __launch_bounds__($blockSize) reduce_kernel(ReduceParameters params) {
+__global__ void reduce_kernel(ReduceParameters params) {
   assert(params.n > 0);
   assert(params.n <= reduceQueueSize);
 #pragma unroll 1
@@ -202,6 +230,8 @@ __global__ void __launch_bounds__($blockSize) reduce_kernel(ReduceParameters par
 __global__ void reduce_scatter_send_ready(uint32_t value) {
   $cpuIn[1] = value;
 }
+
+$globaldefs
 
 $waitFunctions
 
@@ -237,11 +267,7 @@ struct ReduceScatterParameters {
   uintptr_t recvAddress;
 };
 
-extern "C" __global__ void reduce_scatter_local_exit() {
-  generic_exit_local();
-}
-
-__device__ void reduce_scatter_impl(ReduceScatterParameters& params) {
+__device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   [[maybe_unused]] const uint32_t stepValue = globalStepValue;
   ReduceParameters reduces;
   reduces.bytes = params.bytes;
@@ -252,13 +278,13 @@ __device__ void reduce_scatter_impl(ReduceScatterParameters& params) {
   $reduceCode
 
   reduce_flush<T>(reduces);
-
-  reduce_scatter_local_exit<<<1, 1>>>();
+  return true;
 }
 
 extern "C" __global__ void reduce_scatter_local(ReduceScatterParameters params) {
-  generic_entry_local(params);
+  grid_generic_entry_local(params);
   reduce_scatter_impl(params);
+  grid_generic_exit_local();
 }
 
 extern "C" __global__ void reduce_scatter_exit() {
@@ -266,12 +292,14 @@ extern "C" __global__ void reduce_scatter_exit() {
 }
 
 extern "C" __global__ void reduce_scatter(ReduceScatterParameters params) {
-  generic_entry(params);
-  reduce_scatter_impl(params);
+  grid_generic_entry(params);
+  if (reduce_scatter_impl(params)) {
+    reduce_scatter_exit<<<1, 1>>>();
+  }
 }
 
   )zz",
-      "$reduceCode", reduceCode, "$waitFunctions", waitFunctions);
+      "$reduceCode", reduceCode, "$waitFunctions", waitFunctions, "$globaldefs", globaldefs);
 
   std::vector<std::pair<CUfunction*, std::string>> functions;
 

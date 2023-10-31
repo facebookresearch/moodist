@@ -80,6 +80,7 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def _reduce_scatter_base(self, *args, **kwargs):
         # print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
+        #return self.nccl._reduce_scatter_base(*args, **kwargs)
         return self.moodist._reduce_scatter_base(*args, **kwargs)
 
     def alltoall_base(self, *args, **kwargs):

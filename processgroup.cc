@@ -1151,12 +1151,15 @@ struct ProcessGroupImpl {
 
     std::array<void*, 1> params = {&parameters};
 
+    size_t gridSize = group->kernels->gridSize;
+    size_t blockSize = group->kernels->blockSize;
+
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          reduceScatter.cuReduceScatterLocal, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+          reduceScatter.cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, group->stream, params.data(), nullptr));
     } else {
       CHECK_CU(
-          cuLaunchKernel(reduceScatter.cuReduceScatter, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+          cuLaunchKernel(reduceScatter.cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, group->stream, params.data(), nullptr));
     }
 
     trace("post");

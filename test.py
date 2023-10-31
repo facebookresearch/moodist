@@ -95,9 +95,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 256).cuda() + 1
+        data = torch.randn(1024 * 1024 * 256).cuda() + 1
         #data = torch.randn(263520).cuda() + 1
-        data = torch.randn(262144).cuda() + 1
+        #data = torch.randn(262144).cuda() + 1
         #data = torch.randn(1024 * 1024).cuda() + 1
         #data = torch.randn(1027).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
@@ -311,8 +311,8 @@ def f(n):
             for i in range(loopcount):
                 with torch.cuda.stream(stream1):
                     dist.all_gather_into_tensor(result0, tmp)
-                with torch.cuda.stream(stream2):
-                    x(y)
+                # with torch.cuda.stream(stream2):
+                #     x(y)
             torch.cuda.synchronize()
         elif 1 == 1:
             loopcount = 1000

@@ -52,10 +52,11 @@ $pre
   while (%bytes >= $loopbytes) {
     size_t %loopcount = %bytes / $loopbytes;
     $preloop
+    syncthreads();
 #pragma unroll 1
     for (size_t %i = 0; %i != %loopcount - 1; ++%i) {
       //__syncwarp();
-      syncthreads();
+      //syncthreads();
       $loop
     }
     $postloop
@@ -356,10 +357,11 @@ $pre
   while (%remaining >= $loopsize) {
     size_t %loopcount = %remaining / $loopsize;
     $preloop
+    syncthreads();
 #pragma unroll 1
     for (size_t %i = 0; %i != %loopcount - 1; ++%i) {
       //__syncwarp();
-      syncthreads();
+      //syncthreads();
       $loop
     }
     $postloop
@@ -518,7 +520,8 @@ $pre
     return s;
   };
   std::string reducelastitem = generatelast(type, typesize);
-  std::string reduce1 = generate("uint4", 16, 16);
+  std::string reduce1;// = generate("uint4", 16, 32);
+  reduce1 += generate("uint4", 16, 16);
   reduce1 += generate("uint4", 16, 4);
   reduce1 += generate("uint4", 16, 1);
   std::string reduce2 = generate(type, typesize, 1);
@@ -746,8 +749,8 @@ __device__ void reduce_sum(T* __restrict__ dst, const T* __restrict__ src, size_
 
 )";
 
-  uint32_t gridSize = 64;
-  uint32_t blockSize = 128;
+  gridSize = 64;
+  blockSize = 128;
 
   source = replace(
       source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
@@ -869,6 +872,61 @@ __device__ void generic_exit() {
   $waitForRecvs
 
   globalStepValue += 4096;
+}
+
+__device__ uint32_t entryCounter = 0;
+__device__ uint32_t exitCounter = 0;
+
+template<typename Params>
+__device__ void grid_generic_entry_local(const Params& params) {
+  if (threadIdx.x == 0) {
+    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
+      $writes1
+      __threadfence_system();
+      $writes2
+    }
+    $waits
+  }
+  syncthreads();
+}
+__device__ void grid_generic_exit_local() {
+  if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
+    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    $copyDoneAllCode
+    $waitForCopyDones
+
+    globalStepValue += 4096;
+  }
+}
+template<typename Params>
+__device__ void grid_generic_entry(const Params& params) {
+  if (threadIdx.x == 0) {
+    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+    if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
+      cpuIn[0] = stepValue;
+      $writes1
+      __threadfence_system();
+      $writes2
+    }
+    $waits
+  }
+  syncthreads();
+}
+__device__ void grid_generic_exit() {
+  if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
+    uint32_t stepValue = globalStepValue;
+    $copyDoneAllCode
+    volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+    volatile uint32_t* __restrict__ cpuOut = $cpuOut;
+    cpuIn[0] = stepValue + 1;
+    while (cpuOut[0] < stepValue);
+    $waitForCopyDones
+    $waitForRecvs
+
+    globalStepValue += 4096;
+  }
 }
 
 }

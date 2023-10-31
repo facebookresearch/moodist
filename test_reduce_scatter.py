@@ -71,13 +71,13 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 40).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
+    #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(442416 * size).cuda() + 1
-    #data = torch.randn(527040 * size).cuda() + 1
+    data = torch.randn(527040 * size).cuda() + 1
     #data = torch.randn(524284 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
-    # data *= 0
-    # data += 2 ** rank
+    data *= 0
+    data += 2 ** rank
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
     # data = torch.randn(1536024 // 2, device="cuda") + 1
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -91,15 +91,15 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = False
+    check = True
 
     if check:
         all_inputs = []
         for r in range(size):
             torch.manual_seed(42 + r)
             rdata = torch.randn(data.numel()).cuda() + 1
-            # rdata *= 0
-            # rdata += 2 ** r
+            rdata *= 0
+            rdata += 2 ** r
             all_inputs.append(rdata)
 
             # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
@@ -239,7 +239,8 @@ def f(n):
 
         dist.reduce_scatter_tensor(result0, tmp)
     elif 1 == 1:
-        x = torch.nn.Linear(1024, 1024)
+        x1 = torch.nn.Linear(1024, 1024)
+        x2 = torch.nn.Linear(1024, 1024)
         y = torch.randn(1024)
         loopcount = 1000
         stream1 = torch.cuda.Stream()
@@ -247,9 +248,11 @@ def f(n):
         for i in range(loopcount):
             with torch.cuda.stream(stream1):
                 dist.reduce_scatter_tensor(result0, tmp)
-            with torch.cuda.stream(stream2):
-                x(y)
-        torch.cuda.synchronize()
+            #with torch.cuda.stream(stream2):
+            #    x1(y)
+            #    x2(y)
+
+            torch.cuda.synchronize()
     elif 1 == 1:
         loopcount = 1000
         events = []

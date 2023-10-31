@@ -20,6 +20,9 @@ struct Kernels : CollectiveBase {
   ~Kernels();
   void compile();
 
+  size_t gridSize;
+  size_t blockSize;
+
   std::string emitCopy(
       std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
       size_t blockSize, std::string threadIndex, std::string blockIndex);
