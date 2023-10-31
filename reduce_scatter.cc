@@ -119,12 +119,12 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   std::string globaldefs;
 
   auto addLocals = [&]() {
-    reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.bytes * $rank)");
+    reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.pitch * $rank)");
     for (size_t peerIndex : peerIndices) {
       size_t i = ipcRanks[peerIndex];
       reduceAdd(
           "(T*)params.outputAddress", replace(
-                                          "(const T*)(*(uintptr_t*)$src + params.bytes * $rank)", "$src",
+                                          "(const T*)(*(uintptr_t*)$src + params.pitch * $rank)", "$src",
                                           group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
     }
   };
@@ -135,12 +135,12 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
 
     size_t n = 0;
     for (size_t i : sendRanks) {
-      std::string addr = replace("(T*)(params.sendAddress + params.bytes * $n)", "$n", n);
-      reduceAdd(addr, replace("(const T*)(params.inputAddress + params.bytes * $i)", "$i", i));
+      std::string addr = replace("(T*)(params.sendAddress + params.pitch * $n)", "$n", n);
+      reduceAdd(addr, replace("(const T*)(params.inputAddress + params.pitch * $i)", "$i", i));
       for (size_t peerIndex : peerIndices) {
         reduceAdd(
             addr, replace(
-                      "(const T*)(*(uintptr_t*)$src + params.bytes * $i)", "$i", i, "$src",
+                      "(const T*)(*(uintptr_t*)$src + params.pitch * $i)", "$i", i, "$src",
                       group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
       }
 
@@ -168,7 +168,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
         return false;
       }
       )";
-    
+
     n = 0;
     for (size_t i : recvRanks) {
       reduceCode += replace(
@@ -176,7 +176,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
         reduce_scatter_wait_for_recv_$n<<<1, 1>>>();
         )",
           "$n", n);
-      reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.bytes * $n)", "$n", n));
+      reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", n));
 
       ++n;
     }
@@ -259,6 +259,7 @@ __device__ void reduce_add(ReduceParameters& params, void* dst, const void* src1
 
 struct ReduceScatterParameters {
   size_t bytes;
+  size_t pitch;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   uintptr_t peerInputAddresses[8];

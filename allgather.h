@@ -11,6 +11,7 @@ namespace moodist {
 
 struct AllGatherParameters {
   size_t bytes;
+  size_t pitch;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   std::array<uintptr_t, 8> peerInputAddresses;

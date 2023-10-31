@@ -244,13 +244,13 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
 
   std::string localCopies;
   localCopies += R"(
-    allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $rank), (const void*)params.inputAddress);
+    allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $rank), (const void*)params.inputAddress);
   )";
   for (size_t peerIndex : peerIndices) {
     size_t i = ipcRanks[peerIndex];
     localCopies += replace(
         R"(
-      allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $i), *(const void**)$src);
+      allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $i), *(const void**)$src);
     )",
         "$i", i, "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex));
   }
@@ -271,7 +271,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
         R"(
       *(volatile uint32_t*)$forwardPtr = stepValue + $c;
       while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
-      allgather_copy_add(copies, (void*)(params.outputAddress + params.bytes * $source), (void*)(*(uintptr_t*)$src + params.bytes * $source));
+      allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $source), (void*)(*(uintptr_t*)$src + params.pitch * $source));
     )",
         "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
         Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$source",
@@ -284,12 +284,12 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
 
 struct AllGatherParameters {
   size_t bytes;
+  size_t pitch;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   uintptr_t peerInputAddresses[8];
   uintptr_t peerOutputAddresses[8];
 };
-
 
 
 constexpr size_t copyQueueSize = 16;

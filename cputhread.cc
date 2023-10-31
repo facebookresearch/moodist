@@ -771,7 +771,7 @@ void CpuThread::entry() {
         // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
         // Thus, we register each ranks output address independently, so they get different MRs.
         for (size_t i : recvRanks) {
-          auto* mr = regMrCuda(params.outputAddress + params.bytes * i, params.bytes);
+          auto* mr = regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
           outDyns[i].gatherAddress = params.outputAddress;
           for (size_t di = 0; di != devices.size(); ++di) {
             outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
@@ -861,7 +861,7 @@ void CpuThread::entry() {
               //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
               liveSends += devices.size();
               writeDataDistributed2(
-                  i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+                  i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank + offset,
                   localDyns[i].gatherKey,
                   [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
                    &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
@@ -954,13 +954,13 @@ void CpuThread::entry() {
         auto& recvRanks = reduceScatter.recvRanks;
 
         uintptr_t recvAddress = group->recvBuffer.cudaPointer;
-        CHECK(group->recvBuffer.bytes >= params.bytes * recvRanks.size());
+        CHECK(group->recvBuffer.bytes >= params.pitch * recvRanks.size());
 
         uintptr_t sendAddress = group->sendBuffer.cudaPointer;
-        CHECK(group->sendBuffer.bytes >= params.bytes * sendRanks.size());
+        CHECK(group->sendBuffer.bytes >= params.pitch * sendRanks.size());
 
-        auto* sendMr = regMrCuda(sendAddress, params.bytes * sendRanks.size());
-        auto* recvMr = regMrCuda(recvAddress, params.bytes * recvRanks.size());
+        auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
+        auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());
 
         for (size_t i : recvRanks) {
           outDyns[i].gatherAddress = recvAddress;
@@ -1040,7 +1040,7 @@ void CpuThread::entry() {
             size_t nbytes = std::min(params.bytes - offset, chunkSize);
 
             if (nbytes > 0) {
-              uintptr_t srcAddr = (uintptr_t)sendAddress + params.bytes * index + offset;
+              uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index + offset;
 
               // fmt::printf(
               //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
@@ -1053,7 +1053,7 @@ void CpuThread::entry() {
               //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
               liveSends += devices.size();
               writeDataDistributed2(
-                  i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.bytes + offset,
+                  i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch + offset,
                   localDyns[i].gatherKey,
                   [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
                    &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {

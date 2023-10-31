@@ -611,140 +611,8 @@ __device__ void syncthreads() {
   asm volatile ("barrier.sync 0;" :: );
 }
 
-// __device__ void copy_impl_async(void* __restrict__ dstp, const void* __restrict__ srcp, size_t bytes) {
-//   size_t blockIndex = blockIdx.x;
-//   size_t threadIndex = threadIdx.x;
-//   if (threadIndex != 0) {
-//     return;
-//   }
-//   extern __shared__ uint8_t data[];
-
-//   uint32_t state;
-
-//   __shared__ uint64_t barrier;
-//   uint32_t barrierAddr = (uint32_t)__cvta_generic_to_shared(&barrier);
-//   asm volatile ("mbarrier.init.shared.b64 [%0], 1;" :: "r"(barrierAddr) : "memory");
-
-//   uintptr_t dst = (uintptr_t)dstp;
-//   uintptr_t src = (uintptr_t)srcp;
-
-//   const uint32_t chunkSize = $sharedMemSize / 2;
-
-//   size_t myOffset = chunkSize * blockIndex;
-
-//   uint32_t i = 0;
-//   for (;myOffset < bytes; ++i) {
-//     size_t offset = i % 2 ? chunkSize : 0;
-//     uint32_t chunk = (uint32_t)min(bytes - myOffset, (size_t)chunkSize);
-
-//     asm volatile ("mbarrier.arrive.expect_tx.shared.b64 %0, [%1], 2;" : "=r"(state) : "r"(barrierAddr), "r"(chunk) : "memory");
-
-//     asm volatile ("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" :: "l"(dstp), "l"(srcp), "r"(chunk), "l"(barrier) : "memory");
-
-//     asm volatile ("{\nloop:\nmbarrier.try_wait.shared.b64 complete, [%1], %2;\n@!complete bra loop;\n}" :: "r"(barrierAddr), "r"(state));
-//   }
-
-
-
-//   //asm volatile ("cp.async.cg.shared.global [%0], [%1], 16, 16;" :: "r"((uint32_t)(__cvta_generic_to_shared(&data_$i_$n[%offset]))), "l"((void*)($src)) : "memory");
-// }
-
-struct Moo {
-  uint4 a[2];
-};
-
-template<typename T>
-__device__ void copy_impl_impl(T* __restrict__ dstp, const T* __restrict__ srcp, size_t numel) {
-  size_t blockIndex = blockIdx.x;
-  size_t threadIndex = threadIdx.x;
-  for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
-    dstp[i] = srcp[i];
-  }
-  __syncthreads();
-}
-
-// __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
-//   copy_impl_async(dst, src, bytes);
-// }
-
-__device__ void copy_impl_old(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
-  static_assert(sizeof(uint4) == 16);
-  size_t offset = 0;
-  if (((uintptr_t)dst % 16 == 0) && ((uintptr_t)src % 16 == 0)) {
-    size_t n = bytes / sizeof(Moo) * sizeof(Moo);
-    copy_impl_impl((Moo*)dst, (const Moo*)src, bytes / sizeof(Moo));
-    dst = (void*)((uintptr_t)dst + n);
-    src = (void*)((uintptr_t)src + n);
-    bytes -= n;
-    copy_impl_impl((uint4*)dst, (const uint4*)src, bytes / 16);
-    offset += bytes / 16 * 16;
-  } else {
-    assert(((uintptr_t)dst % 4 == 0));
-    assert(((uintptr_t)src % 4 == 0));
-    copy_impl_impl((uint32_t*)dst, (const uint32_t*)src, bytes / 4);
-    offset += bytes / 4 * 4;
-  }
-
-  if (blockIdx.x * $blockSize + threadIdx.x < bytes - offset) {
-    char* dstp = (char*)dst + offset + blockIdx.x * $blockSize + threadIdx.x;
-    char* srcp = (char*)src + offset + blockIdx.x * $blockSize + threadIdx.x;
-    *dstp = *srcp;
-  }
-}
-
 __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
-  uintptr_t a = (uintptr_t)dst | (uintptr_t)src;
-  if (a % 16 == 0) {
-    $copyCode
-  } else {
-    // if (threadIdx.x == 0 && blockIdx.x == 0 && bytes >= 1024) {
-    //   printf("Unaligned copy :(\n");
-    // }
-    copy_impl_old(dst, src, bytes);
-  }
-}
-
-__device__ void copy_impl_x(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
-  const size_t blockIndex = blockIdx.x;
-  const size_t threadIndex = threadIdx.x;
-  const size_t chunkSize = 65536 * 16;
-  const size_t numel = (bytes + chunkSize - 1) / chunkSize;
-  for (size_t i = blockIndex; i < numel; i += $gridSize) {
-    copy_impl_x((void*)((uintptr_t)dst + i * chunkSize), (void*)((uintptr_t)src + i * chunkSize), min(chunkSize, bytes - i * chunkSize));
-  }
-}
-
-// template<typename Op, typename Dst, typename... Src>
-// __device__ void reduce_impl(Dst* __restrict__ dst, size_t numel, const Src*... __restrict__ src) {
-//   size_t blockIndex = blockIdx.x;
-//   size_t threadIndex = threadIdx.x;
-//   for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
-//     Op()(dst[i], src[i]...);
-//   }
-// }
-
-// struct OpAdd {
-//   template<typename T>
-//   operator()(T& dst, const T src) {
-//     dst += src;
-//   }
-//   template<typename T>
-//   operator()(T& dst, const T src1, const T src2) {
-//     dst = src1 + src2;
-//   }
-// };
-
-// template<typename T, size_t N>
-// struct Vec {
-//   T v[N];
-// };
-
-template<typename T>
-__device__ void reduce_sum(T* __restrict__ dst, const T* __restrict__ src, size_t numel) {
-  // uintptr_t a = (uintptr_t)dst | (uintptr_t)src;
-  // if (a % 16 == 0) {
-
-  // }
+  $copyCode
 }
 
 )";
@@ -754,27 +622,13 @@ __device__ void reduce_sum(T* __restrict__ dst, const T* __restrict__ src, size_
 
   source = replace(
       source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
-  // source = replace(
-  //     source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", 1, blockSize, "threadIdx.x", "0"));
 
   source += emitReduceFunction("float", 4, 2, "sum", gridSize, blockSize);
 
   source += R"(
 template<typename T>
 __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
-  uintptr_t a = (uintptr_t)dst | (uintptr_t)src1 | (uintptr_t)src2;
-  if (a % 16 == 0) {
-    reduce_float_sum_n2(numel, dst, src1, src2);
-  } else {
-    // if (threadIdx.x == 0 && blockIdx.x == 0 && numel >= 1024) {
-    //   printf("Unaligned reduce :(\n");
-    // }
-    size_t blockIndex = blockIdx.x;
-    size_t threadIndex = threadIdx.x;
-    for (size_t i = blockIndex * $blockSize + threadIndex; i < numel; i += $gridSize * $blockSize) {
-      dst[i] = src1[i] + src2[i];
-    }
-  }
+  reduce_float_sum_n2(numel, dst, src1, src2);
 }
 )";
 

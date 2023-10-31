@@ -25,33 +25,17 @@ struct QueueEntry {
 };
 
 struct QueueEntryAllGather : QueueEntry {
-  std::vector<uintptr_t> outputAddresses;
   uintptr_t inputAddress = 0;
   uintptr_t outputAddress = 0;
   size_t bytes = 0;
-
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::array<uintptr_t, 8> peerOutputAddresses;
-};
-
-struct QueueEntryAllReduce : QueueEntry {
-  uintptr_t inputAddress = 0;
-  size_t bytes = 0;
-
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::vector<uintptr_t> proxyIpcOutputAddresses;
-
-  AllocatedBuffer recvBuffers;
+  size_t pitch = 0;
 };
 
 struct QueueEntryReduceScatter : QueueEntry {
-  std::vector<uintptr_t> outputAddresses;
   uintptr_t inputAddress = 0;
   uintptr_t outputAddress = 0;
   size_t bytes = 0;
-
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::array<uintptr_t, 8> peerOutputAddresses;
+  size_t pitch = 0;
 };
 
 template<typename T>
@@ -93,7 +77,6 @@ struct CpuThread {
 
   QueueEntryFreeList<QueueEntry> freelistTerminate;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
-  QueueEntryFreeList<QueueEntryAllReduce> freelistAllReduce;
   QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
 
   CpuThread(Group*);

@@ -73,11 +73,12 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(442416 * size).cuda() + 1
-    data = torch.randn(527040 * size).cuda() + 1
+    #data = torch.randn(527040 * size).cuda() + 1
+    data = torch.randn(524288 * size).cuda() + 1
     #data = torch.randn(524284 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
-    data *= 0
-    data += 2 ** rank
+    # data *= 0
+    # data += 2 ** rank
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
     # data = torch.randn(1536024 // 2, device="cuda") + 1
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -98,8 +99,8 @@ def f(n):
         for r in range(size):
             torch.manual_seed(42 + r)
             rdata = torch.randn(data.numel()).cuda() + 1
-            rdata *= 0
-            rdata += 2 ** r
+            # rdata *= 0
+            # rdata += 2 ** r
             all_inputs.append(rdata)
 
             # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
