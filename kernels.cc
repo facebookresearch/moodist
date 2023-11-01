@@ -23,7 +23,6 @@ std::string Kernels::emitCopy(
     for (size_t i = 0; i != destinations.size(); ++i) {
       auto& v = destinations[i];
       writes += fmt::sprintf("__stwt((%s*)(void*)%s, %s);\n", type, v, temporaries[i]);
-      writes += fmt::sprintf("%s = %s + %u;\n", v, v, typesize * stride);
     }
   };
   auto readwrite = [&](std::string& reads, std::string& writes, std::string type, int typesize) {
@@ -32,7 +31,6 @@ std::string Kernels::emitCopy(
       std::string temp = getVar("temporary");
       temporaries.push_back(temp);
       reads += fmt::sprintf("%s %s = __ldcv((%s*)(void*)%s);\n", type, temp, type, v);
-      reads += fmt::sprintf("%s = %s + %u;\n", v, v, typesize * stride);
     }
     genwrites(writes, type, typesize, temporaries);
   };
@@ -371,109 +369,34 @@ $post
 )";
     std::string pre = addOffset(datatypesize);
     std::string post = addOffset(-(int)datatypesize);
-    // pre += replace(R"(printf("pre destination -> %#lx\n", $dst);)", "$dst", addresses[0]);
-    // pre += replace(R"(printf("pre source -> %#lx\n", $dst);)", "$dst", addresses[1]);
     std::string preloop;
     std::string loop;
     std::string postloop;
-    // if (datatypesize == 16 && cg->computeMajor >= 8 && false) {
-    if (false) {
-      // std::string sharedinit;
-      // size_t sharedOffset = 0;
-      // for (size_t n = 0; n != addresses.size(); ++n) {
-      //   for (int i = 0; i != unroll; ++i) {
-      //     // sharedinit += replace("alignas(128) __shared__ $datatype data_$i_$n[$stride];\n", "$i", i, "$n", n);
-      //     sharedinit += replace(
-      //         R"(
-      //       $datatype* data_$i_$n = ($datatype*)((uintptr_t)sharedptr + $offset);
-      //     )",
-      //         "$i", i, "$n", n, "$offset", sharedOffset);
-      //     sharedOffset += datatypesize * stride;
-      //   }
-      // }
-      // currentFunction->sharedMemSize = std::max(currentFunction->sharedMemSize, sharedOffset);
-      // preloop = replace(
-      //     R"(
-      //   $sharedinit
-      // )",
-      //     "$sharedinit", sharedinit, "$unroll", unroll);
-
-      // for (int i = 0; i != unroll; ++i) {
-      //   std::string reads;
-      //   for (size_t n = 0; n != addresses.size(); ++n) {
-      //     auto& src = addresses[n];
-      //     std::string read = replace(
-      //         R"(
-      //         asm volatile ("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::
-      //         "r"((uint32_t)(__cvta_generic_to_shared(&data_$i_$n[%offset]))), "l"((void*)($src)) : "memory"); $src
-      //         += $datatypesize * $stride;
-      //     )",
-      //         "$i", i, "$n", n, "$src", src);
-      //     preloop += read;
-      //     reads += read;
-      //   }
-      //   preloop += R"(asm volatile ("cp.async.commit_group; "::);
-      //   )";
-      //   reads += R"(asm volatile ("cp.async.commit_group; "::);
-      //   )";
-
-      //   std::string settemps;
-      //   std::vector<std::string> tempnames;
-      //   for (size_t n = 0; n != addresses.size(); ++n) {
-      //     std::string temp = getVar("temporary");
-      //     preloop += replace("$datatype $temp;\n", "$temp", temp);
-      //     settemps += replace("$temp = data_$i_$n[%offset];\n", "$temp", temp, "$i", i, "$n", n);
-      //     tempnames.push_back(temp);
-      //   }
-      //   std::string result = getVar("result");
-      //   std::string reducecode = getreducecode(datatype, result, tempnames);
-      //   preloop += replace("$datatype $result;\n", "$result", result);
-      //   std::string write = replace(
-      //       R"($settemps
-      //       $reducecode
-      //       __stwt(($datatype*)(void*)$dst, $result); $dst += $datatypesize * $stride;
-      //               )",
-      //       "$result", result, "$dst", dst, "$reducecode", reducecode, "$settemps", settemps);
-      //   postloop += replace(
-      //       R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
-      //   )",
-      //       "$N", unroll - i - 1);
-      //   loop += replace(
-      //       R"(asm volatile ("cp.async.wait_group $N; ":::"memory");
-      //   )",
-      //       "$N", unroll - 1);
-      //   postloop += write;
-      //   loop += write;
-      //   loop += reads;
-      // }
-
-    } else {
-      for (int i = 0; i != unroll; ++i) {
-        std::vector<std::string> tempnames;
-        std::string reads;
-        for (size_t n = 0; n != addresses.size(); ++n) {
-          auto& src = addresses[n];
-          std::string temp = getVar("temporary");
-          tempnames.push_back(temp);
-          std::string read = replace(
-              R"($temp = __ldcv(($datatype*)(void*)$src); $src += $datatypesize * $stride;
+    for (int i = 0; i != unroll; ++i) {
+      std::vector<std::string> tempnames;
+      std::string reads;
+      for (size_t n = 0; n != addresses.size(); ++n) {
+        auto& src = addresses[n];
+        std::string temp = getVar("temporary");
+        tempnames.push_back(temp);
+        std::string read = replace(
+            R"($temp = __ldcv(($datatype*)(void*)$src); $src += $datatypesize * $stride;
                   )",
-              "$temp", temp, "$src", src);
-          preloop += datatype + " " + read;
-          reads += read;
-        }
-        std::string result = getVar("result");
-        std::string reducecode = getreducecode(datatype, result, tempnames);
-        preloop += replace("$datatype $result;\n", "$result", result);
-        std::string write = replace(
-            R"($reducecode
+            "$temp", temp, "$src", src);
+        preloop += datatype + " " + read;
+        reads += read;
+      }
+      std::string result = getVar("result");
+      std::string reducecode = getreducecode(datatype, result, tempnames);
+      preloop += replace("$datatype $result;\n", "$result", result);
+      std::string write = replace(
+          R"($reducecode
             __stwt(($datatype*)(void*)$dst, $result); $dst += $datatypesize * $stride;
                     )",
-            "$result", result, "$dst", dst, "$reducecode", reducecode);
-        postloop += write;
-        loop += write;
-        loop += reads;
-      }
+          "$result", result, "$dst", dst, "$reducecode", reducecode);
+      postloop += write;
+      loop += write;
+      loop += reads;
     }
     size_t loopsize = (datatypesize / typesize) * unroll * stride;
     s = replace(
@@ -520,7 +443,7 @@ $pre
     return s;
   };
   std::string reducelastitem = generatelast(type, typesize);
-  std::string reduce1;// = generate("uint4", 16, 32);
+  std::string reduce1; // = generate("uint4", 16, 32);
   reduce1 += generate("uint4", 16, 16);
   reduce1 += generate("uint4", 16, 4);
   reduce1 += generate("uint4", 16, 1);
@@ -617,8 +540,9 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
 
 )";
 
-  gridSize = 64;
-  blockSize = 128;
+  gridSize = 32;
+  blockSize = 256;
+  size_t blocksPerSm = 2;
 
   source = replace(
       source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
@@ -798,7 +722,8 @@ __device__ void grid_generic_exit() {
   add(group->allGather->generate());
   add(group->reduceScatter->generate());
 
-  source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize);
+  source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
+  source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);
 
   source = replace(source, "$sharedMemSize", 40960);
 
@@ -948,6 +873,16 @@ __device__ void grid_generic_exit() {
 
   for (auto& v : functions) {
     CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
+
+    int numRegs = 0;
+    CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, *v.first));
+    int maxThreadsPerBlock = 0;
+    CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, *v.first));
+    int localBytes = 0;
+    CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, *v.first));
+    fmt::printf("kernel %s uses %d registers\n", v.second, numRegs);
+    fmt::printf("kernel %s max threads per block: %d\n", v.second, maxThreadsPerBlock);
+    fmt::printf("kernel %s local bytes: %d\n", v.second, localBytes);
   }
 
   CHECK_CU(cuLinkDestroy(linkState));

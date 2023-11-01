@@ -208,7 +208,7 @@ struct ReduceParameters {
 };
 
 template<typename T>
-__global__ void reduce_kernel(ReduceParameters params) {
+__global__ void $launchBounds reduce_kernel(ReduceParameters params) {
   assert(params.n > 0);
   assert(params.n <= reduceQueueSize);
 #pragma unroll 1
@@ -282,7 +282,7 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   return true;
 }
 
-extern "C" __global__ void reduce_scatter_local(ReduceScatterParameters params) {
+extern "C" __global__ void $launchBounds reduce_scatter_local(ReduceScatterParameters params) {
   grid_generic_entry_local(params);
   reduce_scatter_impl(params);
   grid_generic_exit_local();
@@ -292,7 +292,7 @@ extern "C" __global__ void reduce_scatter_exit() {
   generic_exit();
 }
 
-extern "C" __global__ void reduce_scatter(ReduceScatterParameters params) {
+extern "C" __global__ void $launchBounds reduce_scatter(ReduceScatterParameters params) {
   grid_generic_entry(params);
   if (reduce_scatter_impl(params)) {
     reduce_scatter_exit<<<1, 1>>>();

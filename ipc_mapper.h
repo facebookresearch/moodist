@@ -20,6 +20,7 @@ struct IpcMapper {
     uintptr_t peerAddress;
     uintptr_t localAddress;
     uintptr_t size;
+    bool unmappable;
   };
 
   std::array<HashMap<CUipcMemHandle, Mapped, IpcMemHash, IpcMemEqual>, 8> peerIpcMap;
@@ -40,8 +41,44 @@ struct IpcMapper {
   void* getMySharedMem(size_t offset, size_t size);
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size);
 
+  void unmapAll() {
+    std::unique_lock l(mutex);
+    fmt::printf("ipc mapper unmapping all memory!\n");
+    while (true) {
+      bool stop = true;
+      for (size_t peerIndex = 0; peerIndex != peerIpcMap.size(); ++peerIndex) {
+        peerIpcAddressMap[peerIndex].clear();
+        auto& ipcMap = peerIpcMap[peerIndex];
+        for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
+          if (!i->second.unmappable) {
+            continue;
+          }
+          fmt::printf(
+              "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
+              i->second.localAddress, i->second.peerAddress);
+          ++waitCount;
+          uintptr_t peerAddress = i->second.peerAddress;
+          size_t size = i->second.size;
+          ipcMap.erase(i);
+          l.unlock();
+          stop = false;
+          sendRequestUnmap(peerIndex, peerAddress, size, [this](uintptr_t) { --waitCount; });
+          l.lock();
+          break;
+        }
+      }
+      if (stop) {
+        break;
+      }
+    }
+    l.unlock();
+    auto start = Clock::now();
+    while (waitCount.load(std::memory_order_relaxed) && Clock::now() - start < std::chrono::milliseconds(5));
+  }
+
   template<typename Callback>
-  void requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback) {
+  void
+  requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
     unsigned long long bufferId = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
     CHECK(bufferId != -1);
@@ -53,7 +90,7 @@ struct IpcMapper {
     auto i = addressMap.find(address);
     if (i != addressMap.end()) {
       if (i->second.second == bufferId) {
-        //fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address, i->second.first);
+        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address, i->second.first);
         callback(i->second.first);
         return;
       }
@@ -108,7 +145,7 @@ struct IpcMapper {
       sendRequestAddress(
           peerIndex, handle, size,
           [this, peerIndex, address, handle, offset, bufferId, length, base, size,
-           callback = std::forward<Callback>(callback)](uintptr_t mappedAddress) {
+           callback = std::forward<Callback>(callback), unmappable](uintptr_t mappedAddress) {
             fmt::printf(
                 "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, address,
                 mappedAddress + offset, offset);
@@ -117,6 +154,7 @@ struct IpcMapper {
             v.localAddress = base;
             v.peerAddress = mappedAddress;
             v.size = size;
+            v.unmappable = unmappable;
             callback(mappedAddress + offset);
             --waitCount;
           });

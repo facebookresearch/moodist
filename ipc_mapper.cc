@@ -1,4 +1,5 @@
 #include "ipc_mapper.h"
+#include "async.h"
 #include "common.h"
 #include "group.h"
 #include "setup_comms.h"
@@ -85,13 +86,13 @@ struct IpcMapperImpl : IpcMapper {
       CUdeviceptr response;
     };
 
-    std::array<Slot, 16> slots;
+    std::array<Slot, 32> slots;
   };
 
   IpcMapperImpl(Group* group) {
     this->group = group;
 
-    memsize = 4096 * 16 + 1024 * group->size;
+    memsize = 4096 * 32 + 1024 * group->size;
   }
   virtual ~IpcMapperImpl() override {
     if (thread.joinable()) {
@@ -125,7 +126,15 @@ struct IpcMapperImpl : IpcMapper {
 
     try {
 
+      async::setCurrentThreadName("ipc mapper");
+
+      async::Scheduler unmapScheduler;
+      unmapScheduler.setMaxThreads(1);
+      unmapScheduler.setName("ipc unmap");
+
       CHECK_CU(cuCtxSetCurrent(group->cuContext));
+
+      unmapScheduler.run([this]() { CHECK_CU(cuCtxSetCurrent(group->cuContext)); });
 
       while (true) {
         if (terminate.load(std::memory_order_relaxed)) {
@@ -165,7 +174,22 @@ struct IpcMapperImpl : IpcMapper {
               fmt::printf(
                   "%d: got ipc unmap (address %#x size %#x) request from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
-              CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
+              // cuIpcCloseMemHandle synchronizes the device, but we cannot block here.
+              // so, we launch in in a separate thread.
+              // since we respond immediately, there is a race condition where the mem handle may not be closed
+              // by the time the remote process receives the response and finishes its wait.
+              // since this code path is mostly used when the remote process wants to free memory, this
+              // can result in out of memory errors.
+              unmapScheduler.run([this, address = v.requestUnmapAddress]() {
+                try {
+                  CHECK_CU(cuIpcCloseMemHandle(address));
+                } catch (const std::exception& e) {
+                  fmt::printf("ipc mapper got exception %s\n", e.what());
+                  std::lock_guard l(mutex);
+                  hasException = true;
+                  exception = std::current_exception();
+                }
+              });
             } else {
               fmt::printf("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
               CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
@@ -209,7 +233,7 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    fmt::printf("sending ipc request using slot %d\n", slotIndex);
+    fmt::printf("sending ipc request to rank %d using slot %d\n", group->ipcRanks.at(peerIndex), slotIndex);
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();

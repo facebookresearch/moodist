@@ -21,7 +21,7 @@
 
 namespace moodist {
 
-inline async::SchedulerFifo scheduler;
+extern async::Scheduler scheduler;
 
 inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
   throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));

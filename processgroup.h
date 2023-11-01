@@ -23,11 +23,7 @@ class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
   std::unique_ptr<ProcessGroupImpl> impl;
 
-  ProcessGroup(int rank, int size);
-  void init(std::string rank0Address);
-
-  std::string getAddress();
-
+  ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
   ~ProcessGroup();
 
   const std::string getBackendName() const override {

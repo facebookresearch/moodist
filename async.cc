@@ -62,7 +62,8 @@ struct ThreadPool {
   std::list<Thread> threads;
   std::atomic_size_t numThreads = 0;
   size_t maxThreads = 0;
-  ThreadPool() noexcept {
+  std::string name;
+  ThreadPool(std::string name = "async") noexcept : name(std::move(name)) {
     maxThreads = std::thread::hardware_concurrency();
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -91,8 +92,8 @@ struct ThreadPool {
     auto* t = &threads.back();
     t->n = threads.size() - 1;
     t->f = f.release();
-    t->thread = std::thread([n, t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
-      setCurrentThreadName("async " + std::to_string(n));
+    t->thread = std::thread([this, n, t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
+      setCurrentThreadName(name + "-" + std::to_string(n));
       t->entry(std::move(waitFunction));
     });
     return t;
@@ -107,7 +108,7 @@ struct ThreadPool {
   }
 };
 
-struct SchedulerFifoImpl {
+struct SchedulerImpl {
   // std::array<std::atomic<Thread*>, 64> threads{};
 
   struct alignas(64) Incoming {
@@ -177,10 +178,10 @@ struct SchedulerFifoImpl {
 
   ThreadPool pool;
 
-  SchedulerFifoImpl() = default;
-  SchedulerFifoImpl(size_t nThreads) : pool(nThreads) {}
+  SchedulerImpl() = default;
+  SchedulerImpl(size_t nThreads) : pool(nThreads) {}
 
-  ~SchedulerFifoImpl() {
+  ~SchedulerImpl() {
     for (auto& t : pool.threads) {
       t.terminate = true;
       if (outgoing[t.n].sleeping) {
@@ -282,25 +283,27 @@ struct SchedulerFifoImpl {
   }
 };
 
-SchedulerFifo::SchedulerFifo() {
-  impl_ = std::make_unique<SchedulerFifoImpl>();
+Scheduler::Scheduler() {
+  impl_ = std::make_unique<SchedulerImpl>();
 }
-SchedulerFifo::SchedulerFifo(size_t nThreads) {
-  impl_ = std::make_unique<SchedulerFifoImpl>(nThreads);
+Scheduler::Scheduler(size_t nThreads) {
+  impl_ = std::make_unique<SchedulerImpl>(nThreads);
 }
-SchedulerFifo::~SchedulerFifo() {}
-void SchedulerFifo::run(Function<void()> f) noexcept {
+Scheduler::~Scheduler() {}
+void Scheduler::run(Function<void()> f) noexcept {
   impl_->run(std::move(f));
 }
-void SchedulerFifo::setMaxThreads(size_t nThreads) {
+void Scheduler::setMaxThreads(size_t nThreads) {
   impl_->pool.setMaxThreads(nThreads);
 }
-size_t SchedulerFifo::getMaxThreads() const {
+size_t Scheduler::getMaxThreads() const {
   return impl_->pool.getMaxThreads();
 }
-
-bool SchedulerFifo::isInThread() const noexcept {
+bool Scheduler::isInThread() const noexcept {
   return isThisAThread;
+}
+void Scheduler::setName(std::string name) {
+  impl_->pool.name = name;
 }
 
 } // namespace async

@@ -38,6 +38,8 @@ struct AllGather : CollectiveBase {
   CUfunction cuAllGatherLocal = nullptr;
   CUfunction cuAllGather = nullptr;
 
+  CUfunction cuAllGatherCopyKernel = nullptr;
+
   AllGather(Group* group);
   ~AllGather();
   void init();

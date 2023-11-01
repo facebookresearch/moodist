@@ -300,7 +300,7 @@ struct AllGatherCopyParameters {
   uint32_t n;
 };
 
-__global__ void allgather_copy_kernel(AllGatherCopyParameters params) {
+extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
   assert(params.n > 0);
   assert(params.n <= copyQueueSize);
 #pragma unroll 1
@@ -414,6 +414,7 @@ extern "C" __global__ void allgather(AllGatherParameters params) {
 
   fn(cuAllGatherLocal, "allgather_local");
   fn(cuAllGather, "allgather");
+  fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
 
   return std::make_pair(source, functions);
 }

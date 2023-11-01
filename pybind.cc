@@ -33,8 +33,9 @@ PYBIND11_MODULE(_C, m) {
       m, "MoodistProcessGroup", R"d(
     A moodist process group :D
   )d")
-      .def(py::init<int, int>())
-      .def("get_address", &MoodistProcessGroup::getAddress)
-      .def("init", &MoodistProcessGroup::init);
-  m.def("enable_profiling", [](bool b) { printf("enable profiling -> %d\n", b); moodist::profilingEnabled = b; });
+      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>());
+  m.def("enable_profiling", [](bool b) {
+    printf("enable profiling -> %d\n", b);
+    moodist::profilingEnabled = b;
+  });
 }

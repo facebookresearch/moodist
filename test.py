@@ -95,10 +95,10 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 256 - 1).cuda() + 1
+        data = torch.randn(1024 * 1024 * 256).cuda() + 1
         #data = torch.randn(263520).cuda() + 1
         #data = torch.randn(262144).cuda() + 1
-        data = torch.randn(682678 // 2).cuda() + 1
+        #data = torch.randn(682678 // 2).cuda() + 1
         #data = torch.randn(1024 * 1024).cuda() + 1
         #data = torch.randn(1027).cuda() + 1
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
@@ -500,7 +500,7 @@ def f(n):
             ##si = tmp.sum().item()
             # print("-> %f" % si)
             # sum += si
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)
@@ -551,6 +551,7 @@ if len(sys.argv) < 3:
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 #for n in ("moodist", "nccl"):
 for n in ("nccl", "moodist"):
+#for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

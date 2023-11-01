@@ -27,6 +27,8 @@ namespace moodist {
 
 extern bool profilingEnabled;
 
+async::Scheduler scheduler;
+
 void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
 }
@@ -128,24 +130,12 @@ c10::intrusive_ptr<tccl_work::Work> makeFuture(std::shared_ptr<Op> op, std::vect
   return c10::make_intrusive<OpFutureWrappingWork>(op, std::move(outputs));
 }
 
-struct MemoryManager {
-  Group* group;
-  std::vector<AllocatedBuffer> free;
-  AllocatedBuffer allocate(size_t bytes) {
-    for (auto i = free.end(); i != free.begin();) {
-      --i;
-      if (i->bytes >= bytes) {
-        AllocatedBuffer r = std::move(*i);
-        free.erase(i);
-        return r;
-      }
-    }
-    return group->allocateHost(bytes);
-  }
-  void deallocate(AllocatedBuffer buffer) {
-    free.push_back(std::move(buffer));
-  }
-};
+struct ProcessGroupImpl;
+std::mutex activeProcessGroupsMutex;
+std::vector<ProcessGroupImpl*> activeProcessGroups;
+
+std::once_flag freeMemoryCallbackOnceFlag;
+void registerFreeMemoryCallback();
 
 struct ProcessGroupImpl {
   size_t rank = 0;
@@ -153,23 +143,30 @@ struct ProcessGroupImpl {
 
   std::shared_ptr<Group> group;
 
-  MemoryManager inputMemory;
-  MemoryManager outputMemory;
-
   SpinMutex mutex;
   std::vector<std::shared_ptr<Op>> allOps;
   std::atomic_uint32_t nextStepValue = 1;
 
-  ProcessGroupImpl(int rank, int size) : rank(rank), size(size) {
+  ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
 
     scheduler.setMaxThreads(1);
 
     group = std::make_shared<Group>(rank, size);
 
-    for (auto& v : {&inputMemory, &outputMemory}) {
-      v->group = &*group;
+    init(store);
+
+    {
+      std::call_once(freeMemoryCallbackOnceFlag, &registerFreeMemoryCallback);
+      std::lock_guard l(activeProcessGroupsMutex);
+      activeProcessGroups.push_back(this);
     }
+  }
+
+  void freeMemory() {
+    std::lock_guard l(mutex);
+    CHECK_CU(cuStreamSynchronize(group->stream));
+    group->ipcMapper->unmapAll();
   }
 
   struct TraceEvent {
@@ -232,47 +229,50 @@ struct ProcessGroupImpl {
 
   ~ProcessGroupImpl() {
     trace("");
+
+    std::lock_guard l(activeProcessGroupsMutex);
+    auto i = std::find(activeProcessGroups.begin(), activeProcessGroups.end(), this);
+    if (i != activeProcessGroups.end()) {
+      activeProcessGroups.erase(i);
+    }
   }
 
-  void init(std::string rank0Address) {
+  void init(const c10::intrusive_ptr<::c10d::Store>& store) {
 
     fmt::printf("%d: init\n", rank);
 
+    auto start = Clock::now();
+
     std::unique_lock l(mutex);
 
-    if (rank != 0) {
-      // fmt::printf("v is %d: %s\n", v.size(), v);
-      std::vector<uint8_t> data;
-      size_t i = 0;
-      for (char vv : rank0Address) {
-        size_t index = vv >= '0' && vv <= '9' ? vv - '0' : vv - 'a' + 10;
-        if (index >= 16) {
-          throw std::invalid_argument("ProcessGroup: invalid address");
-        }
-        if (i % 2 == 0) {
-          data.push_back(index);
-        } else {
-          data.back() <<= 4;
-          data.back() |= index;
-        }
-        ++i;
-      }
-      // std::string str;
-      // for (auto& v : data) {
-      //   str += fmt::sprintf("%02x", (unsigned char)v);
-      // }
-      // fmt::printf("data.size() is %d: %s\n", data.size(), str);
-      std::vector<std::string> remoteAddresses;
-      deserializeBuffer(data.data(), data.size(), remoteAddresses);
+    std::string key = randomName();
 
-      for (auto& address : remoteAddresses) {
-        group->setupComms->connect(address);
-      }
+    if (rank == 0) {
+      store->set("moodist_pg_key", key);
+    } else {
+      key = store->get_to_str("moodist_pg_key");
+    }
+    store->set(fmt::sprintf("moodist_pg_rank%d_address", rank), getAddress());
+    int prevRank = (rank + size - 1) % size;
+    int nextRank = (rank + 1) % size;
+    std::string prevAddress = store->get_to_str(fmt::sprintf("moodist_pg_rank%d_address", prevRank));
+    std::string nextAddress = store->get_to_str(fmt::sprintf("moodist_pg_rank%d_address", nextRank));
+
+    for (auto& address : decodeAddress(prevAddress)) {
+      group->setupComms->connect(address);
+    }
+    for (auto& address : decodeAddress(nextAddress)) {
+      group->setupComms->connect(address);
     }
 
     fmt::printf("%d: Waiting for setupComms\n", rank);
     std::fflush(stdout);
     group->setupComms->waitForConnections();
+
+    store->set(fmt::sprintf("moodist_rank%d_ready", rank), key);
+    for (size_t i = 0; i != size; ++i) {
+      CHECK(store->get_to_str(fmt::sprintf("moodist_rank%d_ready", i)) == key);
+    }
 
     fmt::printf("%d: Waiting for connections\n", rank);
     std::fflush(stdout);
@@ -280,7 +280,7 @@ struct ProcessGroupImpl {
       if (i == rank) {
         continue;
       }
-      group->setupComms->sendTo(i, fmt::sprintf("hello %d", i));
+      group->setupComms->sendTo(i, fmt::sprintf("hello %d %s", i, key));
     }
     for (size_t i = 0; i != size; ++i) {
       if (i == rank) {
@@ -289,7 +289,7 @@ struct ProcessGroupImpl {
       fmt::printf("%d: waiting for greeting from %d\n", rank, i);
       std::fflush(stdout);
       std::string greeting = group->setupComms->recvFrom<std::string>(i);
-      TORCH_CHECK(greeting == fmt::sprintf("hello %d", rank));
+      TORCH_CHECK(greeting == fmt::sprintf("hello %d %s", rank, key));
       fmt::printf("greeting ok!\n");
       std::fflush(stdout);
     }
@@ -297,6 +297,29 @@ struct ProcessGroupImpl {
     std::fflush(stdout);
 
     group->init();
+
+    fmt::printf("init took %gs\n", seconds(Clock::now() - start));
+  }
+
+  std::vector<std::string> decodeAddress(std::string str) {
+    std::vector<uint8_t> data;
+    size_t i = 0;
+    for (char vv : str) {
+      size_t index = vv >= '0' && vv <= '9' ? vv - '0' : vv - 'a' + 10;
+      if (index >= 16) {
+        throw std::invalid_argument("ProcessGroup: invalid address");
+      }
+      if (i % 2 == 0) {
+        data.push_back(index);
+      } else {
+        data.back() <<= 4;
+        data.back() |= index;
+      }
+      ++i;
+    }
+    std::vector<std::string> remoteAddresses;
+    deserializeBuffer(data.data(), data.size(), remoteAddresses);
+    return remoteAddresses;
   }
 
   std::string getAddress() {
@@ -400,10 +423,10 @@ struct ProcessGroupImpl {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, bytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; });
+          i, inputAddress, bytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
 
       ipcMapper->requestAddress(
-          i, outputAddress, outputBytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
+          i, outputAddress, outputBytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
     }
 
     ipcMapper->wait();
@@ -556,10 +579,10 @@ struct ProcessGroupImpl {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, inputBytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; });
+          i, inputAddress, inputBytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
 
       ipcMapper->requestAddress(
-          i, outputAddress, bytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; });
+          i, outputAddress, bytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
     }
 
     ipcMapper->wait();
@@ -639,18 +662,28 @@ struct ProcessGroupImpl {
   }
 };
 
-ProcessGroup::ProcessGroup(int rank, int size) : c10d::ProcessGroup(rank, size) {
-  impl = std::make_unique<ProcessGroupImpl>(rank, size);
+struct FreeMemoryCallback : at::FreeMemoryCallback {
+  virtual bool Execute() {
+    fmt::printf("free cuda memory callback triggered!\n");
+    std::unique_lock l(activeProcessGroupsMutex);
+    for (auto* pg : activeProcessGroups) {
+      pg->freeMemory();
+    }
+    return false;
+  };
+};
+
+void registerFreeMemoryCallback() {
+  at::FreeCudaMemoryCallbacksRegistry()->Register("moodist", []() { return std::make_unique<FreeMemoryCallback>(); });
+  fmt::printf("free cuda memory callback registered!\n");
+}
+
+ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
+    : c10d::ProcessGroup(rank, size) {
+  impl = std::make_unique<ProcessGroupImpl>(store, rank, size);
 }
 ProcessGroup::~ProcessGroup() {
   impl.reset();
-}
-
-void ProcessGroup::init(std::string rank0Address) {
-  impl->init(rank0Address);
-}
-std::string ProcessGroup::getAddress() {
-  return impl->getAddress();
 }
 
 c10::intrusive_ptr<tccl_work::Work>
