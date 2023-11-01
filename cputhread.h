@@ -12,9 +12,8 @@ namespace moodist {
 
 constexpr uint8_t taskTerminate = 0;
 constexpr uint8_t taskBarrier = 1;
-constexpr uint8_t taskAllreduce = 2;
-constexpr uint8_t taskAllgather = 3;
-constexpr uint8_t taskReduceScatter = 4;
+constexpr uint8_t taskAllgather = 2;
+constexpr uint8_t taskReduceScatter = 3;
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
@@ -22,6 +21,10 @@ struct QueueEntry {
   uint8_t task;
 
   uint32_t stepValue;
+};
+
+struct QueueEntryBarrier : QueueEntry {
+  std::atomic_uint32_t* cpuDone = nullptr;
 };
 
 struct QueueEntryAllGather : QueueEntry {
@@ -76,6 +79,7 @@ struct CpuThread {
   std::atomic_bool ready = false;
 
   QueueEntryFreeList<QueueEntry> freelistTerminate;
+  QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
   QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
 

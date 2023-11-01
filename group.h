@@ -16,7 +16,7 @@ struct DynamicAddresses;
 
 struct alignas(64) Progress {
   uint32_t stepValue;
-  size_t bytesReady;
+  uint32_t cpuStepValue;
 };
 
 struct AddressPair {

@@ -569,6 +569,16 @@ void CpuThread::entry() {
           (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
     };
 
+    auto writeCpuStep = [&](size_t deviceIndex, size_t dst, uint32_t stepValue) {
+      Device& dev = devices[deviceIndex];
+      uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].cpuStepValue);
+      localProgress[rank].cpuStepValue = stepValue;
+      forceSignalNext = true;
+      writeData(
+          dev, dst, &localProgress[rank].cpuStepValue, commsMr->mrs.at(deviceIndex)->lkey,
+          (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
+    };
+
     volatile uint32_t* cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
     volatile uint32_t* cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
 
@@ -741,7 +751,29 @@ void CpuThread::entry() {
 
       CHECK(queueEntry.stepValue < (1ul << 31));
 
-      if (queueEntry.task == taskAllgather) {
+      if (queueEntry.task == taskBarrier) {
+        QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
+        uint32_t stepValue = params.stepValue;
+
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank) {
+            continue;
+          }
+          writeCpuStep((rank + i) % devices.size(), i, stepValue);
+        }
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank) {
+            continue;
+          }
+          while (localProgress[i].cpuStepValue < stepValue) {
+            poll();
+          }
+        }
+        params.cpuDone->store(1);
+        futexWakeAll(params.cpuDone);
+
+        freelistBarrier.push(&params);
+      } else if (queueEntry.task == taskAllgather) {
         QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
 
         uint32_t stepValue = params.stepValue;
@@ -756,8 +788,8 @@ void CpuThread::entry() {
         // fmt::printf("rank %d cpu thread got all gather (step %#x)\n", rank, stepValue);
 
         // fmt::printf(
-        //     "rank %d inputAddress %#x outputAddress %#x bytes %d\n", rank, params.inputAddress, params.outputAddress,
-        //     params.bytes);
+        //     "rank %d inputAddress %#x outputAddress %#x bytes %d\n", rank, params.inputAddress,
+        //     params.outputAddress, params.bytes);
 
         auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
         // auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
@@ -1133,7 +1165,6 @@ void CpuThread::entry() {
     }
 
     trace("");
-
   } catch (const std::exception& e) {
     fmt::fprintf(stderr, "Error: %s\n", e.what());
     fflush(stderr);

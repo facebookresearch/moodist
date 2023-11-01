@@ -35,8 +35,10 @@ void throwCuHelper(CUresult error, const char* file, int line) {
 
 struct Op {
   std::atomic_bool busy = false;
+  bool isCpu = false;
   CUevent inputEvent;
   CUevent outputEvent;
+  std::atomic_uint32_t cpuDone = 0;
 };
 
 class OpFutureWrappingWork : public tccl_work::Work {
@@ -56,6 +58,9 @@ public:
   bool checkDone() const {
     if (done) {
       return true;
+    }
+    if (op->isCpu) {
+      return op->cpuDone.load(std::memory_order_relaxed);
     }
     CUresult r = cuEventQuery(op->outputEvent);
     if (r == CUDA_SUCCESS) {
@@ -94,12 +99,18 @@ public:
     if (done) {
       return;
     }
-    // c10::cuda::CUDACachingAllocator::recordStream(const DataPtr &, CUDAStream stream)
-    // fmt::printf("op future synchronize()!\n");
-    auto stream = c10::cuda::getCurrentCUDAStream();
-    // fmt::printf("synchronize, wait for event %p\n", (void*)op->event);
-    // fmt::printf("synchronize, SKIP wait for event %p\n", (void*)op->outputEvent);
-    CHECK_CU(cuStreamWaitEvent(stream, op->outputEvent, CU_EVENT_WAIT_DEFAULT));
+    if (op->isCpu) {
+      while (op->cpuDone == 0) {
+        futexWait(&op->cpuDone, 0, std::chrono::seconds(10));
+      }
+    } else {
+      // c10::cuda::CUDACachingAllocator::recordStream(const DataPtr &, CUDAStream stream)
+      // fmt::printf("op future synchronize()!\n");
+      auto stream = c10::cuda::getCurrentCUDAStream();
+      // fmt::printf("synchronize, wait for event %p\n", (void*)op->event);
+      // fmt::printf("synchronize, SKIP wait for event %p\n", (void*)op->outputEvent);
+      CHECK_CU(cuStreamWaitEvent(stream, op->outputEvent, CU_EVENT_WAIT_DEFAULT));
+    }
     op->busy = false;
     done = true;
   }
@@ -145,7 +156,8 @@ struct ProcessGroupImpl {
 
   SpinMutex mutex;
   std::vector<std::shared_ptr<Op>> allOps;
-  std::atomic_uint32_t nextStepValue = 1;
+  std::atomic_uint32_t nextCpuStepValue = 1;
+  std::atomic_uint32_t nextCudaStepValue = 1;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -343,6 +355,7 @@ struct ProcessGroupImpl {
         continue;
       }
       v->busy = true;
+      v->isCpu = false;
       return v;
     }
     std::shared_ptr<Op> op = std::make_shared<Op>();
@@ -350,6 +363,7 @@ struct ProcessGroupImpl {
     CHECK_CU(cuEventCreate(&op->inputEvent, CU_EVENT_DISABLE_TIMING));
     CHECK_CU(cuEventCreate(&op->outputEvent, CU_EVENT_DISABLE_TIMING));
     allOps.push_back(op);
+    op->isCpu = false;
     return op;
   }
 
@@ -358,7 +372,18 @@ struct ProcessGroupImpl {
   }
 
   c10::intrusive_ptr<tccl_work::Work> barrier(const c10d::BarrierOptions& opts) {
-    TORCH_CHECK(false, "barrier");
+    std::lock_guard l(mutex);
+    uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
+    CHECK(stepValue < 0x10000000);
+    std::shared_ptr<Op> op = getOp();
+    op->isCpu = true;
+    op->cpuDone = 0;
+    QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
+    e->task = taskBarrier;
+    e->stepValue = stepValue;
+    e->cpuDone = &op->cpuDone;
+    group->cpuThread->enqueue(e);
+    return makeFuture(op, {});
   }
 
   c10::intrusive_ptr<tccl_work::Work>
@@ -370,7 +395,7 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = nextStepValue.fetch_add(4096);
+    uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
     CHECK(stepValue < 0x10000000);
 
     TORCH_CHECK(input.is_contiguous());
@@ -513,7 +538,7 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = nextStepValue.fetch_add(4096);
+    uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
     CHECK(stepValue < 0x10000000);
 
     TORCH_CHECK(input.is_contiguous());
