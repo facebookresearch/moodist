@@ -9,6 +9,7 @@ namespace moodist {
 struct SetupCommsImpl : SetupComms {
 
   static constexpr uint64_t signature = 0x116dc74103a4dc0f;
+  static constexpr uint64_t signatureAllgather = 0x116dc74102a4dc0f;
 
   std::atomic_uint32_t connectionReady = 0;
 
@@ -44,9 +45,9 @@ struct SetupCommsImpl : SetupComms {
           if (error) {
             return;
           }
-          fmt::fprintf(
-              stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
-              connection->remoteAddress());
+          // fmt::fprintf(
+          //     stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
+          //     connection->remoteAddress());
           std::fflush(stdout);
           std::lock_guard l(mutex);
           if (dying) {
@@ -165,7 +166,7 @@ struct SetupCommsImpl : SetupComms {
     uint32_t destinationRank;
     uint32_t ttl;
     auto view = deserializeBufferPart(data, sig, rankId, sourceRank, destinationRank, ttl);
-    if (sig != signature || sourceRank >= size || sourceRank == rank) {
+    if ((sig != signature && sig != signatureAllgather) || sourceRank >= size || sourceRank == rank) {
       return;
     }
     CHECK(connectionIds.size() > sourceRank);
@@ -186,18 +187,18 @@ struct SetupCommsImpl : SetupComms {
           return;
         }
         if (!prev && sourceRank == (rank + size - 1) % size) {
-          fmt::printf(
-              "%d: Got prev connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
-              destinationRank);
+          // fmt::printf(
+          //     "%d: Got prev connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
+          //     destinationRank);
           std::fflush(stdout);
           prev = connection;
           connectionIds[sourceRank] = rankId;
           isNew = true;
         }
         if (!next && sourceRank == (rank + 1) % size) {
-          fmt::printf(
-              "%d: Got next connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
-              destinationRank);
+          // fmt::printf(
+          //     "%d: Got next connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
+          //     destinationRank);
           std::fflush(stdout);
           next = connection;
           connectionIds[sourceRank] = rankId;
@@ -226,7 +227,7 @@ struct SetupCommsImpl : SetupComms {
     //       connectionIds[sourceRank]));
     // }
     // CHECK(rankId != myId);
-    fmt::printf("%d: recv %d bytes (ttl %d)\n", rank, data->size(), ttl);
+    // fmt::printf("%d: recv %d bytes (ttl %d)\n", rank, data->size(), ttl);
     incomingData.push_back(std::move(data));
     l.unlock();
     ++incomingDataCount;
@@ -265,13 +266,10 @@ struct SetupCommsImpl : SetupComms {
   std::vector<BufferHandle> allgatherBuffers;
   std::vector<std::string_view> allgatherResult;
   std::vector<std::string_view>& allgather(BufferHandle data) {
-    for (size_t i = 0; i != size; ++i) {
-      if (i == rank) {
-        continue;
-      }
+    if (size > 1) {
       BufferHandle buffer2 = makeBuffer(data->size());
       std::memcpy(buffer2->data(), data->data(), data->size());
-      sendBufferTo(i, std::move(buffer2));
+      sendBufferTo((rank + 1) % size, std::move(buffer2), true);
     }
     uint64_t sig;
     uint64_t rankId;
@@ -289,12 +287,23 @@ struct SetupCommsImpl : SetupComms {
     while (remaining) {
       waitForIncomingData([&](BufferHandle& data) {
         auto view = deserializeBufferPart(data, sig, rankId, sourceRank, destinationRank, ttl);
-        if (allgatherBuffers[sourceRank]) {
+        if (allgatherBuffers[sourceRank] || sig != signatureAllgather) {
           return false;
         }
+        BufferHandle buffer2 = makeBuffer(data->size());
+        std::memcpy(buffer2->data(), data->data(), data->size());
         allgatherBuffers[sourceRank] = std::move(data);
         allgatherResult[sourceRank] = view;
         --remaining;
+        size_t nextRank = (rank + 1) % size;
+        if (nextRank != sourceRank) {
+          CHECK(ttl > 0);
+          auto* ptr = buffer2->data();
+          std::memcpy(ptr + 20, &nextRank, sizeof(uint32_t));
+          --ttl;
+          std::memcpy(ptr + 24, &ttl, sizeof(uint32_t));
+          next->write(std::move(buffer2), nullptr);
+        }
         return true;
       });
     }
@@ -302,10 +311,10 @@ struct SetupCommsImpl : SetupComms {
     return allgatherResult;
   }
 
-  void sendBufferTo(size_t destinationRank, BufferHandle data) {
+  void sendBufferTo(size_t destinationRank, BufferHandle data, bool isAllgather = false) {
     CHECK(data->size() >= 28);
     auto* ptr = data->data();
-    std::memcpy(ptr, &signature, sizeof(uint64_t));
+    std::memcpy(ptr, isAllgather ? &signatureAllgather : &signature, sizeof(uint64_t));
     std::memcpy(ptr + 8, &myId, sizeof(uint64_t));
     uint32_t sourceRank = rank;
     std::memcpy(ptr + 16, &sourceRank, sizeof(uint32_t));
