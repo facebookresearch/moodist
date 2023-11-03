@@ -282,6 +282,8 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
   std::string source = replace(
       R"zz(
 
+namespace {
+
 struct AllGatherParameters {
   size_t bytes;
   size_t pitch;
@@ -300,6 +302,8 @@ struct AllGatherCopyParameters {
   uint32_t n;
 };
 
+}
+
 extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
   assert(params.n > 0);
   assert(params.n <= copyQueueSize);
@@ -309,6 +313,8 @@ extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyPara
     copy_impl(params.dst[i], params.src[i], params.bytes);
   }
 }
+
+namespace {
 
 __device__ void allgather_copy_flush(AllGatherCopyParameters& params) {
   if (params.n) {
@@ -329,6 +335,8 @@ __device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, c
   }
 }
 
+}
+
 extern "C" __global__ void allgather_local_exit() {
   generic_exit_local();
 }
@@ -336,7 +344,6 @@ extern "C" __global__ void allgather_local_exit() {
 extern "C" __global__ void allgather_exit() {
   generic_exit();
 }
-
 
 extern "C" __global__ void allgather_local(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = globalStepValue;

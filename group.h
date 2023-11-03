@@ -19,6 +19,11 @@ struct alignas(64) Progress {
   uint32_t cpuStepValue;
 };
 
+struct alignas(64) DynamicAddresses {
+  std::array<uint32_t, 32> gatherKey;
+  uintptr_t gatherAddress;
+};
+
 struct AddressPair {
   uintptr_t inputAddress;
   size_t inputBytes;

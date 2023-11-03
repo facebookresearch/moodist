@@ -96,7 +96,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         #data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        data = torch.randn(263520).cuda() + 1
+        #data = torch.randn(263520).cuda() + 1
         #data = torch.randn(262144).cuda() + 1
         #data = torch.randn(682678 // 2).cuda() + 1
         #data = torch.randn(1024 * 1024).cuda() + 1
@@ -104,7 +104,7 @@ def f(n):
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
-        # data = torch.randn(128 * 4).cuda() + 1
+        data = torch.randn(1024 * 1024).cuda() + 1
         if rank == 0:
             print("all-gather")
         result = [torch.zeros_like(data) for _ in range(size)]
@@ -155,7 +155,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if False:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -303,7 +303,7 @@ def f(n):
             moodist.enable_profiling(False)
 
             dist._all_gather_base(result0, tmp)
-        elif 1 == 1:
+        elif 1 == 12:
             x = torch.nn.Linear(1024, 1024)
             y = torch.randn(1024)
             loopcount = 1000
@@ -315,7 +315,7 @@ def f(n):
                 # with torch.cuda.stream(stream2):
                 #     x(y)
             torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 13:
             loopcount = 1000
             for i in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
@@ -548,6 +548,12 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
+ngpus = 8
+
+fds = []
+for i in range(ngpus):
+    fds.append(os.open("out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i), os.O_WRONLY|os.O_CREAT|os.O_TRUNC))
+
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 #for n in ("moodist", "nccl"):
 for n in ("nccl", "moodist"):
@@ -555,7 +561,6 @@ for n in ("nccl", "moodist"):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
-    ngpus = 8
     for i in range(ngpus):
         os.environ["RANK"] = str(int(os.environ["SLURM_PROCID"]) * ngpus + i)
         os.environ["WORLD_SIZE"] = str(int(os.environ["SLURM_NTASKS"]) * ngpus)
@@ -565,7 +570,7 @@ for n in ("nccl", "moodist"):
             print(n)
         pid = os.fork()
         if pid == 0:
-            fd = os.open("out-%s.txt" % os.environ["RANK"], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+            fd = fds[i]
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             f(n)

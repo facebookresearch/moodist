@@ -25,6 +25,11 @@ find_package(CUDAToolkit)
 
 message(STATUS "CUDA includes are ${CUDAToolkit_INCLUDE_DIRS}")
 
+message(STATUS "CUDAToolkit_LIBRARY_DIR is ${CUDAToolkit_LIBRARY_DIR}")
+
+find_library(CUDADEVRT libcudadevrt.a REQUIRED HINTS ${CUDAToolkit_LIBRARY_DIR})
+
+message(STATUS "CUDADEVRT is ${CUDADEVRT}")
 
 find_package(Threads REQUIRED)
 
@@ -61,40 +66,41 @@ target_link_libraries(
   Threads::Threads
   fmt
   anl numa ${FABRIC_LIBRARY}
-  CUDA::cudart CUDA::nvml
+  CUDA::cudart CUDA::nvml CUDA::nvrtc
 )
 target_include_directories(_C SYSTEM PRIVATE rdma-core ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 
 target_link_libraries(_C PUBLIC ibverbs-static bnxt_re cxgb4 efa-static erdma hns irdma mana-static mlx4-static mlx5-static mthca ocrdma qedr vmw_pvrdma hfi1verbs ipathverbs rxe siw ibverbs-static)
 
+target_compile_definitions(_C PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
 
-add_executable(testd
-  testd.cc
-  processgroup.cc
-  group.cc
-  setup_comms.cc  
-  connection.cc
-  socket.cc
-  async.cc
-  ipc_mapper.cc
-  cputhread.cc
-  ib_common.cc
-  allgather.cc
-  kernels.cc
-  reduce_scatter.cc
-)
-target_link_libraries(
-  testd
-  PRIVATE
-  ${TORCH_LIBRARIES}
-  Threads::Threads
-  fmt
-  anl numa ${FABRIC_LIBRARY}
-  CUDA::cudart CUDA::nvml
-  ${Python_LIBRARIES}
-)
-target_include_directories(testd SYSTEM PRIVATE rdma-core ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS} ${Python_INCLUDE_DIRS})
-target_compile_options(testd PRIVATE ${TORCH_CXX_FLAGS})
+# add_executable(testd
+#   testd.cc
+#   processgroup.cc
+#   group.cc
+#   setup_comms.cc  
+#   connection.cc
+#   socket.cc
+#   async.cc
+#   ipc_mapper.cc
+#   cputhread.cc
+#   ib_common.cc
+#   allgather.cc
+#   kernels.cc
+#   reduce_scatter.cc
+# )
+# target_link_libraries(
+#   testd
+#   PRIVATE
+#   ${TORCH_LIBRARIES}
+#   Threads::Threads
+#   fmt
+#   anl numa ${FABRIC_LIBRARY}
+#   CUDA::cudart CUDA::nvml
+#   ${Python_LIBRARIES}
+# )
+# target_include_directories(testd SYSTEM PRIVATE rdma-core ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS} ${Python_INCLUDE_DIRS})
+# target_compile_options(testd PRIVATE ${TORCH_CXX_FLAGS})
 
-target_link_libraries(testd PUBLIC ibverbs-static bnxt_re cxgb4 efa-static erdma hns irdma mana-static mlx4-static mlx5-static mthca ocrdma qedr vmw_pvrdma hfi1verbs ipathverbs rxe siw ibverbs-static)
+# target_link_libraries(testd PUBLIC ibverbs-static bnxt_re cxgb4 efa-static erdma hns irdma mana-static mlx4-static mlx5-static mthca ocrdma qedr vmw_pvrdma hfi1verbs ipathverbs rxe siw ibverbs-static)

@@ -29,11 +29,16 @@ namespace py = pybind11;
 using MoodistProcessGroup = moodist::ProcessGroup;
 
 PYBIND11_MODULE(_C, m) {
-  py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>, c10d::ProcessGroup>(
-      m, "MoodistProcessGroup", R"d(
+  py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>>(m, "MoodistProcessGroup", R"d(
     A moodist process group :D
   )d")
-      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>());
+      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>())
+      .def("barrier", &MoodistProcessGroup::barrier)
+      .def("barrier", [](MoodistProcessGroup& group) { return group.barrier(); })
+      .def("_reduce_scatter_base", &MoodistProcessGroup::_reduce_scatter_base)
+      .def("_reduce_scatter_base", [](MoodistProcessGroup& group, at::Tensor& outputTensor, at::Tensor& inputTensor) {
+        return group._reduce_scatter_base(outputTensor, inputTensor);
+      });
   m.def("enable_profiling", [](bool b) {
     printf("enable profiling -> %d\n", b);
     moodist::profilingEnabled = b;

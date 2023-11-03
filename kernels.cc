@@ -5,6 +5,12 @@
 #include "group.h"
 #include "reduce_scatter.h"
 
+#include <algorithm>
+#include <link.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 namespace moodist {
 
 Kernels::~Kernels() {
@@ -540,9 +546,9 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
 
 )";
 
-  gridSize = 32;
-  blockSize = 256;
-  size_t blocksPerSm = 2;
+  gridSize = 24;
+  blockSize = 384;
+  size_t blocksPerSm = 1;
 
   source = replace(
       source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
@@ -859,10 +865,65 @@ __device__ void grid_generic_exit() {
   //   CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
   // }
 
+  auto exists = [&](std::string fn) {
+    struct stat buf;
+    return ::stat(fn.c_str(), &buf) == 0;
+  };
+
+  std::string devrtPath = CUDADEVRT_PATH;
+  if (!exists(devrtPath)) {
+    std::string fn = "/usr/local/cuda/lib64/libcudadevrt.a";
+    if (exists(fn)) {
+      devrtPath = fn;
+    }
+  }
+
+  dl_iterate_phdr(
+      [](struct dl_phdr_info* info, size_t size, void* data) {
+        Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
+        return 0;
+      },
+      Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
+        fmt::printf("%s\n", info->dlpi_name);
+      }).release());
+
+  if (!exists(devrtPath)) {
+    std::vector<std::string> modules;
+    dl_iterate_phdr(
+        [](struct dl_phdr_info* info, size_t size, void* data) {
+          Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
+          return 0;
+        },
+        Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
+          modules.push_back(info->dlpi_name);
+        }).release());
+    std::reverse(modules.begin(), modules.end());
+    for (auto path : modules) {
+      auto slash = path.rfind('/');
+      if (slash != std::string::npos) {
+        path.resize(slash);
+      }
+      path += "libcudadevrt.a";
+      if (exists(path)) {
+        devrtPath = path;
+      } else {
+        fmt::printf("%s does not exist\n", path);
+      }
+    }
+  }
+
+  if (!exists(devrtPath)) {
+    fmt::fprintf(stderr, "Cannot find libcudadevrt.a (at compile time, it was at %s)\n", devrtPath);
+    fflush(stderr);
+  }
+
+  fmt::printf("devrtPath is %s\n", devrtPath);
+
   CUlinkState linkState;
   CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
-  CHECK_CU(cuLinkAddFile(
-      linkState, CU_JIT_INPUT_LIBRARY, "/usr/local/cuda/targets/x86_64-linux/lib/libcudadevrt.a", 0, nullptr, nullptr));
+  CHECK_CU(cuLinkAddFile(linkState, CU_JIT_INPUT_LIBRARY, devrtPath.c_str(), 0, nullptr, nullptr));
+  // CHECK_CU(cuLinkAddData(
+  //     linkState, CU_JIT_INPUT_PTX, ptx.data(), ptx.size(), cuFilename.c_str(), 0, nullptr, nullptr));
   CHECK_CU(cuLinkAddData(
       linkState, CU_JIT_INPUT_CUBIN, cubin.data(), cubin.size(), cuFilename.c_str(), 0, nullptr, nullptr));
   void* linkedCubin = nullptr;

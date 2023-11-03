@@ -4,12 +4,12 @@ from ._C import MoodistProcessGroup
 import torch.distributed
 
 
-class MyProcessGroup(MoodistProcessGroup):
-    def __init__(self, store, rank, size, timeout):
-        super().__init__(rank, size)
-        if rank == 0:
-            store.set("moodist_rank0_address", self.get_address())
-        self.init(store.get("moodist_rank0_address"))
+# class MyProcessGroup(MoodistProcessGroup):
+#     def __init__(self, store, rank, size, timeout):
+#         super().__init__(rank, size)
+#         if rank == 0:
+#             store.set("moodist_rank0_address", self.get_address())
+#         self.init(store.get("moodist_rank0_address"))
 
 
 def find_tensors(tup):
@@ -29,11 +29,12 @@ def find_tensors(tup):
 class ProcessGroup(torch.distributed.ProcessGroup):
     def __init__(self, store, rank, size, timeout):
         super().__init__(rank, size)
-        self.moodist = MyProcessGroup(store, rank, size, timeout)
-        self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
+        #self.unused = MoodistProcessGroup(torch.distributed.PrefixStore("unused", store), rank, size)
+        #self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
+        self.moodist = MoodistProcessGroup(store, rank, size)
 
     def _get_backend_name(self):
-        return "moodist-nccl"
+        return "moodist"
 
     def broadcast(self, *args, **kwargs):
         print("size %d broadcast %s" % (self.size(), find_tensors(args)))
@@ -81,6 +82,7 @@ class ProcessGroup(torch.distributed.ProcessGroup):
     def _reduce_scatter_base(self, *args, **kwargs):
         # print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
         #return self.nccl._reduce_scatter_base(*args, **kwargs)
+        #raise RuntimeError("stop")
         return self.moodist._reduce_scatter_base(*args, **kwargs)
 
     def alltoall_base(self, *args, **kwargs):
@@ -105,7 +107,7 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def barrier(self, *args, **kwargs):
         print("size %d barrier %s" % (self.size(), find_tensors(args)))
-        return self.nccl.barrier(*args, **kwargs)
+        return self.moodist.barrier()
 
 
 from datetime import timedelta
@@ -114,7 +116,7 @@ from datetime import timedelta
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    return MoodistProcessGroup(store, rank, size)
+    return ProcessGroup(store, rank, size, timeout)
 
 
 torch.distributed.Backend.register_backend("moodist", create_moodist_backend)

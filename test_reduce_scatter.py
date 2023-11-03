@@ -69,12 +69,13 @@ def f(n):
 
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-    # data = torch.randn(1024 * 1024 * 40).cuda() + 1
+    #data = torch.randn(1024 * 1024 * 40).cuda() + 1
+    data = torch.randn(2).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(442416 * size).cuda() + 1
     #data = torch.randn(527040 * size).cuda() + 1
-    data = torch.randn(524288 * size).cuda() + 1
+    #data = torch.randn(524288 * size).cuda() + 1
     #data = torch.randn(524284 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
     # data *= 0
@@ -92,7 +93,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = True
+    check = False
 
     if check:
         all_inputs = []
@@ -239,7 +240,7 @@ def f(n):
         moodist.enable_profiling(False)
 
         dist.reduce_scatter_tensor(result0, tmp)
-    elif 1 == 1:
+    elif 1 == 13:
         x1 = torch.nn.Linear(1024, 1024)
         x2 = torch.nn.Linear(1024, 1024)
         y = torch.randn(1024)
@@ -254,7 +255,7 @@ def f(n):
             #    x2(y)
 
             torch.cuda.synchronize()
-    elif 1 == 1:
+    elif 1 == 12:
         loopcount = 1000
         events = []
         for i in range(loopcount):
@@ -309,12 +310,19 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
+ngpus = 8
+
+fds = []
+for i in range(ngpus):
+    fds.append(os.open("out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i), os.O_WRONLY|os.O_CREAT|os.O_TRUNC))
+
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
+#for n in ("moodist", "nccl"):
 for n in ("nccl", "moodist"):
+#for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
-    ngpus = 8
     for i in range(ngpus):
         os.environ["RANK"] = str(int(os.environ["SLURM_PROCID"]) * ngpus + i)
         os.environ["WORLD_SIZE"] = str(int(os.environ["SLURM_NTASKS"]) * ngpus)
@@ -324,7 +332,7 @@ for n in ("nccl", "moodist"):
             print(n)
         pid = os.fork()
         if pid == 0:
-            fd = os.open("out-%s.txt" % os.environ["RANK"], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+            fd = fds[i]
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             f(n)

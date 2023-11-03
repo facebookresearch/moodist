@@ -4,6 +4,7 @@
 #include "function.h"
 #include "hash_map.h"
 #include "synchronization.h"
+#include <optional>
 
 namespace moodist {
 
@@ -73,7 +74,8 @@ struct IpcMapper {
     }
     l.unlock();
     auto start = Clock::now();
-    while (waitCount.load(std::memory_order_relaxed) && Clock::now() - start < std::chrono::milliseconds(5));
+    while (waitCount.load(std::memory_order_relaxed) && Clock::now() - start < std::chrono::milliseconds(5))
+      ;
   }
 
   template<typename Callback>

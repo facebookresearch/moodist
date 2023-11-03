@@ -251,7 +251,7 @@ struct ProcessGroupImpl {
 
   void init(const c10::intrusive_ptr<::c10d::Store>& store) {
 
-    fmt::printf("%d: init\n", rank);
+    fmt::printf("%d/%d: init\n", rank, size);
 
     auto start = Clock::now();
 
@@ -259,16 +259,22 @@ struct ProcessGroupImpl {
 
     std::string key = randomName();
 
+    auto tovec = [&](std::string str) { return std::vector<uint8_t>(str.begin(), str.end()); };
+    auto fromvec = [&](std::vector<uint8_t> vec) { return std::string(vec.begin(), vec.end()); };
+
+    auto set = [&](std::string key, std::string value) { store->set(key, tovec(value)); };
+    auto get = [&](std::string key) { return fromvec(store->get(key)); };
+
     if (rank == 0) {
-      store->set("moodist_pg_key", key);
+      set("moodist_pg_key", key);
     } else {
-      key = store->get_to_str("moodist_pg_key");
+      key = get("moodist_pg_key");
     }
-    store->set(fmt::sprintf("moodist_pg_rank%d_address", rank), getAddress());
+    set(fmt::sprintf("moodist_pg_rank%d_address", rank), getAddress());
     int prevRank = (rank + size - 1) % size;
     int nextRank = (rank + 1) % size;
-    std::string prevAddress = store->get_to_str(fmt::sprintf("moodist_pg_rank%d_address", prevRank));
-    std::string nextAddress = store->get_to_str(fmt::sprintf("moodist_pg_rank%d_address", nextRank));
+    std::string prevAddress = get(fmt::sprintf("moodist_pg_rank%d_address", prevRank));
+    std::string nextAddress = get(fmt::sprintf("moodist_pg_rank%d_address", nextRank));
 
     for (auto& address : decodeAddress(prevAddress)) {
       group->setupComms->connect(address);
@@ -281,9 +287,9 @@ struct ProcessGroupImpl {
     std::fflush(stdout);
     group->setupComms->waitForConnections();
 
-    store->set(fmt::sprintf("moodist_rank%d_ready", rank), key);
+    set(fmt::sprintf("moodist_rank%d_ready", rank), key);
     for (size_t i = 0; i != size; ++i) {
-      CHECK(store->get_to_str(fmt::sprintf("moodist_rank%d_ready", i)) == key);
+      CHECK(get(fmt::sprintf("moodist_rank%d_ready", i)) == key);
     }
 
     fmt::printf("%d: Waiting for connections\n", rank);
@@ -374,7 +380,7 @@ struct ProcessGroupImpl {
   c10::intrusive_ptr<tccl_work::Work> barrier(const c10d::BarrierOptions& opts) {
     std::lock_guard l(mutex);
     uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
-    CHECK(stepValue < 0x10000000);
+    CHECK(stepValue < 0x80000000);
     std::shared_ptr<Op> op = getOp();
     op->isCpu = true;
     op->cpuDone = 0;
@@ -396,7 +402,7 @@ struct ProcessGroupImpl {
     size_t size = this->size;
 
     uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
-    CHECK(stepValue < 0x10000000);
+    CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(input.is_cuda());
@@ -532,6 +538,13 @@ struct ProcessGroupImpl {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
 
+    // int cpu = sched_getcpu();
+    // int node = numa_node_of_cpu(cpu);
+
+    // if (group->allocationNode && node != group->allocationNode) {
+    //   fmt::printf("running on wrong node!\n");
+    // }
+
     // fmt::printf("pg %p doing reduce scatter\n", (void*)this);
 
     CHECK(opts.reduceOp == c10d::ReduceOp::SUM);
@@ -539,7 +552,7 @@ struct ProcessGroupImpl {
     size_t size = this->size;
 
     uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
-    CHECK(stepValue < 0x10000000);
+    CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(input.is_cuda());
@@ -703,8 +716,7 @@ void registerFreeMemoryCallback() {
   fmt::printf("free cuda memory callback registered!\n");
 }
 
-ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
-    : c10d::ProcessGroup(rank, size) {
+ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) {
   impl = std::make_unique<ProcessGroupImpl>(store, rank, size);
 }
 ProcessGroup::~ProcessGroup() {

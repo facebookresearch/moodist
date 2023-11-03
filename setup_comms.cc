@@ -334,7 +334,7 @@ struct SetupCommsImpl : SetupComms {
       uint32_t destinationRank;
       uint32_t ttl;
       auto view = deserializeBufferPart(data, sig, rankId, sourceRank, destinationRank, ttl);
-      if (sourceRank == rank) {
+      if (sourceRank == rank && sig == signature) {
         recvBuffer = std::move(data);
         r = view;
         return true;

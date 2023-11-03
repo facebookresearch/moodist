@@ -198,6 +198,8 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   std::string source = replace(
       R"zz(
 
+namespace {
+
 constexpr size_t reduceQueueSize = 16;
 struct ReduceParameters {
   size_t bytes;
@@ -280,6 +282,8 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
 
   reduce_flush<T>(reduces);
   return true;
+}
+
 }
 
 extern "C" __global__ void $launchBounds reduce_scatter_local(ReduceScatterParameters params) {

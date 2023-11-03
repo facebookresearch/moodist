@@ -108,7 +108,6 @@ struct Device {
   IbCommon* ib;
   ibv_pd* protectionDomain;
   ibv_cq* cq;
-  ibv_qp* qp;
   size_t currentCqEntries = 0;
   // std::vector<size_t> currentWr;
   // std::vector<size_t> signaledWr;
@@ -191,7 +190,6 @@ void CpuThread::entry() {
       dev.ib = &*v;
       dev.protectionDomain = v->protectionDomain;
       dev.cq = v->cq;
-      dev.qp = v->qp;
     }
 
     const size_t maxWr = IbCommon::maxWr;
@@ -331,12 +329,21 @@ void CpuThread::entry() {
 
         wr.wr_id = (uint64_t)(void*)callback;
 
+        bool efa = qp != nullptr;
+        if (!efa) {
+          qp = dev.ib->qpexs.at(i);
+          CHECK(qp != nullptr);
+        }
+
         ibv_wr_start(qp);
         qp->wr_id = wr.wr_id;
         qp->wr_flags = wr.send_flags;
         ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
         ibv_wr_set_sge_list(qp, 1, &sge);
-        ibv_wr_set_ud_addr(qp, dev.ib->ahs.at(i), dev.ib->remoteAddresses.at(i).qpNum, 0x4242);
+
+        if (efa) {
+          ibv_wr_set_ud_addr(qp, dev.ib->ahs.at(i), dev.ib->remoteAddresses.at(i).qpNum, 0x4242);
+        }
         int error = ibv_wr_complete(qp);
         if (error) {
           fmt::fprintf(stderr, "ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
@@ -549,11 +556,15 @@ void CpuThread::entry() {
         size_t n = i == chunks - 1 ? len - offset : chunkSize;
         auto& dev = devices[i];
         if (n != 0) {
+          bool efa = dev.ib->qpex != nullptr;
           writeData(
               dev, dst, (void*)(srcAddr + offset), mr->mrs[i]->lkey, (void*)(dstAddr + offset), key[i], n,
-              makeCallback([callback, i]() { callback(i); }));
+              makeCallback([callback, i, efa]() { callback(i, efa, true); }));
+          if (!efa) {
+            callback(i, true, false);
+          }
         } else {
-          callback(i);
+          callback(i, true, true);
         }
         offset += n;
       }
@@ -896,14 +907,18 @@ void CpuThread::entry() {
                   i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank + offset,
                   localDyns[i].gatherKey,
                   [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
-                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
+                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
                     // fmt::printf("send done for di %d\n", di);
-                    --liveSends;
-                    auto& dev = devices.at(di);
-                    writeData(
-                        dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                        (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                        remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                    if (done) {
+                      --liveSends;
+                    }
+                    if (ordered) {
+                      auto& dev = devices.at(di);
+                      writeData(
+                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                    }
                   });
               offset += nbytes;
             }
@@ -1088,14 +1103,18 @@ void CpuThread::entry() {
                   i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch + offset,
                   localDyns[i].gatherKey,
                   [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
-                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di) {
+                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
                     // fmt::printf("send done for di %d\n", di);
-                    --liveSends;
-                    auto& dev = devices.at(di);
-                    writeData(
-                        dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                        (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                        remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                    if (done) {
+                      --liveSends;
+                    }
+                    if (ordered) {
+                      auto& dev = devices.at(di);
+                      writeData(
+                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                    }
                   });
               offset += nbytes;
             }

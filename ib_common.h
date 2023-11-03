@@ -78,46 +78,6 @@ using IbvQp = IbvPtr<ibv_qp, ibv_destroy_qp>;
 using IbvMr = IbvPtr<ibv_mr, ibv_dereg_mr>;
 using IbvAh = IbvPtr<ibv_ah, ibv_destroy_ah>;
 
-struct FixedAddresses {
-  uintptr_t dataAddress = 0;
-  uintptr_t cpuStepDoneAddress = 0;
-  uintptr_t cudaStepDoneAddress = 0;
-  uintptr_t dynamicAddressesAddress = 0;
-  uint32_t dataRkey = 0;
-  uint32_t cpuStepDoneRkey = 0;
-  uint32_t cudaStepDoneRkey = 0;
-  uint32_t dynamicAddressesRkey = 0;
-
-  std::string bootId;
-  std::string devId;
-  CUipcMemHandle dataIpcHandle;
-  CUipcMemHandle cudaStepDoneIpcHandle;
-
-  template<typename X>
-  void serialize(X& x) {
-    x(dataAddress, cpuStepDoneAddress, cudaStepDoneAddress, dynamicAddressesAddress, dataRkey, cpuStepDoneRkey,
-      cudaStepDoneRkey, dynamicAddressesRkey, bootId, devId, dataIpcHandle, cudaStepDoneIpcHandle);
-  }
-};
-
-struct alignas(64) DynamicAddresses {
-  std::array<uint32_t, 32> gatherKey;
-  uintptr_t gatherAddress;
-};
-
-// struct alignas(64) DynamicAddresses {
-//   uintptr_t gatherDataAddress;
-//   uintptr_t reduceDataAddress;
-//   uint32_t gatherDataRkey;
-//   uint32_t reduceDataRkey;
-//   uint32_t stepValue;
-
-//   // template<typename X>
-//   // void serialize(X& x) {
-//   //   x(gatherDataAddress, gatherDataRkey, reduceDataAddress, reduceDataRkey, stepValue);
-//   // }
-// };
-
 struct Group;
 
 struct IbCommon {
@@ -134,34 +94,12 @@ struct IbCommon {
   std::vector<IbvAh> ahs;
   std::vector<IbAddress> remoteAddresses;
 
-  std::vector<FixedAddresses> fixedAddresses;
-  std::vector<DynamicAddresses> dynamicAddresses;
-
-  IbvMr dynamicAddressesMr;
+  std::vector<IbvQp> qps;
+  std::vector<ibv_qp_ex*> qpexs;
 
   void init(int portNum, ibv_port_attr portAttributes);
-  void initEfa(int portNum, ibv_port_attr portAttributes);
 
-  struct MrInfo {
-    IbvMr mr;
-    std::vector<std::pair<uintptr_t, unsigned long long>> buffers;
-
-    bool valid() const {
-      for (auto [address, bufferId] : buffers) {
-        unsigned long long bufferId2 = -1;
-        cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address);
-        if (bufferId2 != bufferId) {
-          fmt::printf(
-              "mr %#x %#x invalidated due to buffer id change %d -> %d\n", mr->lkey, mr->rkey, bufferId, bufferId2);
-          return false;
-        }
-      }
-      return true;
-    }
-  };
-  HashMap<unsigned long long, MrInfo> mrs;
-
-  ibv_mr* getMr(uintptr_t address, size_t length);
+  void init2Ib(int portNum, ibv_port_attr portAttributes);
 
   IbCommon(Group* group);
   ~IbCommon();
