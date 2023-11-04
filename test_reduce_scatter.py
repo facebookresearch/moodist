@@ -70,9 +70,9 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     #data = torch.randn(1024 * 1024 * 40).cuda() + 1
-    data = torch.randn(2).cuda() + 1
+    #data = torch.randn(4 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
+    data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(442416 * size).cuda() + 1
     #data = torch.randn(527040 * size).cuda() + 1
     #data = torch.randn(524288 * size).cuda() + 1
@@ -93,7 +93,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = False
+    check = True
 
     if check:
         all_inputs = []
@@ -122,8 +122,8 @@ def f(n):
         #print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result0 -= 1
-        # if _ % 3 == 0:
-        #     tmp = torch.zeros_like(tmp)
+        if _ % 3 == 0:
+            tmp = torch.zeros_like(tmp)
         # if _ % 9 <= 4:
         #     dist.all_gather_into_tensor(y, x)
         tmp.copy_(data)

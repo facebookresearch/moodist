@@ -177,10 +177,6 @@ void CpuThread::entry() {
     CUcontext cuCtx;
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
 
-    CUstream stream;
-    // CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-    CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -10000));
-
     SetupComms* setupComms = &*group->setupComms;
 
     std::vector<Device> devices;
@@ -423,6 +419,9 @@ void CpuThread::entry() {
     };
 
     auto regMrCuda = [&](uintptr_t address, size_t bytes) {
+      if (bytes == 0) {
+        bytes = 1;
+      }
       unsigned long long bufferId = -1;
       CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
       CHECK(bufferId != -1);
@@ -551,7 +550,7 @@ void CpuThread::entry() {
       CHECK(len > 0);
       size_t offset = 0;
       const size_t chunks = devices.size();
-      const size_t chunkSize = len / chunks;
+      const size_t chunkSize = len / chunks / 128u * 128u;
       for (size_t i = 0; i != chunks; ++i) {
         size_t n = i == chunks - 1 ? len - offset : chunkSize;
         auto& dev = devices[i];
@@ -740,446 +739,455 @@ void CpuThread::entry() {
 
     while (true) {
 
-      while (queueSize == 0) {
-        poll();
-        int sum = 0;
-        for (auto& dev : devices) {
-          sum += dev.currentCqEntries;
-        }
-        if (sum == 0) {
-          futexWait(&queueSize, 0, std::chrono::seconds(10));
-        }
-      }
-      --queueSize;
+      try {
 
-      ++opCount;
-
-      std::unique_lock l(mutex);
-      CHECK(!queue.empty());
-      QueueEntry& queueEntry = queue.front();
-      queue.pop_front();
-      l.unlock();
-
-      CHECK(queueEntry.stepValue < (1ul << 31));
-
-      if (queueEntry.task == taskBarrier) {
-        QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
-        uint32_t stepValue = params.stepValue;
-
-        for (size_t i = 0; i != size; ++i) {
-          if (i == rank) {
-            continue;
-          }
-          writeCpuStep((rank + i) % devices.size(), i, stepValue);
-        }
-        for (size_t i = 0; i != size; ++i) {
-          if (i == rank) {
-            continue;
-          }
-          while (localProgress[i].cpuStepValue < stepValue) {
-            poll();
-          }
-        }
-        params.cpuDone->store(1);
-        futexWakeAll(params.cpuDone);
-
-        freelistBarrier.push(&params);
-      } else if (queueEntry.task == taskAllgather) {
-        QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
-
-        uint32_t stepValue = params.stepValue;
-
-        AllGather& allGather = *group->allGather;
-
-        auto& sendRanks = allGather.sendRanks;
-        auto& recvRanks = allGather.recvRanks;
-
-        trace(fmt::sprintf("op_%d_setup_%d", opCount - 1, params.bytes));
-
-        // fmt::printf("rank %d cpu thread got all gather (step %#x)\n", rank, stepValue);
-
-        // fmt::printf(
-        //     "rank %d inputAddress %#x outputAddress %#x bytes %d\n", rank, params.inputAddress,
-        //     params.outputAddress, params.bytes);
-
-        auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
-        // auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
-
-        // DynamicAddresses* mydyn = &localDyns[rank];
-        // for (size_t i = 0; i != devices.size(); ++i) {
-        //   mydyn->gatherKey[i] = outputMr->mrs[i]->rkey;
-        // }
-        // mydyn->gatherAddress = (uintptr_t)params.outputAddress;
-
-        // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
-        // Thus, we register each ranks output address independently, so they get different MRs.
-        for (size_t i : recvRanks) {
-          auto* mr = regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
-          outDyns[i].gatherAddress = params.outputAddress;
-          for (size_t di = 0; di != devices.size(); ++di) {
-            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
-          }
-        }
-
-        // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-        // until kernel entry, such that we don't receive data until we're ready.
-        dynReady.resize(recvRanks.size());
-        size_t n = 0;
-        for (size_t i : recvRanks) {
-          size_t di = (rank + n) % devices.size();
-          auto& dev = devices[di];
-          writeData(
-              dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
-              (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
-              sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
-          ++n;
-        }
-
-        // fmt::printf("sent dyns\n");
-
-        // fmt::printf("got all dyns!\n");
-
-        trace("enter_wait_for_kernel");
-
-        // wait for kernel
-        while (cpuIn[0] < stepValue) {
+        while (queueSize == 0) {
           poll();
-        }
-
-        trace("dyn_ready");
-
-        // Now we can signal remote peers
-        n = 0;
-        for (size_t i : recvRanks) {
-          while (dynReady[n] < stepValue) {
-            poll();
+          int sum = 0;
+          for (auto& dev : devices) {
+            sum += dev.currentCqEntries;
           }
-          // size_t di = (rank + n) % devices.size();
-          // auto& dev = devices[di];
-          // writeStep(di, i, stepValue);
-          ++n;
-        }
-
-        auto start = std::chrono::steady_clock::now();
-
-        for (size_t i = 0; i != Group::dataChunks; ++i) {
-          sendStepValues[i] = stepValue + i;
-        }
-
-        CHECK(recvRanks.size() == sendRanks.size());
-
-        // for (size_t i : sendRanks) {
-        size_t liveSends = 0;
-        for (size_t index = 0; index != sendRanks.size(); ++index) {
-          if (true) {
-            size_t i = recvRanks[index];
-            trace(fmt::sprintf("%d_write_step_%d", i, stepValue + index));
-            size_t di = (rank + index) % devices.size();
-            auto& dev = devices[di];
-            writeStep(di, i, stepValue + index);
+          if (sum == 0) {
+            fmt::printf("cpu thread wait\n");
+            futexWait(&queueSize, 0, std::chrono::seconds(10));
           }
-          size_t i = sendRanks[index];
-          // wait for dyns
-          trace(fmt::sprintf("%d_wait_for_step_%d", i, stepValue + index));
-          while (localProgress[i].stepValue < stepValue + index) {
-            poll();
-          }
-          size_t offset = 0;
-          size_t liveStepValues = 0;
-          size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
-          for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
-            size_t nbytes = std::min(params.bytes - offset, chunkSize);
+        }
+        --queueSize;
 
-            if (nbytes > 0) {
-              uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
+        ++opCount;
 
-              // fmt::printf(
-              //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
-              //     localDyns[i].gatherAddress, rank * params.bytes, offset);
+        std::unique_lock l(mutex);
+        CHECK(!queue.empty());
+        QueueEntry& queueEntry = queue.front();
+        queue.pop_front();
+        l.unlock();
 
-              trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
-              //++liveSends;
-              // writeDataDistributed(
-              //     i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
-              //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
-              liveSends += devices.size();
-              writeDataDistributed2(
-                  i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank + offset,
-                  localDyns[i].gatherKey,
-                  [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
-                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
-                    // fmt::printf("send done for di %d\n", di);
-                    if (done) {
-                      --liveSends;
-                    }
-                    if (ordered) {
-                      auto& dev = devices.at(di);
-                      writeData(
-                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-                    }
-                  });
-              offset += nbytes;
+        CHECK(queueEntry.stepValue < (1ul << 31));
+
+        if (queueEntry.task == taskBarrier) {
+          QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
+          uint32_t stepValue = params.stepValue;
+
+          for (size_t i = 0; i != size; ++i) {
+            if (i == rank) {
+              continue;
             }
-            while (liveSends >= devices.size() * 2) {
+            writeCpuStep((rank + i) % devices.size(), i, stepValue);
+          }
+          for (size_t i = 0; i != size; ++i) {
+            if (i == rank) {
+              continue;
+            }
+            while (localProgress[i].cpuStepValue < stepValue) {
               poll();
             }
-            // trace(fmt::sprintf("%d_wait_for_liveSends", i));
-            // while (liveSends) {
-            //   poll();
-            // }
-            // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+          }
+          params.cpuDone->store(1);
+          futexWakeAll(params.cpuDone);
+
+          freelistBarrier.push(&params);
+        } else if (queueEntry.task == taskAllgather) {
+          QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
+
+          uint32_t stepValue = params.stepValue;
+
+          AllGather& allGather = *group->allGather;
+
+          auto& sendRanks = allGather.sendRanks;
+          auto& recvRanks = allGather.recvRanks;
+
+          trace(fmt::sprintf("op_%d_setup_%d", opCount - 1, params.bytes));
+
+          // fmt::printf("rank %d cpu thread got all gather (step %#x)\n", rank, stepValue);
+
+          // fmt::printf(
+          //     "rank %d inputAddress %#x outputAddress %#x bytes %d\n", rank, params.inputAddress,
+          //     params.outputAddress, params.bytes);
+
+          auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
+          // auto* outputMr = regMrCuda(params.outputAddress, params.bytes * size);
+
+          // DynamicAddresses* mydyn = &localDyns[rank];
+          // for (size_t i = 0; i != devices.size(); ++i) {
+          //   mydyn->gatherKey[i] = outputMr->mrs[i]->rkey;
+          // }
+          // mydyn->gatherAddress = (uintptr_t)params.outputAddress;
+
+          // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+          // Thus, we register each ranks output address independently, so they get different MRs.
+          for (size_t i : recvRanks) {
+            auto* mr = regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+            outDyns[i].gatherAddress = params.outputAddress;
+            for (size_t di = 0; di != devices.size(); ++di) {
+              outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+            }
+          }
+
+          // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+          // until kernel entry, such that we don't receive data until we're ready.
+          dynReady.resize(recvRanks.size());
+          size_t n = 0;
+          for (size_t i : recvRanks) {
+            size_t di = (rank + n) % devices.size();
+            auto& dev = devices[di];
+            writeData(
+                dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
+                (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
+                sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
+            ++n;
+          }
+
+          // fmt::printf("sent dyns\n");
+
+          // fmt::printf("got all dyns!\n");
+
+          trace("enter_wait_for_kernel");
+
+          // wait for kernel
+          while (cpuIn[0] < stepValue) {
+            poll();
+          }
+
+          trace("dyn_ready");
+
+          // Now we can signal remote peers
+          n = 0;
+          for (size_t i : recvRanks) {
+            while (dynReady[n] < stepValue) {
+              poll();
+            }
+            // size_t di = (rank + n) % devices.size();
+            // auto& dev = devices[di];
+            // writeStep(di, i, stepValue);
+            ++n;
+          }
+
+          auto start = std::chrono::steady_clock::now();
+
+          for (size_t i = 0; i != Group::dataChunks; ++i) {
+            sendStepValues[i] = stepValue + i;
+          }
+
+          CHECK(recvRanks.size() == sendRanks.size());
+
+          // for (size_t i : sendRanks) {
+          size_t liveSends = 0;
+          for (size_t index = 0; index != sendRanks.size(); ++index) {
+            if (true) {
+              size_t i = recvRanks[index];
+              trace(fmt::sprintf("%d_write_step_%d", i, stepValue + index));
+              size_t di = (rank + index) % devices.size();
+              auto& dev = devices[di];
+              writeStep(di, i, stepValue + index);
+            }
+            size_t i = sendRanks[index];
+            // wait for dyns
+            trace(fmt::sprintf("%d_wait_for_step_%d", i, stepValue + index));
+            while (localProgress[i].stepValue < stepValue + index) {
+              poll();
+            }
+            size_t offset = 0;
+            size_t liveStepValues = 0;
+            size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
+            for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
+              size_t nbytes = std::min(params.bytes - offset, chunkSize);
+
+              if (nbytes > 0) {
+                uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
+
+                // fmt::printf(
+                //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
+                //     localDyns[i].gatherAddress, rank * params.bytes, offset);
+
+                trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
+                //++liveSends;
+                // writeDataDistributed(
+                //     i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + rank * params.bytes + offset,
+                //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+                liveSends += devices.size();
+                writeDataDistributed2(
+                    i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank + offset,
+                    localDyns[i].gatherKey,
+                    [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
+                     &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
+                      // fmt::printf("send done for di %d\n", di);
+                      if (done) {
+                        --liveSends;
+                      }
+                      if (ordered) {
+                        auto& dev = devices.at(di);
+                        writeData(
+                            dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                            (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                            remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                      }
+                    });
+                offset += nbytes;
+              }
+              while (liveSends >= devices.size() * 2) {
+                poll();
+              }
+              // trace(fmt::sprintf("%d_wait_for_liveSends", i));
+              // while (liveSends) {
+              //   poll();
+              // }
+              // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+              // while (liveStepValues) {
+              //   poll();
+              // }
+              // trace(fmt::sprintf("%d_send_stepValues", i));
+              // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
+              // for (size_t di = 0; di != devices.size(); ++di) {
+              //   Device& dev = devices[di];
+              //   ++liveStepValues;
+              //   writeData(
+              //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+              //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+              //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+              //       makeCallback([&]() { --liveStepValues; }));
+              // }
+            }
+            // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
             // while (liveStepValues) {
             //   poll();
             // }
-            // trace(fmt::sprintf("%d_send_stepValues", i));
-            // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
-            // for (size_t di = 0; di != devices.size(); ++di) {
-            //   Device& dev = devices[di];
-            //   ++liveStepValues;
-            //   writeData(
-            //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-            //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-            //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
-            //       makeCallback([&]() { --liveStepValues; }));
-            // }
+            // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
+            CHECK(offset == params.bytes);
+            // CHECK(liveSends == 0);
+            // CHECK(liveStepValues == 0);
           }
-          // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
-          // while (liveStepValues) {
-          //   poll();
-          // }
-          // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
-          CHECK(offset == params.bytes);
-          // CHECK(liveSends == 0);
-          // CHECK(liveStepValues == 0);
-        }
 
-        trace("wait_for_cq_entries");
+          trace("wait_for_cq_entries");
 
-        while (true) {
-          bool stop = true;
+          while (true) {
+            bool stop = true;
+            for (auto& dev : devices) {
+              while (dev.currentCqEntries) {
+                poll();
+                stop = false;
+              }
+            }
+            if (stop) {
+              break;
+            }
+          }
           for (auto& dev : devices) {
-            while (dev.currentCqEntries) {
-              poll();
-              stop = false;
+            CHECK(dev.currentCqEntries == 0);
+          }
+
+          // fmt::printf(
+          //     "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f /
+          //     1024.0f);
+          // bytesWritten = 0;
+
+          // fmt::printf("rank %d cpu thread all gather all done! (step %#x)\n", rank, stepValue);
+
+          trace("exit_wait_for_kernel");
+
+          cpuOut[0] = stepValue;
+          while (cpuIn[0] < stepValue + 1) {
+            poll();
+          }
+
+          trace("");
+
+          freelistAllGather.push(&params);
+        } else if (queueEntry.task == taskReduceScatter) {
+          QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
+
+          uint32_t stepValue = params.stepValue;
+
+          ReduceScatter& reduceScatter = *group->reduceScatter;
+
+          auto& sendRanks = reduceScatter.sendRanks;
+          auto& recvRanks = reduceScatter.recvRanks;
+
+          uintptr_t recvAddress = group->recvBuffer.cudaPointer;
+          CHECK(group->recvBuffer.bytes >= params.pitch * recvRanks.size());
+
+          uintptr_t sendAddress = group->sendBuffer.cudaPointer;
+          CHECK(group->sendBuffer.bytes >= params.pitch * sendRanks.size());
+
+          auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
+          auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());
+
+          for (size_t i : recvRanks) {
+            outDyns[i].gatherAddress = recvAddress;
+            for (size_t di = 0; di != devices.size(); ++di) {
+              outDyns[i].gatherKey[di] = recvMr->mrs[di]->rkey;
             }
           }
-          if (stop) {
-            break;
-          }
-        }
-        for (auto& dev : devices) {
-          CHECK(dev.currentCqEntries == 0);
-        }
 
-        // fmt::printf(
-        //     "%fG/s\n", bytesWritten / seconds(std::chrono::steady_clock::now() - start) / 1024.0f / 1024.0f /
-        //     1024.0f);
-        // bytesWritten = 0;
-
-        // fmt::printf("rank %d cpu thread all gather all done! (step %#x)\n", rank, stepValue);
-
-        trace("exit_wait_for_kernel");
-
-        cpuOut[0] = stepValue;
-        while (cpuIn[0] < stepValue + 1) {
-          poll();
-        }
-
-        trace("");
-
-        freelistAllGather.push(&params);
-      } else if (queueEntry.task == taskReduceScatter) {
-        QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
-
-        uint32_t stepValue = params.stepValue;
-
-        ReduceScatter& reduceScatter = *group->reduceScatter;
-
-        auto& sendRanks = reduceScatter.sendRanks;
-        auto& recvRanks = reduceScatter.recvRanks;
-
-        uintptr_t recvAddress = group->recvBuffer.cudaPointer;
-        CHECK(group->recvBuffer.bytes >= params.pitch * recvRanks.size());
-
-        uintptr_t sendAddress = group->sendBuffer.cudaPointer;
-        CHECK(group->sendBuffer.bytes >= params.pitch * sendRanks.size());
-
-        auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
-        auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());
-
-        for (size_t i : recvRanks) {
-          outDyns[i].gatherAddress = recvAddress;
-          for (size_t di = 0; di != devices.size(); ++di) {
-            outDyns[i].gatherKey[di] = recvMr->mrs[di]->rkey;
-          }
-        }
-
-        // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-        // until kernel entry, such that we don't receive data until we're ready.
-        dynReady.resize(recvRanks.size());
-        size_t n = 0;
-        for (size_t i : recvRanks) {
-          size_t di = (rank + n) % devices.size();
-          auto& dev = devices[di];
-          writeData(
-              dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
-              (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
-              sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
-          ++n;
-        }
-
-        // fmt::printf("sent dyns\n");
-
-        // fmt::printf("got all dyns!\n");
-
-        trace("enter_wait_for_kernel");
-
-        for (size_t i = 0; i != Group::dataChunks; ++i) {
-          sendStepValues[i] = stepValue + i;
-        }
-
-        n = 0;
-        for (size_t i : recvRanks) {
-          while (dynReady[n] < stepValue) {
-            poll();
-          }
-          ++n;
-        }
-
-        // wait for kernel
-        while (cpuIn[0] < stepValue) {
-          poll();
-        }
-
-        trace("dyn_ready");
-
-        CHECK(recvRanks.size() == sendRanks.size());
-
-        size_t liveSends = 0;
-        for (size_t index = 0; index != sendRanks.size(); ++index) {
-
-          // wait for send ready
-          // this also functions as wait for recv ready
-          while (cpuIn[1] < stepValue + index + 1) {
-            poll();
-          }
-
-          {
-            size_t i = recvRanks[index];
-            trace(fmt::sprintf("%d_write_step_%d", i, stepValue + index));
-            size_t di = (rank + index) % devices.size();
+          // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+          // until kernel entry, such that we don't receive data until we're ready.
+          dynReady.resize(recvRanks.size());
+          size_t n = 0;
+          for (size_t i : recvRanks) {
+            size_t di = (rank + n) % devices.size();
             auto& dev = devices[di];
-            writeStep(di, i, stepValue + index);
+            writeData(
+                dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
+                (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
+                sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
+            ++n;
           }
 
-          size_t i = sendRanks[index];
-          // wait for dyns
-          trace(fmt::sprintf("%d_wait_for_step_%d", i, stepValue + index));
-          while (localProgress[i].stepValue < stepValue + index) {
-            poll();
+          // fmt::printf("sent dyns\n");
+
+          // fmt::printf("got all dyns!\n");
+
+          trace("enter_wait_for_kernel");
+
+          for (size_t i = 0; i != Group::dataChunks; ++i) {
+            sendStepValues[i] = stepValue + i;
           }
-          size_t offset = 0;
-          size_t liveStepValues = 0;
-          size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
-          for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
-            size_t nbytes = std::min(params.bytes - offset, chunkSize);
 
-            if (nbytes > 0) {
-              uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index + offset;
-
-              // fmt::printf(
-              //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
-              //     localDyns[i].gatherAddress, rank * params.bytes, offset);
-
-              trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
-              // ++liveSends;
-              // writeDataDistributed(
-              //     i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + (params.bytes * (index % 2)) + offset,
-              //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
-              liveSends += devices.size();
-              writeDataDistributed2(
-                  i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch + offset,
-                  localDyns[i].gatherKey,
-                  [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
-                   &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
-                    // fmt::printf("send done for di %d\n", di);
-                    if (done) {
-                      --liveSends;
-                    }
-                    if (ordered) {
-                      auto& dev = devices.at(di);
-                      writeData(
-                          dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                          (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                          remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-                    }
-                  });
-              offset += nbytes;
-            }
-            while (liveSends >= devices.size() * 2) {
+          n = 0;
+          for (size_t i : recvRanks) {
+            while (dynReady[n] < stepValue) {
               poll();
             }
-            // trace(fmt::sprintf("%d_wait_for_liveSends", i));
-            // while (liveSends) {
-            //   poll();
-            // }
-            // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+            ++n;
+          }
+
+          // wait for kernel
+          while (cpuIn[0] < stepValue) {
+            poll();
+          }
+
+          trace("dyn_ready");
+
+          CHECK(recvRanks.size() == sendRanks.size());
+
+          size_t liveSends = 0;
+          for (size_t index = 0; index != sendRanks.size(); ++index) {
+
+            // wait for send ready
+            // this also functions as wait for recv ready
+            while (cpuIn[1] < stepValue + index + 1) {
+              poll();
+            }
+
+            {
+              size_t i = recvRanks[index];
+              trace(fmt::sprintf("%d_write_step_%d", i, stepValue + index));
+              size_t di = (rank + index) % devices.size();
+              auto& dev = devices[di];
+              writeStep(di, i, stepValue + index);
+            }
+
+            size_t i = sendRanks[index];
+            // wait for dyns
+            trace(fmt::sprintf("%d_wait_for_step_%d", i, stepValue + index));
+            while (localProgress[i].stepValue < stepValue + index) {
+              poll();
+            }
+            size_t offset = 0;
+            size_t liveStepValues = 0;
+            size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
+            for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
+              size_t nbytes = std::min(params.bytes - offset, chunkSize);
+
+              if (nbytes > 0) {
+                uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index + offset;
+
+                // fmt::printf(
+                //     "%d: write %#x bytes of remote data to %d at %#x + %#x + %#x\n", rank, nbytes, i,
+                //     localDyns[i].gatherAddress, rank * params.bytes, offset);
+
+                trace(fmt::sprintf("%d_send_%d_bytes", i, nbytes));
+                // ++liveSends;
+                // writeDataDistributed(
+                //     i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + (params.bytes * (index % 2)) + offset,
+                //     localDyns[i].gatherKey, makeCallback([&, i, stepValue, chunkIndex]() { --liveSends; }));
+                liveSends += devices.size();
+                writeDataDistributed2(
+                    i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch + offset,
+                    localDyns[i].gatherKey,
+                    [&writeData, &liveSends, &devices, &sendStepValues, sendStepValuesStorageMr,
+                     &remoteCudaCommsDeviceDataSent, rank, i, chunkIndex](size_t di, bool ordered, bool done) {
+                      // fmt::printf("send done for di %d\n", di);
+                      if (done) {
+                        --liveSends;
+                      }
+                      if (ordered) {
+                        auto& dev = devices.at(di);
+                        writeData(
+                            dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                            (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                            remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                      }
+                    });
+                offset += nbytes;
+              }
+              while (liveSends >= devices.size() * 2) {
+                poll();
+              }
+              // trace(fmt::sprintf("%d_wait_for_liveSends", i));
+              // while (liveSends) {
+              //   poll();
+              // }
+              // trace(fmt::sprintf("%d_wait_for_liveStepValues", i));
+              // while (liveStepValues) {
+              //   poll();
+              // }
+              // trace(fmt::sprintf("%d_send_stepValues", i));
+              // // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
+              // for (size_t di = 0; di != devices.size(); ++di) {
+              //   Device& dev = devices[di];
+              //   ++liveStepValues;
+              //   writeData(
+              //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
+              //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+              //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
+              //       makeCallback([&]() { --liveStepValues; }));
+              // }
+            }
+            // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
             // while (liveStepValues) {
             //   poll();
             // }
-            // trace(fmt::sprintf("%d_send_stepValues", i));
-            // // fmt::printf("%d: stepValue %#x + %d sent to %d\n", rank, stepValue, chunkIndex, i);
-            // for (size_t di = 0; di != devices.size(); ++di) {
-            //   Device& dev = devices[di];
-            //   ++liveStepValues;
-            //   writeData(
-            //       dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-            //       (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-            //       remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue),
-            //       makeCallback([&]() { --liveStepValues; }));
-            // }
+            // // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
+            // CHECK(offset == params.bytes);
+            // CHECK(liveSends == 0);
+            // CHECK(liveStepValues == 0);
           }
-          // trace(fmt::sprintf("%d_wait_for_liveStepValues_final", i));
-          // while (liveStepValues) {
-          //   poll();
-          // }
-          // // fmt::printf("sent %d  -> %d/%d\n", n, bytesSent, params.bytes);
-          // CHECK(offset == params.bytes);
-          // CHECK(liveSends == 0);
-          // CHECK(liveStepValues == 0);
-        }
 
-        trace("wait_for_cq_entries");
+          trace("wait_for_cq_entries");
 
-        while (true) {
-          bool stop = true;
-          for (auto& dev : devices) {
-            while (dev.currentCqEntries) {
-              poll();
-              stop = false;
+          while (true) {
+            bool stop = true;
+            for (auto& dev : devices) {
+              while (dev.currentCqEntries) {
+                poll();
+                stop = false;
+              }
+            }
+            if (stop) {
+              break;
             }
           }
-          if (stop) {
-            break;
+          for (auto& dev : devices) {
+            CHECK(dev.currentCqEntries == 0);
           }
-        }
-        for (auto& dev : devices) {
-          CHECK(dev.currentCqEntries == 0);
+
+          cpuOut[0] = stepValue;
+          while (cpuIn[0] < stepValue + 1) {
+            poll();
+          }
+
+          freelistReduceScatter.push(&params);
+        } else if (queueEntry.task == taskTerminate) {
+          freelistTerminate.push(&queueEntry);
+          break;
+        } else {
+          throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
         }
 
-        cpuOut[0] = stepValue;
-        while (cpuIn[0] < stepValue + 1) {
-          poll();
-        }
-
-        freelistReduceScatter.push(&params);
-      } else if (queueEntry.task == taskTerminate) {
-        freelistTerminate.push(&queueEntry);
-        break;
-      } else {
-        throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+      } catch (const std::exception& e) {
+        fmt::fprintf(stderr, "cpu thread exception: %s\n", e.what());
+        fflush(stderr);
+        throw;
       }
     }
 

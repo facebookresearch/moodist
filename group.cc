@@ -556,9 +556,12 @@ void Group::init() {
   // cudaStepDoneBuffer = allocateDevice(size * 8);
   // cpuStepDoneBuffer = allocateHost(size * 8);
 
-  cpuOutBuffer = allocateManaged(4096 + 16 * size);
-  CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
-  cpuInBuffer = allocateHost(4096 + 16 * size);
+  cpuOutBuffer = allocateHostMapped(4096 + 16 * size);
+  //cpuOutBuffer = allocateManaged(4096 + 16 * size);
+  //CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
+  //cpuInBuffer = allocateManaged(4096 + 16 * size);
+  //CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_, cuDevice));
+  cpuInBuffer = allocateHostMapped(4096 + 16 * size);
 
   auto mapPeerAddrs = [&](AllocatedBuffer& localBuffer, std::array<uintptr_t, 8>& peerPtrs) {
     peerPtrs.fill(0);

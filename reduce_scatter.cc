@@ -216,22 +216,17 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
 #pragma unroll 1
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
-    //if (params.src1[i] == params.dst[i]) {
-    //  reduce_sum((T*)params.dst[i], (const T*)params.src2[i], params.bytes / sizeof(T));
-    //} else if (params.src2[i] != nullptr) {
-    //  reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
     if (params.src2[i] != nullptr) {
       reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
-      //reduce_float_sum_n2(params.bytes / sizeof(T), (T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i]);
     } else {
       copy_impl(params.dst[i], params.src1[i], params.bytes);
     }
   }
 }
 
-__global__ void reduce_scatter_send_ready(uint32_t value) {
-  $cpuIn[1] = value;
-}
+// __global__ void reduce_scatter_send_ready(uint32_t value) {
+//   $cpuIn[1] = value;
+// }
 
 $globaldefs
 

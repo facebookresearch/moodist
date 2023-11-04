@@ -270,12 +270,13 @@ $post
   } else {
     // 16 uint4 uses 64 registers. we could go higher to hide more latency,
     // but it seems to not improve performance
-    copy1 = genCopy("uint4", 16, 32);
+    // copy1 = genCopy("uint4", 16, 32);
     copy1 += genCopy("uint4", 16, 16);
+    copy1 += genCopy("uint4", 16, 8);
     copy1 += genCopy("uint4", 16, 4);
     copy1 += genCopy("uint4", 16, 1);
   }
-  std::string copy2 = genCopy("unsigned int", 4, 1);
+  std::string copy2 = genCopy("unsigned int", 4, 2) + genCopy("unsigned int", 4, 1);
   std::string copy3 = genCopy("unsigned char", 1, 1);
   std::string copylastbyte = addOffset(1);
   readwrite(copylastbyte, copylastbyte, "unsigned char", 1);
@@ -450,10 +451,15 @@ $pre
   };
   std::string reducelastitem = generatelast(type, typesize);
   std::string reduce1; // = generate("uint4", 16, 32);
-  reduce1 += generate("uint4", 16, 16);
+  reduce1 += generate("uint4", 16, 8);
   reduce1 += generate("uint4", 16, 4);
+  reduce1 += generate("uint4", 16, 2);
   reduce1 += generate("uint4", 16, 1);
-  std::string reduce2 = generate(type, typesize, 1);
+  std::string reduce2;
+  if (typesize <= 4) {
+    reduce2 += generate(type, typesize, 2);
+  }
+  reduce2 += generate(type, typesize, 1);
   std::string s = replace(
       R"(
 __device__ void reduce_$typename_$op_n$nsources(size_t size, $typename* destination, $sourcesargs) {
@@ -546,9 +552,9 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
 
 )";
 
-  gridSize = 24;
-  blockSize = 384;
-  size_t blocksPerSm = 1;
+  gridSize = 36;
+  blockSize = 256;
+  size_t blocksPerSm = 3;
 
   source = replace(
       source, "$copyCode", emitCopy({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
@@ -878,14 +884,14 @@ __device__ void grid_generic_exit() {
     }
   }
 
-  dl_iterate_phdr(
-      [](struct dl_phdr_info* info, size_t size, void* data) {
-        Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
-        return 0;
-      },
-      Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
-        fmt::printf("%s\n", info->dlpi_name);
-      }).release());
+  // dl_iterate_phdr(
+  //     [](struct dl_phdr_info* info, size_t size, void* data) {
+  //       Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
+  //       return 0;
+  //     },
+  //     Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
+  //       fmt::printf("%s\n", info->dlpi_name);
+  //     }).release());
 
   if (!exists(devrtPath)) {
     std::vector<std::string> modules;
@@ -906,8 +912,7 @@ __device__ void grid_generic_exit() {
       path += "libcudadevrt.a";
       if (exists(path)) {
         devrtPath = path;
-      } else {
-        fmt::printf("%s does not exist\n", path);
+        break;
       }
     }
   }

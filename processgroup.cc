@@ -550,7 +550,6 @@ struct ProcessGroupImpl {
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
   virtual bool Execute() {
-    fmt::printf("free cuda memory callback triggered!\n");
     std::unique_lock l(activeProcessGroupsMutex);
     for (auto* pg : activeProcessGroups) {
       pg->freeMemory();
@@ -561,7 +560,6 @@ struct FreeMemoryCallback : at::FreeMemoryCallback {
 
 void registerFreeMemoryCallback() {
   at::FreeCudaMemoryCallbacksRegistry()->Register("moodist", []() { return std::make_unique<FreeMemoryCallback>(); });
-  fmt::printf("free cuda memory callback registered!\n");
 }
 
 ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) {

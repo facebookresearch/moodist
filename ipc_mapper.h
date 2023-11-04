@@ -44,7 +44,6 @@ struct IpcMapper {
 
   void unmapAll() {
     std::unique_lock l(mutex);
-    fmt::printf("ipc mapper unmapping all memory!\n");
     while (true) {
       bool stop = true;
       for (size_t peerIndex = 0; peerIndex != peerIpcMap.size(); ++peerIndex) {
@@ -74,8 +73,13 @@ struct IpcMapper {
     }
     l.unlock();
     auto start = Clock::now();
-    while (waitCount.load(std::memory_order_relaxed) && Clock::now() - start < std::chrono::milliseconds(5))
-      ;
+    while (waitCount.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (Clock::now() - start >= std::chrono::seconds(60)) {
+        fmt::printf("Timeout waiting for ipc unmapper!\n");
+        start = Clock::now();
+      }
+    }
   }
 
   template<typename Callback>

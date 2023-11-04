@@ -68,13 +68,16 @@ def f(n):
         if rank == 0:
            f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
-        s = 1
+        s = 128
         xi = 0
         while True:
             xi += 1
             # s = s + (s + 1) // 2
             s = s * 2
             s = min(s, max_size)
+
+            if s * i > 33554432 * 128:
+                break
 
             # if xi == 8:
             #     group = group1
@@ -169,6 +172,8 @@ def f(n):
             if s == max_size:
                 break
 
+        dist.destroy_process_group(group)
+
         torch.cuda.synchronize()
         gloo.barrier()
 
@@ -184,7 +189,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = 8
+    i = min(8, world_size)
     while True:
         t(i)
 
@@ -214,8 +219,8 @@ for i in range(ngpus):
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
-#for n in ("moodist", "nccl"):
-for n in ("nccl",):
+for n in ("moodist", "nccl"):
+#for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
