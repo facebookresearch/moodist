@@ -25,6 +25,9 @@ def find_tensors(tup):
             s += "?"
     return s
 
+class Work():
+    def wait(self):
+        pass
 
 class ProcessGroup(torch.distributed.ProcessGroup):
     def __init__(self, store, rank, size, timeout):
@@ -83,7 +86,8 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         # print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
         #return self.nccl._reduce_scatter_base(*args, **kwargs)
         #raise RuntimeError("stop")
-        return self.moodist._reduce_scatter_base(*args, **kwargs)
+        self.moodist._reduce_scatter_base(*args, **kwargs)
+        return Work()
 
     def alltoall_base(self, *args, **kwargs):
         print("size %d alltoall_base %s" % (self.size(), find_tensors(args)))
@@ -107,7 +111,8 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def barrier(self, *args, **kwargs):
         print("size %d barrier %s" % (self.size(), find_tensors(args)))
-        return self.moodist.barrier()
+        self.moodist.barrier()
+        return Work()
 
 
 from datetime import timedelta

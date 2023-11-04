@@ -57,10 +57,7 @@ def f(n):
         if rank == 0:
             print("Running benchmark with world size %d" % i)
         ranks = list(range(i))
-        group1 = dist.new_group(ranks)
-        group2 = dist.new_group(ranks)
-        print("group is ", type(group1))
-        group = dist
+        group = dist.new_group(ranks)
         if not rank in range(i):
             gloo.barrier()
             return
@@ -68,8 +65,8 @@ def f(n):
         max_size = 1024 * 1024 * 40
 
         f = None
-        # if rank == 0:
-        #    f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
+        if rank == 0:
+           f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
         s = 1
         xi = 0
@@ -79,25 +76,22 @@ def f(n):
             s = s * 2
             s = min(s, max_size)
 
-            if xi == 8:
-                group = group1
-                print("time group1")
-            if xi == 16:
-                group = group2
-                print("time group2")
-            if xi == 24:
-                # group = dist
-                print("time dist")
+            # if xi == 8:
+            #     group = group1
+            #     print("time group1")
+            # if xi == 16:
+            #     group = group2
+            #     print("time group2")
+            # if xi == 24:
+            #     # group = dist
+            #     print("time dist")
 
-                break
+            #     break
 
             print("test world %d  size %d" % (i, s))
 
             iterations = min((max_size * 40) // max(s, 4096), 2000)
             print("%d iterations" % iterations)
-
-            s = 1
-            iterations = 1000
 
             output = torch.randn(s).cuda()
             input = torch.randn(s * i).cuda()
@@ -190,7 +184,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = 2
+    i = 8
     while True:
         t(i)
 
@@ -220,7 +214,8 @@ for i in range(ngpus):
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
-for n in ("moodist", "nccl"):
+#for n in ("moodist", "nccl"):
+for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

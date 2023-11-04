@@ -40,11 +40,6 @@ struct Group {
   CUcontext cuContext = nullptr;
   CUdevice cuDevice;
 
-  CUstream stream = nullptr;
-
-  std::array<CUstream, 9> extraStreams{};
-  std::array<CUevent, 9> extraEvents{};
-
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;

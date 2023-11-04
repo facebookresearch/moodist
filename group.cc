@@ -100,18 +100,6 @@ void Group::init() {
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   fmt::printf("device async engines: %d\n", asyncEngines);
 
-  // CHECK_CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-  CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
-
-  // // temporaryBuffer = allocateDevice(temporaryBytes);
-  // cudaStepDoneBuffer = allocateDevice(size * 8);
-  // cpuStepDoneBuffer = allocateHost(size * 8);
-
-  // // cpuOutBuffer = allocateHostMapped(4096 + 16 * size);
-  // cpuOutBuffer = allocateManaged(4096 + 16 * size);
-  // CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
-  // cpuInBuffer = allocateHost(4096 + 16 * size);
-
   CHECK_NVML(nvmlInit_v2());
 
   std::array<char, 0x100> cudaPciBus;

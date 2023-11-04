@@ -33,114 +33,6 @@ void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
 }
 
-struct Op {
-  std::atomic_bool busy = false;
-  bool isCpu = false;
-  CUevent inputEvent;
-  CUevent outputEvent;
-  std::atomic_uint32_t cpuDone = 0;
-};
-
-class OpFutureWrappingWork : public tccl_work::Work {
-public:
-  std::shared_ptr<Op> op;
-  std::vector<at::Tensor> outputs;
-  bool done = false;
-  OpFutureWrappingWork(std::shared_ptr<Op> op, std::vector<at::Tensor> outputs)
-      : Work(), op(op), outputs(std::move(outputs)) {}
-
-  ~OpFutureWrappingWork() {
-    if (!done) {
-      op->busy = false;
-    }
-  }
-
-  bool checkDone() const {
-    if (done) {
-      return true;
-    }
-    if (op->isCpu) {
-      return op->cpuDone.load(std::memory_order_relaxed);
-    }
-    CUresult r = cuEventQuery(op->outputEvent);
-    if (r == CUDA_SUCCESS) {
-      return true;
-    }
-    if (r == CUDA_ERROR_NOT_READY) {
-      return false;
-    }
-    CHECK_CU(r);
-    return false;
-  }
-
-  bool isCompleted() override {
-    return checkDone();
-  }
-
-  bool isSuccess() const override {
-    return checkDone();
-  }
-
-  std::exception_ptr exception() const override {
-    return nullptr;
-    // return fut_->exception_ptr();
-  }
-
-  int sourceRank() const override {
-    TORCH_CHECK(false, "FutureWrappingWork::sourceRank() not implemented");
-  }
-
-  std::vector<at::Tensor> result() override {
-    return outputs;
-    // return fut_->value().toPyObjectHolder()->extractTensors();
-  }
-
-  virtual void synchronize() override final {
-    if (done) {
-      return;
-    }
-    if (op->isCpu) {
-      while (op->cpuDone == 0) {
-        futexWait(&op->cpuDone, 0, std::chrono::seconds(10));
-      }
-    } else {
-      // c10::cuda::CUDACachingAllocator::recordStream(const DataPtr &, CUDAStream stream)
-      // fmt::printf("op future synchronize()!\n");
-      auto stream = c10::cuda::getCurrentCUDAStream();
-      // fmt::printf("synchronize, wait for event %p\n", (void*)op->event);
-      // fmt::printf("synchronize, SKIP wait for event %p\n", (void*)op->outputEvent);
-      CHECK_CU(cuStreamWaitEvent(stream, op->outputEvent, CU_EVENT_WAIT_DEFAULT));
-    }
-    op->busy = false;
-    done = true;
-  }
-
-  bool wait(std::chrono::milliseconds timeout) override {
-    if (done) {
-      return true;
-    }
-    synchronize();
-    return true;
-  }
-
-  void abort() override {
-    TORCH_CHECK(false, "FutureWrappingWork::abort() not implemented");
-  }
-
-  c10::intrusive_ptr<c10::ivalue::Future> getFuture() override {
-    TORCH_CHECK(false, "getFuture");
-    return {};
-    // return fut_;
-  }
-
-  // private:
-  //   c10::intrusive_ptr<c10::ivalue::Future> fut_;
-};
-
-c10::intrusive_ptr<tccl_work::Work> makeFuture(std::shared_ptr<Op> op, std::vector<at::Tensor> outputs) {
-  return c10::make_intrusive<OpFutureWrappingWork>(op, std::move(outputs));
-}
-
 struct ProcessGroupImpl;
 std::mutex activeProcessGroupsMutex;
 std::vector<ProcessGroupImpl*> activeProcessGroups;
@@ -155,7 +47,6 @@ struct ProcessGroupImpl {
   std::shared_ptr<Group> group;
 
   SpinMutex mutex;
-  std::vector<std::shared_ptr<Op>> allOps;
   std::atomic_uint32_t nextCpuStepValue = 1;
   std::atomic_uint32_t nextCudaStepValue = 1;
 
@@ -177,7 +68,7 @@ struct ProcessGroupImpl {
 
   void freeMemory() {
     std::lock_guard l(mutex);
-    CHECK_CU(cuStreamSynchronize(group->stream));
+    CHECK_CU(cuCtxSynchronize());
     group->ipcMapper->unmapAll();
   }
 
@@ -355,45 +246,26 @@ struct ProcessGroupImpl {
     return r;
   }
 
-  std::shared_ptr<Op> getOp() {
-    for (auto& v : allOps) {
-      if (v->busy.load(std::memory_order_relaxed)) {
-        continue;
-      }
-      v->busy = true;
-      v->isCpu = false;
-      return v;
-    }
-    std::shared_ptr<Op> op = std::make_shared<Op>();
-    op->busy = true;
-    CHECK_CU(cuEventCreate(&op->inputEvent, CU_EVENT_DISABLE_TIMING));
-    CHECK_CU(cuEventCreate(&op->outputEvent, CU_EVENT_DISABLE_TIMING));
-    allOps.push_back(op);
-    op->isCpu = false;
-    return op;
-  }
-
-  c10::intrusive_ptr<tccl_work::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+  void allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(false, "allreduce");
   }
 
-  c10::intrusive_ptr<tccl_work::Work> barrier(const c10d::BarrierOptions& opts) {
+  void barrier(const c10d::BarrierOptions& opts) {
     std::lock_guard l(mutex);
     uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
     CHECK(stepValue < 0x80000000);
-    std::shared_ptr<Op> op = getOp();
-    op->isCpu = true;
-    op->cpuDone = 0;
+    std::atomic_uint32_t cpuDone = 0;
     QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
     e->task = taskBarrier;
     e->stepValue = stepValue;
-    e->cpuDone = &op->cpuDone;
+    e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
-    return makeFuture(op, {});
+    while (cpuDone == 0) {
+      futexWait(&cpuDone, 0, std::chrono::seconds(10));
+    }
   }
 
-  c10::intrusive_ptr<tccl_work::Work>
-  _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
+  void _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
     trace("_allgather_base");
     std::lock_guard l(mutex);
 
@@ -425,7 +297,7 @@ struct ProcessGroupImpl {
 
     auto allocbuffer = [&](auto& buffer, size_t size) {
       if (buffer.bytes < size) {
-        CHECK_CU(cuStreamSynchronize(group->stream));
+        CHECK_CU(cuCtxSynchronize());
         buffer = {};
         buffer = group->allocateDevice(size);
       }
@@ -438,9 +310,7 @@ struct ProcessGroupImpl {
       outputBytes = pitch * size;
     }
 
-    std::shared_ptr<Op> op = getOp();
-    CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
-    CHECK_CU(cuStreamWaitEvent(group->stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
 
@@ -498,9 +368,9 @@ struct ProcessGroupImpl {
     std::array<void*, 1> params = {&parameters};
 
     if (isLocalOnly) {
-      CHECK_CU(cuLaunchKernel(allGather.cuAllGatherLocal, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(allGather.cuAllGatherLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
     } else {
-      CHECK_CU(cuLaunchKernel(allGather.cuAllGather, 1, 1, 1, 1, 1, 1, 0, group->stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(allGather.cuAllGather, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     if (outputAddress != (uintptr_t)output.data_ptr()) {
@@ -512,29 +382,19 @@ struct ProcessGroupImpl {
       copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
       copyArgs.WidthInBytes = bytes;
       copyArgs.Height = size;
-      CHECK_CU(cuMemcpy2DAsync(&copyArgs, group->stream));
+      CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
     }
 
     trace("post");
-
-    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
-
-    c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
-        c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));
-    c10::cuda::CUDACachingAllocator::recordStream(input.data().storage().data_ptr(), sg.current_stream());
-    c10::cuda::CUDACachingAllocator::recordStream(output.data().storage().data_ptr(), sg.current_stream());
-    trace("");
-    return makeFuture(op, {output});
   }
 
-  c10::intrusive_ptr<tccl_work::Work> allgather(
+  void allgather(
       std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
       const c10d::AllgatherOptions& opts) {
     TORCH_CHECK(false, "allgather impl");
   }
 
-  c10::intrusive_ptr<tccl_work::Work>
-  _reduce_scatter_base(at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
+  void _reduce_scatter_base(at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
 
@@ -579,15 +439,13 @@ struct ProcessGroupImpl {
 
     auto allocbuffer = [&](auto& buffer, size_t size) {
       if (buffer.bytes < size) {
-        CHECK_CU(cuStreamSynchronize(group->stream));
+        CHECK_CU(cuCtxSynchronize());
         buffer = {};
         buffer = group->allocateDevice(size);
       }
     };
 
-    std::shared_ptr<Op> op = getOp();
-    CHECK_CU(cuEventRecord(op->inputEvent, c10::cuda::getCurrentCUDAStream()));
-    CHECK_CU(cuStreamWaitEvent(group->stream, op->inputEvent, CU_EVENT_WAIT_DEFAULT));
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     if (bytes % 16 != 0) {
       pitch = (bytes + 127u) / 128u * 128u;
@@ -600,7 +458,7 @@ struct ProcessGroupImpl {
       copyArgs.dstPitch = pitch;
       copyArgs.WidthInBytes = bytes;
       copyArgs.Height = size;
-      CHECK_CU(cuMemcpy2DAsync(&copyArgs, group->stream));
+      CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
       inputAddress = group->alignedBuffer.cudaPointer;
       inputBytes = pitch * size;
     }
@@ -680,23 +538,13 @@ struct ProcessGroupImpl {
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          reduceScatter.cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, group->stream, params.data(),
-          nullptr));
+          reduceScatter.cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else {
       CHECK_CU(cuLaunchKernel(
-          reduceScatter.cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, group->stream, params.data(), nullptr));
+          reduceScatter.cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     trace("post");
-
-    CHECK_CU(cuEventRecord(op->outputEvent, group->stream));
-
-    c10::cuda::CUDAStreamGuard sg(c10::cuda::CUDAStream(
-        c10::cuda::CUDAStream::UNCHECKED, c10::Stream(c10::Stream::UNSAFE, input.device(), (long)group->stream)));
-    c10::cuda::CUDACachingAllocator::recordStream(input.data().storage().data_ptr(), sg.current_stream());
-    c10::cuda::CUDACachingAllocator::recordStream(output.data().storage().data_ptr(), sg.current_stream());
-    trace("");
-    return makeFuture(op, {output});
   }
 };
 
@@ -723,33 +571,31 @@ ProcessGroup::~ProcessGroup() {
   impl.reset();
 }
 
-c10::intrusive_ptr<tccl_work::Work>
-ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
+void ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
   TORCH_CHECK(false, "broadcast");
 }
 
-c10::intrusive_ptr<tccl_work::Work>
-ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+void ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
   return impl->allreduce(tensors, opts);
 }
 
-c10::intrusive_ptr<tccl_work::Work>
-ProcessGroup::_allgather_base(at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
+void ProcessGroup::_allgather_base(
+    at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
   return impl->_allgather_base(outputbuffer, inputbuffer, opts);
 }
 
-c10::intrusive_ptr<tccl_work::Work> ProcessGroup::allgather(
+void ProcessGroup::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
   return impl->allgather(outputTensors, inputTensors, opts);
 }
 
-c10::intrusive_ptr<tccl_work::Work> ProcessGroup::_reduce_scatter_base(
+void ProcessGroup::_reduce_scatter_base(
     at::Tensor& outputTensor, at::Tensor& inputTensor, const c10d::ReduceScatterOptions& opts) {
   return impl->_reduce_scatter_base(outputTensor, inputTensor, opts);
 }
 
-c10::intrusive_ptr<tccl_work::Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
+void ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
   return impl->barrier(opts);
 }
 
