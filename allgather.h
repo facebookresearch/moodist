@@ -26,14 +26,10 @@ struct AllGather : CollectiveBase {
   std::vector<ProxyInfo> proxyInfo;
   std::vector<ProxyDestinationInfo> proxyDestinationInfo;
 
-  CUfunction cuAllgatherEntry = nullptr;
-  CUfunction cuAllgatherExit = nullptr;
-  std::array<CUfunction, 8> cuAllgatherCopyDone{};
-  CUfunction cuAllgatherCopyAllDone = nullptr;
-  std::vector<std::vector<CUfunction>> cuAllgatherWaitForProxy{};
-
-  std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecvForward{};
-  std::vector<std::vector<CUfunction>> cuAllgatherWaitForReady{};
+  size_t blockSizeLocal = 0;
+  size_t gridSizeLocal = 0;
+  size_t blockSize = 0;
+  size_t gridSize = 0;
 
   CUfunction cuAllGatherLocal = nullptr;
   CUfunction cuAllGather = nullptr;

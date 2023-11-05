@@ -3,6 +3,7 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "setup_comms.h"
+#include "kernels.h"
 
 #include <vector>
 
@@ -242,18 +243,27 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
     return s;
   };
 
+  bool isInGrid = true;
+
+  auto addCopy = [&](std::string dst, std::string src) {
+    if (isInGrid) {
+      return replace("copy_impl($dst, $src, params.bytes);\n", "$dst", dst, "$src", src);
+    } else {
+      return replace("allgather_copy_add(copies, $dst, $src);\n", "$dst", dst, "$src", src);
+    }
+  };
+
   std::string localCopies;
-  localCopies += R"(
-    allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $rank), (const void*)params.inputAddress);
-  )";
+  localCopies += addCopy("(void*)(params.outputAddress + params.pitch * $rank)", "(const void*)params.inputAddress");
   for (size_t peerIndex : peerIndices) {
     size_t i = ipcRanks[peerIndex];
-    localCopies += replace(
-        R"(
-      allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $i), *(const void**)$src);
-    )",
-        "$i", i, "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex));
+    localCopies += addCopy(
+        replace("(void*)(params.outputAddress + params.pitch * $i)", "$i", i),
+        replace(
+            "*(const void**)$src", "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
   }
+
+  std::string globaldefs;
 
   std::string recvCopies;
   int prevRecvSource = -1;
@@ -263,37 +273,101 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
     auto& pdi = proxyDestinationInfo[i];
 
     if (prevRecvSource != pi.source) {
-      //recvCopies += "allgather_copy_flush(copies);\n";
+      // recvCopies += "allgather_copy_flush(copies);\n";
       recvCopies += waitForRecv(pi.source, Group::dataChunks - 1);
       prevRecvSource = pi.source;
     }
 
-    recvCopies += replace(
-        R"(
-      *(volatile uint32_t*)$forwardPtr = stepValue + $c;
-      while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
-      allgather_copy_add(copies, (void*)(params.outputAddress + params.pitch * $source), (void*)(*(uintptr_t*)$src + params.pitch * $source));
-    )",
-        "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
-        Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source, "$source",
-        pdi.source, "$src",
-        group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)));
+    if (isInGrid) {
+      globaldefs += replace("__device__ uint32_t dataReadyCounter_$n = 0;\n", "$n", i);
+      recvCopies += replace(
+          R"(
+        syncthreads();
+        __threadfence_system();
+        if (threadIdx.x == 0) {
+          if (atomicInc(&dataReadyCounter_$n, $gridSize - 1) == $gridSize - 1) {
+            *(volatile uint32_t*)$forwardPtr = stepValue + $c;
+          }
+          while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+        }
+        syncthreads();
+      )",
+          "$n", i);
+    } else {
+      recvCopies += replace(
+          R"(
+        *(volatile uint32_t*)$forwardPtr = stepValue + $c;
+        while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+      )",
+          "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
+          Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
+    }
+
+    recvCopies += addCopy(
+        replace("(void*)(params.outputAddress + params.pitch * $source)", "$source", pdi.source),
+        replace(
+            "(void*)(*(uintptr_t*)$src + params.pitch * $source)", "$source", pdi.source, "$src",
+            group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t))));
   }
 
-  std::string source = replace(
-      R"zz(
+  std::string source;
+
+  source += R"(
+  namespace {
+
+  struct AllGatherParameters {
+    size_t bytes;
+    size_t pitch;
+    uintptr_t inputAddress;
+    uintptr_t outputAddress;
+    uintptr_t peerInputAddresses[8];
+    uintptr_t peerOutputAddresses[8];
+  };
+  
+  }
+
+  )";
+
+  if (true) {
+
+    source += replace(
+        R"zz(
+
+$globaldefs
+
+extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters params) {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  grid_generic_entry_local(params);
+
+  $localCopies
+
+  grid_generic_exit_local();
+}
+
+extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
+  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  grid_generic_entry(params);
+
+  $localCopies
+
+  $recvCopies
+
+  grid_generic_exit();
+}
+
+    )zz",
+        "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs);
+
+    gridSizeLocal = group->kernels->gridSize;
+    blockSizeLocal = group->kernels->blockSize;
+    gridSize = group->kernels->gridSize;
+    blockSize = group->kernels->blockSize;
+  } else {
+
+    source = replace(
+        R"zz(
 
 namespace {
-
-struct AllGatherParameters {
-  size_t bytes;
-  size_t pitch;
-  uintptr_t inputAddress;
-  uintptr_t outputAddress;
-  uintptr_t peerInputAddresses[8];
-  uintptr_t peerOutputAddresses[8];
-};
-
 
 constexpr size_t copyQueueSize = 16;
 struct AllGatherCopyParameters {
@@ -379,8 +453,14 @@ extern "C" __global__ void allgather(AllGatherParameters params) {
 }
 
 
-  )zz",
-      "$localCopies", localCopies, "$recvCopies", recvCopies);
+    )zz",
+        "$localCopies", localCopies, "$recvCopies", recvCopies);
+
+    gridSizeLocal = 1;
+    blockSizeLocal = 1;
+    gridSize = 1;
+    blockSize = 1;
+  }
 
   // if (rank == 0) {
   //   fmt::printf("code\n----\n%s\n", source);
@@ -422,7 +502,9 @@ extern "C" __global__ void allgather(AllGatherParameters params) {
 
   fn(cuAllGatherLocal, "allgather_local");
   fn(cuAllGather, "allgather");
-  fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
+  if (!isInGrid) {
+    fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
+  }
 
   return std::make_pair(source, functions);
 }

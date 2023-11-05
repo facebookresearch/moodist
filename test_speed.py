@@ -142,7 +142,7 @@ def f(n):
                         e = events.pop(0)
                         e.synchronize()
                         freeevents.append(e)
-                    group._reduce_scatter_base(output, input)
+                    group._reduce_scatter_base(output, input).wait()
                     e = freeevents.pop(0)
                     e.record()
                     events.append(e)

@@ -325,7 +325,7 @@ struct ProcessGroupImpl {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, bytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, inputAddress, pitch, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
 
       ipcMapper->requestAddress(
           i, outputAddress, outputBytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
@@ -351,7 +351,7 @@ struct ProcessGroupImpl {
       e->stepValue = stepValue;
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
-      e->bytes = bytes;
+      e->bytes = pitch;
       e->pitch = pitch;
       group->cpuThread->enqueue(e);
     }
@@ -359,7 +359,7 @@ struct ProcessGroupImpl {
     trace("launch");
 
     AllGatherParameters parameters;
-    parameters.bytes = bytes;
+    parameters.bytes = pitch;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
     parameters.outputAddress = outputAddress;
@@ -369,9 +369,13 @@ struct ProcessGroupImpl {
     std::array<void*, 1> params = {&parameters};
 
     if (isLocalOnly) {
-      CHECK_CU(cuLaunchKernel(allGather.cuAllGatherLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(
+          allGather.cuAllGatherLocal, allGather.gridSizeLocal, 1, 1, allGather.blockSizeLocal, 1, 1, 0, stream,
+          params.data(), nullptr));
     } else {
-      CHECK_CU(cuLaunchKernel(allGather.cuAllGather, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(
+          allGather.cuAllGather, allGather.gridSize, 1, 1, allGather.blockSize, 1, 1, 0, stream, params.data(),
+          nullptr));
     }
 
     if (outputAddress != (uintptr_t)output.data_ptr()) {

@@ -148,8 +148,8 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
       globaldefs += replace("__device__ uint32_t sendReadyCounter_$n = 0;\n", "$n", n);
       reduceCode += replace(
           R"(
-        syncthreads();
         __threadfence_system();
+        syncthreads();
         if (threadIdx.x == 0 && atomicInc(&sendReadyCounter_$n, $gridSize - 1) == $gridSize - 1) {
           $cpuIn[1] = stepValue + $n + 1;
         }
@@ -162,8 +162,8 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
 
     isInGrid = false;
     reduceCode += R"(
-      syncthreads();
       __threadfence_system();
+      syncthreads();
       if (threadIdx.x != 0 || atomicInc(&exitCounter, $gridSize - 1) != $gridSize - 1) {
         return false;
       }
