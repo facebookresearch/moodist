@@ -20,21 +20,26 @@ def find_tensors(tup):
         if isinstance(v, list) or isinstance(v, tuple):
             s += find_tensors(v)
         elif isinstance(v, torch.Tensor):
-            s += "(tensor numel %d itemsize %d ptr %#x)" % (v.numel(), v.element_size(), v.data_ptr())
+            s += "(tensor numel %d itemsize %d ptr %#x)" % (
+                v.numel(),
+                v.element_size(),
+                v.data_ptr(),
+            )
         else:
             s += "?"
     return s
 
-class Work():
+
+class Work:
     def wait(self):
         pass
+
 
 class ProcessGroup(torch.distributed.ProcessGroup):
     def __init__(self, store, rank, size, timeout):
         super().__init__(rank, size)
-        #self.unused = MoodistProcessGroup(torch.distributed.PrefixStore("unused", store), rank, size)
-        #self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
         self.moodist = MoodistProcessGroup(store, rank, size)
+        self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
 
     def _get_backend_name(self):
         return "moodist"
@@ -44,7 +49,7 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         return self.nccl.broadcast(*args, **kwargs)
 
     def allreduce(self, *args, **kwargs):
-        #print("size %d allreduce %s" % (self.size(), find_tensors(args)))
+        # print("size %d allreduce %s" % (self.size(), find_tensors(args)))
         return self.nccl.allreduce(*args, **kwargs)
 
     def allreduce_coalesced(self, *args, **kwargs):
@@ -56,14 +61,15 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         return self.nccl.reduce(*args, **kwargs)
 
     def allgather(self, *args, **kwargs):
-        #print("size %d allgather %s" % (self.size(), find_tensors(args)))
+        # print("size %d allgather %s" % (self.size(), find_tensors(args)))
         return self.nccl.allgather(*args, **kwargs)
         # return self.moodist.allgather(*args, **kwargs)
 
     def _allgather_base(self, *args, **kwargs):
         # print("size %d _allgather_base %s" % (self.size(), find_tensors(args)))
         # return self.nccl._allgather_base(*args, **kwargs)
-        return self.moodist._allgather_base(*args, **kwargs)
+        self.moodist._allgather_base(*args, **kwargs)
+        return Work()
 
     def allgather_coalesced(self, *args, **kwargs):
         print("size %d allgather_coalesced %s" % (self.size(), find_tensors(args)))
@@ -84,8 +90,8 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def _reduce_scatter_base(self, *args, **kwargs):
         # print("size %d _reduce_scatter_base %s" % (self.size(), find_tensors(args)))
-        #return self.nccl._reduce_scatter_base(*args, **kwargs)
-        #raise RuntimeError("stop")
+        # return self.nccl._reduce_scatter_base(*args, **kwargs)
+        # raise RuntimeError("stop")
         self.moodist._reduce_scatter_base(*args, **kwargs)
         return Work()
 
@@ -111,8 +117,9 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def barrier(self, *args, **kwargs):
         print("size %d barrier %s" % (self.size(), find_tensors(args)))
-        self.moodist.barrier()
-        return Work()
+        return self.nccl.barrier()
+        # self.moodist.barrier()
+        # return Work()
 
 
 from datetime import timedelta
@@ -129,5 +136,6 @@ torch.distributed.Backend.register_backend("moodist", create_moodist_backend)
 
 def enable_profiling(b):
     _C.enable_profiling(b)
+
 
 __all__ = []

@@ -251,6 +251,7 @@ struct ProcessGroupImpl {
   }
 
   void barrier(const c10d::BarrierOptions& opts) {
+    CHECK_CU(cuStreamSynchronize(c10::cuda::getCurrentCUDAStream()));
     std::lock_guard l(mutex);
     uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
     CHECK(stepValue < 0x80000000);

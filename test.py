@@ -96,7 +96,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 40).cuda() + 1
         #data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        #data = torch.randn(263520).cuda() + 1
+        data = torch.randn(263520).cuda() + 1
         #data = torch.randn(262144).cuda() + 1
         #data = torch.randn(682678 // 2).cuda() + 1
         #data = torch.randn(1024 * 1024).cuda() + 1
@@ -104,7 +104,7 @@ def f(n):
         #data = torch.randn(1024 * 1024 * 800).cuda() + 1
         #data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
-        data = torch.randn(1024 * 1024).cuda() + 1
+        #data = torch.randn(1024 * 1024).cuda() + 1
         if rank == 0:
             print("all-gather")
         result = [torch.zeros_like(data) for _ in range(size)]

@@ -92,6 +92,9 @@ void Group::init() {
     fmt::printf("group %p, context %p\n", (void*)this, (void*)cuContext);
   }
 
+  // CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
+  // CHECK_CU(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+
   int clockRate;
   CHECK_CU(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, cuDevice));
   fmt::printf("device clock rate: %dkhz\n", clockRate);
@@ -557,10 +560,10 @@ void Group::init() {
   // cpuStepDoneBuffer = allocateHost(size * 8);
 
   cpuOutBuffer = allocateHostMapped(4096 + 16 * size);
-  //cpuOutBuffer = allocateManaged(4096 + 16 * size);
-  //CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
-  //cpuInBuffer = allocateManaged(4096 + 16 * size);
-  //CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_, cuDevice));
+  // cpuOutBuffer = allocateManaged(4096 + 16 * size);
+  // CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
+  // cpuInBuffer = allocateManaged(4096 + 16 * size);
+  // CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_, cuDevice));
   cpuInBuffer = allocateHostMapped(4096 + 16 * size);
 
   auto mapPeerAddrs = [&](AllocatedBuffer& localBuffer, std::array<uintptr_t, 8>& peerPtrs) {
@@ -669,9 +672,9 @@ AllocatedBuffer Group::allocateHostMapped(size_t bytes) {
   }
   AllocatedBuffer r;
   r.bytes = bytes;
-  r.cpuPointer = numaAllocate(bytes, allocationNode);
-  CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
-  // CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP));
+  // r.cpuPointer = numaAllocate(bytes, allocationNode);
+  // CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
+  CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP));
   std::memset(r.cpuPointer, 0, bytes);
   // r.hostAllocated = true;
   r.numaAllocated = true;

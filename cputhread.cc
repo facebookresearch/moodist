@@ -748,7 +748,6 @@ void CpuThread::entry() {
             sum += dev.currentCqEntries;
           }
           if (sum == 0) {
-            fmt::printf("cpu thread wait\n");
             futexWait(&queueSize, 0, std::chrono::seconds(10));
           }
         }

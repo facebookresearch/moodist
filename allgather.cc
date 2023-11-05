@@ -263,6 +263,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
     auto& pdi = proxyDestinationInfo[i];
 
     if (prevRecvSource != pi.source) {
+      //recvCopies += "allgather_copy_flush(copies);\n";
       recvCopies += waitForRecv(pi.source, Group::dataChunks - 1);
       prevRecvSource = pi.source;
     }
