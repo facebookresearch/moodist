@@ -24,40 +24,31 @@ std::string Kernels::emitCopySeq(
     size_t blockSize, std::string threadIndex, std::string blockIndex) {
   TORCH_CHECK(sources.size() == destinations.size());
   auto genCopy = [&](std::string type, int typesize, int unroll) {
+    std::string nbytes;
+    std::string condi;
     std::string s;
     if (unroll == 1) {
-      s = R"(
-  %count = (%bytes - %offset) / ($typesize * $unroll);
-  if ($blockSize * %blockIndex + %threadIndex < %count) {
-    size_t %i = %blockIndex;
-    $preloop
-    syncthreads();
-    while ($blockSize * %i + %threadIndex < %count) {
-      $loop
-    }
-    $postloop
-  }
-  %offset += $loopbytes * %count;
-  if (%offset == %bytes) {
-    return;
-  }
-)";
+      nbytes = "$typesize";
+      condi = "$blockSize * %i + %threadIndex";
     } else {
-      s = R"(
-    %count = (%bytes - %offset) / $loopbytes;
-    if (%blockIndex < %count) {
-      size_t %i = %blockIndex;
+      nbytes = "$loopbytes";
+      condi = "%i";
+    }
+    s = replace(
+        R"(
+    %count = (%bytes - %offset) / $nbytes;
+    %i = %blockIndex;
+    if ($cond < %count) {
       $preloop
-      syncthreads();
-      while (%i < %count) {
+      while ($cond < %count) {
         $loop
       }
       $postloop
-      if (%count < $gridSize) {
+      if (%count < %numBlocks) {
         return;
       }
     } else {
-      if (%count < $gridSize) {
+      if (%count < %numBlocks) {
         %numBlocks -= %count;
         %blockIndex -= %count;
       }
@@ -66,13 +57,17 @@ std::string Kernels::emitCopySeq(
     if (%offset == %bytes) {
       return;
     }
-  )";
-    }
+  )",
+        "$nbytes", nbytes, "$cond", condi);
     std::string preloop;
     std::string loop;
     std::string postloop;
     std::string loopreads;
     std::string loopwrites;
+    if (unroll != 1) {
+      preloop += "__syncthreads();\n";
+      loop += "__syncthreads();\n";
+    }
     for (int i = 0; i != unroll; ++i) {
       for (size_t n = 0; n != destinations.size(); ++n) {
         auto& src = sources[n];
@@ -107,10 +102,12 @@ std::string Kernels::emitCopySeq(
   s += R"(
   const size_t %bytes = $bytes;
   const uint32_t %threadIndex = $threadIndex;
-  uint32_t %blockIndex = $blockIndex / 3 + (($gridSize + 2) / 3 * ($blockIndex % 3));
+  static_assert($gridSize % $blocksPerSm == 0);
+  uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
   uint32_t %numBlocks = $gridSize;
   size_t %offset = 0;
   size_t %count = 0;
+  size_t %i;
   $defs
   $copy1
 )";
@@ -543,7 +540,7 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
 
 )";
 
-  gridSize = 32;
+  gridSize = 36;
   blockSize = 256;
   size_t blocksPerSm = 3;
 

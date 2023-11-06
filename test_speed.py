@@ -53,6 +53,8 @@ def f(n):
 
     rank = dist.get_rank()
 
+    op = "all_gather"
+
     def t(i):
         if rank == 0:
             print("Running benchmark with world size %d" % i)
@@ -66,7 +68,7 @@ def f(n):
 
         f = None
         if rank == 0:
-           f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
+            f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
         s = 128
         xi = 0
@@ -96,8 +98,14 @@ def f(n):
             iterations = min((max_size * 40) // max(s, 4096), 2000)
             print("%d iterations" % iterations)
 
-            output = torch.randn(s).cuda()
-            input = torch.randn(s * i).cuda()
+            if op == "all_gather":
+                output = torch.randn(s * i).cuda()
+                input = torch.randn(s).cuda()
+            elif op == "reduce_scatter":
+                output = torch.randn(s).cuda()
+                input = torch.randn(s * i).cuda()
+            else:
+                assert False
 
             # print("backend is ", dist.get_backend(group))
 
@@ -107,9 +115,16 @@ def f(n):
             torch.cuda.synchronize()
 
             # warmup
-            events = []
-            for _ in range(iterations):
-                group._reduce_scatter_base(output, input)
+            if op == "all_gather":
+                events = []
+                for _ in range(iterations):
+                    group._allgather_base(output, input).wait()
+            elif op == "reduce_scatter":
+                events = []
+                for _ in range(iterations):
+                    group._reduce_scatter_base(output, input).wait()
+            else:
+                assert False
                 # torch.cuda.synchronize()
             # for _ in range(iterations):
             #     if len(events) >= 2:
@@ -137,30 +152,35 @@ def f(n):
                 # for _ in range(iterations):
                 #     group._reduce_scatter_base(output, input)
                 #     #torch.cuda.synchronize()
-                for _ in range(iterations):
-                    if len(events) >= 2:
-                        e = events.pop(0)
-                        e.synchronize()
-                        freeevents.append(e)
-                    group._reduce_scatter_base(output, input).wait()
-                    e = freeevents.pop(0)
-                    e.record()
-                    events.append(e)
+                if op == "all_gather":
+                    for _ in range(iterations):
+                        if len(events) >= 2:
+                            e = events.pop(0)
+                            e.synchronize()
+                            freeevents.append(e)
+                        group._allgather_base(output, input).wait()
+                        e = freeevents.pop(0)
+                        e.record()
+                        events.append(e)
+                elif op == "reduce_scatter":
+                    for _ in range(iterations):
+                        if len(events) >= 2:
+                            e = events.pop(0)
+                            e.synchronize()
+                            freeevents.append(e)
+                        group._reduce_scatter_base(output, input).wait()
+                        e = freeevents.pop(0)
+                        e.record()
+                        events.append(e)
+                else:
+                    assert False
                 torch.cuda.synchronize()
                 t = time.monotonic() - start
                 torch.cuda.synchronize()
 
                 if rank == 0 or True:
                     rate = iterations / t
-                    bw = (
-                        output.numel()
-                        * output.element_size()
-                        / 1024
-                        / 1024
-                        / 1024
-                        * iterations
-                        / t
-                    )
+                    bw = s * output.element_size() / 1024 / 1024 / 1024 * iterations / t
                     print(
                         "time: %g, %g/s  %gG/s (iterations %d)"
                         % (t, rate, bw, iterations)
@@ -189,7 +209,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(8, world_size)
+    i = min(256, world_size)
     while True:
         t(i)
 
@@ -218,9 +238,9 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-# for n in ("moodist", "nccl"):
 for n in ("moodist", "nccl"):
-#for n in ("nccl",):
+#for n in ("nccl", "moodist"):
+    # for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
