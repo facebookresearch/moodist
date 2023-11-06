@@ -9,14 +9,14 @@ namespace moodist {
 IbCommon::IbCommon(Group* group) : group(group) {}
 
 IbCommon::~IbCommon() {
-  fmt::printf("~IbCommon %p (group size %d)\n", (void*)this, group->size);
+  log.debug("~IbCommon %p (group size %d)\n", (void*)this, group->size);
 }
 
 void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
-  fmt::printf("Init IB\n");
+  log.debug("Init IB\n");
 
   for (size_t i = 0; i != size; ++i) {
     if (i == rank) {
@@ -41,7 +41,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
       IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
       if (!qp) {
-        perror("ibv_create_qp");
+        perror("ibv_create_qp_ex");
         TORCH_CHECK(false);
       }
       ibv_qp_attr attr;
@@ -49,8 +49,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       attr.qp_state = IBV_QPS_RESET;
       int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
       if (error) {
-        fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-        std::fflush(stderr);
+        log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
         TORCH_CHECK(false);
       }
 
@@ -61,8 +60,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
       error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
       if (error) {
-        fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-        std::fflush(stderr);
+        log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
         TORCH_CHECK(false);
       }
 
@@ -112,8 +110,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
             IBV_QP_MIN_RNR_TIMER);
     if (error) {
-      fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      std::fflush(stderr);
+      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
       TORCH_CHECK(false);
     }
 
@@ -136,8 +133,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC |
             IBV_QP_ACCESS_FLAGS);
     if (error) {
-      fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      std::fflush(stderr);
+      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
       TORCH_CHECK(false);
     }
 
@@ -149,15 +145,19 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
-  fmt::printf("IbCommon %p init (group size %d)\n", (void*)this, group->size);
+  log.debug("IbCommon %p init (group size %d)\n", (void*)this, group->size);
 
   protectionDomain = ibv_alloc_pd(context);
+  if (!protectionDomain) {
+    perror("ibv_alloc_pd");
+    CHECK(false);
+  }
 
   cq = ibv_create_cq(context, maxCqEntries, nullptr, nullptr, 0);
-
-  auto initIb = [&]() {
-
-  };
+  if (!cq) {
+    perror("ibv_create_cq");
+    CHECK(false);
+  }
 
   ibv_qp_init_attr_ex initAttributes;
   std::memset(&initAttributes, 0, sizeof(initAttributes));
@@ -185,14 +185,13 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
     perror("efadv_create_qp_ex");
     CHECK(false);
   }
-  fmt::printf("Init EFA\n");
+  log.debug("Init EFA\n");
   ibv_qp_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RESET;
   int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
   if (error) {
-    fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-    std::fflush(stderr);
+    log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
     CHECK(false);
   }
 
@@ -203,8 +202,7 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   attr.qkey = 0x4242;
   error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY);
   if (error) {
-    fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-    std::fflush(stderr);
+    log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
     CHECK(false);
   }
 
@@ -258,8 +256,7 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
     attr.qp_state = IBV_QPS_RTR;
     error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (error) {
-      fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      std::fflush(stderr);
+      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
       TORCH_CHECK(false);
     }
 
@@ -269,12 +266,11 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
     attr.rnr_retry = 7;
     error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RNR_RETRY);
     if (error) {
-      fmt::fprintf(stderr, "ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      std::fflush(stderr);
+      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
       TORCH_CHECK(false);
     }
   }
-  fmt::printf("connected, yey!\n");
+  log.debug("connected, yey!\n");
 }
 
 } // namespace moodist

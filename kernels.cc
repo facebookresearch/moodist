@@ -338,17 +338,17 @@ void Kernels::compile() {
   int major = 6;
   int minor = 0;
   CHECK_NVRTC(nvrtcVersion(&major, &minor));
-  fmt::printf("nvrtc version is %d %d\n", major, minor);
+  log.verbose("nvrtc version is %d %d\n", major, minor);
 
   int driverVersion = 5000;
   CHECK_CU(cuDriverGetVersion(&driverVersion));
 
-  fmt::printf("cuda driver version is %d\n", driverVersion);
+  log.verbose("cuda driver version is %d\n", driverVersion);
 
   CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
   CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
 
-  fmt::printf("cuda device compute capability is %d.%d\n", computeMajor, computeMinor);
+  log.verbose("cuda device compute capability is %d.%d\n", computeMajor, computeMinor);
 
   int cudaWarpSize = 0;
   int cudaMaxSharedMemory = 0;
@@ -361,8 +361,8 @@ void Kernels::compile() {
   CHECK_CU(cuDeviceGetAttribute(&maxThreadsPerSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, cuDevice));
   CHECK_CU(cuDeviceGetAttribute(&smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDevice));
 
-  fmt::printf("warp size: %d\nmax shared memory: %d\n", cudaWarpSize, cudaMaxSharedMemory);
-  fmt::printf("multiprocessor count: %d\nmax threads per multiprocessor: %d\n", smCount, maxThreadsPerSm);
+  log.verbose("warp size: %d\nmax shared memory: %d\n", cudaWarpSize, cudaMaxSharedMemory);
+  log.verbose("multiprocessor count: %d\nmax threads per multiprocessor: %d\n", smCount, maxThreadsPerSm);
 
   const auto& cpuInBuffer = group->cpuInBuffer;
   const auto& cpuOutBuffer = group->cpuOutBuffer;
@@ -591,7 +591,7 @@ __device__ void grid_generic_exit() {
 
   std::string cuFilename = fmt::sprintf("moodist-kernels-rank%d.cu", rank);
 
-  if (rank == 0 || true) {
+  if (false) {
     FILE* f = fopen(cuFilename.c_str(), "wb");
     if (f) {
       fwrite(source.data(), source.size(), 1, f);
@@ -639,33 +639,33 @@ __device__ void grid_generic_exit() {
     }
     error = nvrtcCompileProgram(program, options2.size(), options2.data());
     if (error == NVRTC_SUCCESS) {
-      fmt::printf("success with %s\n", archOptions[i].second);
+      log.verbose("success with %s\n", archOptions[i].second);
     }
   }
   if (error != NVRTC_SUCCESS) {
-    fmt::printf("Failed to compile--\n%s\n", source.c_str());
+    log.error("Failed to compile--\n%s\n", source.c_str());
     size_t logSize = 0;
-    std::string log;
+    std::string logstr;
     CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
-    log.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, log.data()));
-    fmt::printf("%s\n", log);
+    logstr.resize(logSize);
+    CHECK_NVRTC(nvrtcGetProgramLog(program, logstr.data()));
+    log.error("%s\n", logstr);
 
     CHECK_NVRTC(error);
   } else {
     size_t logSize = 0;
-    std::string log;
+    std::string logstr;
     CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
-    log.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, log.data()));
-    for (char& c : log) {
+    logstr.resize(logSize);
+    CHECK_NVRTC(nvrtcGetProgramLog(program, logstr.data()));
+    for (char& c : logstr) {
       if (c < 32 || c >= 127) {
         if (c != 10 && c != 13) {
           c = 32;
         }
       }
     }
-    fmt::printf("compile log\n---\n%s\n", log);
+    log.debug("compile log\n---\n%s\n", logstr);
   }
 
   size_t ptxSize = 0;
@@ -674,7 +674,7 @@ __device__ void grid_generic_exit() {
   ptx.resize(ptxSize);
   CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
 
-  if (rank == 0 || true) {
+  if (false) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d-ptx.s", rank);
     FILE* f = fopen(fn.c_str(), "wb");
     if (f) {
@@ -692,7 +692,7 @@ __device__ void grid_generic_exit() {
   CHECK_NVRTC(nvrtcGetCUBINSize(program, &cubinSize));
   std::vector<char> cubin;
   cubin.resize(cubinSize);
-  fmt::printf("cubin size is %d\n", cubin.size());
+  log.debug("cubin size is %d\n", cubin.size());
   CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
 
   if (rank == 0 || true) {
@@ -701,17 +701,11 @@ __device__ void grid_generic_exit() {
     if (f) {
       fwrite(cubin.data(), cubin.size(), 1, f);
       fclose(f);
-      fmt::printf("cubin dumped to %s\n", fn);
+      log.debug("cubin dumped to %s\n", fn);
     }
   }
 
   CHECK_NVRTC(nvrtcDestroyProgram(&program));
-
-  // CHECK_CU(cuModuleLoadDataEx(&cuModule, cubin.data(), 0, nullptr, nullptr));
-
-  // for (auto& v : functions) {
-  //   CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
-  // }
 
   auto exists = [&](std::string fn) {
     struct stat buf;
@@ -760,11 +754,10 @@ __device__ void grid_generic_exit() {
   }
 
   if (!exists(devrtPath)) {
-    fmt::fprintf(stderr, "Cannot find libcudadevrt.a (at compile time, it was at %s)\n", devrtPath);
-    fflush(stderr);
+    log.error("Cannot find libcudadevrt.a (at compile time, it was at %s)\n", devrtPath);
   }
 
-  fmt::printf("devrtPath is %s\n", devrtPath);
+  log.verbose("devrtPath is %s\n", devrtPath);
 
   CUlinkState linkState;
   CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
@@ -788,9 +781,9 @@ __device__ void grid_generic_exit() {
     CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, *v.first));
     int localBytes = 0;
     CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, *v.first));
-    fmt::printf("kernel %s uses %d registers\n", v.second, numRegs);
-    fmt::printf("kernel %s max threads per block: %d\n", v.second, maxThreadsPerBlock);
-    fmt::printf("kernel %s local bytes: %d\n", v.second, localBytes);
+    log.debug("kernel %s uses %d registers\n", v.second, numRegs);
+    log.debug("kernel %s max threads per block: %d\n", v.second, maxThreadsPerBlock);
+    log.debug("kernel %s local bytes: %d\n", v.second, localBytes);
   }
 
   CHECK_CU(cuLinkDestroy(linkState));

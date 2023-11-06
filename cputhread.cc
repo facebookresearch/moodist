@@ -231,10 +231,8 @@ void CpuThread::entry() {
           //     wc.wr_id);
           // std::fflush(stderr);
           if (wc.status) {
-            fmt::fprintf(
-                stderr, "rank %d Work completion with status %d (opcode %d, id %d)\n", rank, wc.status, wc.opcode,
-                wc.wr_id);
-            std::fflush(stderr);
+            log.error(
+                "rank %d Work completion with status %d (opcode %d, id %d)\n", rank, wc.status, wc.opcode, wc.wr_id);
             CHECK(false);
           } else {
             --dev.currentCqEntries;
@@ -263,14 +261,14 @@ void CpuThread::entry() {
         pollStart = now;
       } else {
         if (now - pollStart >= std::chrono::seconds(30)) {
-          fmt::printf("rank %d of group with size %d stuck at line %d\n", rank, size, line);
+          log.debug("rank %d of group with size %d stuck at line %d\n", rank, size, line);
           pollStart = now;
         }
       }
       poll();
     };
 
-#define poll() debugPoll(__LINE__)
+    // #define poll() debugPoll(__LINE__)
 
     auto preSend = [&](Device& dev, size_t index, auto& wr) {
       while (dev.currentCqEntries == maxCqEntries) {
@@ -342,8 +340,7 @@ void CpuThread::entry() {
         }
         int error = ibv_wr_complete(qp);
         if (error) {
-          fmt::fprintf(stderr, "ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
-          std::fflush(stderr);
+          log.error("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
           CHECK(false);
         }
 
@@ -406,8 +403,8 @@ void CpuThread::entry() {
         IbvMr mr = ibv_reg_mr(
             devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!mr) {
-          fmt::printf("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
           perror("ibv_reg_mr");
+          log.error("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
           TORCH_CHECK(false);
         }
         ptr->mrs[i] = mr;
@@ -440,17 +437,16 @@ void CpuThread::entry() {
       ptr->mr.mrs.fill(nullptr);
       CHECK(devices.size() <= ptr->mr.mrs.size());
       for (size_t i = 0; i != devices.size(); ++i) {
-        // ptr->mr.mrs[i] = devices[i].ib->getMr(address, bytes);
         auto* mr = ibv_reg_mr(
             devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!mr) {
-          fmt::printf("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
           perror("ibv_reg_mr");
+          log.error("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
           TORCH_CHECK(false);
         }
         localMrs.push_back(std::move(mr));
         ptr->mr.mrs[i] = mr;
-        fmt::printf(
+        log.debug(
             "new mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
             mr->lkey, mr->rkey);
       }
@@ -458,31 +454,6 @@ void CpuThread::entry() {
       mrMapCuda[address] = std::move(ptr);
       return r;
     };
-
-    // auto regMrCuda = [&](uintptr_t address, size_t bytes) {
-    //   unsigned long long bufferId = -1;
-    //   CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
-    //   CHECK(bufferId != -1);
-    //   unsigned long long bufferId2 = -1;
-    //   CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + bytes - 1));
-    //   CHECK(bufferId == bufferId2);
-    //   auto i = mrMapCuda.find(bufferId);
-    //   if (i != mrMapCuda.end()) {
-    //     CHECK(
-    //         (uintptr_t)(*i->second).mrs[0]->addr <= address &&
-    //         (uintptr_t)(*i->second).mrs[0]->addr + (*i->second).mrs[0]->length >= address + bytes);
-    //     return &*i->second;
-    //   }
-    //   auto ptr = std::make_unique<MemoryRegion>();
-    //   ptr->mrs.fill(nullptr);
-    //   CHECK(devices.size() <= ptr->mrs.size());
-    //   for (size_t i = 0; i != devices.size(); ++i) {
-    //     ptr->mrs[i] = devices[i].ib->getMr(address, bytes);
-    //   }
-    //   MemoryRegion* r = &*ptr;
-    //   mrMapCuda[bufferId] = std::move(ptr);
-    //   return r;
-    // };
 
     auto* commsMr = regMr((uintptr_t)group->mySharedMem, group->mySharedMemSize);
 
@@ -594,7 +565,7 @@ void CpuThread::entry() {
 
     AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
     for (size_t i = 0; i != 1; ++i) {
-      fmt::printf("rank %d starting CPU test %d!\n", rank, i);
+      log.debug("rank %d starting CPU test %d!\n", rank, i);
 
       // AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
       auto* testMr = regMr((uintptr_t)testBuffer.cpuPointer, testBuffer.bytes);
@@ -630,16 +601,16 @@ void CpuThread::entry() {
         for (size_t j = 0; j != 512; ++j) {
           uint64_t v = rng();
           if (testPtr[512 * i + j] != v) {
-            fmt::printf("i %d j %d expected %#x, but got %#x\n", i, j, v, testPtr[512 * i + j]);
+            log.error("i %d j %d expected %#x, but got %#x\n", i, j, v, testPtr[512 * i + j]);
           }
           CHECK(testPtr[512 * i + j] == v);
         }
       }
 
-      fmt::printf("rank %d CPU test done!\n", rank);
+      log.debug("rank %d CPU test done!\n", rank);
     }
     for (size_t i = 0; i != 1; ++i) {
-      fmt::printf("rank %d starting CUDA test %d!\n", rank, i);
+      log.debug("rank %d starting CUDA test %d!\n", rank, i);
       AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
       auto* testMr = regMrCuda((uintptr_t)testBuffer.cudaPointer, testBuffer.bytes);
       auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cudaPointer, testMr);
@@ -665,7 +636,7 @@ void CpuThread::entry() {
       }
       setupComms->allgather(0);
 
-      fmt::printf("rank %d CUDA test done!\n", rank);
+      log.debug("rank %d CUDA test done!\n", rank);
     }
 
     AllocatedBuffer outDynsBuffer = group->allocateHost(sizeof(DynamicAddresses) * size);
@@ -1184,16 +1155,17 @@ void CpuThread::entry() {
         }
 
       } catch (const std::exception& e) {
-        fmt::fprintf(stderr, "cpu thread exception: %s\n", e.what());
-        fflush(stderr);
+        // This handler is here because there's some AllocatedBuffers in scope which will be freed when the exception
+        // escapes this scope. These frees may deadlock as they require cuda syncs and we have kernels waiting on this
+        // thread. This way, at least we print an error before deadlocking.
+        log.error("cpu thread exception: %s\n", e.what());
         throw;
       }
     }
 
     trace("");
   } catch (const std::exception& e) {
-    fmt::fprintf(stderr, "Error: %s\n", e.what());
-    fflush(stderr);
+    log.error("Error: %s\n", e.what());
     throw std::runtime_error("Moodist cpu thread got an exception");
   } catch (QuitCpuThread) {
   }

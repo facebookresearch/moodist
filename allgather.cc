@@ -50,7 +50,7 @@ void AllGather::init() {
           continue;
         }
         if (!peerIpcAccess.at(list[src]).at(list[dst])) {
-          fmt::printf("no ipc %d <-> %d\n", list[src], list[dst]);
+          log.error("no ipc %d <-> %d\n", list[src], list[dst]);
         }
         CHECK(peerIpcAccess.at(list[src]).at(list[dst]));
       }
@@ -133,14 +133,16 @@ void AllGather::init() {
     }
   }
 
-  fmt::printf("paths.size() is %d\n", paths.size());
-  if (rank == 0 || true) {
-    FILE* f = fopen(fmt::sprintf("paths-%d.txt", rank).c_str(), "wb");
-    CHECK(f != nullptr);
-    for (auto& path : paths) {
-      fmt::fprintf(f, "[%s]\n", fmt::to_string(fmt::join(path, ", ")));
+  if (false) {
+    fmt::printf("paths.size() is %d\n", paths.size());
+    if (rank == 0 || true) {
+      FILE* f = fopen(fmt::sprintf("paths-%d.txt", rank).c_str(), "wb");
+      CHECK(f != nullptr);
+      for (auto& path : paths) {
+        fmt::fprintf(f, "[%s]\n", fmt::to_string(fmt::join(path, ", ")));
+      }
+      fclose(f);
     }
-    fclose(f);
   }
 
   for (auto& path : paths) {
@@ -189,9 +191,9 @@ void AllGather::init() {
     CHECK(n == proxyDestinationInfo.size());
   }
 
-  fmt::printf("rank %d: ipc ranks are [%s]\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
-  fmt::printf("rank %d: send ranks are [%s]\n", rank, fmt::to_string(fmt::join(sendRanks, ", ")));
-  fmt::printf("rank %d: recv ranks are [%s]\n", rank, fmt::to_string(fmt::join(recvRanks, ", ")));
+  log.verbose("rank %d: ipc ranks are [%s]\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
+  log.verbose("rank %d: send ranks are [%s]\n", rank, fmt::to_string(fmt::join(sendRanks, ", ")));
+  log.verbose("rank %d: recv ranks are [%s]\n", rank, fmt::to_string(fmt::join(recvRanks, ", ")));
 
   std::string proxyForwardOrder;
   std::string proxyCopyOrder;
@@ -203,8 +205,8 @@ void AllGather::init() {
     proxyCopyOrder += fmt::sprintf(" (%d %d)", v.source, v.proxy);
   }
 
-  fmt::printf("%d: proxy forward order %s\n", rank, proxyForwardOrder);
-  fmt::printf("%d: proxy copy order %s\n", rank, proxyCopyOrder);
+  log.verbose("%d: proxy forward order %s\n", rank, proxyForwardOrder);
+  log.verbose("%d: proxy copy order %s\n", rank, proxyCopyOrder);
 }
 
 std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGather::generate() {

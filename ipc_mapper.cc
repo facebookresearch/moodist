@@ -52,13 +52,13 @@ struct Memfd {
       throw std::system_error(errno, std::generic_category(), "ftruncate");
     }
 
-    fmt::printf("memfd create %d\n", fd);
+    log.debug("memfd create %d\n", fd);
 
     return map(fd, size);
   }
   static Memfd map(int fd, size_t size) {
     void* base;
-    base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    base = mmap(nullptr, size, PROT_READ | PROT_WRITE | MAP_POPULATE, MAP_SHARED, fd, 0);
     if (!base || base == MAP_FAILED) {
       close(fd);
       throw std::system_error(errno, std::generic_category(), "mmap");
@@ -152,7 +152,7 @@ struct IpcMapperImpl : IpcMapper {
               SharedStruct* nshared = peershared[i->peerIndex];
               auto& slot = nshared->slots[i->slotIndex];
               if (slot.stage == 3) {
-                fmt::printf("%d: got request response -> %#x\n", group->rank, slot.response);
+                log.debug("%d: got request response -> %#x\n", group->rank, slot.response);
                 TORCH_CHECK(slot.response != 0);
                 std::move(i->callback)(slot.response);
                 slot.response = 0;
@@ -171,7 +171,7 @@ struct IpcMapperImpl : IpcMapper {
             TORCH_CHECK(sourceRank < group->size);
             if (v.requestUnmapAddress) {
               v.response = 1;
-              fmt::printf(
+              log.debug(
                   "%d: got ipc unmap (address %#x size %#x) request from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
               // cuIpcCloseMemHandle synchronizes the device, but we cannot block here.
@@ -184,16 +184,16 @@ struct IpcMapperImpl : IpcMapper {
                 try {
                   CHECK_CU(cuIpcCloseMemHandle(address));
                 } catch (const std::exception& e) {
-                  fmt::printf("ipc mapper got exception %s\n", e.what());
+                  log.error("ipc mapper got exception %s\n", e.what());
                   std::lock_guard l(mutex);
                   hasException = true;
                   exception = std::current_exception();
                 }
               });
             } else {
-              fmt::printf("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
+              log.debug("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
               CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
-              fmt::printf("%d: mapped %#x bytes to %#x\n", group->rank, v.requestBytes, v.response);
+              log.debug("%d: mapped %#x bytes to %#x\n", group->rank, v.requestBytes, v.response);
             }
             v.stage = 3;
 
@@ -206,7 +206,7 @@ struct IpcMapperImpl : IpcMapper {
         shared->count -= n;
       }
     } catch (const std::exception& e) {
-      fmt::printf("ipc mapper got exception %s\n", e.what());
+      log.error("ipc mapper got exception %s\n", e.what());
       std::lock_guard l(mutex);
       hasException = true;
       exception = std::current_exception();
@@ -233,7 +233,7 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    fmt::printf("sending ipc request to rank %d using slot %d\n", group->ipcRanks.at(peerIndex), slotIndex);
+    log.debug("sending ipc request to rank %d using slot %d\n", group->ipcRanks.at(peerIndex), slotIndex);
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();
@@ -271,7 +271,7 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    fmt::printf("sending ipc request using slot %d\n", slotIndex);
+    log.debug("sending ipc request using slot %d\n", slotIndex);
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();
@@ -311,7 +311,7 @@ struct IpcMapperImpl : IpcMapper {
 
     auto onRead = [&](std::shared_ptr<SocketHelper> socket, Error* error) {
       if (error) {
-        fmt::printf("read error %s\n", error->what());
+        log.error("read error %s\n", error->what());
         socket->socket.close();
         return;
       }
@@ -351,10 +351,10 @@ struct IpcMapperImpl : IpcMapper {
     listener.listen(myAddress);
     listener.accept([&](Error* error, Socket socket) {
       if (error) {
-        fmt::printf("accept error %s\n", error->what());
+        log.error("accept error %s\n", error->what());
         return;
       }
-      fmt::printf("got a new connection!\n");
+      log.debug("got a new connection!\n");
       auto s = std::make_shared<SocketHelper>(std::move(socket));
       s->socket.setOnRead([s, &onRead](Error* error) { onRead(s, error); });
     });
@@ -367,7 +367,7 @@ struct IpcMapperImpl : IpcMapper {
       auto s = std::make_shared<SocketHelper>(Socket::Unix());
       s->socket.connect(group->setupComms->recvFrom<std::string>(i), [](Error* error) {
         if (error) {
-          fmt::printf("connect error %s\n", error->what());
+          log.error("connect error %s\n", error->what());
         }
       });
 
@@ -377,12 +377,12 @@ struct IpcMapperImpl : IpcMapper {
 
       s->socket.writev(&iov, 1, [](Error* error) {
         if (error) {
-          fmt::printf("write error %s\n", error->what());
+          log.error("write error %s\n", error->what());
         }
       });
       s->socket.sendFd(mymem.fd, [](Error* error) {
         if (error) {
-          fmt::printf("sendfd error %s\n", error->what());
+          log.error("sendfd error %s\n", error->what());
         }
       });
 

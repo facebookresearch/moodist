@@ -40,6 +40,36 @@ std::vector<ProcessGroupImpl*> activeProcessGroups;
 std::once_flag freeMemoryCallbackOnceFlag;
 void registerFreeMemoryCallback();
 
+std::once_flag globalInitFlag;
+void globalInit() {
+
+  const char* logLevel = std::getenv("MOODIST_LOG_LEVEL");
+  if (logLevel) {
+    std::string s = logLevel;
+    for (auto& c : s) {
+      c = std::toupper(c);
+    }
+    if (s == "NONE") {
+      currentLogLevel = LOG_NONE;
+    } else if (s == "ERROR") {
+      currentLogLevel = LOG_ERROR;
+    } else if (s == "INFO") {
+      currentLogLevel = LOG_INFO;
+    } else if (s == "VERBOSE") {
+      currentLogLevel = LOG_VERBOSE;
+    } else if (s == "DEBUG") {
+      currentLogLevel = LOG_DEBUG;
+    } else {
+      currentLogLevel = (LogLevel)std::atoi(logLevel);
+    }
+    if (currentLogLevel < LOG_ERROR) {
+      currentLogLevel = LOG_ERROR;
+    }
+
+    fmt::printf("currentLogLevel set to %d\n", (int)currentLogLevel);
+  }
+}
+
 struct ProcessGroupImpl {
   size_t rank = 0;
   size_t size = 0;
@@ -54,6 +84,8 @@ struct ProcessGroupImpl {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
 
     scheduler.setMaxThreads(1);
+
+    std::call_once(globalInitFlag, &globalInit);
 
     group = std::make_shared<Group>(rank, size);
 
@@ -142,7 +174,7 @@ struct ProcessGroupImpl {
 
   void init(const c10::intrusive_ptr<::c10d::Store>& store) {
 
-    fmt::printf("%d/%d: init\n", rank, size);
+    log.verbose("%d/%d: init\n", rank, size);
 
     auto start = Clock::now();
 
@@ -174,7 +206,7 @@ struct ProcessGroupImpl {
       group->setupComms->connect(address);
     }
 
-    fmt::printf("%d: Waiting for setupComms\n", rank);
+    log.debug("%d: Waiting for setupComms\n", rank);
     std::fflush(stdout);
     group->setupComms->waitForConnections();
 
@@ -183,7 +215,7 @@ struct ProcessGroupImpl {
       CHECK(get(fmt::sprintf("moodist_rank%d_ready", i)) == key);
     }
 
-    fmt::printf("%d: Waiting for connections\n", rank);
+    log.debug("%d: Waiting for connections\n", rank);
     std::fflush(stdout);
     for (size_t i = 0; i != size; ++i) {
       if (i == rank) {
@@ -195,19 +227,19 @@ struct ProcessGroupImpl {
       if (i == rank) {
         continue;
       }
-      fmt::printf("%d: waiting for greeting from %d\n", rank, i);
+      log.debug("%d: waiting for greeting from %d\n", rank, i);
       std::fflush(stdout);
       std::string greeting = group->setupComms->recvFrom<std::string>(i);
       TORCH_CHECK(greeting == fmt::sprintf("hello %d %s", rank, key));
-      fmt::printf("greeting ok!\n");
+      log.debug("greeting ok!\n");
       std::fflush(stdout);
     }
-    fmt::printf("got all connections\n");
+    log.debug("got all connections\n");
     std::fflush(stdout);
 
     group->init();
 
-    fmt::printf("init took %gs\n", seconds(Clock::now() - start));
+    log.verbose("init took %gs\n", seconds(Clock::now() - start));
   }
 
   std::vector<std::string> decodeAddress(std::string str) {
@@ -234,8 +266,6 @@ struct ProcessGroupImpl {
   std::string getAddress() {
     std::vector<std::string> addresses = group->setupComms->listenerAddresses();
     auto buffer = serializeToBuffer(addresses);
-
-    // fmt::printf("serialized to %d bytes\n", buffer->size);
 
     std::string r;
     for (size_t i = 0; i != buffer->size(); ++i) {
@@ -269,8 +299,6 @@ struct ProcessGroupImpl {
   void _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
     trace("_allgather_base");
     std::lock_guard l(mutex);
-
-    // fmt::printf("pg %p doing all gather\n", (void*)this);
 
     size_t size = this->size;
 
@@ -402,15 +430,6 @@ struct ProcessGroupImpl {
   void _reduce_scatter_base(at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
-
-    // int cpu = sched_getcpu();
-    // int node = numa_node_of_cpu(cpu);
-
-    // if (group->allocationNode && node != group->allocationNode) {
-    //   fmt::printf("running on wrong node!\n");
-    // }
-
-    // fmt::printf("pg %p doing reduce scatter\n", (void*)this);
 
     CHECK(opts.reduceOp == c10d::ReduceOp::SUM);
 

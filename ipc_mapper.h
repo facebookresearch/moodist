@@ -53,7 +53,7 @@ struct IpcMapper {
           if (!i->second.unmappable) {
             continue;
           }
-          fmt::printf(
+          log.debug(
               "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
               i->second.localAddress, i->second.peerAddress);
           ++waitCount;
@@ -76,7 +76,7 @@ struct IpcMapper {
     while (waitCount.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       if (Clock::now() - start >= std::chrono::seconds(60)) {
-        fmt::printf("Timeout waiting for ipc unmapper!\n");
+        log.error("Timeout waiting for ipc unmapper!\n");
         start = Clock::now();
       }
     }
@@ -101,21 +101,21 @@ struct IpcMapper {
         return;
       }
       addressMap.erase(i);
-      fmt::printf("requestAddress: bufferId changed for %#x bytes at %#x\n", length, address);
+      log.debug("requestAddress: bufferId changed for %#x bytes at %#x\n", length, address);
     }
 
     CUdeviceptr base = 0;
     size_t size = 0;
     CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
     CHECK(size >= length);
-    fmt::printf(
+    log.debug(
         "requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x\n", length, address, size, base);
     CUipcMemHandle handle;
     CHECK_CU(cuIpcGetMemHandle(&handle, base));
     size_t offset = address - base;
     uintptr_t baseAddress = peerIpcMap[peerIndex][handle].peerAddress;
     if (baseAddress) {
-      fmt::printf(
+      log.debug(
           "requestAddress: (allocation mapped) %#x bytes at %#x is already mapped at %#x (offset %#x)\n", length,
           address, baseAddress + offset, offset);
       addressMap[address] = {baseAddress + offset, bufferId};
@@ -127,7 +127,7 @@ struct IpcMapper {
         auto& ipcMap = peerIpcMap[peerIndex];
         for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
           if (i->second.localAddress + i->second.size > base && i->second.localAddress < base + size) {
-            fmt::printf(
+            log.debug(
                 "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x) due to allocations changing!\n",
                 i->second.size, i->second.localAddress, i->second.peerAddress);
             anyUnmaps = true;
@@ -152,7 +152,7 @@ struct IpcMapper {
           peerIndex, handle, size,
           [this, peerIndex, address, handle, offset, bufferId, length, base, size,
            callback = std::forward<Callback>(callback), unmappable](uintptr_t mappedAddress) {
-            fmt::printf(
+            log.debug(
                 "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, address,
                 mappedAddress + offset, offset);
             peerIpcAddressMap[peerIndex][address] = {mappedAddress + offset, bufferId};

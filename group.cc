@@ -82,26 +82,20 @@ void Group::init() {
     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
     CHECK_CU(cuDevicePrimaryCtxRetain(&cuContext, cuDevice));
     CHECK_CU(cuCtxSetCurrent(cuContext));
-    fmt::printf("group %p, cuInit! context %p\n", (void*)this, (void*)cuContext);
 
     cuCtxSetLimit(CU_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT, 0x10000);
 
   } else {
     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
-
-    fmt::printf("group %p, context %p\n", (void*)this, (void*)cuContext);
   }
-
-  // CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, -100));
-  // CHECK_CU(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
 
   int clockRate;
   CHECK_CU(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, cuDevice));
-  fmt::printf("device clock rate: %dkhz\n", clockRate);
+  log.verbose("device clock rate: %dkhz\n", clockRate);
 
   int asyncEngines;
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
-  fmt::printf("device async engines: %d\n", asyncEngines);
+  log.verbose("device async engines: %d\n", asyncEngines);
 
   CHECK_NVML(nvmlInit_v2());
 
@@ -125,16 +119,20 @@ void Group::init() {
   nvmlDevice_t nvmlDevice;
   CHECK_NVML(nvmlDeviceGetHandleByPciBusId_v2(cudaPciBus.data(), &nvmlDevice));
 
+  CHECK(numa_available() >= 0);
+
   unsigned long nodeSet = 0;
   CHECK_NVML(nvmlDeviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
 
   for (unsigned int i = 0; i != 64; ++i) {
     if (nodeSet & (1ull << i)) {
       allocationNode = i;
-      fmt::printf("allocationNode is %d\n", i);
+      log.debug("allocationNode is %d\n", i);
       break;
     }
   }
+
+  log.info("%d: allocationNode is %d\n", rank, allocationNode);
 
   // if (allocationNode != -1) {
   //   numa_run_on_node(allocationNode);
@@ -145,6 +143,8 @@ void Group::init() {
   std::vector<LocalDeviceNode> localDeviceNodes;
 
   std::string bootId = readBootId();
+
+  ibv_fork_init();
 
   ibv_device** list = ibv_get_device_list(nullptr);
   for (ibv_device** i = list; *i; ++i) {
@@ -159,8 +159,8 @@ void Group::init() {
         continue;
       }
 
-      fmt::printf("max_mr_size is %d\n", attributes.max_mr_size);
-      fmt::printf("max_mr is %d\n", attributes.max_mr);
+      log.debug("max_mr_size is %d\n", attributes.max_mr_size);
+      log.debug("max_mr is %d\n", attributes.max_mr);
 
       int portNum = -1;
       ibv_port_attr portAttributes;
@@ -172,8 +172,8 @@ void Group::init() {
           if (attributes.state != IBV_PORT_ACTIVE) {
             continue;
           }
-          fmt::printf("got a port with link layer %d\n", attributes.link_layer);
-          // fmt::printf("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
+          log.debug("got a port with link layer %d\n", attributes.link_layer);
+          log.debug("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
           int speed = attributes.active_speed;
           if (attributes.link_layer == IBV_LINK_LAYER_INFINIBAND) {
             speed += 0x100000;
@@ -210,7 +210,7 @@ void Group::init() {
         }
       }
 
-      fmt::printf("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, nmatch, bestSpeed);
+      log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, nmatch, bestSpeed);
 
       for (auto& v : localDevices) {
         CHECK(v.ibPath != ibPath);
@@ -256,7 +256,7 @@ void Group::init() {
   }
   TORCH_CHECK(std::find(localRanksByBootId.begin(), localRanksByBootId.end(), rank) != localRanksByBootId.end());
 
-  fmt::printf("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
+  log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
 
   size_t localRankIndex = ~(size_t)0;
   for (size_t i = 0; i != localRanksByBootId.size(); ++i) {
@@ -283,13 +283,13 @@ void Group::init() {
       nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
       CHECK_NVML(nvmlDeviceGetP2PStatus(nvmlDevice, peerDevice, NVML_P2P_CAPS_INDEX_NVLINK, &status));
       if (status == NVML_P2P_STATUS_OK) {
-        fmt::printf("rank %d: connected to local rank %d through nvlink\n", rank, i);
+        log.debug("rank %d: connected to local rank %d through nvlink\n", rank, i);
         localNvlink[i] = 1;
       } else {
-        fmt::printf("rank %d: connected to local rank %d through NOT nvlink\n", rank, i);
+        log.debug("rank %d: connected to local rank %d through NOT nvlink\n", rank, i);
       }
     } else {
-      fmt::printf("rank %d: nvml failed to access cuda device for local rank %d\n", rank, i);
+      log.error("rank %d: nvml failed to access cuda device for local rank %d\n", rank, i);
     }
   }
 
@@ -364,8 +364,8 @@ void Group::init() {
         taken[v->ibPath] = true;
       }
 
-      fmt::printf("evaluated %d solutions\n", solutions);
-      fmt::printf("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
+      log.debug("evaluated %d solutions\n", solutions);
+      log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
 
       for (auto& v : localDeviceNodes) {
         if (v.ibPath == best[localRankIndex]->ibPath) {
@@ -401,7 +401,7 @@ void Group::init() {
     bestPortAttributes = d->portAttributes;
     TORCH_CHECK(bestCtx != nullptr);
 
-    fmt::printf("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
+    log.verbose("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
     std::string devId = bestCtx->device->ibdev_path;
 
     ibCommon->init(bestPortNum, bestPortAttributes);
@@ -438,7 +438,7 @@ void Group::init() {
       CUdeviceptr mapPtr = 0;
       bool success =
           cuIpcOpenMemHandle(&mapPtr, allTestIpcHandles[i], CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS) == CUDA_SUCCESS;
-      fmt::printf("ipc success? %d address %#x\n", success, mapPtr);
+      log.debug("ipc success? %d address %#x\n", success, mapPtr);
       if (success) {
         cuIpcCloseMemHandle(mapPtr);
         ipcAccess[i] = true;
@@ -448,8 +448,10 @@ void Group::init() {
     }
   }
 
+  CHECK(peerIndices.size() <= 8);
+
   if (rank == 0) {
-    fmt::printf("initial connection setup took %g ms\n", seconds(Clock::now() - start) * 1000);
+    log.debug("initial connection setup took %g ms\n", seconds(Clock::now() - start) * 1000);
     start = Clock::now();
   }
 
@@ -466,7 +468,7 @@ void Group::init() {
       if (localNvlink[i] == 0) {
         for (size_t n : peerIpcRanks[i]) {
           if (allRanksNvlink[n][i]) {
-            fmt::printf(
+            log.debug(
                 "rank %d: dropping connection to %d as there is no nvlink, but there is an nvlink through rank %d\n",
                 rank, i, n);
             keep = false;
@@ -481,7 +483,7 @@ void Group::init() {
     ipcRanks = newIpcRanks;
     peerIpcRanks = setupComms->allgather(ipcRanks);
 
-    fmt::printf("rank %d ipc ranks is %s\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
+    log.debug("rank %d ipc ranks is %s\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
   }
 
   // rankIbDevNames = setupComms->allgather(std::string(bestCtx->device->name));
@@ -494,7 +496,7 @@ void Group::init() {
   // }
 
   if (rank == 0) {
-    fmt::printf("ipc ranks sync took %g ms\n", seconds(Clock::now() - start) * 1000);
+    log.debug("ipc ranks sync took %g ms\n", seconds(Clock::now() - start) * 1000);
     start = Clock::now();
   }
 
@@ -509,7 +511,7 @@ void Group::init() {
   }
 
   if (rank == 0) {
-    fmt::printf("final connection setup and sync took %g ms\n", seconds(Clock::now() - start) * 1000);
+    log.debug("final connection setup and sync took %g ms\n", seconds(Clock::now() - start) * 1000);
     start = Clock::now();
   }
 
@@ -556,14 +558,7 @@ void Group::init() {
 
   ipcMapper->getMySharedMem(0, offset);
 
-  // cudaStepDoneBuffer = allocateDevice(size * 8);
-  // cpuStepDoneBuffer = allocateHost(size * 8);
-
   cpuOutBuffer = allocateHostMapped(4096 + 16 * size);
-  // cpuOutBuffer = allocateManaged(4096 + 16 * size);
-  // CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_READ_MOSTLY, cuDevice));
-  // cpuInBuffer = allocateManaged(4096 + 16 * size);
-  // CHECK_CU(cuMemAdvise(cpuOutBuffer.cudaPointer, cpuOutBuffer.bytes, CU_MEM_ADVISE_SET_, cuDevice));
   cpuInBuffer = allocateHostMapped(4096 + 16 * size);
 
   auto mapPeerAddrs = [&](AllocatedBuffer& localBuffer, std::array<uintptr_t, 8>& peerPtrs) {
@@ -606,12 +601,12 @@ void Group::init() {
   allGather->init();
   reduceScatter->init();
 
-  fmt::printf("%d: init ok!\n", rank);
+  log.debug("%d: init ok!\n", rank);
 
   // synchronize to prevent ipc init race conditions
   setupComms->allgather(0);
 
-  fmt::printf("%d: init synchronized!\n", rank);
+  log.debug("%d: init synchronized!\n", rank);
 
   // cpuThread takes over setupComms from here
   cpuThread->start();
@@ -632,7 +627,7 @@ AllocatedBuffer Group::allocateManaged(size_t bytes) {
   r.hostAllocated = false;
   r.cudaPointer = ptr;
   r.cpuPointer = (void*)ptr;
-  fmt::printf("allocated managed memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  log.verbose("allocated managed memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
 AllocatedBuffer Group::allocateDevice(size_t bytes) {
@@ -647,7 +642,7 @@ AllocatedBuffer Group::allocateDevice(size_t bytes) {
   r.hostAllocated = false;
   r.cudaPointer = ptr;
   r.cpuPointer = nullptr;
-  fmt::printf("allocated device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  log.verbose("allocated device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
 
@@ -659,8 +654,7 @@ void* numaAllocate(size_t bytes, int node) {
     r = numa_alloc_local(bytes);
   }
   if (!r) {
-    fmt::fprintf(stderr, "ERROR: Failed to allocate %d bytes of host memory on NUMA node %d\n", bytes, node);
-    fflush(stderr);
+    log.error("ERROR: Failed to allocate %d bytes of host memory on NUMA node %d\n", bytes, node);
     throw std::bad_alloc();
   }
   return r;
@@ -672,16 +666,14 @@ AllocatedBuffer Group::allocateHostMapped(size_t bytes) {
   }
   AllocatedBuffer r;
   r.bytes = bytes;
-  // r.cpuPointer = numaAllocate(bytes, allocationNode);
-  // CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
-  CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP));
+  r.cpuPointer = numaAllocate(bytes, allocationNode);
+  CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
   std::memset(r.cpuPointer, 0, bytes);
-  // r.hostAllocated = true;
   r.numaAllocated = true;
   CUdeviceptr ptr;
   CHECK_CU(cuMemHostGetDevicePointer(&ptr, r.cpuPointer, 0));
   r.cudaPointer = ptr;
-  fmt::printf(
+  log.verbose(
       "allocated device mapped host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer,
       r.bytes, allocationNode);
   return r;
@@ -694,12 +686,10 @@ AllocatedBuffer Group::allocateHost(size_t bytes) {
   r.bytes = bytes;
   r.cpuPointer = numaAllocate(bytes, allocationNode);
   CHECK_CU(cuMemHostRegister(r.cpuPointer, bytes, 0));
-  // CHECK_CU(cuMemHostAlloc(&r.cpuPointer, r.bytes, 0));
   std::memset(r.cpuPointer, 0, bytes);
-  // r.hostAllocated = true;
   r.numaAllocated = true;
   r.cudaPointer = (uintptr_t)r.cpuPointer;
-  fmt::printf(
+  log.verbose(
       "allocated host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer, r.bytes,
       allocationNode);
   return r;
@@ -710,14 +700,13 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   }
   AllocatedBuffer r;
   r.bytes = bytes;
-  r.cpuPointer = numaAllocate(bytes, allocationNode);
   CHECK_CU(cuMemHostAlloc(&r.cpuPointer, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_WRITECOMBINED));
   std::memset(r.cpuPointer, 0, bytes);
   r.hostAllocated = true;
   CUdeviceptr ptr;
   CHECK_CU(cuMemHostGetDevicePointer(&ptr, r.cpuPointer, 0));
   r.cudaPointer = ptr;
-  fmt::printf("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  log.verbose("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
 

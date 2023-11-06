@@ -66,8 +66,7 @@ struct SetupCommsImpl : SetupComms {
         listeners.push_back(listener);
 
       } catch (const std::exception& e) {
-        fmt::fprintf(stderr, "Error while listening on '%s': %s\n", addr, e.what());
-        fflush(stderr);
+        log.error("Error while listening on '%s': %s\n", addr, e.what());
       }
     }
   }
@@ -104,7 +103,6 @@ struct SetupCommsImpl : SetupComms {
     }
     closeAll(tmp);
     dead = true;
-    fmt::printf("~SetupCommsImpl()\n");
   }
 
   std::vector<std::string> listenerAddresses() {

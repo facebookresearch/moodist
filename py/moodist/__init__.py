@@ -38,8 +38,9 @@ class Work:
 class ProcessGroup(torch.distributed.ProcessGroup):
     def __init__(self, store, rank, size, timeout):
         super().__init__(rank, size)
+        # self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
+        # self.nccl.barrier()
         self.moodist = MoodistProcessGroup(store, rank, size)
-        self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
 
     def _get_backend_name(self):
         return "moodist"
@@ -117,9 +118,8 @@ class ProcessGroup(torch.distributed.ProcessGroup):
 
     def barrier(self, *args, **kwargs):
         print("size %d barrier %s" % (self.size(), find_tensors(args)))
-        return self.nccl.barrier()
-        # self.moodist.barrier()
-        # return Work()
+        self.moodist.barrier()
+        return Work()
 
 
 from datetime import timedelta

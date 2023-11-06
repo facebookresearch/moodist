@@ -55,7 +55,7 @@ struct QueueEntryFreeList {
       return r;
     }
     ++nAllocated;
-    fmt::printf("QueueEntryFreeList %s allocated -> %d\n", typeid(T).name(), nAllocated);
+    log.debug("QueueEntryFreeList %s allocated -> %d\n", typeid(T).name(), nAllocated);
     all.emplace_front();
     return &all.front();
   }

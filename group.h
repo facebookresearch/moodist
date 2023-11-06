@@ -40,9 +40,6 @@ struct Group {
   CUcontext cuContext = nullptr;
   CUdevice cuDevice;
 
-  // CUstream stream = nullptr;
-  // CUevent event = nullptr;
-
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
@@ -50,10 +47,6 @@ struct Group {
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   std::unique_ptr<CpuThread> cpuThread;
-
-  // AllocatedBuffer temporaryBuffer;
-  // AllocatedBuffer cudaStepDoneBuffer;
-  // AllocatedBuffer cpuStepDoneBuffer;
 
   AllocatedBuffer cpuOutBuffer;
   AllocatedBuffer cpuInBuffer;
@@ -72,9 +65,6 @@ struct Group {
   AllocatedBuffer cudaCopyDone;
   std::array<uintptr_t, 8> peerCudaCopyDone;
 
-  // AllocatedBuffer peerInBuffer;
-  // std::array<uintptr_t, 8> peerOut;
-
   std::vector<size_t> ipcRanks;
   std::vector<size_t> peerIndices;
   std::vector<uint8_t> ipcAccess;
@@ -89,7 +79,6 @@ struct Group {
 
   int allocationNode = -1;
 
-  // AllocatedBuffer commsBuffer;
   void* mySharedMem = nullptr;
   size_t mySharedMemSize = 0;
   std::array<void*, 8> peerSharedMem;

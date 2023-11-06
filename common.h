@@ -1,6 +1,7 @@
 #pragma once
 
 #include "async.h"
+#include "logging.h"
 
 #include "fmt/printf.h"
 
