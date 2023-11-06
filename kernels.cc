@@ -44,16 +44,16 @@ std::string Kernels::emitCopySeq(
         $loop
       }
       $postloop
-      if (%count < %numBlocks) {
+      if ($unroll != 1 && %count < %numBlocks) {
         return;
       }
     } else {
-      if (%count < %numBlocks) {
+      if ($unroll != 1 && %count < %numBlocks) {
         %numBlocks -= %count;
         %blockIndex -= %count;
       }
     }
-    %offset += $loopbytes * %count;
+    %offset += $nbytes * %count;
     if (%offset == %bytes) {
       return;
     }
@@ -62,29 +62,49 @@ std::string Kernels::emitCopySeq(
     std::string preloop;
     std::string loop;
     std::string postloop;
-    std::string loopreads;
-    std::string loopwrites;
     if (unroll != 1) {
       preloop += "__syncthreads();\n";
       loop += "__syncthreads();\n";
     }
+    std::vector<std::string> srcPtr;
+    std::vector<std::string> dstPtr;
+    for (size_t n = 0; n != destinations.size(); ++n) {
+      srcPtr.push_back(getVar("src_ptr"));
+      dstPtr.push_back(getVar("dst_ptr"));
+    }
     for (int i = 0; i != unroll; ++i) {
       for (size_t n = 0; n != destinations.size(); ++n) {
         auto& src = sources[n];
+        auto& dst = destinations[n];
         std::string temp = getVar("temporary");
-        std::string read = replace(
-            R"($temp = __ldcv(($type*)(void*)($src + %offset + $loopbytes * %i + $typesize * $blockSize * $i + $typesize * %threadIndex));
+        if (i == 0) {
+          std::string srcptr = replace(
+              R"($ptr = $src + %offset + $loopbytes * %i + $typesize * %threadIndex;
                 )",
-            "$type", type, "$temp", temp, "$src", src, "$i", i, "$typesize", typesize);
+              "$ptr", srcPtr[n], "$src", src);
+          preloop += "uintptr_t " + srcptr;
+          loop += srcptr;
+
+          std::string dstptr = replace(
+              R"($ptr = $dst + %offset + $loopbytes * (%i - %numBlocks) + $typesize * %threadIndex;
+                )",
+              "$ptr", dstPtr[n], "$dst", dst);
+          preloop += replace("uintptr_t $ptr;\n", "$ptr", dstPtr[n]);
+          loop += dstptr;
+          postloop += dstptr;
+        }
+        std::string read = replace(
+            R"($temp = __ldcv(($type*)(void*)($ptr + $typesize * $blockSize * $i));
+                )",
+            "$temp", temp, "$ptr", srcPtr[n], "$i", i);
         if (i == unroll - 1 && n == destinations.size() - 1) {
           read += "%i += %numBlocks;\n";
         }
         preloop += type + " " + read;
-        auto& dst = destinations[n];
         std::string write = replace(
-            R"(__stwt(($type*)(void*)($dst + %offset + $loopbytes * (%i - %numBlocks) + $typesize * $blockSize * $i + $typesize * %threadIndex), $temp);
+            R"(__stwt(($type*)(void*)($ptr + $typesize * $blockSize * $i), $temp);
                 )",
-            "$type", type, "$temp", temp, "$dst", dst, "$i", i, "$typesize", typesize);
+            "$ptr", dstPtr[n], "$i", i, "$temp", temp);
         postloop += write;
         loop += write;
         loop += read;
@@ -132,6 +152,7 @@ std::string Kernels::emitCopySeq(
   copy1 += genCopy("uint4", 16, 4);
   copy1 += genCopy("uint4", 16, 2);
   copy1 += genCopy("uint4", 16, 1);
+  copy1 += genCopy("unsigned char", 1, 1);
   s = replace(s, "$bytes", bytes, "$defs", defs, "$copy1", copy1);
   s = replace(
       s, "$threadIndex", threadIndex, "$blockIndex", blockIndex, "$gridSize", gridSize, "$blockSize", blockSize);
@@ -139,174 +160,25 @@ std::string Kernels::emitCopySeq(
   return s;
 }
 
-std::string Kernels::emitCopy(
-    std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
-    size_t blockSize, std::string threadIndex, std::string blockIndex) {
-  TORCH_CHECK(sources.size() == destinations.size());
-  size_t stride = gridSize * blockSize;
-  auto genwrites = [&](std::string& writes, std::string type, int typesize,
-                       const std::vector<std::string>& temporaries) {
-    for (size_t i = 0; i != destinations.size(); ++i) {
-      auto& v = destinations[i];
-      writes += fmt::sprintf("__stwt((%s*)(void*)%s, %s);\n", type, v, temporaries[i]);
-    }
-  };
-  auto readwrite = [&](std::string& reads, std::string& writes, std::string type, int typesize) {
-    std::vector<std::string> temporaries;
-    for (auto& v : sources) {
-      std::string temp = getVar("temporary");
-      temporaries.push_back(temp);
-      reads += fmt::sprintf("%s %s = __ldcv((%s*)(void*)%s);\n", type, temp, type, v);
-    }
-    genwrites(writes, type, typesize, temporaries);
-  };
-  auto addOffset = [&](int typesize) {
-    std::string s;
-    for (auto& v : sources) {
-      s += fmt::sprintf("%s += %d * %%offset;\n", v, typesize);
-    }
-    for (auto& v : destinations) {
-      s += fmt::sprintf("%s += %d * %%offset;\n", v, typesize);
-    }
-    return s;
-  };
-  auto genCopy = [&](std::string type, int typesize, int unroll) {
-    std::string s = R"(
-$pre
-  while (%bytes >= $loopbytes) {
-    size_t %loopcount = %bytes / $loopbytes;
-    $preloop
-    syncthreads();
-#pragma unroll 1
-    for (size_t %i = 0; %i != %loopcount - 1; ++%i) {
-      //__syncwarp();
-      //syncthreads();
-      $loop
-    }
-    $postloop
-    %bytes -= $loopbytes * %loopcount;
-  }
-$post
-)";
-    std::string pre = addOffset(typesize);
-    std::string preloop;
-    std::string loop;
-    std::string postloop;
-    for (int i = 0; i != unroll; ++i) {
-      for (size_t n = 0; n != destinations.size(); ++n) {
-        auto& src = sources[n];
-        std::string temp = getVar("temporary");
-        std::string read = replace(
-            R"($temp = __ldcv(($type*)(void*)$src); $src += $typesize * $stride;
-                )",
-            "$type", type, "$temp", temp, "$src", src, "$typesize", typesize, "$stride", stride);
-        preloop += type + " " + read;
-        auto& dst = destinations[n];
-        std::string write = replace(
-            R"(__stwt(($type*)(void*)$dst, $temp); $dst += $typesize * $stride;
-                )",
-            "$type", type, "$temp", temp, "$dst", dst, "$typesize", typesize, "$stride", stride);
-        postloop += write;
-        loop += write;
-        loop += read;
-      }
-    }
-    std::string post;
-    for (auto& v : sources) {
-      post += fmt::sprintf("%s -= %d * %%offset;\n", v, typesize);
-    }
-    for (auto& v : destinations) {
-      post += fmt::sprintf("%s -= %d * %%offset;\n", v, typesize);
-    }
-    size_t loopbytes = typesize * unroll * stride;
-    s = replace(
-        s, "$loop", loop, "$pre", pre, "$post", post, "$loopbytes", loopbytes, "$preloop", preloop, "$postloop",
-        postloop);
-    s = replace(s, "$datatype", type, "$datatypesize", typesize, "$stride", stride, "$type", type);
-    return s;
-  };
-  std::string s;
-  s += fmt::sprintf(
-      "/* copy  bytes: %s  gridSize: %d  blockSize: %d  threadIndex: %s  blockIndex: %s */\n", bytes, gridSize,
-      blockSize, threadIndex, blockIndex);
-  s += R"(
-  size_t %bytes = $bytes;
-  uint32_t %threadIndex = $threadIndex;
-  uint32_t %blockIndex = $blockIndex;
-  uint32_t %offset = $blockSize * %blockIndex + %threadIndex;
-  $defs
-  $copy1
-  $copy2
-  $copy3
-  if (%offset < (uint32_t)%bytes) {
-    $copylastbyte
-  }
-)";
-
-  std::string defs;
-  for (auto& v : sources) {
-    auto var = getVar(v);
-    defs += fmt::sprintf("uintptr_t %s = (uintptr_t)(void*)(%s);\n", var, v);
-    v = var;
-  }
-  for (auto& v : destinations) {
-    auto var = getVar(v);
-    defs += fmt::sprintf("uintptr_t %s = (uintptr_t)(void*)(%s);\n", var, v);
-    // defs += replace(R"(if (threadIdx.x == 0) printf("rank $rank got dst %%#llx from $v\n", (uintptr_t)$var);
-    // )", "$var", var, "$v", v);
-    v = var;
-  }
-  std::string copy1;
-  // 16 uint4 uses 64 registers. we could go higher to hide more latency,
-  // but it seems to not improve performance
-  // copy1 = genCopy("uint4", 16, 32);
-  copy1 += genCopy("uint4", 16, 16);
-  copy1 += genCopy("uint4", 16, 8);
-  copy1 += genCopy("uint4", 16, 4);
-  copy1 += genCopy("uint4", 16, 1);
-  std::string copy2 = genCopy("unsigned int", 4, 2) + genCopy("unsigned int", 4, 1);
-  std::string copy3 = genCopy("unsigned char", 1, 1);
-  std::string copylastbyte = addOffset(1);
-  readwrite(copylastbyte, copylastbyte, "unsigned char", 1);
-  s = replace(
-      s, "$bytes", bytes, "$defs", defs, "$copy1", copy1, "$copy2", copy2, "$copy3", copy3, "$copylastbyte",
-      copylastbyte);
-  s = replace(
-      s, "$threadIndex", threadIndex, "$blockIndex", blockIndex, "$copyGridSize", gridSize, "$blockSize", blockSize);
-  s = makeVars(s);
-  return s;
-}
-
-std::string Kernels::emitReduceFunction(
-    std::string type, size_t typesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize) {
-  TORCH_CHECK(type != "");
+std::string Kernels::emitReduceFunctionSeq(
+    std::string sourcetype, size_t sourcetypesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize) {
+  CHECK(sourcetype != "");
   std::string sourcesargs;
   for (size_t i = 0; i != nsources; ++i) {
     if (!sourcesargs.empty()) {
       sourcesargs += ", ";
     }
-    sourcesargs += replace("const $type* source_$i", "$type", type, "$i", i);
+    sourcesargs += replace("const $type* source_$i", "$type", sourcetype, "$i", i);
   }
   std::string addressesdefs;
   std::string dst = "dst";
   addressesdefs += "uintptr_t dst = (uintptr_t)destination;\n";
-  // addressesdefs += "printf(\"dst alignment is %d\\n\", dst & 127);\n";
   std::vector<std::string> addresses;
   for (size_t i = 0; i != nsources; ++i) {
     addresses.push_back(fmt::sprintf("src%d", i));
     addressesdefs += replace("uintptr_t src$i = (uintptr_t)source_$i;\n", "$i", i);
-    // addressesdefs += replace("printf(\"src$i alignment is %d\\n\", src$i & 127);\n", "$i", i);
   }
-  addressesdefs = replace(addressesdefs, "$type", type);
-  size_t stride = gridSize * blockSize;
-  auto addOffset = [&](int typesize) {
-    std::string s;
-    s += fmt::sprintf("%s += %d * (int)%%offset;\n", dst, typesize);
-    for (auto& v : addresses) {
-      s += fmt::sprintf("%s += %d * (int)%%offset;\n", v, typesize);
-    }
-    return s;
-  };
+  addressesdefs = replace(addressesdefs, "$type", sourcetype);
   auto reduceopcode = [&](auto& names) {
     if (op == "sum") {
       return fmt::to_string(fmt::join(names, " + "));
@@ -316,7 +188,7 @@ std::string Kernels::emitReduceFunction(
   };
   std::function<std::string(std::string, std::string, std::vector<std::string>)> getreducecode =
       [&](std::string datatype, std::string result, std::vector<std::string> inputs) {
-        if (datatype == type) {
+        if (datatype == sourcetype) {
           return replace("$result = $code;", "$result", result, "$code", reduceopcode(inputs));
         } else if (datatype == "uint4") {
           std::string s;
@@ -331,7 +203,7 @@ std::string Kernels::emitReduceFunction(
           }
           return s;
         } else if (datatype == "uint32_t") {
-          if (type == "float") {
+          if (sourcetype == "float") {
             for (auto& v : inputs) {
               v = replace("__uint_as_float($v)", "$v", v);
             }
@@ -344,29 +216,49 @@ std::string Kernels::emitReduceFunction(
         }
       };
   auto generate = [&](std::string datatype, int datatypesize, int unroll) {
-    TORCH_CHECK(datatypesize % typesize == 0);
-    std::string s = R"(
-$pre
-  while (%remaining >= $loopsize) {
-    size_t %loopcount = %remaining / $loopsize;
-    $preloop
-    syncthreads();
-#pragma unroll 1
-    for (size_t %i = 0; %i != %loopcount - 1; ++%i) {
-      //__syncwarp();
-      //syncthreads();
-      $loop
+    TORCH_CHECK(datatypesize % sourcetypesize == 0);
+    std::string nbytes;
+    std::string condi;
+    std::string s;
+    if (unroll == 1) {
+      nbytes = "$datatypesize";
+      condi = "$blockSize * %i + %threadIndex";
+    } else {
+      nbytes = "$loopbytes";
+      condi = "%i";
     }
-    $postloop
-    %remaining -= $loopsize * %loopcount;
-  }
-$post
-)";
-    std::string pre = addOffset(datatypesize);
-    std::string post = addOffset(-(int)datatypesize);
+    s = replace(
+        R"(
+    %count = (%bytes - %offset) / $nbytes;
+    %i = %blockIndex;
+    if ($cond < %count) {
+      $preloop
+      while ($cond < %count) {
+        $loop
+      }
+      $postloop
+      if ($unroll != 1 && %count < %numBlocks) {
+        return;
+      }
+    } else {
+      if ($unroll != 1 && %count < %numBlocks) {
+        %numBlocks -= %count;
+        %blockIndex -= %count;
+      }
+    }
+    %offset += $nbytes * %count;
+    if (%offset == %bytes) {
+      return;
+    }
+  )",
+        "$nbytes", nbytes, "$cond", condi);
     std::string preloop;
     std::string loop;
     std::string postloop;
+    if (unroll != 1) {
+      preloop += "__syncthreads();\n";
+      loop += "__syncthreads();\n";
+    }
     for (int i = 0; i != unroll; ++i) {
       std::vector<std::string> tempnames;
       std::string reads;
@@ -375,9 +267,12 @@ $post
         std::string temp = getVar("temporary");
         tempnames.push_back(temp);
         std::string read = replace(
-            R"($temp = __ldcv(($datatype*)(void*)$src); $src += $datatypesize * $stride;
-                  )",
-            "$temp", temp, "$src", src);
+            R"($temp = __ldcv(($datatype*)(void*)($src + %offset + $loopbytes * %i + $datatypesize * $blockSize * $i + $datatypesize * %threadIndex));
+                )",
+            "$temp", temp, "$src", src, "$i", i);
+        if (i == unroll - 1 && n == addresses.size() - 1) {
+          read += "%i += %numBlocks;\n";
+        }
         preloop += datatype + " " + read;
         reads += read;
       }
@@ -386,89 +281,44 @@ $post
       preloop += replace("$datatype $result;\n", "$result", result);
       std::string write = replace(
           R"($reducecode
-            __stwt(($datatype*)(void*)$dst, $result); $dst += $datatypesize * $stride;
-                    )",
-          "$result", result, "$dst", dst, "$reducecode", reducecode);
+              __stwt(($datatype*)(void*)($dst + %offset + $loopbytes * (%i - %numBlocks) + $datatypesize * $blockSize * $i + $datatypesize * %threadIndex), $result);
+                )",
+          "$result", result, "$dst", dst, "$i", i, "$reducecode", reducecode);
       postloop += write;
       loop += write;
       loop += reads;
     }
-    size_t loopsize = (datatypesize / typesize) * unroll * stride;
+    size_t loopbytes = datatypesize * unroll * blockSize;
+    s = replace(s, "$preloop", preloop, "$postloop", postloop, "$loop", loop, "$loopbytes", loopbytes);
     s = replace(
-        s, "$loopsize", loopsize, "$preloop", preloop, "$postloop", postloop, "$loop", loop, "$pre", pre, "$post",
-        post);
-    s = replace(s, "$datatype", datatype, "$datatypesize", datatypesize, "$stride", stride, "$type", type);
+        s, "$datatype", datatype, "$datatypesize", datatypesize, "$sourcetype", sourcetype, "$sourcetypesize",
+        sourcetypesize, "$loopbytes", loopbytes, "$unroll", unroll);
     return s;
   };
-  auto generatelast = [&](std::string datatype, int datatypesize) {
-    TORCH_CHECK(datatypesize % typesize == 0);
-    std::string s = R"(
-$pre
-  $preloop
-  $loop
-)";
-    std::string pre = addOffset(datatypesize);
-    std::string preloop;
-    std::string loop;
-    std::vector<std::string> tempnames;
-    std::string reads;
-    for (size_t n = 0; n != addresses.size(); ++n) {
-      auto& src = addresses[n];
-      std::string temp = getVar("temporary");
-      tempnames.push_back(temp);
-      std::string read = replace(
-          R"($temp = __ldcv(($datatype*)(void*)$src); $src += $datatypesize * $stride;
-                )",
-          "$temp", temp, "$src", src);
-      preloop += datatype + " " + read;
-      reads += read;
-    }
-    std::string result = getVar("result");
-    std::string reducecode = getreducecode(datatype, result, tempnames);
-    preloop += replace("$datatype $result;\n", "$result", result);
-    std::string write = replace(
-        R"($reducecode
-          __stwt(($datatype*)(void*)$dst, $result); $dst += $datatypesize * $stride;
-                  )",
-        "$result", result, "$dst", dst, "$reducecode", reducecode);
-    loop += write;
-    loop += reads;
-    s = replace(s, "$preloop", preloop, "$loop", loop, "$pre", pre);
-    s = replace(s, "$datatype", datatype, "$datatypesize", datatypesize, "$stride", stride, "$type", type);
-    return s;
-  };
-  std::string reducelastitem = generatelast(type, typesize);
   std::string reduce1; // = generate("uint4", 16, 32);
   reduce1 += generate("uint4", 16, 8);
   reduce1 += generate("uint4", 16, 4);
   reduce1 += generate("uint4", 16, 2);
   reduce1 += generate("uint4", 16, 1);
-  std::string reduce2;
-  if (typesize <= 4) {
-    reduce2 += generate(type, typesize, 2);
-  }
-  reduce2 += generate(type, typesize, 1);
+  reduce1 += generate(sourcetype, sourcetypesize, 1);
   std::string s = replace(
       R"(
 __device__ void reduce_$typename_$op_n$nsources(size_t size, $typename* destination, $sourcesargs) {
-  size_t %remaining = size;
-  uint32_t %offset = $blockSize * blockIdx.x + threadIdx.x;
-  if ((uintptr_t)destination < 0x100000 || (uintptr_t)source_0 < 0x100000) {
-    printf("bad reduce with destination %p, source %p, offset %#x\n", destination, source_0, %offset);
-    while(1);
-  }
   $addressesdefs
-  // if (threadIdx.x == 0)
-  // printf("$rank: reduce with destination %#lx, source_0 %#lx, source_1 %#lx, offset %#x\n", dst, src0, src1, %offset);
+  const size_t %bytes = $sourcetypesize * size;
+  const uint32_t %threadIndex = $threadIndex;
+  static_assert($gridSize % $blocksPerSm == 0);
+  uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
+  uint32_t %numBlocks = $gridSize;
+  size_t %offset = 0;
+  size_t %count = 0;
+  size_t %i;
   $reduce1
-  $reduce2
-  if (%offset < (uint32_t)%remaining) {
-    $reducelastitem
-  }
 }
   )",
-      "$sourcesargs", sourcesargs, "$op", op, "$nsources", nsources, "$typename", type, "$reduce1", reduce1, "$reduce2",
-      reduce2, "$addressesdefs", addressesdefs, "$blockSize", blockSize, "$reducelastitem", reducelastitem);
+      "$sourcesargs", sourcesargs, "$op", op, "$nsources", nsources, "$typename", sourcetype, "$sourcetypesize",
+      sourcetypesize, "$reduce1", reduce1, "$addressesdefs", addressesdefs, "$gridSize", gridSize, "$blockSize",
+      blockSize, "$blockIndex", "blockIdx.x", "$threadIndex", "threadIdx.x");
   s = makeVars(s);
   return s;
 }
@@ -547,7 +397,7 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
   source = replace(
       source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
 
-  source += emitReduceFunction("float", 4, 2, "sum", gridSize, blockSize);
+  source += emitReduceFunctionSeq("float", 4, 2, "sum", gridSize, blockSize);
 
   source += R"(
 template<typename T>
