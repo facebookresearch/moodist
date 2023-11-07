@@ -528,13 +528,46 @@ void Group::init() {
     peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
   }
 
-  ipcMapper->init();
+  int cpu = sched_getcpu();
+  int node = numa_node_of_cpu(cpu);
+
+  log.info("%d: pre running on cpu %d, node %d\n", rank, cpu, node);
+
+  log.info("%d: pre preferred numa node is %d\n", rank, numa_preferred());
+
+  {
+    // we want shared memory (allocated with memfd_create) to be allocated on allocationNode,
+    // but we don't want to change the current numa allocation policy.
+    // thus we create a temporary thread to do it.
+    std::thread tmp([&] {
+      if (allocationNode != -1) {
+        auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
+        if (bitmask) {
+          numa_bitmask_clearall(bitmask);
+          numa_bitmask_setbit(bitmask, allocationNode);
+          numa_bind(bitmask);
+          numa_bitmask_free(bitmask);
+        }
+      }
+      ipcMapper->init();
+    });
+    tmp.join();
+  }
+
+  cpu = sched_getcpu();
+  node = numa_node_of_cpu(cpu);
+
+  log.info("%d: post running on cpu %d, node %d\n", rank, cpu, node);
 
   mySharedMem = ipcMapper->getMySharedMem(0, 0);
   peerSharedMem.fill(nullptr);
   for (size_t i : peerIndices) {
     peerSharedMem[i] = ipcMapper->getPeerSharedMem(i, 0, 0);
   }
+
+  int status;
+  CHECK(numa_move_pages(0, 1, &mySharedMem, nullptr, &status, 0) == 0);
+  log.info("%d: shared mem is on node %d\n", rank, status);
 
   size_t offset = 0;
   uintptr_t addr = (uintptr_t)mySharedMem;

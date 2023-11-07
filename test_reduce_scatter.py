@@ -70,10 +70,10 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     #data = torch.randn(1024 * 1024 * 40).cuda() + 1
-    #data = torch.randn(1 * size).cuda() + 1
+    data = torch.randn(4 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
-    data = torch.randn((442416 - 4) * size).cuda() + 1
+    #data = torch.randn((442416 - 4) * size).cuda() + 1
     #data = torch.randn(527040 * size).cuda() + 1
     #data = torch.randn(524288 * size).cuda() + 1
     #data = torch.randn(524288 * size).cuda() + 1
