@@ -71,7 +71,7 @@ inline struct Log {
 template<typename... Args>
 [[noreturn]] void fatal(const char* fmt, Args&&... args) {
   auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
-  log.error(" -- FATAL ERROR --\n%s\n", s);
+  log.error(" -- MOODIST FATAL ERROR --\n%s\n", s);
   std::abort();
 }
 

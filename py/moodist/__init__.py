@@ -38,8 +38,6 @@ class Work:
 class ProcessGroup(torch.distributed.ProcessGroup):
     def __init__(self, store, rank, size, timeout):
         super().__init__(rank, size)
-        # self.nccl = torch.distributed.ProcessGroupNCCL(store, rank, size, timeout)
-        # self.nccl.barrier()
         self.moodist = MoodistProcessGroup(store, rank, size)
 
     def _get_backend_name(self):
@@ -61,15 +59,14 @@ class ProcessGroup(torch.distributed.ProcessGroup):
         print("size %d reduce %s" % (self.size(), find_tensors(args)))
         return self.nccl.reduce(*args, **kwargs)
 
-    def allgather(self, *args, **kwargs):
+    def allgather(self, output, input):
         # print("size %d allgather %s" % (self.size(), find_tensors(args)))
-        return self.nccl.allgather(*args, **kwargs)
-        # return self.moodist.allgather(*args, **kwargs)
+        return self.moodist.all_gather_list(output, input)
 
-    def _allgather_base(self, *args, **kwargs):
+    def _allgather_base(self, output, input):
         # print("size %d _allgather_base %s" % (self.size(), find_tensors(args)))
         # return self.nccl._allgather_base(*args, **kwargs)
-        self.moodist._allgather_base(*args, **kwargs)
+        self.moodist.all_gather(output, input)
         return Work()
 
     def allgather_coalesced(self, *args, **kwargs):

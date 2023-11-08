@@ -276,12 +276,7 @@ struct ProcessGroupImpl {
     return r;
   }
 
-  void allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
-    TORCH_CHECK(false, "allreduce");
-  }
-
-  void barrier(const c10d::BarrierOptions& opts) {
-    CHECK_CU(cuStreamSynchronize(c10::cuda::getCurrentCUDAStream()));
+  void barrier() {
     std::lock_guard l(mutex);
     uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
     CHECK(stepValue < 0x80000000);
@@ -296,8 +291,8 @@ struct ProcessGroupImpl {
     }
   }
 
-  void _allgather_base(at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
-    trace("_allgather_base");
+  void all_gather(at::Tensor& output, const at::Tensor& input) {
+    trace("all_gather");
     std::lock_guard l(mutex);
 
     size_t size = this->size;
@@ -421,17 +416,15 @@ struct ProcessGroupImpl {
     trace("post");
   }
 
-  void allgather(
-      std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::AllgatherOptions& opts) {
-    TORCH_CHECK(false, "allgather impl");
+  void all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
+    TORCH_CHECK(false, "all_gather_list");
   }
 
-  void _reduce_scatter_base(at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
+  void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp) {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
 
-    CHECK(opts.reduceOp == c10d::ReduceOp::SUM);
+    CHECK(reduceOp == c10d::ReduceOp::SUM);
 
     size_t size = this->size;
 
@@ -570,6 +563,11 @@ struct ProcessGroupImpl {
 
     trace("post");
   }
+
+  void reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp reduceOp) {
+    
+  }
+
 };
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
@@ -593,32 +591,24 @@ ProcessGroup::~ProcessGroup() {
   impl.reset();
 }
 
-void ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
-  TORCH_CHECK(false, "broadcast");
+void ProcessGroup::all_gather(at::Tensor& output, const at::Tensor& input) {
+  return impl->all_gather(output, input);
 }
 
-void ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
-  return impl->allreduce(tensors, opts);
+void ProcessGroup::all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
+  return impl->all_gather_list(output, input);
 }
 
-void ProcessGroup::_allgather_base(
-    at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
-  return impl->_allgather_base(outputbuffer, inputbuffer, opts);
+void ProcessGroup::reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp op) {
+  return impl->reduce_scatter(output, input, op);
 }
 
-void ProcessGroup::allgather(
-    std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-    const c10d::AllgatherOptions& opts) {
-  return impl->allgather(outputTensors, inputTensors, opts);
+void ProcessGroup::reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp op) {
+  return impl->reduce_scatter_list(output, input, op);
 }
 
-void ProcessGroup::_reduce_scatter_base(
-    at::Tensor& outputTensor, at::Tensor& inputTensor, const c10d::ReduceScatterOptions& opts) {
-  return impl->_reduce_scatter_base(outputTensor, inputTensor, opts);
-}
-
-void ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
-  return impl->barrier(opts);
+void ProcessGroup::barrier() {
+  return impl->barrier();
 }
 
 } // namespace moodist

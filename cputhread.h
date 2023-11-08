@@ -87,7 +87,6 @@ struct CpuThread {
   ~CpuThread();
 
   void start();
-  void entry();
   void enqueue(QueueEntry* e) {
     std::unique_lock l(mutex);
     queue.push_back(*e);
