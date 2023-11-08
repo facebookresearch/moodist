@@ -127,16 +127,11 @@ void Group::init() {
   for (unsigned int i = 0; i != 64; ++i) {
     if (nodeSet & (1ull << i)) {
       allocationNode = i;
-      log.debug("allocationNode is %d\n", i);
       break;
     }
   }
 
-  log.info("%d: allocationNode is %d\n", rank, allocationNode);
-
-  // if (allocationNode != -1) {
-  //   numa_run_on_node(allocationNode);
-  // }
+  log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
   std::vector<LocalDevice> localDevices;
 
@@ -528,13 +523,6 @@ void Group::init() {
     peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
   }
 
-  int cpu = sched_getcpu();
-  int node = numa_node_of_cpu(cpu);
-
-  log.info("%d: pre running on cpu %d, node %d\n", rank, cpu, node);
-
-  log.info("%d: pre preferred numa node is %d\n", rank, numa_preferred());
-
   {
     // we want shared memory (allocated with memfd_create) to be allocated on allocationNode,
     // but we don't want to change the current numa allocation policy.
@@ -554,20 +542,11 @@ void Group::init() {
     tmp.join();
   }
 
-  cpu = sched_getcpu();
-  node = numa_node_of_cpu(cpu);
-
-  log.info("%d: post running on cpu %d, node %d\n", rank, cpu, node);
-
   mySharedMem = ipcMapper->getMySharedMem(0, 0);
   peerSharedMem.fill(nullptr);
   for (size_t i : peerIndices) {
     peerSharedMem[i] = ipcMapper->getPeerSharedMem(i, 0, 0);
   }
-
-  int status;
-  CHECK(numa_move_pages(0, 1, &mySharedMem, nullptr, &status, 0) == 0);
-  log.info("%d: shared mem is on node %d\n", rank, status);
 
   size_t offset = 0;
   uintptr_t addr = (uintptr_t)mySharedMem;

@@ -431,20 +431,18 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
         "$ptr", group->peerCudaStepValue[i] + sizeof(uint32_t) * rank);
   }
 
-  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
+  auto waitForRecv = [&](size_t i) {
     std::string s;
-    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
+    s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(
-          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
-          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
+      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
     }
     return s;
   };
 
   std::string waitForRecvs;
   for (size_t i : group->allGather->recvRanks) {
-    waitForRecvs += waitForRecv(i, Group::dataChunks - 1);
+    waitForRecvs += waitForRecv(i);
   }
 
   std::string copyDoneAllCode;

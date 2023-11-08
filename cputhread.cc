@@ -46,24 +46,14 @@ struct Device {
 struct Callback {
   Function<void()> onComplete;
   size_t refcount = 0;
-  CpuThreadImpl* owner = nullptr;
   Callback* next = nullptr;
 
   void decref(CpuThreadImpl* currentThread) {
     CHECK(refcount >= 1);
     if (--refcount == 0) {
-      if (currentThread == owner) {
-        std::move(onComplete)();
-        FreeList<Callback>::push(this, 0x1000);
-      } else {
-        enqueue();
-      }
+      std::move(onComplete)();
+      FreeList<Callback>::push(this, 0x1000);
     }
-  }
-
-  template<typename T = CpuThreadImpl>
-  void enqueue() {
-    ((T*)owner)->enqueueCallback(this);
   }
 };
 
@@ -129,7 +119,7 @@ struct CpuThreadImpl {
   std::vector<RemoteAddressAndKey> remoteCudaCommsDeviceDataSent =
       distributeAddressAndKeys(group->cudaCommsDeviceDataSent.cudaPointer, cudaCommsDeviceDataSentMr);
 
-  AllocatedBuffer sendStepValuesStorage = group->allocateHost(sizeof(uint32_t) * Group::dataChunks);
+  AllocatedBuffer sendStepValuesStorage = group->allocateHost(sizeof(uint32_t));
   MemoryRegistration* sendStepValuesStorageMr =
       regMr((uintptr_t)sendStepValuesStorage.cpuPointer, sendStepValuesStorage.bytes);
   uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.cpuPointer;
@@ -157,13 +147,6 @@ struct CpuThreadImpl {
       dev.cq = v->cq;
     }
     return devices;
-  }
-
-  void enqueueCallback(Callback* callback) {
-    CHECK(!dead);
-    std::lock_guard l(callbackMutex);
-    callbackQueue.push_back(callback);
-    callbackQueueSize += 1;
   }
 
   CallbackWrapper makeCallback(Function<void()> f) {
@@ -552,9 +535,7 @@ struct CpuThreadImpl {
 
     auto start = std::chrono::steady_clock::now();
 
-    for (size_t i = 0; i != Group::dataChunks; ++i) {
-      sendStepValues[i] = stepValue + i;
-    }
+    sendStepValues[0] = stepValue;
 
     CHECK(recvRanks.size() == sendRanks.size());
 
@@ -571,37 +552,30 @@ struct CpuThreadImpl {
       while (localProgress[i].stepValue < stepValue + index) {
         poll();
       }
-      size_t offset = 0;
-      size_t liveStepValues = 0;
-      size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
-      for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
-        size_t nbytes = std::min(params.bytes - offset, chunkSize);
+      size_t nbytes = params.bytes;
 
-        if (nbytes > 0) {
-          uintptr_t srcAddr = (uintptr_t)params.inputAddress + offset;
+      if (nbytes > 0) {
+        uintptr_t srcAddr = (uintptr_t)params.inputAddress;
 
-          liveSends += devices.size();
-          writeDataDistributed2(
-              i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank + offset,
-              localDyns[i].gatherKey, [this, &liveSends, i, chunkIndex](size_t di, bool ordered, bool done) {
-                if (done) {
-                  --liveSends;
-                }
-                if (ordered) {
-                  auto& dev = devices.at(di);
-                  writeData(
-                      dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                      (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                      remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-                }
-              });
-          offset += nbytes;
-        }
-        while (liveSends >= devices.size() * 2) {
-          poll();
-        }
+        liveSends += devices.size();
+        writeDataDistributed2(
+            i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank, localDyns[i].gatherKey,
+            [this, &liveSends, i](size_t di, bool ordered, bool done) {
+              if (done) {
+                --liveSends;
+              }
+              if (ordered) {
+                auto& dev = devices.at(di);
+                writeData(
+                    dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                    (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                    remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+              }
+            });
       }
-      CHECK(offset == params.bytes);
+      while (liveSends >= devices.size() * 2) {
+        poll();
+      }
     }
 
     while (true) {
@@ -664,9 +638,7 @@ struct CpuThreadImpl {
       ++n;
     }
 
-    for (size_t i = 0; i != Group::dataChunks; ++i) {
-      sendStepValues[i] = stepValue + i;
-    }
+    sendStepValues[0] = stepValue;
 
     n = 0;
     for (size_t i : recvRanks) {
@@ -703,35 +675,29 @@ struct CpuThreadImpl {
       while (localProgress[i].stepValue < stepValue + index) {
         poll();
       }
-      size_t offset = 0;
-      size_t liveStepValues = 0;
-      size_t chunkSize = std::max(params.bytes / Group::dataChunks, (size_t)(1024 * 1024));
-      for (size_t chunkIndex = 0; chunkIndex != Group::dataChunks; ++chunkIndex) {
-        size_t nbytes = std::min(params.bytes - offset, chunkSize);
+      size_t nbytes = params.bytes;
 
-        if (nbytes > 0) {
-          uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index + offset;
+      if (nbytes > 0) {
+        uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index;
 
-          liveSends += devices.size();
-          writeDataDistributed2(
-              i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch + offset,
-              localDyns[i].gatherKey, [this, &liveSends, i, chunkIndex](size_t di, bool ordered, bool done) {
-                if (done) {
-                  --liveSends;
-                }
-                if (ordered) {
-                  auto& dev = devices.at(di);
-                  writeData(
-                      dev, i, &sendStepValues[chunkIndex], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                      (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                      remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-                }
-              });
-          offset += nbytes;
-        }
-        while (liveSends >= devices.size() * 2) {
-          poll();
-        }
+        liveSends += devices.size();
+        writeDataDistributed2(
+            i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch, localDyns[i].gatherKey,
+            [this, &liveSends, i](size_t di, bool ordered, bool done) {
+              if (done) {
+                --liveSends;
+              }
+              if (ordered) {
+                auto& dev = devices.at(di);
+                writeData(
+                    dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
+                    (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+                    remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+              }
+            });
+      }
+      while (liveSends >= devices.size() * 2) {
+        poll();
       }
     }
 

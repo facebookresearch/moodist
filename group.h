@@ -104,8 +104,6 @@ struct Group {
     return (T*)((uintptr_t)peerSharedMem[peerIndex] + getSharedOffset(myVar));
   }
 
-  static constexpr size_t dataChunks = 1;
-
   Group(size_t rank, size_t size);
   ~Group();
 

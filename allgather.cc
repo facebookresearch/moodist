@@ -234,13 +234,11 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
         "$ptr", address, "$value", value);
   };
 
-  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
+  auto waitForRecv = [&](size_t i) {
     std::string s;
-    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
+    s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(
-          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
-          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
+      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
     }
     return s;
   };
@@ -280,7 +278,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
       if (isInGrid) {
         recvCopies += "if (threadIdx.x == 0) {\n";
       }
-      recvCopies += waitForRecv(pi.source, Group::dataChunks - 1);
+      recvCopies += waitForRecv(pi.source);
       prevRecvSource = pi.source;
       if (isInGrid) {
         recvCopies += "}\n";
@@ -295,22 +293,22 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
         __threadfence_system();
         if (threadIdx.x == 0) {
           if (atomicInc(&dataReadyCounter_$n, $gridSize - 1) == 0) {
-            *(volatile uint32_t*)$forwardPtr = stepValue + $c;
+            *(volatile uint32_t*)$forwardPtr = stepValue;
           }
-          while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+          while (*(volatile uint32_t*)$readyPtr < stepValue);
         }
         syncthreads();
       )",
-          "$n", i, "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
-          Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
+          "$n", i, "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source,
+          "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
     } else {
       recvCopies += replace(
           R"(
-        *(volatile uint32_t*)$forwardPtr = stepValue + $c;
-        while (*(volatile uint32_t*)$readyPtr < stepValue + $c);
+        *(volatile uint32_t*)$forwardPtr = stepValue;
+        while (*(volatile uint32_t*)$readyPtr < stepValue);
       )",
-          "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$c",
-          Group::dataChunks - 1, "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
+          "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$readyPtr",
+          cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
     }
 
     recvCopies += addCopy(
@@ -334,7 +332,7 @@ struct AllGatherParameters {
   uintptr_t peerOutputAddresses[8];
 };
 
-constexpr size_t copyQueueSize = 7;
+constexpr size_t copyQueueSize = 16;
 struct AllGatherCopyParameters {
   size_t bytes;
   const void* src[copyQueueSize];
@@ -484,43 +482,9 @@ extern "C" __global__ void allgather(AllGatherParameters params) {
     blockSize = 1;
   }
 
-  // if (rank == 0) {
-  //   fmt::printf("code\n----\n%s\n", source);
-  // }
-
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
-
-  // fn(cuAllgatherEntry, "allgather_entry");
-  // fn(cuAllgatherExit, "allgather_exit");
-
-  // for (size_t i : group->peerIndices) {
-  //   fn(cuAllgatherCopyDone[i], replace("allgather_copy_done_$i", "$i", i));
-  // }
-  // fn(cuAllgatherCopyAllDone, "allgather_copy_all_done");
-
-  // cuAllgatherWaitForProxy.resize(proxyDestinationInfo.size());
-  // for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-  //   cuAllgatherWaitForProxy[i].resize(Group::dataChunks);
-  //   for (size_t c = 0; c != Group::dataChunks; ++c) {
-  //     fn(cuAllgatherWaitForProxy[i][c], replace("allgather_wait_for_proxy_$i_$c", "$i", i, "$c", c));
-  //   }
-  // }
-
-  // cuAllgatherWaitForRecvForward.resize(proxyDestinationInfo.size());
-  // cuAllgatherWaitForReady.resize(proxyDestinationInfo.size());
-  // for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
-  //   cuAllgatherWaitForRecvForward[i].resize(Group::dataChunks);
-  //   cuAllgatherWaitForReady[i].resize(Group::dataChunks);
-  //   size_t recvSource = proxyInfo[i].source;
-  //   for (size_t c = 0; c != Group::dataChunks; ++c) {
-  //     fn(cuAllgatherWaitForRecvForward[i][c],
-  //        replace("allgather_wait_for_recv_forward_$source_$c_$i", "$i", i, "$c", c, "$source", proxyInfo[i].source));
-  //     fn(cuAllgatherWaitForReady[i][c],
-  //        replace("allgather_wait_for_ready_$i_$c", "$i", proxyDestinationInfo[i].source, "$c", c));
-  //   }
-  // }
 
   fn(cuAllGatherLocal, "allgather_local");
   fn(cuAllGather, "allgather");

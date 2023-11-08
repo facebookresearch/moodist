@@ -41,13 +41,6 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
   const auto& cpuOutBuffer = group->cpuOutBuffer;
   const auto& peerIndices = group->peerIndices;
 
-  const auto& cudaStepValue = group->cudaStepValue;
-  const auto& peerCudaStepValue = group->peerCudaStepValue;
-  const auto& cudaCopyDone = group->cudaCopyDone;
-  const auto& peerCudaCopyDone = group->peerCudaCopyDone;
-  const auto& cudaProxyReady = group->cudaProxyReady;
-  const auto& peerCudaProxyReady = group->peerCudaProxyReady;
-
   auto waitFor32 = [&](uintptr_t address, std::string value) {
     return replace(
         R"(while (*(volatile uint32_t*)$ptr < $value);
@@ -55,13 +48,11 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
         "$ptr", address, "$value", value);
   };
 
-  auto waitForRecv = [&](size_t i, size_t chunkIndex) {
+  auto waitForRecv = [&](size_t i) {
     std::string s;
-    s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
+    s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(
-          group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di),
-          replace("stepValue + $chunkIndex", "$chunkIndex", chunkIndex));
+      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
     }
     return s;
   };
@@ -192,7 +183,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
         $code
       }
     )",
-        "$code", waitForRecv(recvRanks.at(n), Group::dataChunks - 1), "$n", n);
+        "$code", waitForRecv(recvRanks.at(n)), "$n", n);
   }
 
   std::string source = replace(
@@ -223,10 +214,6 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
     }
   }
 }
-
-// __global__ void reduce_scatter_send_ready(uint32_t value) {
-//   $cpuIn[1] = value;
-// }
 
 $globaldefs
 
@@ -304,21 +291,6 @@ extern "C" __global__ void $launchBounds reduce_scatter(ReduceScatterParameters 
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
-
-  // fn(cuLocalReduceScatterEntry, "local_reduce_scatter_entry");
-  // fn(cuLocalReduceScatterExit, "local_reduce_scatter_exit");
-  // fn(cuReduceScatterEntry, "reduce_scatter_entry");
-  // fn(cuReduceScatterExit, "reduce_scatter_exit");
-
-  // cuSendReady.resize(sendRanks.size());
-  // for (size_t n = 0; n != sendRanks.size(); ++n) {
-  //   fn(cuSendReady[n], replace("reduce_scatter_send_ready_$n", "$n", n));
-  // }
-  // cuWaitForRecv.resize(recvRanks.size());
-  // for (size_t n = 0; n != recvRanks.size(); ++n) {
-  //   size_t i = recvRanks[n];
-  //   fn(cuWaitForRecv[n], replace("reduce_scatter_wait_for_recv_$i_$n", "$i", i, "$n", n));
-  // }
 
   fn(cuReduceScatterLocal, "reduce_scatter_local");
   fn(cuReduceScatter, "reduce_scatter");

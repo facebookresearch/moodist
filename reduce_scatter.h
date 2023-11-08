@@ -25,19 +25,8 @@ struct ReduceScatter : CollectiveBase {
   std::vector<size_t> sendRanks;
   std::vector<size_t> recvRanks;
 
-  CUfunction cuReduceScatterEntry = nullptr;
-  CUfunction cuReduceScatterExit = nullptr;
-  CUfunction cuLocalReduceScatterEntry = nullptr;
-  CUfunction cuLocalReduceScatterExit = nullptr;
-
-  std::vector<CUfunction> cuSendReady;
-  std::vector<CUfunction> cuWaitForRecv;
-
   CUfunction cuReduceScatterLocal = nullptr;
   CUfunction cuReduceScatter = nullptr;
-
-  // std::vector<std::vector<CUfunction>> cuAllgatherWaitForRecv{};
-  // std::vector<std::vector<CUfunction>> cuAllgatherWaitForReady{};
 
   ReduceScatter(Group* group);
   ~ReduceScatter();
