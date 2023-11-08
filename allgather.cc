@@ -209,7 +209,7 @@ void AllGather::init() {
   log.verbose("%d: proxy copy order %s\n", rank, proxyCopyOrder);
 }
 
-std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGather::generate() {
+std::string AllGather::generate() {
 
   // allgatherBlocksize = group->ipcRanks.size() == group->size - 1 ? 256 : 64;
   // allgatherGridsize = group->ipcRanks.size() == group->size - 1 ? smCount / 4 : smCount / 4;
@@ -324,6 +324,7 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> AllGath
 namespace {
 
 struct AllGatherParameters {
+  uint32_t stepValue;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -377,28 +378,26 @@ __device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, c
 
   )";
 
-  if (true) {
-
-    source += replace(
-        R"zz(
+  source += replace(
+      R"zz(
 
 $globaldefs
 
 extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   grid_generic_entry_local(params);
 
   $localCopies
 
-  grid_generic_exit_local();
+  grid_generic_exit_local(stepValue);
 }
 
-extern "C" __global__ void allgather_exit() {
-  generic_exit();
+extern "C" __global__ void allgather_exit(uint32_t stepValue) {
+  generic_exit(stepValue);
 }
 
 extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   grid_generic_entry(params);
 
   $localCopies
@@ -417,80 +416,13 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   allgather_copy_flush(copies);
 
-  allgather_exit<<<1, 1>>>();
+  allgather_exit<<<1, 1>>>(stepValue);
 }
 
-    )zz",
-        "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs);
+  )zz",
+      "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs);
 
-    gridSizeLocal = group->kernels->gridSize;
-    blockSizeLocal = group->kernels->blockSize;
-    gridSize = group->kernels->gridSize;
-    blockSize = group->kernels->blockSize;
-  } else {
-
-    source = replace(
-        R"zz(
-
-extern "C" __global__ void allgather_local_exit() {
-  generic_exit_local();
-}
-
-extern "C" __global__ void allgather_exit() {
-  generic_exit();
-}
-
-extern "C" __global__ void allgather_local(AllGatherParameters params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
-  generic_entry_local(params);
-
-  AllGatherCopyParameters copies;
-  copies.bytes = params.bytes;
-  copies.n = 0;
-
-  $localCopies
-
-  allgather_copy_flush(copies);
-
-  allgather_local_exit<<<1, 1>>>();
-}
-
-extern "C" __global__ void allgather(AllGatherParameters params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
-  generic_entry(params);
-
-  AllGatherCopyParameters copies;
-  copies.bytes = params.bytes;
-  copies.n = 0;
-
-  $localCopies
-
-  $recvCopies
-
-  allgather_copy_flush(copies);
-
-  allgather_exit<<<1, 1>>>();
-}
-
-
-    )zz",
-        "$localCopies", localCopies, "$recvCopies", recvCopies);
-
-    gridSizeLocal = 1;
-    blockSizeLocal = 1;
-    gridSize = 1;
-    blockSize = 1;
-  }
-
-  std::vector<std::pair<CUfunction*, std::string>> functions;
-
-  auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
-
-  fn(cuAllGatherLocal, "allgather_local");
-  fn(cuAllGather, "allgather");
-  fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
-
-  return std::make_pair(source, functions);
+  return source;
 }
 
 } // namespace moodist

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "hash_map.h"
 
 namespace moodist {
 
@@ -31,6 +32,15 @@ struct AddressPair {
   size_t outputBytes;
 };
 
+struct StreamData {
+  std::unique_ptr<Kernels> kernels;
+  AllocatedBuffer sendBuffer;
+  AllocatedBuffer recvBuffer;
+  AllocatedBuffer alignedBuffer;
+  StreamData();
+  ~StreamData();
+};
+
 struct Group {
   size_t rank;
   size_t size;
@@ -40,10 +50,11 @@ struct Group {
   CUcontext cuContext = nullptr;
   CUdevice cuDevice;
 
+  HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
+
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
-  std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   std::unique_ptr<CpuThread> cpuThread;
@@ -72,10 +83,6 @@ struct Group {
   std::array<size_t, 8> peerMyRemoteIndex;
 
   std::vector<std::vector<size_t>> nodeRanks;
-
-  AllocatedBuffer sendBuffer;
-  AllocatedBuffer recvBuffer;
-  AllocatedBuffer alignedBuffer;
 
   int allocationNode = -1;
 
@@ -124,6 +131,15 @@ struct Group {
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);
+
+  void createStreamData(std::unique_ptr<StreamData>& ptr);
+  StreamData& getStreamData(CUstream stream) {
+    auto& ptr = streamData[stream];
+    if (!ptr) {
+      createStreamData(ptr);
+    }
+    return *ptr;
+  }
 };
 
 } // namespace moodist

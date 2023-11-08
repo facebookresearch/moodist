@@ -10,6 +10,7 @@
 namespace moodist {
 
 struct AllGatherParameters {
+  uint32_t stepValue;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -26,20 +27,10 @@ struct AllGather : CollectiveBase {
   std::vector<ProxyInfo> proxyInfo;
   std::vector<ProxyDestinationInfo> proxyDestinationInfo;
 
-  size_t blockSizeLocal = 0;
-  size_t gridSizeLocal = 0;
-  size_t blockSize = 0;
-  size_t gridSize = 0;
-
-  CUfunction cuAllGatherLocal = nullptr;
-  CUfunction cuAllGather = nullptr;
-
-  CUfunction cuAllGatherCopyKernel = nullptr;
-
   AllGather(Group* group);
   ~AllGather();
   void init();
-  std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> generate();
+  std::string generate();
 };
 
 } // namespace moodist

@@ -324,6 +324,7 @@ __device__ void reduce_$typename_$op_n$nsources(size_t size, $typename* destinat
 }
 
 void Kernels::compile() {
+  auto start = Clock::now();
   CUdevice& cuDevice = group->cuDevice;
   CUcontext& cuContext = group->cuContext;
 
@@ -377,8 +378,6 @@ typedef unsigned long uint64_t;
 typedef unsigned char uint8_t;
 
 namespace {
-
-__device__ uint32_t globalStepValue = 1;
 
 __device__ void syncthreads() {
   asm volatile ("barrier.sync 0;" :: );
@@ -464,22 +463,19 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
       R"(
 template<typename Params>
 __device__ void generic_entry_local(const Params& params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   $writes1
   __threadfence_system();
   $writes2
   $waits
 }
-__device__ void generic_exit_local() {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+__device__ void generic_exit_local(uint32_t stepValue) {
   $copyDoneAllCode
   $waitForCopyDones
-
-  globalStepValue += 4096;
 }
 template<typename Params>
 __device__ void generic_entry(const Params& params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   cpuIn[0] = stepValue;
   $writes1
@@ -487,8 +483,7 @@ __device__ void generic_entry(const Params& params) {
   $writes2
   $waits
 }
-__device__ void generic_exit() {
-  uint32_t stepValue = globalStepValue;
+__device__ void generic_exit(uint32_t stepValue) {
   $copyDoneAllCode
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
@@ -496,8 +491,6 @@ __device__ void generic_exit() {
   while (cpuOut[0] < stepValue);
   $waitForCopyDones
   $waitForRecvs
-
-  globalStepValue += 4096;
 }
 
 __device__ uint32_t entryCounter = 0;
@@ -506,7 +499,7 @@ __device__ uint32_t exitCounter = 0;
 template<typename Params>
 __device__ void grid_generic_entry_local(const Params& params) {
   if (threadIdx.x == 0) {
-    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    [[maybe_unused]] const uint32_t stepValue = params.stepValue;
     if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
       $writes1
       __threadfence_system();
@@ -516,21 +509,18 @@ __device__ void grid_generic_entry_local(const Params& params) {
   }
   syncthreads();
 }
-__device__ void grid_generic_exit_local() {
+__device__ void grid_generic_exit_local(uint32_t stepValue) {
   __threadfence_system();
   syncthreads();
   if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
-    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
     $copyDoneAllCode
     $waitForCopyDones
-
-    globalStepValue += 4096;
   }
 }
 template<typename Params>
 __device__ void grid_generic_entry(const Params& params) {
   if (threadIdx.x == 0) {
-    [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+    [[maybe_unused]] const uint32_t stepValue = params.stepValue;
     volatile uint32_t* __restrict__ cpuIn = $cpuIn;
     if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
       cpuIn[0] = stepValue;
@@ -542,11 +532,10 @@ __device__ void grid_generic_entry(const Params& params) {
   }
   syncthreads();
 }
-__device__ void grid_generic_exit() {
+__device__ void grid_generic_exit(uint32_t stepValue) {
   __threadfence_system();
   syncthreads();
   if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
-    uint32_t stepValue = globalStepValue;
     $copyDoneAllCode
     volatile uint32_t* __restrict__ cpuIn = $cpuIn;
     volatile uint32_t* __restrict__ cpuOut = $cpuOut;
@@ -554,8 +543,6 @@ __device__ void grid_generic_exit() {
     while (cpuOut[0] < stepValue);
     $waitForCopyDones
     $waitForRecvs
-
-    globalStepValue += 4096;
   }
 }
 
@@ -566,13 +553,15 @@ __device__ void grid_generic_exit() {
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
-  auto add = [&](auto&& v) {
-    source += v.first;
-    functions.insert(functions.end(), v.second.begin(), v.second.end());
-  };
+  source += group->allGather->generate();
+  source += group->reduceScatter->generate();
 
-  add(group->allGather->generate());
-  add(group->reduceScatter->generate());
+  fn(cuAllGatherLocal, "allgather_local");
+  fn(cuAllGather, "allgather");
+  fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
+
+  fn(cuReduceScatterLocal, "reduce_scatter_local");
+  fn(cuReduceScatter, "reduce_scatter");
 
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);
@@ -785,6 +774,8 @@ __device__ void grid_generic_exit() {
   }
 
   CHECK_CU(cuLinkDestroy(linkState));
+
+  log.info("compile took %gs", seconds(Clock::now() - start));
 }
 
 } // namespace moodist

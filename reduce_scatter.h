@@ -10,6 +10,7 @@
 namespace moodist {
 
 struct ReduceScatterParameters {
+  uint32_t stepValue;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -25,13 +26,10 @@ struct ReduceScatter : CollectiveBase {
   std::vector<size_t> sendRanks;
   std::vector<size_t> recvRanks;
 
-  CUfunction cuReduceScatterLocal = nullptr;
-  CUfunction cuReduceScatter = nullptr;
-
   ReduceScatter(Group* group);
   ~ReduceScatter();
   void init();
-  std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> generate();
+  std::string generate();
 };
 
 } // namespace moodist

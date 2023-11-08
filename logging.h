@@ -42,9 +42,9 @@ void logat(LogLevel level, const char* fmt, Args&&... args) {
   std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", tm);
   auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
   if (!s.empty() && s.back() == '\n') {
-    fmt::fprintf(ftarget, "%s: %s", buf, s);
+    fmt::fprintf(ftarget, "%s moodist: %s", buf, s);
   } else {
-    fmt::fprintf(ftarget, "%s: %s\n", buf, s);
+    fmt::fprintf(ftarget, "%s moodist: %s\n", buf, s);
   }
   fflush(ftarget);
 }

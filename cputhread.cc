@@ -608,11 +608,11 @@ struct CpuThreadImpl {
     auto& sendRanks = reduceScatter.sendRanks;
     auto& recvRanks = reduceScatter.recvRanks;
 
-    uintptr_t recvAddress = group->recvBuffer.cudaPointer;
-    CHECK(group->recvBuffer.bytes >= params.pitch * recvRanks.size());
+    uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
+    CHECK(params.sd->recvBuffer.bytes >= params.pitch * recvRanks.size());
 
-    uintptr_t sendAddress = group->sendBuffer.cudaPointer;
-    CHECK(group->sendBuffer.bytes >= params.pitch * sendRanks.size());
+    uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
+    CHECK(params.sd->sendBuffer.bytes >= params.pitch * sendRanks.size());
 
     auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
     auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());

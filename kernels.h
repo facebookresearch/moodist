@@ -23,15 +23,17 @@ struct Kernels : CollectiveBase {
   size_t gridSize;
   size_t blockSize;
 
-  std::string emitCopy(
-      std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
-      size_t blockSize, std::string threadIndex, std::string blockIndex);
+  CUfunction cuAllGatherLocal = nullptr;
+  CUfunction cuAllGather = nullptr;
+  CUfunction cuAllGatherCopyKernel = nullptr;
+
+  CUfunction cuReduceScatterLocal = nullptr;
+  CUfunction cuReduceScatter = nullptr;
+
   std::string emitCopySeq(
       std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
       size_t blockSize, std::string threadIndex, std::string blockIndex);
 
-  std::string emitReduceFunction(
-      std::string type, size_t typesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize);
   std::string emitReduceFunctionSeq(
       std::string type, size_t typesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize);
 };

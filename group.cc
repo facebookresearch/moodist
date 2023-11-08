@@ -61,7 +61,6 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
   cpuThread = std::make_unique<CpuThread>(this);
-  kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
@@ -720,6 +719,14 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   r.cudaPointer = ptr;
   log.verbose("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
+}
+
+StreamData::StreamData() = default;
+StreamData::~StreamData() = default;
+
+void Group::createStreamData(std::unique_ptr<StreamData>& ptr) {
+  ptr = std::make_unique<StreamData>();
+  ptr->kernels = std::make_unique<Kernels>(this);
 }
 
 } // namespace moodist

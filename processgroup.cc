@@ -319,6 +319,10 @@ struct ProcessGroupImpl {
     CHECK(inputAddress % 16 == 0);
     CHECK(outputAddress % 16 == 0);
 
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
+
+    StreamData& sd = group->getStreamData(stream);
+
     auto allocbuffer = [&](auto& buffer, size_t size) {
       if (buffer.bytes < size) {
         CHECK_CU(cuCtxSynchronize());
@@ -329,12 +333,10 @@ struct ProcessGroupImpl {
 
     if (bytes % 16 != 0) {
       pitch = (bytes + 127u) / 128u * 128u;
-      allocbuffer(group->alignedBuffer, pitch * size);
-      outputAddress = group->alignedBuffer.cudaPointer;
+      allocbuffer(sd.alignedBuffer, pitch * size);
+      outputAddress = sd.alignedBuffer.cudaPointer;
       outputBytes = pitch * size;
     }
-
-    CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
 
@@ -362,8 +364,8 @@ struct ProcessGroupImpl {
 
     AllGather& allGather = *group->allGather;
 
-    if (!group->kernels->cuModule) {
-      group->kernels->compile();
+    if (!sd.kernels->cuModule) {
+      sd.kernels->compile();
     }
 
     bool isLocalOnly = allGather.recvRanks.empty();
@@ -382,6 +384,7 @@ struct ProcessGroupImpl {
     trace("launch");
 
     AllGatherParameters parameters;
+    parameters.stepValue = stepValue;
     parameters.bytes = pitch;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
@@ -391,19 +394,20 @@ struct ProcessGroupImpl {
 
     std::array<void*, 1> params = {&parameters};
 
+    size_t gridSize = sd.kernels->gridSize;
+    size_t blockSize = sd.kernels->blockSize;
+
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          allGather.cuAllGatherLocal, allGather.gridSizeLocal, 1, 1, allGather.blockSizeLocal, 1, 1, 0, stream,
-          params.data(), nullptr));
+          sd.kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else {
-      CHECK_CU(cuLaunchKernel(
-          allGather.cuAllGather, allGather.gridSize, 1, 1, allGather.blockSize, 1, 1, 0, stream, params.data(),
-          nullptr));
+      CHECK_CU(
+          cuLaunchKernel(sd.kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     if (outputAddress != (uintptr_t)output.data_ptr()) {
       CUDA_MEMCPY2D copyArgs = {0};
-      copyArgs.srcDevice = group->alignedBuffer.cudaPointer;
+      copyArgs.srcDevice = sd.alignedBuffer.cudaPointer;
       copyArgs.srcPitch = pitch;
       copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
       copyArgs.dstDevice = (uintptr_t)output.data_ptr();
@@ -454,6 +458,10 @@ struct ProcessGroupImpl {
     CHECK(inputAddress % 16 == 0);
     CHECK(outputAddress % 16 == 0);
 
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
+
+    StreamData& sd = group->getStreamData(stream);
+
     auto allocbuffer = [&](auto& buffer, size_t size) {
       if (buffer.bytes < size) {
         CHECK_CU(cuCtxSynchronize());
@@ -462,21 +470,19 @@ struct ProcessGroupImpl {
       }
     };
 
-    CUstream stream = c10::cuda::getCurrentCUDAStream();
-
     if (bytes % 16 != 0) {
       pitch = (bytes + 127u) / 128u * 128u;
-      allocbuffer(group->alignedBuffer, pitch * size);
+      allocbuffer(sd.alignedBuffer, pitch * size);
       CUDA_MEMCPY2D copyArgs = {0};
       copyArgs.srcDevice = inputAddress;
       copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-      copyArgs.dstDevice = group->alignedBuffer.cudaPointer;
+      copyArgs.dstDevice = sd.alignedBuffer.cudaPointer;
       copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
       copyArgs.dstPitch = pitch;
       copyArgs.WidthInBytes = bytes;
       copyArgs.Height = size;
       CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-      inputAddress = group->alignedBuffer.cudaPointer;
+      inputAddress = sd.alignedBuffer.cudaPointer;
       inputBytes = pitch * size;
     }
 
@@ -509,11 +515,11 @@ struct ProcessGroupImpl {
     auto& sendRanks = reduceScatter.sendRanks;
     auto& recvRanks = reduceScatter.recvRanks;
 
-    allocbuffer(group->sendBuffer, pitch * sendRanks.size());
-    allocbuffer(group->recvBuffer, pitch * recvRanks.size());
+    allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
+    allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
 
-    if (!group->kernels->cuModule) {
-      group->kernels->compile();
+    if (!sd.kernels->cuModule) {
+      sd.kernels->compile();
     }
 
     bool isLocalOnly = reduceScatter.recvRanks.empty();
@@ -526,19 +532,21 @@ struct ProcessGroupImpl {
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
+      e->sd = &sd;
       group->cpuThread->enqueue(e);
     }
 
     trace("launch");
 
-    uintptr_t sendAddress = group->sendBuffer.cudaPointer;
-    uintptr_t recvAddress = group->recvBuffer.cudaPointer;
+    uintptr_t sendAddress = sd.sendBuffer.cudaPointer;
+    uintptr_t recvAddress = sd.recvBuffer.cudaPointer;
     if (!isLocalOnly) {
       CHECK(sendAddress != 0);
       CHECK(recvAddress != 0);
     }
 
     ReduceScatterParameters parameters;
+    parameters.stepValue = stepValue;
     parameters.bytes = bytes;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
@@ -550,24 +558,21 @@ struct ProcessGroupImpl {
 
     std::array<void*, 1> params = {&parameters};
 
-    size_t gridSize = group->kernels->gridSize;
-    size_t blockSize = group->kernels->blockSize;
+    size_t gridSize = sd.kernels->gridSize;
+    size_t blockSize = sd.kernels->blockSize;
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          reduceScatter.cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          sd.kernels->cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else {
       CHECK_CU(cuLaunchKernel(
-          reduceScatter.cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          sd.kernels->cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     trace("post");
   }
 
-  void reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp reduceOp) {
-    
-  }
-
+  void reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp reduceOp) {}
 };
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {

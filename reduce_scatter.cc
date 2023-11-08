@@ -30,7 +30,7 @@ void ReduceScatter::init() {
   }
 }
 
-std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceScatter::generate() {
+std::string ReduceScatter::generate() {
 
   // allgatherBlocksize = group->ipcRanks.size() == group->size - 1 ? 256 : 64;
   // allgatherGridsize = group->ipcRanks.size() == group->size - 1 ? smCount / 4 : smCount / 4;
@@ -164,27 +164,15 @@ std::pair<std::string, std::vector<std::pair<CUfunction*, std::string>>> ReduceS
     for (size_t i : recvRanks) {
       reduceCode += replace(
           R"(
-        reduce_scatter_wait_for_recv_$n<<<1, 1>>>();
+        $code
         )",
-          "$n", n);
+          "$code", waitForRecv(recvRanks.at(n)));
       reduceAdd("(T*)params.outputAddress", replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", n));
 
       ++n;
     }
   }
   reduceFlush();
-
-  std::string waitFunctions;
-  for (size_t n = 0; n != recvRanks.size(); ++n) {
-    waitFunctions += replace(
-        R"(
-      __global__ void reduce_scatter_wait_for_recv_$n() {
-        uint32_t stepValue = globalStepValue;
-        $code
-      }
-    )",
-        "$code", waitForRecv(recvRanks.at(n)), "$n", n);
-  }
 
   std::string source = replace(
       R"zz(
@@ -217,8 +205,6 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
 
 $globaldefs
 
-$waitFunctions
-
 template<typename T>
 __device__ void reduce_flush(ReduceParameters& params) {
   if (params.n) {
@@ -242,6 +228,7 @@ __device__ void reduce_add(ReduceParameters& params, void* dst, const void* src1
 }
 
 struct ReduceScatterParameters {
+  uint32_t stepValue;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -253,7 +240,7 @@ struct ReduceScatterParameters {
 };
 
 __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
-  [[maybe_unused]] const uint32_t stepValue = globalStepValue;
+  [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   ReduceParameters reduces;
   reduces.bytes = params.bytes;
   reduces.n = 0;
@@ -271,31 +258,24 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
 extern "C" __global__ void $launchBounds reduce_scatter_local(ReduceScatterParameters params) {
   grid_generic_entry_local(params);
   reduce_scatter_impl(params);
-  grid_generic_exit_local();
+  grid_generic_exit_local(params.stepValue);
 }
 
-extern "C" __global__ void reduce_scatter_exit() {
-  generic_exit();
+extern "C" __global__ void reduce_scatter_exit(uint32_t stepValue) {
+  generic_exit(stepValue);
 }
 
 extern "C" __global__ void $launchBounds reduce_scatter(ReduceScatterParameters params) {
   grid_generic_entry(params);
   if (reduce_scatter_impl(params)) {
-    reduce_scatter_exit<<<1, 1>>>();
+    reduce_scatter_exit<<<1, 1>>>(params.stepValue);
   }
 }
 
   )zz",
-      "$reduceCode", reduceCode, "$waitFunctions", waitFunctions, "$globaldefs", globaldefs);
+      "$reduceCode", reduceCode, "$globaldefs", globaldefs);
 
-  std::vector<std::pair<CUfunction*, std::string>> functions;
-
-  auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
-
-  fn(cuReduceScatterLocal, "reduce_scatter_local");
-  fn(cuReduceScatter, "reduce_scatter");
-
-  return std::make_pair(source, functions);
+  return source;
 }
 
 } // namespace moodist

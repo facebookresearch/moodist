@@ -325,6 +325,31 @@ def f(n):
                 torch.cuda.synchronize()
         elif 1 == 1:
             loopcount = 1000
+            events1 = []
+            events2 = []
+            stream1 = torch.cuda.Stream()
+            stream2 = torch.cuda.Stream()
+            tmp2 = tmp.clone()
+            result02 = result0.clone()
+            for i in range(10 + loopcount):
+                if i == 10:
+                    start = time.time()
+                with torch.cuda.stream(stream1):
+                    if len(events1) >= 2:
+                        events1.pop(0).synchronize()
+                    dist.all_gather_into_tensor(result0, tmp)
+                    e = torch.cuda.Event()
+                    e.record()
+                    events1.append(e)
+                with torch.cuda.stream(stream2):
+                    if len(events2) >= 2:
+                        events2.pop(0).synchronize()
+                    dist.all_gather_into_tensor(result02, tmp2)
+                    e = torch.cuda.Event()
+                    e.record()
+                    events2.append(e)
+        elif 1 == 1:
+            loopcount = 1000
             events = []
             for i in range(loopcount):
                 if len(events) >= 2:
@@ -400,10 +425,10 @@ def f(n):
         #     # #print("rank %d result %d: %s" % (rank, _, s))
         #     # print("rank %d result %d: %s (should be %f)" % (rank, _, s, data.sum()))
 
-        print("rank %d all done!" % rank)
-        dist.barrier()
         torch.cuda.synchronize()
         t = time.time() - start
+        print("rank %d all done!" % rank)
+        dist.barrier()
         if rank == 0:
             print(
                 "time: %g, %g/s  %gG/s"
