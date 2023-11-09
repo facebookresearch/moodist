@@ -17,10 +17,9 @@ constexpr uint8_t taskReduceScatter = 3;
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
-
   uint8_t task;
-
   uint32_t stepValue;
+  StreamData* sd = nullptr;
 };
 
 struct QueueEntryBarrier : QueueEntry {
@@ -39,7 +38,6 @@ struct QueueEntryReduceScatter : QueueEntry {
   uintptr_t outputAddress = 0;
   size_t bytes = 0;
   size_t pitch = 0;
-  StreamData* sd = nullptr;
 };
 
 template<typename T>

@@ -5,6 +5,7 @@
 #include "common.h"
 #include "freelist.h"
 #include "ib_common.h"
+#include "intrusive_list.h"
 #include "ipc_mapper.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
@@ -16,6 +17,7 @@
 #include <memory>
 #include <numa.h>
 #include <random>
+#include <type_traits>
 #include <utility>
 
 namespace moodist {
@@ -48,7 +50,7 @@ struct Callback {
   size_t refcount = 0;
   Callback* next = nullptr;
 
-  void decref(CpuThreadImpl* currentThread) {
+  void decref() {
     CHECK(refcount >= 1);
     if (--refcount == 0) {
       std::move(onComplete)();
@@ -68,10 +70,52 @@ struct CallbackWrapper {
     ++callback->refcount;
   }
   ~CallbackWrapper() {
-    callback->decref(nullptr);
+    callback->decref();
   }
   operator Callback*() {
     return callback;
+  }
+};
+
+template<typename T, size_t poolSize = 0x1000>
+struct PoolAllocatorReused {
+  std::deque<std::vector<std::aligned_storage_t<sizeof(T), alignof(T)>>> all;
+  size_t i0 = 0;
+  size_t i1 = 0;
+  PoolAllocatorReused() {
+    all.emplace_back();
+    all.back().resize(poolSize);
+  }
+  ~PoolAllocatorReused() {
+    reset();
+  }
+  template<typename... Args>
+  T* allocate(Args&&... args) {
+    CHECK(i0 < all.size());
+    CHECK(i1 < poolSize);
+    T* r = (T*)&all[i0][i1];
+    ++i1;
+    if (i1 == poolSize) {
+      i1 = 0;
+      ++i0;
+      if (i0 == all.size()) {
+        all.emplace_back();
+        all.back().resize(poolSize);
+      }
+    }
+    return new (r) T(std::forward<Args>(args)...);
+  }
+  void reset() {
+    for (size_t i = 0; i != i0; ++i) {
+      for (auto& v : all[i]) {
+        ((T*)&v)->~T();
+      }
+    }
+    for (size_t i = 0; i != i1; ++i) {
+      ((T*)&all[i0][i])->~T();
+    }
+    i0 = 0;
+    i1 = 0;
   }
 };
 
@@ -119,23 +163,19 @@ struct CpuThreadImpl {
   std::vector<RemoteAddressAndKey> remoteCudaCommsDeviceDataSent =
       distributeAddressAndKeys(group->cudaCommsDeviceDataSent.cudaPointer, cudaCommsDeviceDataSentMr);
 
-  AllocatedBuffer sendStepValuesStorage = group->allocateHost(sizeof(uint32_t));
+  AllocatedArray sendStepValuesStorage = group->allocateHostArray(sizeof(uint32_t), Group::maxConcurrency);
   MemoryRegistration* sendStepValuesStorageMr =
-      regMr((uintptr_t)sendStepValuesStorage.cpuPointer, sendStepValuesStorage.bytes);
-  uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.cpuPointer;
+      regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
+  uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
 
   volatile uint32_t* const cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
   volatile uint32_t* const cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
 
-  AllocatedBuffer outDynsBuffer = group->allocateHost(sizeof(DynamicAddresses) * size);
+  AllocatedArray outDynsBuffer = group->allocateHostArray(sizeof(DynamicAddresses) * size);
   DynamicAddresses* outDyns = (DynamicAddresses*)outDynsBuffer.cpuPointer;
   MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.cpuPointer, outDynsBuffer.bytes);
 
   std::vector<uint32_t> dynReady;
-
-  SpinMutex callbackMutex;
-  std::atomic_size_t callbackQueueSize = 0;
-  Vector<Callback*> callbackQueue;
 
   std::vector<Device> initDevices() {
     std::vector<Device> devices;
@@ -160,9 +200,6 @@ struct CpuThreadImpl {
   }
 
   void poll() {
-    if (cpuThread->terminate.load(std::memory_order_relaxed)) {
-      throw QuitCpuThread();
-    }
     for (auto& dev : devices) {
       ibv_wc wcs[4];
       int n = ibv_poll_cq(dev.cq, 4, wcs);
@@ -175,18 +212,10 @@ struct CpuThreadImpl {
           --dev.currentCqEntries;
           if (wc.wr_id) {
             Callback* callback = (Callback*)(void*)wc.wr_id;
-            callback->decref(this);
+            callback->decref();
           }
         }
       }
-    }
-    if (callbackQueueSize.load(std::memory_order_relaxed)) {
-      std::lock_guard l(callbackMutex);
-      for (Callback* cb : callbackQueue) {
-        cb->onComplete();
-      }
-      callbackQueueSize -= callbackQueue.size();
-      callbackQueue.clear();
     }
   }
 
@@ -465,26 +494,226 @@ struct CpuThreadImpl {
     }
   }
 
-  void barrier(QueueEntryBarrier& params) {
-    uint32_t stepValue = params.stepValue;
+  struct WorkBase {
+    IntrusiveListLink<WorkBase> link;
+  };
+  struct Work : WorkBase {
+    CpuThreadImpl& self;
+    void* state = nullptr;
+    bool done = false;
+    void (Work::*stepPtr)();
 
-    for (size_t i = 0; i != size; ++i) {
-      if (i == rank) {
-        continue;
-      }
-      writeCpuStep((rank + i) % devices.size(), i, stepValue);
-    }
-    for (size_t i = 0; i != size; ++i) {
-      if (i == rank) {
-        continue;
-      }
-      while (localProgress[i].cpuStepValue < stepValue) {
-        poll();
-      }
-    }
-    params.cpuDone->store(1);
-    futexWakeAll(params.cpuDone);
+    Work(CpuThreadImpl& self) : self(self) {}
+  };
+
+#define CAT2(a, b) a##b
+#define CAT(a, b) CAT2(a, b)
+#define ENTER                                                                                                          \
+  {                                                                                                                    \
+    if (this->state) {                                                                                                 \
+      goto* this->state;                                                                                               \
+    }                                                                                                                  \
   }
+#define YIELD                                                                                                          \
+  {                                                                                                                    \
+    this->state = &&CAT(s, __LINE__);                                                                                  \
+    return;                                                                                                            \
+    CAT(s, __LINE__) :;                                                                                                \
+  }
+#define DONE                                                                                                           \
+  {                                                                                                                    \
+    this->done = true;                                                                                                 \
+    return;                                                                                                            \
+  }
+
+  struct WorkBarrier : Work {
+    QueueEntryBarrier& params;
+    size_t i;
+
+    WorkBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self), params(params) {}
+
+    void step() {
+      const uint32_t stepValue = params.stepValue;
+      const size_t size = self.size;
+      const size_t rank = self.rank;
+      ENTER
+      for (size_t i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        self.writeCpuStep((rank + i) % self.devices.size(), i, stepValue);
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        while (self.localProgress[i].cpuStepValue < stepValue) {
+          YIELD
+        }
+      }
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+      self.cpuThread->freelistBarrier.push(&params);
+      IntrusiveList<WorkBase, &WorkBase::link>::erase(*this);
+      self.allocatorBarrier.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkAllGather : Work {
+    QueueEntryAllGather& params;
+    size_t i;
+    MemoryRegistration* inputMr;
+    size_t liveSends;
+    size_t index;
+
+    WorkAllGather(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self), params(params) {}
+
+    void step() {
+      const uint32_t stepValue = params.stepValue;
+      const size_t size = self.size;
+      const size_t rank = self.rank;
+
+      AllGather& allGather = *self.group->allGather;
+
+      auto& sendRanks = allGather.sendRanks;
+      auto& recvRanks = allGather.recvRanks;
+
+      ENTER
+
+      inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+
+      // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+      // Thus, we register each ranks output address independently, so they get different MRs.
+      for (size_t i : recvRanks) {
+        auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+        self.outDyns[i].gatherAddress = params.outputAddress;
+        for (size_t di = 0; di != self.devices.size(); ++di) {
+          self.outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+        }
+      }
+
+      // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+      // until kernel entry, such that we don't receive data until we're ready.
+      self.dynReady.resize(recvRanks.size());
+      {
+        size_t n = 0;
+        for (size_t i : recvRanks) {
+          size_t di = (rank + n) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeData(
+              dev, i, &self.outDyns[i], self.outDynsMr->mrs[di]->lkey,
+              (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * rank), self.remoteComms[i].keys[di],
+              sizeof(DynamicAddresses),
+              self.makeCallback([&, i, di, stepValue, n]() { self.dynReady[n] = stepValue; }));
+          ++n;
+        }
+      }
+
+      // wait for kernel
+      while (self.cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      for (i = 0; i != recvRanks.size(); ++i) {
+        while (self.dynReady[i] < stepValue) {
+          YIELD
+        }
+      }
+
+      self.sendStepValues[0] = stepValue;
+
+      CHECK(recvRanks.size() == sendRanks.size());
+
+      liveSends = 0;
+      for (index = 0; index != sendRanks.size(); ++index) {
+        if (true) {
+          size_t i = recvRanks[index];
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeStep(di, i, stepValue + index);
+        }
+        i = sendRanks[index];
+        // wait for dyns
+        while (self.localProgress[i].stepValue < stepValue + index) {
+          YIELD
+        }
+
+        if (params.bytes > 0) {
+          uintptr_t srcAddr = (uintptr_t)params.inputAddress;
+
+          liveSends += self.devices.size();
+          self.writeDataDistributed2(
+              i, srcAddr, params.bytes, inputMr, self.localDyns[i].gatherAddress + params.pitch * rank,
+              self.localDyns[i].gatherKey, [this, i = this->i](size_t di, bool ordered, bool done) {
+                if (done) {
+                  --liveSends;
+                }
+                if (ordered) {
+                  auto& dev = self.devices.at(di);
+                  self.writeData(
+                      dev, i, &self.sendStepValues[0], self.sendStepValuesStorageMr->mrs.at(di)->lkey,
+                      (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (self.rank * 32 + di)),
+                      self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                }
+              });
+        }
+        while (liveSends >= self.devices.size() * 2) {
+          YIELD
+        }
+      }
+
+      while (true) {
+        {
+          bool stop = true;
+          for (auto& dev : self.devices) {
+            if (dev.currentCqEntries) {
+              stop = false;
+              break;
+            }
+          }
+          if (stop) {
+            break;
+          }
+        }
+        YIELD
+      }
+      for (auto& dev : self.devices) {
+        CHECK(dev.currentCqEntries == 0);
+      }
+
+      self.cpuOut[0] = stepValue;
+      while (self.cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      self.cpuThread->freelistAllGather.push(&params);
+      IntrusiveList<WorkBase, &WorkBase::link>::erase(*this);
+      self.allocatorAllGather.deallocate(this);
+      DONE
+    }
+  };
+
+  // void barrier(QueueEntryBarrier& params) {
+  //   uint32_t stepValue = params.stepValue;
+
+  //   for (size_t i = 0; i != size; ++i) {
+  //     if (i == rank) {
+  //       continue;
+  //     }
+  //     writeCpuStep((rank + i) % devices.size(), i, stepValue);
+  //   }
+  //   for (size_t i = 0; i != size; ++i) {
+  //     if (i == rank) {
+  //       continue;
+  //     }
+  //     while (localProgress[i].cpuStepValue < stepValue) {
+  //       poll();
+  //     }
+  //   }
+  //   params.cpuDone->store(1);
+  //   futexWakeAll(params.cpuDone);
+  // }
 
   void all_gather(QueueEntryAllGather& params) {
     uint32_t stepValue = params.stepValue;
@@ -723,6 +952,28 @@ struct CpuThreadImpl {
     }
   }
 
+  template<typename T>
+  struct WorkAllocator {
+    PoolAllocatorReused<T> allocator;
+    IntrusiveList<WorkBase, &WorkBase::link> free;
+    template<typename... Args>
+    T* allocate(Args&&... args) {
+      if (!free.empty()) {
+        T* r = (T*)&free.front();
+        free.pop_front();
+        r->~T();
+        new (r) T(std::forward<Args>(args)...);
+        return r;
+      }
+      return allocator.allocate(std::forward<Args>(args)...);
+    }
+    void deallocate(T* ptr) {
+      free.push_front(*ptr);
+    }
+  };
+  WorkAllocator<WorkBarrier> allocatorBarrier;
+  WorkAllocator<WorkAllGather> allocatorAllGather;
+
   void entry() {
     try {
 
@@ -730,47 +981,126 @@ struct CpuThreadImpl {
 
       cpuThread->ready = true;
 
-      while (true) {
+      std::vector<IntrusiveList<WorkBase, &WorkBase::link>> works;
 
-        while (cpuThread->queueSize == 0) {
-          poll();
-          int sum = 0;
-          for (auto& dev : devices) {
-            sum += dev.currentCqEntries;
+      auto enqueue = [&](auto& allocator, auto& params) {
+        auto* work = allocator.allocate(*this, params);
+        work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
+        if (params.sd->cpuThreadIndex == -1) {
+          log.info("new work index %d\n", works.size());
+          params.sd->cpuThreadIndex = works.size();
+          works.emplace_back();
+        }
+        works[params.sd->cpuThreadIndex].push_back(*work);
+      };
+
+      while (!cpuThread->terminate.load(std::memory_order_relaxed)) {
+        if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
+          bool allEmpty = true;
+          for (auto& list : works) {
+            if (!list.empty()) {
+              allEmpty = false;
+              break;
+            }
           }
-          if (sum == 0) {
-            futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+          if (allEmpty) {
+            int sum = 0;
+            for (auto& dev : devices) {
+              sum += dev.currentCqEntries;
+            }
+            if (sum == 0) {
+              futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+              continue;
+            }
           }
         }
-        --cpuThread->queueSize;
+        for (int i = 0; i != 256; ++i) {
+          if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
+            --cpuThread->queueSize;
 
-        std::unique_lock l(cpuThread->mutex);
-        CHECK(!cpuThread->queue.empty());
-        QueueEntry& queueEntry = cpuThread->queue.front();
-        cpuThread->queue.pop_front();
-        l.unlock();
+            std::unique_lock l(cpuThread->mutex);
+            CHECK(!cpuThread->queue.empty());
+            QueueEntry& queueEntry = cpuThread->queue.front();
+            cpuThread->queue.pop_front();
+            l.unlock();
 
-        CHECK(queueEntry.stepValue < (1ul << 31));
+            CHECK(queueEntry.stepValue < (1ul << 31));
 
-        if (queueEntry.task == taskBarrier) {
-          QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
-          barrier(params);
-          cpuThread->freelistBarrier.push(&params);
-        } else if (queueEntry.task == taskAllgather) {
-          QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
-          all_gather(params);
-          cpuThread->freelistAllGather.push(&params);
-        } else if (queueEntry.task == taskReduceScatter) {
-          QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
-          reduce_scatter(params);
-          cpuThread->freelistReduceScatter.push(&params);
-        } else if (queueEntry.task == taskTerminate) {
-          cpuThread->freelistTerminate.push(&queueEntry);
-          break;
-        } else {
-          throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+            if (queueEntry.task == taskBarrier) {
+              enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
+            } else if (queueEntry.task == taskAllgather) {
+              enqueue(allocatorAllGather, (QueueEntryAllGather&)queueEntry);
+              // QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
+              // all_gather(params);
+              // cpuThread->freelistAllGather.push(&params);
+            } else if (queueEntry.task == taskReduceScatter) {
+              CHECK(false);
+              QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
+              // reduce_scatter(params);
+              // cpuThread->freelistReduceScatter.push(&params);
+            } else if (queueEntry.task == taskTerminate) {
+              cpuThread->freelistTerminate.push(&queueEntry);
+            } else {
+              throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+            }
+          }
+          for (int i2 = 0; i2 != 4; ++i2) {
+            poll();
+
+            for (auto& list : works) {
+              while (!list.empty()) {
+                Work* w = (Work*)&list.front();
+                (w->*w->stepPtr)();
+                if (!w->done) {
+                  break;
+                }
+              }
+            }
+          }
         }
       }
+
+      // while (true) {
+
+      //   while (cpuThread->queueSize == 0) {
+      //     poll();
+      //     int sum = 0;
+      //     for (auto& dev : devices) {
+      //       sum += dev.currentCqEntries;
+      //     }
+      //     if (sum == 0) {
+      //       futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+      //     }
+      //   }
+      //   --cpuThread->queueSize;
+
+      //   std::unique_lock l(cpuThread->mutex);
+      //   CHECK(!cpuThread->queue.empty());
+      //   QueueEntry& queueEntry = cpuThread->queue.front();
+      //   cpuThread->queue.pop_front();
+      //   l.unlock();
+
+      //   CHECK(queueEntry.stepValue < (1ul << 31));
+
+      //   if (queueEntry.task == taskBarrier) {
+      //     QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
+      //     barrier(params);
+      //     cpuThread->freelistBarrier.push(&params);
+      //   } else if (queueEntry.task == taskAllgather) {
+      //     QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
+      //     all_gather(params);
+      //     cpuThread->freelistAllGather.push(&params);
+      //   } else if (queueEntry.task == taskReduceScatter) {
+      //     QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
+      //     reduce_scatter(params);
+      //     cpuThread->freelistReduceScatter.push(&params);
+      //   } else if (queueEntry.task == taskTerminate) {
+      //     cpuThread->freelistTerminate.push(&queueEntry);
+      //     break;
+      //   } else {
+      //     throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+      //   }
+      // }
 
     } catch (const std::exception& e) {
       fatal("CPU thread error: %s\n", e.what());
@@ -787,9 +1117,9 @@ CpuThread::~CpuThread() {
     std::unique_lock l(mutex);
     queue.push_back(*e);
     l.unlock();
+    terminate = true;
     ++queueSize;
     futexWakeAll(&queueSize);
-    terminate = true;
 
     thread.join();
   }

@@ -56,9 +56,9 @@ def f(n):
 
     print("%d: world size is %d\n" % (rank, size))
 
-    # dist.barrier()
+    dist.barrier()
     torch.cuda.synchronize()
-    # dist.barrier()
+    dist.barrier()
     torch.cuda.synchronize()
     if rank == 0:
         print("init ok")
@@ -323,7 +323,7 @@ def f(n):
             for i in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 14:
             loopcount = 1000
             events1 = []
             events2 = []

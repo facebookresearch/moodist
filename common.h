@@ -112,6 +112,27 @@ struct AllocatedBuffer {
   }
 };
 
+template<typename T>
+struct ArrayAccessor {
+  void* base;
+};
+
+struct AllocatedArray {
+  AllocatedBuffer buffer;
+  size_t itembytes;
+  size_t numel;
+  void* cpu(size_t index) {
+    CHECK(index < numel);
+    return (void*)((uintptr_t)buffer.cpuPointer + itembytes * index);
+  }
+  uintptr_t cuda(size_t index) {
+    CHECK(index < numel);
+    return (uintptr_t)buffer.cudaPointer + itembytes * index;
+  }
+
+  
+};
+
 struct IpcMemHash {
   size_t operator()(const CUipcMemHandle& v) {
     static_assert(sizeof(v) % sizeof(size_t) == 0);

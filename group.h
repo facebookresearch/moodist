@@ -39,6 +39,7 @@ struct StreamData {
   AllocatedBuffer alignedBuffer;
   StreamData();
   ~StreamData();
+  size_t cpuThreadIndex = -1;
 };
 
 struct Group {
@@ -51,6 +52,7 @@ struct Group {
   CUdevice cuDevice;
 
   HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
+  static constexpr size_t maxConcurrency = 16;
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
@@ -131,6 +133,8 @@ struct Group {
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);
+
+  AllocatedArray allocateHostArray(size_t itembytes, size_t numel);
 
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {

@@ -284,6 +284,7 @@ struct ProcessGroupImpl {
     QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
     e->task = taskBarrier;
     e->stepValue = stepValue;
+    e->sd = &group->getStreamData(nullptr);
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
     while (cpuDone == 0) {
@@ -374,6 +375,7 @@ struct ProcessGroupImpl {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
       e->task = taskAllgather;
       e->stepValue = stepValue;
+      e->sd = &group->getStreamData(stream);
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
       e->bytes = pitch;
@@ -528,11 +530,11 @@ struct ProcessGroupImpl {
       QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();
       e->task = taskReduceScatter;
       e->stepValue = stepValue;
+      e->sd = &sd;
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
-      e->sd = &sd;
       group->cpuThread->enqueue(e);
     }
 
