@@ -164,8 +164,10 @@ def f(n):
             if _ % 3 == 0:
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
+            ostream = torch.cuda.current_stream()
             # dist.all_gather(result, tmp)
             with torch.cuda.stream(stream1):
+                stream1.wait_stream(ostream)
                 dist._all_gather_base(result0, tmp)
             with torch.cuda.stream(stream2):
                 dist._all_gather_base(result02, tmp2)
