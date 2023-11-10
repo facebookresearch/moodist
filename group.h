@@ -33,13 +33,12 @@ struct AddressPair {
 };
 
 struct StreamData {
-  std::unique_ptr<Kernels> kernels;
   AllocatedBuffer sendBuffer;
   AllocatedBuffer recvBuffer;
   AllocatedBuffer alignedBuffer;
+  size_t cpuThreadIndex = -1;
   StreamData();
   ~StreamData();
-  size_t cpuThreadIndex = -1;
 };
 
 struct Group {
@@ -57,26 +56,27 @@ struct Group {
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
+  std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   std::unique_ptr<CpuThread> cpuThread;
 
-  AllocatedBuffer cpuOutBuffer;
-  AllocatedBuffer cpuInBuffer;
+  AllocatedArray cpuOutBuffer;
+  AllocatedArray cpuInBuffer;
 
-  AllocatedBuffer cudaStepValue;
-  std::array<uintptr_t, 8> peerCudaStepValue;
+  AllocatedArray cudaStepValue;
+  std::array<PeerArrayRef, 8> peerCudaStepValue;
 
-  AllocatedBuffer cudaPeerAddresses;
-  std::array<uintptr_t, 8> peerCudaPeerAddresses;
+  AllocatedArray cudaPeerAddresses;
+  std::array<PeerArrayRef, 8> peerCudaPeerAddresses;
 
-  AllocatedBuffer cudaCommsDeviceDataSent;
+  AllocatedArray cudaCommsDeviceDataSent;
 
-  AllocatedBuffer cudaProxyReady;
-  std::array<uintptr_t, 8> peerCudaProxyReady;
+  AllocatedArray cudaProxyReady;
+  std::array<PeerArrayRef, 8> peerCudaProxyReady;
 
-  AllocatedBuffer cudaCopyDone;
-  std::array<uintptr_t, 8> peerCudaCopyDone;
+  AllocatedArray cudaCopyDone;
+  std::array<PeerArrayRef, 8> peerCudaCopyDone;
 
   std::vector<size_t> ipcRanks;
   std::vector<size_t> peerIndices;
@@ -93,13 +93,6 @@ struct Group {
   std::array<void*, 8> peerSharedMem;
   DynamicAddresses* localDyns = nullptr;
   Progress* localProgress = nullptr;
-
-  std::atomic_uint32_t* myStepCounter = nullptr;
-
-  using AddressPairs = std::array<AddressPair, 8>;
-  using PeerStepValues = std::array<std::atomic_uint32_t, 8>;
-  AddressPairs* peerAddrs = nullptr;
-  PeerStepValues* peerCopyDone = nullptr;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
@@ -134,7 +127,9 @@ struct Group {
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);
 
-  AllocatedArray allocateHostArray(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayHost(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayHostMapped(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayDevice(size_t itembytes, size_t numel);
 
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {

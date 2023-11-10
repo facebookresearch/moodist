@@ -61,6 +61,7 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
   cpuThread = std::make_unique<CpuThread>(this);
+  kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
@@ -559,21 +560,19 @@ void Group::init() {
     ptr = (T*)(addr + offset);
     offset += sizeof(T) * n;
   };
-  get(localDyns, size);
-  get(localProgress, size);
-  get(myStepCounter, 1);
-  get(peerAddrs, 1);
-  get(peerCopyDone, 1);
+  get(localDyns, size * Group::maxConcurrency);
+  get(localProgress, size * Group::maxConcurrency);
 
   mySharedMemSize = offset;
 
   ipcMapper->getMySharedMem(0, offset);
 
-  cpuOutBuffer = allocateHostMapped(4096 + 16 * size);
-  cpuInBuffer = allocateHostMapped(4096 + 16 * size);
+  cpuOutBuffer = allocateArrayHostMapped(4096 + 16 * size, Group::maxConcurrency);
+  cpuInBuffer = allocateArrayHostMapped(4096 + 16 * size, Group::maxConcurrency);
 
-  auto mapPeerAddrs = [&](AllocatedBuffer& localBuffer, std::array<uintptr_t, 8>& peerPtrs) {
-    peerPtrs.fill(0);
+  auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
+    peerPtrs.fill({});
+    auto& localBuffer = localArray.buffer;
 
     std::array<uintptr_t, 8> peerMapping;
 
@@ -590,23 +589,23 @@ void Group::init() {
           setupComms->recvFrom<std::tuple<size_t, size_t, uintptr_t>>(ipcRanks[i]);
       CHECK(sourceRank == ipcRanks[i]);
       CHECK(sourcePeerIndex == peerMyRemoteIndex[i]);
-      peerPtrs[i] = address;
+      peerPtrs[i] = {address, localArray.itembytes};
     }
     setupComms->allgather(0);
   };
 
-  cudaStepValue = allocateDevice(sizeof(uint64_t) * size);
+  cudaStepValue = allocateArrayDevice(sizeof(uint64_t) * size, Group::maxConcurrency);
   mapPeerAddrs(cudaStepValue, peerCudaStepValue);
 
-  cudaPeerAddresses = allocateDevice(sizeof(uintptr_t) * 2 * size);
+  cudaPeerAddresses = allocateArrayDevice(sizeof(uintptr_t) * 2 * size, Group::maxConcurrency);
   mapPeerAddrs(cudaPeerAddresses, peerCudaPeerAddresses);
 
-  cudaCommsDeviceDataSent = allocateDevice(sizeof(uint32_t) * size * 32);
+  cudaCommsDeviceDataSent = allocateArrayDevice(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
 
-  cudaProxyReady = allocateDevice(sizeof(uint32_t) * size);
+  cudaProxyReady = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
   mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
 
-  cudaCopyDone = allocateDevice(sizeof(uint64_t) * 8);
+  cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
   mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
 
   allGather->init();
@@ -721,12 +720,33 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   return r;
 }
 
+AllocatedArray Group::allocateArrayHost(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateHost(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
+AllocatedArray Group::allocateArrayHostMapped(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateHostMapped(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
+AllocatedArray Group::allocateArrayDevice(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateDevice(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
+
 StreamData::StreamData() = default;
 StreamData::~StreamData() = default;
 
 void Group::createStreamData(std::unique_ptr<StreamData>& ptr) {
   ptr = std::make_unique<StreamData>();
-  ptr->kernels = std::make_unique<Kernels>(this);
 }
 
 } // namespace moodist

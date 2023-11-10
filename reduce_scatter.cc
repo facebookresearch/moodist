@@ -41,9 +41,9 @@ std::string ReduceScatter::generate() {
   const auto& cpuOutBuffer = group->cpuOutBuffer;
   const auto& peerIndices = group->peerIndices;
 
-  auto waitFor32 = [&](uintptr_t address, std::string value) {
+  auto waitFor32 = [&](std::string address, std::string value) {
     return replace(
-        R"(while (*(volatile uint32_t*)$ptr < $value);
+        R"(while (*(volatile uint32_t*)($ptr) < $value);
     )",
         "$ptr", address, "$value", value);
   };
@@ -52,7 +52,7 @@ std::string ReduceScatter::generate() {
     std::string s;
     s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
+      s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
     }
     return s;
   };
@@ -114,9 +114,10 @@ std::string ReduceScatter::generate() {
     for (size_t peerIndex : peerIndices) {
       size_t i = ipcRanks[peerIndex];
       reduceAdd(
-          "(T*)params.outputAddress", replace(
-                                          "(const T*)(*(uintptr_t*)$src + params.pitch * $rank)", "$src",
-                                          group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
+          "(T*)params.outputAddress",
+          replace(
+              "(const T*)(*(uintptr_t*)$src + params.pitch * $rank)", "$src",
+              concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
     }
   };
 
@@ -132,7 +133,7 @@ std::string ReduceScatter::generate() {
         reduceAdd(
             addr, replace(
                       "(const T*)(*(uintptr_t*)$src + params.pitch * $i)", "$i", i, "$src",
-                      group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
+                      concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
       }
 
       reduceFlush();
@@ -229,6 +230,7 @@ __device__ void reduce_add(ReduceParameters& params, void* dst, const void* src1
 
 struct ReduceScatterParameters {
   uint32_t stepValue;
+  uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -241,6 +243,7 @@ struct ReduceScatterParameters {
 
 __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+  [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   ReduceParameters reduces;
   reduces.bytes = params.bytes;
   reduces.n = 0;
@@ -258,17 +261,17 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
 extern "C" __global__ void $launchBounds reduce_scatter_local(ReduceScatterParameters params) {
   grid_generic_entry_local(params);
   reduce_scatter_impl(params);
-  grid_generic_exit_local(params.stepValue);
+  grid_generic_exit_local(params.stepValue, params.concurrencyIndex);
 }
 
-extern "C" __global__ void reduce_scatter_exit(uint32_t stepValue) {
-  generic_exit(stepValue);
+extern "C" __global__ void reduce_scatter_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
+  generic_exit(stepValue, concurrencyIndex);
 }
 
 extern "C" __global__ void $launchBounds reduce_scatter(ReduceScatterParameters params) {
   grid_generic_entry(params);
   if (reduce_scatter_impl(params)) {
-    reduce_scatter_exit<<<1, 1>>>(params.stepValue);
+    reduce_scatter_exit<<<1, 1>>>(params.stepValue, params.concurrencyIndex);
   }
 }
 

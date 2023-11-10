@@ -42,7 +42,7 @@ public:
 
   public:
     iterator() = default;
-    iterator(T* ptr) : ptr(ptr) {}
+    explicit iterator(T* ptr) : ptr(ptr) {}
 
     using difference_type = std::ptrdiff_t;
     using value_type = T;
@@ -119,7 +119,7 @@ public:
     next(prevItem) = nextItem;
     prev(&*at) = nullptr;
     next(&*at) = nullptr;
-    return at;
+    return iterator(nextItem);
   }
   static void erase(T& item) noexcept {
     erase(iterator(&item));
@@ -134,7 +134,7 @@ public:
     erase(begin());
   }
   void pop_back() noexcept {
-    erase(prev(&head));
+    erase(iterator(prev(&head)));
   }
   T& front() noexcept {
     return *next(&head);

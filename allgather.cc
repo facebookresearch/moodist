@@ -227,9 +227,9 @@ std::string AllGather::generate() {
   const auto& cudaProxyReady = group->cudaProxyReady;
   const auto& peerCudaProxyReady = group->peerCudaProxyReady;
 
-  auto waitFor32 = [&](uintptr_t address, std::string value) {
+  auto waitFor32 = [&](std::string address, std::string value) {
     return replace(
-        R"(while (*(volatile uint32_t*)$ptr < $value);
+        R"(while (*(volatile uint32_t*)($ptr) < $value);
     )",
         "$ptr", address, "$value", value);
   };
@@ -238,7 +238,7 @@ std::string AllGather::generate() {
     std::string s;
     s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
+      s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
     }
     return s;
   };
@@ -260,7 +260,8 @@ std::string AllGather::generate() {
     localCopies += addCopy(
         replace("(void*)(params.outputAddress + params.pitch * $i)", "$i", i),
         replace(
-            "*(const void**)$src", "$src", group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * peerIndex)));
+            "*(const void**)$src", "$src",
+            concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
   }
   isInGrid = false;
 
@@ -299,23 +300,25 @@ std::string AllGather::generate() {
         }
         syncthreads();
       )",
-          "$n", i, "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source,
-          "$readyPtr", cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
+          "$n", i, "$forwardPtr",
+          concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source), "$readyPtr",
+          concurrencyIndex(cudaProxyReady, +sizeof(uint32_t) * pdi.source));
     } else {
       recvCopies += replace(
           R"(
         *(volatile uint32_t*)$forwardPtr = stepValue;
         while (*(volatile uint32_t*)$readyPtr < stepValue);
       )",
-          "$forwardPtr", peerCudaProxyReady[pi.destinationPeerIndex] + sizeof(uint32_t) * pi.source, "$readyPtr",
-          cudaProxyReady.cudaPointer + sizeof(uint32_t) * pdi.source);
+          "$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
+          "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source));
     }
 
     recvCopies += addCopy(
         replace("(void*)(params.outputAddress + params.pitch * $source)", "$source", pdi.source),
         replace(
             "(void*)(*(uintptr_t*)$src + params.pitch * $source)", "$source", pdi.source, "$src",
-            group->cudaPeerAddresses.cudaPointer + (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t))));
+            concurrencyIndex(
+                group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)))));
   }
 
   std::string source;
@@ -325,6 +328,7 @@ namespace {
 
 struct AllGatherParameters {
   uint32_t stepValue;
+  uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
@@ -385,19 +389,21 @@ $globaldefs
 
 extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+  [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   grid_generic_entry_local(params);
 
   $localCopies
 
-  grid_generic_exit_local(stepValue);
+  grid_generic_exit_local(stepValue, concurrencyIndex);
 }
 
-extern "C" __global__ void allgather_exit(uint32_t stepValue) {
-  generic_exit(stepValue);
+extern "C" __global__ void allgather_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
+  generic_exit(stepValue, concurrencyIndex);
 }
 
 extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+  [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   grid_generic_entry(params);
 
   $localCopies
@@ -416,7 +422,7 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   allgather_copy_flush(copies);
 
-  allgather_exit<<<1, 1>>>(stepValue);
+  allgather_exit<<<1, 1>>>(stepValue, concurrencyIndex);
 }
 
   )zz",

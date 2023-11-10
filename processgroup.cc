@@ -77,8 +77,8 @@ struct ProcessGroupImpl {
   std::shared_ptr<Group> group;
 
   SpinMutex mutex;
-  std::atomic_uint32_t nextCpuStepValue = 1;
-  std::atomic_uint32_t nextCudaStepValue = 1;
+  uint32_t nextStepValue = 1;
+  uint32_t nextConcurrencyIndex = 0;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -278,13 +278,15 @@ struct ProcessGroupImpl {
 
   void barrier() {
     std::lock_guard l(mutex);
-    uint32_t stepValue = nextCpuStepValue.fetch_add(4096);
+    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
     std::atomic_uint32_t cpuDone = 0;
     QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
     e->task = taskBarrier;
     e->stepValue = stepValue;
     e->sd = &group->getStreamData(nullptr);
+    e->concurrencyIndex = concurrencyIndex;
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
     while (cpuDone == 0) {
@@ -298,7 +300,8 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
+    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
@@ -365,8 +368,8 @@ struct ProcessGroupImpl {
 
     AllGather& allGather = *group->allGather;
 
-    if (!sd.kernels->cuModule) {
-      sd.kernels->compile();
+    if (!group->kernels->cuModule) {
+      group->kernels->compile();
     }
 
     bool isLocalOnly = allGather.recvRanks.empty();
@@ -375,8 +378,8 @@ struct ProcessGroupImpl {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
       e->task = taskAllgather;
       e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
       e->sd = &group->getStreamData(stream);
-      e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
       e->bytes = pitch;
       e->pitch = pitch;
@@ -387,6 +390,7 @@ struct ProcessGroupImpl {
 
     AllGatherParameters parameters;
     parameters.stepValue = stepValue;
+    parameters.concurrencyIndex = concurrencyIndex;
     parameters.bytes = pitch;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
@@ -396,15 +400,15 @@ struct ProcessGroupImpl {
 
     std::array<void*, 1> params = {&parameters};
 
-    size_t gridSize = sd.kernels->gridSize;
-    size_t blockSize = sd.kernels->blockSize;
+    size_t gridSize = group->kernels->gridSize;
+    size_t blockSize = group->kernels->blockSize;
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          sd.kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else {
-      CHECK_CU(
-          cuLaunchKernel(sd.kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(
+          group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     if (outputAddress != (uintptr_t)output.data_ptr()) {
@@ -434,7 +438,8 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = nextCudaStepValue.fetch_add(4096);
+    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
@@ -520,8 +525,8 @@ struct ProcessGroupImpl {
     allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
     allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
 
-    if (!sd.kernels->cuModule) {
-      sd.kernels->compile();
+    if (!group->kernels->cuModule) {
+      group->kernels->compile();
     }
 
     bool isLocalOnly = reduceScatter.recvRanks.empty();
@@ -530,6 +535,7 @@ struct ProcessGroupImpl {
       QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();
       e->task = taskReduceScatter;
       e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
       e->sd = &sd;
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
@@ -549,6 +555,7 @@ struct ProcessGroupImpl {
 
     ReduceScatterParameters parameters;
     parameters.stepValue = stepValue;
+    parameters.concurrencyIndex = concurrencyIndex;
     parameters.bytes = bytes;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
@@ -560,15 +567,15 @@ struct ProcessGroupImpl {
 
     std::array<void*, 1> params = {&parameters};
 
-    size_t gridSize = sd.kernels->gridSize;
-    size_t blockSize = sd.kernels->blockSize;
+    size_t gridSize = group->kernels->gridSize;
+    size_t blockSize = group->kernels->blockSize;
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          sd.kernels->cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          group->kernels->cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else {
       CHECK_CU(cuLaunchKernel(
-          sd.kernels->cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          group->kernels->cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
     trace("post");

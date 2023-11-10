@@ -92,7 +92,7 @@ struct IpcMapperImpl : IpcMapper {
   IpcMapperImpl(Group* group) {
     this->group = group;
 
-    memsize = 4096 * 32 + 1024 * group->size;
+    memsize = 4096 * 32 + 1024 * group->size * Group::maxConcurrency;
   }
   virtual ~IpcMapperImpl() override {
     if (thread.joinable()) {

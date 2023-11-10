@@ -39,6 +39,7 @@ struct CudaMapping {
 };
 
 struct Device {
+  IntrusiveListLink<Device> link;
   IbCommon* ib;
   ibv_pd* protectionDomain;
   ibv_cq* cq;
@@ -78,15 +79,15 @@ struct CallbackWrapper {
 };
 
 template<typename T, size_t poolSize = 0x1000>
-struct PoolAllocatorReused {
+struct PoolAllocator {
   std::deque<std::vector<std::aligned_storage_t<sizeof(T), alignof(T)>>> all;
   size_t i0 = 0;
   size_t i1 = 0;
-  PoolAllocatorReused() {
+  PoolAllocator() {
     all.emplace_back();
     all.back().resize(poolSize);
   }
-  ~PoolAllocatorReused() {
+  ~PoolAllocator() {
     reset();
   }
   template<typename... Args>
@@ -139,6 +140,7 @@ struct CpuThreadImpl {
 
   SetupComms* setupComms = &*group->setupComms;
   std::vector<Device> devices;
+  IntrusiveList<Device, &Device::link> activeDevices;
 
   size_t bytesWritten = 0;
 
@@ -152,28 +154,26 @@ struct CpuThreadImpl {
   DynamicAddresses* localDyns = group->localDyns;
   Progress* localProgress = group->localProgress;
 
-  MemoryRegistration* cudaStepValueMr = regMrCuda(group->cudaStepValue.cudaPointer, group->cudaStepValue.bytes);
+  MemoryRegistration* cudaStepValueMr =
+      regMrCuda(group->cudaStepValue.buffer.cudaPointer, group->cudaStepValue.buffer.bytes);
 
   std::vector<RemoteAddressAndKey> remoteComms = distributeAddressAndKeys((uintptr_t)group->mySharedMem, commsMr);
   std::vector<RemoteAddressAndKey> remoteCudaStepValue =
-      distributeAddressAndKeys(group->cudaStepValue.cudaPointer, cudaStepValueMr);
+      distributeAddressAndKeys(group->cudaStepValue.buffer.cudaPointer, cudaStepValueMr);
 
   MemoryRegistration* cudaCommsDeviceDataSentMr =
-      regMrCuda(group->cudaCommsDeviceDataSent.cudaPointer, group->cudaCommsDeviceDataSent.bytes);
+      regMrCuda(group->cudaCommsDeviceDataSent.buffer.cudaPointer, group->cudaCommsDeviceDataSent.buffer.bytes);
   std::vector<RemoteAddressAndKey> remoteCudaCommsDeviceDataSent =
-      distributeAddressAndKeys(group->cudaCommsDeviceDataSent.cudaPointer, cudaCommsDeviceDataSentMr);
+      distributeAddressAndKeys(group->cudaCommsDeviceDataSent.buffer.cudaPointer, cudaCommsDeviceDataSentMr);
 
-  AllocatedArray sendStepValuesStorage = group->allocateHostArray(sizeof(uint32_t), Group::maxConcurrency);
+  AllocatedArray sendStepValuesStorage = group->allocateArrayHost(sizeof(uint32_t), Group::maxConcurrency);
   MemoryRegistration* sendStepValuesStorageMr =
       regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
   uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
 
-  volatile uint32_t* const cpuIn = (uint32_t*)group->cpuInBuffer.cpuPointer;
-  volatile uint32_t* const cpuOut = (uint32_t*)group->cpuOutBuffer.cpuPointer;
-
-  AllocatedArray outDynsBuffer = group->allocateHostArray(sizeof(DynamicAddresses) * size);
-  DynamicAddresses* outDyns = (DynamicAddresses*)outDynsBuffer.cpuPointer;
-  MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.cpuPointer, outDynsBuffer.bytes);
+  AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
+  // DynamicAddresses* outDyns = (DynamicAddresses*)outDynsBuffer.buffer.cpuPointer;
+  MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.buffer.cpuPointer, outDynsBuffer.buffer.bytes);
 
   std::vector<uint32_t> dynReady;
 
@@ -200,7 +200,9 @@ struct CpuThreadImpl {
   }
 
   void poll() {
-    for (auto& dev : devices) {
+    for (auto i = activeDevices.begin(); i != activeDevices.end();) {
+      Device& dev = *i;
+      ++i;
       ibv_wc wcs[4];
       int n = ibv_poll_cq(dev.cq, 4, wcs);
       CHECK(n >= 0);
@@ -210,6 +212,9 @@ struct CpuThreadImpl {
           fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode, wc.wr_id);
         } else {
           --dev.currentCqEntries;
+          if (dev.currentCqEntries == 0) {
+            activeDevices.erase(dev);
+          }
           if (wc.wr_id) {
             Callback* callback = (Callback*)(void*)wc.wr_id;
             callback->decref();
@@ -240,6 +245,9 @@ struct CpuThreadImpl {
         poll();
       }
       ++dev.currentCqEntries;
+      if (dev.currentCqEntries == 1) {
+        activeDevices.push_back(dev);
+      }
 
       ibv_qp_ex* qp = dev.ib->qpex;
 
@@ -398,21 +406,21 @@ struct CpuThreadImpl {
     }
   }
 
-  void writeStep(size_t deviceIndex, size_t dst, uint32_t stepValue) {
+  void writeStep(size_t deviceIndex, size_t dst, uint32_t stepValue, size_t concurrencyIndex) {
     Device& dev = devices[deviceIndex];
-    uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].stepValue);
-    localProgress[rank].stepValue = stepValue;
+    uintptr_t dstOffset = group->getSharedOffset(&localProgress[size * concurrencyIndex + rank].stepValue);
+    localProgress[size * concurrencyIndex + rank].stepValue = stepValue;
     writeData(
-        dev, dst, &localProgress[rank].stepValue, commsMr->mrs.at(deviceIndex)->lkey,
+        dev, dst, &localProgress[size * concurrencyIndex + rank].stepValue, commsMr->mrs.at(deviceIndex)->lkey,
         (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
   }
 
-  void writeCpuStep(size_t deviceIndex, size_t dst, uint32_t stepValue) {
+  void writeCpuStep(size_t deviceIndex, size_t dst, uint32_t stepValue, size_t concurrencyIndex) {
     Device& dev = devices[deviceIndex];
-    uintptr_t dstOffset = group->getSharedOffset(&localProgress[rank].cpuStepValue);
-    localProgress[rank].cpuStepValue = stepValue;
+    uintptr_t dstOffset = group->getSharedOffset(&localProgress[size * concurrencyIndex + rank].cpuStepValue);
+    localProgress[size * concurrencyIndex + rank].cpuStepValue = stepValue;
     writeData(
-        dev, dst, &localProgress[rank].cpuStepValue, commsMr->mrs.at(deviceIndex)->lkey,
+        dev, dst, &localProgress[size * concurrencyIndex + rank].cpuStepValue, commsMr->mrs.at(deviceIndex)->lkey,
         (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
   }
 
@@ -495,7 +503,10 @@ struct CpuThreadImpl {
   }
 
   struct WorkBase {
-    IntrusiveListLink<WorkBase> link;
+    IntrusiveListLink<WorkBase> freeLink;
+    IntrusiveListLink<WorkBase> workLink;
+    IntrusiveListLink<WorkBase> streamLink;
+    IntrusiveListLink<WorkBase> concurrencyLink;
   };
   struct Work : WorkBase {
     CpuThreadImpl& self;
@@ -526,6 +537,10 @@ struct CpuThreadImpl {
     return;                                                                                                            \
   }
 
+  struct WorkParams : Work {
+    QueueEntry& params;
+  };
+
   struct WorkBarrier : Work {
     QueueEntryBarrier& params;
     size_t i;
@@ -541,20 +556,19 @@ struct CpuThreadImpl {
         if (i == rank) {
           continue;
         }
-        self.writeCpuStep((rank + i) % self.devices.size(), i, stepValue);
+        self.writeCpuStep((rank + i) % self.devices.size(), i, stepValue, params.concurrencyIndex);
       }
       for (i = 0; i != size; ++i) {
         if (i == self.rank) {
           continue;
         }
-        while (self.localProgress[i].cpuStepValue < stepValue) {
+        while (self.localProgress[size * params.concurrencyIndex + i].cpuStepValue < stepValue) {
           YIELD
         }
       }
       params.cpuDone->store(1);
       futexWakeAll(params.cpuDone);
       self.cpuThread->freelistBarrier.push(&params);
-      IntrusiveList<WorkBase, &WorkBase::link>::erase(*this);
       self.allocatorBarrier.deallocate(this);
       DONE
     }
@@ -566,6 +580,8 @@ struct CpuThreadImpl {
     MemoryRegistration* inputMr;
     size_t liveSends;
     size_t index;
+    volatile uint32_t* cpuIn;
+    volatile uint32_t* cpuOut;
 
     WorkAllGather(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self), params(params) {}
 
@@ -581,37 +597,44 @@ struct CpuThreadImpl {
 
       ENTER
 
-      inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+      cpuIn = &self.group->cpuInBuffer.at<volatile uint32_t>(params.concurrencyIndex);
+      cpuOut = &self.group->cpuOutBuffer.at<volatile uint32_t>(params.concurrencyIndex);
 
-      // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
-      // Thus, we register each ranks output address independently, so they get different MRs.
-      for (size_t i : recvRanks) {
-        auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
-        self.outDyns[i].gatherAddress = params.outputAddress;
-        for (size_t di = 0; di != self.devices.size(); ++di) {
-          self.outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
-        }
-      }
-
-      // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-      // until kernel entry, such that we don't receive data until we're ready.
-      self.dynReady.resize(recvRanks.size());
       {
-        size_t n = 0;
+        inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(params.concurrencyIndex);
+
+        // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+        // Thus, we register each ranks output address independently, so they get different MRs.
         for (size_t i : recvRanks) {
-          size_t di = (rank + n) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeData(
-              dev, i, &self.outDyns[i], self.outDynsMr->mrs[di]->lkey,
-              (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * rank), self.remoteComms[i].keys[di],
-              sizeof(DynamicAddresses),
-              self.makeCallback([&, i, di, stepValue, n]() { self.dynReady[n] = stepValue; }));
-          ++n;
+          auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+          outDyns[i].gatherAddress = params.outputAddress;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+          }
+        }
+
+        // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+        // until kernel entry, such that we don't receive data until we're ready.
+        self.dynReady.resize(recvRanks.size());
+        {
+          size_t n = 0;
+          for (size_t i : recvRanks) {
+            size_t di = (rank + n) % self.devices.size();
+            auto& dev = self.devices[di];
+            self.writeData(
+                dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * params.concurrencyIndex + sizeof(DynamicAddresses) * rank),
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+                self.makeCallback([&, i, di, stepValue, n]() { self.dynReady[n] = stepValue; }));
+            ++n;
+          }
         }
       }
 
       // wait for kernel
-      while (self.cpuIn[0] < stepValue) {
+      while (cpuIn[0] < stepValue) {
         YIELD
       }
 
@@ -621,7 +644,7 @@ struct CpuThreadImpl {
         }
       }
 
-      self.sendStepValues[0] = stepValue;
+      self.sendStepValues[params.concurrencyIndex] = stepValue;
 
       CHECK(recvRanks.size() == sendRanks.size());
 
@@ -631,11 +654,11 @@ struct CpuThreadImpl {
           size_t i = recvRanks[index];
           size_t di = (rank + index) % self.devices.size();
           auto& dev = self.devices[di];
-          self.writeStep(di, i, stepValue + index);
+          self.writeStep(di, i, stepValue + index, params.concurrencyIndex);
         }
         i = sendRanks[index];
         // wait for dyns
-        while (self.localProgress[i].stepValue < stepValue + index) {
+        while (self.localProgress[size * params.concurrencyIndex + i].stepValue < stepValue + index) {
           YIELD
         }
 
@@ -644,16 +667,19 @@ struct CpuThreadImpl {
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
-              i, srcAddr, params.bytes, inputMr, self.localDyns[i].gatherAddress + params.pitch * rank,
-              self.localDyns[i].gatherKey, [this, i = this->i](size_t di, bool ordered, bool done) {
+              i, srcAddr, params.bytes, inputMr,
+              self.localDyns[size * params.concurrencyIndex + i].gatherAddress + params.pitch * rank,
+              self.localDyns[size * params.concurrencyIndex + i].gatherKey,
+              [this, i = this->i, size](size_t di, bool ordered, bool done) {
                 if (done) {
                   --liveSends;
                 }
                 if (ordered) {
                   auto& dev = self.devices.at(di);
                   self.writeData(
-                      dev, i, &self.sendStepValues[0], self.sendStepValuesStorageMr->mrs.at(di)->lkey,
-                      (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (self.rank * 32 + di)),
+                      dev, i, &self.sendStepValues[params.concurrencyIndex],
+                      self.sendStepValuesStorageMr->mrs.at(di)->lkey,
+                      (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * params.concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
               });
@@ -663,32 +689,19 @@ struct CpuThreadImpl {
         }
       }
 
-      while (true) {
-        {
-          bool stop = true;
-          for (auto& dev : self.devices) {
-            if (dev.currentCqEntries) {
-              stop = false;
-              break;
-            }
-          }
-          if (stop) {
-            break;
-          }
-        }
+      while (!self.activeDevices.empty()) {
         YIELD
       }
       for (auto& dev : self.devices) {
         CHECK(dev.currentCqEntries == 0);
       }
 
-      self.cpuOut[0] = stepValue;
-      while (self.cpuIn[0] < stepValue + 1) {
+      cpuOut[0] = stepValue;
+      while (cpuIn[0] < stepValue + 1) {
         YIELD
       }
 
       self.cpuThread->freelistAllGather.push(&params);
-      IntrusiveList<WorkBase, &WorkBase::link>::erase(*this);
       self.allocatorAllGather.deallocate(this);
       DONE
     }
@@ -715,247 +728,247 @@ struct CpuThreadImpl {
   //   futexWakeAll(params.cpuDone);
   // }
 
-  void all_gather(QueueEntryAllGather& params) {
-    uint32_t stepValue = params.stepValue;
+  // void all_gather(QueueEntryAllGather& params) {
+  //   uint32_t stepValue = params.stepValue;
 
-    AllGather& allGather = *group->allGather;
+  //   AllGather& allGather = *group->allGather;
 
-    auto& sendRanks = allGather.sendRanks;
-    auto& recvRanks = allGather.recvRanks;
+  //   auto& sendRanks = allGather.sendRanks;
+  //   auto& recvRanks = allGather.recvRanks;
 
-    auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
+  //   auto* inputMr = regMrCuda(params.inputAddress, params.bytes);
 
-    // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
-    // Thus, we register each ranks output address independently, so they get different MRs.
-    for (size_t i : recvRanks) {
-      auto* mr = regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
-      outDyns[i].gatherAddress = params.outputAddress;
-      for (size_t di = 0; di != devices.size(); ++di) {
-        outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
-      }
-    }
+  //   // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+  //   // Thus, we register each ranks output address independently, so they get different MRs.
+  //   for (size_t i : recvRanks) {
+  //     auto* mr = regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+  //     outDyns[i].gatherAddress = params.outputAddress;
+  //     for (size_t di = 0; di != devices.size(); ++di) {
+  //       outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+  //     }
+  //   }
 
-    // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-    // until kernel entry, such that we don't receive data until we're ready.
-    dynReady.resize(recvRanks.size());
-    size_t n = 0;
-    for (size_t i : recvRanks) {
-      size_t di = (rank + n) % devices.size();
-      auto& dev = devices[di];
-      writeData(
-          dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
-          (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
-          sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
-      ++n;
-    }
+  //   // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+  //   // until kernel entry, such that we don't receive data until we're ready.
+  //   dynReady.resize(recvRanks.size());
+  //   size_t n = 0;
+  //   for (size_t i : recvRanks) {
+  //     size_t di = (rank + n) % devices.size();
+  //     auto& dev = devices[di];
+  //     writeData(
+  //         dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
+  //         (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
+  //         sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
+  //     ++n;
+  //   }
 
-    // wait for kernel
-    while (cpuIn[0] < stepValue) {
-      poll();
-    }
+  //   // wait for kernel
+  //   while (cpuIn[0] < stepValue) {
+  //     poll();
+  //   }
 
-    n = 0;
-    for (size_t i : recvRanks) {
-      while (dynReady[n] < stepValue) {
-        poll();
-      }
-      ++n;
-    }
+  //   n = 0;
+  //   for (size_t i : recvRanks) {
+  //     while (dynReady[n] < stepValue) {
+  //       poll();
+  //     }
+  //     ++n;
+  //   }
 
-    auto start = std::chrono::steady_clock::now();
+  //   auto start = std::chrono::steady_clock::now();
 
-    sendStepValues[0] = stepValue;
+  //   sendStepValues[0] = stepValue;
 
-    CHECK(recvRanks.size() == sendRanks.size());
+  //   CHECK(recvRanks.size() == sendRanks.size());
 
-    size_t liveSends = 0;
-    for (size_t index = 0; index != sendRanks.size(); ++index) {
-      if (true) {
-        size_t i = recvRanks[index];
-        size_t di = (rank + index) % devices.size();
-        auto& dev = devices[di];
-        writeStep(di, i, stepValue + index);
-      }
-      size_t i = sendRanks[index];
-      // wait for dyns
-      while (localProgress[i].stepValue < stepValue + index) {
-        poll();
-      }
-      size_t nbytes = params.bytes;
+  //   size_t liveSends = 0;
+  //   for (size_t index = 0; index != sendRanks.size(); ++index) {
+  //     if (true) {
+  //       size_t i = recvRanks[index];
+  //       size_t di = (rank + index) % devices.size();
+  //       auto& dev = devices[di];
+  //       writeStep(di, i, stepValue + index);
+  //     }
+  //     size_t i = sendRanks[index];
+  //     // wait for dyns
+  //     while (localProgress[i].stepValue < stepValue + index) {
+  //       poll();
+  //     }
+  //     size_t nbytes = params.bytes;
 
-      if (nbytes > 0) {
-        uintptr_t srcAddr = (uintptr_t)params.inputAddress;
+  //     if (nbytes > 0) {
+  //       uintptr_t srcAddr = (uintptr_t)params.inputAddress;
 
-        liveSends += devices.size();
-        writeDataDistributed2(
-            i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank, localDyns[i].gatherKey,
-            [this, &liveSends, i](size_t di, bool ordered, bool done) {
-              if (done) {
-                --liveSends;
-              }
-              if (ordered) {
-                auto& dev = devices.at(di);
-                writeData(
-                    dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                    (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                    remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-              }
-            });
-      }
-      while (liveSends >= devices.size() * 2) {
-        poll();
-      }
-    }
+  //       liveSends += devices.size();
+  //       writeDataDistributed2(
+  //           i, srcAddr, nbytes, inputMr, localDyns[i].gatherAddress + params.pitch * rank, localDyns[i].gatherKey,
+  //           [this, &liveSends, i](size_t di, bool ordered, bool done) {
+  //             if (done) {
+  //               --liveSends;
+  //             }
+  //             if (ordered) {
+  //               auto& dev = devices.at(di);
+  //               writeData(
+  //                   dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
+  //                   (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+  //                   remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+  //             }
+  //           });
+  //     }
+  //     while (liveSends >= devices.size() * 2) {
+  //       poll();
+  //     }
+  //   }
 
-    while (true) {
-      bool stop = true;
-      for (auto& dev : devices) {
-        while (dev.currentCqEntries) {
-          poll();
-          stop = false;
-        }
-      }
-      if (stop) {
-        break;
-      }
-    }
-    for (auto& dev : devices) {
-      CHECK(dev.currentCqEntries == 0);
-    }
+  //   while (true) {
+  //     bool stop = true;
+  //     for (auto& dev : devices) {
+  //       while (dev.currentCqEntries) {
+  //         poll();
+  //         stop = false;
+  //       }
+  //     }
+  //     if (stop) {
+  //       break;
+  //     }
+  //   }
+  //   for (auto& dev : devices) {
+  //     CHECK(dev.currentCqEntries == 0);
+  //   }
 
-    cpuOut[0] = stepValue;
-    while (cpuIn[0] < stepValue + 1) {
-      poll();
-    }
-  }
+  //   cpuOut[0] = stepValue;
+  //   while (cpuIn[0] < stepValue + 1) {
+  //     poll();
+  //   }
+  // }
 
-  void reduce_scatter(QueueEntryReduceScatter& params) {
-    uint32_t stepValue = params.stepValue;
+  // void reduce_scatter(QueueEntryReduceScatter& params) {
+  //   uint32_t stepValue = params.stepValue;
 
-    ReduceScatter& reduceScatter = *group->reduceScatter;
+  //   ReduceScatter& reduceScatter = *group->reduceScatter;
 
-    auto& sendRanks = reduceScatter.sendRanks;
-    auto& recvRanks = reduceScatter.recvRanks;
+  //   auto& sendRanks = reduceScatter.sendRanks;
+  //   auto& recvRanks = reduceScatter.recvRanks;
 
-    uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
-    CHECK(params.sd->recvBuffer.bytes >= params.pitch * recvRanks.size());
+  //   uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
+  //   CHECK(params.sd->recvBuffer.bytes >= params.pitch * recvRanks.size());
 
-    uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
-    CHECK(params.sd->sendBuffer.bytes >= params.pitch * sendRanks.size());
+  //   uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
+  //   CHECK(params.sd->sendBuffer.bytes >= params.pitch * sendRanks.size());
 
-    auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
-    auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());
+  //   auto* sendMr = regMrCuda(sendAddress, params.pitch * sendRanks.size());
+  //   auto* recvMr = regMrCuda(recvAddress, params.pitch * recvRanks.size());
 
-    for (size_t i : recvRanks) {
-      outDyns[i].gatherAddress = recvAddress;
-      for (size_t di = 0; di != devices.size(); ++di) {
-        outDyns[i].gatherKey[di] = recvMr->mrs[di]->rkey;
-      }
-    }
+  //   for (size_t i : recvRanks) {
+  //     outDyns[i].gatherAddress = recvAddress;
+  //     for (size_t di = 0; di != devices.size(); ++di) {
+  //       outDyns[i].gatherKey[di] = recvMr->mrs[di]->rkey;
+  //     }
+  //   }
 
-    // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-    // until kernel entry, such that we don't receive data until we're ready.
-    dynReady.resize(recvRanks.size());
-    size_t n = 0;
-    for (size_t i : recvRanks) {
-      size_t di = (rank + n) % devices.size();
-      auto& dev = devices[di];
-      writeData(
-          dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
-          (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
-          sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
-      ++n;
-    }
+  //   // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+  //   // until kernel entry, such that we don't receive data until we're ready.
+  //   dynReady.resize(recvRanks.size());
+  //   size_t n = 0;
+  //   for (size_t i : recvRanks) {
+  //     size_t di = (rank + n) % devices.size();
+  //     auto& dev = devices[di];
+  //     writeData(
+  //         dev, i, &outDyns[i], outDynsMr->mrs[di]->lkey,
+  //         (void*)(remoteComms[i].address + sizeof(DynamicAddresses) * rank), remoteComms[i].keys[di],
+  //         sizeof(DynamicAddresses), makeCallback([&, i, di, stepValue, n]() { dynReady[n] = stepValue; }));
+  //     ++n;
+  //   }
 
-    sendStepValues[0] = stepValue;
+  //   sendStepValues[0] = stepValue;
 
-    n = 0;
-    for (size_t i : recvRanks) {
-      while (dynReady[n] < stepValue) {
-        poll();
-      }
-      ++n;
-    }
+  //   n = 0;
+  //   for (size_t i : recvRanks) {
+  //     while (dynReady[n] < stepValue) {
+  //       poll();
+  //     }
+  //     ++n;
+  //   }
 
-    // wait for kernel
-    while (cpuIn[0] < stepValue) {
-      poll();
-    }
+  //   // wait for kernel
+  //   while (cpuIn[0] < stepValue) {
+  //     poll();
+  //   }
 
-    CHECK(recvRanks.size() == sendRanks.size());
+  //   CHECK(recvRanks.size() == sendRanks.size());
 
-    size_t liveSends = 0;
-    for (size_t index = 0; index != sendRanks.size(); ++index) {
+  //   size_t liveSends = 0;
+  //   for (size_t index = 0; index != sendRanks.size(); ++index) {
 
-      // wait for send ready
-      while (cpuIn[1] < stepValue + index + 1) {
-        poll();
-      }
+  //     // wait for send ready
+  //     while (cpuIn[1] < stepValue + index + 1) {
+  //       poll();
+  //     }
 
-      {
-        size_t i = recvRanks[index];
-        size_t di = (rank + index) % devices.size();
-        auto& dev = devices[di];
-        writeStep(di, i, stepValue + index);
-      }
+  //     {
+  //       size_t i = recvRanks[index];
+  //       size_t di = (rank + index) % devices.size();
+  //       auto& dev = devices[di];
+  //       writeStep(di, i, stepValue + index);
+  //     }
 
-      size_t i = sendRanks[index];
-      // wait for dyns
-      while (localProgress[i].stepValue < stepValue + index) {
-        poll();
-      }
-      size_t nbytes = params.bytes;
+  //     size_t i = sendRanks[index];
+  //     // wait for dyns
+  //     while (localProgress[i].stepValue < stepValue + index) {
+  //       poll();
+  //     }
+  //     size_t nbytes = params.bytes;
 
-      if (nbytes > 0) {
-        uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index;
+  //     if (nbytes > 0) {
+  //       uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index;
 
-        liveSends += devices.size();
-        writeDataDistributed2(
-            i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch, localDyns[i].gatherKey,
-            [this, &liveSends, i](size_t di, bool ordered, bool done) {
-              if (done) {
-                --liveSends;
-              }
-              if (ordered) {
-                auto& dev = devices.at(di);
-                writeData(
-                    dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
-                    (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
-                    remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
-              }
-            });
-      }
-      while (liveSends >= devices.size() * 2) {
-        poll();
-      }
-    }
+  //       liveSends += devices.size();
+  //       writeDataDistributed2(
+  //           i, srcAddr, nbytes, sendMr, localDyns[i].gatherAddress + index * params.pitch, localDyns[i].gatherKey,
+  //           [this, &liveSends, i](size_t di, bool ordered, bool done) {
+  //             if (done) {
+  //               --liveSends;
+  //             }
+  //             if (ordered) {
+  //               auto& dev = devices.at(di);
+  //               writeData(
+  //                   dev, i, &sendStepValues[0], sendStepValuesStorageMr->mrs.at(di)->lkey,
+  //                   (void*)(remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (rank * 32 + di)),
+  //                   remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+  //             }
+  //           });
+  //     }
+  //     while (liveSends >= devices.size() * 2) {
+  //       poll();
+  //     }
+  //   }
 
-    while (true) {
-      bool stop = true;
-      for (auto& dev : devices) {
-        while (dev.currentCqEntries) {
-          poll();
-          stop = false;
-        }
-      }
-      if (stop) {
-        break;
-      }
-    }
-    for (auto& dev : devices) {
-      CHECK(dev.currentCqEntries == 0);
-    }
+  //   while (true) {
+  //     bool stop = true;
+  //     for (auto& dev : devices) {
+  //       while (dev.currentCqEntries) {
+  //         poll();
+  //         stop = false;
+  //       }
+  //     }
+  //     if (stop) {
+  //       break;
+  //     }
+  //   }
+  //   for (auto& dev : devices) {
+  //     CHECK(dev.currentCqEntries == 0);
+  //   }
 
-    cpuOut[0] = stepValue;
-    while (cpuIn[0] < stepValue + 1) {
-      poll();
-    }
-  }
+  //   cpuOut[0] = stepValue;
+  //   while (cpuIn[0] < stepValue + 1) {
+  //     poll();
+  //   }
+  // }
 
   template<typename T>
   struct WorkAllocator {
-    PoolAllocatorReused<T> allocator;
-    IntrusiveList<WorkBase, &WorkBase::link> free;
+    PoolAllocator<T> allocator;
+    IntrusiveList<WorkBase, &WorkBase::freeLink> free;
     template<typename... Args>
     T* allocate(Args&&... args) {
       if (!free.empty()) {
@@ -981,37 +994,34 @@ struct CpuThreadImpl {
 
       cpuThread->ready = true;
 
-      std::vector<IntrusiveList<WorkBase, &WorkBase::link>> works;
+      std::vector<IntrusiveList<WorkBase, &WorkBase::concurrencyLink>> concurrency;
+      concurrency.resize(Group::maxConcurrency);
+      std::vector<IntrusiveList<WorkBase, &WorkBase::streamLink>> streams;
+      IntrusiveList<WorkBase, &WorkBase::workLink> activeWorks;
 
       auto enqueue = [&](auto& allocator, auto& params) {
+        CHECK(params.concurrencyIndex < Group::maxConcurrency);
         auto* work = allocator.allocate(*this, params);
         work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
         if (params.sd->cpuThreadIndex == -1) {
-          log.info("new work index %d\n", works.size());
-          params.sd->cpuThreadIndex = works.size();
-          works.emplace_back();
+          log.info("new stream index %d\n", streams.size());
+          params.sd->cpuThreadIndex = streams.size();
+          streams.emplace_back();
         }
-        works[params.sd->cpuThreadIndex].push_back(*work);
+        CHECK(params.sd->cpuThreadIndex < streams.size());
+        if (concurrency[params.concurrencyIndex].empty() && streams[params.sd->cpuThreadIndex].empty()) {
+          activeWorks.push_back(*work);
+        }
+        streams[params.sd->cpuThreadIndex].push_back(*work);
+        concurrency[params.concurrencyIndex].push_back(*work);
+        log.info("work enqueued, params.concurrencyIndex %d\n", params.concurrencyIndex);
       };
 
       while (!cpuThread->terminate.load(std::memory_order_relaxed)) {
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
-          bool allEmpty = true;
-          for (auto& list : works) {
-            if (!list.empty()) {
-              allEmpty = false;
-              break;
-            }
-          }
-          if (allEmpty) {
-            int sum = 0;
-            for (auto& dev : devices) {
-              sum += dev.currentCqEntries;
-            }
-            if (sum == 0) {
-              futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
-              continue;
-            }
+          if (activeWorks.empty() && activeDevices.empty()) {
+            futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+            continue;
           }
         }
         for (int i = 0; i != 256; ++i) {
@@ -1047,15 +1057,47 @@ struct CpuThreadImpl {
           for (int i2 = 0; i2 != 4; ++i2) {
             poll();
 
-            for (auto& list : works) {
-              while (!list.empty()) {
-                Work* w = (Work*)&list.front();
-                (w->*w->stepPtr)();
-                if (!w->done) {
-                  break;
+            for (auto i = activeWorks.begin(); i != activeWorks.end();) {
+              Work* w = (Work*)&*i;
+              CHECK(!w->done);
+              (w->*w->stepPtr)();
+              if (w->done) {
+                auto& params = ((WorkParams*)w)->params;
+                log.info("work done, params.concurrencyIndex %d\n", params.concurrencyIndex);
+                CHECK(&concurrency[params.concurrencyIndex].front() == w);
+                concurrency[params.concurrencyIndex].pop_front();
+                size_t streamIndex = params.sd->cpuThreadIndex;
+                CHECK(&streams[streamIndex].front() == w);
+                streams[streamIndex].pop_front();
+                bool queuedThisConcurrency = false;
+                if (!streams[streamIndex].empty()) {
+                  WorkParams* nextWork = (WorkParams*)&streams[streamIndex].front();
+                  if (&concurrency[nextWork->params.concurrencyIndex].front() == nextWork) {
+                    queuedThisConcurrency = nextWork->params.concurrencyIndex == params.concurrencyIndex;
+                    activeWorks.push_back(*nextWork);
+                  }
                 }
+                if (!queuedThisConcurrency && !concurrency[params.concurrencyIndex].empty()) {
+                  WorkParams* nextWork = (WorkParams*)&concurrency[params.concurrencyIndex].front();
+                  if (&streams[nextWork->params.sd->cpuThreadIndex].front() == nextWork) {
+                    activeWorks.push_back(*nextWork);
+                  }
+                }
+                i = activeWorks.erase(i);
+              } else {
+                ++i;
               }
             }
+
+            // for (auto& list : works) {
+            //   while (!list.empty()) {
+            //     Work* w = (Work*)&list.front();
+            //     (w->*w->stepPtr)();
+            //     if (!w->done) {
+            //       break;
+            //     }
+            //   }
+            // }
           }
         }
       }
@@ -1101,7 +1143,6 @@ struct CpuThreadImpl {
       //     throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
       //   }
       // }
-
     } catch (const std::exception& e) {
       fatal("CPU thread error: %s\n", e.what());
     } catch (QuitCpuThread) {

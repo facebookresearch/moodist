@@ -405,9 +405,9 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
 }
 )";
 
-  auto waitFor32 = [&](uintptr_t address, std::string value) {
+  auto waitFor32 = [&](std::string address, std::string value) {
     return replace(
-        R"(while (*(volatile uint32_t*)$ptr < $value);
+        R"(while (*(volatile uint32_t*)($ptr) < $value);
     )",
         "$ptr", address, "$value", value);
   };
@@ -416,25 +416,27 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
   std::string writes2;
   std::string waits;
   for (size_t i : group->peerIndices) {
-    waits += waitFor32(group->cudaStepValue.cudaPointer + sizeof(uint32_t) * group->ipcRanks[i], "stepValue");
+    waits += waitFor32(concurrencyIndex(group->cudaStepValue, sizeof(uint32_t) * group->ipcRanks[i]), "stepValue");
     writes1 += replace(
         R"(
       ((volatile uintptr_t*)$addrPtr)[0] = params.peerInputAddresses[$i];
       ((volatile uintptr_t*)$addrPtr)[1] = params.peerOutputAddresses[$i];
     )",
-        "$addrPtr", group->peerCudaPeerAddresses[i] + (sizeof(uintptr_t) * 2 * group->peerMyRemoteIndex[i]), "$i", i);
+        "$addrPtr",
+        concurrencyIndex(group->peerCudaPeerAddresses[i], (sizeof(uintptr_t) * 2 * group->peerMyRemoteIndex[i])), "$i",
+        i);
     writes2 += replace(
         R"(
       *(volatile uint32_t*)$ptr = stepValue;
     )",
-        "$ptr", group->peerCudaStepValue[i] + sizeof(uint32_t) * rank);
+        "$ptr", concurrencyIndex(group->peerCudaStepValue[i], sizeof(uint32_t) * rank));
   }
 
   auto waitForRecv = [&](size_t i) {
     std::string s;
     s = replace("// wait for recv from $i\n", "$i", i);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(group->cudaCommsDeviceDataSent.cudaPointer + sizeof(uint32_t) * (i * 32 + di), "stepValue");
+      s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
     }
     return s;
   };
@@ -451,12 +453,12 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
         R"(
   *(volatile uint32_t*)$ptr = stepValue;
       )",
-        "$ptr", group->peerCudaCopyDone[i] + sizeof(uint32_t) * group->peerMyRemoteIndex[i]);
+        "$ptr", concurrencyIndex(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
     waitForCopyDones += replace(
         R"(
   while (*(volatile uint32_t*)$ptr < stepValue);
       )",
-        "$i", i, "$ptr", group->cudaCopyDone.cudaPointer + sizeof(uint32_t) * i);
+        "$i", i, "$ptr", concurrencyIndex(group->cudaCopyDone, sizeof(uint32_t) * i));
   }
 
   source += replace(
@@ -464,18 +466,20 @@ __device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, con
 template<typename Params>
 __device__ void generic_entry_local(const Params& params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+  [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   $writes1
   __threadfence_system();
   $writes2
   $waits
 }
-__device__ void generic_exit_local(uint32_t stepValue) {
+__device__ void generic_exit_local(uint32_t stepValue, uint32_t concurrencyIndex) {
   $copyDoneAllCode
   $waitForCopyDones
 }
 template<typename Params>
 __device__ void generic_entry(const Params& params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+  [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   cpuIn[0] = stepValue;
   $writes1
@@ -483,7 +487,7 @@ __device__ void generic_entry(const Params& params) {
   $writes2
   $waits
 }
-__device__ void generic_exit(uint32_t stepValue) {
+__device__ void generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   $copyDoneAllCode
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
@@ -500,6 +504,7 @@ template<typename Params>
 __device__ void grid_generic_entry_local(const Params& params) {
   if (threadIdx.x == 0) {
     [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+    [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
     if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
       $writes1
       __threadfence_system();
@@ -509,7 +514,7 @@ __device__ void grid_generic_entry_local(const Params& params) {
   }
   syncthreads();
 }
-__device__ void grid_generic_exit_local(uint32_t stepValue) {
+__device__ void grid_generic_exit_local(uint32_t stepValue, uint32_t concurrencyIndex) {
   __threadfence_system();
   syncthreads();
   if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
@@ -521,6 +526,7 @@ template<typename Params>
 __device__ void grid_generic_entry(const Params& params) {
   if (threadIdx.x == 0) {
     [[maybe_unused]] const uint32_t stepValue = params.stepValue;
+    [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
     volatile uint32_t* __restrict__ cpuIn = $cpuIn;
     if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
       cpuIn[0] = stepValue;
@@ -532,7 +538,7 @@ __device__ void grid_generic_entry(const Params& params) {
   }
   syncthreads();
 }
-__device__ void grid_generic_exit(uint32_t stepValue) {
+__device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   __threadfence_system();
   syncthreads();
   if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
@@ -566,11 +572,10 @@ __device__ void grid_generic_exit(uint32_t stepValue) {
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);
 
-  source = replace(source, "$sharedMemSize", 40960);
-
   source = replace(
-      source, "$rank", rank, "$cpuOut", cast("volatile uint32_t*", cpuOutBuffer.cudaPointer), "$cpuIn",
-      cast("volatile uint32_t*", cpuInBuffer.cudaPointer));
+      source, "$cpuOut", cast("volatile uint32_t*", concurrencyIndex(cpuOutBuffer)), "$cpuIn",
+      cast("volatile uint32_t*", concurrencyIndex(cpuInBuffer)));
+  source = replace(source, "$rank", rank, "$size", size);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);
@@ -578,12 +583,20 @@ __device__ void grid_generic_exit(uint32_t stepValue) {
 
   std::string cuFilename = fmt::sprintf("moodist-kernels-rank%d.cu", rank);
 
-  if (false) {
+  auto boolenv = [&](const char* name) {
+    const char* c = std::getenv(name);
+    if (!c) {
+      return false;
+    }
+    return !strcmp(c, "1");
+  };
+
+  if (boolenv("MOODIST_DUMP_KERNELS")) {
     FILE* f = fopen(cuFilename.c_str(), "wb");
     if (f) {
       fwrite(source.data(), source.size(), 1, f);
       fclose(f);
-      fmt::printf("source dumped to %s\n", cuFilename);
+      log.info("source dumped to %s\n", cuFilename);
     }
   }
 

@@ -112,11 +112,6 @@ struct AllocatedBuffer {
   }
 };
 
-template<typename T>
-struct ArrayAccessor {
-  void* base;
-};
-
 struct AllocatedArray {
   AllocatedBuffer buffer;
   size_t itembytes;
@@ -130,7 +125,15 @@ struct AllocatedArray {
     return (uintptr_t)buffer.cudaPointer + itembytes * index;
   }
 
-  
+  template<typename T>
+  T& at(size_t index) {
+    return *(T*)cpu(index);
+  }
+};
+
+struct PeerArrayRef {
+  uintptr_t base = 0;
+  uintptr_t itembytes = 0;
 };
 
 struct IpcMemHash {

@@ -19,6 +19,7 @@ struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
   uint8_t task;
   uint32_t stepValue;
+  uint32_t concurrencyIndex = -1;
   StreamData* sd = nullptr;
 };
 

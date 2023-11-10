@@ -11,6 +11,7 @@ namespace moodist {
 
 struct AllGatherParameters {
   uint32_t stepValue;
+  uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
   uintptr_t inputAddress;
