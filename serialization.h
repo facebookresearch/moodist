@@ -10,6 +10,7 @@
 #include "buffer.h"
 #include "hash_map.h"
 #include "vector.h"
+#include "simple_vector.h"
 
 #include <cstddef>
 #include <cstring>
@@ -142,6 +143,16 @@ void serialize(X& x, const Vector<T>& v) {
 
 template<typename X, typename T>
 void serialize(X& x, Vector<T>& v) {
+  serializeVector(x, v);
+}
+
+template<typename X, typename T>
+void serialize(X& x, const SimpleVector<T>& v) {
+  serializeVector(x, v);
+}
+
+template<typename X, typename T>
+void serialize(X& x, SimpleVector<T>& v) {
   serializeVector(x, v);
 }
 

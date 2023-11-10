@@ -380,6 +380,7 @@ struct ProcessGroupImpl {
       e->stepValue = stepValue;
       e->concurrencyIndex = concurrencyIndex;
       e->sd = &group->getStreamData(stream);
+      e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
       e->bytes = pitch;
       e->pitch = pitch;

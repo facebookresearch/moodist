@@ -27,6 +27,7 @@ else:
 
 os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
+
 def f(n):
     import torch
     import torch.distributed as dist
@@ -37,7 +38,8 @@ def f(n):
         # sys.path.append("/home/vegardmella/moolib/py")
         # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
-        #moodist.enable_profiling(True)
+
+        # moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
 
@@ -50,6 +52,9 @@ def f(n):
     dist.init_process_group(
         backend=n,
     )
+
+    group1 = dist.new_group()
+    group2 = dist.new_group()
 
     rank = dist.get_rank()
     size = dist.get_world_size()
@@ -94,20 +99,20 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        #data = torch.randn(4).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 32).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        #data = torch.randn(263520).cuda() + 1
+        # data = torch.randn(4).cuda() + 1
+        # data = torch.randn(1024 * 1024 * 32).cuda() + 1
+        # data = torch.randn(1024 * 1024 * 256).cuda() + 1
+        # data = torch.randn(263520).cuda() + 1
         data = torch.randn(442416).cuda() + 1
-        #data = torch.randn(262144 - 1024).cuda() + 1
-        #data = torch.randn(262144 - 64).cuda() + 1
-        #data = torch.randn(682678 // 2).cuda() + 1
-        #data = torch.randn(1024 * 1024).cuda() + 1
-        #data = torch.randn(1024).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 800).cuda() + 1
-        #data = torch.randn(1536024 // 2, device="cuda") + 1
+        # data = torch.randn(262144 - 1024).cuda() + 1
+        # data = torch.randn(262144 - 64).cuda() + 1
+        # data = torch.randn(682678 // 2).cuda() + 1
+        # data = torch.randn(1024 * 1024).cuda() + 1
+        # data = torch.randn(1024).cuda() + 1
+        # data = torch.randn(1024 * 1024 * 800).cuda() + 1
+        # data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 4).cuda() + 1
+        # data = torch.randn(1024 * 1024 * 4).cuda() + 1
         if rank == 0:
             print("all-gather")
         result = [torch.zeros_like(data) for _ in range(size)]
@@ -117,7 +122,7 @@ def f(n):
         # tmp2 = data2.clone()
 
         result0 = torch.cat(result)
-        #result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
+        # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
         print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
@@ -145,8 +150,14 @@ def f(n):
 
         print("result0 is at %#x" % result0.data_ptr())
 
+        stream1 = torch.cuda.Stream()
+        stream2 = torch.cuda.Stream()
+
+        tmp2 = tmp.clone()
+        result02 = result0.clone()
+
         for _ in range(100):
-            #print("rank %d warmup %d" % (rank, _))
+            # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
             result0 -= 1
@@ -154,7 +165,11 @@ def f(n):
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             # dist.all_gather(result, tmp)
-            dist._all_gather_base(result0, tmp)
+            with torch.cuda.stream(stream1):
+                dist._all_gather_base(result0, tmp)
+            with torch.cuda.stream(stream2):
+                dist._all_gather_base(result02, tmp2)
+            torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
@@ -168,7 +183,9 @@ def f(n):
                         print("%d: data.data_ptr() is %#x" % (rank, data.data_ptr()))
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         print("%d: should be %f" % (rank, v.sum()))
-                        indices = ((result[i] - v).abs() >= 1e-3).nonzero(as_tuple=True)[0]
+                        indices = ((result[i] - v).abs() >= 1e-3).nonzero(
+                            as_tuple=True
+                        )[0]
                         print(
                             "%d: indices " % rank,
                             indices,
@@ -191,7 +208,7 @@ def f(n):
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         raise RuntimeError("%d: wrong result for index %d" % (rank, i))
             torch.cuda.synchronize()
-            #print("rank %d warmup %d done" % (rank, _))
+            # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
         print("rank %d warmup done" % (rank))
@@ -207,7 +224,7 @@ def f(n):
                     dist._all_gather_base(test2_result, test2_data)
                 torch.cuda.synchronize()
                 print("rank %d test2 done" % rank)
-                
+
                 tmpz.append(test2_data)
                 tmpz.append(test2_result)
 
@@ -216,6 +233,7 @@ def f(n):
             tmpz = None
 
             import random
+
             random.seed(42)
             for x in range(100):
                 print("rank %d enter test3 %d\n" % (rank, x))
@@ -300,7 +318,7 @@ def f(n):
                 loopcount = 100
                 for _ in range(loopcount):
                     dist._all_gather_base(result0, tmp)
-                    #torch.cuda.synchronize()
+                    # torch.cuda.synchronize()
             torch.cuda.synchronize()
             prof.export_chrome_trace(f"trace-{rank}.json")
             moodist.enable_profiling(False)
@@ -323,7 +341,7 @@ def f(n):
             for i in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
-        elif 1 == 14:
+        elif 1 == 1:
             loopcount = 1000
             events1 = []
             events2 = []
@@ -337,14 +355,14 @@ def f(n):
                 with torch.cuda.stream(stream1):
                     if len(events1) >= 2:
                         events1.pop(0).synchronize()
-                    dist.all_gather_into_tensor(result0, tmp)
+                    dist.all_gather_into_tensor(result0, tmp, group=group1)
                     e = torch.cuda.Event()
                     e.record()
                     events1.append(e)
                 with torch.cuda.stream(stream2):
                     if len(events2) >= 2:
                         events2.pop(0).synchronize()
-                    dist.all_gather_into_tensor(result02, tmp2)
+                    dist.all_gather_into_tensor(result02, tmp2, group=group1)
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
@@ -528,7 +546,7 @@ def f(n):
             ##si = tmp.sum().item()
             # print("-> %f" % si)
             # sum += si
-            #torch.cuda.synchronize()
+            # torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)
@@ -557,7 +575,7 @@ def f(n):
     # dist.barrier()
     torch.cuda.synchronize()
 
-    #moodist.enable_profiling(False)
+    # moodist.enable_profiling(False)
 
     # correct = torch.zeros_like(data)
 
@@ -572,6 +590,7 @@ def f(n):
     # diff = data - correct
     # print(diff.abs().max())
 
+
 if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
@@ -580,12 +599,17 @@ ngpus = 8
 
 fds = []
 for i in range(ngpus):
-    fds.append(os.open("out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i), os.O_WRONLY|os.O_CREAT|os.O_TRUNC))
+    fds.append(
+        os.open(
+            "out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        )
+    )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
+# for n in ("moodist", "nccl"):
 for n in ("nccl", "moodist"):
-#for n in ("moodist",):
+    # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

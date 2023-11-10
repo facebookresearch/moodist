@@ -197,9 +197,9 @@ struct CollectiveBase {
     bool isInComment = false;
     for (int line = 1; *c; ++line) {
       if (isInComment) {
-        r += fmt::sprintf(" * % 4d *  ", line);
+        r += fmt::sprintf(" * % 5d *  ", line);
       } else {
-        r += fmt::sprintf("/* % 4d */ ", line);
+        r += fmt::sprintf("/* % 5d */ ", line);
       }
       const char* p = c;
       while (*c && *c != '\n') {

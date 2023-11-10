@@ -137,12 +137,12 @@ std::string ReduceScatter::generate() {
       }
 
       reduceFlush();
-      globaldefs += replace("__device__ uint32_t sendReadyCounter_$n = 0;\n", "$n", n);
+      globaldefs += replace("__device__ uint32_t sendReadyCounter_$n[$maxConcurrency];\n", "$n", n);
       reduceCode += replace(
           R"(
         __threadfence_system();
         syncthreads();
-        if (threadIdx.x == 0 && atomicInc(&sendReadyCounter_$n, $gridSize - 1) == $gridSize - 1) {
+        if (threadIdx.x == 0 && atomicInc(&sendReadyCounter_$n[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
           $cpuIn[1] = stepValue + $n + 1;
         }
       )",
@@ -156,7 +156,7 @@ std::string ReduceScatter::generate() {
     reduceCode += R"(
       __threadfence_system();
       syncthreads();
-      if (threadIdx.x != 0 || atomicInc(&exitCounter, $gridSize - 1) != $gridSize - 1) {
+      if (threadIdx.x != 0 || atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) != $gridSize - 1) {
         return false;
       }
       )";

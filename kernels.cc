@@ -497,15 +497,15 @@ __device__ void generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   $waitForRecvs
 }
 
-__device__ uint32_t entryCounter = 0;
-__device__ uint32_t exitCounter = 0;
+__device__ uint32_t entryCounter[$maxConcurrency];
+__device__ uint32_t exitCounter[$maxConcurrency];
 
 template<typename Params>
 __device__ void grid_generic_entry_local(const Params& params) {
   if (threadIdx.x == 0) {
     [[maybe_unused]] const uint32_t stepValue = params.stepValue;
     [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
-    if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
       $writes1
       __threadfence_system();
       $writes2
@@ -517,7 +517,7 @@ __device__ void grid_generic_entry_local(const Params& params) {
 __device__ void grid_generic_exit_local(uint32_t stepValue, uint32_t concurrencyIndex) {
   __threadfence_system();
   syncthreads();
-  if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
     $copyDoneAllCode
     $waitForCopyDones
   }
@@ -528,7 +528,7 @@ __device__ void grid_generic_entry(const Params& params) {
     [[maybe_unused]] const uint32_t stepValue = params.stepValue;
     [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
     volatile uint32_t* __restrict__ cpuIn = $cpuIn;
-    if (atomicInc(&entryCounter, $gridSize - 1) == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
       cpuIn[0] = stepValue;
       $writes1
       __threadfence_system();
@@ -541,7 +541,7 @@ __device__ void grid_generic_entry(const Params& params) {
 __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   __threadfence_system();
   syncthreads();
-  if (threadIdx.x == 0 && atomicInc(&exitCounter, $gridSize - 1) == $gridSize - 1) {
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
     $copyDoneAllCode
     volatile uint32_t* __restrict__ cpuIn = $cpuIn;
     volatile uint32_t* __restrict__ cpuOut = $cpuOut;
@@ -575,7 +575,7 @@ __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex)
   source = replace(
       source, "$cpuOut", cast("volatile uint32_t*", concurrencyIndex(cpuOutBuffer)), "$cpuIn",
       cast("volatile uint32_t*", concurrencyIndex(cpuInBuffer)));
-  source = replace(source, "$rank", rank, "$size", size);
+  source = replace(source, "$rank", rank, "$size", size, "$maxConcurrency", Group::maxConcurrency);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);

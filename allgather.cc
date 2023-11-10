@@ -287,13 +287,13 @@ std::string AllGather::generate() {
     }
 
     if (isInGrid) {
-      globaldefs += replace("__device__ uint32_t dataReadyCounter_$n = 0;\n", "$n", i);
+      globaldefs += replace("__device__ uint32_t dataReadyCounter_$n[$maxConccurency];\n", "$n", i);
       recvCopies += replace(
           R"(
         syncthreads();
         __threadfence_system();
         if (threadIdx.x == 0) {
-          if (atomicInc(&dataReadyCounter_$n, $gridSize - 1) == 0) {
+          if (atomicInc(&dataReadyCounter_$n[concurrencyIndex], $gridSize - 1) == 0) {
             *(volatile uint32_t*)$forwardPtr = stepValue;
           }
           while (*(volatile uint32_t*)$readyPtr < stepValue);
@@ -410,7 +410,7 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   __threadfence_system();
   syncthreads();
-  if (threadIdx.x != 0 || atomicInc(&exitCounter, $gridSize - 1) != $gridSize - 1) {
+  if (threadIdx.x != 0 || atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) != $gridSize - 1) {
     return;
   }
 

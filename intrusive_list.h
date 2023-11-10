@@ -86,6 +86,25 @@ public:
     prev(&head) = &head;
     next(&head) = &head;
   }
+  IntrusiveList(const IntrusiveList&) = delete;
+  IntrusiveList(IntrusiveList&& n) {
+    *this = std::move(n);
+  }
+  IntrusiveList& operator=(const IntrusiveList&) = delete;
+  IntrusiveList& operator=(IntrusiveList&& n) {
+    if (n.empty()) {
+      clear();
+    } else {
+      auto hp = prev(&n.head);
+      auto hn = next(&n.head);
+      prev(hn) = &head;
+      next(hp) = &head;
+      prev(&head) = hp;
+      next(&head) = hn;
+      n.clear();
+    }
+    return *this;
+  }
 
   iterator begin() noexcept {
     return iterator(next(&head));
