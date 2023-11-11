@@ -125,7 +125,7 @@ from datetime import timedelta
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    return ProcessGroup(store, rank, size, timeout)
+    return MoodistProcessGroup(store, rank, size)
 
 
 torch.distributed.Backend.register_backend("moodist", create_moodist_backend)

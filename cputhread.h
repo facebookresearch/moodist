@@ -14,6 +14,7 @@ constexpr uint8_t taskTerminate = 0;
 constexpr uint8_t taskBarrier = 1;
 constexpr uint8_t taskAllgather = 2;
 constexpr uint8_t taskReduceScatter = 3;
+constexpr uint8_t taskBroadcast = 4;
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
@@ -39,6 +40,12 @@ struct QueueEntryReduceScatter : QueueEntry {
   uintptr_t outputAddress = 0;
   size_t bytes = 0;
   size_t pitch = 0;
+};
+
+struct QueueEntryBroadcast : QueueEntry {
+  uintptr_t tensorAddress = 0;
+  size_t bytes = 0;
+  size_t sourceRank = 0;
 };
 
 template<typename T>
@@ -82,6 +89,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
   QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
+  QueueEntryFreeList<QueueEntryBroadcast> freelistBroadcast;
 
   CpuThread(Group*);
   ~CpuThread();

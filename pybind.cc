@@ -29,15 +29,11 @@ namespace py = pybind11;
 using MoodistProcessGroup = moodist::ProcessGroup;
 
 PYBIND11_MODULE(_C, m) {
-  py::class_<MoodistProcessGroup>(m, "MoodistProcessGroup", R"d(
+  py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>, c10d::ProcessGroup>(
+      m, "MoodistProcessGroup", R"d(
     A moodist process group :D
   )d")
-      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
-      .def("barrier", &MoodistProcessGroup::barrier, py::call_guard<py::gil_scoped_release>())
-      .def("all_gather_list", &MoodistProcessGroup::all_gather_list, py::call_guard<py::gil_scoped_release>())
-      .def("all_gather", &MoodistProcessGroup::all_gather, py::call_guard<py::gil_scoped_release>())
-      .def("reduce_scatter_list", &MoodistProcessGroup::reduce_scatter_list, py::call_guard<py::gil_scoped_release>())
-      .def("reduce_scatter", &MoodistProcessGroup::reduce_scatter, py::call_guard<py::gil_scoped_release>());
+      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>());
   m.def("enable_profiling", [](bool b) {
     printf("enable profiling -> %d\n", b);
     moodist::profilingEnabled = b;

@@ -510,10 +510,16 @@ struct CpuThreadImpl {
     void* state = nullptr;
     bool done = false;
     void (*stepPtr)(Work*);
-    uint32_t concurrencyIndex;
-    uint32_t streamIndex;
+    const QueueEntry& params;
+    const uint32_t stepValue = params.stepValue;
+    const uint32_t concurrencyIndex = params.concurrencyIndex;
+    const uint32_t streamIndex = params.sd->cpuThreadIndex;
+    const size_t size = self.size;
+    const size_t rank = self.rank;
+    volatile uint32_t* const cpuIn = &self.group->cpuInBuffer.at<volatile uint32_t>(concurrencyIndex);
+    volatile uint32_t* const cpuOut = &self.group->cpuOutBuffer.at<volatile uint32_t>(concurrencyIndex);
 
-    Work(CpuThreadImpl& self) : self(self) {}
+    Work(CpuThreadImpl& self, const QueueEntry& params) : self(self), params(params) {}
   };
 
 #define CAT2(a, b) a##b
@@ -540,11 +546,7 @@ struct CpuThreadImpl {
     QueueEntryBarrier& params;
     size_t i;
 
-    const uint32_t stepValue = params.stepValue;
-    const size_t size = self.size;
-    const size_t rank = self.rank;
-
-    WorkBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self), params(params) {}
+    WorkBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self, params), params(params) {}
 
     void step() {
       ENTER
@@ -578,24 +580,16 @@ struct CpuThreadImpl {
     MemoryRegistration* inputMr;
     size_t liveSends;
     size_t index;
-    volatile uint32_t* cpuIn;
-    volatile uint32_t* cpuOut;
     size_t nDynReady = 0;
 
-    const uint32_t stepValue = params.stepValue;
-    const size_t size = self.size;
-    const size_t rank = self.rank;
     const AllGather& allGather = *self.group->allGather;
     const std::vector<size_t>& sendRanks = allGather.sendRanks;
     const std::vector<size_t>& recvRanks = allGather.recvRanks;
 
-    WorkAllGather(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self), params(params) {}
+    WorkAllGather(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {}
 
     void step() {
       ENTER
-
-      cpuIn = &self.group->cpuInBuffer.at<volatile uint32_t>(concurrencyIndex);
-      cpuOut = &self.group->cpuOutBuffer.at<volatile uint32_t>(concurrencyIndex);
 
       {
         inputMr = self.regMrCuda(params.inputAddress, params.bytes);
@@ -703,25 +697,17 @@ struct CpuThreadImpl {
     MemoryRegistration* sendMr;
     size_t liveSends;
     size_t index;
-    volatile uint32_t* cpuIn;
-    volatile uint32_t* cpuOut;
     size_t nDynReady = 0;
     uintptr_t sendAddress;
 
-    const uint32_t stepValue = params.stepValue;
-    const size_t size = self.size;
-    const size_t rank = self.rank;
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
     const std::vector<size_t>& sendRanks = reduceScatter.sendRanks;
     const std::vector<size_t>& recvRanks = reduceScatter.recvRanks;
 
-    WorkReduceScatter(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self), params(params) {}
+    WorkReduceScatter(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params) {}
 
     void step() {
       ENTER
-
-      cpuIn = &self.group->cpuInBuffer.at<volatile uint32_t>(concurrencyIndex);
-      cpuOut = &self.group->cpuOutBuffer.at<volatile uint32_t>(concurrencyIndex);
 
       {
         uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
@@ -839,6 +825,126 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkBroadcast : Work {
+    QueueEntryBroadcast& params;
+    size_t i;
+    MemoryRegistration* tensorMr;
+    size_t liveSends;
+    size_t nDynReady = 0;
+
+    WorkBroadcast(CpuThreadImpl& self, QueueEntryBroadcast& params) : Work(self, params), params(params) {}
+
+    void step() {
+      ENTER
+
+      tensorMr = self.regMrCuda(params.tensorAddress, params.bytes);
+
+      if (params.sourceRank != rank) {
+        {
+          DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+          for (size_t i = 0; i != size; ++i) {
+            if (i == rank) {
+              continue;
+            }
+            outDyns[i].gatherAddress = params.tensorAddress;
+            for (size_t di = 0; di != self.devices.size(); ++di) {
+              outDyns[i].gatherKey[di] = tensorMr->mrs[di]->rkey;
+            }
+          }
+
+          // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+          // until kernel entry, such that we don't receive data until we're ready.
+          nDynReady = 0;
+          {
+            size_t n = 0;
+            for (size_t i = 0; i != size; ++i) {
+              if (i == rank) {
+                continue;
+              }
+              size_t di = (rank + n) % self.devices.size();
+              auto& dev = self.devices[di];
+              self.writeData(
+                  dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                  (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
+                  self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+              ++n;
+            }
+          }
+        }
+
+        // wait for kernel
+        while (cpuIn[0] < stepValue) {
+          YIELD
+        }
+
+        while (nDynReady < size - 1) {
+          YIELD
+        }
+
+        i = params.sourceRank;
+        {
+          size_t di = (rank + i) % self.devices.size();
+          self.writeStep(di, i, stepValue, concurrencyIndex);
+        }
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
+          YIELD
+        }
+      } else {
+
+        // wait for kernel
+        while (cpuIn[0] < stepValue) {
+          YIELD
+        }
+
+        liveSends = 0;
+        for (i = 0; i != size; ++i) {
+          if (i == rank) {
+            continue;
+          }
+          // wait for dyns
+          while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
+            YIELD
+          }
+
+          if (params.bytes > 0) {
+            uintptr_t srcAddr = (uintptr_t)params.tensorAddress;
+
+            liveSends += self.devices.size();
+            self.writeDataDistributed2(
+                i, srcAddr, params.bytes, tensorMr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
+                self.localDyns[size * concurrencyIndex + i].gatherKey,
+                [this, i = this->i](size_t di, bool ordered, bool done) {
+                  if (done) {
+                    --liveSends;
+                  }
+                  if (ordered) {
+                  }
+                });
+          }
+          while (liveSends) {
+            YIELD
+          }
+          size_t di = (rank + i) % self.devices.size();
+          self.writeStep(di, i, stepValue, concurrencyIndex);
+        }
+
+        while (liveSends) {
+          YIELD
+        }
+      }
+
+      cpuOut[0] = stepValue;
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      self.cpuThread->freelistBroadcast.push(&params);
+      self.allocatorBroadcast.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -861,6 +967,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkBarrier> allocatorBarrier;
   WorkAllocator<WorkAllGather> allocatorAllGather;
   WorkAllocator<WorkReduceScatter> allocatorReduceScatter;
+  WorkAllocator<WorkBroadcast> allocatorBroadcast;
 
   void entry() {
     try {
@@ -876,16 +983,14 @@ struct CpuThreadImpl {
 
       auto enqueue = [&](auto& allocator, auto& params) {
         CHECK(params.concurrencyIndex < Group::maxConcurrency);
-        auto* work = allocator.allocate(*this, params);
-        // work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
-        work->stepPtr = [](Work* w) { ((decltype(work))w)->step(); };
         if (params.sd->cpuThreadIndex == -1) {
           // log.info("new stream index %d\n", streams.size());
           params.sd->cpuThreadIndex = streams.size();
           streams.resize(streams.size() + 1);
         }
-        work->concurrencyIndex = params.concurrencyIndex;
-        work->streamIndex = params.sd->cpuThreadIndex;
+        auto* work = allocator.allocate(*this, params);
+        // work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
+        work->stepPtr = [](Work* w) { ((decltype(work))w)->step(); };
         CHECK(work->streamIndex < streams.size());
         if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
           activeWorks.push_back(*work);
@@ -928,6 +1033,8 @@ struct CpuThreadImpl {
               enqueue(allocatorReduceScatter, (QueueEntryReduceScatter&)queueEntry);
             } else if (queueEntry.task == taskTerminate) {
               cpuThread->freelistTerminate.push(&queueEntry);
+            } else if (queueEntry.task == taskBroadcast) {
+              enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }

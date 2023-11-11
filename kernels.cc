@@ -553,6 +553,13 @@ __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex)
 }
 
 }
+
+extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyIndex) {
+  volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+  volatile uint32_t* __restrict__ cpuOut = $cpuOut;
+  cpuIn[0] = stepValue + 1;
+  while (cpuOut[0] < stepValue);
+}
   )",
       "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones, "$waitForRecvs",
       waitForRecvs, "$copyDoneAllCode", copyDoneAllCode);
@@ -568,6 +575,8 @@ __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex)
 
   fn(cuReduceScatterLocal, "reduce_scatter_local");
   fn(cuReduceScatter, "reduce_scatter");
+
+  fn(cuBroadcast, "broadcast");
 
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);

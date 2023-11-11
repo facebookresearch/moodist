@@ -13,6 +13,7 @@
 #include "synchronization.h"
 #include "vector.h"
 
+#include <ATen/ops/pad.h>
 #include <c10/core/Device.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAStream.h>
@@ -428,10 +429,6 @@ struct ProcessGroupImpl {
     trace("post");
   }
 
-  void all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
-    TORCH_CHECK(false, "all_gather_list");
-  }
-
   void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp) {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
@@ -583,7 +580,57 @@ struct ProcessGroupImpl {
     trace("post");
   }
 
-  void reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp reduceOp) {}
+  void broadcast(const torch::Tensor& tensor, uint32_t sourceRank) {
+    std::lock_guard l(mutex);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    TORCH_CHECK(tensor.is_contiguous());
+    TORCH_CHECK(tensor.is_cuda());
+    TORCH_CHECK(tensor.device().index() == group->deviceIndex);
+    TORCH_CHECK(sourceRank < size);
+
+    size_t numel = tensor.numel();
+    size_t bytes = numel * tensor.itemsize();
+
+    uintptr_t tensorAddress = (uintptr_t)tensor.data_ptr();
+
+    CHECK(tensorAddress % 16 == 0);
+
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
+
+    StreamData& sd = group->getStreamData(stream);
+
+    Group* group = &*this->group;
+
+    if (!group->kernels->cuModule) {
+      group->kernels->compile();
+    }
+
+    QueueEntryBroadcast* e = group->cpuThread->freelistBroadcast.pop();
+    e->task = taskBroadcast;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->tensorAddress = tensorAddress;
+    e->bytes = bytes;
+    e->sourceRank = sourceRank;
+    group->cpuThread->enqueue(e);
+
+    std::array<void*, 2> params = {&stepValue, &concurrencyIndex};
+
+    size_t gridSize = 1;
+    size_t blockSize = 1;
+
+    CHECK_CU(cuLaunchKernel(
+        group->kernels->cuBroadcast, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+
+    trace("post");
+  }
 };
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
@@ -600,31 +647,130 @@ void registerFreeMemoryCallback() {
   at::FreeCudaMemoryCallbacksRegistry()->Register("moodist", []() { return std::make_unique<FreeMemoryCallback>(); });
 }
 
-ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) {
+ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
+    : c10d::ProcessGroup(rank, size) {
   impl = std::make_unique<ProcessGroupImpl>(store, rank, size);
 }
 ProcessGroup::~ProcessGroup() {
   impl.reset();
 }
 
-void ProcessGroup::all_gather(at::Tensor& output, const at::Tensor& input) {
-  return impl->all_gather(output, input);
+struct WorkImpl : c10d::Work {
+  std::variant<torch::Tensor, std::vector<torch::Tensor>> var;
+  virtual void synchronize() override {}
+  virtual bool wait(std::chrono::milliseconds timeout) override {
+    return true;
+  }
+
+  WorkImpl(torch::Tensor result) : var(result) {}
+  WorkImpl(std::vector<torch::Tensor> result) : var(result) {}
+
+  virtual c10::intrusive_ptr<c10::ivalue::Future> getFuture() override {
+    std::vector<torch::Tensor> result;
+    if (var.index() == 0) {
+      result = {std::get<0>(var)};
+    } else {
+      result = std::get<1>(var);
+    }
+    auto fut = c10::make_intrusive<at::ivalue::Future>(
+        c10::ListType::create(c10::TensorType::get()), std::vector<c10::Device>{result[0].device()});
+    fut->markCompleted(at::IValue(result));
+    return fut;
+  }
+};
+
+c10::intrusive_ptr<Work> ProcessGroup::allgather(
+    std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
+    const c10d::AllgatherOptions& opts) {
+  TORCH_CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
+  const auto& input = inputTensors[0];
+  int64_t numel = input.numel();
+  const auto& outputList = outputTensors[0];
+  for (auto& v : outputList) {
+    TORCH_CHECK(v.numel() == numel);
+  }
+  auto output =
+      torch::empty({(int64_t)impl->size, numel}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+  impl->all_gather(output, input);
+  for (size_t i = impl->size; i;) {
+    --i;
+    outputList[i].copy_(output[i]);
+  }
+  return c10::make_intrusive<WorkImpl>(outputList);
 }
 
-void ProcessGroup::all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
-  return impl->all_gather_list(output, input);
+c10::intrusive_ptr<Work>
+ProcessGroup::_allgather_base(at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
+  impl->all_gather(outputbuffer, inputbuffer);
+  return c10::make_intrusive<WorkImpl>(outputbuffer);
 }
 
-void ProcessGroup::reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp op) {
-  return impl->reduce_scatter(output, input, op);
+c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
+    at::Tensor& outputTensor, at::Tensor& inputTensor, const c10d::ReduceScatterOptions& opts) {
+  impl->reduce_scatter(outputTensor, inputTensor, opts.reduceOp);
+  return c10::make_intrusive<WorkImpl>(outputTensor);
 }
 
-void ProcessGroup::reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp op) {
-  return impl->reduce_scatter_list(output, input, op);
+c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
+  impl->barrier();
+  return c10::make_intrusive<WorkImpl>(torch::Tensor());
 }
 
-void ProcessGroup::barrier() {
-  return impl->barrier();
+c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1);
+  impl->broadcast(tensors[0], opts.rootRank);
+  return c10::make_intrusive<WorkImpl>(tensors);
 }
+
+c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1);
+  auto& tensor = tensors[0];
+  if (tensor.numel() % impl->size == 0) {
+    auto t = tensor.view({(int64_t)impl->size, -1});
+    auto o = t[impl->rank];
+    impl->reduce_scatter(o, t, opts.reduceOp);
+    impl->all_gather(t, o);
+    return c10::make_intrusive<WorkImpl>(tensors);
+  } else {
+    int64_t numel = tensor.numel();
+    int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
+    newsize = (newsize + 127) / 128u * 128u;
+    size_t bytes = numel * tensor.itemsize();
+    torch::Tensor temporary =
+        torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+    CHECK_CU(cuMemcpyAsync(
+        (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+
+    auto t = temporary.view({(int64_t)impl->size, -1});
+    auto o = t[impl->rank];
+    impl->reduce_scatter(o, t, opts.reduceOp);
+    impl->all_gather(t, o);
+
+    CHECK_CU(cuMemcpyAsync(
+        (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+
+    return c10::make_intrusive<WorkImpl>(tensors);
+  }
+}
+
+// void ProcessGroup::all_gather(at::Tensor& output, const at::Tensor& input) {
+//   return impl->all_gather(output, input);
+// }
+
+// void ProcessGroup::all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
+//   return impl->all_gather_list(output, input);
+// }
+
+// void ProcessGroup::reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp op) {
+//   return impl->reduce_scatter(output, input, op);
+// }
+
+// void ProcessGroup::reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp op) {
+//   return impl->reduce_scatter_list(output, input, op);
+// }
+
+// void ProcessGroup::barrier() {
+//   return impl->barrier();
+// }
 
 } // namespace moodist
