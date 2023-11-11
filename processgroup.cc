@@ -193,6 +193,7 @@ struct ProcessGroupImpl {
     } else {
       key = get("moodist_pg_key");
     }
+    group->setupComms->key = key;
     set(fmt::sprintf("moodist_pg_rank%d_address", rank), getAddress());
     int prevRank = (rank + size - 1) % size;
     int nextRank = (rank + 1) % size;

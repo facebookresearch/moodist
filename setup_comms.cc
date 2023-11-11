@@ -137,7 +137,7 @@ struct SetupCommsImpl : SetupComms {
     // std::fflush(stdout);
     auto connection = context.connect(address);
     auto buffer =
-        serializeToBuffer(signature, myId, (uint32_t)rank, ~(uint32_t)0, (uint32_t)0, std::string_view("connect"));
+        serializeToBuffer(signature, myId, (uint32_t)rank, ~(uint32_t)0, (uint32_t)0, std::string_view("connect"), key);
     connection->write(std::move(buffer), nullptr);
 
     floatingConnections.push_back(connection);
@@ -180,31 +180,31 @@ struct SetupCommsImpl : SetupComms {
       } else {
         CHECK(destinationRank == ~(uint32_t)0);
 
-        bool isNew = false;
-        if (dead) {
+        try {
+          std::string_view connectstr;
+          std::string_view keystr;
+          deserializeBuffer(view, connectstr, keystr);
+          if (connectstr != "connect" || keystr != key) {
+            return;
+          }
+        } catch (const std::exception&) {
           return;
         }
-        if (!prev && sourceRank == (rank + size - 1) % size) {
-          // fmt::printf(
-          //     "%d: Got prev connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
-          //     destinationRank);
-          std::fflush(stdout);
-          prev = connection;
-          connectionIds[sourceRank] = rankId;
-          isNew = true;
-        }
-        if (!next && sourceRank == (rank + 1) % size) {
-          // fmt::printf(
-          //     "%d: Got next connection to rank %d (id %#x) (destination %d)\n", rank, sourceRank, rankId,
-          //     destinationRank);
-          std::fflush(stdout);
-          next = connection;
+
+        bool isNew = false;
+        bool isPrev = !prev && sourceRank == (rank + size - 1) % size;
+        bool isNext = !next && sourceRank == (rank + 1) % size;
+        if (isPrev || isNext) {
+          log.debug(
+              "%d: Got %s connection to rank %d (id %#x) (destination %d)\n", rank, isNext ? "next" : "prev",
+              sourceRank, rankId, destinationRank);
+          (isNext ? next : prev) = connection;
           connectionIds[sourceRank] = rankId;
           isNew = true;
         }
         if (isNew) {
           auto buffer = serializeToBuffer(
-              signature, myId, (uint32_t)rank, ~(uint32_t)0, (uint32_t)0, std::string_view("connect"));
+              signature, myId, (uint32_t)rank, ~(uint32_t)0, (uint32_t)0, std::string_view("connect"), key);
           connection->write(std::move(buffer), nullptr);
 
           connectionReady = 1;

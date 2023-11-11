@@ -10,6 +10,8 @@ struct SetupComms {
   const size_t rank;
   const size_t size;
 
+  std::string key;
+
   SetupComms(size_t rank, size_t size) : rank(rank), size(size) {}
   virtual ~SetupComms() {}
 
