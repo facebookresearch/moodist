@@ -30,7 +30,8 @@ void ReduceScatter::init() {
   }
 }
 
-std::string ReduceScatter::generate() {
+std::string
+ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std::string> generateReductions) {
 
   // allgatherBlocksize = group->ipcRanks.size() == group->size - 1 ? 256 : 64;
   // allgatherGridsize = group->ipcRanks.size() == group->size - 1 ? smCount / 4 : smCount / 4;
@@ -76,7 +77,8 @@ std::string ReduceScatter::generate() {
           "reduce2<T, R>((T*)$dst, (const T*)$src1, (const T*)$src2, params.bytes / sizeof(T));\n", "$dst", dst,
           "$src1", src1, "$src2", src2);
     } else {
-      reduceCode += replace("reduce_add<T, R>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
+      reduceCode +=
+          replace("reduce_add<T, R>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
     }
   };
   auto reduceFlush = [&]() {
@@ -176,8 +178,8 @@ std::string ReduceScatter::generate() {
   reduceFlush();
 
   std::string kernels;
-  for (auto& type : supportedTypes) {
-    for (auto& red : supportedReductions) {
+  for (auto& type : generateTypes) {
+    for (auto& red : generateReductions) {
       kernels += replace(
           R"(
 extern "C" __global__ void $launchBounds reduce_scatter_local_$type_$red(ReduceScatterParameters params) {

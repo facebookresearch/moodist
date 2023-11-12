@@ -374,10 +374,6 @@ struct ProcessGroupImpl {
 
     AllGather& allGather = *group->allGather;
 
-    if (!group->kernels->cuModule) {
-      group->kernels->compile();
-    }
-
     bool isLocalOnly = allGather.recvRanks.empty();
 
     if (!isLocalOnly) {
@@ -394,6 +390,12 @@ struct ProcessGroupImpl {
     }
 
     trace("launch");
+
+    if (!group->kernels->cuAllGather) {
+      group->kernels->compile(CompileAllGather);
+      CHECK(group->kernels->cuAllGather != nullptr);
+      CHECK(group->kernels->cuAllGatherLocal != nullptr);
+    }
 
     AllGatherParameters parameters;
     parameters.stepValue = stepValue;
@@ -530,10 +532,6 @@ struct ProcessGroupImpl {
     allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
     allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
 
-    if (!group->kernels->cuModule) {
-      group->kernels->compile();
-    }
-
     bool isLocalOnly = reduceScatter.recvRanks.empty();
 
     if (!isLocalOnly) {
@@ -550,30 +548,6 @@ struct ProcessGroupImpl {
     }
 
     trace("launch");
-
-    uintptr_t sendAddress = sd.sendBuffer.cudaPointer;
-    uintptr_t recvAddress = sd.recvBuffer.cudaPointer;
-    if (!isLocalOnly) {
-      CHECK(sendAddress != 0);
-      CHECK(recvAddress != 0);
-    }
-
-    ReduceScatterParameters parameters;
-    parameters.stepValue = stepValue;
-    parameters.concurrencyIndex = concurrencyIndex;
-    parameters.bytes = bytes;
-    parameters.pitch = pitch;
-    parameters.inputAddress = inputAddress;
-    parameters.outputAddress = outputAddress;
-    parameters.peerInputAddresses = peerInputAddresses;
-    parameters.peerOutputAddresses = peerOutputAddresses;
-    parameters.sendAddress = sendAddress;
-    parameters.recvAddress = recvAddress;
-
-    std::array<void*, 1> params = {&parameters};
-
-    size_t gridSize = group->kernels->gridSize;
-    size_t blockSize = group->kernels->blockSize;
 
     Dtype dindex;
     switch (dtype.toScalarType()) {
@@ -611,6 +585,38 @@ struct ProcessGroupImpl {
       throw std::runtime_error(
           fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %s", std::string(dtype.name())));
     }
+
+    if (!group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex]) {
+      group->kernels->compile(
+          CompileReduceScatter, group->kernels->supportedTypes[(size_t)dindex],
+          group->kernels->supportedReductions[(size_t)opindex]);
+      CHECK(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex] != nullptr);
+      CHECK(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex] != nullptr);
+    }
+
+    uintptr_t sendAddress = sd.sendBuffer.cudaPointer;
+    uintptr_t recvAddress = sd.recvBuffer.cudaPointer;
+    if (!isLocalOnly) {
+      CHECK(sendAddress != 0);
+      CHECK(recvAddress != 0);
+    }
+
+    ReduceScatterParameters parameters;
+    parameters.stepValue = stepValue;
+    parameters.concurrencyIndex = concurrencyIndex;
+    parameters.bytes = bytes;
+    parameters.pitch = pitch;
+    parameters.inputAddress = inputAddress;
+    parameters.outputAddress = outputAddress;
+    parameters.peerInputAddresses = peerInputAddresses;
+    parameters.peerOutputAddresses = peerOutputAddresses;
+    parameters.sendAddress = sendAddress;
+    parameters.recvAddress = recvAddress;
+
+    std::array<void*, 1> params = {&parameters};
+
+    size_t gridSize = group->kernels->gridSize;
+    size_t blockSize = group->kernels->blockSize;
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
@@ -656,10 +662,6 @@ struct ProcessGroupImpl {
 
     Group* group = &*this->group;
 
-    if (!group->kernels->cuModule) {
-      group->kernels->compile();
-    }
-
     QueueEntryBroadcast* e = group->cpuThread->freelistBroadcast.pop();
     e->task = taskBroadcast;
     e->stepValue = stepValue;
@@ -669,6 +671,10 @@ struct ProcessGroupImpl {
     e->bytes = bytes;
     e->sourceRank = sourceRank;
     group->cpuThread->enqueue(e);
+
+    if (!group->kernels->cuBroadcast) {
+      group->kernels->compile(0);
+    }
 
     std::array<void*, 2> params = {&stepValue, &concurrencyIndex};
 

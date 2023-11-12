@@ -30,7 +30,7 @@ struct ReduceScatter : CollectiveBase {
   ReduceScatter(Group* group);
   ~ReduceScatter();
   void init();
-  std::string generate();
+  std::string generate(std::vector<std::string> generateTypes, std::vector<std::string> generateReductions);
 };
 
 } // namespace moodist

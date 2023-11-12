@@ -14,7 +14,8 @@
 namespace moodist {
 
 Kernels::~Kernels() {
-  if (cuModule) {
+  log.info("~Kernels()\n");
+  for (auto cuModule : cuModules) {
     cuModuleUnload(cuModule);
   }
 }
@@ -369,15 +370,10 @@ __device__ void reduce_n$nsources<$typename, $op>(size_t size, $typename* destin
   return s;
 }
 
-void Kernels::compile() {
+void Kernels::compile(int flags, std::string compileType, std::string compileReduction) {
   auto start = Clock::now();
   CUdevice& cuDevice = group->cuDevice;
   CUcontext& cuContext = group->cuContext;
-
-  if (cuModule) {
-    cuModuleUnload(cuModule);
-    cuModule = nullptr;
-  }
 
   int computeMajor = 0;
   int computeMinor = 0;
@@ -459,11 +455,18 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
   source = replace(
       source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
 
-  for (auto& type : supportedTypes) {
-    for (auto& red : supportedReductions) {
-      source +=
-          emitReduceFunctionSeq(type, supportedTypeSizes[&type - supportedTypes.data()], 2, red, gridSize, blockSize);
-    }
+  // for (auto& type : supportedTypes) {
+  //   for (auto& red : supportedReductions) {
+  //     source +=
+  //         emitReduceFunctionSeq(type, supportedTypeSizes[&type - supportedTypes.data()], 2, red, gridSize,
+  //         blockSize);
+  //   }
+  // }
+  if (flags & CompileReduceScatter) {
+    auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
+    CHECK(i != supportedTypes.end());
+    source += emitReduceFunctionSeq(
+        compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize, blockSize);
   }
 
   source += R"(
@@ -635,21 +638,32 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
-  source += group->allGather->generate();
-  source += group->reduceScatter->generate();
-
-  fn(cuAllGatherLocal, "allgather_local");
-  fn(cuAllGather, "allgather");
-  fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
-
-  for (auto& type : supportedTypes) {
-    for (auto& red : supportedReductions) {
-      size_t t = &type - supportedTypes.data();
-      size_t r = &red - supportedReductions.data();
-      fn(cuReduceScatterLocal[t][r], replace("reduce_scatter_local_$type_$red", "$type", type, "$red", red));
-      fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", type, "$red", red));
-    }
+  if (flags & CompileAllGather) {
+    source += group->allGather->generate();
+    fn(cuAllGatherLocal, "allgather_local");
+    fn(cuAllGather, "allgather");
+    fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
   }
+  if (flags & CompileReduceScatter) {
+    source += group->reduceScatter->generate({compileType}, {compileReduction});
+
+    auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
+    auto i2 = std::find(supportedReductions.begin(), supportedReductions.end(), compileReduction);
+    size_t t = i - supportedTypes.begin();
+    size_t r = i2 - supportedReductions.begin();
+    fn(cuReduceScatterLocal[t][r],
+       replace("reduce_scatter_local_$type_$red", "$type", compileType, "$red", compileReduction));
+    fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", compileType, "$red", compileReduction));
+  }
+
+  // for (auto& type : supportedTypes) {
+  //   for (auto& red : supportedReductions) {
+  //     size_t t = &type - supportedTypes.data();
+  //     size_t r = &red - supportedReductions.data();
+  //     fn(cuReduceScatterLocal[t][r], replace("reduce_scatter_local_$type_$red", "$type", type, "$red", red));
+  //     fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", type, "$red", red));
+  //   }
+  // }
 
   // fn(cuReduceScatterLocal[Dtype::float32], "reduce_scatter_local_float");
   // fn(cuReduceScatter[Dtype::float32], "reduce_scatter_float");
@@ -786,7 +800,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   log.debug("cubin size is %d\n", cubin.size());
   CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
 
-  if (rank == 0 || true) {
+  if (false) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d.o", rank);
     FILE* f = fopen(fn.c_str(), "wb");
     if (f) {
@@ -861,7 +875,9 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   size_t linkedCubinSize = 0;
   CHECK_CU(cuLinkComplete(linkState, &linkedCubin, &linkedCubinSize));
 
+  CUmodule cuModule = nullptr;
   CHECK_CU(cuModuleLoadDataEx(&cuModule, linkedCubin, 0, nullptr, nullptr));
+  cuModules.push_back(cuModule);
 
   for (auto& v : functions) {
     log.info("%s\n", v.second);
@@ -873,9 +889,9 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, *v.first));
     int localBytes = 0;
     CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, *v.first));
-    log.debug("kernel %s uses %d registers\n", v.second, numRegs);
-    log.debug("kernel %s max threads per block: %d\n", v.second, maxThreadsPerBlock);
-    log.debug("kernel %s local bytes: %d\n", v.second, localBytes);
+    log.verbose("kernel %s uses %d registers\n", v.second, numRegs);
+    log.verbose("kernel %s max threads per block: %d\n", v.second, maxThreadsPerBlock);
+    log.verbose("kernel %s local bytes: %d\n", v.second, localBytes);
   }
 
   CHECK_CU(cuLinkDestroy(linkState));

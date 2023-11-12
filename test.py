@@ -94,12 +94,12 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = False
+    test_gather = True
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        # data = torch.randn(4).cuda() + 1
+        data = torch.randn(4).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
@@ -166,11 +166,12 @@ def f(n):
             tmp.copy_(data)
             ostream = torch.cuda.current_stream()
             # dist.all_gather(result, tmp)
-            with torch.cuda.stream(stream1):
-                stream1.wait_stream(ostream)
-                dist._all_gather_base(result0, tmp)
-            with torch.cuda.stream(stream2):
-                dist._all_gather_base(result02, tmp2)
+            dist._all_gather_base(result0, tmp)
+            # with torch.cuda.stream(stream1):
+            #     stream1.wait_stream(ostream)
+            #     dist._all_gather_base(result0, tmp)
+            # with torch.cuda.stream(stream2):
+            #     dist._all_gather_base(result02, tmp2)
             torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
             result = result0.chunk(size)
@@ -343,7 +344,7 @@ def f(n):
             for i in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
-        elif 1 == 1:
+        elif 1 == 187:
             loopcount = 1000
             events1 = []
             events2 = []
@@ -477,8 +478,8 @@ def f(n):
         # items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
         #items = 1024 * 1024 * 40
-        items = 1
-        # items = 128
+        # items = 1
+        items = 128
         sum = 0
         sumdata = torch.zeros(items).cuda().long()
         for i in range(size):
@@ -506,7 +507,7 @@ def f(n):
         for _ in range(50):
             # if rank == _ % size:
             #     time.sleep(0.15)
-            print("%d: start allreduce %d, data is " % (rank, _), data)
+            #print("%d: start allreduce %d, data is " % (rank, _), data)
             datax = data.clone()
             tmp2.copy_(datax)
             datax.zero_()
@@ -514,7 +515,7 @@ def f(n):
             tmp.copy_(tmp2)
             tmp2.zero_()
             #torch.cuda.synchronize()
-            print("%d: finished allreduce %d!" % (rank, _))
+            #print("%d: finished allreduce %d!" % (rank, _))
 
             # print("%d:" % rank, tmp)
             tmpsum = tmp.sum()
@@ -551,7 +552,7 @@ def f(n):
             ##si = tmp.sum().item()
             # print("-> %f" % si)
             # sum += si
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)

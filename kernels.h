@@ -8,13 +8,18 @@ namespace moodist {
 enum class Dtype { float32, float64, int32, int64, count };
 enum class Reduction { sum, min, max, avg, count };
 
+enum CompileFlags {
+  CompileAllGather = 1,
+  CompileReduceScatter = 2,
+};
+
 struct Group;
 struct Kernels : CollectiveBase {
-  CUmodule cuModule = nullptr;
+  std::vector<CUmodule> cuModules;
   Kernels(Group* group) : CollectiveBase(group) {}
   Kernels(const Kernels&) = delete;
   ~Kernels();
-  void compile();
+  void compile(int flags, std::string type = "", std::string reduction = "");
 
   size_t gridSize;
   size_t blockSize;
