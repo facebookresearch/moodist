@@ -5,12 +5,8 @@
 
 namespace moodist {
 
-enum class ReduceOp {
-  sum,
-};
-enum Dtype {
-  float32,
-};
+enum class Dtype { float32, float64, int32, int64, count };
+enum class Reduction { sum, min, max, avg, count };
 
 struct Group;
 struct Kernels : CollectiveBase {
@@ -27,8 +23,8 @@ struct Kernels : CollectiveBase {
   CUfunction cuAllGather = nullptr;
   CUfunction cuAllGatherCopyKernel = nullptr;
 
-  CUfunction cuReduceScatterLocal = nullptr;
-  CUfunction cuReduceScatter = nullptr;
+  std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatterLocal{};
+  std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatter{};
 
   CUfunction cuBroadcast = nullptr;
 

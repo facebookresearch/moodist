@@ -36,6 +36,7 @@ struct StreamData {
   AllocatedBuffer sendBuffer;
   AllocatedBuffer recvBuffer;
   AllocatedBuffer alignedBuffer;
+  AllocatedBuffer alignedBuffer2;
   size_t cpuThreadIndex = -1;
   StreamData();
   ~StreamData();

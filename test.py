@@ -477,13 +477,13 @@ def f(n):
         # items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
         #items = 1024 * 1024 * 40
-        items = 400000
+        items = 1
         # items = 128
         sum = 0
-        sumdata = torch.zeros(items).cuda()
+        sumdata = torch.zeros(items).cuda().long()
         for i in range(size):
             torch.manual_seed(42 + i)
-            data = torch.randn(items).cuda()
+            data = torch.randn(items).cuda().long()
             sumdata += data
             sum += data.sum().item()
         if rank == 0:
@@ -491,7 +491,7 @@ def f(n):
             # for i, v in zip(range(4), sumdata.split(items // size)):
             #     print("%d: chunk %d should be " % (rank, i), v)
         torch.manual_seed(42 + rank)
-        data = torch.randn(items).cuda()
+        data = torch.randn(items).cuda().long()
         data2 = data.clone()
         tmp = data.clone()
         tmp2 = tmp.clone()
@@ -508,15 +508,17 @@ def f(n):
             #     time.sleep(0.15)
             print("%d: start allreduce %d, data is " % (rank, _), data)
             datax = data.clone()
-            tmp.copy_(datax)
+            tmp2.copy_(datax)
             datax.zero_()
-            dist.all_reduce(tmp)
-            torch.cuda.synchronize()
+            dist.all_reduce(tmp2)
+            tmp.copy_(tmp2)
+            tmp2.zero_()
+            #torch.cuda.synchronize()
             print("%d: finished allreduce %d!" % (rank, _))
 
             # print("%d:" % rank, tmp)
             tmpsum = tmp.sum()
-            if False and not torch.allclose(tmp, sumdata, 1e-3, 1e-2):
+            if True and not torch.allclose(tmp, sumdata, 1e-3, 1e-2):
                 print("%d: sum %f" % (rank, tmpsum))
                 for i, v in zip(range(4), tmp.split(items // size)):
                     print("%d: chunk %d is " % (rank, i), v)
@@ -549,7 +551,7 @@ def f(n):
             ##si = tmp.sum().item()
             # print("-> %f" % si)
             # sum += si
-            # torch.cuda.synchronize()
+            torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)

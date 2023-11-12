@@ -67,16 +67,16 @@ std::string ReduceScatter::generate() {
     if (isInGrid) {
       reduceCode += replace("copy_impl($dst, $src, params.bytes);", "$dst", dst, "$src", src);
     } else {
-      reduceCode += replace("reduce_add<T>(reduces, $dst, $src, nullptr);\n", "$dst", dst, "$src", src);
+      reduceCode += replace("reduce_add<T, R>(reduces, $dst, $src, nullptr);\n", "$dst", dst, "$src", src);
     }
   };
   auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2) {
     if (isInGrid) {
       reduceCode += replace(
-          "reduce2_sum((T*)$dst, (const T*)$src1, (const T*)$src2, params.bytes / sizeof(T));\n", "$dst", dst, "$src1",
-          src1, "$src2", src2);
+          "reduce2<T, R>((T*)$dst, (const T*)$src1, (const T*)$src2, params.bytes / sizeof(T));\n", "$dst", dst,
+          "$src1", src1, "$src2", src2);
     } else {
-      reduceCode += replace("reduce_add<T>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
+      reduceCode += replace("reduce_add<T, R>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
     }
   };
   auto reduceFlush = [&]() {
@@ -175,6 +175,22 @@ std::string ReduceScatter::generate() {
   }
   reduceFlush();
 
+  std::string kernels;
+  for (auto& type : supportedTypes) {
+    for (auto& red : supportedReductions) {
+      kernels += replace(
+          R"(
+extern "C" __global__ void $launchBounds reduce_scatter_local_$type_$red(ReduceScatterParameters params) {
+  reduce_scatter_local<$type, $red>(params);
+}
+extern "C" __global__ void $launchBounds reduce_scatter_$type_$red(ReduceScatterParameters params) {
+  reduce_scatter<$type, $red>(params);
+}
+)",
+          "$type", type, "$red", red);
+    }
+  }
+
   std::string source = replace(
       R"zz(
 
@@ -189,7 +205,7 @@ struct ReduceParameters {
   uint32_t n;
 };
 
-template<typename T>
+template<typename T, typename R>
 __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
   assert(params.n > 0);
   assert(params.n <= reduceQueueSize);
@@ -197,7 +213,7 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
     if (params.src2[i] != nullptr) {
-      reduce2_sum((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+      reduce2<T, R>((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
     } else {
       copy_impl(params.dst[i], params.src1[i], params.bytes);
     }
@@ -206,25 +222,25 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
 
 $globaldefs
 
-template<typename T>
+template<typename T, typename R>
 __device__ void reduce_flush(ReduceParameters& params) {
   if (params.n) {
     // work around compiler bug
     ReduceParameters params2;
     memcpy(&params2, &params, sizeof(params2));
-    reduce_kernel<T><<<$gridSize, $blockSize>>>(params2);
+    reduce_kernel<T, R><<<$gridSize, $blockSize>>>(params2);
     params.n = 0;
   }
 }
 
-template<typename T>
+template<typename T, typename R>
 __device__ void reduce_add(ReduceParameters& params, void* dst, const void* src1, const void* src2) {
   params.dst[params.n] = dst;
   params.src1[params.n] = src1;
   params.src2[params.n] = src2;
   ++params.n;
   if (params.n == reduceQueueSize) {
-    reduce_flush<T>(params);
+    reduce_flush<T, R>(params);
   }
 }
 
@@ -241,6 +257,7 @@ struct ReduceScatterParameters {
   uintptr_t recvAddress;
 };
 
+template<typename T, typename R>
 __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
@@ -248,35 +265,37 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   reduces.bytes = params.bytes;
   reduces.n = 0;
 
-  using T = float;
-
   $reduceCode
 
-  reduce_flush<T>(reduces);
+  reduce_flush<T, R>(reduces);
   return true;
 }
 
-}
-
-extern "C" __global__ void $launchBounds reduce_scatter_local(ReduceScatterParameters params) {
-  grid_generic_entry_local(params);
-  reduce_scatter_impl(params);
-  grid_generic_exit_local(params.stepValue, params.concurrencyIndex);
 }
 
 extern "C" __global__ void reduce_scatter_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   generic_exit(stepValue, concurrencyIndex);
 }
 
-extern "C" __global__ void $launchBounds reduce_scatter(ReduceScatterParameters params) {
+template<typename T, typename R>
+__device__ void reduce_scatter_local(ReduceScatterParameters params) {
+  grid_generic_entry_local(params);
+  reduce_scatter_impl<T, R>(params);
+  grid_generic_exit_local(params.stepValue, params.concurrencyIndex);
+}
+
+template<typename T, typename R>
+__device__ void reduce_scatter(ReduceScatterParameters params) {
   grid_generic_entry(params);
-  if (reduce_scatter_impl(params)) {
+  if (reduce_scatter_impl<T, R>(params)) {
     reduce_scatter_exit<<<1, 1>>>(params.stepValue, params.concurrencyIndex);
   }
 }
 
+$kernels
+
   )zz",
-      "$reduceCode", reduceCode, "$globaldefs", globaldefs);
+      "$reduceCode", reduceCode, "$globaldefs", globaldefs, "$kernels", kernels);
 
   return source;
 }

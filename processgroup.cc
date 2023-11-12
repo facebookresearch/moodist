@@ -19,6 +19,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <torch/types.h>
 #include <variant>
 
@@ -322,9 +323,6 @@ struct ProcessGroupImpl {
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
 
-    CHECK(inputAddress % 16 == 0);
-    CHECK(outputAddress % 16 == 0);
-
     CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     StreamData& sd = group->getStreamData(stream);
@@ -337,11 +335,17 @@ struct ProcessGroupImpl {
       }
     };
 
-    if (bytes % 16 != 0) {
+    if (bytes % 16 != 0 || outputAddress % 16 != 0) {
       pitch = (bytes + 127u) / 128u * 128u;
       allocbuffer(sd.alignedBuffer, pitch * size);
       outputAddress = sd.alignedBuffer.cudaPointer;
       outputBytes = pitch * size;
+    }
+
+    if (inputAddress % 16 != 0) {
+      allocbuffer(sd.alignedBuffer2, bytes);
+      CHECK_CU(cuMemcpyDtoDAsync(sd.alignedBuffer2.cudaPointer, inputAddress, bytes, stream));
+      inputAddress = sd.alignedBuffer2.cudaPointer;
     }
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
@@ -433,8 +437,6 @@ struct ProcessGroupImpl {
     trace("_reduce_scatter_base");
     std::lock_guard l(mutex);
 
-    CHECK(reduceOp == c10d::ReduceOp::SUM);
-
     size_t size = this->size;
 
     uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
@@ -448,8 +450,9 @@ struct ProcessGroupImpl {
     TORCH_CHECK(output.is_cuda());
     TORCH_CHECK(output.device().index() == group->deviceIndex);
 
-    TORCH_CHECK(input.dtype() == torch::Dtype::Float);
-    TORCH_CHECK(output.dtype() == torch::Dtype::Float);
+    auto dtype = output.dtype();
+    TORCH_CHECK(input.dtype() == dtype);
+    // TORCH_CHECK(output.dtype() == torch::Dtype::Float);
 
     size_t numel = output.numel();
     size_t bytes = numel * output.itemsize();
@@ -460,9 +463,6 @@ struct ProcessGroupImpl {
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
-
-    CHECK(inputAddress % 16 == 0);
-    CHECK(outputAddress % 16 == 0);
 
     CUstream stream = c10::cuda::getCurrentCUDAStream();
 
@@ -476,7 +476,7 @@ struct ProcessGroupImpl {
       }
     };
 
-    if (bytes % 16 != 0) {
+    if (bytes % 16 != 0 || inputAddress % 16 != 0) {
       pitch = (bytes + 127u) / 128u * 128u;
       allocbuffer(sd.alignedBuffer, pitch * size);
       CUDA_MEMCPY2D copyArgs = {0};
@@ -490,6 +490,12 @@ struct ProcessGroupImpl {
       CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
       inputAddress = sd.alignedBuffer.cudaPointer;
       inputBytes = pitch * size;
+    }
+
+    if (outputAddress % 16 != 0) {
+      allocbuffer(sd.alignedBuffer2, bytes);
+      CHECK_CU(cuMemcpyDtoDAsync(sd.alignedBuffer2.cudaPointer, outputAddress, bytes, stream));
+      outputAddress = sd.alignedBuffer2.cudaPointer;
     }
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
@@ -569,12 +575,55 @@ struct ProcessGroupImpl {
     size_t gridSize = group->kernels->gridSize;
     size_t blockSize = group->kernels->blockSize;
 
+    Dtype dindex;
+    switch (dtype.toScalarType()) {
+    case torch::Dtype::Float:
+      dindex = Dtype::float32;
+      break;
+    case torch::Dtype::Double:
+      dindex = Dtype::float64;
+      break;
+    case torch::Dtype::Int:
+      dindex = Dtype::int32;
+      break;
+    case torch::Dtype::Long:
+      dindex = Dtype::int64;
+      break;
+    default:
+      throw std::runtime_error(
+          fmt::sprintf("moodist: reduce_scatter: Unsupported dtype %s", std::string(dtype.name())));
+    }
+    Reduction opindex;
+    switch (reduceOp) {
+    case c10d::ReduceOp::SUM:
+      opindex = Reduction::sum;
+      break;
+    case c10d::ReduceOp::MIN:
+      opindex = Reduction::min;
+      break;
+    case c10d::ReduceOp::MAX:
+      opindex = Reduction::max;
+      break;
+    case c10d::ReduceOp::AVG:
+      opindex = Reduction::avg;
+      break;
+    default:
+      throw std::runtime_error(
+          fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %s", std::string(dtype.name())));
+    }
+
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
-          group->kernels->cuReduceScatterLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0,
+          stream, params.data(), nullptr));
     } else {
       CHECK_CU(cuLaunchKernel(
-          group->kernels->cuReduceScatter, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+          group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0, stream,
+          params.data(), nullptr));
+    }
+
+    if (outputAddress != (uintptr_t)output.data_ptr()) {
+      CHECK_CU(cuMemcpyDtoDAsync((uintptr_t)output.data_ptr(), outputAddress, bytes, stream));
     }
 
     trace("post");
@@ -734,7 +783,6 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   } else {
     int64_t numel = tensor.numel();
     int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
-    newsize = (newsize + 127) / 128u * 128u;
     size_t bytes = numel * tensor.itemsize();
     torch::Tensor temporary =
         torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));

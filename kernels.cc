@@ -123,7 +123,8 @@ std::string Kernels::emitCopySeq(
   const size_t %bytes = $bytes;
   const uint32_t %threadIndex = $threadIndex;
   static_assert($gridSize % $blocksPerSm == 0);
-  uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
+  //uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
+  uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
   size_t %offset = 0;
   size_t %count = 0;
@@ -180,11 +181,27 @@ std::string Kernels::emitReduceFunctionSeq(
   }
   addressesdefs = replace(addressesdefs, "$type", sourcetype);
   auto reduceopcode = [&](auto& names) {
-    if (op == "sum") {
+    if (op == "rsum") {
       return fmt::to_string(fmt::join(names, " + "));
-    } else {
-      TORCH_CHECK(false, "unknown reduce op");
+    } else if (op == "rmin") {
+      return replace("min($args)", "$args", fmt::to_string(fmt::join(names, ", ")));
+    } else if (op == "rmax") {
+      return replace("max($args)", "$args", fmt::to_string(fmt::join(names, ", ")));
+    } else if (op == "ravg") {
+      std::string s;
+      for (auto& v : names) {
+        if (!s.empty()) {
+          s += " + ";
+        }
+        if (sourcetypesize > 4) {
+          s += replace("($type)($v * (1.0 / $size))", "$v", v, "$type", sourcetype);
+        } else {
+          s += replace("($type)($v * (1.0f / $size))", "$v", v, "$type", sourcetype);
+        }
+      }
+      return s;
     }
+    fatal("unknown reduce op %s", op);
   };
   std::function<std::string(std::string, std::string, std::vector<std::string>)> getreducecode =
       [&](std::string datatype, std::string result, std::vector<std::string> inputs) {
@@ -202,18 +219,38 @@ std::string Kernels::emitReduceFunctionSeq(
             s += "\n";
           }
           return s;
+        } else if (datatype == "ulonglong2") {
+          std::string s;
+          for (auto& field : {"x", "y"}) {
+            auto inputs2 = inputs;
+            for (std::string& v : inputs2) {
+              v += ".";
+              v += field;
+            }
+            s += getreducecode("uint64_t", result + "." + field, inputs2);
+            s += "\n";
+          }
+          return s;
         } else if (datatype == "uint32_t") {
           if (sourcetype == "float") {
             for (auto& v : inputs) {
               v = replace("__uint_as_float($v)", "$v", v);
             }
             return replace("$result = __float_as_uint($op);", "$result", result, "$op", reduceopcode(inputs));
-          } else {
-            TORCH_CHECK(false, "unhandled reduce type for datatype uint32_t");
+          } else if (sourcetype == "int32_t") {
+            return replace("$result = $op;", "$result", result, "$op", reduceopcode(inputs));
           }
-        } else {
-          TORCH_CHECK(false, "don't know how to reduce these types");
+        } else if (datatype == "uint64_t") {
+          if (sourcetype == "int64_t") {
+            return replace("$result = $op;", "$result", result, "$op", reduceopcode(inputs));
+          } else if (sourcetype == "double") {
+            for (auto& v : inputs) {
+              v = replace("__longlong_as_double($v)", "$v", v);
+            }
+            return replace("$result = __double_as_longlong($op);", "$result", result, "$op", reduceopcode(inputs));
+          }
         }
+        fatal("unhandled reduce type %s for datatype %s", sourcetype, datatype);
       };
   auto generate = [&](std::string datatype, int datatypesize, int unroll) {
     TORCH_CHECK(datatypesize % sourcetypesize == 0);
@@ -296,19 +333,28 @@ std::string Kernels::emitReduceFunctionSeq(
     return s;
   };
   std::string reduce1; // = generate("uint4", 16, 32);
-  reduce1 += generate("uint4", 16, 8);
-  reduce1 += generate("uint4", 16, 4);
-  reduce1 += generate("uint4", 16, 2);
-  reduce1 += generate("uint4", 16, 1);
+  if (sourcetypesize == 8) {
+    reduce1 += generate("ulonglong2", 16, 8);
+    reduce1 += generate("ulonglong2", 16, 4);
+    reduce1 += generate("ulonglong2", 16, 2);
+    reduce1 += generate("ulonglong2", 16, 1);
+  } else {
+    reduce1 += generate("uint4", 16, 8);
+    reduce1 += generate("uint4", 16, 4);
+    reduce1 += generate("uint4", 16, 2);
+    reduce1 += generate("uint4", 16, 1);
+  }
   reduce1 += generate(sourcetype, sourcetypesize, 1);
   std::string s = replace(
       R"(
-__device__ void reduce_$typename_$op_n$nsources(size_t size, $typename* destination, $sourcesargs) {
+template<>
+__device__ void reduce_n$nsources<$typename, $op>(size_t size, $typename* destination, $sourcesargs) {
   $addressesdefs
   const size_t %bytes = $sourcetypesize * size;
   const uint32_t %threadIndex = $threadIndex;
   static_assert($gridSize % $blocksPerSm == 0);
-  uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
+  //uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
+  uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
   size_t %offset = 0;
   size_t %count = 0;
@@ -372,10 +418,24 @@ void Kernels::compile() {
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
   source = R"(
-typedef unsigned long uintptr_t;
-typedef unsigned int uint32_t;
-typedef unsigned long uint64_t;
-typedef unsigned char uint8_t;
+using uintptr_t =  unsigned long;
+using uint32_t = unsigned int;
+using uint64_t = unsigned long;
+using uint8_t = unsigned char;
+using int32_t = int;
+using int64_t = long;
+using int8_t = char;
+
+struct bf16 {
+  unsigned short x;
+};
+static_assert(alignof(bf16) == 2);
+static_assert(sizeof(bf16) == 2);
+
+struct rsum {};
+struct rmin {};
+struct rmax {};
+struct ravg {};
 
 namespace {
 
@@ -387,6 +447,9 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
   $copyCode
 }
 
+template<typename T, typename R>
+__device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2);
+
 )";
 
   gridSize = 36;
@@ -396,12 +459,18 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
   source = replace(
       source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
 
-  source += emitReduceFunctionSeq("float", 4, 2, "sum", gridSize, blockSize);
+  for (auto& type : supportedTypes) {
+    for (auto& red : supportedReductions) {
+      source +=
+          emitReduceFunctionSeq(type, supportedTypeSizes[&type - supportedTypes.data()], 2, red, gridSize, blockSize);
+    }
+  }
 
   source += R"(
-template<typename T>
-__device__ void reduce2_sum(T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
-  reduce_float_sum_n2(numel, dst, src1, src2);
+
+template<typename T, typename R>
+__device__ void reduce2(T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
+  reduce_n2<T, R>(numel, dst, src1, src2);
 }
 )";
 
@@ -573,8 +642,21 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   fn(cuAllGather, "allgather");
   fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
 
-  fn(cuReduceScatterLocal, "reduce_scatter_local");
-  fn(cuReduceScatter, "reduce_scatter");
+  for (auto& type : supportedTypes) {
+    for (auto& red : supportedReductions) {
+      size_t t = &type - supportedTypes.data();
+      size_t r = &red - supportedReductions.data();
+      fn(cuReduceScatterLocal[t][r], replace("reduce_scatter_local_$type_$red", "$type", type, "$red", red));
+      fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", type, "$red", red));
+    }
+  }
+
+  // fn(cuReduceScatterLocal[Dtype::float32], "reduce_scatter_local_float");
+  // fn(cuReduceScatter[Dtype::float32], "reduce_scatter_float");
+  // fn(cuReduceScatterLocal[Dtype::int32], "reduce_scatter_local_int32_t");
+  // fn(cuReduceScatter[Dtype::int32], "reduce_scatter_int32_t");
+  // fn(cuReduceScatterLocal[Dtype::int64], "reduce_scatter_local_int64_t");
+  // fn(cuReduceScatter[Dtype::int64], "reduce_scatter_int64_t");
 
   fn(cuBroadcast, "broadcast");
 
@@ -782,6 +864,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   CHECK_CU(cuModuleLoadDataEx(&cuModule, linkedCubin, 0, nullptr, nullptr));
 
   for (auto& v : functions) {
+    log.info("%s\n", v.second);
     CHECK_CU(cuModuleGetFunction(v.first, cuModule, v.second.c_str()));
 
     int numRegs = 0;
