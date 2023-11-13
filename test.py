@@ -99,11 +99,12 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        data = torch.randn(4).cuda() + 1
+        #data = torch.randn(4).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416).cuda() + 1
+        data = torch.randn(589824).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -216,7 +217,7 @@ def f(n):
 
         print("rank %d warmup done" % (rank))
 
-        if False:
+        if True:
             tmpz = []
             for x in range(10):
                 print("rank %d enter test2 %d\n" % (rank, x))
@@ -237,10 +238,12 @@ def f(n):
 
             import random
 
+            tmpz = torch.randn(1024 + 1024 * 1024 * rank)
+
             random.seed(42)
-            for x in range(100):
+            for x in range(1000):
                 print("rank %d enter test3 %d\n" % (rank, x))
-                s = random.randint(1024, 1024 * 10) * 4
+                s = random.randint(1024, 1024 * 64 * 10) * 4
                 test3_data = torch.randn(s, device="cuda")
                 test3_result = torch.zeros(s * size, device="cuda")
 
@@ -614,7 +617,7 @@ for i in range(ngpus):
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
-for n in ("nccl", "moodist"):
+for n in ("moodist",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

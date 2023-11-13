@@ -14,8 +14,11 @@ struct IpcMapper {
 
   SpinMutex mutex;
   int requestNum = 0;
+  SpinMutex unmapMutex;
 
   std::atomic_int waitCount = 0;
+
+  uint32_t stepValue = 0;
 
   struct Mapped {
     uintptr_t peerAddress;
@@ -42,49 +45,79 @@ struct IpcMapper {
   void* getMySharedMem(size_t offset, size_t size);
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size);
 
+  void setStepValue(uint32_t stepValue) {
+    std::lock_guard l2(unmapMutex);
+    std::lock_guard l(mutex);
+    this->stepValue = stepValue;
+  }
+
   void unmapAll() {
+    std::lock_guard l2(unmapMutex);
     std::unique_lock l(mutex);
-    while (true) {
-      bool stop = true;
-      for (size_t peerIndex = 0; peerIndex != peerIpcMap.size(); ++peerIndex) {
-        peerIpcAddressMap[peerIndex].clear();
-        auto& ipcMap = peerIpcMap[peerIndex];
-        for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
-          if (!i->second.unmappable) {
-            continue;
-          }
-          log.debug(
-              "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
-              i->second.localAddress, i->second.peerAddress);
-          ++waitCount;
-          uintptr_t peerAddress = i->second.peerAddress;
-          size_t size = i->second.size;
-          ipcMap.erase(i);
-          l.unlock();
-          stop = false;
-          sendRequestUnmap(peerIndex, peerAddress, size, [this](uintptr_t) { --waitCount; });
-          l.lock();
-          break;
+    for (size_t peerIndex = 0; peerIndex != peerIpcMap.size(); ++peerIndex) {
+      peerIpcAddressMap[peerIndex].clear();
+      std::vector<CUipcMemHandle> unmapList;
+      auto& ipcMap = peerIpcMap[peerIndex];
+      for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
+        if (!i->second.unmappable) {
+          continue;
         }
+        log.debug(
+            "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
+            i->second.localAddress, i->second.peerAddress);
+        unmapList.push_back(i->first);
       }
-      if (stop) {
-        break;
+      if (!unmapList.empty()) {
+        tryToUnmapList(peerIndex, unmapList, l);
       }
+    }
+  }
+
+  void tryToUnmapList(size_t peerIndex, const std::vector<CUipcMemHandle>& unmapList, std::unique_lock<SpinMutex>& l) {
+    CHECK(l.owns_lock());
+    if (unmapList.empty()) {
+      return;
+    }
+    auto& ipcMap = peerIpcMap[peerIndex];
+    for (auto& v : unmapList) {
+      auto i = ipcMap.find(v);
+      if (i == ipcMap.end()) {
+        continue;
+      }
+      ++waitCount;
+      uintptr_t peerAddress = i->second.peerAddress;
+      size_t size = i->second.size;
+      l.unlock();
+      sendRequestUnmap(peerIndex, peerAddress, size, [this, v, &ipcMap](uintptr_t response) {
+        // mutex is held
+        auto i = ipcMap.find(v);
+        if (i != ipcMap.end()) {
+          if (response) {
+            ipcMap.erase(i);
+          } else {
+            log.info("unmap failed!\n");
+          }
+        }
+        --waitCount;
+      });
+      l.lock();
     }
     l.unlock();
     auto start = Clock::now();
     while (waitCount.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       if (Clock::now() - start >= std::chrono::seconds(60)) {
-        log.error("Timeout waiting for ipc unmapper!\n");
+        log.error("Timeout waiting for ipc unmap!\n");
         start = Clock::now();
       }
     }
+    l.lock();
   }
 
   template<typename Callback>
   void
   requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
+    CHECK(length > 0);
     unsigned long long bufferId = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
     CHECK(bufferId != -1);
@@ -122,29 +155,18 @@ struct IpcMapper {
       l.unlock();
       callback(baseAddress + offset);
     } else {
-      while (true) {
-        bool anyUnmaps = false;
-        auto& ipcMap = peerIpcMap[peerIndex];
-        for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
-          if (i->second.localAddress + i->second.size > base && i->second.localAddress < base + size) {
-            log.debug(
-                "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x) due to allocations changing!\n",
-                i->second.size, i->second.localAddress, i->second.peerAddress);
-            anyUnmaps = true;
-            ++waitCount;
-            uintptr_t peerAddress = i->second.peerAddress;
-            size_t size = i->second.size;
-            ipcMap.erase(i);
-            l.unlock();
-            sendRequestUnmap(peerIndex, peerAddress, size, [this](uintptr_t) { --waitCount; });
-            break;
-          }
+      std::vector<CUipcMemHandle> unmapList;
+      auto& ipcMap = peerIpcMap[peerIndex];
+      for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
+        if (i->second.localAddress + i->second.size > base && i->second.localAddress < base + size) {
+          log.debug(
+              "requestAddress: requesting unmap of %#x bytes at %#x (mapped at %#x) due to allocations changing!\n",
+              i->second.size, i->second.localAddress, i->second.peerAddress);
+          unmapList.push_back(i->first);
         }
-        if (!anyUnmaps) {
-          break;
-        }
-        wait();
-        l.lock();
+      }
+      if (!unmapList.empty()) {
+        tryToUnmapList(peerIndex, unmapList, l);
       }
       l.unlock();
       ++waitCount;

@@ -562,6 +562,7 @@ void Group::init() {
   };
   get(localDyns, size * Group::maxConcurrency);
   get(localProgress, size * Group::maxConcurrency);
+  get(myStepCounter, 1);
 
   mySharedMemSize = offset;
 

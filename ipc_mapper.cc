@@ -80,6 +80,7 @@ struct IpcMapperImpl : IpcMapper {
     struct Slot {
       std::atomic_size_t sourceRank = -1;
       std::atomic_int stage = 0;
+      uint32_t requestStepValue;
       CUipcMemHandle request;
       size_t requestBytes;
       uintptr_t requestUnmapAddress;
@@ -153,7 +154,6 @@ struct IpcMapperImpl : IpcMapper {
               auto& slot = nshared->slots[i->slotIndex];
               if (slot.stage == 3) {
                 log.debug("%d: got request response -> %#x\n", group->rank, slot.response);
-                TORCH_CHECK(slot.response != 0);
                 std::move(i->callback)(slot.response);
                 slot.response = 0;
                 slot.stage = 0;
@@ -164,32 +164,43 @@ struct IpcMapperImpl : IpcMapper {
             }
           }
         }
+
         for (auto& v : shared->slots) {
           int stage = v.stage;
           if (stage == 2) {
             size_t sourceRank = v.sourceRank;
-            TORCH_CHECK(sourceRank < group->size);
+            CHECK(sourceRank < group->size);
             if (v.requestUnmapAddress) {
-              v.response = 1;
               log.debug(
                   "%d: got ipc unmap (address %#x size %#x) request from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
-              // cuIpcCloseMemHandle synchronizes the device, but we cannot block here.
-              // so, we launch in in a separate thread.
-              // since we respond immediately, there is a race condition where the mem handle may not be closed
-              // by the time the remote process receives the response and finishes its wait.
-              // since this code path is mostly used when the remote process wants to free memory, this
-              // can result in out of memory errors.
-              unmapScheduler.run([this, address = v.requestUnmapAddress]() {
-                try {
-                  CHECK_CU(cuIpcCloseMemHandle(address));
-                } catch (const std::exception& e) {
-                  log.error("ipc mapper got exception %s\n", e.what());
-                  std::lock_guard l(mutex);
-                  hasException = true;
-                  exception = std::current_exception();
-                }
-              });
+              std::lock_guard l(mutex);
+              if (this->stepValue > v.requestStepValue) {
+                v.response = 0;
+                log.info(
+                    "Cannot unmap due to local stepvalue %#x vs request stepvalue %#x\n", this->stepValue,
+                    v.requestStepValue);
+              } else {
+                CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
+                v.response = 1;
+
+                // auto ptr = std::make_shared<std::atomic_bool>(false);
+                // unmapScheduler.run([address = v.requestUnmapAddress, ptr]() {
+                //   CHECK_CU(cuIpcCloseMemHandle(address));
+                //   *ptr = true;
+                // });
+                // v.response = 0;
+                // auto start = Clock::now();
+                // while (Clock::now() - start < std::chrono::milliseconds(10)) {
+                //   if (*ptr) {
+                //     v.response = 1;
+                //     break;
+                //   }
+                // }
+                // if (v.response == 0) {
+                //   log.error("Timed out waiting for unmap\n");
+                // }
+              }
             } else {
               log.debug("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
               CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
@@ -208,8 +219,10 @@ struct IpcMapperImpl : IpcMapper {
     } catch (const std::exception& e) {
       log.error("ipc mapper got exception %s\n", e.what());
       std::lock_guard l(mutex);
-      hasException = true;
-      exception = std::current_exception();
+      if (!hasException) {
+        hasException = true;
+        exception = std::current_exception();
+      }
     }
   }
 
@@ -244,6 +257,7 @@ struct IpcMapperImpl : IpcMapper {
 
     auto& slot = nshared->slots[slotIndex];
     slot.sourceRank = group->rank;
+    slot.requestStepValue = this->stepValue;
     slot.request = handle;
     slot.requestBytes = size;
     slot.requestUnmapAddress = 0;
@@ -282,6 +296,7 @@ struct IpcMapperImpl : IpcMapper {
 
     auto& slot = nshared->slots[slotIndex];
     slot.sourceRank = group->rank;
+    slot.requestStepValue = this->stepValue;
     slot.request = {};
     slot.requestBytes = size;
     slot.requestUnmapAddress = base;

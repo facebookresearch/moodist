@@ -95,6 +95,8 @@ struct Group {
   DynamicAddresses* localDyns = nullptr;
   Progress* localProgress = nullptr;
 
+  std::atomic_uint32_t* myStepCounter = nullptr;
+
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
     size_t offset = (uintptr_t)(void*)myVar - (uintptr_t)mySharedMem;

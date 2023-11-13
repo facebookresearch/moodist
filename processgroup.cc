@@ -318,6 +318,7 @@ struct ProcessGroupImpl {
     size_t outputBytes = bytes * size;
     size_t pitch = bytes;
 
+    TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
@@ -360,13 +361,19 @@ struct ProcessGroupImpl {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, pitch, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, inputAddress, bytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
 
       ipcMapper->requestAddress(
           i, outputAddress, outputBytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
     }
 
     ipcMapper->wait();
+
+    // solution
+    // ipc mapper lock, keep track of stepvalue
+    // on unmap, if local stepvalue less than remote stepvalue, fail (as it would deadlock)
+    // unmap is blocking
+    // do we request unmap again after incrementing stepvalue?
 
     trace("enqueue");
 
@@ -384,7 +391,7 @@ struct ProcessGroupImpl {
       e->sd = &group->getStreamData(stream);
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
-      e->bytes = pitch;
+      e->bytes = bytes;
       e->pitch = pitch;
       group->cpuThread->enqueue(e);
     }
@@ -400,7 +407,7 @@ struct ProcessGroupImpl {
     AllGatherParameters parameters;
     parameters.stepValue = stepValue;
     parameters.concurrencyIndex = concurrencyIndex;
-    parameters.bytes = pitch;
+    parameters.bytes = bytes;
     parameters.pitch = pitch;
     parameters.inputAddress = inputAddress;
     parameters.outputAddress = outputAddress;
@@ -411,6 +418,13 @@ struct ProcessGroupImpl {
 
     size_t gridSize = group->kernels->gridSize;
     size_t blockSize = group->kernels->blockSize;
+
+    ipcMapper->setStepValue(stepValue);
+    // group->myStepCounter->store(stepValue);
+    // futexWakeAll(group->myStepCounter);
+    // for (size_t i : peerIndices) {
+    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
+    // }
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
@@ -461,6 +475,7 @@ struct ProcessGroupImpl {
     size_t inputBytes = bytes * size;
     size_t pitch = bytes;
 
+    TORCH_CHECK(bytes > 0);
     TORCH_CHECK(input.numel() * input.itemsize() == inputBytes);
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
@@ -618,6 +633,13 @@ struct ProcessGroupImpl {
     size_t gridSize = group->kernels->gridSize;
     size_t blockSize = group->kernels->blockSize;
 
+    ipcMapper->setStepValue(stepValue);
+    // group->myStepCounter->store(stepValue);
+    // futexWakeAll(group->myStepCounter);
+    // for (size_t i : peerIndices) {
+    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
+    // }
+
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0,
@@ -680,6 +702,13 @@ struct ProcessGroupImpl {
 
     size_t gridSize = 1;
     size_t blockSize = 1;
+
+    group->ipcMapper->setStepValue(stepValue);
+    // group->myStepCounter->store(stepValue);
+    // futexWakeAll(group->myStepCounter);
+    // for (size_t i : group->peerIndices) {
+    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
+    // }
 
     CHECK_CU(cuLaunchKernel(
         group->kernels->cuBroadcast, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
@@ -780,14 +809,15 @@ c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensor
 c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
   TORCH_CHECK(tensors.size() == 1);
   auto& tensor = tensors[0];
-  if (tensor.numel() % impl->size == 0) {
+  int64_t numel = tensor.numel();
+  TORCH_CHECK(numel > 0);
+  if (numel % impl->size == 0) {
     auto t = tensor.view({(int64_t)impl->size, -1});
     auto o = t[impl->rank];
     impl->reduce_scatter(o, t, opts.reduceOp);
     impl->all_gather(t, o);
     return c10::make_intrusive<WorkImpl>(tensors);
   } else {
-    int64_t numel = tensor.numel();
     int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
     size_t bytes = numel * tensor.itemsize();
     torch::Tensor temporary =
@@ -806,25 +836,5 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
     return c10::make_intrusive<WorkImpl>(tensors);
   }
 }
-
-// void ProcessGroup::all_gather(at::Tensor& output, const at::Tensor& input) {
-//   return impl->all_gather(output, input);
-// }
-
-// void ProcessGroup::all_gather_list(std::vector<at::Tensor>& output, const at::Tensor& input) {
-//   return impl->all_gather_list(output, input);
-// }
-
-// void ProcessGroup::reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp op) {
-//   return impl->reduce_scatter(output, input, op);
-// }
-
-// void ProcessGroup::reduce_scatter_list(at::Tensor& output, const std::vector<at::Tensor>& input, c10d::ReduceOp op) {
-//   return impl->reduce_scatter_list(output, input, op);
-// }
-
-// void ProcessGroup::barrier() {
-//   return impl->barrier();
-// }
 
 } // namespace moodist

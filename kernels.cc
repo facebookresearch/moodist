@@ -14,7 +14,6 @@
 namespace moodist {
 
 Kernels::~Kernels() {
-  log.info("~Kernels()\n");
   for (auto cuModule : cuModules) {
     cuModuleUnload(cuModule);
   }
