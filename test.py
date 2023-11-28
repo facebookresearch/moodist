@@ -243,7 +243,7 @@ def f(n):
             random.seed(42)
             for x in range(1000):
                 print("rank %d enter test3 %d\n" % (rank, x))
-                s = random.randint(1024, 1024 * 64 * 10) * 4
+                s = random.randint(1024, 1024 * 1024 * 10) * 4
                 test3_data = torch.randn(s, device="cuda")
                 test3_result = torch.zeros(s * size, device="cuda")
 

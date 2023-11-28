@@ -177,14 +177,14 @@ struct IpcMapperImpl : IpcMapper {
               std::lock_guard l(mutex);
               if (this->stepValue > v.requestStepValue) {
                 v.response = 0;
-                log.info(
+                log.error(
                     "Cannot unmap due to local stepvalue %#x vs request stepvalue %#x\n", this->stepValue,
                     v.requestStepValue);
               } else {
                 CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
                 v.response = 1;
 
-                // auto ptr = std::make_shared<std::atomic_bool>(false);
+                // auto ptr = std::make_shared<std::atomic_bool>(fal se);
                 // unmapScheduler.run([address = v.requestUnmapAddress, ptr]() {
                 //   CHECK_CU(cuIpcCloseMemHandle(address));
                 //   *ptr = true;

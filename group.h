@@ -42,6 +42,13 @@ struct StreamData {
   ~StreamData();
 };
 
+struct SyncData {
+  std::atomic_bool shouldSync = false;
+  std::atomic_uint32_t syncStepValue = 0;
+  std::atomic_uint32_t myStepValue = 0;
+  std::atomic_uint32_t syncStepValue2 = 0;
+};
+
 struct Group {
   size_t rank;
   size_t size;
@@ -95,7 +102,7 @@ struct Group {
   DynamicAddresses* localDyns = nullptr;
   Progress* localProgress = nullptr;
 
-  std::atomic_uint32_t* myStepCounter = nullptr;
+  SyncData* syncData = nullptr;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {

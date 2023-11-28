@@ -102,8 +102,9 @@ struct ProcessGroupImpl {
 
   void freeMemory() {
     std::lock_guard l(mutex);
-    CHECK_CU(cuCtxSynchronize());
-    group->ipcMapper->unmapAll();
+    group->ipcMapper->enqueueUnmapAll();
+    // CHECK_CU(cuCtxSynchronize());
+    // group->ipcMapper->unmapAll();
   }
 
   struct TraceEvent {
@@ -297,6 +298,76 @@ struct ProcessGroupImpl {
     }
   }
 
+  void sync(uint32_t stepValue) {
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+    const auto& peerIndices = group->peerIndices;
+    if (ipcMapper->hasQueuedUnmaps.load(std::memory_order_relaxed) ||
+        group->syncData->shouldSync.load(std::memory_order_relaxed)) {
+
+      group->syncData->syncStepValue = stepValue;
+      for (size_t i : peerIndices) {
+        group->getPeerVar(i, group->syncData)->shouldSync = true;
+      }
+      log.info("%d: attempting to sync up at step %#x!\n", rank, stepValue);
+      bool failed = false;
+      while (true) {
+        uint32_t minStepValue = std::numeric_limits<uint32_t>::max();
+        uint32_t maxStepValue = 0;
+        for (size_t i : peerIndices) {
+          uint32_t v = group->getPeerVar(i, group->syncData)->myStepValue.load();
+          minStepValue = std::min(minStepValue, v);
+          maxStepValue = std::max(maxStepValue, v);
+        }
+        // log.info("%d: min %d max %d\n", rank, minStepValue, maxStepValue);
+        if (maxStepValue >= stepValue) {
+          log.info("failed to sync up, unmap later!\n");
+          failed = true;
+          break;
+        }
+        if (minStepValue == maxStepValue) {
+          bool synced = true;
+          for (size_t i : peerIndices) {
+            if (group->getPeerVar(i, group->syncData)->syncStepValue.load() != stepValue) {
+              synced = false;
+              break;
+            }
+          }
+          if (synced) {
+            break;
+          }
+        }
+      }
+      if (!failed) {
+        group->syncData->syncStepValue2 = stepValue;
+        for (size_t i : peerIndices) {
+          while (group->getPeerVar(i, group->syncData)->syncStepValue2.load() < stepValue) {
+            _mm_pause();
+          }
+        }
+        log.info("%d: all synced up, execute unmaps!\n", rank);
+        for (size_t i : peerIndices) {
+          uint32_t v = group->getPeerVar(i, group->syncData)->syncStepValue.load();
+          CHECK(v == stepValue);
+        }
+        ipcMapper->executeQueuedUnmaps();
+        for (size_t i : peerIndices) {
+          uint32_t v = group->getPeerVar(i, group->syncData)->syncStepValue.load();
+          CHECK(v == stepValue);
+        }
+        group->syncData->shouldSync = false;
+
+        group->syncData->syncStepValue2 = stepValue + 1;
+        for (size_t i : peerIndices) {
+          while (group->getPeerVar(i, group->syncData)->syncStepValue2.load() < stepValue + 1) {
+            _mm_pause();
+          }
+        }
+      }
+    }
+    group->syncData->myStepValue.store(stepValue, std::memory_order_relaxed);
+    ipcMapper->setStepValue(stepValue);
+  }
+
   void all_gather(at::Tensor& output, const at::Tensor& input) {
     trace("all_gather");
     std::lock_guard l(mutex);
@@ -356,6 +427,8 @@ struct ProcessGroupImpl {
 
     trace("ipcMapper");
 
+    sync(stepValue);
+
     std::array<uintptr_t, 8> peerInputAddresses;
     std::array<uintptr_t, 8> peerOutputAddresses;
 
@@ -368,12 +441,6 @@ struct ProcessGroupImpl {
     }
 
     ipcMapper->wait();
-
-    // solution
-    // ipc mapper lock, keep track of stepvalue
-    // on unmap, if local stepvalue less than remote stepvalue, fail (as it would deadlock)
-    // unmap is blocking
-    // do we request unmap again after incrementing stepvalue?
 
     trace("enqueue");
 
@@ -418,13 +485,6 @@ struct ProcessGroupImpl {
 
     size_t gridSize = group->kernels->gridSize;
     size_t blockSize = group->kernels->blockSize;
-
-    ipcMapper->setStepValue(stepValue);
-    // group->myStepCounter->store(stepValue);
-    // futexWakeAll(group->myStepCounter);
-    // for (size_t i : peerIndices) {
-    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
-    // }
 
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
@@ -521,6 +581,8 @@ struct ProcessGroupImpl {
     const auto& peerIndices = group->peerIndices;
 
     trace("ipcMapper");
+
+    sync(stepValue);
 
     std::array<uintptr_t, 8> peerInputAddresses;
     std::array<uintptr_t, 8> peerOutputAddresses;
@@ -633,13 +695,6 @@ struct ProcessGroupImpl {
     size_t gridSize = group->kernels->gridSize;
     size_t blockSize = group->kernels->blockSize;
 
-    ipcMapper->setStepValue(stepValue);
-    // group->myStepCounter->store(stepValue);
-    // futexWakeAll(group->myStepCounter);
-    // for (size_t i : peerIndices) {
-    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
-    // }
-
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0,
@@ -684,6 +739,8 @@ struct ProcessGroupImpl {
 
     Group* group = &*this->group;
 
+    sync(stepValue);
+
     QueueEntryBroadcast* e = group->cpuThread->freelistBroadcast.pop();
     e->task = taskBroadcast;
     e->stepValue = stepValue;
@@ -702,13 +759,6 @@ struct ProcessGroupImpl {
 
     size_t gridSize = 1;
     size_t blockSize = 1;
-
-    group->ipcMapper->setStepValue(stepValue);
-    // group->myStepCounter->store(stepValue);
-    // futexWakeAll(group->myStepCounter);
-    // for (size_t i : group->peerIndices) {
-    //   futexWaitWhileLess(group->getPeerVar(i, group->myStepCounter), stepValue);
-    // }
 
     CHECK_CU(cuLaunchKernel(
         group->kernels->cuBroadcast, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
