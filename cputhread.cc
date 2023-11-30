@@ -14,12 +14,15 @@
 #include "fmt/printf.h"
 
 #include <atomic>
+#include <cstring>
 #include <libibverbs/verbs.h>
 #include <memory>
 #include <numa.h>
 #include <random>
 #include <type_traits>
 #include <utility>
+
+#include <sys/uio.h>
 
 namespace moodist {
 
@@ -123,6 +126,95 @@ struct PoolAllocator {
 
 } // namespace
 
+template<Dtype dtype>
+struct CpuTypes;
+
+template<>
+struct CpuTypes<Dtype::float32> {
+  static constexpr size_t bytes = 4;
+  using T = float;
+};
+
+template<>
+struct CpuTypes<Dtype::float64> {
+  static constexpr size_t bytes = 8;
+  using T = double;
+};
+
+template<>
+struct CpuTypes<Dtype::int32> {
+  static constexpr size_t bytes = 4;
+  using T = int32_t;
+};
+
+template<>
+struct CpuTypes<Dtype::int64> {
+  static constexpr size_t bytes = 8;
+  using T = int64_t;
+};
+
+template<Dtype dtype>
+typename CpuTypes<dtype>::T cpuLoad(uintptr_t address) {
+  return *(typename CpuTypes<dtype>::T*)address;
+}
+
+template<Dtype dtype>
+void cpuStore(uintptr_t address, typename CpuTypes<dtype>::T value) {
+  *(typename CpuTypes<dtype>::T*)address = value;
+}
+
+template<Dtype dtype, Reduction reduction>
+struct CpuReductions {
+  using T = typename CpuTypes<dtype>::T;
+  static T add(T a, T b) {
+    return a + b;
+  }
+  static T min(T a, T b) {
+    return std::min(a, b);
+  }
+  static T max(T a, T b) {
+    return a + b;
+  }
+  static void reduce(uintptr_t dst, uintptr_t src) {
+    if (reduction == Reduction::sum) {
+      cpuStore<dtype>(dst, add(cpuLoad<dtype>(dst), cpuLoad<dtype>(src)));
+    } else if (reduction == Reduction::min) {
+      cpuStore<dtype>(dst, min(cpuLoad<dtype>(dst), cpuLoad<dtype>(src)));
+    } else if (reduction == Reduction::max) {
+      cpuStore<dtype>(dst, max(cpuLoad<dtype>(dst), cpuLoad<dtype>(src)));
+    } else {
+      fatal("Unsupported cpu reduction");
+    }
+  }
+};
+
+struct TemporaryBufferHandle {
+  AllocatedBuffer buffer;
+  Vector<AllocatedBuffer>* container = nullptr;
+  TemporaryBufferHandle() = default;
+  TemporaryBufferHandle(AllocatedBuffer buffer, Vector<AllocatedBuffer>* container)
+      : buffer(std::move(buffer)), container(container) {}
+  TemporaryBufferHandle(TemporaryBufferHandle&& n) {
+    *this = std::move(n);
+  }
+  TemporaryBufferHandle& operator=(TemporaryBufferHandle&& n) {
+    std::swap(buffer, n.buffer);
+    std::swap(container, n.container);
+    return *this;
+  }
+  ~TemporaryBufferHandle() {
+    if (container) {
+      container->push_back(std::move(buffer));
+    }
+  }
+  AllocatedBuffer& operator*() {
+    return buffer;
+  }
+  AllocatedBuffer* operator->() {
+    return &buffer;
+  }
+};
+
 struct CpuThreadImpl {
   CpuThread* cpuThread;
   Group* group;
@@ -174,6 +266,20 @@ struct CpuThreadImpl {
 
   AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
   MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.buffer.cpuPointer, outDynsBuffer.buffer.bytes);
+
+  Vector<AllocatedBuffer> temporaryBuffers;
+
+  TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes) {
+    if (temporaryBuffers.empty()) {
+      return TemporaryBufferHandle(group->allocateHost(bytes), &temporaryBuffers);
+    }
+    auto buffer = std::move(temporaryBuffers.back());
+    temporaryBuffers.pop_back();
+    if (buffer.bytes < bytes) {
+      buffer = group->allocateHost(bytes);
+    }
+    return TemporaryBufferHandle(std::move(buffer), &temporaryBuffers);
+  }
 
   SimpleVector<Device> initDevices() {
     SimpleVector<Device> devices;
@@ -520,6 +626,11 @@ struct CpuThreadImpl {
     volatile uint32_t* const cpuOut = &self.group->cpuOutBuffer.at<volatile uint32_t>(concurrencyIndex);
 
     Work(CpuThreadImpl& self, const QueueEntry& params) : self(self), params(params) {}
+
+    template<typename T>
+    auto getStepPtr() {
+      return [](Work* w) { ((T*)w)->step(); };
+    }
   };
 
 #define CAT2(a, b) a##b
@@ -825,6 +936,222 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkReduceScatterCpu : Work {
+    QueueEntryReduceScatterCpu& params;
+    size_t i;
+    MemoryRegistration* sendMr;
+    size_t liveSends;
+    size_t index;
+    size_t nDynReady = 0;
+    uintptr_t sendAddress;
+
+    uintptr_t prevReduceOutput = 0;
+
+    TemporaryBufferHandle temporaryBuffer;
+
+    const ReduceScatter& reduceScatter = *self.group->reduceScatter;
+    const std::vector<size_t>& sendRanks = reduceScatter.sendRanks;
+    const std::vector<size_t>& recvRanks = reduceScatter.recvRanks;
+    const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
+    const std::vector<size_t>& peerIndices = self.group->peerIndices;
+
+    WorkReduceScatterCpu(CpuThreadImpl& self, QueueEntryReduceScatterCpu& params)
+        : Work(self, params), params(params) {}
+
+    template<typename T, size_t dindex = 0, size_t opindex = 0>
+    decltype(stepPtr) getStepPtr() {
+      if constexpr (dindex < (size_t)Dtype::count && opindex < (size_t)Reduction::count) {
+        if (dindex == (size_t)params.dindex && opindex == (size_t)params.opindex) {
+          return [](Work* w) { ((T*)w)->template step<(Dtype)dindex, (Reduction)opindex>(); };
+        }
+      }
+      if constexpr (dindex < (size_t)Dtype::count) {
+        return getStepPtr<T, dindex + 1, opindex>();
+      }
+      if constexpr (opindex < (size_t)Reduction::count) {
+        return getStepPtr<T, dindex, opindex + 1>();
+      }
+      CHECK(false);
+    }
+
+    template<Dtype dtype, Reduction reduction>
+    void reduceAdd(uintptr_t output, uintptr_t input) {
+      if (prevReduceOutput != output) {
+        std::memcpy((void*)output, (void*)input, params.bytes);
+        prevReduceOutput = output;
+      } else {
+        size_t bytes = params.bytes;
+        size_t itembytes = CpuTypes<dtype>::bytes;
+        uintptr_t end = output + bytes;
+        CHECK(bytes % itembytes == 0);
+        while (output != end) {
+          CpuReductions<dtype, reduction>::reduce(output, input);
+          output += itembytes;
+          input += itembytes;
+        }
+      }
+    }
+
+    uintptr_t vmread(int pid, uintptr_t src, size_t bytes) {
+      if (temporaryBuffer->bytes < bytes) {
+        temporaryBuffer = self.allocateTemporaryBuffer(bytes);
+      }
+      iovec local;
+      local.iov_base = temporaryBuffer->cpuPointer;
+      local.iov_len = bytes;
+      iovec remote;
+      remote.iov_base = (void*)src;
+      remote.iov_len = bytes;
+      if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != bytes) {
+        fatal("process_vm_readv failed with error: %s", std::strerror(errno));
+      }
+      return (uintptr_t)temporaryBuffer->cpuPointer;
+    }
+
+    template<Dtype dtype, Reduction reduction>
+    void step() {
+      ENTER
+
+      {
+        uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
+        CHECK(params.sd->recvBuffer.bytes >= params.pitch * recvRanks.size());
+
+        sendAddress = params.sd->sendBuffer.cudaPointer;
+        CHECK(params.sd->sendBuffer.bytes >= params.pitch * sendRanks.size());
+
+        if (!recvRanks.empty()) {
+          CHECK(sendAddress && recvAddress);
+          CHECK(false);
+
+          sendMr = self.regMr(sendAddress, params.pitch * sendRanks.size());
+
+          DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+          // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+          // Thus, we register each ranks output address independently, so they get different MRs.
+          size_t n = 0;
+          for (size_t i : recvRanks) {
+            auto* mr = self.regMrCuda(recvAddress + params.pitch * n, params.pitch);
+            outDyns[i].gatherAddress = recvAddress;
+            for (size_t di = 0; di != self.devices.size(); ++di) {
+              outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+            }
+            ++n;
+          }
+
+          nDynReady = 0;
+          {
+            size_t n = 0;
+            for (size_t i : recvRanks) {
+              size_t di = (rank + n) % self.devices.size();
+              auto& dev = self.devices[di];
+              self.writeData(
+                  dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                  (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
+                  self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+              ++n;
+            }
+          }
+        } else {
+          CHECK(recvRanks.empty() && sendRanks.empty());
+        }
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = params.inputAddress;
+      self.group->cpuAddresses[concurrencyIndex].outputAddress = params.outputAddress;
+      self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
+
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue) {
+          YIELD
+        }
+      }
+
+      while (nDynReady < recvRanks.size()) {
+        YIELD
+      }
+
+      self.sendStepValues[concurrencyIndex] = stepValue;
+
+      CHECK(recvRanks.size() == sendRanks.size());
+
+      liveSends = 0;
+      for (index = 0; index != sendRanks.size(); ++index) {
+        CHECK(false);
+        // wait for send ready
+        while (cpuIn[1] < stepValue + index + 1) {
+          YIELD
+        }
+
+        {
+          size_t i = recvRanks[index];
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeStep(di, i, stepValue + index, concurrencyIndex);
+        }
+        i = sendRanks[index];
+        // wait for dyns
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+          YIELD
+        }
+
+        if (params.bytes > 0) {
+          uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index;
+
+          liveSends += self.devices.size();
+          self.writeDataDistributed2(
+              i, srcAddr, params.bytes, sendMr,
+              self.localDyns[size * concurrencyIndex + i].gatherAddress + params.pitch * index,
+              self.localDyns[size * concurrencyIndex + i].gatherKey,
+              [this, i = this->i](size_t di, bool ordered, bool done) {
+                if (done) {
+                  --liveSends;
+                }
+                if (ordered) {
+                  auto& dev = self.devices[di];
+                  self.writeData(
+                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
+                      self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                }
+              });
+        }
+        while (liveSends >= self.devices.size() * 2) {
+          YIELD
+        }
+      }
+
+      reduceAdd<dtype, reduction>(params.outputAddress, params.inputAddress + params.pitch * rank);
+      for (size_t peerIndex : peerIndices) {
+        auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+        reduceAdd<dtype, reduction>(
+            params.outputAddress, vmread(x->pid, x->inputAddress + params.pitch * rank, params.bytes));
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
+
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+
+      temporaryBuffer = {};
+
+      self.cpuThread->freelistReduceScatterCpu.push(&params);
+      self.allocatorReduceScatterCpu.deallocate(this);
+      DONE
+    }
+  };
+
   struct WorkBroadcast : Work {
     QueueEntryBroadcast& params;
     size_t i;
@@ -968,6 +1295,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkAllGather> allocatorAllGather;
   WorkAllocator<WorkReduceScatter> allocatorReduceScatter;
   WorkAllocator<WorkBroadcast> allocatorBroadcast;
+  WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
 
   void entry() {
     try {
@@ -990,7 +1318,7 @@ struct CpuThreadImpl {
         }
         auto* work = allocator.allocate(*this, params);
         // work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
-        work->stepPtr = [](Work* w) { ((decltype(work))w)->step(); };
+        work->stepPtr = work->template getStepPtr<std::remove_pointer_t<decltype(work)>>();
         CHECK(work->streamIndex < streams.size());
         if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
           activeWorks.push_back(*work);
@@ -1035,6 +1363,8 @@ struct CpuThreadImpl {
               cpuThread->freelistTerminate.push(&queueEntry);
             } else if (queueEntry.task == taskBroadcast) {
               enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
+            } else if (queueEntry.task == taskReduceScatterCpu) {
+              enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }

@@ -5,9 +5,6 @@
 
 namespace moodist {
 
-enum class Dtype { float32, float64, int32, int64, count };
-enum class Reduction { sum, min, max, avg, count };
-
 enum CompileFlags {
   CompileAllGather = 1,
   CompileReduceScatter = 2,

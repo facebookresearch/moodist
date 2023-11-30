@@ -73,6 +73,7 @@ void Group::init() {
   auto start = Clock::now();
 
   deviceIndex = c10::cuda::current_device();
+  pid = ::getpid();
 
   cuContext = nullptr;
   cuCtxGetCurrent(&cuContext);
@@ -562,6 +563,7 @@ void Group::init() {
   };
   get(localDyns, size * Group::maxConcurrency);
   get(localProgress, size * Group::maxConcurrency);
+  get(cpuAddresses, Group::maxConcurrency);
   get(syncData, 1);
 
   mySharedMemSize = offset;

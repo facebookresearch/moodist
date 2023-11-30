@@ -520,15 +520,19 @@ struct ProcessGroupImpl {
     CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
-    TORCH_CHECK(input.is_cuda());
-    TORCH_CHECK(input.device().index() == group->deviceIndex);
     TORCH_CHECK(output.is_contiguous());
-    TORCH_CHECK(output.is_cuda());
-    TORCH_CHECK(output.device().index() == group->deviceIndex);
+
+    bool isCuda = input.is_cuda();
+
+    if (isCuda) {
+      TORCH_CHECK(input.is_cuda());
+      TORCH_CHECK(input.device().index() == group->deviceIndex);
+      TORCH_CHECK(output.is_cuda());
+      TORCH_CHECK(output.device().index() == group->deviceIndex);
+    }
 
     auto dtype = output.dtype();
     TORCH_CHECK(input.dtype() == dtype);
-    // TORCH_CHECK(output.dtype() == torch::Dtype::Float);
 
     size_t numel = output.numel();
     size_t bytes = numel * output.itemsize();
@@ -540,6 +544,84 @@ struct ProcessGroupImpl {
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+
+    Dtype dindex;
+    switch (dtype.toScalarType()) {
+    case torch::Dtype::Float:
+      dindex = Dtype::float32;
+      break;
+    case torch::Dtype::Double:
+      dindex = Dtype::float64;
+      break;
+    case torch::Dtype::Int:
+      dindex = Dtype::int32;
+      break;
+    case torch::Dtype::Long:
+      dindex = Dtype::int64;
+      break;
+    default:
+      throw std::runtime_error(
+          fmt::sprintf("moodist: reduce_scatter: Unsupported dtype %s", std::string(dtype.name())));
+    }
+    Reduction opindex;
+    switch (reduceOp) {
+    case c10d::ReduceOp::SUM:
+      opindex = Reduction::sum;
+      break;
+    case c10d::ReduceOp::MIN:
+      opindex = Reduction::min;
+      break;
+    case c10d::ReduceOp::MAX:
+      opindex = Reduction::max;
+      break;
+    case c10d::ReduceOp::AVG:
+      opindex = Reduction::avg;
+      break;
+    default:
+      throw std::runtime_error(
+          fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %s", std::string(dtype.name())));
+    }
+
+    Group* group = &*this->group;
+
+    ReduceScatter& reduceScatter = *group->reduceScatter;
+
+    auto& sendRanks = reduceScatter.sendRanks;
+    auto& recvRanks = reduceScatter.recvRanks;
+
+    if (!isCuda) {
+
+      StreamData& sd = group->getStreamData(nullptr);
+
+      auto allocbuffer = [&](auto& buffer, size_t size) {
+        if (buffer.bytes < size) {
+          buffer = {};
+          buffer = group->allocateHost(size);
+        }
+      };
+
+      allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
+      allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
+
+      std::atomic_uint32_t cpuDone = 0;
+      QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();
+      e->task = taskReduceScatterCpu;
+      e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
+      e->sd = &sd;
+      e->inputAddress = inputAddress;
+      e->outputAddress = outputAddress;
+      e->bytes = bytes;
+      e->pitch = pitch;
+      e->cpuDone = &cpuDone;
+      e->dindex = dindex;
+      e->opindex = opindex;
+      group->cpuThread->enqueue(e);
+      while (cpuDone == 0) {
+        futexWait(&cpuDone, 0, std::chrono::seconds(10));
+      }
+      return;
+    }
 
     CUstream stream = c10::cuda::getCurrentCUDAStream();
 
@@ -599,13 +681,6 @@ struct ProcessGroupImpl {
 
     trace("enqueue");
 
-    Group* group = &*this->group;
-
-    ReduceScatter& reduceScatter = *group->reduceScatter;
-
-    auto& sendRanks = reduceScatter.sendRanks;
-    auto& recvRanks = reduceScatter.recvRanks;
-
     allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
     allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
 
@@ -625,43 +700,6 @@ struct ProcessGroupImpl {
     }
 
     trace("launch");
-
-    Dtype dindex;
-    switch (dtype.toScalarType()) {
-    case torch::Dtype::Float:
-      dindex = Dtype::float32;
-      break;
-    case torch::Dtype::Double:
-      dindex = Dtype::float64;
-      break;
-    case torch::Dtype::Int:
-      dindex = Dtype::int32;
-      break;
-    case torch::Dtype::Long:
-      dindex = Dtype::int64;
-      break;
-    default:
-      throw std::runtime_error(
-          fmt::sprintf("moodist: reduce_scatter: Unsupported dtype %s", std::string(dtype.name())));
-    }
-    Reduction opindex;
-    switch (reduceOp) {
-    case c10d::ReduceOp::SUM:
-      opindex = Reduction::sum;
-      break;
-    case c10d::ReduceOp::MIN:
-      opindex = Reduction::min;
-      break;
-    case c10d::ReduceOp::MAX:
-      opindex = Reduction::max;
-      break;
-    case c10d::ReduceOp::AVG:
-      opindex = Reduction::avg;
-      break;
-    default:
-      throw std::runtime_error(
-          fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %s", std::string(dtype.name())));
-    }
 
     if (!group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex]) {
       group->kernels->compile(
@@ -872,16 +910,24 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
     size_t bytes = numel * tensor.itemsize();
     torch::Tensor temporary =
         torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
-    CHECK_CU(cuMemcpyAsync(
-        (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+    if (tensor.device().is_cuda()) {
+      CHECK_CU(cuMemcpyAsync(
+          (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+    } else {
+      temporary.narrow(0, 0, numel).copy_(tensor);
+    }
 
     auto t = temporary.view({(int64_t)impl->size, -1});
     auto o = t[impl->rank];
     impl->reduce_scatter(o, t, opts.reduceOp);
     impl->all_gather(t, o);
 
-    CHECK_CU(cuMemcpyAsync(
-        (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+    if (tensor.device().is_cuda()) {
+      CHECK_CU(cuMemcpyAsync(
+          (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+    } else {
+      tensor.narrow(0, 0, numel).copy_(temporary);
+    }
 
     return c10::make_intrusive<WorkImpl>(tensors);
   }

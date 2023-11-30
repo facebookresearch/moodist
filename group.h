@@ -15,9 +15,21 @@ struct ReduceScatter;
 
 struct DynamicAddresses;
 
+enum class Dtype { float32, float64, int32, int64, count };
+enum class Reduction { sum, min, max, avg, count };
+
+static constexpr size_t maxConcurrency = 16;
+
 struct alignas(64) Progress {
   uint32_t stepValue;
   uint32_t cpuStepValue;
+};
+
+struct alignas(64) CpuAddresses {
+  uint32_t stepValue;
+  int pid;
+  uintptr_t inputAddress;
+  uintptr_t outputAddress;
 };
 
 struct alignas(64) DynamicAddresses {
@@ -54,6 +66,7 @@ struct Group {
   size_t size;
 
   int deviceIndex = 0;
+  int pid = 0;
 
   CUcontext cuContext = nullptr;
   CUdevice cuDevice;
@@ -101,6 +114,7 @@ struct Group {
   std::array<void*, 8> peerSharedMem;
   DynamicAddresses* localDyns = nullptr;
   Progress* localProgress = nullptr;
+  CpuAddresses* cpuAddresses = nullptr;
 
   SyncData* syncData = nullptr;
 
