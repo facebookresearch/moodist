@@ -593,15 +593,15 @@ struct ProcessGroupImpl {
 
       StreamData& sd = group->getStreamData(nullptr);
 
-      auto allocbuffer = [&](auto& buffer, size_t size) {
-        if (buffer.bytes < size) {
-          buffer = {};
-          buffer = group->allocateHost(size);
-        }
-      };
+      // auto allocbuffer = [&](auto& buffer, size_t size) {
+      //   if (buffer.bytes < size) {
+      //     buffer = {};
+      //     buffer = group->allocateHost(size);
+      //   }
+      // };
 
-      allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
-      allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
+      // allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
+      // allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
 
       std::atomic_uint32_t cpuDone = 0;
       QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();

@@ -78,10 +78,7 @@ struct AllocatedBuffer {
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
-    std::swap(cpuPointer, n.cpuPointer);
-    std::swap(cudaPointer, n.cudaPointer);
-    std::swap(bytes, n.bytes);
-    std::swap(hostAllocated, n.hostAllocated);
+    *this = std::move(n);
   }
 
   AllocatedBuffer& operator=(AllocatedBuffer&& n) noexcept {
@@ -89,10 +86,11 @@ struct AllocatedBuffer {
     std::swap(cudaPointer, n.cudaPointer);
     std::swap(bytes, n.bytes);
     std::swap(hostAllocated, n.hostAllocated);
+    std::swap(numaAllocated, n.numaAllocated);
     return *this;
   }
 
-  ~AllocatedBuffer() {
+  void dtor() {
     if (numaAllocated) {
       if (cpuPointer) {
         cuMemHostUnregister(cpuPointer);
@@ -108,6 +106,12 @@ struct AllocatedBuffer {
         // fmt::printf("free cuda memory %#x\n", cudaPointer);
         cuMemFree(cudaPointer);
       }
+    }
+  }
+
+  ~AllocatedBuffer() {
+    if ((uintptr_t)cpuPointer | cudaPointer) {
+      dtor();
     }
   }
 };
@@ -128,6 +132,28 @@ struct AllocatedArray {
   template<typename T>
   T& at(size_t index) {
     return *(T*)cpu(index);
+  }
+};
+
+struct AllocatedCpuBuffer {
+  void* cpuPointer = nullptr;
+  size_t bytes = 0;
+
+  AllocatedCpuBuffer() = default;
+  AllocatedCpuBuffer(AllocatedCpuBuffer&& n) noexcept {
+    *this = std::move(n);
+  }
+
+  AllocatedCpuBuffer& operator=(AllocatedCpuBuffer&& n) noexcept {
+    std::swap(cpuPointer, n.cpuPointer);
+    std::swap(bytes, n.bytes);
+    return *this;
+  }
+
+  ~AllocatedCpuBuffer() {
+    if (cpuPointer) {
+      numa_free(cpuPointer, bytes);
+    }
   }
 };
 

@@ -604,6 +604,7 @@ void Group::init() {
   mapPeerAddrs(cudaPeerAddresses, peerCudaPeerAddresses);
 
   cudaCommsDeviceDataSent = allocateArrayDevice(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
+  cpuCommsDeviceDataSent = allocateArrayHost(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
 
   cudaProxyReady = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
   mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
@@ -720,6 +721,18 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   CHECK_CU(cuMemHostGetDevicePointer(&ptr, r.cpuPointer, 0));
   r.cudaPointer = ptr;
   log.verbose("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  return r;
+}
+
+AllocatedCpuBuffer Group::allocateCpu(size_t bytes) {
+  if (bytes < 4096) {
+    bytes = 4096;
+  }
+  AllocatedCpuBuffer r;
+  r.bytes = bytes;
+  r.cpuPointer = numaAllocate(bytes, allocationNode);
+  std::memset(r.cpuPointer, 0, bytes);
+  log.verbose("allocated CPU memory (%p) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.bytes, allocationNode);
   return r;
 }
 

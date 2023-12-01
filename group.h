@@ -92,6 +92,7 @@ struct Group {
   std::array<PeerArrayRef, 8> peerCudaPeerAddresses;
 
   AllocatedArray cudaCommsDeviceDataSent;
+  AllocatedArray cpuCommsDeviceDataSent;
 
   AllocatedArray cudaProxyReady;
   std::array<PeerArrayRef, 8> peerCudaProxyReady;
@@ -150,6 +151,8 @@ struct Group {
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);
+
+  AllocatedCpuBuffer allocateCpu(size_t bytes);
 
   AllocatedArray allocateArrayHost(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayHostMapped(size_t itembytes, size_t numel);

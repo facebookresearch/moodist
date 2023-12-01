@@ -263,12 +263,7 @@ def f(n):
         loopcount = 1000
         events = []
         for i in range(loopcount):
-            if len(events) >= 2:
-                events.pop(0).synchronize()
             dist.reduce_scatter_tensor(result0, tmp)
-            e = torch.cuda.Event()
-            e.record()
-            events.append(e)
 
     print("rank %d all done!" % rank)
     dist.barrier()

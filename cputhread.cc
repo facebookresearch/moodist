@@ -33,7 +33,7 @@ namespace {
 struct QuitCpuThread {};
 
 struct MemoryRegistration {
-  std::array<ibv_mr*, 32> mrs;
+  std::array<ibv_mr*, 32> mrs{};
 };
 
 struct CudaMapping {
@@ -189,28 +189,31 @@ struct CpuReductions {
 };
 
 struct TemporaryBufferHandle {
-  AllocatedBuffer buffer;
-  Vector<AllocatedBuffer>* container = nullptr;
+  AllocatedCpuBuffer buffer;
+  MemoryRegistration* mr = nullptr;
+  Vector<TemporaryBufferHandle>* container = nullptr;
   TemporaryBufferHandle() = default;
-  TemporaryBufferHandle(AllocatedBuffer buffer, Vector<AllocatedBuffer>* container)
-      : buffer(std::move(buffer)), container(container) {}
+  TemporaryBufferHandle(AllocatedCpuBuffer buffer, MemoryRegistration* mr, Vector<TemporaryBufferHandle>* container)
+      : buffer(std::move(buffer)), mr(mr), container(container) {}
   TemporaryBufferHandle(TemporaryBufferHandle&& n) {
     *this = std::move(n);
   }
   TemporaryBufferHandle& operator=(TemporaryBufferHandle&& n) {
     std::swap(buffer, n.buffer);
+    std::swap(mr, n.mr);
     std::swap(container, n.container);
     return *this;
   }
   ~TemporaryBufferHandle() {
     if (container) {
-      container->push_back(std::move(buffer));
+      auto* container = std::exchange(this->container, nullptr);
+      container->push_back(std::move(*this));
     }
   }
-  AllocatedBuffer& operator*() {
+  AllocatedCpuBuffer& operator*() {
     return buffer;
   }
-  AllocatedBuffer* operator->() {
+  AllocatedCpuBuffer* operator->() {
     return &buffer;
   }
 };
@@ -259,6 +262,11 @@ struct CpuThreadImpl {
   std::vector<RemoteAddressAndKey> remoteCudaCommsDeviceDataSent =
       distributeAddressAndKeys(group->cudaCommsDeviceDataSent.buffer.cudaPointer, cudaCommsDeviceDataSentMr);
 
+  MemoryRegistration* cpuCommsDeviceDataSentMr =
+      regMr((uintptr_t)group->cpuCommsDeviceDataSent.buffer.cpuPointer, group->cpuCommsDeviceDataSent.buffer.bytes);
+  std::vector<RemoteAddressAndKey> remoteCpuCommsDeviceDataSent =
+      distributeAddressAndKeys((uintptr_t)group->cpuCommsDeviceDataSent.buffer.cpuPointer, cpuCommsDeviceDataSentMr);
+
   AllocatedArray sendStepValuesStorage = group->allocateArrayHost(sizeof(uint32_t), Group::maxConcurrency);
   MemoryRegistration* sendStepValuesStorageMr =
       regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
@@ -267,18 +275,59 @@ struct CpuThreadImpl {
   AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
   MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.buffer.cpuPointer, outDynsBuffer.buffer.bytes);
 
-  Vector<AllocatedBuffer> temporaryBuffers;
+  Vector<TemporaryBufferHandle> vmreadBuffers;
+  Vector<TemporaryBufferHandle> sendRecvBuffers;
 
-  TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes) {
-    if (temporaryBuffers.empty()) {
-      return TemporaryBufferHandle(group->allocateHost(bytes), &temporaryBuffers);
+  TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes, Vector<TemporaryBufferHandle>& container) {
+    for (size_t i = container.size(); i;) {
+      --i;
+      auto& v = container[i];
+      if (v->bytes >= bytes) {
+        auto h = std::move(v);
+        container.erase(container.begin() + i);
+        h.container = &container;
+        return h;
+      }
     }
-    auto buffer = std::move(temporaryBuffers.back());
-    temporaryBuffers.pop_back();
-    if (buffer.bytes < bytes) {
-      buffer = group->allocateHost(bytes);
-    }
-    return TemporaryBufferHandle(std::move(buffer), &temporaryBuffers);
+    auto buffer = group->allocateCpu(bytes);
+    auto* mr = regMr((uintptr_t)buffer.cpuPointer, buffer.bytes);
+    return TemporaryBufferHandle(std::move(buffer), mr, &container);
+    //  todo: this isn't good enough, for now never free memory
+    //        the problem is we need to de-register when we free memory,
+    //        as we don't have a buffer id like with cuda memory,
+    //        but it's tricky because of the extra regs we do due to
+    //        efa 2gb bug. this code could just iterate over all regs
+    //        and free the ones in the region when we reallocate,
+    //        but for now let's just do the above (never free).
+    // if (container.empty()) {
+    //   auto buffer = group->allocateCpu(bytes);
+    //   auto* mr = regMr((uintptr_t)buffer.cpuPointer, buffer.bytes);
+    //   return TemporaryBufferHandle(std::move(buffer), mr, &container);
+    // }
+    // auto handle = std::move(container.back());
+    // container.pop_back();
+    // if (handle->bytes < bytes) {
+    //   CHECK(false);
+    //   auto i = mrMap.find((uintptr_t)handle->cpuPointer);
+    //   if (i != mrMap.end()) {
+    //     mrMap.erase(i);
+    //   }
+    //   for (size_t i = 0; i != devices.size(); ++i) {
+    //     if (handle.mr->mrs[i]) {
+    //       for (auto& v : localMrs) {
+    //         if (&*v == handle.mr->mrs[i]) {
+    //           localMrs.erase(localMrs.begin() + (&v - localMrs.data()));
+    //           break;
+    //         }
+    //       }
+    //       //ibv_dereg_mr(handle.mr->mrs[i]);
+    //     }
+    //   }
+    //   handle.buffer = group->allocateCpu(bytes);
+    //   handle.mr = regMr((uintptr_t)handle->cpuPointer, handle->bytes);
+    // }
+    // handle.container = &container;
+    // return std::move(handle);
   }
 
   SimpleVector<Device> initDevices() {
@@ -939,15 +988,17 @@ struct CpuThreadImpl {
   struct WorkReduceScatterCpu : Work {
     QueueEntryReduceScatterCpu& params;
     size_t i;
-    MemoryRegistration* sendMr;
+    size_t di;
     size_t liveSends;
     size_t index;
     size_t nDynReady = 0;
-    uintptr_t sendAddress;
 
     uintptr_t prevReduceOutput = 0;
 
     TemporaryBufferHandle temporaryBuffer;
+
+    TemporaryBufferHandle sendBuffer;
+    TemporaryBufferHandle recvBuffer;
 
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
     const std::vector<size_t>& sendRanks = reduceScatter.sendRanks;
@@ -960,15 +1011,13 @@ struct CpuThreadImpl {
 
     template<typename T, size_t dindex = 0, size_t opindex = 0>
     decltype(stepPtr) getStepPtr() {
-      if constexpr (dindex < (size_t)Dtype::count && opindex < (size_t)Reduction::count) {
-        if (dindex == (size_t)params.dindex && opindex == (size_t)params.opindex) {
-          return [](Work* w) { ((T*)w)->template step<(Dtype)dindex, (Reduction)opindex>(); };
-        }
+      if (dindex == (size_t)params.dindex && opindex == (size_t)params.opindex) {
+        return [](Work* w) { ((T*)w)->template step<(Dtype)dindex, (Reduction)opindex>(); };
       }
-      if constexpr (dindex < (size_t)Dtype::count) {
+      if constexpr (dindex + 1 < (size_t)Dtype::count) {
         return getStepPtr<T, dindex + 1, opindex>();
       }
-      if constexpr (opindex < (size_t)Reduction::count) {
+      if constexpr (opindex + 1 < (size_t)Reduction::count) {
         return getStepPtr<T, dindex, opindex + 1>();
       }
       CHECK(false);
@@ -994,7 +1043,7 @@ struct CpuThreadImpl {
 
     uintptr_t vmread(int pid, uintptr_t src, size_t bytes) {
       if (temporaryBuffer->bytes < bytes) {
-        temporaryBuffer = self.allocateTemporaryBuffer(bytes);
+        temporaryBuffer = self.allocateTemporaryBuffer(bytes, self.vmreadBuffers);
       }
       iovec local;
       local.iov_base = temporaryBuffer->cpuPointer;
@@ -1013,17 +1062,14 @@ struct CpuThreadImpl {
       ENTER
 
       {
-        uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
-        CHECK(params.sd->recvBuffer.bytes >= params.pitch * recvRanks.size());
-
-        sendAddress = params.sd->sendBuffer.cudaPointer;
-        CHECK(params.sd->sendBuffer.bytes >= params.pitch * sendRanks.size());
+        recvBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size(), self.sendRecvBuffers);
+        sendBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size(), self.sendRecvBuffers);
+        uintptr_t recvAddress = (uintptr_t)recvBuffer->cpuPointer;
 
         if (!recvRanks.empty()) {
-          CHECK(sendAddress && recvAddress);
-          CHECK(false);
+          CHECK(recvAddress);
 
-          sendMr = self.regMr(sendAddress, params.pitch * sendRanks.size());
+          // sendMr = self.regMr(sendAddress, params.pitch * sendRanks.size());
 
           DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
 
@@ -1031,7 +1077,7 @@ struct CpuThreadImpl {
           // Thus, we register each ranks output address independently, so they get different MRs.
           size_t n = 0;
           for (size_t i : recvRanks) {
-            auto* mr = self.regMrCuda(recvAddress + params.pitch * n, params.pitch);
+            auto* mr = self.regMr(recvAddress + params.pitch * n, params.pitch);
             outDyns[i].gatherAddress = recvAddress;
             for (size_t di = 0; di != self.devices.size(); ++di) {
               outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
@@ -1078,10 +1124,14 @@ struct CpuThreadImpl {
 
       liveSends = 0;
       for (index = 0; index != sendRanks.size(); ++index) {
-        CHECK(false);
-        // wait for send ready
-        while (cpuIn[1] < stepValue + index + 1) {
-          YIELD
+        {
+          size_t i = recvRanks[index];
+          uintptr_t addr = (uintptr_t)sendBuffer->cpuPointer + params.pitch * index;
+          reduceAdd<dtype, reduction>(addr, params.inputAddress + params.pitch * i);
+          for (size_t peerIndex : peerIndices) {
+            auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+            reduceAdd<dtype, reduction>(addr, vmread(x->pid, x->inputAddress + params.pitch * i, params.bytes));
+          }
         }
 
         {
@@ -1097,11 +1147,11 @@ struct CpuThreadImpl {
         }
 
         if (params.bytes > 0) {
-          uintptr_t srcAddr = (uintptr_t)sendAddress + params.pitch * index;
+          uintptr_t srcAddr = (uintptr_t)sendBuffer->cpuPointer + params.pitch * index;
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
-              i, srcAddr, params.bytes, sendMr,
+              i, srcAddr, params.bytes, sendBuffer.mr,
               self.localDyns[size * concurrencyIndex + i].gatherAddress + params.pitch * index,
               self.localDyns[size * concurrencyIndex + i].gatherKey,
               [this, i = this->i](size_t di, bool ordered, bool done) {
@@ -1112,8 +1162,8 @@ struct CpuThreadImpl {
                   auto& dev = self.devices[di];
                   self.writeData(
                       dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
-                      (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
-                      self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                      (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
+                      self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
               });
         }
@@ -1127,6 +1177,16 @@ struct CpuThreadImpl {
         auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
         reduceAdd<dtype, reduction>(
             params.outputAddress, vmread(x->pid, x->inputAddress + params.pitch * rank, params.bytes));
+      }
+
+      for (index = 0; index != recvRanks.size(); ++index) {
+        i = recvRanks[index];
+        for (di = 0; di != self.devices.size(); ++di) {
+          while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+            YIELD
+          }
+        }
+        reduceAdd<dtype, reduction>(params.outputAddress, (uintptr_t)recvBuffer->cpuPointer + params.pitch * index);
       }
 
       while (liveSends) {
