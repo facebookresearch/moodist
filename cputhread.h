@@ -4,6 +4,7 @@
 #include "intrusive_list.h"
 #include "synchronization.h"
 #include "vector.h"
+#include "simple_vector.h"
 
 #include <forward_list>
 #include <memory>
@@ -17,6 +18,12 @@ constexpr uint8_t taskReduceScatter = 3;
 constexpr uint8_t taskBroadcast = 4;
 constexpr uint8_t taskAllGatherCpu = 5;
 constexpr uint8_t taskReduceScatterCpu = 6;
+constexpr uint8_t taskGatherCpu = 7;
+
+struct DataRef {
+  uintptr_t address = 0;
+  size_t bytes = 0;
+};
 
 struct QueueEntry {
   IntrusiveListLink<QueueEntry> link;
@@ -68,6 +75,14 @@ struct QueueEntryReduceScatterCpu : QueueEntry {
   Reduction opindex;
 };
 
+struct QueueEntryGatherCpu : QueueEntry {
+  uintptr_t inputAddress = 0;
+  SimpleVector<DataRef> outputList;
+  size_t bytes = 0;
+  uint32_t destinationRank = -1;
+  std::atomic_uint32_t* cpuDone = nullptr;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -112,6 +127,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryBroadcast> freelistBroadcast;
   QueueEntryFreeList<QueueEntryAllGatherCpu> freelistAllGatherCpu;
   QueueEntryFreeList<QueueEntryReduceScatterCpu> freelistReduceScatterCpu;
+  QueueEntryFreeList<QueueEntryGatherCpu> freelistGatherCpu;
 
   CpuThread(Group*);
   ~CpuThread();

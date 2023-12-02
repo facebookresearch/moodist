@@ -713,7 +713,6 @@ struct CpuThreadImpl {
 
     void step() {
       ENTER
-      // log.info("barrier enter stepValue %#x concurrency %d\n", stepValue, concurrencyIndex);
       for (size_t i = 0; i != size; ++i) {
         if (i == rank) {
           continue;
@@ -728,7 +727,6 @@ struct CpuThreadImpl {
           YIELD
         }
       }
-      // log.info("barrier leave stepValue %#x concurrency %d\n", stepValue, concurrencyIndex);
       params.cpuDone->store(1);
       futexWakeAll(params.cpuDone);
       self.cpuThread->freelistBarrier.push(&params);
@@ -1052,6 +1050,9 @@ struct CpuThreadImpl {
 
       params.cpuDone->store(1);
       futexWakeAll(params.cpuDone);
+
+      inputBuffer = {};
+      outputBuffer = {};
 
       self.cpuThread->freelistAllGatherCpu.push(&params);
       self.allocatorAllGatherCpu.deallocate(this);
@@ -1413,6 +1414,8 @@ struct CpuThreadImpl {
       futexWakeAll(params.cpuDone);
 
       temporaryBuffer = {};
+      sendBuffer = {};
+      recvBuffer = {};
 
       self.cpuThread->freelistReduceScatterCpu.push(&params);
       self.allocatorReduceScatterCpu.deallocate(this);
@@ -1540,6 +1543,194 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkGatherCpu : Work {
+    QueueEntryGatherCpu& params;
+    size_t i;
+    size_t di;
+    size_t offset;
+    TemporaryBufferHandle inputBuffer;
+    TemporaryBufferHandle outputBuffer;
+    size_t liveSends;
+    size_t index;
+    size_t nDynReady;
+
+    const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
+    const std::vector<size_t>& peerIndices = self.group->peerIndices;
+
+    WorkGatherCpu(CpuThreadImpl& self, QueueEntryGatherCpu& params) : Work(self, params), params(params) {}
+
+    void vmcopy(uintptr_t dst, int pid, uintptr_t src, size_t bytes) {
+      iovec local;
+      local.iov_base = (void*)dst;
+      local.iov_len = bytes;
+      iovec remote;
+      remote.iov_base = (void*)src;
+      remote.iov_len = bytes;
+      if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != bytes) {
+        fatal("process_vm_readv failed with error: %s", std::strerror(errno));
+      }
+    }
+
+    void step() {
+      ENTER
+
+      if (rank == params.destinationRank) {
+        CHECK(params.outputList.size() == size);
+        size_t outputSize = 0;
+        for (auto& v : params.outputList) {
+          outputSize += (v.bytes + 63) / 64u * 64u;
+        }
+        outputBuffer = self.allocateTemporaryBuffer(outputSize, self.allGatherOutputBuffers);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        size_t offset = 0;
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank || self.group->ipcAccess[i]) {
+            offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+            continue;
+          }
+          auto* mr = self.regMr((uintptr_t)outputBuffer->cpuPointer + offset, params.bytes);
+          outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + offset;
+          outDyns[i].gatherSize = params.outputList[i].bytes;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+          }
+          offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+        }
+
+        nDynReady = 0;
+        {
+          size_t n = 0;
+          for (size_t i = 0; i != size; ++i) {
+            if (i == rank || self.group->ipcAccess[i]) {
+              continue;
+            }
+            size_t di = (rank + n) % self.devices.size();
+            auto& dev = self.devices[di];
+            self.writeData(
+                dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+            ++n;
+          }
+        }
+      } else {
+        CHECK(params.outputList.empty());
+        inputBuffer = self.allocateTemporaryBuffer(params.bytes, self.allGatherInputBuffers);
+        std::memcpy(inputBuffer->cpuPointer, (void*)params.inputAddress, params.bytes);
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = (uintptr_t)inputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].outputAddress = (uintptr_t)outputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
+
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue) {
+          YIELD
+        }
+      }
+
+      liveSends = 0;
+
+      if (rank == params.destinationRank) {
+        while (nDynReady < size - 1 - ipcRanks.size()) {
+          YIELD
+        }
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank || self.group->ipcAccess[i]) {
+            continue;
+          }
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeStep(di, i, stepValue + index, concurrencyIndex);
+        }
+      } else if (!self.group->ipcAccess[params.destinationRank]) {
+        self.sendStepValues[concurrencyIndex] = stepValue;
+
+        i = params.destinationRank;
+        // wait for dyns
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+          YIELD
+        }
+
+        if (params.bytes > 0) {
+          uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
+
+          CHECK(self.localDyns[size * concurrencyIndex + i].gatherSize == params.bytes);
+
+          liveSends += self.devices.size();
+          self.writeDataDistributed2(
+              i, srcAddr, params.bytes, inputBuffer.mr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
+              self.localDyns[size * concurrencyIndex + i].gatherKey,
+              [this, i = this->i](size_t di, bool ordered, bool done) {
+                if (done) {
+                  --liveSends;
+                }
+                if (ordered) {
+                  auto& dev = self.devices[di];
+                  self.writeData(
+                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
+                      self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                }
+              });
+        }
+        while (liveSends >= self.devices.size() * 2) {
+          YIELD
+        }
+      }
+
+      if (rank == params.destinationRank) {
+        CHECK(params.outputList[rank].bytes == params.bytes);
+        std::memcpy((void*)params.outputList[rank].address, (void*)params.inputAddress, params.bytes);
+        for (size_t peerIndex : peerIndices) {
+          auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+          size_t i = ipcRanks[peerIndex];
+          vmcopy(params.outputList[i].address, x->pid, x->inputAddress, params.bytes);
+        }
+
+        offset = 0;
+        for (i = 0; i != size; ++i) {
+          if (i == rank || self.group->ipcAccess[i]) {
+            offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+            continue;
+          }
+          for (di = 0; di != self.devices.size(); ++di) {
+            while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+              YIELD
+            }
+          }
+          std::memcpy(
+              (void*)params.outputList[i].address, (void*)((uintptr_t)outputBuffer->cpuPointer + offset), params.bytes);
+          offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+        }
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+
+      inputBuffer = {};
+      outputBuffer = {};
+
+      self.cpuThread->freelistGatherCpu.push(&params);
+      self.allocatorGatherCpu.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -1565,6 +1756,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkBroadcast> allocatorBroadcast;
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
+  WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
 
   void entry() {
     try {
@@ -1581,29 +1773,20 @@ struct CpuThreadImpl {
       auto enqueue = [&](auto& allocator, auto& params) {
         CHECK(params.concurrencyIndex < Group::maxConcurrency);
         if (params.sd->cpuThreadIndex == -1) {
-          // log.info("new stream index %d\n", streams.size());
           params.sd->cpuThreadIndex = streams.size();
           streams.resize(streams.size() + 1);
         }
         auto* work = allocator.allocate(*this, params);
-        // work->stepPtr = (void(Work::*)()) & std::remove_pointer_t<decltype(work)>::step;
         work->stepPtr = work->template getStepPtr<std::remove_pointer_t<decltype(work)>>();
         CHECK(work->streamIndex < streams.size());
         if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
           activeWorks.push_back(*work);
-          // log.info("new work %#x (%d) added from queue\n", work->params.stepValue, work->concurrencyIndex);
         }
-        // log.info("work enqueued, concurrencyIndex %d, streamIndex %d\n", work->concurrencyIndex, work->streamIndex);
-        // log.info(
-        //     "pre enqueue concurrency (%d) size: %d  stream (%d) size: %d\n", work->concurrencyIndex,
-        //     std::distance(concurrency[work->concurrencyIndex].begin(), concurrency[work->concurrencyIndex].end()),
-        //     work->streamIndex, std::distance(streams[work->streamIndex].begin(), streams[work->streamIndex].end()));
         streams[work->streamIndex].push_back(*work);
         concurrency[work->concurrencyIndex].push_back(*work);
       };
 
       while (!cpuThread->terminate.load(std::memory_order_relaxed)) {
-        // log.info("activeWorks.size() is %d\n", std::distance(activeWorks.begin(), activeWorks.end()));
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
           if (activeWorks.empty() && activeDevices.empty()) {
             futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
@@ -1636,6 +1819,8 @@ struct CpuThreadImpl {
               enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskReduceScatterCpu) {
               enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
+            } else if (queueEntry.task == taskGatherCpu) {
+              enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }
@@ -1646,104 +1831,37 @@ struct CpuThreadImpl {
             for (auto i = activeWorks.begin(); i != activeWorks.end();) {
               Work* w = (Work*)&*i;
               CHECK(!w->done);
-              //(w->*w->stepPtr)();
               w->stepPtr(w);
               if (w->done) {
                 uint32_t concurrencyIndex = w->concurrencyIndex;
                 uint32_t streamIndex = w->streamIndex;
-                // log.info("work %#x done, concurrencyIndex %d\n", -1, concurrencyIndex);
-                // log.info(
-                //     "pre concurrency (%d) size: %d  stream (%d) size: %d\n", concurrencyIndex,
-                //     std::distance(concurrency[concurrencyIndex].begin(), concurrency[concurrencyIndex].end()),
-                //     streamIndex, std::distance(streams[streamIndex].begin(), streams[streamIndex].end()));
                 CHECK(&concurrency[concurrencyIndex].front() == w);
                 concurrency[concurrencyIndex].pop_front();
                 CHECK(&streams[streamIndex].front() == w);
                 streams[streamIndex].pop_front();
-                // log.info(
-                //     "remaining stream (%d) size: %d\n", streamIndex,
-                //     std::distance(streams[streamIndex].begin(), streams[streamIndex].end()));
-                // log.info(
-                //     "remaining concurrency (%d) size: %d\n", concurrencyIndex,
-                //     std::distance(concurrency[concurrencyIndex].begin(), concurrency[concurrencyIndex].end()));
                 bool queuedThisConcurrency = false;
                 if (!streams[streamIndex].empty()) {
                   Work* nextWork = (Work*)&streams[streamIndex].front();
                   if (&concurrency[nextWork->concurrencyIndex].front() == nextWork) {
                     queuedThisConcurrency = nextWork->concurrencyIndex == concurrencyIndex;
                     activeWorks.push_back(*nextWork);
-                    // log.info("new work %#x (%d) added from stream\n", -1, nextWork->concurrencyIndex);
                   }
                 }
                 if (!queuedThisConcurrency && !concurrency[concurrencyIndex].empty()) {
                   Work* nextWork = (Work*)&concurrency[concurrencyIndex].front();
                   if (&streams[nextWork->streamIndex].front() == nextWork) {
                     activeWorks.push_back(*nextWork);
-                    // log.info("new work %#x (%d) added from concurrency\n", -1, nextWork->concurrencyIndex);
                   }
                 }
                 i = activeWorks.erase(i);
-
-                // log.info("activeWorks.size() -> %d\n", std::distance(activeWorks.begin(), activeWorks.end()));
               } else {
                 ++i;
               }
             }
-
-            // for (auto& list : works) {
-            //   while (!list.empty()) {
-            //     Work* w = (Work*)&list.front();
-            //     (w->*w->stepPtr)();
-            //     if (!w->done) {
-            //       break;
-            //     }
-            //   }
-            // }
           }
         }
       }
 
-      // while (true) {
-
-      //   while (cpuThread->queueSize == 0) {
-      //     poll();
-      //     int sum = 0;
-      //     for (auto& dev : devices) {
-      //       sum += dev.currentCqEntries;
-      //     }
-      //     if (sum == 0) {
-      //       futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
-      //     }
-      //   }
-      //   --cpuThread->queueSize;
-
-      //   std::unique_lock l(cpuThread->mutex);
-      //   CHECK(!cpuThread->queue.empty());
-      //   QueueEntry& queueEntry = cpuThread->queue.front();
-      //   cpuThread->queue.pop_front();
-      //   l.unlock();
-
-      //   CHECK(queueEntry.stepValue < (1ul << 31));
-
-      //   if (queueEntry.task == taskBarrier) {
-      //     QueueEntryBarrier& params = (QueueEntryBarrier&)queueEntry;
-      //     barrier(params);
-      //     cpuThread->freelistBarrier.push(&params);
-      //   } else if (queueEntry.task == taskAllgather) {
-      //     QueueEntryAllGather& params = (QueueEntryAllGather&)queueEntry;
-      //     all_gather(params);
-      //     cpuThread->freelistAllGather.push(&params);
-      //   } else if (queueEntry.task == taskReduceScatter) {
-      //     QueueEntryReduceScatter& params = (QueueEntryReduceScatter&)queueEntry;
-      //     reduce_scatter(params);
-      //     cpuThread->freelistReduceScatter.push(&params);
-      //   } else if (queueEntry.task == taskTerminate) {
-      //     cpuThread->freelistTerminate.push(&queueEntry);
-      //     break;
-      //   } else {
-      //     throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
-      //   }
-      // }
     } catch (const std::exception& e) {
       fatal("CPU thread error: %s\n", e.what());
     } catch (QuitCpuThread) {

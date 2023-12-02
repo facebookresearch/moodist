@@ -40,7 +40,7 @@ struct SimpleVector {
     }
     return *this;
   }
-  SimpleVector& operator=(SimpleVector&& n) {
+  SimpleVector& operator=(SimpleVector&& n) noexcept {
     std::swap(beginptr, n.beginptr);
     std::swap(msize, n.msize);
     return *this;
@@ -94,7 +94,7 @@ struct SimpleVector {
       msize = 0;
     }
   }
-  void move(T* dst, T* begin, T* end) {
+  void move(T* dst, T* begin, T* end) noexcept {
     if constexpr (std::is_trivially_copyable_v<T>) {
       std::memmove((void*)dst, (void*)begin, (end - begin) * sizeof(T));
     } else {
@@ -130,7 +130,12 @@ struct SimpleVector {
       T* i = beginptr + msize;
       T* e = beginptr + n;
       while (i != e) {
-        new (i) T();
+        try {
+          new (i) T();
+        } catch (...) {
+          msize = i - beginptr;
+          throw;
+        }
         ++i;
       }
     }

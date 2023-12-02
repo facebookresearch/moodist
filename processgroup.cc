@@ -817,6 +817,76 @@ struct ProcessGroupImpl {
 
     trace("post");
   }
+
+  void gather(const std::vector<at::Tensor>& outputList, const at::Tensor& input, uint32_t destinationRank) {
+    trace("all_gather");
+    std::lock_guard l(mutex);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    TORCH_CHECK(destinationRank < size);
+    if (destinationRank == rank) {
+      TORCH_CHECK(outputList.size() == size);
+    } else {
+      TORCH_CHECK(outputList.empty());
+    }
+
+    TORCH_CHECK(input.is_contiguous());
+    for (auto& output : outputList) {
+      TORCH_CHECK(output.is_contiguous());
+    }
+
+    bool isCuda = input.is_cuda();
+
+    if (isCuda) {
+      TORCH_CHECK(input.is_cuda());
+      TORCH_CHECK(input.device().index() == group->deviceIndex);
+      for (auto& output : outputList) {
+        TORCH_CHECK(output.is_cuda());
+        TORCH_CHECK(output.device().index() == group->deviceIndex);
+      }
+    }
+
+    size_t bytes = input.numel() * input.itemsize();
+    size_t outputBytes = bytes * size;
+
+    TORCH_CHECK(bytes > 0);
+
+    uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+
+    if (!isCuda) {
+      StreamData& sd = group->getStreamData(nullptr);
+      std::atomic_uint32_t cpuDone = 0;
+
+      QueueEntryGatherCpu* e = group->cpuThread->freelistGatherCpu.pop();
+      e->task = taskGatherCpu;
+      e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
+      e->sd = &sd;
+      e->inputAddress = inputAddress;
+
+      e->outputList.resize(outputList.size());
+      for (size_t i = 0; i != outputList.size(); ++i) {
+        auto& output = outputList[i];
+        e->outputList[i] = {(uintptr_t)output.data_ptr(), (size_t)(output.itemsize() * output.numel())};
+      }
+
+      e->bytes = bytes;
+      e->destinationRank = destinationRank;
+      e->cpuDone = &cpuDone;
+      group->cpuThread->enqueue(e);
+      while (cpuDone == 0) {
+        futexWait(&cpuDone, 0, std::chrono::seconds(10));
+      }
+      return;
+    }
+
+    fatal("cuda gather is not yet supported :(");
+  }
 };
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
@@ -928,7 +998,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       CHECK_CU(cuMemcpyAsync(
           (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
     } else {
-      temporary.narrow(0, 0, numel).copy_(tensor);
+      temporary.narrow(0, 0, numel).copy_(tensor.flatten());
     }
 
     auto t = temporary.view({(int64_t)impl->size, -1});
@@ -940,11 +1010,20 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       CHECK_CU(cuMemcpyAsync(
           (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
     } else {
-      tensor.narrow(0, 0, numel).copy_(temporary);
+      tensor.flatten().copy_(temporary.narrow(0, 0, numel));
     }
 
     return c10::make_intrusive<WorkImpl>(tensors);
   }
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::gather(
+    std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
+    const c10d::GatherOptions& opts) {
+  TORCH_CHECK(outputTensors.size() <= 1);
+  TORCH_CHECK(inputTensors.size() == 1);
+  impl->gather(outputTensors.empty() ? std::vector<at::Tensor>() : outputTensors[0], inputTensors[0], opts.rootRank);
+  return c10::make_intrusive<WorkImpl>(outputTensors.empty() ? std::vector<at::Tensor>() : outputTensors[0]);
 }
 
 } // namespace moodist

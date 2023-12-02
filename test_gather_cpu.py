@@ -91,7 +91,7 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = False
+    test_gather = True
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
@@ -152,6 +152,8 @@ def f(n):
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
+        dstrank = 0
+
         for _ in range(100):
             # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
@@ -161,11 +163,11 @@ def f(n):
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             # dist.all_gather(result, tmp)
-            dist._all_gather_base(result0, tmp)
+            dist.gather(tmp, result if rank == dstrank else None, dstrank)
             tmp.zero_()
-            result = result0.chunk(size)
+            # result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if rank == dstrank:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -368,7 +370,7 @@ def f(n):
         elif 1 == 1:
             loopcount = 1000
             for _ in range(loopcount):
-                dist._all_gather_base(result0, tmp)
+                dist.gather(tmp, result if rank == dstrank else None, dstrank)
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000

@@ -89,9 +89,7 @@ public:
 
   c10::intrusive_ptr<Work> gather(
       std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::GatherOptions& opts = c10d::GatherOptions()) override {
-    TORCH_CHECK(false, "gather not supported");
-  }
+      const c10d::GatherOptions& opts = c10d::GatherOptions()) override;
 
   c10::intrusive_ptr<Work> scatter(
       std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
