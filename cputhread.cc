@@ -278,6 +278,9 @@ struct CpuThreadImpl {
   Vector<TemporaryBufferHandle> vmreadBuffers;
   Vector<TemporaryBufferHandle> sendRecvBuffers;
 
+  Vector<TemporaryBufferHandle> allGatherInputBuffers;
+  Vector<TemporaryBufferHandle> allGatherOutputBuffers;
+
   TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes, Vector<TemporaryBufferHandle>& container) {
     for (size_t i = container.size(); i;) {
       --i;
@@ -292,7 +295,7 @@ struct CpuThreadImpl {
     auto buffer = group->allocateCpu(bytes);
     auto* mr = regMr((uintptr_t)buffer.cpuPointer, buffer.bytes);
     return TemporaryBufferHandle(std::move(buffer), mr, &container);
-    //  todo: this isn't good enough, for now never free memory
+    //  todo: this isn't good enough, for now never free memory.
     //        the problem is we need to de-register when we free memory,
     //        as we don't have a buffer id like with cuda memory,
     //        but it's tricky because of the extra regs we do due to
@@ -851,6 +854,211 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkAllGatherCpu : Work {
+    QueueEntryAllGatherCpu& params;
+    size_t i;
+    size_t di;
+    TemporaryBufferHandle inputBuffer;
+    TemporaryBufferHandle outputBuffer;
+    size_t liveSends;
+    size_t index;
+    size_t nDynReady;
+
+    const AllGather& allGather = *self.group->allGather;
+    const std::vector<size_t>& sendRanks = allGather.sendRanks;
+    const std::vector<size_t>& recvRanks = allGather.recvRanks;
+    const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
+    const std::vector<size_t>& peerIndices = self.group->peerIndices;
+
+    int prevRecvSource = -1;
+    const std::vector<ProxyInfo>& proxyInfo = allGather.proxyInfo;
+    const std::vector<ProxyDestinationInfo>& proxyDestinationInfo = allGather.proxyDestinationInfo;
+
+    WorkAllGatherCpu(CpuThreadImpl& self, QueueEntryAllGatherCpu& params) : Work(self, params), params(params) {}
+
+    void vmcopy(uintptr_t dst, int pid, uintptr_t src, size_t bytes) {
+      iovec local;
+      local.iov_base = (void*)dst;
+      local.iov_len = bytes;
+      iovec remote;
+      remote.iov_base = (void*)src;
+      remote.iov_len = bytes;
+      if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != bytes) {
+        fatal("process_vm_readv failed with error: %s", std::strerror(errno));
+      }
+    }
+
+    void step() {
+      ENTER
+
+      {
+        // Registering the input/output addrs directly here would be fragile, as we cannot
+        // check if a previous registration for this address corresponds to the same
+        // allocation/physical-address as the current one, like we can for cuda with buffer ids.
+        // Thus, we use a staging buffer.
+        inputBuffer = self.allocateTemporaryBuffer(params.bytes, self.allGatherInputBuffers);
+        outputBuffer = self.allocateTemporaryBuffer(params.pitch * size, self.allGatherOutputBuffers);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+        // Thus, we register each ranks output address independently, so they get different MRs.
+        for (size_t i : recvRanks) {
+          auto* mr = self.regMr((uintptr_t)outputBuffer->cpuPointer + params.pitch * i, params.bytes);
+          outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+          }
+        }
+
+        nDynReady = 0;
+        {
+          size_t n = 0;
+          for (size_t i : recvRanks) {
+            size_t di = (rank + n) % self.devices.size();
+            auto& dev = self.devices[di];
+            self.writeData(
+                dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+            ++n;
+          }
+        }
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = (uintptr_t)inputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].outputAddress = (uintptr_t)outputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
+
+      std::memcpy(inputBuffer->cpuPointer, (void*)params.inputAddress, params.bytes);
+
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue) {
+          YIELD
+        }
+      }
+
+      while (nDynReady < recvRanks.size()) {
+        YIELD
+      }
+
+      self.sendStepValues[concurrencyIndex] = stepValue;
+
+      CHECK(recvRanks.size() == sendRanks.size());
+
+      liveSends = 0;
+      for (index = 0; index != sendRanks.size(); ++index) {
+        {
+          size_t i = recvRanks[index];
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeStep(di, i, stepValue + index, concurrencyIndex);
+        }
+        i = sendRanks[index];
+        // wait for dyns
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+          YIELD
+        }
+
+        if (params.bytes > 0) {
+          uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
+
+          liveSends += self.devices.size();
+          self.writeDataDistributed2(
+              i, srcAddr, params.bytes, inputBuffer.mr,
+              self.localDyns[size * concurrencyIndex + i].gatherAddress + params.pitch * rank,
+              self.localDyns[size * concurrencyIndex + i].gatherKey,
+              [this, i = this->i](size_t di, bool ordered, bool done) {
+                if (done) {
+                  --liveSends;
+                }
+                if (ordered) {
+                  auto& dev = self.devices[di];
+                  self.writeData(
+                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
+                      self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                }
+              });
+        }
+        while (liveSends >= self.devices.size() * 2) {
+          YIELD
+        }
+      }
+
+      std::memcpy((void*)(params.outputAddress + params.pitch * rank), (void*)params.inputAddress, params.bytes);
+      for (size_t peerIndex : peerIndices) {
+        auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+        size_t i = ipcRanks[peerIndex];
+        vmcopy(params.outputAddress + params.pitch * i, x->pid, x->inputAddress, params.bytes);
+      }
+
+      {
+        CHECK(proxyInfo.size() == proxyDestinationInfo.size());
+        for (index = 0; index != proxyDestinationInfo.size(); ++index) {
+          i = proxyInfo[index].source;
+          if (prevRecvSource != i) {
+            for (di = 0; di != self.devices.size(); ++di) {
+              while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+                YIELD
+              }
+            }
+            prevRecvSource = i;
+          }
+
+          self.group->getPeerVar(
+              proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
+              stepValue;
+
+          std::memcpy(
+              (void*)(params.outputAddress + params.pitch * i),
+              (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
+
+          i = proxyDestinationInfo[index].source;
+          while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
+            YIELD
+          }
+
+          auto& pdi = proxyDestinationInfo[index];
+
+          auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+          vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
+        }
+      }
+
+      for (index = 0; index != recvRanks.size(); ++index) {
+        i = recvRanks[index];
+        for (di = 0; di != self.devices.size(); ++di) {
+          while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+            YIELD
+          }
+        }
+        std::memcpy(
+            (void*)(params.outputAddress + params.pitch * i),
+            (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+
+      self.cpuThread->freelistAllGatherCpu.push(&params);
+      self.allocatorAllGatherCpu.deallocate(this);
+      DONE
+    }
+  };
+
   struct WorkReduceScatter : Work {
     QueueEntryReduceScatter& params;
     size_t i;
@@ -1355,6 +1563,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkAllGather> allocatorAllGather;
   WorkAllocator<WorkReduceScatter> allocatorReduceScatter;
   WorkAllocator<WorkBroadcast> allocatorBroadcast;
+  WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
 
   void entry() {
@@ -1415,7 +1624,7 @@ struct CpuThreadImpl {
 
             if (queueEntry.task == taskBarrier) {
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
-            } else if (queueEntry.task == taskAllgather) {
+            } else if (queueEntry.task == taskAllGather) {
               enqueue(allocatorAllGather, (QueueEntryAllGather&)queueEntry);
             } else if (queueEntry.task == taskReduceScatter) {
               enqueue(allocatorReduceScatter, (QueueEntryReduceScatter&)queueEntry);
@@ -1423,6 +1632,8 @@ struct CpuThreadImpl {
               cpuThread->freelistTerminate.push(&queueEntry);
             } else if (queueEntry.task == taskBroadcast) {
               enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
+            } else if (queueEntry.task == taskAllGatherCpu) {
+              enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskReduceScatterCpu) {
               enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
             } else {

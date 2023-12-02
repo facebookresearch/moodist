@@ -116,8 +116,8 @@ struct Group {
   DynamicAddresses* localDyns = nullptr;
   Progress* localProgress = nullptr;
   CpuAddresses* cpuAddresses = nullptr;
-
   SyncData* syncData = nullptr;
+  uint32_t* cpuProxyReady = nullptr;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {

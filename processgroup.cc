@@ -379,11 +379,16 @@ struct ProcessGroupImpl {
     CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
-    TORCH_CHECK(input.is_cuda());
-    TORCH_CHECK(input.device().index() == group->deviceIndex);
     TORCH_CHECK(output.is_contiguous());
-    TORCH_CHECK(output.is_cuda());
-    TORCH_CHECK(output.device().index() == group->deviceIndex);
+
+    bool isCuda = input.is_cuda();
+
+    if (isCuda) {
+      TORCH_CHECK(input.is_cuda());
+      TORCH_CHECK(input.device().index() == group->deviceIndex);
+      TORCH_CHECK(output.is_cuda());
+      TORCH_CHECK(output.device().index() == group->deviceIndex);
+    }
 
     size_t bytes = input.numel() * input.itemsize();
     size_t outputBytes = bytes * size;
@@ -394,6 +399,27 @@ struct ProcessGroupImpl {
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+
+    if (!isCuda) {
+      StreamData& sd = group->getStreamData(nullptr);
+      std::atomic_uint32_t cpuDone = 0;
+
+      QueueEntryAllGatherCpu* e = group->cpuThread->freelistAllGatherCpu.pop();
+      e->task = taskAllGatherCpu;
+      e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
+      e->sd = &sd;
+      e->inputAddress = inputAddress;
+      e->outputAddress = outputAddress;
+      e->bytes = bytes;
+      e->pitch = pitch;
+      e->cpuDone = &cpuDone;
+      group->cpuThread->enqueue(e);
+      while (cpuDone == 0) {
+        futexWait(&cpuDone, 0, std::chrono::seconds(10));
+      }
+      return;
+    }
 
     CUstream stream = c10::cuda::getCurrentCUDAStream();
 
@@ -452,10 +478,10 @@ struct ProcessGroupImpl {
 
     if (!isLocalOnly) {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
-      e->task = taskAllgather;
+      e->task = taskAllGather;
       e->stepValue = stepValue;
       e->concurrencyIndex = concurrencyIndex;
-      e->sd = &group->getStreamData(stream);
+      e->sd = &sd;
       e->inputAddress = inputAddress;
       e->outputAddress = outputAddress;
       e->bytes = bytes;
@@ -590,19 +616,7 @@ struct ProcessGroupImpl {
     auto& recvRanks = reduceScatter.recvRanks;
 
     if (!isCuda) {
-
       StreamData& sd = group->getStreamData(nullptr);
-
-      // auto allocbuffer = [&](auto& buffer, size_t size) {
-      //   if (buffer.bytes < size) {
-      //     buffer = {};
-      //     buffer = group->allocateHost(size);
-      //   }
-      // };
-
-      // allocbuffer(sd.sendBuffer, pitch * sendRanks.size());
-      // allocbuffer(sd.recvBuffer, pitch * recvRanks.size());
-
       std::atomic_uint32_t cpuDone = 0;
       QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();
       e->task = taskReduceScatterCpu;

@@ -62,15 +62,12 @@ def f(n):
     print("%d: world size is %d\n" % (rank, size))
 
     dist.barrier()
-    torch.cuda.synchronize()
     dist.barrier()
-    torch.cuda.synchronize()
     if rank == 0:
         print("init ok")
 
     torch.manual_seed(42 + rank)
 
-    device = torch.device("cuda:0")
     world_size = size
 
     # process_group = torch.distributed.new_group("foo")
@@ -104,7 +101,8 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416).cuda() + 1
-        data = torch.randn(589824).cuda() + 1
+        #data = torch.randn(589824) + 1
+        data = torch.randn(589824) + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -130,12 +128,12 @@ def f(n):
         correct_result = []
         for r in range(size):
             torch.manual_seed(42 + r)
-            rdata = torch.randn(data.numel()).cuda() + 1
+            rdata = torch.randn(data.numel()) + 1
             correct_result.append(rdata)
 
         torch.manual_seed(420 + rank)
 
-        datax = torch.randn(20, 1024 * 1024 * 10).cuda()
+        datax = torch.randn(20, 1024 * 1024 * 10)
 
         # for i in range(20):
         #     print(rank, i)
@@ -151,9 +149,6 @@ def f(n):
 
         print("result0 is at %#x" % result0.data_ptr())
 
-        stream1 = torch.cuda.Stream()
-        stream2 = torch.cuda.Stream()
-
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
@@ -165,15 +160,8 @@ def f(n):
             if _ % 3 == 0:
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
-            ostream = torch.cuda.current_stream()
             # dist.all_gather(result, tmp)
             dist._all_gather_base(result0, tmp)
-            # with torch.cuda.stream(stream1):
-            #     stream1.wait_stream(ostream)
-            #     dist._all_gather_base(result0, tmp)
-            # with torch.cuda.stream(stream2):
-            #     dist._all_gather_base(result02, tmp2)
-            torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
@@ -211,7 +199,6 @@ def f(n):
                         )
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         raise RuntimeError("%d: wrong result for index %d" % (rank, i))
-            torch.cuda.synchronize()
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
@@ -221,12 +208,11 @@ def f(n):
             tmpz = []
             for x in range(10):
                 print("rank %d enter test2 %d\n" % (rank, x))
-                test2_data = torch.randn(3072048, device="cuda")
-                test2_result = torch.zeros(3072048 * size, device="cuda")
+                test2_data = torch.randn(3072048)
+                test2_result = torch.zeros(3072048 * size)
 
                 for i in range(10):
                     dist._all_gather_base(test2_result, test2_data)
-                torch.cuda.synchronize()
                 print("rank %d test2 done" % rank)
 
                 tmpz.append(test2_data)
@@ -241,24 +227,21 @@ def f(n):
             tmpz = torch.randn(1024 + 1024 * 1024 * rank)
 
             random.seed(42)
-            for x in range(1000):
+            for x in range(10):
                 print("rank %d enter test3 %d\n" % (rank, x))
                 s = random.randint(1024, 1024 * 1024 * 10) * 4
-                test3_data = torch.randn(s, device="cuda")
-                test3_result = torch.zeros(s * size, device="cuda")
+                test3_data = torch.randn(s)
+                test3_result = torch.zeros(s * size)
 
                 for i in range(10):
                     dist._all_gather_base(test3_result, test3_data)
-                torch.cuda.synchronize()
                 print("rank %d test3 done" % rank)
 
                 print("rank %d exit test3 %d\n" % (rank, x))
 
         warmup_result = [t.clone() for t in result]
         dist.barrier()
-        torch.cuda.synchronize()
         dist.barrier()
-        torch.cuda.synchronize()
         start = time.time()
         if 1 == 13:
             lin = torch.nn.Linear(4096, 4096).cuda()
@@ -372,7 +355,7 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 1:
+        elif 1 == 11:
             loopcount = 1000
             events = []
             for i in range(loopcount):
@@ -386,7 +369,6 @@ def f(n):
             loopcount = 1000
             for _ in range(loopcount):
                 dist._all_gather_base(result0, tmp)
-            torch.cuda.synchronize()
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000
@@ -449,7 +431,6 @@ def f(n):
         #     # #print("rank %d result %d: %s" % (rank, _, s))
         #     # print("rank %d result %d: %s (should be %f)" % (rank, _, s, data.sum()))
 
-        torch.cuda.synchronize()
         t = time.time() - start
         print("rank %d all done!" % rank)
         dist.barrier()
