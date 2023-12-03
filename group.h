@@ -30,6 +30,7 @@ struct alignas(64) CpuAddresses {
   int pid;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
+  size_t bytes;
 };
 
 struct alignas(64) DynamicAddresses {

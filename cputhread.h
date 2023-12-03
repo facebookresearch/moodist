@@ -19,6 +19,7 @@ constexpr uint8_t taskBroadcast = 4;
 constexpr uint8_t taskAllGatherCpu = 5;
 constexpr uint8_t taskReduceScatterCpu = 6;
 constexpr uint8_t taskGatherCpu = 7;
+constexpr uint8_t taskBroadcastCpu = 8;
 
 struct DataRef {
   uintptr_t address = 0;
@@ -83,6 +84,13 @@ struct QueueEntryGatherCpu : QueueEntry {
   std::atomic_uint32_t* cpuDone = nullptr;
 };
 
+struct QueueEntryBroadcastCpu : QueueEntry {
+  uintptr_t tensorAddress = 0;
+  size_t bytes = 0;
+  size_t sourceRank = 0;
+  std::atomic_uint32_t* cpuDone = nullptr;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -128,6 +136,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryAllGatherCpu> freelistAllGatherCpu;
   QueueEntryFreeList<QueueEntryReduceScatterCpu> freelistReduceScatterCpu;
   QueueEntryFreeList<QueueEntryGatherCpu> freelistGatherCpu;
+  QueueEntryFreeList<QueueEntryBroadcastCpu> freelistBroadcastCpu;
 
   CpuThread(Group*);
   ~CpuThread();

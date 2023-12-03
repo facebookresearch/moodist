@@ -281,7 +281,7 @@ struct ProcessGroupImpl {
   }
 
   void barrier() {
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
     uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
@@ -293,6 +293,7 @@ struct ProcessGroupImpl {
     e->concurrencyIndex = concurrencyIndex;
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
+    l.unlock();
     while (cpuDone == 0) {
       futexWait(&cpuDone, 0, std::chrono::seconds(10));
     }
@@ -370,7 +371,7 @@ struct ProcessGroupImpl {
 
   void all_gather(at::Tensor& output, const at::Tensor& input) {
     trace("all_gather");
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
 
     size_t size = this->size;
 
@@ -415,6 +416,7 @@ struct ProcessGroupImpl {
       e->pitch = pitch;
       e->cpuDone = &cpuDone;
       group->cpuThread->enqueue(e);
+      l.unlock();
       while (cpuDone == 0) {
         futexWait(&cpuDone, 0, std::chrono::seconds(10));
       }
@@ -537,7 +539,7 @@ struct ProcessGroupImpl {
 
   void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp) {
     trace("_reduce_scatter_base");
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
 
     size_t size = this->size;
 
@@ -631,6 +633,7 @@ struct ProcessGroupImpl {
       e->dindex = dindex;
       e->opindex = opindex;
       group->cpuThread->enqueue(e);
+      l.unlock();
       while (cpuDone == 0) {
         futexWait(&cpuDone, 0, std::chrono::seconds(10));
       }
@@ -765,7 +768,7 @@ struct ProcessGroupImpl {
   }
 
   void broadcast(const torch::Tensor& tensor, uint32_t sourceRank) {
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
 
     size_t size = this->size;
 
@@ -773,15 +776,39 @@ struct ProcessGroupImpl {
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
+    bool isCuda = tensor.is_cuda();
+
     TORCH_CHECK(tensor.is_contiguous());
-    TORCH_CHECK(tensor.is_cuda());
-    TORCH_CHECK(tensor.device().index() == group->deviceIndex);
     TORCH_CHECK(sourceRank < size);
+
+    if (isCuda) {
+      TORCH_CHECK(tensor.device().index() == group->deviceIndex);
+    }
 
     size_t numel = tensor.numel();
     size_t bytes = numel * tensor.itemsize();
 
     uintptr_t tensorAddress = (uintptr_t)tensor.data_ptr();
+
+    if (!isCuda) {
+      StreamData& sd = group->getStreamData(nullptr);
+      std::atomic_uint32_t cpuDone = 0;
+      QueueEntryBroadcastCpu* e = group->cpuThread->freelistBroadcastCpu.pop();
+      e->task = taskBroadcastCpu;
+      e->stepValue = stepValue;
+      e->concurrencyIndex = concurrencyIndex;
+      e->sd = &sd;
+      e->tensorAddress = tensorAddress;
+      e->bytes = bytes;
+      e->sourceRank = sourceRank;
+      e->cpuDone = &cpuDone;
+      group->cpuThread->enqueue(e);
+      l.unlock();
+      while (cpuDone == 0) {
+        futexWait(&cpuDone, 0, std::chrono::seconds(10));
+      }
+      return;
+    }
 
     CHECK(tensorAddress % 16 == 0);
 
@@ -820,7 +847,7 @@ struct ProcessGroupImpl {
 
   void gather(const std::vector<at::Tensor>& outputList, const at::Tensor& input, uint32_t destinationRank) {
     trace("all_gather");
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
 
     size_t size = this->size;
 
@@ -879,6 +906,7 @@ struct ProcessGroupImpl {
       e->destinationRank = destinationRank;
       e->cpuDone = &cpuDone;
       group->cpuThread->enqueue(e);
+      l.unlock();
       while (cpuDone == 0) {
         futexWait(&cpuDone, 0, std::chrono::seconds(10));
       }

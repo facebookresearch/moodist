@@ -277,9 +277,9 @@ struct CpuThreadImpl {
 
   Vector<TemporaryBufferHandle> vmreadBuffers;
   Vector<TemporaryBufferHandle> sendRecvBuffers;
-
   Vector<TemporaryBufferHandle> allGatherInputBuffers;
   Vector<TemporaryBufferHandle> allGatherOutputBuffers;
+  Vector<TemporaryBufferHandle> broadcastBuffers;
 
   TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes, Vector<TemporaryBufferHandle>& container) {
     for (size_t i = container.size(); i;) {
@@ -1543,6 +1543,163 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkBroadcastCpu : Work {
+    QueueEntryBroadcastCpu& params;
+    size_t i;
+    size_t di;
+    size_t offset;
+    TemporaryBufferHandle temporaryBuffer;
+    size_t liveSends;
+    size_t index;
+    size_t nDynReady;
+
+    const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
+    const std::vector<size_t>& peerIndices = self.group->peerIndices;
+
+    WorkBroadcastCpu(CpuThreadImpl& self, QueueEntryBroadcastCpu& params) : Work(self, params), params(params) {}
+
+    void vmcopy(uintptr_t dst, int pid, uintptr_t src, size_t bytes) {
+      iovec local;
+      local.iov_base = (void*)dst;
+      local.iov_len = bytes;
+      iovec remote;
+      remote.iov_base = (void*)src;
+      remote.iov_len = bytes;
+      if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != bytes) {
+        fatal("process_vm_readv failed with error: %s", std::strerror(errno));
+      }
+    }
+
+    void step() {
+      ENTER
+
+      if (rank != params.sourceRank && !self.group->ipcAccess[params.sourceRank]) {
+        temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        size_t i = params.sourceRank;
+        outDyns[i].gatherAddress = (uintptr_t)temporaryBuffer->cpuPointer;
+        outDyns[i].gatherSize = params.bytes;
+        for (size_t di = 0; di != self.devices.size(); ++di) {
+          outDyns[i].gatherKey[di] = temporaryBuffer.mr->mrs[di]->rkey;
+        }
+
+        nDynReady = 0;
+        {
+
+          size_t di = (rank + 0) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeData(
+              dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+              (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
+              self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+        }
+      } else if (rank == params.sourceRank) {
+        temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+        std::memcpy(temporaryBuffer->cpuPointer, (void*)params.tensorAddress, params.bytes);
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = params.tensorAddress;
+      self.group->cpuAddresses[concurrencyIndex].outputAddress = params.tensorAddress;
+      self.group->cpuAddresses[concurrencyIndex].bytes = params.bytes;
+      self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
+
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue) {
+          YIELD
+        }
+      }
+
+      liveSends = 0;
+
+      if (rank != params.sourceRank) {
+        if (self.group->ipcAccess[params.sourceRank]) {
+          auto* x = self.group->getPeerVar(
+              self.group->getPeerIndex(params.sourceRank), &self.group->cpuAddresses[concurrencyIndex]);
+          CHECK(x->bytes == params.bytes);
+          vmcopy(params.tensorAddress, x->pid, x->inputAddress, params.bytes);
+        } else {
+          while (nDynReady == 0) {
+            YIELD
+          }
+          i = params.sourceRank;
+          {
+            size_t di = (rank + 0) % self.devices.size();
+            auto& dev = self.devices[di];
+            self.writeStep(di, i, stepValue + index, concurrencyIndex);
+          }
+
+          for (di = 0; di != self.devices.size(); ++di) {
+            while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+              YIELD
+            }
+          }
+          std::memcpy((void*)params.tensorAddress, (void*)(uintptr_t)temporaryBuffer->cpuPointer, params.bytes);
+        }
+      } else if (rank == params.sourceRank) {
+        self.sendStepValues[concurrencyIndex] = stepValue;
+
+        for (i = 0; i != size; ++i) {
+          if (i == rank || self.group->ipcAccess[i]) {
+            continue;
+          }
+          // wait for dyns
+          while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+            YIELD
+          }
+
+          if (params.bytes > 0) {
+            uintptr_t srcAddr = (uintptr_t)temporaryBuffer->cpuPointer;
+
+            CHECK(self.localDyns[size * concurrencyIndex + i].gatherSize == params.bytes);
+
+            liveSends += self.devices.size();
+            self.writeDataDistributed2(
+                i, srcAddr, params.bytes, temporaryBuffer.mr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
+                self.localDyns[size * concurrencyIndex + i].gatherKey,
+                [this, i = this->i](size_t di, bool ordered, bool done) {
+                  if (done) {
+                    --liveSends;
+                  }
+                  if (ordered) {
+                    auto& dev = self.devices[di];
+                    self.writeData(
+                        dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                        (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
+                        self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
+                  }
+                });
+          }
+          while (liveSends >= self.devices.size() * 2) {
+            YIELD
+          }
+        }
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+
+      temporaryBuffer = {};
+
+      self.cpuThread->freelistBroadcastCpu.push(&params);
+      self.allocatorBroadcastCpu.deallocate(this);
+      DONE
+    }
+  };
+
   struct WorkGatherCpu : Work {
     QueueEntryGatherCpu& params;
     size_t i;
@@ -1757,6 +1914,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
   WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
+  WorkAllocator<WorkBroadcastCpu> allocatorBroadcastCpu;
 
   void entry() {
     try {
@@ -1821,6 +1979,8 @@ struct CpuThreadImpl {
               enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
             } else if (queueEntry.task == taskGatherCpu) {
               enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
+            } else if (queueEntry.task == taskBroadcastCpu) {
+              enqueue(allocatorBroadcastCpu, (QueueEntryBroadcastCpu&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }

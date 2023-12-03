@@ -25,10 +25,7 @@ inline LogLevel currentLogLevel = LOG_INFO;
 inline std::mutex logMutex;
 
 template<typename... Args>
-void logat(LogLevel level, const char* fmt, Args&&... args) {
-  if (level > currentLogLevel) {
-    return;
-  }
+[[gnu::cold]] void logat(LogLevel level, const char* fmt, Args&&... args) {
   std::lock_guard l(logMutex);
   FILE* ftarget = stdout;
   FILE* fother = stderr;
@@ -56,23 +53,32 @@ inline struct Log {
   }
   template<typename... Args>
   void info(const char* fmt, Args&&... args) {
-    logat(LOG_INFO, fmt, std::forward<Args>(args)...);
+    if (currentLogLevel >= LOG_INFO) {
+      [[unlikely]];
+      logat(LOG_INFO, fmt, std::forward<Args>(args)...);
+    }
   }
   template<typename... Args>
   void verbose(const char* fmt, Args&&... args) {
-    logat(LOG_VERBOSE, fmt, std::forward<Args>(args)...);
+    if (currentLogLevel >= LOG_VERBOSE) {
+      [[unlikely]];
+      logat(LOG_VERBOSE, fmt, std::forward<Args>(args)...);
+    }
   }
   template<typename... Args>
   void debug(const char* fmt, Args&&... args) {
-    logat(LOG_DEBUG, fmt, std::forward<Args>(args)...);
+    if (currentLogLevel >= LOG_DEBUG) {
+      [[unlikely]];
+      logat(LOG_DEBUG, fmt, std::forward<Args>(args)...);
+    }
   }
 } log;
 
 template<typename... Args>
-[[noreturn]] void fatal(const char* fmt, Args&&... args) {
+[[noreturn]] [[gnu::cold]] void fatal(const char* fmt, Args&&... args) {
   auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
   log.error(" -- MOODIST FATAL ERROR --\n%s\n", s);
-  std::abort();
+  std::quick_exit(1);
 }
 
 } // namespace moodist

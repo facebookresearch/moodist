@@ -41,25 +41,29 @@ inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
 #define CHECK_NVRTC(x)                                                                                                 \
   {                                                                                                                    \
     nvrtcResult error__ = (x);                                                                                         \
-    if (error__ != NVRTC_SUCCESS) throwNvrtc(error__, __FILE__, __LINE__);                                             \
+    if (error__ != NVRTC_SUCCESS) [[unlikely]]                                                                         \
+      throwNvrtc(error__, __FILE__, __LINE__);                                                                         \
   }
 #define CHECK_CU(x)                                                                                                    \
   {                                                                                                                    \
     CUresult error__ = (x);                                                                                            \
-    if (error__ != CUDA_SUCCESS) throwCu(error__, __FILE__, __LINE__);                                                 \
+    if (error__ != CUDA_SUCCESS) [[unlikely]]                                                                          \
+      throwCu(error__, __FILE__, __LINE__);                                                                            \
   }
 
 #define CHECK_NVML(x)                                                                                                  \
   {                                                                                                                    \
     nvmlReturn_t error__ = (x);                                                                                        \
-    if (error__ != NVML_SUCCESS) throwNvml(error__, __FILE__, __LINE__);                                               \
+    if (error__ != NVML_SUCCESS) [[unlikely]]                                                                          \
+      throwNvml(error__, __FILE__, __LINE__);                                                                          \
   }
 
 #undef CHECK
 #define CHECK(x)                                                                                                       \
-  (bool(x) ? 0                                                                                                         \
-           : (fprintf(stderr, "[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x), fflush(stderr), fflush(stdout),    \
-              std::abort(), 0))
+  {                                                                                                                    \
+    if (!(x)) [[unlikely]]                                                                                             \
+      fatal("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x);                                                      \
+  }
 
 inline std::string removePciPathPrefix(std::string path) {
   std::string_view prefix = "/sys/devices/";
