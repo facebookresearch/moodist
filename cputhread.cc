@@ -902,10 +902,10 @@ struct CpuThreadImpl {
         // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
         // Thus, we register each ranks output address independently, so they get different MRs.
         for (size_t i : recvRanks) {
-          auto* mr = self.regMr((uintptr_t)outputBuffer->cpuPointer + params.pitch * i, params.bytes);
-          outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer;
+          outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + params.pitch * i;
+          outDyns[i].gatherBytes = params.bytes;
           for (size_t di = 0; di != self.devices.size(); ++di) {
-            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+            outDyns[i].gatherKey[di] = outputBuffer.mr->mrs[di]->rkey;
           }
         }
 
@@ -924,8 +924,9 @@ struct CpuThreadImpl {
         }
       }
 
-      self.group->cpuAddresses[concurrencyIndex].inputAddress = (uintptr_t)inputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = params.inputAddress;
       self.group->cpuAddresses[concurrencyIndex].outputAddress = (uintptr_t)outputBuffer->cpuPointer;
+      self.group->cpuAddresses[concurrencyIndex].bytes = params.bytes;
       self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
       self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
 
@@ -962,10 +963,11 @@ struct CpuThreadImpl {
         if (params.bytes > 0) {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
+          CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
+
           liveSends += self.devices.size();
           self.writeDataDistributed2(
-              i, srcAddr, params.bytes, inputBuffer.mr,
-              self.localDyns[size * concurrencyIndex + i].gatherAddress + params.pitch * rank,
+              i, srcAddr, params.bytes, inputBuffer.mr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
               self.localDyns[size * concurrencyIndex + i].gatherKey,
               [this, i = this->i](size_t di, bool ordered, bool done) {
                 if (done) {
@@ -988,6 +990,7 @@ struct CpuThreadImpl {
       std::memcpy((void*)(params.outputAddress + params.pitch * rank), (void*)params.inputAddress, params.bytes);
       for (size_t peerIndex : peerIndices) {
         auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+        CHECK(x->bytes == params.bytes);
         size_t i = ipcRanks[peerIndex];
         vmcopy(params.outputAddress + params.pitch * i, x->pid, x->inputAddress, params.bytes);
       }
@@ -1272,7 +1275,7 @@ struct CpuThreadImpl {
 
       {
         recvBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size(), self.sendRecvBuffers);
-        sendBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size(), self.sendRecvBuffers);
+        sendBuffer = self.allocateTemporaryBuffer(params.pitch * sendRanks.size(), self.sendRecvBuffers);
         uintptr_t recvAddress = (uintptr_t)recvBuffer->cpuPointer;
 
         if (!recvRanks.empty()) {
@@ -1286,10 +1289,10 @@ struct CpuThreadImpl {
           // Thus, we register each ranks output address independently, so they get different MRs.
           size_t n = 0;
           for (size_t i : recvRanks) {
-            auto* mr = self.regMr(recvAddress + params.pitch * n, params.pitch);
-            outDyns[i].gatherAddress = recvAddress;
+            outDyns[i].gatherAddress = recvAddress + params.pitch * n;
+            outDyns[i].gatherBytes = params.bytes;
             for (size_t di = 0; di != self.devices.size(); ++di) {
-              outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+              outDyns[i].gatherKey[di] = recvBuffer.mr->mrs[di]->rkey;
             }
             ++n;
           }
@@ -1358,10 +1361,11 @@ struct CpuThreadImpl {
         if (params.bytes > 0) {
           uintptr_t srcAddr = (uintptr_t)sendBuffer->cpuPointer + params.pitch * index;
 
+          CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
+
           liveSends += self.devices.size();
           self.writeDataDistributed2(
-              i, srcAddr, params.bytes, sendBuffer.mr,
-              self.localDyns[size * concurrencyIndex + i].gatherAddress + params.pitch * index,
+              i, srcAddr, params.bytes, sendBuffer.mr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
               self.localDyns[size * concurrencyIndex + i].gatherKey,
               [this, i = this->i](size_t di, bool ordered, bool done) {
                 if (done) {
@@ -1580,7 +1584,7 @@ struct CpuThreadImpl {
 
         size_t i = params.sourceRank;
         outDyns[i].gatherAddress = (uintptr_t)temporaryBuffer->cpuPointer;
-        outDyns[i].gatherSize = params.bytes;
+        outDyns[i].gatherBytes = params.bytes;
         for (size_t di = 0; di != self.devices.size(); ++di) {
           outDyns[i].gatherKey[di] = temporaryBuffer.mr->mrs[di]->rkey;
         }
@@ -1653,7 +1657,7 @@ struct CpuThreadImpl {
           if (params.bytes > 0) {
             uintptr_t srcAddr = (uintptr_t)temporaryBuffer->cpuPointer;
 
-            CHECK(self.localDyns[size * concurrencyIndex + i].gatherSize == params.bytes);
+            CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
 
             liveSends += self.devices.size();
             self.writeDataDistributed2(
@@ -1749,7 +1753,7 @@ struct CpuThreadImpl {
           }
           auto* mr = self.regMr((uintptr_t)outputBuffer->cpuPointer + offset, params.bytes);
           outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + offset;
-          outDyns[i].gatherSize = params.outputList[i].bytes;
+          outDyns[i].gatherBytes = params.outputList[i].bytes;
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
           }
@@ -1815,7 +1819,7 @@ struct CpuThreadImpl {
         if (params.bytes > 0) {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
-          CHECK(self.localDyns[size * concurrencyIndex + i].gatherSize == params.bytes);
+          CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
