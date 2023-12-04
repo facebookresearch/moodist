@@ -917,7 +917,7 @@ struct CpuThreadImpl {
                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
                 self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
-                self.makeCallback([this, &dev, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
+                self.makeCallback([this, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
             ++n;
           }
         }
@@ -1295,7 +1295,7 @@ struct CpuThreadImpl {
                   dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                   (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
                   self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
-                  self.makeCallback([this, &dev, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
+                  self.makeCallback([this, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
               ++n;
             }
           }
@@ -1531,7 +1531,6 @@ struct CpuThreadImpl {
     TemporaryBufferHandle temporaryBuffer;
     size_t liveSends;
     size_t index;
-    size_t nDynReady;
 
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
@@ -1565,7 +1564,6 @@ struct CpuThreadImpl {
           outDyns[i].gatherKey[di] = temporaryBuffer.mr->mrs[di]->rkey;
         }
 
-        nDynReady = 0;
         {
 
           size_t di = (rank + 0) % self.devices.size();
@@ -1573,7 +1571,8 @@ struct CpuThreadImpl {
           self.writeData(
               dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
               (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-              self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+              self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+              self.makeCallback([this, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
         }
       } else if (rank == params.sourceRank) {
         temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
@@ -1601,15 +1600,7 @@ struct CpuThreadImpl {
           CHECK(x->bytes == params.bytes);
           vmcopy(params.tensorAddress, x->pid, x->inputAddress, params.bytes);
         } else {
-          while (nDynReady == 0) {
-            YIELD
-          }
           i = params.sourceRank;
-          {
-            size_t di = (rank + 0) % self.devices.size();
-            auto& dev = self.devices[di];
-            self.writeStep(di, i, stepValue + index, concurrencyIndex);
-          }
 
           for (di = 0; di != self.devices.size(); ++di) {
             while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
@@ -1626,7 +1617,7 @@ struct CpuThreadImpl {
             continue;
           }
           // wait for dyns
-          while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+          while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
             YIELD
           }
 
@@ -1689,7 +1680,6 @@ struct CpuThreadImpl {
     TemporaryBufferHandle outputBuffer;
     size_t liveSends;
     size_t index;
-    size_t nDynReady;
 
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
@@ -1736,7 +1726,6 @@ struct CpuThreadImpl {
           offset += (params.outputList[i].bytes + 63) / 64u * 64u;
         }
 
-        nDynReady = 0;
         {
           size_t n = 0;
           for (size_t i = 0; i != size; ++i) {
@@ -1748,7 +1737,8 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+                self.makeCallback([this, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
             ++n;
           }
         }
@@ -1772,23 +1762,12 @@ struct CpuThreadImpl {
       liveSends = 0;
 
       if (rank == params.destinationRank) {
-        while (nDynReady < size - 1 - ipcRanks.size()) {
-          YIELD
-        }
-        for (size_t i = 0; i != size; ++i) {
-          if (i == rank || self.group->ipcAccess[i]) {
-            continue;
-          }
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeStep(di, i, stepValue + index, concurrencyIndex);
-        }
       } else if (!self.group->ipcAccess[params.destinationRank]) {
         self.sendStepValues[concurrencyIndex] = stepValue;
 
         i = params.destinationRank;
         // wait for dyns
-        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
           YIELD
         }
 

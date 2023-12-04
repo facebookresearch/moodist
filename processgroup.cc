@@ -1026,7 +1026,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       CHECK_CU(cuMemcpyAsync(
           (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
     } else {
-      temporary.narrow(0, 0, numel).copy_(tensor.flatten());
+      std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
     }
 
     auto t = temporary.view({(int64_t)impl->size, -1});
@@ -1038,7 +1038,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       CHECK_CU(cuMemcpyAsync(
           (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
     } else {
-      tensor.flatten().copy_(temporary.narrow(0, 0, numel));
+      std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
     }
 
     return c10::make_intrusive<WorkImpl>(tensors);
