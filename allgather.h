@@ -22,11 +22,11 @@ struct AllGatherParameters {
 
 struct AllGather : CollectiveBase {
 
-  std::vector<size_t> sendRanks;
-  std::vector<size_t> recvRanks;
+  Vector<size_t> sendRanks;
+  Vector<size_t> recvRanks;
 
-  std::vector<ProxyInfo> proxyInfo;
-  std::vector<ProxyDestinationInfo> proxyDestinationInfo;
+  Vector<ProxyInfo> proxyInfo;
+  Vector<ProxyDestinationInfo> proxyDestinationInfo;
 
   AllGather(Group* group);
   ~AllGather();

@@ -14,20 +14,20 @@ ReduceScatter::ReduceScatter(Group* group) : CollectiveBase(group) {}
 ReduceScatter::~ReduceScatter() {}
 
 void ReduceScatter::init() {
-  sendRanks = group->allGather->sendRanks;
-  recvRanks = group->allGather->recvRanks;
+  sendRanks = group->allGather->recvRanks;
+  recvRanks = group->allGather->sendRanks;
 
-  CHECK(recvRanks.size() == sendRanks.size());
-  auto allSendRanks = group->setupComms->allgather(sendRanks);
-  for (auto& v : allSendRanks) {
-    if (&v - allSendRanks.data() == rank) {
-      continue;
-    }
-    CHECK(v.size() == sendRanks.size());
-    for (size_t i = 0; i != sendRanks.size(); ++i) {
-      CHECK(v[i] != sendRanks[i]);
-    }
-  }
+  // CHECK(recvRanks.size() == sendRanks.size());
+  // auto allSendRanks = group->setupComms->allgather(sendRanks);
+  // for (auto& v : allSendRanks) {
+  //   if (&v - allSendRanks.data() == rank) {
+  //     continue;
+  //   }
+  //   CHECK(v.size() == sendRanks.size());
+  //   for (size_t i = 0; i != sendRanks.size(); ++i) {
+  //     CHECK(v[i] != sendRanks[i]);
+  //   }
+  // }
 }
 
 std::string

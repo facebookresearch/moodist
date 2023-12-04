@@ -744,8 +744,8 @@ struct CpuThreadImpl {
     size_t nDynReady = 0;
 
     const AllGather& allGather = *self.group->allGather;
-    const std::vector<size_t>& sendRanks = allGather.sendRanks;
-    const std::vector<size_t>& recvRanks = allGather.recvRanks;
+    const Vector<size_t>& sendRanks = allGather.sendRanks;
+    const Vector<size_t>& recvRanks = allGather.recvRanks;
 
     WorkAllGather(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {}
 
@@ -860,17 +860,16 @@ struct CpuThreadImpl {
     TemporaryBufferHandle outputBuffer;
     size_t liveSends;
     size_t index;
-    size_t nDynReady;
 
     const AllGather& allGather = *self.group->allGather;
-    const std::vector<size_t>& sendRanks = allGather.sendRanks;
-    const std::vector<size_t>& recvRanks = allGather.recvRanks;
+    const Vector<size_t>& sendRanks = allGather.sendRanks;
+    const Vector<size_t>& recvRanks = allGather.recvRanks;
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
 
     int prevRecvSource = -1;
-    const std::vector<ProxyInfo>& proxyInfo = allGather.proxyInfo;
-    const std::vector<ProxyDestinationInfo>& proxyDestinationInfo = allGather.proxyDestinationInfo;
+    const Vector<ProxyInfo>& proxyInfo = allGather.proxyInfo;
+    const Vector<ProxyDestinationInfo>& proxyDestinationInfo = allGather.proxyDestinationInfo;
 
     WorkAllGatherCpu(CpuThreadImpl& self, QueueEntryAllGatherCpu& params) : Work(self, params), params(params) {}
 
@@ -909,7 +908,6 @@ struct CpuThreadImpl {
           }
         }
 
-        nDynReady = 0;
         {
           size_t n = 0;
           for (size_t i : recvRanks) {
@@ -918,7 +916,8 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+                self.makeCallback([this, &dev, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
             ++n;
           }
         }
@@ -938,25 +937,13 @@ struct CpuThreadImpl {
         }
       }
 
-      while (nDynReady < recvRanks.size()) {
-        YIELD
-      }
-
       self.sendStepValues[concurrencyIndex] = stepValue;
-
-      CHECK(recvRanks.size() == sendRanks.size());
 
       liveSends = 0;
       for (index = 0; index != sendRanks.size(); ++index) {
-        {
-          size_t i = recvRanks[index];
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeStep(di, i, stepValue + index, concurrencyIndex);
-        }
         i = sendRanks[index];
         // wait for dyns
-        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
           YIELD
         }
 
@@ -996,35 +983,38 @@ struct CpuThreadImpl {
       }
 
       {
-        CHECK(proxyInfo.size() == proxyDestinationInfo.size());
-        for (index = 0; index != proxyDestinationInfo.size(); ++index) {
-          i = proxyInfo[index].source;
-          if (prevRecvSource != i) {
-            for (di = 0; di != self.devices.size(); ++di) {
-              while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
-                YIELD
+        for (index = 0; index != std::max(proxyDestinationInfo.size(), proxyInfo.size()); ++index) {
+          if (index < proxyInfo.size()) {
+            i = proxyInfo[index].source;
+            if (prevRecvSource != i) {
+              for (di = 0; di != self.devices.size(); ++di) {
+                while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) <
+                       stepValue) {
+                  YIELD
+                }
               }
+              prevRecvSource = i;
             }
-            prevRecvSource = i;
+
+            self.group->getPeerVar(
+                proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
+                stepValue;
+
+            // std::memcpy(
+            //     (void*)(params.outputAddress + params.pitch * i),
+            //     (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
           }
+          if (index < proxyDestinationInfo.size()) {
+            i = proxyDestinationInfo[index].source;
+            while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
+              YIELD
+            }
 
-          self.group->getPeerVar(
-              proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
-              stepValue;
+            auto& pdi = proxyDestinationInfo[index];
 
-          std::memcpy(
-              (void*)(params.outputAddress + params.pitch * i),
-              (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
-
-          i = proxyDestinationInfo[index].source;
-          while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
-            YIELD
+            auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+            vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
           }
-
-          auto& pdi = proxyDestinationInfo[index];
-
-          auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
-          vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
         }
       }
 
@@ -1073,8 +1063,8 @@ struct CpuThreadImpl {
     uintptr_t sendAddress;
 
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
-    const std::vector<size_t>& sendRanks = reduceScatter.sendRanks;
-    const std::vector<size_t>& recvRanks = reduceScatter.recvRanks;
+    const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
+    const Vector<size_t>& recvRanks = reduceScatter.recvRanks;
 
     WorkReduceScatter(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params) {}
 
@@ -1203,7 +1193,6 @@ struct CpuThreadImpl {
     size_t di;
     size_t liveSends;
     size_t index;
-    size_t nDynReady = 0;
 
     uintptr_t prevReduceOutput = 0;
 
@@ -1213,8 +1202,8 @@ struct CpuThreadImpl {
     TemporaryBufferHandle recvBuffer;
 
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
-    const std::vector<size_t>& sendRanks = reduceScatter.sendRanks;
-    const std::vector<size_t>& recvRanks = reduceScatter.recvRanks;
+    const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
+    const Vector<size_t>& recvRanks = reduceScatter.recvRanks;
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
 
@@ -1297,7 +1286,6 @@ struct CpuThreadImpl {
             ++n;
           }
 
-          nDynReady = 0;
           {
             size_t n = 0;
             for (size_t i : recvRanks) {
@@ -1306,12 +1294,11 @@ struct CpuThreadImpl {
               self.writeData(
                   dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                   (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-                  self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+                  self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+                  self.makeCallback([this, &dev, di, i]() { self.writeStep(di, i, stepValue, concurrencyIndex); }));
               ++n;
             }
           }
-        } else {
-          CHECK(recvRanks.empty() && sendRanks.empty());
         }
       }
 
@@ -1326,18 +1313,14 @@ struct CpuThreadImpl {
         }
       }
 
-      while (nDynReady < recvRanks.size()) {
-        YIELD
-      }
-
       self.sendStepValues[concurrencyIndex] = stepValue;
 
-      CHECK(recvRanks.size() == sendRanks.size());
+      // CHECK(recvRanks.size() == sendRanks.size());
 
       liveSends = 0;
       for (index = 0; index != sendRanks.size(); ++index) {
+        i = sendRanks[index];
         {
-          size_t i = recvRanks[index];
           uintptr_t addr = (uintptr_t)sendBuffer->cpuPointer + params.pitch * index;
           reduceAdd<dtype, reduction>(addr, params.inputAddress + params.pitch * i);
           for (size_t peerIndex : peerIndices) {
@@ -1346,15 +1329,8 @@ struct CpuThreadImpl {
           }
         }
 
-        {
-          size_t i = recvRanks[index];
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeStep(di, i, stepValue + index, concurrencyIndex);
-        }
-        i = sendRanks[index];
         // wait for dyns
-        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue + index) {
+        while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
           YIELD
         }
 

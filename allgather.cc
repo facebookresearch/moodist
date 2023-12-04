@@ -42,8 +42,8 @@ void AllGather::init() {
   CHECK(myNode != -1 && myLocalRank != -1);
   size_t ranksPerNode = nodeRanks[myNode].size();
   for (auto& list : nodeRanks) {
-    CHECK(list.size() == ranksPerNode);
-    // fmt::printf("node is %s\n", fmt::to_string(fmt::join(list, ", ")));
+    // CHECK(list.size() == ranksPerNode);
+    //  fmt::printf("node is %s\n", fmt::to_string(fmt::join(list, ", ")));
     for (size_t dst = 0; dst != list.size(); ++dst) {
       for (size_t src = 0; src != list.size(); ++src) {
         if (src == dst) {
@@ -71,23 +71,24 @@ void AllGather::init() {
 
   std::vector<std::vector<size_t>> paths;
   for (size_t src = 0; src != size; ++src) {
-    size_t l = findLocalRank(src);
+    size_t ol = findLocalRank(src);
     for (auto& list : nodeRanks) {
       if (std::find(list.begin(), list.end(), src) != list.end()) {
         continue;
       }
+      size_t ll = ol % list.size();
       if (src == rank) {
-        paths.push_back({src, list[l]});
-      } else if (list[l] == rank) {
+        paths.push_back({src, list[ll]});
+      } else if (list[ll] == rank) {
         for (size_t n = 0; n != list.size(); ++n) {
-          if (n == l) {
+          if (n == ll) {
             paths.push_back({src, list[n]});
           } else {
-            paths.push_back({src, list[l], list[n]});
+            paths.push_back({src, list[ll], list[n]});
           }
         }
       } else if (std::find(list.begin(), list.end(), rank) != list.end()) {
-        paths.push_back({src, list[l], rank});
+        paths.push_back({src, list[ll], rank});
       }
     }
   }
@@ -184,12 +185,12 @@ void AllGather::init() {
     }
   }
 
-  CHECK(proxyInfo.size() == proxyDestinationInfo.size());
+  // CHECK(proxyInfo.size() == proxyDestinationInfo.size());
 
-  auto proxyDestinationCounts = setupComms->allgather(proxyDestinationInfo.size());
-  for (size_t n : proxyDestinationCounts) {
-    CHECK(n == proxyDestinationInfo.size());
-  }
+  // auto proxyDestinationCounts = setupComms->allgather(proxyDestinationInfo.size());
+  // for (size_t n : proxyDestinationCounts) {
+  //   CHECK(n == proxyDestinationInfo.size());
+  // }
 
   log.verbose("rank %d: ipc ranks are [%s]\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
   log.verbose("rank %d: send ranks are [%s]\n", rank, fmt::to_string(fmt::join(sendRanks, ", ")));

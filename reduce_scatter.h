@@ -24,8 +24,8 @@ struct ReduceScatterParameters {
 
 struct ReduceScatter : CollectiveBase {
 
-  std::vector<size_t> sendRanks;
-  std::vector<size_t> recvRanks;
+  Vector<size_t> sendRanks;
+  Vector<size_t> recvRanks;
 
   ReduceScatter(Group* group);
   ~ReduceScatter();

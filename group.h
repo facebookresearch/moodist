@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "hash_map.h"
+#include "vector.h"
 
 namespace moodist {
 
@@ -108,7 +109,7 @@ struct Group {
   std::vector<std::vector<uint8_t>> peerIpcAccess;
   std::array<size_t, 8> peerMyRemoteIndex;
 
-  std::vector<std::vector<size_t>> nodeRanks;
+  Vector<Vector<size_t>> nodeRanks;
 
   int allocationNode = -1;
 
