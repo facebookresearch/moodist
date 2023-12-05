@@ -97,17 +97,18 @@ struct AllocatedBuffer {
   void dtor() {
     if (numaAllocated) {
       if (cpuPointer) {
+        log.verbose("free cpu memory %p\n", cpuPointer);
         cuMemHostUnregister(cpuPointer);
         numa_free(cpuPointer, bytes);
       }
     } else if (hostAllocated) {
       if (cpuPointer) {
-        // fmt::printf("free host memory %p\n", cpuPointer);
+        log.verbose("free host memory %p\n", cpuPointer);
         cuMemFreeHost(cpuPointer);
       }
     } else {
       if (cudaPointer) {
-        // fmt::printf("free cuda memory %#x\n", cudaPointer);
+        log.verbose("free cuda memory %#x\n", cudaPointer);
         cuMemFree(cudaPointer);
       }
     }
@@ -167,7 +168,7 @@ struct PeerArrayRef {
 };
 
 struct IpcMemHash {
-  size_t operator()(const CUipcMemHandle& v) {
+  size_t operator()(const CUipcMemHandle& v) const {
     static_assert(sizeof(v) % sizeof(size_t) == 0);
     auto rotl = [&](auto v, int n) {
       static_assert(std::is_unsigned_v<decltype(v)>);
@@ -187,7 +188,7 @@ struct IpcMemHash {
   }
 };
 struct IpcMemEqual {
-  bool operator()(const CUipcMemHandle& a, const CUipcMemHandle& b) {
+  bool operator()(const CUipcMemHandle& a, const CUipcMemHandle& b) const {
     return std::memcmp(&a, &b, sizeof(a)) == 0;
   }
 };
@@ -236,6 +237,18 @@ inline std::string randomName() {
 template<typename Duration>
 float seconds(Duration duration) {
   return std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(duration).count();
+}
+
+inline std::string hexstr(const void* data, size_t len) {
+  std::string r;
+  const uint8_t* p = (uint8_t*)data;
+  const uint8_t* e = p + len;
+  while (p != e) {
+    r += "0123456789abcdef"[*p >> 4];
+    r += "0123456789abcdef"[*p & 0x0f];
+    ++p;
+  }
+  return r;
 }
 
 } // namespace moodist

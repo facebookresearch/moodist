@@ -70,7 +70,7 @@ def f(n):
         if rank == 0:
             f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
-        s = 128
+        s = 73728 // 4
         xi = 0
         while True:
             xi += 1
@@ -209,7 +209,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(256, world_size)
+    i = min(8, world_size)
     while True:
         t(i)
 
@@ -238,8 +238,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist", "nccl"):
-#for n in ("nccl", "moodist"):
+#for n in ("moodist", "nccl"):
+for n in ("nccl",):
     # for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)

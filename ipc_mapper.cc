@@ -129,13 +129,15 @@ struct IpcMapperImpl : IpcMapper {
 
       async::setCurrentThreadName("ipc mapper");
 
-      async::Scheduler unmapScheduler;
-      unmapScheduler.setMaxThreads(1);
-      unmapScheduler.setName("ipc unmap");
+      // async::Scheduler unmapScheduler;
+      // unmapScheduler.setMaxThreads(1);
+      // unmapScheduler.setName("ipc unmap");
 
       CHECK_CU(cuCtxSetCurrent(group->cuContext));
 
-      unmapScheduler.run([this]() { CHECK_CU(cuCtxSetCurrent(group->cuContext)); });
+      // unmapScheduler.run([this]() { CHECK_CU(cuCtxSetCurrent(group->cuContext)); });
+
+      HashMap<uintptr_t, uint32_t> activeMaps;
 
       while (true) {
         if (terminate.load(std::memory_order_relaxed)) {
@@ -172,7 +174,7 @@ struct IpcMapperImpl : IpcMapper {
             CHECK(sourceRank < group->size);
             if (v.requestUnmapAddress) {
               log.debug(
-                  "%d: got ipc unmap (address %#x size %#x) request from rank %d!\n", group->rank,
+                  "%d: got ipc unmap request (address %#x size %#x) from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
               std::lock_guard l(mutex);
               if (this->stepValue > v.requestStepValue) {
@@ -181,10 +183,15 @@ struct IpcMapperImpl : IpcMapper {
                     "Cannot unmap due to local stepvalue %#x vs request stepvalue %#x\n", this->stepValue,
                     v.requestStepValue);
               } else {
+                auto i = activeMaps.find(v.requestUnmapAddress);
+                CHECK(i != activeMaps.end());
+                CHECK(i->second == 1);
+                activeMaps.erase(i);
+
                 CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
                 v.response = 1;
 
-                // auto ptr = std::make_shared<std::atomic_bool>(fal se);
+                // auto ptr = std::make_shared<std::atomic_bool>(false);
                 // unmapScheduler.run([address = v.requestUnmapAddress, ptr]() {
                 //   CHECK_CU(cuIpcCloseMemHandle(address));
                 //   *ptr = true;
@@ -202,9 +209,12 @@ struct IpcMapperImpl : IpcMapper {
                 // }
               }
             } else {
-              log.debug("%d: got ipc map request from rank %d!\n", group->rank, sourceRank);
+              log.debug("%d: got ipc map request (size %#x) from rank %d!\n", group->rank, v.requestBytes, sourceRank);
               CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
               log.debug("%d: mapped %#x bytes to %#x\n", group->rank, v.requestBytes, v.response);
+
+              ++activeMaps[v.response];
+              CHECK(activeMaps[v.response] == 1);
             }
             v.stage = 3;
 
@@ -216,8 +226,13 @@ struct IpcMapperImpl : IpcMapper {
 
         shared->count -= n;
       }
+      for (auto& v : activeMaps) {
+        CHECK_CU(cuIpcCloseMemHandle(v.first));
+      }
     } catch (const std::exception& e) {
       log.error("ipc mapper got exception %s\n", e.what());
+      while (true)
+        ;
       std::lock_guard l(mutex);
       if (!hasException) {
         hasException = true;
@@ -246,7 +261,9 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    log.debug("sending ipc request to rank %d using slot %d\n", group->ipcRanks.at(peerIndex), slotIndex);
+    log.debug(
+        "sending ipc map request to rank %d using slot %d (size %#x)\n", group->ipcRanks.at(peerIndex), slotIndex,
+        size);
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();
@@ -285,7 +302,9 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    log.debug("sending ipc request using slot %d\n", slotIndex);
+    log.debug(
+        "sending ipc unmap request to rank %d using slot %d (base %#x size %#x)\n", group->ipcRanks.at(peerIndex),
+        slotIndex, base, size);
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();
