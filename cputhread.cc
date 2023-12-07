@@ -51,6 +51,7 @@ struct Device {
 };
 
 struct Callback {
+  IntrusiveListLink<Callback> link;
   Function<void()> onComplete;
   size_t refcount = 0;
   Callback* next = nullptr;
@@ -79,6 +80,12 @@ struct CallbackWrapper {
   }
   operator Callback*() {
     return callback;
+  }
+  Callback* operator->() {
+    return callback;
+  }
+  Callback& operator*() {
+    return *callback;
   }
 };
 
@@ -274,6 +281,8 @@ struct CpuThreadImpl {
 
   AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
   MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.buffer.cpuPointer, outDynsBuffer.buffer.bytes);
+
+  Vector<uint8_t> dynReadyVector{size * Group::maxConcurrency};
 
   Vector<TemporaryBufferHandle> vmreadBuffers;
   Vector<TemporaryBufferHandle> sendRecvBuffers;
@@ -741,7 +750,6 @@ struct CpuThreadImpl {
     MemoryRegistration* inputMr;
     size_t liveSends;
     size_t index;
-    size_t nDynReady = 0;
 
     const AllGather& allGather = *self.group->allGather;
     const Vector<size_t>& sendRanks = allGather.sendRanks;
@@ -769,7 +777,6 @@ struct CpuThreadImpl {
 
         // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
         // until kernel entry, such that we don't receive data until we're ready.
-        nDynReady = 0;
         {
           size_t n = 0;
           for (size_t i : recvRanks) {
@@ -778,7 +785,9 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this]() { ++nDynReady; }));
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this, n]() {
+                  self.dynReadyVector[size * concurrencyIndex + n] = 1;
+                }));
             ++n;
           }
         }
@@ -789,16 +798,16 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      while (nDynReady < recvRanks.size()) {
-        YIELD
-      }
-
       self.sendStepValues[concurrencyIndex] = stepValue;
 
       CHECK(recvRanks.size() == sendRanks.size());
 
       liveSends = 0;
       for (index = 0; index != sendRanks.size(); ++index) {
+        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
+          YIELD
+        }
+        self.dynReadyVector[size * concurrencyIndex + index] = 0;
         {
           size_t i = recvRanks[index];
           size_t di = (rank + index) % self.devices.size();

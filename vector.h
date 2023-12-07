@@ -33,6 +33,9 @@ struct Vector {
   Vector(Vector&& n) {
     *this = std::move(n);
   }
+  Vector(size_t count) {
+    resize(count);
+  }
   ~Vector() {
     if (beginptr != endptr) {
       clear();
