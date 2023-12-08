@@ -93,14 +93,19 @@ void AllGather::init() {
     }
   }
 
+  auto abs = [&](size_t v, size_t n) {
+    v = (v + n) % n;
+    return v <= (n - v) ? v : n - v;
+  };
+
   auto sortFn = [&](auto& a, auto& b) {
     if (a.size() != b.size()) {
       return a.size() < b.size();
     }
     int am;
     int bm;
-    am = (size + a[1] - a[0]) % size;
-    bm = (size + b[1] - b[0]) % size;
+    am = abs(a[1] - a[0], size);
+    bm = abs(b[1] - b[0], size);
     if (am != bm) {
       return am < bm;
     }
@@ -110,6 +115,9 @@ void AllGather::init() {
       if (am != bm) {
         return am > bm;
       }
+    }
+    if ((a[1] - a[0] + size) % size != (b[1] - b[0] + size) % size) {
+      return (a[1] - a[0] + size) % size > (b[1] - b[0] + size) % size;
     }
     return a < b;
   };
@@ -183,6 +191,97 @@ void AllGather::init() {
       pid.proxyPeerIndex = group->getPeerIndex(proxy);
       proxyDestinationInfo.push_back(pid);
     }
+  }
+
+  std::vector<size_t> rankNodes;
+  rankNodes.resize(size);
+  for (size_t i = 0; i != nodeRanks.size(); ++i) {
+    for (size_t r : nodeRanks[i]) {
+      rankNodes[r] = i;
+    }
+  }
+
+  {
+    std::vector<size_t> neighbors;
+    for (auto& path : paths) {
+      if (path.size() != 2) {
+        continue;
+      }
+      if (path[0] == rank) {
+        size_t sourceNode = rankNodes[path[0]];
+        size_t destinationNode = rankNodes[path[1]];
+        if (abs(destinationNode - sourceNode, nodeRanks.size()) == 1) {
+          neighbors.push_back(path[1]);
+          log.info("%d is a neighbor\n", path[1]);
+        }
+      } else if (path[1] == rank) {
+        size_t source = path[0];
+        size_t bestDistance = size;
+        size_t proxy = -1;
+        for (auto& v : neighbors) {
+          size_t d = abs(v - source, size);
+          if (d < bestDistance) {
+            bestDistance = d;
+            proxy = v;
+          }
+        }
+        ringRecvs.push_back({source, proxy});
+      }
+    }
+    auto allRingRecvs = setupComms->allgather(ringRecvs);
+    for (size_t i = 0;; ++i) {
+      bool any = false;
+      for (size_t r = 0; r != size; ++r) {
+        auto& v = allRingRecvs.at(r);
+        if (v.size() <= i) {
+          continue;
+        }
+        any = true;
+        if (std::get<1>(v[i]) == rank) {
+          ringSends.push_back({std::get<0>(v[i]), r});
+        }
+      }
+      if (!any) {
+        break;
+      }
+    }
+    std::string s;
+    for (auto& v : ringSends) {
+      if (!s.empty()) {
+        s += ", ";
+      }
+      s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
+    }
+    log.info("rank %d: ring sends are [%s]\n", rank, s);
+    s.clear();
+    for (auto& v : ringRecvs) {
+      if (!s.empty()) {
+        s += ", ";
+      }
+      s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
+    }
+    log.info("rank %d: ring recvs are [%s]\n", rank, s);
+    // for (auto& x : ringRecvs) {
+    //   CHECK(std::get<2>(x) == (size_t)-1);
+    // }
+    // auto allRingSends = setupComms->allgather(ringSends);
+    // for (size_t n : neighbors) {
+    //   size_t index = 0;
+    //   for (auto& t : allRingSends[n]) {
+    //     if (std::get<1>(t) == rank) {
+    //       for (auto& x : ringRecvs) {
+    //         if (std::get<0>(t) == n == std::get<0>(x) && std::get<1>(x) == n) {
+    //           CHECK(std::get<2>(x) == (size_t)-1);
+    //           std::get<2>(x) = index;
+    //         }
+    //       }
+    //     }
+    //     ++index;
+    //   }
+    // }
+    // for (auto& x : ringRecvs) {
+    //   CHECK(std::get<2>(x) != (size_t)-1 && std::get<2>(x) < size);
+    // }
   }
 
   // CHECK(proxyInfo.size() == proxyDestinationInfo.size());

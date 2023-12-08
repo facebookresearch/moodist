@@ -76,7 +76,7 @@ void Group::init() {
   pid = ::getpid();
 
   cuContext = nullptr;
-  cuCtxGetCurrent(&cuContext);
+  //cuCtxGetCurrent(&cuContext);
   if (!cuContext) {
     CHECK_CU(cuInit(0));
 
@@ -529,6 +529,7 @@ void Group::init() {
     // but we don't want to change the current numa allocation policy.
     // thus we create a temporary thread to do it.
     std::thread tmp([&] {
+      log.error("begin shared memory %d\n", allocationNode);
       if (allocationNode != -1) {
         auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
         if (bitmask) {
@@ -539,6 +540,7 @@ void Group::init() {
         }
       }
       ipcMapper->init();
+      log.error("end shared memory\n");
     });
     tmp.join();
   }

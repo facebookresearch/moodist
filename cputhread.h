@@ -2,9 +2,9 @@
 
 #include "group.h"
 #include "intrusive_list.h"
+#include "simple_vector.h"
 #include "synchronization.h"
 #include "vector.h"
-#include "simple_vector.h"
 
 #include <forward_list>
 #include <memory>

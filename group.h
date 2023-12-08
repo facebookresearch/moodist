@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "hash_map.h"
+#include "simple_vector.h"
 #include "vector.h"
 
 namespace moodist {

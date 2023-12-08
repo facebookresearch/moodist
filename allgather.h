@@ -28,6 +28,9 @@ struct AllGather : CollectiveBase {
   Vector<ProxyInfo> proxyInfo;
   Vector<ProxyDestinationInfo> proxyDestinationInfo;
 
+  Vector<std::pair<size_t, size_t>> ringSends;
+  Vector<std::pair<size_t, size_t>> ringRecvs;
+
   AllGather(Group* group);
   ~AllGather();
   void init();

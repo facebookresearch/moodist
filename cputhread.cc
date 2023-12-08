@@ -279,10 +279,17 @@ struct CpuThreadImpl {
       regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
   uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
 
+  AllocatedArray writeStepStorage = group->allocateArrayHost(sizeof(uint32_t) * size, Group::maxConcurrency);
+  MemoryRegistration* writeStepStorageMr =
+      regMr((uintptr_t)writeStepStorage.buffer.cpuPointer, writeStepStorage.buffer.bytes);
+  Vector<uint8_t> writeStepBusy{size * Group::maxConcurrency};
+  Vector<Vector<std::pair<size_t, uint32_t>>> writeStepQueue{size * Group::maxConcurrency};
+
   AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
   MemoryRegistration* outDynsMr = regMr((uintptr_t)outDynsBuffer.buffer.cpuPointer, outDynsBuffer.buffer.bytes);
 
   Vector<uint8_t> dynReadyVector{size * Group::maxConcurrency};
+  Vector<MemoryRegistration*> outDynsMrVector{size * Group::maxConcurrency};
 
   Vector<TemporaryBufferHandle> vmreadBuffers;
   Vector<TemporaryBufferHandle> sendRecvBuffers;
@@ -574,10 +581,26 @@ struct CpuThreadImpl {
   void writeStep(size_t deviceIndex, size_t dst, uint32_t stepValue, size_t concurrencyIndex) {
     Device& dev = devices[deviceIndex];
     uintptr_t dstOffset = group->getSharedOffset(&localProgress[size * concurrencyIndex + rank].stepValue);
-    localProgress[size * concurrencyIndex + rank].stepValue = stepValue;
+    // localProgress[size * concurrencyIndex + rank].stepValue = stepValue;
+    if (writeStepBusy[size * concurrencyIndex + dst]) {
+      writeStepQueue[size * concurrencyIndex + dst].emplace_back(deviceIndex, stepValue);
+      return;
+    }
+    writeStepBusy[size * concurrencyIndex + dst] = 1;
+    uint32_t& val = ((uint32_t*)writeStepStorage.cpu(concurrencyIndex))[dst];
+    val = stepValue;
     writeData(
-        dev, dst, &localProgress[size * concurrencyIndex + rank].stepValue, commsMr->mrs[deviceIndex]->lkey,
-        (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue));
+        dev, dst, &val, writeStepStorageMr->mrs[deviceIndex]->lkey,
+        (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue),
+        makeCallback([this, concurrencyIndex, dst] {
+          writeStepBusy[size * concurrencyIndex + dst] = 0;
+          auto& q = writeStepQueue[size * concurrencyIndex + dst];
+          if (!q.empty()) {
+            auto [deviceIndex, stepValue] = q.front();
+            q.pop_front();
+            writeStep(deviceIndex, dst, stepValue, concurrencyIndex);
+          }
+        }));
   }
 
   void writeCpuStep(size_t deviceIndex, size_t dst, uint32_t stepValue, size_t concurrencyIndex) {
@@ -785,9 +808,8 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex + sizeof(DynamicAddresses) * rank),
-                self.remoteComms[i].keys[di], sizeof(DynamicAddresses), self.makeCallback([this, n]() {
-                  self.dynReadyVector[size * concurrencyIndex + n] = 1;
-                }));
+                self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
+                self.makeCallback([this, n]() { self.dynReadyVector[size * concurrencyIndex + n] = 1; }));
             ++n;
           }
         }
@@ -857,6 +879,179 @@ struct CpuThreadImpl {
 
       self.cpuThread->freelistAllGather.push(&params);
       self.allocatorAllGather.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkAllGatherRing : Work {
+    QueueEntryAllGather& params;
+    size_t i;
+    size_t neighbor;
+    size_t di;
+    MemoryRegistration* inputMr;
+    size_t liveSends;
+    size_t index;
+
+    const AllGather& allGather = *self.group->allGather;
+    const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
+    const Vector<std::pair<size_t, size_t>>& ringSends = allGather.ringSends;
+
+    WorkAllGatherRing(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {}
+
+    void step() {
+      ENTER
+
+      {
+        inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
+        // Thus, we register each ranks output address independently, so they get different MRs.
+        for (auto [i, neighbor] : ringRecvs) {
+          auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+          self.outDynsMrVector[size * concurrencyIndex + i] = mr;
+          outDyns[i].gatherAddress = params.outputAddress + params.pitch * i;
+          outDyns[i].gatherBytes = params.bytes;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+          }
+        }
+
+        // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
+        // until kernel entry, such that we don't receive data until we're ready.
+        {
+          size_t n = 0;
+          for (auto [i, neighbor] : ringRecvs) {
+            size_t di = (rank + n) % self.devices.size();
+            auto& dev = self.devices[di];
+
+            auto offset = self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + n]);
+
+            self.writeData(
+                dev, neighbor, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
+                (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
+                sizeof(DynamicAddresses),
+                self.makeCallback([this, n]() { self.dynReadyVector[size * concurrencyIndex + n] = 1; }));
+            ++n;
+          }
+        }
+      }
+
+      //log.info("wait for enter kernel %d\n", stepValue);
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      //log.info("enter kernel %d ok\n", stepValue);
+
+      self.sendStepValues[concurrencyIndex] = stepValue;
+
+      CHECK(ringRecvs.size() == ringSends.size());
+
+      liveSends = 0;
+      for (index = 0; index != ringSends.size(); ++index) {
+        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
+          YIELD
+        }
+        self.dynReadyVector[size * concurrencyIndex + index] = 0;
+        {
+          auto [i, neighbor] = ringRecvs[index];
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeStep(di, neighbor, stepValue + index, concurrencyIndex);
+        }
+        i = std::get<0>(ringSends[index]);
+        neighbor = std::get<1>(ringSends[index]);
+        CHECK(i < size && neighbor < size);
+        //log.info("wait for dyn index %d from %d\n", index, neighbor);
+        // wait for dyns
+        while (self.localProgress[size * concurrencyIndex + neighbor].stepValue < stepValue + index) {
+          YIELD
+        }
+
+        if (params.bytes > 0) {
+
+          if (i != rank) {
+            //log.info(" wait for source %d\n", i);
+            for (di = 0; di != self.devices.size(); ++di) {
+              while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+                YIELD
+              }
+            }
+          }
+
+          //log.info("send source %d to %d\n", i, neighbor);
+
+          uintptr_t srcAddr = i == rank ? (uintptr_t)params.inputAddress : params.outputAddress + params.pitch * i;
+          auto* srcMr = i == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + i];
+          CHECK(srcMr != nullptr);
+
+          CHECK(self.localDyns[size * concurrencyIndex + index].gatherBytes == params.bytes);
+
+          liveSends += self.devices.size();
+          self.writeDataDistributed2(
+              neighbor, srcAddr, params.bytes, srcMr, self.localDyns[size * concurrencyIndex + index].gatherAddress,
+              self.localDyns[size * concurrencyIndex + index].gatherKey,
+              [this, i = this->i, neighbor = this->neighbor](size_t di, bool ordered, bool done) {
+                if (done) {
+                  --liveSends;
+                }
+                if (ordered) {
+                  auto& dev = self.devices[di];
+                  self.writeData(
+                      dev, neighbor, &self.sendStepValues[concurrencyIndex],
+                      self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      (void*)(self.remoteCpuCommsDeviceDataSent[neighbor].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * i + di)),
+                      self.remoteCpuCommsDeviceDataSent[neighbor].keys[di], sizeof(stepValue));
+                  self.writeData(
+                      dev, neighbor, &self.sendStepValues[concurrencyIndex],
+                      self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      (void*)(self.remoteCudaCommsDeviceDataSent[neighbor].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * i + di)),
+                      self.remoteCudaCommsDeviceDataSent[neighbor].keys[di], sizeof(stepValue));
+                }
+              });
+        }
+        // while (liveSends >= self.devices.size() * 2) {
+        // while (liveSends >= self.devices.size() ) {
+        //   YIELD
+        // }
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      // for (di = 0; di != self.devices.size(); ++di) {
+      //   while (self.devices[di].currentCqEntries) {
+      //     YIELD
+      //   }
+      // }
+
+      for (index = 0; index != ringRecvs.size(); ++index) {
+        i = std::get<0>(ringRecvs[index]);
+        CHECK(i < size);
+        //log.info("exit wait for source %d from %d\n", i, std::get<1>(ringRecvs[index]));
+        for (di = 0; di != self.devices.size(); ++di) {
+          while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+            YIELD
+          }
+        }
+      }
+
+      //log.info("wait for exit kernel %d\n", stepValue);
+
+      cpuOut[0] = stepValue;
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      //log.info("exit kernel %d ok\n", stepValue);
+
+      self.cpuThread->freelistAllGather.push(&params);
+      self.allocatorAllGatherRing.deallocate(this);
       DONE
     }
   };
@@ -1877,6 +2072,7 @@ struct CpuThreadImpl {
   };
   WorkAllocator<WorkBarrier> allocatorBarrier;
   WorkAllocator<WorkAllGather> allocatorAllGather;
+  WorkAllocator<WorkAllGatherRing> allocatorAllGatherRing;
   WorkAllocator<WorkReduceScatter> allocatorReduceScatter;
   WorkAllocator<WorkBroadcast> allocatorBroadcast;
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
@@ -1934,7 +2130,8 @@ struct CpuThreadImpl {
             if (queueEntry.task == taskBarrier) {
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
             } else if (queueEntry.task == taskAllGather) {
-              enqueue(allocatorAllGather, (QueueEntryAllGather&)queueEntry);
+              enqueue(allocatorAllGatherRing, (QueueEntryAllGather&)queueEntry);
+              // enqueue(allocatorAllGather, (QueueEntryAllGather&)queueEntry);
             } else if (queueEntry.task == taskReduceScatter) {
               enqueue(allocatorReduceScatter, (QueueEntryReduceScatter&)queueEntry);
             } else if (queueEntry.task == taskTerminate) {

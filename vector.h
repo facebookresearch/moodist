@@ -26,6 +26,7 @@ struct Vector {
   T* beginptr = nullptr;
   T* endptr = nullptr;
   size_t msize = 0;
+  using value_type = T;
   Vector() = default;
   Vector(const Vector& n) {
     *this = n;

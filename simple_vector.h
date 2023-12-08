@@ -32,6 +32,14 @@ struct SimpleVector {
   ~SimpleVector() {
     clear();
   }
+  SimpleVector(std::initializer_list<T> list) {
+    resize(list.size());
+    size_t i = 0;
+    for (auto& v : list) {
+      (*this)[i] = std::move(v);
+      ++i;
+    }
+  }
   SimpleVector& operator=(const SimpleVector& n) {
     resize(n.msize);
     for (size_t i = msize; i;) {

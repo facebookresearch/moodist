@@ -119,10 +119,12 @@ def f(n):
                 events = []
                 for _ in range(iterations):
                     group._allgather_base(output, input).wait()
+                    torch.cuda.synchronize()
             elif op == "reduce_scatter":
                 events = []
                 for _ in range(iterations):
                     group._reduce_scatter_base(output, input).wait()
+                    torch.cuda.synchronize()
             else:
                 assert False
                 # torch.cuda.synchronize()
@@ -153,15 +155,20 @@ def f(n):
                 #     group._reduce_scatter_base(output, input)
                 #     #torch.cuda.synchronize()
                 if op == "all_gather":
-                    for _ in range(iterations):
-                        if len(events) >= 2:
-                            e = events.pop(0)
-                            e.synchronize()
-                            freeevents.append(e)
-                        group._allgather_base(output, input).wait()
-                        e = freeevents.pop(0)
-                        e.record()
-                        events.append(e)
+                    if True:
+                        for _ in range(iterations):
+                            dist.all_gather_into_tensor(output, input)
+                            torch.cuda.synchronize()
+                    else:
+                        for _ in range(iterations):
+                            if len(events) >= 2:
+                                e = events.pop(0)
+                                e.synchronize()
+                                freeevents.append(e)
+                            group._allgather_base(output, input).wait()
+                            e = freeevents.pop(0)
+                            e.record()
+                            events.append(e)
                 elif op == "reduce_scatter":
                     for _ in range(iterations):
                         if len(events) >= 2:
@@ -209,7 +216,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(8, world_size)
+    i = min(800, world_size)
     while True:
         t(i)
 
@@ -238,8 +245,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
-for n in ("nccl",):
+for n in ("moodist", "nccl"):
+#for n in ("moodist",):
     # for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
