@@ -568,6 +568,7 @@ void Group::init() {
   get(cpuAddresses, Group::maxConcurrency);
   get(syncData, 1);
   get(cpuProxyReady, size * Group::maxConcurrency);
+  get(localProgress2, size * Group::maxConcurrency);
 
   mySharedMemSize = offset;
 

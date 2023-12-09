@@ -71,6 +71,7 @@ def f(n):
             f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
         s = 73728 // 4
+        #s = 9437184
         xi = 0
         while True:
             xi += 1
@@ -155,11 +156,13 @@ def f(n):
                 #     group._reduce_scatter_base(output, input)
                 #     #torch.cuda.synchronize()
                 if op == "all_gather":
-                    if True:
+                    if False:
                         for _ in range(iterations):
                             dist.all_gather_into_tensor(output, input)
                             torch.cuda.synchronize()
                     else:
+                        #if x == 1:
+                        #    moodist.enable_profiling(True)
                         for _ in range(iterations):
                             if len(events) >= 2:
                                 e = events.pop(0)
@@ -169,6 +172,8 @@ def f(n):
                             e = freeevents.pop(0)
                             e.record()
                             events.append(e)
+                        #if x == 1:
+                        #    moodist.enable_profiling(False)
                 elif op == "reduce_scatter":
                     for _ in range(iterations):
                         if len(events) >= 2:
@@ -245,8 +250,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
+#for n in ("moodist", "nccl"):
 for n in ("moodist", "nccl"):
-#for n in ("moodist",):
     # for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)

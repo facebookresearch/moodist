@@ -104,7 +104,7 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416).cuda() + 1
-        data = torch.randn(589824).cuda() + 1
+        data = torch.randn(18874368).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -374,19 +374,38 @@ def f(n):
                     events2.append(e)
         elif 1 == 1:
             loopcount = 1000
+            freeevents = [
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+            ]
             events = []
-            for i in range(loopcount):
+            for _ in range(loopcount):
                 if len(events) >= 2:
-                    events.pop(0).synchronize()
+                    e = events.pop(0)
+                    e.synchronize()
+                    freeevents.append(e)
                 dist.all_gather_into_tensor(result0, tmp)
-                e = torch.cuda.Event()
+                e = freeevents.pop(0)
                 e.record()
                 events.append(e)
+            # for i in range(loopcount):
+            #     if len(events) >= 2:
+            #         events.pop(0).synchronize()
+            #     dist.all_gather_into_tensor(result0, tmp)
+            #     e = torch.cuda.Event()
+            #     e.record()
+            #     events.append(e)
         elif 1 == 1:
+            #moodist.enable_profiling(True)
             loopcount = 1000
             for _ in range(loopcount):
-                dist._all_gather_base(result0, tmp)
-            torch.cuda.synchronize()
+                dist.all_gather_into_tensor(result0, tmp)
+                torch.cuda.synchronize()
+            #moodist.enable_profiling(False)
+
+            dist.all_gather_into_tensor(result0, tmp)
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000

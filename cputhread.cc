@@ -26,6 +26,8 @@
 
 namespace moodist {
 
+extern bool profilingEnabled;
+
 struct CpuThreadImpl;
 
 namespace {
@@ -256,6 +258,7 @@ struct CpuThreadImpl {
 
   DynamicAddresses* localDyns = group->localDyns;
   Progress* localProgress = group->localProgress;
+  Progress* localProgress2 = group->localProgress2;
 
   MemoryRegistration* cudaStepValueMr =
       regMrCuda(group->cudaStepValue.buffer.cudaPointer, group->cudaStepValue.buffer.bytes);
@@ -278,6 +281,12 @@ struct CpuThreadImpl {
   MemoryRegistration* sendStepValuesStorageMr =
       regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
   uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
+
+  AllocatedArray sendStepValues2Storage = group->allocateArrayHost(sizeof(uint32_t), 32 * Group::maxConcurrency);
+  MemoryRegistration* sendStepValues2StorageMr =
+      regMr((uintptr_t)sendStepValues2Storage.buffer.cpuPointer, sendStepValues2Storage.buffer.bytes);
+  uint32_t* sendStepValues2 = (uint32_t*)sendStepValues2Storage.buffer.cpuPointer;
+  size_t sendStepValues2Counter = 0;
 
   AllocatedArray writeStepStorage = group->allocateArrayHost(sizeof(uint32_t) * size, Group::maxConcurrency);
   MemoryRegistration* writeStepStorageMr =
@@ -590,9 +599,8 @@ struct CpuThreadImpl {
     uint32_t& val = ((uint32_t*)writeStepStorage.cpu(concurrencyIndex))[dst];
     val = stepValue;
     writeData(
-        dev, dst, &val, writeStepStorageMr->mrs[deviceIndex]->lkey,
-        (void*)(remoteComms[dst].address + dstOffset), remoteComms[dst].keys[deviceIndex], sizeof(stepValue),
-        makeCallback([this, concurrencyIndex, dst] {
+        dev, dst, &val, writeStepStorageMr->mrs[deviceIndex]->lkey, (void*)(remoteComms[dst].address + dstOffset),
+        remoteComms[dst].keys[deviceIndex], sizeof(stepValue), makeCallback([this, concurrencyIndex, dst] {
           writeStepBusy[size * concurrencyIndex + dst] = 0;
           auto& q = writeStepQueue[size * concurrencyIndex + dst];
           if (!q.empty()) {
@@ -688,6 +696,71 @@ struct CpuThreadImpl {
       log.debug("rank %d CUDA test done!\n", rank);
     }
   }
+
+  size_t opCount = 0;
+
+  struct TraceEvent {
+    std::string name;
+    std::chrono::system_clock::time_point begin;
+    std::chrono::system_clock::time_point end;
+    int threadId = -1;
+  };
+  std::vector<TraceEvent> traceEvents;
+
+  std::chrono::system_clock::time_point beginning = std::chrono::system_clock::now();
+
+  std::string currentTraceName = "";
+  std::chrono::system_clock::time_point currentTraceBegin = beginning;
+  int threadId = gettid();
+
+  template<typename... Args>
+  void trace(const char* fmt, Args&&... args) {
+    return;
+    // fmt::printf("trace enter '%s'\n", name);
+    //  if (opCount < 1000 || opCount >= 1200) {
+    if (!profilingEnabled) {
+      if (!traceEvents.empty()) {
+        std::string fn = fmt::sprintf("moodist-trace-cpu-%d.json", rank);
+        FILE* f = fopen(fn.c_str(), "wb");
+        CHECK(f != nullptr);
+        fmt::fprintf(
+            f, R"({"traceEvents": [)"
+               "\n");
+        bool first = true;
+        for (auto& e : traceEvents) {
+          if (!first) {
+            fmt::fprintf(f, ",\n");
+          } else {
+            first = false;
+          }
+          fmt::fprintf(
+              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
+              std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
+              std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId);
+        }
+        fmt::fprintf(f, "]}\n");
+        fclose(f);
+        fmt::printf("Chrome trace dumped to %s\n", fn);
+        traceEvents.clear();
+      }
+      return;
+    }
+    auto now = std::chrono::system_clock::now();
+    if (traceEvents.empty() && currentTraceName.empty()) {
+      beginning = now;
+    }
+    if (!currentTraceName.empty()) {
+      traceEvents.emplace_back();
+      TraceEvent& e = traceEvents.back();
+      e.name = std::move(currentTraceName);
+      e.begin = currentTraceBegin;
+      e.end = now;
+      e.threadId = threadId;
+    }
+    currentTraceBegin = now;
+    currentTraceName = fmt::sprintf(fmt, std::forward<Args>(args)...);
+  }
+  // #define trace(name)
 
   struct WorkBase {
     IntrusiveListLink<WorkBase> freeLink;
@@ -896,10 +969,18 @@ struct CpuThreadImpl {
     const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
     const Vector<std::pair<size_t, size_t>>& ringSends = allGather.ringSends;
 
+    uint32_t* sendStepValue;
+    bool kernelHasEntered = false;
+
     WorkAllGatherRing(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {}
 
     void step() {
       ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      sendStepValue = &self.sendStepValues2[32 * concurrencyIndex + (self.sendStepValues2Counter++) % 32];
+      *sendStepValue = stepValue;
 
       {
         inputMr = self.regMrCuda(params.inputAddress, params.bytes);
@@ -913,9 +994,12 @@ struct CpuThreadImpl {
           self.outDynsMrVector[size * concurrencyIndex + i] = mr;
           outDyns[i].gatherAddress = params.outputAddress + params.pitch * i;
           outDyns[i].gatherBytes = params.bytes;
+          outDyns[i].stepValue = stepValue;
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
           }
+
+          // log.info("outDyns[%d] address is %#x\n", i, outDyns[i].gatherAddress);
         }
 
         // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
@@ -931,51 +1015,88 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, neighbor, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
-                sizeof(DynamicAddresses),
-                self.makeCallback([this, n]() { self.dynReadyVector[size * concurrencyIndex + n] = 1; }));
+                sizeof(DynamicAddresses), self.makeCallback([this, di, n, neighbor = neighbor]() {
+                  if (kernelHasEntered) {
+                    self.dynReadyVector[size * concurrencyIndex + n] = 1;
+                    // log.info("dyn index %d sent to %d\n", n, neighbor);
+                    auto& dev = self.devices[di];
+                    self.writeData(dev, neighbor,
+                            sendStepValue,
+                            self.sendStepValues2StorageMr->mrs[di]->lkey,
+                            (void*)(self.remoteComms[neighbor].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + n].stepValue)),
+                            self.remoteComms[neighbor].keys[di],
+                            sizeof(stepValue));
+                  } else {
+                    self.dynReadyVector[size * concurrencyIndex + n] = 2;
+                  }
+                }));
             ++n;
           }
         }
       }
 
-      //log.info("wait for enter kernel %d\n", stepValue);
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
 
       // wait for kernel
       while (cpuIn[0] < stepValue) {
         YIELD
       }
+      for (index = 0; index != ringSends.size(); ++index) {
+        // self.trace("dyn-ready %d", index);
+        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
+          YIELD
+        }
+        if (self.dynReadyVector[size * concurrencyIndex + index] == 2) {
+          auto [i, neighbor] = ringRecvs[index];
+          size_t di = (rank + index) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeData(dev, neighbor,
+              sendStepValue,
+              self.sendStepValues2StorageMr->mrs[di]->lkey,
+              (void*)(self.remoteComms[neighbor].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + index].stepValue)),
+              self.remoteComms[neighbor].keys[di],
+              sizeof(stepValue));
+        }
+        self.dynReadyVector[size * concurrencyIndex + index] = 0;
+      }
 
-      //log.info("enter kernel %d ok\n", stepValue);
-
-      self.sendStepValues[concurrencyIndex] = stepValue;
+      // log.info("enter kernel %d ok\n", stepValue);
 
       CHECK(ringRecvs.size() == ringSends.size());
 
       liveSends = 0;
       for (index = 0; index != ringSends.size(); ++index) {
-        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
-          YIELD
-        }
-        self.dynReadyVector[size * concurrencyIndex + index] = 0;
-        {
-          auto [i, neighbor] = ringRecvs[index];
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeStep(di, neighbor, stepValue + index, concurrencyIndex);
-        }
+        // self.trace("dyn-ready %d", index);
+        // while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
+        //   YIELD
+        // }
+        // self.dynReadyVector[size * concurrencyIndex + index] = 0;
+        // {
+        //   auto [i, neighbor] = ringRecvs[index];
+        //   size_t di = (rank + index) % self.devices.size();
+        //   auto& dev = self.devices[di];
+        //   self.writeStep(di, neighbor, stepValue + index, concurrencyIndex);
+        // }
         i = std::get<0>(ringSends[index]);
         neighbor = std::get<1>(ringSends[index]);
         CHECK(i < size && neighbor < size);
-        //log.info("wait for dyn index %d from %d\n", index, neighbor);
-        // wait for dyns
-        while (self.localProgress[size * concurrencyIndex + neighbor].stepValue < stepValue + index) {
+        // log.info("wait for dyn index %d from %d\n", index, neighbor);
+        self.trace("dyn-wait %d", index);
+        //  wait for dyns
+        while (self.localProgress2[size * concurrencyIndex + index].stepValue < stepValue) {
           YIELD
         }
+
+        CHECK(self.localDyns[size * concurrencyIndex + index].stepValue == stepValue);
+        CHECK(self.localDyns[size * concurrencyIndex + index].gatherBytes == params.bytes);
 
         if (params.bytes > 0) {
 
           if (i != rank) {
-            //log.info(" wait for source %d\n", i);
+            self.trace("source-wait %d", i);
+            // log.info(" wait for source %d\n", i);
             for (di = 0; di != self.devices.size(); ++di) {
               while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
                 YIELD
@@ -983,43 +1104,59 @@ struct CpuThreadImpl {
             }
           }
 
-          //log.info("send source %d to %d\n", i, neighbor);
+          // log.info(
+          //     "send source %d to %d (address %#x)\n", i, neighbor,
+          //     self.localDyns[size * concurrencyIndex + index].gatherAddress);
+
+          // while (liveSends >= self.devices.size()) {
+          //   YIELD
+          // }
 
           uintptr_t srcAddr = i == rank ? (uintptr_t)params.inputAddress : params.outputAddress + params.pitch * i;
           auto* srcMr = i == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + i];
           CHECK(srcMr != nullptr);
 
-          CHECK(self.localDyns[size * concurrencyIndex + index].gatherBytes == params.bytes);
+          auto sendStart = std::chrono::system_clock::now();
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
               neighbor, srcAddr, params.bytes, srcMr, self.localDyns[size * concurrencyIndex + index].gatherAddress,
               self.localDyns[size * concurrencyIndex + index].gatherKey,
-              [this, i = this->i, neighbor = this->neighbor](size_t di, bool ordered, bool done) {
+              [this, i = this->i, neighbor = this->neighbor, sendStart,
+               index = this->index](size_t di, bool ordered, bool done) {
                 if (done) {
                   --liveSends;
+
+                  if (profilingEnabled) {
+                    TraceEvent e;
+                    e.name = fmt::sprintf("%d -> %d", i, neighbor);
+                    e.begin = sendStart;
+                    e.end = std::chrono::system_clock::now();
+                    e.threadId = index;
+                    self.traceEvents.push_back(std::move(e));
+                  }
                 }
                 if (ordered) {
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, neighbor, &self.sendStepValues[concurrencyIndex],
-                      self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, neighbor, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCpuCommsDeviceDataSent[neighbor].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * i + di)),
                       self.remoteCpuCommsDeviceDataSent[neighbor].keys[di], sizeof(stepValue));
                   self.writeData(
-                      dev, neighbor, &self.sendStepValues[concurrencyIndex],
-                      self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, neighbor, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCudaCommsDeviceDataSent[neighbor].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * i + di)),
                       self.remoteCudaCommsDeviceDataSent[neighbor].keys[di], sizeof(stepValue));
                 }
               });
         }
+        self.trace("liveSends");
         // while (liveSends >= self.devices.size() * 2) {
-        // while (liveSends >= self.devices.size() ) {
-        //   YIELD
-        // }
+        while (liveSends >= self.devices.size()) {
+          YIELD
+        }
       }
 
+      self.trace("final liveSends");
       while (liveSends) {
         YIELD
       }
@@ -1030,10 +1167,11 @@ struct CpuThreadImpl {
       //   }
       // }
 
+      self.trace("wait for recvs");
       for (index = 0; index != ringRecvs.size(); ++index) {
         i = std::get<0>(ringRecvs[index]);
         CHECK(i < size);
-        //log.info("exit wait for source %d from %d\n", i, std::get<1>(ringRecvs[index]));
+        // log.info("exit wait for source %d from %d\n", i, std::get<1>(ringRecvs[index]));
         for (di = 0; di != self.devices.size(); ++di) {
           while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
             YIELD
@@ -1041,14 +1179,18 @@ struct CpuThreadImpl {
         }
       }
 
-      //log.info("wait for exit kernel %d\n", stepValue);
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      self.trace("kernel-exit");
 
       cpuOut[0] = stepValue;
       while (cpuIn[0] < stepValue + 1) {
         YIELD
       }
 
-      //log.info("exit kernel %d ok\n", stepValue);
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
 
       self.cpuThread->freelistAllGather.push(&params);
       self.allocatorAllGatherRing.deallocate(this);

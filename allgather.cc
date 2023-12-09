@@ -363,37 +363,84 @@ std::string AllGather::generate() {
             "*(const void**)$src", "$src",
             concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
   }
-  isInGrid = false;
+  // isInGrid = false;
 
   std::string globaldefs;
 
   std::string recvCopies;
-  int prevRecvSource = -1;
+  HashMap<size_t, bool> hasWaitedForRecv;
+  bool hasEstablishedFirstThread = false;
   CHECK(proxyInfo.size() == proxyDestinationInfo.size());
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     auto& pi = proxyInfo[i];
     auto& pdi = proxyDestinationInfo[i];
 
-    if (prevRecvSource != pi.source) {
+    if (!hasWaitedForRecv[pi.source]) {
       // recvCopies += "allgather_copy_flush(copies);\n";
       if (isInGrid) {
         recvCopies += "if (threadIdx.x == 0) {\n";
       }
       recvCopies += waitForRecv(pi.source);
-      prevRecvSource = pi.source;
+      hasWaitedForRecv[pi.source] = true;
       if (isInGrid) {
         recvCopies += "}\n";
+      }
+
+      if (!isInGrid) {
+        size_t ss = pi.source;
+        for (auto& pi : proxyInfo) {
+          if (pi.source != ss) {
+            continue;
+          }
+          recvCopies += replace(
+              R"(
+          // forward recv $forwardSource to $forwardRank
+          *(volatile uint32_t*)$forwardPtr = stepValue;
+        )",
+              "$forwardPtr",
+              concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
+              "$forwardSource", pi.source, "$forwardRank", ipcRanks[pi.destinationPeerIndex]);
+        }
+      } else {
+        if (!hasEstablishedFirstThread) {
+          hasEstablishedFirstThread = true;
+          globaldefs += replace("__device__ uint32_t firstThreadCounter[$maxConcurrency];\n");
+          recvCopies += replace(
+              R"(
+        bool isFirstThread = false;
+        if (threadIdx.x == 0) {
+          if (atomicInc(&firstThreadCounter[concurrencyIndex], $gridSize - 1) == 0) {
+            isFirstThread = true;
+          }
+        }
+        syncthreads();
+      )");
+        }
+        // recvCopies += "if (isFirstThread) {\n";
+        // size_t ss = pi.source;
+        // for (auto& pi : proxyInfo) {
+        //   if (pi.source != ss) {
+        //     continue;
+        //   }
+        //   recvCopies += replace(
+        //       R"(
+        //   // forward recv $forwardSource to $forwardRank
+        //   //*(volatile uint32_t*)$forwardPtr = stepValue;
+        // )",
+        //       "$forwardPtr",
+        //       concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
+        //       "$forwardSource", pi.source, "$forwardRank", ipcRanks[pi.destinationPeerIndex]);
+        // }
+        // recvCopies += "}\n";
       }
     }
 
     if (isInGrid) {
-      globaldefs += replace("__device__ uint32_t dataReadyCounter_$n[$maxConccurency];\n", "$n", i);
+      globaldefs += replace("__device__ uint32_t dataReadyCounter_$n[$maxConcurrency];\n", "$n", i);
       recvCopies += replace(
           R"(
-        syncthreads();
-        __threadfence_system();
         if (threadIdx.x == 0) {
-          if (atomicInc(&dataReadyCounter_$n[concurrencyIndex], $gridSize - 1) == 0) {
+          if (isFirstThread) {
             *(volatile uint32_t*)$forwardPtr = stepValue;
           }
           while (*(volatile uint32_t*)$readyPtr < stepValue);
@@ -406,11 +453,15 @@ std::string AllGather::generate() {
     } else {
       recvCopies += replace(
           R"(
-        *(volatile uint32_t*)$forwardPtr = stepValue;
+        // forward recv $forwardSource to $forwardRank
+        // *(volatile uint32_t*)$forwardPtr = stepValue;
+        // wait for proxy recv $proxySource at $proxyRank
         while (*(volatile uint32_t*)$readyPtr < stepValue);
       )",
           "$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
-          "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source));
+          "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$forwardSource", pi.source,
+          "$forwardRank", ipcRanks[pi.destinationPeerIndex], "$proxySource", pdi.source, "$proxyRank",
+          ipcRanks[pdi.proxyPeerIndex]);
     }
 
     recvCopies += addCopy(
@@ -508,21 +559,23 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   $localCopies
 
-  __threadfence_system();
-  syncthreads();
-  if (threadIdx.x != 0 || atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) != $gridSize - 1) {
-    return;
-  }
+  // __threadfence_system();
+  // syncthreads();
+  // if (threadIdx.x != 0 || atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) != $gridSize - 1) {
+  //   return;
+  // }
 
-  AllGatherCopyParameters copies;
-  copies.bytes = params.bytes;
-  copies.n = 0;
+  // AllGatherCopyParameters copies;
+  // copies.bytes = params.bytes;
+  // copies.n = 0;
 
   $recvCopies
 
-  allgather_copy_flush(copies);
+  grid_generic_exit(stepValue, concurrencyIndex);
 
-  allgather_exit<<<1, 1>>>(stepValue, concurrencyIndex);
+  // allgather_copy_flush(copies);
+
+  // allgather_exit<<<1, 1>>>(stepValue, concurrencyIndex);
 }
 
   )zz",

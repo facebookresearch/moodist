@@ -39,6 +39,7 @@ struct alignas(64) DynamicAddresses {
   std::array<uint32_t, 32> gatherKey;
   uintptr_t gatherAddress;
   size_t gatherBytes;
+  uint32_t stepValue;
 };
 
 struct AddressPair {
@@ -122,6 +123,8 @@ struct Group {
   CpuAddresses* cpuAddresses = nullptr;
   SyncData* syncData = nullptr;
   uint32_t* cpuProxyReady = nullptr;
+
+  Progress* localProgress2 = nullptr;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
