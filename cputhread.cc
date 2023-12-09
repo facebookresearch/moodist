@@ -1111,6 +1111,13 @@ struct CpuThreadImpl {
           // while (liveSends >= self.devices.size()) {
           //   YIELD
           // }
+        // while (liveSends >= self.devices.size() * 2) {
+          if (liveSends) {
+            self.trace("liveSends");
+            while (liveSends) {
+              YIELD
+            }
+          }
 
           uintptr_t srcAddr = i == rank ? (uintptr_t)params.inputAddress : params.outputAddress + params.pitch * i;
           auto* srcMr = i == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + i];
@@ -1148,11 +1155,6 @@ struct CpuThreadImpl {
                       self.remoteCudaCommsDeviceDataSent[neighbor].keys[di], sizeof(stepValue));
                 }
               });
-        }
-        self.trace("liveSends");
-        // while (liveSends >= self.devices.size() * 2) {
-        while (liveSends >= self.devices.size()) {
-          YIELD
         }
       }
 

@@ -161,7 +161,7 @@ def f(n):
                             dist.all_gather_into_tensor(output, input)
                             torch.cuda.synchronize()
                     else:
-                        #if x == 1:
+                        # if x == 1:
                         #    moodist.enable_profiling(True)
                         for _ in range(iterations):
                             if len(events) >= 2:
@@ -172,7 +172,7 @@ def f(n):
                             e = freeevents.pop(0)
                             e.record()
                             events.append(e)
-                        #if x == 1:
+                        # if x == 1:
                         #    moodist.enable_profiling(False)
                 elif op == "reduce_scatter":
                     for _ in range(iterations):
@@ -221,7 +221,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(800, world_size)
+    i = min(8, world_size)
     while True:
         t(i)
 

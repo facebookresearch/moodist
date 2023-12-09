@@ -242,8 +242,10 @@ int main() {
     }
     int am;
     int bm;
-    am = abs(a[1] - a[0], size);
-    bm = abs(b[1] - b[0], size);
+    // am = abs(a[1] - a[0], size);
+    // bm = abs(b[1] - b[0], size);
+    am = (size + a[1] - a[0]) % size;
+    bm = (size + b[1] - b[0]) % size;
     if (am != bm) {
       return am < bm;
     }
@@ -254,9 +256,9 @@ int main() {
         return am > bm;
       }
     }
-    if ((a[1] - a[0] + size) % size != (b[1] - b[0] + size) % size) {
-      return (a[1] - a[0] + size) % size > (b[1] - b[0] + size) % size;
-    }
+    // if ((a[1] - a[0] + size) % size != (b[1] - b[0] + size) % size) {
+    //   return (a[1] - a[0] + size) % size > (b[1] - b[0] + size) % size;
+    // }
     return a < b;
   };
   std::sort(paths.begin(), paths.end(), sortFn);
@@ -339,7 +341,8 @@ int main() {
     if (path[0] == rank) {
       size_t sourceNode = rankNodes[path[0]];
       size_t destinationNode = rankNodes[path[1]];
-      if (abs(destinationNode - sourceNode, nodeRanks.size()) == 1) {
+      //if (abs(destinationNode - sourceNode, nodeRanks.size()) == 1) {
+      if (destinationNode == (sourceNode + nodeRanks.size() - 1) % nodeRanks.size()) {
         sends.push_back({rank, path[1]});
         neighbors.push_back(path[1]);
         fmt::printf("%d is a neighbor\n", path[1]);

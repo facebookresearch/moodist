@@ -104,7 +104,8 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416).cuda() + 1
-        data = torch.randn(18874368).cuda() + 1
+        #data = torch.randn(18874368).cuda() + 1
+        data = torch.randn(1179648).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -381,6 +382,7 @@ def f(n):
                 torch.cuda.Event(),
             ]
             events = []
+            moodist.enable_profiling(True)
             for _ in range(loopcount):
                 if len(events) >= 2:
                     e = events.pop(0)
@@ -390,6 +392,9 @@ def f(n):
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)
+            moodist.enable_profiling(False)
+
+            dist.all_gather_into_tensor(result0, tmp)
             # for i in range(loopcount):
             #     if len(events) >= 2:
             #         events.pop(0).synchronize()
