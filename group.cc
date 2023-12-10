@@ -76,7 +76,7 @@ void Group::init() {
   pid = ::getpid();
 
   cuContext = nullptr;
-  //cuCtxGetCurrent(&cuContext);
+  // cuCtxGetCurrent(&cuContext);
   if (!cuContext) {
     CHECK_CU(cuInit(0));
 
@@ -609,6 +609,9 @@ void Group::init() {
 
   cudaCommsDeviceDataSent = allocateArrayDevice(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
   cpuCommsDeviceDataSent = allocateArrayHost(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
+
+  cudaCommsDeviceDataSent2 = allocateArrayDevice(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
+  cpuCommsDeviceDataSent2 = allocateArrayHost(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
 
   cudaProxyReady = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
   mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);

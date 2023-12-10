@@ -148,7 +148,7 @@ std::string Kernels::emitCopySeq(
   // 16 uint4 uses 64 registers. we could go higher to hide more latency,
   // but it seems to not improve performance
   // copy1 = genCopy("uint4", 16, 32);
-  copy1 += genCopy("uint4", 16, 16);
+  //copy1 += genCopy("uint4", 16, 16);
   copy1 += genCopy("uint4", 16, 8);
   copy1 += genCopy("uint4", 16, 4);
   copy1 += genCopy("uint4", 16, 2);

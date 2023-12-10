@@ -99,6 +99,9 @@ struct Group {
   AllocatedArray cudaCommsDeviceDataSent;
   AllocatedArray cpuCommsDeviceDataSent;
 
+  AllocatedArray cudaCommsDeviceDataSent2;
+  AllocatedArray cpuCommsDeviceDataSent2;
+
   AllocatedArray cudaProxyReady;
   std::array<PeerArrayRef, 8> peerCudaProxyReady;
 
