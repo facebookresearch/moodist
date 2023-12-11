@@ -41,7 +41,12 @@ struct IpcMapper {
   std::atomic_bool hasQueuedUnmaps = false;
 
   struct MapCallbacks {
-    std::vector<std::pair<Function<void(uintptr_t)>, size_t>> list;
+    struct ListEntry {
+      Function<void(uintptr_t)> callback;
+      size_t offset;
+      uintptr_t address;
+    };
+    std::vector<ListEntry> list;
     uintptr_t base;
     size_t size;
     unsigned long bufferId;
@@ -194,7 +199,11 @@ struct IpcMapper {
         CHECK(q.bufferId == bufferId);
         CHECK(q.base == base);
         CHECK(q.size == size);
-        q.list.emplace_back(std::move(callback), offset);
+        q.list.emplace_back();
+        auto& e = q.list.back();
+        e.callback = std::move(callback);
+        e.offset = offset;
+        e.address = address;
         log.debug("requestAddress: already being mapped, adding callback\n");
         return;
       }
@@ -213,12 +222,16 @@ struct IpcMapper {
       q.bufferId = bufferId;
       q.base = base;
       q.size = size;
-      q.list.emplace_back(std::move(callback), offset);
+      q.list.emplace_back();
+      auto& e = q.list.back();
+      e.callback = std::move(callback);
+      e.offset = offset;
+      e.address = address;
       l.unlock();
       ++waitCount;
       sendRequestAddress(
           peerIndex, handle, size,
-          [this, peerIndex, address, handle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
+          [this, peerIndex, handle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
             auto& v = peerIpcMap[peerIndex][handle];
             v.localAddress = base;
             v.peerAddress = mappedAddress;
@@ -230,12 +243,12 @@ struct IpcMapper {
             auto& q = it->second;
             CHECK(q.bufferId == bufferId);
             CHECK(!q.list.empty());
-            for (auto& [callback, offset] : q.list) {
+            for (auto& e : q.list) {
               log.debug(
-                  "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, address,
-                  mappedAddress + offset, offset);
-              peerIpcAddressMap[peerIndex][address] = {mappedAddress + offset, bufferId};
-              callback(mappedAddress + offset);
+                  "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, e.address,
+                  mappedAddress + e.offset, e.offset);
+              peerIpcAddressMap[peerIndex][e.address] = {mappedAddress + e.offset, bufferId};
+              std::move(e.callback)(mappedAddress + e.offset);
             }
             peerMapCallbacks[peerIndex].erase(it);
             --waitCount;
