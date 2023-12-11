@@ -104,9 +104,9 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416).cuda() + 1
-        data = torch.randn(18874368).cuda() + 1
+        #data = torch.randn(18874368).cuda() + 1
         #data = torch.randn(589824).cuda() + 1
-        #data = torch.randn(1179648).cuda() + 1
+        data = torch.randn(1179648).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -179,7 +179,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if False:
+            if True:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(

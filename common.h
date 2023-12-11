@@ -97,18 +97,18 @@ struct AllocatedBuffer {
   void dtor() {
     if (numaAllocated) {
       if (cpuPointer) {
-        log.verbose("free cpu memory %p\n", cpuPointer);
+        log.verbose("free %d bytes of cpu memory %p\n", bytes, cpuPointer);
         cuMemHostUnregister(cpuPointer);
         numa_free(cpuPointer, bytes);
       }
     } else if (hostAllocated) {
       if (cpuPointer) {
-        log.verbose("free host memory %p\n", cpuPointer);
+        log.verbose("free %d bytes of host memory %p\n", bytes, cpuPointer);
         cuMemFreeHost(cpuPointer);
       }
     } else {
       if (cudaPointer) {
-        log.verbose("free cuda memory %#x\n", cudaPointer);
+        log.verbose("free %d bytes of cuda memory at %#x\n", bytes, cudaPointer);
         cuMemFree(cudaPointer);
       }
     }

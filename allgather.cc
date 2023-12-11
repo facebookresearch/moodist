@@ -383,147 +383,75 @@ std::string AllGather::generate() {
 
   std::string recvCopies;
   HashMap<size_t, bool> hasWaitedForRecv;
-  bool hasEstablishedFirstThread = false;
   CHECK(proxyInfo.size() == proxyDestinationInfo.size());
+
+  Vector<Vector<std::pair<ProxyDestinationInfo*, ProxyInfo*>>> groupedProxyMap;
+
+  size_t prevRecvSource = -1;
   for (size_t i = 0; i != proxyDestinationInfo.size(); ++i) {
     auto& pi = proxyInfo[i];
     auto& pdi = proxyDestinationInfo[i];
+    if (pi.source != prevRecvSource) {
+      prevRecvSource = pi.source;
+      groupedProxyMap.emplace_back();
+    }
+    groupedProxyMap.back().emplace_back(&pdi, &pi);
+  }
 
+  for (auto& gg : groupedProxyMap) {
     for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
-      // recvCopies += replace("{\n// chunk $chunkIndex\n", "$chunkIndex", chunkIndex);
-
-      recvCopies += replace(
-          replace(
-              R"(
+      recvCopies += R"(
           {
             // chunk $chunkIndex
             const size_t currentChunkSize = $currentChunkSize;
             const size_t chunkOffset = chunkSize * $chunkIndex;
-      )",
-              "$currentChunkSize", "min(chunkSize, params.bytes - chunkSize * $chunkIndex)"),
-          "$chunkIndex", chunkIndex);
+        )";
+      for (auto& vv : gg) {
+        auto& pi = *vv.second;
+        auto& pdi = *vv.first;
+        // recvCopies += replace("{\n// chunk $chunkIndex\n", "$chunkIndex", chunkIndex);
 
-      if (!hasWaitedForRecv[pi.source * numChunks + chunkIndex]) {
-        // recvCopies += "allgather_copy_flush(copies);\n";
-        hasWaitedForRecv[pi.source * numChunks + chunkIndex] = true;
         if (isInGrid) {
           recvCopies += "if (threadIdx.x == 0) {\n";
         }
-        recvCopies += replace(
-            R"(
-          if (chunkOffset + currentChunkSize == params.bytes) {
-            $waitlast
-          } else {
-            $waitnotlast
-          }
-          )",
-            "$waitlast", waitForRecv(pi.source, chunkIndex, true), "$waitnotlast",
-            waitForRecv(pi.source, chunkIndex, false));
-        if (isInGrid) {
-          recvCopies += "}\n";
-        }
 
-        if (!isInGrid) {
-          CHECK(false);
-          //   size_t ss = pi.source;
-          //   for (auto& pi : proxyInfo) {
-          //     if (pi.source != ss) {
-          //       continue;
-          //     }
-          //     recvCopies += replace(
-          //         R"(
-          //   // forward recv $forwardSource to $forwardRank
-          //   *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
-          // )",
-          //         "$forwardPtr",
-          //         concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
-          //         "$forwardSource", pi.source, "$forwardRank", ipcRanks[pi.destinationPeerIndex], "$chunkIndex",
-          //         chunkIndex);
-          //   }
-        } else {
-          if (!hasEstablishedFirstThread) {
-            hasEstablishedFirstThread = true;
-            globaldefs += replace("__device__ uint32_t firstThreadCounter[$maxConcurrency];\n");
-            recvCopies += replace(
-                R"(
-        if (threadIdx.x == 0) {
-          if (atomicInc(&firstThreadCounter[concurrencyIndex], $gridSize - 1) == 0) {
-            isFirstThread = true;
-          }
-        }
-        syncthreads();
-      )");
-          }
-          // recvCopies += "if (isFirstThread) {\n";
-          // size_t ss = pi.source;
-          // for (auto& pi : proxyInfo) {
-          //   if (pi.source != ss) {
-          //     continue;
-          //   }
-          //   recvCopies += replace(
-          //       R"(
-          //   // forward recv $forwardSource to $forwardRank
-          //   //*(volatile uint32_t*)$forwardPtr = stepValue;
-          // )",
-          //       "$forwardPtr",
-          //       concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
-          //       "$forwardSource", pi.source, "$forwardRank", ipcRanks[pi.destinationPeerIndex]);
-          // }
-          // recvCopies += "}\n";
-        }
-      }
-
-      if (isInGrid) {
-        // globaldefs += replace("__device__ uint32_t dataReadyCounter_$n[$maxConcurrency];\n", "$n", i);
-        recvCopies += replace(
-            R"(
-          __syncwarp();
-          if (threadIdx.x == 0) {
-            if (isFirstThread) {
-              *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
+        if (!hasWaitedForRecv[pi.source * numChunks + chunkIndex]) {
+          // recvCopies += "allgather_copy_flush(copies);\n";
+          hasWaitedForRecv[pi.source * numChunks + chunkIndex] = true;
+          recvCopies += replace(
+              R"(
+            if (chunkOffset + currentChunkSize == params.bytes) {
+              $waitlast
+            } else {
+              $waitnotlast
             }
-            while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
+            )",
+              "$waitlast", waitForRecv(pi.source, chunkIndex, true), "$waitnotlast",
+              waitForRecv(pi.source, chunkIndex, false));
+        }
+
+        recvCopies += replace(
+            R"(
+          if (isFirstThread) {
+            *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
           }
-          syncthreads();
+          while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
         )",
-            "$n", i, "$forwardPtr",
-            concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source), "$readyPtr",
-            concurrencyIndex(cudaProxyReady, +sizeof(uint32_t) * pdi.source), "$chunkIndex", chunkIndex);
-      } else {
-        CHECK(false);
-        // recvCopies += replace(
-        //     R"(
-        //   // forward recv $forwardSource to $forwardRank
-        //   // *(volatile uint32_t*)$forwardPtr = stepValue;
-        //   // wait for proxy recv $proxySource at $proxyRank
-        //   while (*(volatile uint32_t*)$readyPtr < stepValue);
-        // )",
-        //     "$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) *
-        //     pi.source),
-        //     "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$forwardSource",
-        //     pi.source,
-        //     "$forwardRank", ipcRanks[pi.destinationPeerIndex], "$proxySource", pdi.source, "$proxyRank",
-        //     ipcRanks[pdi.proxyPeerIndex]);
+            "$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
+            "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$chunkIndex", chunkIndex);
+
+        if (isInGrid) {
+          recvCopies += "}\nsyncthreads();\n";
+        }
+
+        recvCopies += addCopy(
+            replace("(void*)(params.outputAddress + params.pitch * $source + chunkOffset)", "$source", pdi.source),
+            replace(
+                "(void*)(*(uintptr_t*)$src + params.pitch * $source + chunkOffset)", "$source", pdi.source, "$src",
+                concurrencyIndex(
+                    group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)))),
+            "currentChunkSize");
       }
-
-      // recvCopies += replace(
-      //     replace(
-      //         R"(
-      //     const size_t currentChunkSize = $currentChunkSize;
-      //     const size_t chunkOffset = chunkSize * $chunkIndex;
-      // )",
-      //         "$currentChunkSize",
-      //         chunkIndex == numChunks - 1 ? "params.bytes - chunkSize * $chunkIndex" : "chunkSize"),
-      //     "$chunkIndex", chunkIndex);
-
-      recvCopies += addCopy(
-          replace("(void*)(params.outputAddress + params.pitch * $source + chunkOffset)", "$source", pdi.source),
-          replace(
-              "(void*)(*(uintptr_t*)$src + params.pitch * $source + chunkOffset)", "$source", pdi.source, "$src",
-              concurrencyIndex(
-                  group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)))),
-          "currentChunkSize");
-
       if (chunkIndex != numChunks - 1) {
         recvCopies += "if (chunkSize * $chunkIndex + $currentChunkSize != params.bytes) {\n";
       } else {
@@ -621,6 +549,8 @@ extern "C" __global__ void allgather_exit(uint32_t stepValue, uint32_t concurren
   generic_exit(stepValue, concurrencyIndex);
 }
 
+__device__ uint32_t firstThreadCounter[$maxConcurrency];
+
 extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
@@ -638,8 +568,15 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   // copies.bytes = params.bytes;
   // copies.n = 0;
 
-  const size_t chunkSize = params.bytes < (size_t)65536 * 48 ? params.bytes : max(params.bytes / $numChunks, (size_t)65536 * 36);
+  const size_t chunkSize = params.bytes < (size_t)65536 * 96 ? params.bytes : max((params.bytes + $numChunks - 1) / $numChunks, (size_t)65536 * 72);
   bool isFirstThread = false;
+
+  if (threadIdx.x == 0) {
+    if (atomicInc(&firstThreadCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      isFirstThread = true;
+    }
+  }
+  syncthreads();
 
   $recvCopies
 

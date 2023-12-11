@@ -1014,8 +1014,9 @@ struct CpuThreadImpl {
     bool kernelHasEntered = false;
 
     static const size_t numChunks = 8;
-    const size_t chunkSize =
-        params.bytes < (size_t)65536 * 48 ? params.bytes : std::max(params.bytes / numChunks, (size_t)65536 * 36);
+    const size_t chunkSize = params.bytes < (size_t)65536 * 96
+                                 ? params.bytes
+                                 : std::max((params.bytes + numChunks - 1) / numChunks, (size_t)65536 * 72);
     const size_t numParallel = std::max(std::min((params.bytes + chunkSize - 1) / chunkSize / 2, (size_t)2), (size_t)1);
 
     struct SendState {
