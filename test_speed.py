@@ -221,7 +221,7 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(8, world_size)
+    i = min(800, world_size)
     while True:
         t(i)
 

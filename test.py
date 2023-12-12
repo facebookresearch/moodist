@@ -94,7 +94,7 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = True
+    test_gather = False
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
@@ -106,7 +106,7 @@ def f(n):
         #data = torch.randn(442416).cuda() + 1
         #data = torch.randn(18874368).cuda() + 1
         #data = torch.randn(589824).cuda() + 1
-        data = torch.randn(1179648).cuda() + 1
+        data = torch.randn(4194304).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -168,8 +168,8 @@ def f(n):
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             ostream = torch.cuda.current_stream()
-            # dist.all_gather(result, tmp)
-            dist._all_gather_base(result0, tmp)
+            dist.all_gather(result, tmp)
+            #dist._all_gather_base(result0, tmp)
             # with torch.cuda.stream(stream1):
             #     stream1.wait_stream(ostream)
             #     dist._all_gather_base(result0, tmp)
@@ -177,7 +177,7 @@ def f(n):
             #     dist._all_gather_base(result02, tmp2)
             torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
-            result = result0.chunk(size)
+            #result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
             if True:
                 for i, v in zip(range(size), correct_result):
@@ -390,7 +390,8 @@ def f(n):
                     e = events.pop(0)
                     e.synchronize()
                     freeevents.append(e)
-                dist.all_gather_into_tensor(result0, tmp)
+                #dist.all_gather_into_tensor(result0, tmp)
+                dist.all_gather(result, tmp)
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)
@@ -511,10 +512,11 @@ def f(n):
         # items = 1
         items = 128
         sum = 0
-        sumdata = torch.zeros(items).cuda().long()
+        dtype = torch.bfloat16
+        sumdata = torch.zeros(items).cuda().to(dtype)
         for i in range(size):
             torch.manual_seed(42 + i)
-            data = torch.randn(items).cuda().long()
+            data = torch.randn(items).cuda().to(dtype)
             sumdata += data
             sum += data.sum().item()
         if rank == 0:
@@ -522,7 +524,7 @@ def f(n):
             # for i, v in zip(range(4), sumdata.split(items // size)):
             #     print("%d: chunk %d should be " % (rank, i), v)
         torch.manual_seed(42 + rank)
-        data = torch.randn(items).cuda().long()
+        data = torch.randn(items).cuda().to(dtype)
         data2 = data.clone()
         tmp = data.clone()
         tmp2 = tmp.clone()

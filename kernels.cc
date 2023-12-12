@@ -412,7 +412,7 @@ void Kernels::compile(int flags, std::string compileType, std::string compileRed
   std::string source;
   std::vector<std::pair<CUfunction*, std::string>> functions;
 
-  source = R"(
+  source = R"z(
 using uintptr_t =  unsigned long;
 using uint32_t = unsigned int;
 using uint64_t = unsigned long;
@@ -445,7 +445,7 @@ __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, 
 template<typename T, typename R>
 __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2);
 
-)";
+)z";
 
   gridSize = 36;
   blockSize = 256;
@@ -623,6 +623,19 @@ __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex)
   }
 }
 
+__device__ void grid_generic_exit_no_recv(uint32_t stepValue, uint32_t concurrencyIndex) {
+  __threadfence_system();
+  syncthreads();
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneAllCode
+    volatile uint32_t* __restrict__ cpuIn = $cpuIn;
+    volatile uint32_t* __restrict__ cpuOut = $cpuOut;
+    cpuIn[0] = stepValue + 1;
+    while (cpuOut[0] < stepValue);
+    $waitForCopyDones
+  }
+}
+
 }
 
 extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyIndex) {
@@ -727,7 +740,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   options.push_back("--use_fast_math");
   options.push_back("--std=c++17");
   options.push_back("-lineinfo");
-  options.push_back("--relocatable-device-code=true");
+  //options.push_back("--relocatable-device-code=true");
   // options.push_back("--maxrregcount=32");
   //    options.push_back("-G");
   //     options.push_back("--dopt=on");
@@ -863,19 +876,23 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
 
   log.verbose("devrtPath is %s\n", devrtPath);
 
-  CUlinkState linkState;
-  CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
-  CHECK_CU(cuLinkAddFile(linkState, CU_JIT_INPUT_LIBRARY, devrtPath.c_str(), 0, nullptr, nullptr));
+  // CUlinkState linkState;
+  // CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
+  // CHECK_CU(cuLinkAddFile(linkState, CU_JIT_INPUT_LIBRARY, devrtPath.c_str(), 0, nullptr, nullptr));
+  // // CHECK_CU(cuLinkAddData(
+  // //     linkState, CU_JIT_INPUT_PTX, ptx.data(), ptx.size(), cuFilename.c_str(), 0, nullptr, nullptr));
   // CHECK_CU(cuLinkAddData(
-  //     linkState, CU_JIT_INPUT_PTX, ptx.data(), ptx.size(), cuFilename.c_str(), 0, nullptr, nullptr));
-  CHECK_CU(cuLinkAddData(
-      linkState, CU_JIT_INPUT_CUBIN, cubin.data(), cubin.size(), cuFilename.c_str(), 0, nullptr, nullptr));
-  void* linkedCubin = nullptr;
-  size_t linkedCubinSize = 0;
-  CHECK_CU(cuLinkComplete(linkState, &linkedCubin, &linkedCubinSize));
+  //     linkState, CU_JIT_INPUT_CUBIN, cubin.data(), cubin.size(), cuFilename.c_str(), 0, nullptr, nullptr));
+  // void* linkedCubin = nullptr;
+  // size_t linkedCubinSize = 0;
+  // CHECK_CU(cuLinkComplete(linkState, &linkedCubin, &linkedCubinSize));
+
+  // CUmodule cuModule = nullptr;
+  // CHECK_CU(cuModuleLoadDataEx(&cuModule, linkedCubin, 0, nullptr, nullptr));
+  // cuModules.push_back(cuModule);
 
   CUmodule cuModule = nullptr;
-  CHECK_CU(cuModuleLoadDataEx(&cuModule, linkedCubin, 0, nullptr, nullptr));
+  CHECK_CU(cuModuleLoadDataEx(&cuModule, cubin.data(), 0, nullptr, nullptr));
   cuModules.push_back(cuModule);
 
   for (auto& v : functions) {
@@ -893,7 +910,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     log.verbose("kernel %s local bytes: %d\n", v.second, localBytes);
   }
 
-  CHECK_CU(cuLinkDestroy(linkState));
+  //CHECK_CU(cuLinkDestroy(linkState));
 
   log.info("compile took %gs", seconds(Clock::now() - start));
 }

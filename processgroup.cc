@@ -969,6 +969,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(
   TORCH_CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
   const auto& input = inputTensors[0];
   int64_t numel = input.numel();
+  size_t bytes = numel * input.itemsize();
   const auto& outputList = outputTensors[0];
   for (auto& v : outputList) {
     TORCH_CHECK(v.numel() == numel);
@@ -976,9 +977,18 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(
   auto output =
       torch::empty({(int64_t)impl->size, numel}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
   impl->all_gather(output, input);
-  for (size_t i = impl->size; i;) {
-    --i;
-    outputList[i].copy_(output[i]);
+  if (input.is_cuda()) {
+    size_t n = impl->size;
+    for (size_t i = 0; i != n; ++i) {
+      CHECK_CU(cuMemcpyAsync(
+          (uintptr_t)outputList[i].data_ptr(), (uintptr_t)output[i].data_ptr(), bytes,
+          c10::cuda::getCurrentCUDAStream()));
+    }
+  } else {
+    size_t n = impl->size;
+    for (size_t i = 0; i != n; ++i) {
+      std::memcpy(outputList[i].data_ptr(), output[i].data_ptr(), bytes);
+    }
   }
   return c10::make_intrusive<WorkImpl>(outputList);
 }

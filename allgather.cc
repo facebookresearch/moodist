@@ -255,7 +255,7 @@ void AllGather::init() {
       }
       s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
     }
-    log.info("rank %d: ring sends are [%s]\n", rank, s);
+    log.info("rank %d: all gather ring sends are [%s]\n", rank, s);
     s.clear();
     for (auto& v : ringRecvs) {
       if (!s.empty()) {
@@ -263,7 +263,7 @@ void AllGather::init() {
       }
       s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
     }
-    log.info("rank %d: ring recvs are [%s]\n", rank, s);
+    log.info("rank %d: all gather ring recvs are [%s]\n", rank, s);
     // for (auto& x : ringRecvs) {
     //   CHECK(std::get<2>(x) == (size_t)-1);
     // }

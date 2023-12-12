@@ -27,6 +27,9 @@ struct ReduceScatter : CollectiveBase {
   Vector<size_t> sendRanks;
   Vector<size_t> recvRanks;
 
+  Vector<std::pair<size_t, size_t>> ringSends;
+  Vector<std::pair<size_t, size_t>> ringRecvs;
+
   ReduceScatter(Group* group);
   ~ReduceScatter();
   void init();

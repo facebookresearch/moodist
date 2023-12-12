@@ -75,7 +75,7 @@ def f(n):
     #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     #data = torch.randn((442416 - 4) * size).cuda() + 1
     #data = torch.randn(527040 * size).cuda() + 1
-    data = torch.randn(524288 * size).cuda() + 1
+    data = torch.randn(589824 * size).cuda() + 1
     #data = torch.randn(524288 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
@@ -262,6 +262,30 @@ def f(n):
         for i in range(loopcount):
             dist.reduce_scatter_tensor(result0, tmp)
             torch.cuda.synchronize()
+    elif 1 == 1:
+        loopcount = 1000
+        freeevents = [
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        ]
+        events = []
+        if n == "moodist":
+            moodist.enable_profiling(True)
+        for _ in range(loopcount):
+            if len(events) >= 2:
+                e = events.pop(0)
+                e.synchronize()
+                freeevents.append(e)
+            dist.reduce_scatter_tensor(result0, tmp)
+            e = freeevents.pop(0)
+            e.record()
+            events.append(e)
+        if n == "moodist":
+            moodist.enable_profiling(False)
+
+        dist.reduce_scatter_tensor(result0, tmp)
     elif True:
         loopcount = 1000
         events = []
@@ -318,9 +342,9 @@ for i in range(ngpus):
     fds.append(os.open("out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i), os.O_WRONLY|os.O_CREAT|os.O_TRUNC))
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
-for n in ("nccl", "moodist"):
-#for n in ("moodist",):
+for n in ("moodist", "nccl"):
+#for n in ("nccl", "moodist"):
+#for n in ("moodist", ):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
