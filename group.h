@@ -17,7 +17,7 @@ struct ReduceScatter;
 
 struct DynamicAddresses;
 
-enum class Dtype { float32, float64, int32, int64, count };
+enum class Dtype { float32, float64, int32, int64, bfloat16, count };
 enum class Reduction { sum, min, max, avg, count };
 
 static constexpr size_t maxConcurrency = 16;
@@ -167,6 +167,8 @@ struct Group {
   AllocatedArray allocateArrayHost(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayHostMapped(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayDevice(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayManaged(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayWriteCombined(size_t itembytes, size_t numel);
 
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {

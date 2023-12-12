@@ -35,8 +35,8 @@ struct CollectiveBase {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
-  std::vector<std::string> supportedTypes = {"float", "double", "int32_t", "int64_t"};
-  std::vector<size_t> supportedTypeSizes = {4, 8, 4, 8};
+  std::vector<std::string> supportedTypes = {"float", "double", "int32_t", "int64_t", "bf16"};
+  std::vector<size_t> supportedTypeSizes = {4, 8, 4, 8, 2};
   std::vector<std::string> supportedReductions = {"rsum", "rmin", "rmax", "ravg"};
 
   static std::string replace(std::string str, std::vector<std::pair<std::string, std::string>> vars) {

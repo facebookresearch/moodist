@@ -162,6 +162,22 @@ struct CpuTypes<Dtype::int64> {
   using T = int64_t;
 };
 
+struct Bfloat16 {
+  uint16_t value;
+  Bfloat16 operator+(Bfloat16 n) const {
+    fatal("cpu bfloat16 is not currently supported");
+  }
+  bool operator<(Bfloat16 n) const {
+    fatal("cpu bfloat16 is not currently supported");
+  }
+};
+
+template<>
+struct CpuTypes<Dtype::bfloat16> {
+  static constexpr size_t bytes = 2;
+  using T = Bfloat16;
+};
+
 template<Dtype dtype>
 typename CpuTypes<dtype>::T cpuLoad(uintptr_t address) {
   return *(typename CpuTypes<dtype>::T*)address;
@@ -182,7 +198,7 @@ struct CpuReductions {
     return std::min(a, b);
   }
   static T max(T a, T b) {
-    return a + b;
+    return std::max(a, b);
   }
   static void reduce(uintptr_t dst, uintptr_t src) {
     if (reduction == Reduction::sum) {

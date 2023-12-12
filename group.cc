@@ -764,6 +764,20 @@ AllocatedArray Group::allocateArrayDevice(size_t itembytes, size_t numel) {
   r.numel = numel;
   return r;
 }
+AllocatedArray Group::allocateArrayWriteCombined(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateWriteCombined(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
+AllocatedArray Group::allocateArrayManaged(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateManaged(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
 
 StreamData::StreamData() = default;
 StreamData::~StreamData() = default;

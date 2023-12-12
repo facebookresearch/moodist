@@ -23,6 +23,7 @@ struct Kernels : CollectiveBase {
 
   CUfunction cuAllGatherLocal = nullptr;
   CUfunction cuAllGather = nullptr;
+  CUfunction cuAllGatherNoLocal = nullptr;
   CUfunction cuAllGatherCopyKernel = nullptr;
 
   std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatterLocal{};

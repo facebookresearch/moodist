@@ -535,6 +535,12 @@ __device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, c
 
 $globaldefs
 
+extern "C" __global__ void allgather_no_local(AllGatherParameters params) {
+  generic_entry(params);
+  generic_exit(params.stepValue, params.concurrencyIndex);
+}
+
+
 extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;

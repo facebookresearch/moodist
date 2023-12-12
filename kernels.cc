@@ -148,7 +148,7 @@ std::string Kernels::emitCopySeq(
   // 16 uint4 uses 64 registers. we could go higher to hide more latency,
   // but it seems to not improve performance
   // copy1 = genCopy("uint4", 16, 32);
-  //copy1 += genCopy("uint4", 16, 16);
+  // copy1 += genCopy("uint4", 16, 16);
   copy1 += genCopy("uint4", 16, 8);
   copy1 += genCopy("uint4", 16, 4);
   copy1 += genCopy("uint4", 16, 2);
@@ -237,17 +237,38 @@ std::string Kernels::emitReduceFunctionSeq(
               v = replace("__uint_as_float($v)", "$v", v);
             }
             return replace("$result = __float_as_uint($op);", "$result", result, "$op", reduceopcode(inputs));
-          } else if (sourcetype == "int32_t") {
+          }
+          if (sourcetype == "int32_t") {
             return replace("$result = $op;", "$result", result, "$op", reduceopcode(inputs));
+          }
+          if (sourcetype == "bf16") {
+            std::vector<std::string> inputslo;
+            std::vector<std::string> inputshi;
+            for (auto& v : inputs) {
+              inputslo.push_back(replace("convert<bf16>((uint16_t)(($v) & 0xffff))", "$v", v));
+              inputshi.push_back(replace("convert<bf16>((uint16_t)(($v) >> 16))", "$v", v));
+            }
+            return replace(
+                R"(
+              $result = (uint32_t)convert<uint16_t>($lo) | ((uint32_t)convert<uint16_t>($hi) << 16);)",
+                "$result", result, "$lo", reduceopcode(inputslo), "$hi", reduceopcode(inputshi));
           }
         } else if (datatype == "uint64_t") {
           if (sourcetype == "int64_t") {
             return replace("$result = $op;", "$result", result, "$op", reduceopcode(inputs));
-          } else if (sourcetype == "double") {
+          }
+          if (sourcetype == "double") {
             for (auto& v : inputs) {
               v = replace("__longlong_as_double($v)", "$v", v);
             }
             return replace("$result = __double_as_longlong($op);", "$result", result, "$op", reduceopcode(inputs));
+          }
+        } else if (datatype == "uint16_t") {
+          if (sourcetype == "bf16") {
+            for (auto& v : inputs) {
+              v = replace("convert<bf16>($v)", "$v", v);
+            }
+            return replace("$result = convert<uint16_t>($op);", "$result", result, "$op", reduceopcode(inputs));
           }
         }
         fatal("unhandled reduce type %s for datatype %s", sourcetype, datatype);
@@ -344,7 +365,11 @@ std::string Kernels::emitReduceFunctionSeq(
     reduce1 += generate("uint4", 16, 2);
     reduce1 += generate("uint4", 16, 1);
   }
-  reduce1 += generate(sourcetype, sourcetypesize, 1);
+  std::string singletype = sourcetype;
+  if (sourcetype == "bf16") {
+    singletype = "uint16_t";
+  }
+  reduce1 += generate(singletype, sourcetypesize, 1);
   std::string s = replace(
       R"(
 template<>
@@ -414,18 +439,40 @@ void Kernels::compile(int flags, std::string compileType, std::string compileRed
 
   source = R"z(
 using uintptr_t =  unsigned long;
-using uint32_t = unsigned int;
 using uint64_t = unsigned long;
+using uint32_t = unsigned int;
+using uint16_t = unsigned short;
 using uint8_t = unsigned char;
 using int32_t = int;
 using int64_t = long;
+using int16_t = short;
 using int8_t = char;
 
 struct bf16 {
   unsigned short x;
+  __device__ bf16 operator+(bf16 n) const {
+    bf16 r;
+    //asm("add.bf16 %0, %1, %2;" : "=h"(r.x) : "h"(x), "h"(n.x));
+    uint16_t one = 0x3f80;
+    asm("fma.rn.bf16 %0, %1, %2, %3;" : "=h"(r.x) : "h"(x), "h"(one), "h"(n.x));
+    return r;
+  }
 };
 static_assert(alignof(bf16) == 2);
 static_assert(sizeof(bf16) == 2);
+
+template<typename Out, typename In>
+__device__ Out convert(In value);
+
+template<>
+__device__ bf16 convert<bf16, uint16_t>(uint16_t value) {
+  return bf16{value};
+}
+
+template<>
+__device__ uint16_t convert<uint16_t, bf16>(bf16 value) {
+  return value.x;
+}
 
 struct rsum {};
 struct rmin {};
@@ -654,6 +701,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     source += group->allGather->generate();
     fn(cuAllGatherLocal, "allgather_local");
     fn(cuAllGather, "allgather");
+    fn(cuAllGatherNoLocal, "allgather_no_local");
     fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
   }
   if (flags & CompileReduceScatter) {
@@ -661,6 +709,8 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
 
     auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
     auto i2 = std::find(supportedReductions.begin(), supportedReductions.end(), compileReduction);
+    CHECK(i != supportedTypes.end());
+    CHECK(i2 != supportedReductions.end());
     size_t t = i - supportedTypes.begin();
     size_t r = i2 - supportedReductions.begin();
     fn(cuReduceScatterLocal[t][r],
@@ -740,10 +790,10 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   options.push_back("--use_fast_math");
   options.push_back("--std=c++17");
   options.push_back("-lineinfo");
-  //options.push_back("--relocatable-device-code=true");
-  // options.push_back("--maxrregcount=32");
-  //    options.push_back("-G");
-  //     options.push_back("--dopt=on");
+  // options.push_back("--relocatable-device-code=true");
+  //  options.push_back("--maxrregcount=32");
+  //     options.push_back("-G");
+  //      options.push_back("--dopt=on");
   nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
   for (size_t i = 0; i != archOptions.size() && error == NVRTC_ERROR_INVALID_OPTION; ++i) {
     if (computeMajor * 1000 + computeMinor * 10 < archOptions[i].first) {
@@ -910,7 +960,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     log.verbose("kernel %s local bytes: %d\n", v.second, localBytes);
   }
 
-  //CHECK_CU(cuLinkDestroy(linkState));
+  // CHECK_CU(cuLinkDestroy(linkState));
 
   log.info("compile took %gs", seconds(Clock::now() - start));
 }

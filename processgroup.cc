@@ -435,23 +435,32 @@ struct ProcessGroupImpl {
       }
     };
 
-    if (bytes % 16 != 0 || outputAddress % 16 != 0) {
-      pitch = (bytes + 127u) / 128u * 128u;
-      allocbuffer(sd.alignedBuffer, pitch * size);
-      outputAddress = sd.alignedBuffer.cudaPointer;
-      outputBytes = pitch * size;
-    }
+    Group* group = &*this->group;
 
-    if (inputAddress % 16 != 0) {
-      allocbuffer(sd.alignedBuffer2, bytes);
-      CHECK_CU(cuMemcpyDtoDAsync(sd.alignedBuffer2.cudaPointer, inputAddress, bytes, stream));
-      inputAddress = sd.alignedBuffer2.cudaPointer;
-    }
-
-    IpcMapper* ipcMapper = &*group->ipcMapper;
+    AllGather& allGather = *group->allGather;
 
     const auto& ipcRanks = group->ipcRanks;
     const auto& peerIndices = group->peerIndices;
+
+    bool isLocalOnly = allGather.recvRanks.empty();
+    bool isNoLocal = !isLocalOnly && peerIndices.empty();
+
+    if (!isNoLocal) {
+      if (bytes % 16 != 0 || outputAddress % 16 != 0) {
+        pitch = (bytes + 127u) / 128u * 128u;
+        allocbuffer(sd.alignedBuffer, pitch * size);
+        outputAddress = sd.alignedBuffer.cudaPointer;
+        outputBytes = pitch * size;
+      }
+
+      if (inputAddress % 16 != 0) {
+        allocbuffer(sd.alignedBuffer2, bytes);
+        CHECK_CU(cuMemcpyDtoDAsync(sd.alignedBuffer2.cudaPointer, inputAddress, bytes, stream));
+        inputAddress = sd.alignedBuffer2.cudaPointer;
+      }
+    }
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
 
     trace("ipcMapper");
 
@@ -472,12 +481,6 @@ struct ProcessGroupImpl {
 
     trace("enqueue");
 
-    Group* group = &*this->group;
-
-    AllGather& allGather = *group->allGather;
-
-    bool isLocalOnly = allGather.recvRanks.empty();
-
     if (!isLocalOnly) {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
       e->task = taskAllGather;
@@ -497,6 +500,7 @@ struct ProcessGroupImpl {
       group->kernels->compile(CompileAllGather);
       CHECK(group->kernels->cuAllGather != nullptr);
       CHECK(group->kernels->cuAllGatherLocal != nullptr);
+      CHECK(group->kernels->cuAllGatherNoLocal != nullptr);
     }
 
     AllGatherParameters parameters;
@@ -517,12 +521,16 @@ struct ProcessGroupImpl {
     if (isLocalOnly) {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+    } else if (isNoLocal) {
+      CHECK_CU(cuLaunchKernel(
+          group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
+      CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, stream));
     } else {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }
 
-    if (outputAddress != (uintptr_t)output.data_ptr()) {
+    if (!isNoLocal && outputAddress != (uintptr_t)output.data_ptr()) {
       CUDA_MEMCPY2D copyArgs = {0};
       copyArgs.srcDevice = sd.alignedBuffer.cudaPointer;
       copyArgs.srcPitch = pitch;
@@ -586,6 +594,9 @@ struct ProcessGroupImpl {
       break;
     case torch::Dtype::Long:
       dindex = Dtype::int64;
+      break;
+    case torch::Dtype::BFloat16:
+      dindex = Dtype::bfloat16;
       break;
     default:
       throw std::runtime_error(

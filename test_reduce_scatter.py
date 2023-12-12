@@ -92,9 +92,15 @@ def f(n):
     result0 = torch.zeros(data.numel() // size).cuda()
     # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
+    dtype = torch.bfloat16
+
+    data = data.to(dtype)
+    result0 = result0.to(dtype)
+    tmp = tmp.to(dtype)
+
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = True
+    check = False
 
     if check:
         all_inputs = []
@@ -103,7 +109,7 @@ def f(n):
             rdata = torch.randn(data.numel()).cuda() + 1
             # rdata *= 0
             # rdata += 2 ** r
-            all_inputs.append(rdata)
+            all_inputs.append(rdata.to(dtype))
 
             # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
 
