@@ -100,25 +100,51 @@ void Group::init() {
 
   CHECK_NVML(nvmlInit_v2());
 
-  std::array<char, 0x100> cudaPciBus;
+  std::array<char, 0x400> cudaPciBus;
   CHECK_CU(cuDeviceGetPCIBusId(cudaPciBus.data(), cudaPciBus.size(), cuDevice));
-  cudaPciBus[0xff] = 0;
-  std::string cudaPath = fmt::sprintf("/sys/bus/pci/devices/%s", cudaPciBus.data());
-  for (auto& v : cudaPath) {
-    if (v >= 'A' && v <= 'Z') {
-      v += 0x20;
+  cudaPciBus[0x3ff] = 0;
+  auto getDevicePath = [](std::string pciBus) {
+    std::string s = fmt::sprintf("/sys/bus/pci/devices/%s", pciBus);
+    for (auto& v : s) {
+      if (v >= 'A' && v <= 'Z') {
+        v += 0x20;
+      }
     }
-  }
-  char* path = realpath(cudaPath.c_str(), nullptr);
-  if (path) {
-    cudaPath = path;
-    free(path);
-  }
-  cudaPath = removePciPathPrefix(cudaPath);
-  // fmt::printf("cuda path is %s\n", cudaPath);
+    char* path = realpath(s.c_str(), nullptr);
+    if (path) {
+      s = path;
+      free(path);
+    }
+    return removePciPathPrefix(s);
+  };
+  std::string cudaPath = getDevicePath(cudaPciBus.data());
+  log.debug("cuda path is %s\n", cudaPath);
 
   nvmlDevice_t nvmlDevice;
   CHECK_NVML(nvmlDeviceGetHandleByPciBusId_v2(cudaPciBus.data(), &nvmlDevice));
+
+  std::vector<std::string> allCudaPaths;
+
+  bool localCudaDeviceFound = false;
+  size_t localAllCudaPathsIndex = 0;
+  unsigned int deviceCount = 0;
+  CHECK_NVML(nvmlDeviceGetCount(&deviceCount));
+  for (unsigned int i = 0; i != deviceCount; ++i) {
+    nvmlDevice_t device;
+    CHECK_NVML(nvmlDeviceGetHandleByIndex_v2(i, &device));
+    nvmlPciInfo_t pciInfo;
+    CHECK_NVML(nvmlDeviceGetPciInfo_v3(device, &pciInfo));
+    std::string path = getDevicePath(pciInfo.busIdLegacy);
+    allCudaPaths.push_back(path);
+    if (path == cudaPath) {
+      localCudaDeviceFound = true;
+      localAllCudaPathsIndex = i;
+    }
+    log.debug("there is a cuda device at %s\n", path);
+  }
+  if (!localCudaDeviceFound) {
+    throw std::runtime_error("The current CUDA device could not be found using NVML!");
+  }
 
   CHECK(numa_available() >= 0);
 
@@ -137,6 +163,9 @@ void Group::init() {
   std::vector<LocalDevice> localDevices;
 
   std::vector<LocalDeviceNode> localDeviceNodes;
+
+  std::vector<std::vector<LocalDeviceNode>> allDeviceNodes;
+  allDeviceNodes.resize(allCudaPaths.size());
 
   std::string bootId = readBootId();
 
@@ -195,18 +224,21 @@ void Group::init() {
       ibPath = removePciPathPrefix(ibPath);
       // fmt::printf("ib path is %s\n", ibPath);
 
-      int nmatch = 0;
-      for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
-        if (cudaPath[i] == ibPath[i]) {
-          if (cudaPath[i] == '/') {
-            ++nmatch;
+      auto getScore = [&](std::string cudaPath) {
+        int nmatch = 0;
+        for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
+          if (cudaPath[i] == ibPath[i]) {
+            if (cudaPath[i] == '/') {
+              ++nmatch;
+            }
+          } else {
+            break;
           }
-        } else {
-          break;
         }
-      }
+        return nmatch;
+      };
 
-      log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, nmatch, bestSpeed);
+      log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
 
       for (auto& v : localDevices) {
         CHECK(v.ibPath != ibPath);
@@ -223,11 +255,19 @@ void Group::init() {
         CHECK(v.ibPath != ibPath);
       }
 
-      std::tuple<int, int, int> score = {nmatch, 0, bestSpeed};
+      std::tuple<int, int, int> score = {getScore(cudaPath), 0, bestSpeed};
       LocalDeviceNode n;
       n.ibPath = ibPath;
       n.score = score;
       localDeviceNodes.push_back(n);
+
+      for (size_t i = 0; i != allCudaPaths.size(); ++i) {
+        std::tuple<int, int, int> score = {getScore(allCudaPaths[i]), 0, bestSpeed};
+        LocalDeviceNode n;
+        n.ibPath = ibPath;
+        n.score = score;
+        allDeviceNodes.at(i).push_back(n);
+      }
     }
   }
   ibv_free_device_list(list);
@@ -298,12 +338,12 @@ void Group::init() {
     while (true) {
       std::vector<LocalDeviceNode*> current;
       HashMap<std::string_view, int> useCount;
-      current.resize(localRanksByBootId.size());
+      current.resize(allDeviceNodes.size());
       std::vector<LocalDeviceNode*> best;
       std::tuple<int, int, int> bestScore = {0, 0, 0};
       int solutions = 0;
       std::function<void(size_t)> visit = [&](size_t index) {
-        if (index == localRanksByBootId.size()) {
+        if (index == allDeviceNodes.size()) {
           std::tuple<int, int, int> score = {0, 0, 0};
           for (LocalDeviceNode* n : current) {
             auto s = n->score;
@@ -324,9 +364,8 @@ void Group::init() {
           ++solutions;
           return;
         }
-        size_t rank = localRanksByBootId.at(index);
         std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
-        for (LocalDeviceNode& v : allRanksDeviceNodes.at(rank).ibDevices) {
+        for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
           if (std::get<0>(v.score) && !taken[v.ibPath]) {
             sorted.emplace_back(v.score, &v);
           }
@@ -363,8 +402,12 @@ void Group::init() {
       log.debug("evaluated %d solutions\n", solutions);
       log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
 
+      for (size_t i = 0; i != best.size(); ++i) {
+        log.debug("best device for %d is %s with score %d\n", i, best[i]->ibPath, std::get<0>(best[i]->score));
+      }
+
       for (auto& v : localDeviceNodes) {
-        if (v.ibPath == best[localRankIndex]->ibPath) {
+        if (v.ibPath == best.at(localAllCudaPathsIndex)->ibPath) {
           for (auto& v2 : localDevices) {
             if (v2.ibPath == v.ibPath) {
               useDevices.emplace_back(&v, &v2);
