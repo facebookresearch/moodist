@@ -25,7 +25,7 @@ if "LOCAL_RANK" not in os.environ:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
-os.environ["NCCL_PROTO"] = "^LL,^LL128"
+os.environ["NCCL_PROTO"] = "LL128"
 
 
 def f(n):
@@ -106,7 +106,7 @@ def f(n):
         #data = torch.randn(442416).cuda() + 1
         #data = torch.randn(18874368).cuda() + 1
         #data = torch.randn(589824).cuda() + 1
-        data = torch.randn(4194304).cuda() + 1
+        data = torch.randn(294912).cuda() + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -168,8 +168,8 @@ def f(n):
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             ostream = torch.cuda.current_stream()
-            dist.all_gather(result, tmp)
-            #dist._all_gather_base(result0, tmp)
+            #dist.all_gather(result, tmp)
+            dist._all_gather_base(result0, tmp)
             # with torch.cuda.stream(stream1):
             #     stream1.wait_stream(ostream)
             #     dist._all_gather_base(result0, tmp)
@@ -177,7 +177,7 @@ def f(n):
             #     dist._all_gather_base(result02, tmp2)
             torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
-            #result = result0.chunk(size)
+            result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
             if True:
                 for i, v in zip(range(size), correct_result):
@@ -390,8 +390,8 @@ def f(n):
                     e = events.pop(0)
                     e.synchronize()
                     freeevents.append(e)
-                #dist.all_gather_into_tensor(result0, tmp)
-                dist.all_gather(result, tmp)
+                dist.all_gather_into_tensor(result0, tmp)
+                #dist.all_gather(result, tmp)
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)

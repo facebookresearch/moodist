@@ -63,8 +63,8 @@ std::string Kernels::emitCopySeq(
     std::string loop;
     std::string postloop;
     if (unroll != 1) {
-      preloop += "__syncthreads();\n";
-      loop += "__syncthreads();\n";
+      preloop += "__syncwarp();\n";
+      loop += "__syncwarp();\n";
     }
     std::vector<std::string> srcPtr;
     std::vector<std::string> dstPtr;
@@ -123,7 +123,6 @@ std::string Kernels::emitCopySeq(
   const size_t %bytes = $bytes;
   const uint32_t %threadIndex = $threadIndex;
   static_assert($gridSize % $blocksPerSm == 0);
-  //uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
   uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
   size_t %offset = 0;
@@ -147,8 +146,8 @@ std::string Kernels::emitCopySeq(
   std::string copy1;
   // 16 uint4 uses 64 registers. we could go higher to hide more latency,
   // but it seems to not improve performance
-  // copy1 = genCopy("uint4", 16, 32);
-  // copy1 += genCopy("uint4", 16, 16);
+  // copy1 += genCopy("uint4", 16, 32);
+  copy1 += genCopy("uint4", 16, 16);
   copy1 += genCopy("uint4", 16, 8);
   copy1 += genCopy("uint4", 16, 4);
   copy1 += genCopy("uint4", 16, 2);
@@ -485,6 +484,12 @@ __device__ void syncthreads() {
   asm volatile ("barrier.sync 0;" :: );
 }
 
+__device__ uint32_t smid() {
+  uint32_t r;
+  asm("mov.u32 %%0, %%smid;" : "=r"(r));
+  return r;
+}
+
 __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
   $copyCode
 }
@@ -494,12 +499,22 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
 
 )z";
 
-  gridSize = 36;
+  gridSize = 16;
   blockSize = 256;
-  size_t blocksPerSm = 3;
+  size_t blocksPerSm = 1;
 
+  // source = replace(
+  //     source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
   source = replace(
-      source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
+      source, "$copyCode",
+      emitCopySeq(
+          {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u",
+          "$gridSize * (threadIdx.x / 32u) + blockIdx.x"));
+  // source = replace(
+  //     source, "$copyCode",
+  //     emitCopySeq(
+  //         {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "(blockIdx.x * $blockSize + threadIdx.x) % 32u",
+  //         "(blockIdx.x * $blockSize + threadIdx.x) / 32u"));
 
   // for (auto& type : supportedTypes) {
   //   for (auto& red : supportedReductions) {
@@ -718,22 +733,6 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", compileType, "$red", compileReduction));
   }
 
-  // for (auto& type : supportedTypes) {
-  //   for (auto& red : supportedReductions) {
-  //     size_t t = &type - supportedTypes.data();
-  //     size_t r = &red - supportedReductions.data();
-  //     fn(cuReduceScatterLocal[t][r], replace("reduce_scatter_local_$type_$red", "$type", type, "$red", red));
-  //     fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", type, "$red", red));
-  //   }
-  // }
-
-  // fn(cuReduceScatterLocal[Dtype::float32], "reduce_scatter_local_float");
-  // fn(cuReduceScatter[Dtype::float32], "reduce_scatter_float");
-  // fn(cuReduceScatterLocal[Dtype::int32], "reduce_scatter_local_int32_t");
-  // fn(cuReduceScatter[Dtype::int32], "reduce_scatter_int32_t");
-  // fn(cuReduceScatterLocal[Dtype::int64], "reduce_scatter_local_int64_t");
-  // fn(cuReduceScatter[Dtype::int64], "reduce_scatter_int64_t");
-
   fn(cuBroadcast, "broadcast");
 
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
@@ -791,9 +790,9 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   options.push_back("--std=c++17");
   options.push_back("-lineinfo");
   // options.push_back("--relocatable-device-code=true");
-  //  options.push_back("--maxrregcount=32");
-  //     options.push_back("-G");
-  //      options.push_back("--dopt=on");
+  // options.push_back("--maxrregcount=32");
+  // options.push_back("-G");
+  // options.push_back("--dopt=on");
   nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
   for (size_t i = 0; i != archOptions.size() && error == NVRTC_ERROR_INVALID_OPTION; ++i) {
     if (computeMajor * 1000 + computeMinor * 10 < archOptions[i].first) {

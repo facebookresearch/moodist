@@ -360,8 +360,9 @@ std::string AllGather::generate() {
     if (isInGrid) {
       return replace("copy_impl($dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes", bytes);
     } else {
-      CHECK(false);
-      return replace("allgather_copy_add(copies, $dst, $src);\n", "$dst", dst, "$src", src);
+      // return replace("cudaMemcpyAsync($dst, $src, $bytes, cudaMemcpyDeviceToDevice, 0);\n", "$dst", dst, "$src", src,
+      // "$bytes", bytes);
+      return replace("allgather_copy_add(copies, $dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes", bytes);
     }
   };
 
@@ -416,7 +417,9 @@ std::string AllGather::generate() {
         }
 
         if (!hasWaitedForRecv[pi.source * numChunks + chunkIndex]) {
-          // recvCopies += "allgather_copy_flush(copies);\n";
+          if (!isInGrid) {
+            // recvCopies += "allgather_copy_flush(copies);\n";
+          }
           hasWaitedForRecv[pi.source * numChunks + chunkIndex] = true;
           recvCopies += replace(
               R"(
@@ -485,23 +488,22 @@ struct AllGatherParameters {
   uintptr_t peerOutputAddresses[8];
 };
 
-constexpr size_t copyQueueSize = 16;
+constexpr size_t copyQueueSize = 8;
 struct AllGatherCopyParameters {
-  size_t bytes;
+  //size_t bytes;
   const void* src[copyQueueSize];
   void* dst[copyQueueSize];
+  size_t bytes[copyQueueSize];
   uint32_t n;
 };
 
 }
 
 extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
-  assert(params.n > 0);
-  assert(params.n <= copyQueueSize);
 #pragma unroll 1
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
-    copy_impl(params.dst[i], params.src[i], params.bytes);
+    copy_impl(params.dst[i], params.src[i], params.bytes[i]);
   }
 }
 
@@ -517,9 +519,10 @@ __device__ void allgather_copy_flush(AllGatherCopyParameters& params) {
   }
 }
 
-__device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, const void* src) {
+__device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, const void* src, size_t bytes) {
   params.dst[params.n] = dst;
   params.src[params.n] = src;
+  params.bytes[params.n] = bytes;
   ++params.n;
   if (params.n == copyQueueSize) {
     allgather_copy_flush(params);
@@ -542,6 +545,7 @@ extern "C" __global__ void allgather_no_local(AllGatherParameters params) {
 
 
 extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters params) {
+  //if (threadIdx.x == 0) printf("step %#x block %d running on sm %d\n", params.stepValue, blockIdx.x, smid());
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   grid_generic_entry_local(params);
@@ -571,8 +575,9 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   // }
 
   // AllGatherCopyParameters copies;
-  // copies.bytes = params.bytes;
+  // //copies.bytes = params.bytes;
   // copies.n = 0;
+  //bool isFirstThread = true;
 
   const size_t chunkSize = params.bytes < (size_t)65536 * 96 ? params.bytes : max((params.bytes + $numChunks - 1) / $numChunks, (size_t)65536 * 72);
   bool isFirstThread = false;
@@ -588,9 +593,9 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   grid_generic_exit(stepValue, concurrencyIndex);
 
-  // allgather_copy_flush(copies);
+  //allgather_copy_flush(copies);
 
-  // allgather_exit<<<1, 1>>>(stepValue, concurrencyIndex);
+  //allgather_exit<<<1, 1>>>(stepValue, concurrencyIndex);
 }
 
   )zz",

@@ -1477,6 +1477,7 @@ struct CpuThreadImpl {
               ++nDone;
               continue;
             }
+            // wait for dyns
             if (self.localProgress2[size * concurrencyIndex + state.sendIndex].stepValue < stepValue) {
               continue;
             }

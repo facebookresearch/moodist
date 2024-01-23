@@ -170,7 +170,12 @@ struct IpcMapper {
 
     CUdeviceptr base = 0;
     size_t size = 0;
-    CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
+    try {
+      CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
+    } catch (const std::exception& e) {
+      log.error("requestAddress: %#x bytes at %#x (buffer id %d), error %s\n", length, address, bufferId, e.what());
+      throw;
+    }
     CHECK(size >= length);
     log.debug(
         "requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length, address,
