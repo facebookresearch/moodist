@@ -38,6 +38,7 @@ std::string Kernels::emitCopySeq(
         R"(
     %count = (%bytes - %offset) / $nbytes;
     %i = %blockIndex;
+    assert(%offset + $nbytes * %count <= %bytes);
     if ($cond < %count) {
       $preloop
       while ($cond < %count) {
@@ -54,6 +55,7 @@ std::string Kernels::emitCopySeq(
       }
     }
     %offset += $nbytes * %count;
+    assert(%offset <= %bytes);
     if (%offset == %bytes) {
       return;
     }
@@ -161,7 +163,8 @@ std::string Kernels::emitCopySeq(
 }
 
 std::string Kernels::emitReduceFunctionSeq(
-    std::string sourcetype, size_t sourcetypesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize) {
+    std::string sourcetype, size_t sourcetypesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize,
+    std::string threadIndex, std::string blockIndex) {
   CHECK(sourcetype != "");
   std::string sourcesargs;
   for (size_t i = 0; i != nsources; ++i) {
@@ -288,6 +291,7 @@ std::string Kernels::emitReduceFunctionSeq(
         R"(
     %count = (%bytes - %offset) / $nbytes;
     %i = %blockIndex;
+    assert(%offset + $nbytes * %count <= %bytes);
     if ($cond < %count) {
       $preloop
       while ($cond < %count) {
@@ -304,6 +308,7 @@ std::string Kernels::emitReduceFunctionSeq(
       }
     }
     %offset += $nbytes * %count;
+    assert(%offset <= %bytes);
     if (%offset == %bytes) {
       return;
     }
@@ -313,8 +318,8 @@ std::string Kernels::emitReduceFunctionSeq(
     std::string loop;
     std::string postloop;
     if (unroll != 1) {
-      preloop += "__syncthreads();\n";
-      loop += "__syncthreads();\n";
+      preloop += "__syncwarp();\n";
+      loop += "__syncwarp();\n";
     }
     for (int i = 0; i != unroll; ++i) {
       std::vector<std::string> tempnames;
@@ -354,11 +359,13 @@ std::string Kernels::emitReduceFunctionSeq(
   };
   std::string reduce1; // = generate("uint4", 16, 32);
   if (sourcetypesize == 8) {
+    reduce1 += generate("ulonglong2", 16, 16);
     reduce1 += generate("ulonglong2", 16, 8);
     reduce1 += generate("ulonglong2", 16, 4);
     reduce1 += generate("ulonglong2", 16, 2);
     reduce1 += generate("ulonglong2", 16, 1);
   } else {
+    reduce1 += generate("uint4", 16, 16);
     reduce1 += generate("uint4", 16, 8);
     reduce1 += generate("uint4", 16, 4);
     reduce1 += generate("uint4", 16, 2);
@@ -377,18 +384,19 @@ __device__ void reduce_n$nsources<$typename, $op>(size_t size, $typename* destin
   const size_t %bytes = $sourcetypesize * size;
   const uint32_t %threadIndex = $threadIndex;
   static_assert($gridSize % $blocksPerSm == 0);
-  //uint32_t %blockIndex = $blockIndex / $blocksPerSm + ($gridSize / $blocksPerSm * ($blockIndex % $blocksPerSm));
   uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
   size_t %offset = 0;
   size_t %count = 0;
   size_t %i;
   $reduce1
+  assert(false);
 }
   )",
       "$sourcesargs", sourcesargs, "$op", op, "$nsources", nsources, "$typename", sourcetype, "$sourcetypesize",
-      sourcetypesize, "$reduce1", reduce1, "$addressesdefs", addressesdefs, "$gridSize", gridSize, "$blockSize",
-      blockSize, "$blockIndex", "blockIdx.x", "$threadIndex", "threadIdx.x");
+      sourcetypesize, "$reduce1", reduce1, "$addressesdefs", addressesdefs);
+  s = replace(
+      s, "$gridSize", gridSize, "$blockSize", blockSize, "$blockIndex", blockIndex, "$threadIndex", threadIndex);
   s = makeVars(s);
   return s;
 }
@@ -526,8 +534,11 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
   if (flags & CompileReduceScatter) {
     auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
     CHECK(i != supportedTypes.end());
+    // source += emitReduceFunctionSeq(compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction,
+    // gridSize, blockSize);
     source += emitReduceFunctionSeq(
-        compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize, blockSize);
+        compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize * blockSize / 32, 32,
+        "threadIdx.x % 32u", "$gridSize * (threadIdx.x / 32u) + blockIdx.x");
   }
 
   source += R"(

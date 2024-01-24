@@ -70,12 +70,13 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     #data = torch.randn(1024 * 1024 * 40).cuda() + 1
-    #data = torch.randn(4 * size).cuda() + 1
+    data = torch.randn(589824 * 8 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     #data = torch.randn((442416 - 4) * size).cuda() + 1
     #data = torch.randn(527040 * size).cuda() + 1
-    data = torch.randn(589824 * size).cuda() + 1
+    #data = torch.randn(589824 * size).cuda() + 1
+    #data = torch.randn(294912 * size).cuda() + 1
     #data = torch.randn(524288 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
@@ -92,7 +93,8 @@ def f(n):
     result0 = torch.zeros(data.numel() // size).cuda()
     # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
-    dtype = torch.bfloat16
+    #dtype = torch.bfloat16
+    dtype = torch.float
 
     data = data.to(dtype)
     result0 = result0.to(dtype)
@@ -100,7 +102,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = False
+    check = True
 
     if check:
         all_inputs = []
