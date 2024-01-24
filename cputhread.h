@@ -20,6 +20,7 @@ constexpr uint8_t taskAllGatherCpu = 5;
 constexpr uint8_t taskReduceScatterCpu = 6;
 constexpr uint8_t taskGatherCpu = 7;
 constexpr uint8_t taskBroadcastCpu = 8;
+constexpr uint8_t taskInternalBarrier = 9;
 
 struct DataRef {
   uintptr_t address = 0;

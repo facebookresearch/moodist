@@ -81,6 +81,7 @@ struct ProcessGroupImpl {
   SpinMutex mutex;
   uint32_t nextStepValue = 1;
   uint32_t nextConcurrencyIndex = 0;
+  uint32_t nextInternalStepValue = 1;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -105,6 +106,41 @@ struct ProcessGroupImpl {
     group->ipcMapper->enqueueUnmapAll();
     // CHECK_CU(cuCtxSynchronize());
     // group->ipcMapper->unmapAll();
+  }
+
+  uint32_t getNextStepValue() {
+    uint32_t r = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    if (r < 0x80000000) {
+      return r;
+    }
+
+    resetStepValue();
+    return 1;
+  }
+  void resetStepValue() {
+    // We need to reset the 32 bit step value to prevent it from overflowing.
+    // We could avoid this by changing the way we compare the step values everywhere,
+    // but this is simpler.
+
+    log.verbose("Reset step value begin\n");
+    internalBarrier();
+
+    CHECK_CU(cuCtxSynchronize());
+    std::memset(group->mySharedMem, 0, group->mySharedMemSize);
+    nextStepValue = 1 + 0x1000;
+    for (auto& a : group->buffersToReset) {
+      auto& buffer = a->buffer;
+      if (buffer.hostAllocated || buffer.numaAllocated) {
+        std::memset(buffer.cpuPointer, 0, buffer.bytes);
+      } else {
+        CHECK_CU(cuMemsetD8(buffer.cudaPointer, 0, buffer.bytes));
+      }
+    }
+    CHECK_CU(cuCtxSynchronize());
+
+    log.verbose("Reset step value done, syncing\n");
+    internalBarrier();
+    log.verbose("Reset step value end\n");
   }
 
   struct TraceEvent {
@@ -280,9 +316,26 @@ struct ProcessGroupImpl {
     return r;
   }
 
+  void internalBarrier() {
+    uint32_t stepValue = std::exchange(nextInternalStepValue, nextInternalStepValue + 1);
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+    std::atomic_uint32_t cpuDone = 0;
+    QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
+    e->task = taskInternalBarrier;
+    e->stepValue = stepValue;
+    e->sd = &group->getStreamData(nullptr);
+    e->concurrencyIndex = concurrencyIndex;
+    e->cpuDone = &cpuDone;
+    group->cpuThread->enqueue(e);
+    while (cpuDone == 0) {
+      futexWait(&cpuDone, 0, std::chrono::seconds(10));
+    }
+  }
+
   void barrier() {
     std::unique_lock l(mutex);
-    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
     std::atomic_uint32_t cpuDone = 0;
@@ -375,9 +428,9 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-    CHECK(stepValue < 0x80000000);
+    CHECK(stepValue < 0x8000);
 
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(output.is_contiguous());
@@ -522,8 +575,7 @@ struct ProcessGroupImpl {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else if (isNoLocal) {
-      CHECK_CU(cuLaunchKernel(
-          group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
+      CHECK_CU(cuLaunchKernel(group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
       CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, stream));
     } else {
       CHECK_CU(cuLaunchKernel(
@@ -551,7 +603,7 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
@@ -783,7 +835,7 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
@@ -862,7 +914,7 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = std::exchange(nextStepValue, nextStepValue + 0x1000);
+    uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 

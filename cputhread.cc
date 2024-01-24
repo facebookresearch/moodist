@@ -276,6 +276,12 @@ struct CpuThreadImpl {
   Progress* localProgress = group->localProgress;
   Progress* localProgress2 = group->localProgress2;
 
+  AllocatedArray internalLocalProgressBuffer = group->allocateArrayHost(sizeof(uint32_t) * size, Group::maxConcurrency);
+  MemoryRegistration* internalLocalProgressBufferMr =
+      regMr((uintptr_t)internalLocalProgressBuffer.buffer.cpuPointer, internalLocalProgressBuffer.buffer.bytes);
+  std::vector<RemoteAddressAndKey> remoteInternalLocalProgressBuffer =
+      distributeAddressAndKeys((uintptr_t)internalLocalProgressBuffer.buffer.cpuPointer, internalLocalProgressBufferMr);
+
   MemoryRegistration* cudaStepValueMr =
       regMrCuda(group->cudaStepValue.buffer.cudaPointer, group->cudaStepValue.buffer.bytes);
 
@@ -892,6 +898,47 @@ struct CpuThreadImpl {
       futexWakeAll(params.cpuDone);
       self.cpuThread->freelistBarrier.push(&params);
       self.allocatorBarrier.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkInternalBarrier : Work {
+    QueueEntryBarrier& params;
+    size_t i;
+
+    WorkInternalBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self, params), params(params) {}
+
+    uint32_t* internalLocalProgress() {
+      return (uint32_t*)self.internalLocalProgressBuffer.buffer.cpuPointer;
+    }
+
+    void step() {
+      ENTER
+      for (size_t i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+
+        size_t deviceIndex = (rank + i) % self.devices.size();
+        Device& dev = self.devices[deviceIndex];
+        self.sendStepValues[concurrencyIndex] = stepValue;
+        self.writeData(
+            dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[deviceIndex]->lkey,
+            (void*)(self.remoteInternalLocalProgressBuffer[i].address + sizeof(uint32_t) * (size * concurrencyIndex + rank)),
+            self.remoteInternalLocalProgressBuffer[i].keys[deviceIndex], sizeof(stepValue));
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        while (internalLocalProgress()[size * concurrencyIndex + i] < stepValue) {
+          YIELD
+        }
+      }
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+      self.cpuThread->freelistBarrier.push(&params);
+      self.allocatorInternalBarrier.deallocate(this);
       DONE
     }
   };
@@ -2599,6 +2646,7 @@ struct CpuThreadImpl {
     }
   };
   WorkAllocator<WorkBarrier> allocatorBarrier;
+  WorkAllocator<WorkInternalBarrier> allocatorInternalBarrier;
   WorkAllocator<WorkAllGather> allocatorAllGather;
   WorkAllocator<WorkAllGatherRing> allocatorAllGatherRing;
   WorkAllocator<WorkReduceScatter> allocatorReduceScatter;
@@ -2676,6 +2724,8 @@ struct CpuThreadImpl {
               enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskBroadcastCpu) {
               enqueue(allocatorBroadcastCpu, (QueueEntryBroadcastCpu&)queueEntry);
+            } else if (queueEntry.task == taskInternalBarrier) {
+              enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }

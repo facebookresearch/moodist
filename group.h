@@ -108,6 +108,8 @@ struct Group {
   AllocatedArray cudaCopyDone;
   std::array<PeerArrayRef, 8> peerCudaCopyDone;
 
+  std::vector<AllocatedArray*> buffersToReset;
+
   std::vector<size_t> ipcRanks;
   std::vector<size_t> peerIndices;
   std::vector<uint8_t> ipcAccess;
