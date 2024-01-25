@@ -430,7 +430,7 @@ struct ProcessGroupImpl {
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-    CHECK(stepValue < 0x8000);
+    CHECK(stepValue < 0x80000000);
 
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(output.is_contiguous());

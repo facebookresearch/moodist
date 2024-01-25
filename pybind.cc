@@ -6,19 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <pybind11/chrono.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
-#undef __GXX_ABI_VERSION
-#define __GXX_ABI_VERSION 1011
-
 #include <torch/csrc/utils/pybind.h>
 
 #include "processgroup.h"
-
-#include <pybind11/chrono.h>
-#include <pybind11/pybind11.h>
-
-// __pybind11_internals_v4_gcc_libstdcpp_cxxabi1013
-// __pybind11_internals_v4_gcc_libstdcpp_cxxabi1011
 
 namespace moodist {
 bool profilingEnabled = false;

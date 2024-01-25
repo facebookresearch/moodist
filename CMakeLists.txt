@@ -21,6 +21,17 @@ message(STATUS "PyTorch compilation flags: ${TORCH_CXX_FLAGS}")
 message(STATUS "PyTorch include dirs: ${TORCH_INCLUDE_DIRS}")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
+# We're forced to inherit from a class defined in pytorch, whose pybind code is also in pytorch.
+# pybind then requires the abi of our class and the parent class to be the same.
+# (pybind enforces this by a string lookup, where the string is composed of compiler, abi version etc)
+set(ABI_VERSION "11" CACHE STRING "The ABI version that pytorch was built with")
+if(ABI_VERSION)
+  message(STATUS "using -fabi-version=${ABI_VERSION}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fabi-version=${ABI_VERSION}")
+else()
+  message(STATUS "using no abi version")
+endif()
+
 find_package(CUDAToolkit)
 
 message(STATUS "CUDA includes are ${CUDAToolkit_INCLUDE_DIRS}")
