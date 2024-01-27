@@ -50,6 +50,8 @@ struct Device {
   ibv_pd* protectionDomain;
   ibv_cq* cq;
   size_t currentCqEntries = 0;
+  bool efa;
+  bool ordered;
 };
 
 struct Callback {
@@ -73,12 +75,18 @@ struct RemoteAddressAndKey {
 };
 
 struct CallbackWrapper {
-  Callback* callback;
+  Callback* callback = nullptr;
+  CallbackWrapper() = default;
+  CallbackWrapper(std::nullptr_t) {}
   CallbackWrapper(Callback* callback) : callback(callback) {
-    ++callback->refcount;
+    if (callback) {
+      ++callback->refcount;
+    }
   }
   ~CallbackWrapper() {
-    callback->decref();
+    if (callback) {
+      callback->decref();
+    }
   }
   operator Callback*() {
     return callback;
@@ -398,6 +406,8 @@ struct CpuThreadImpl {
       dev.ib = &*v;
       dev.protectionDomain = v->protectionDomain;
       dev.cq = v->cq;
+      dev.efa = dev.ib->qpex != nullptr;
+      dev.ordered = !dev.efa;
     }
     return devices;
   }
@@ -1175,7 +1185,8 @@ struct CpuThreadImpl {
             self.writeData(
                 dev, neighbor, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
-                sizeof(DynamicAddresses), self.makeCallback([this, di, n, neighbor = neighbor]() {
+                sizeof(DynamicAddresses),
+                dev.ordered ? nullptr : self.makeCallback([this, di, n, neighbor = neighbor]() {
                   if (kernelHasEntered) {
                     self.dynReadyVector[size * concurrencyIndex + n] = 1;
                     // log.info("dyn index %d sent to %d\n", n, neighbor);
@@ -1203,23 +1214,21 @@ struct CpuThreadImpl {
       while (cpuIn[0] < stepValue) {
         YIELD
       }
+      kernelHasEntered = true;
       for (index = 0; index != ringSends.size(); ++index) {
         // self.trace("dyn-ready %d", index);
-        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
-          YIELD
-        }
-        if (self.dynReadyVector[size * concurrencyIndex + index] == 2) {
+        size_t di = (rank + index) % self.devices.size();
+        auto& dev = self.devices[di];
+        if (self.dynReadyVector[size * concurrencyIndex + index] == 2 || dev.ordered) {
           auto [i, neighbor] = ringRecvs[index];
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
           self.writeData(dev, neighbor,
               sendStepValue,
               self.sendStepValues2StorageMr->mrs[di]->lkey,
               (void*)(self.remoteComms[neighbor].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + index].stepValue)),
               self.remoteComms[neighbor].keys[di],
               sizeof(stepValue));
+          self.dynReadyVector[size * concurrencyIndex + index] = 3;
         }
-        self.dynReadyVector[size * concurrencyIndex + index] = 0;
       }
 
       // log.info("enter kernel %d ok\n", stepValue);
@@ -1326,6 +1335,13 @@ struct CpuThreadImpl {
       cpuOut[0] = stepValue;
       while (cpuIn[0] < stepValue + 1) {
         YIELD
+      }
+
+      // Clean up dyns
+      for (index = 0; index != ringSends.size(); ++index) {
+        CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 0);
+        CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 2);
+        self.dynReadyVector[size * concurrencyIndex + index] = 0;
       }
 
       // log.info("exit kernel %d ok\n", stepValue);
@@ -1447,10 +1463,13 @@ struct CpuThreadImpl {
 
             auto offset = self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + n]);
 
+            CHECK(self.dynReadyVector[size * concurrencyIndex + n] == 0);
+
             self.writeData(
                 dev, neighbor, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
                 (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
-                sizeof(DynamicAddresses), self.makeCallback([this, di, n, neighbor = neighbor]() {
+                sizeof(DynamicAddresses),
+                dev.ordered ? nullptr : self.makeCallback([this, di, n, neighbor = neighbor]() {
                   if (kernelHasEntered) {
                     self.dynReadyVector[size * concurrencyIndex + n] = 1;
                     // log.info("dyn index %d sent to %d\n", n, neighbor);
@@ -1478,23 +1497,21 @@ struct CpuThreadImpl {
       while (cpuIn[0] < stepValue) {
         YIELD
       }
+      kernelHasEntered = true;
       for (index = 0; index != ringSends.size(); ++index) {
         // self.trace("dyn-ready %d", index);
-        while (self.dynReadyVector[size * concurrencyIndex + index] == 0) {
-          YIELD
-        }
-        if (self.dynReadyVector[size * concurrencyIndex + index] == 2) {
+        size_t di = (rank + index) % self.devices.size();
+        auto& dev = self.devices[di];
+        if (self.dynReadyVector[size * concurrencyIndex + index] == 2 || dev.ordered) {
           auto [i, neighbor] = ringRecvs[index];
-          size_t di = (rank + index) % self.devices.size();
-          auto& dev = self.devices[di];
           self.writeData(dev, neighbor,
               sendStepValue,
               self.sendStepValues2StorageMr->mrs[di]->lkey,
               (void*)(self.remoteComms[neighbor].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + index].stepValue)),
               self.remoteComms[neighbor].keys[di],
               sizeof(stepValue));
+          self.dynReadyVector[size * concurrencyIndex + index] = 3;
         }
-        self.dynReadyVector[size * concurrencyIndex + index] = 0;
       }
 
       // log.info("enter kernel %d ok\n", stepValue);
@@ -1619,6 +1636,13 @@ struct CpuThreadImpl {
       cpuOut[0] = stepValue;
       while (cpuIn[0] < stepValue + 1) {
         YIELD
+      }
+
+      // Clean up dyns
+      for (index = 0; index != ringSends.size(); ++index) {
+        CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 0);
+        CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 2);
+        self.dynReadyVector[size * concurrencyIndex + index] = 0;
       }
 
       // log.info("exit kernel %d ok\n", stepValue);

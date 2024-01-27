@@ -159,7 +159,7 @@ def f(n):
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
-        for _ in range(100):
+        for _ in range(1000):
             # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
@@ -383,8 +383,8 @@ def f(n):
                 torch.cuda.Event(),
             ]
             events = []
-            if n == "moodist":
-                moodist.enable_profiling(True)
+            #if n == "moodist":
+            #    moodist.enable_profiling(True)
             for _ in range(loopcount):
                 if len(events) >= 2:
                     e = events.pop(0)
@@ -395,8 +395,8 @@ def f(n):
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)
-            if n == "moodist":
-                moodist.enable_profiling(False)
+            #if n == "moodist":
+            #    moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp)
             # for i in range(loopcount):

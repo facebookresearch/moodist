@@ -58,9 +58,15 @@ def f(n):
     def t(i):
         if rank == 0:
             print("Running benchmark with world size %d" % i)
-        ranks = list(range(i))
-        group = dist.new_group(ranks)
-        if not rank in range(i):
+        for lr in range(8):
+            tmpranks = list(range(lr, i * 8, 8))
+            tmpgroup = dist.new_group(tmpranks)
+            if rank in tmpranks:
+                group = tmpgroup
+                ranks = tmpranks
+        print("Ranks: %s" % ranks)
+
+        if rank not in ranks:
             gloo.barrier()
             return
 
@@ -68,10 +74,10 @@ def f(n):
 
         f = None
         if rank == 0:
-            f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
+            f = open("speed-mp-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
         s = 73728 // 4
-        #s = 9437184
+        # s = 9437184
         xi = 0
         while True:
             xi += 1
@@ -221,17 +227,17 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(800, world_size)
+    i = min(800, world_size // 8)
     while True:
         t(i)
 
-        if i >= world_size:
+        if i >= world_size // 8:
             break
         # i = i + (i + 1) // 2
         i = max(i * 2, 1)
         if i >= 8:
             i = (i + 7) // 8 * 8
-        i = min(i, world_size)
+        i = min(i, world_size // 8)
 
 
 if len(sys.argv) < 3:
@@ -250,7 +256,7 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
+# for n in ("moodist", "nccl"):
 for n in ("moodist", "nccl"):
     # for n in ("nccl",):
     # for n in ("moodist",):
