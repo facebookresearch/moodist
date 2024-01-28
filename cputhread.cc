@@ -871,10 +871,12 @@ struct CpuThreadImpl {
     }                                                                                                                  \
   }
 #define YIELD                                                                                                          \
-  {                                                                                                                    \
+  if (self.numActiveWorks != 1 || self.cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {                    \
     this->state = &&CAT(s, __LINE__);                                                                                  \
     return;                                                                                                            \
     CAT(s, __LINE__) :;                                                                                                \
+  } else {                                                                                                             \
+    self.poll();                                                                                                       \
   }
 #define DONE                                                                                                           \
   {                                                                                                                    \
@@ -2681,6 +2683,8 @@ struct CpuThreadImpl {
   WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
   WorkAllocator<WorkBroadcastCpu> allocatorBroadcastCpu;
 
+  size_t numActiveWorks = 0;
+
   void entry() {
     try {
 
@@ -2704,6 +2708,7 @@ struct CpuThreadImpl {
         CHECK(work->streamIndex < streams.size());
         if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
           activeWorks.push_back(*work);
+          ++numActiveWorks;
         }
         streams[work->streamIndex].push_back(*work);
         concurrency[work->concurrencyIndex].push_back(*work);
@@ -2754,38 +2759,39 @@ struct CpuThreadImpl {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }
           }
-          for (int i2 = 0; i2 != 4; ++i2) {
-            poll();
+          poll();
 
-            for (auto i = activeWorks.begin(); i != activeWorks.end();) {
-              Work* w = (Work*)&*i;
-              CHECK(!w->done);
-              w->stepPtr(w);
-              if (w->done) {
-                uint32_t concurrencyIndex = w->concurrencyIndex;
-                uint32_t streamIndex = w->streamIndex;
-                CHECK(&concurrency[concurrencyIndex].front() == w);
-                concurrency[concurrencyIndex].pop_front();
-                CHECK(&streams[streamIndex].front() == w);
-                streams[streamIndex].pop_front();
-                bool queuedThisConcurrency = false;
-                if (!streams[streamIndex].empty()) {
-                  Work* nextWork = (Work*)&streams[streamIndex].front();
-                  if (&concurrency[nextWork->concurrencyIndex].front() == nextWork) {
-                    queuedThisConcurrency = nextWork->concurrencyIndex == concurrencyIndex;
-                    activeWorks.push_back(*nextWork);
-                  }
+          for (auto i = activeWorks.begin(); i != activeWorks.end();) {
+            Work* w = (Work*)&*i;
+            CHECK(!w->done);
+            w->stepPtr(w);
+            if (w->done) {
+              uint32_t concurrencyIndex = w->concurrencyIndex;
+              uint32_t streamIndex = w->streamIndex;
+              CHECK(&concurrency[concurrencyIndex].front() == w);
+              concurrency[concurrencyIndex].pop_front();
+              CHECK(&streams[streamIndex].front() == w);
+              streams[streamIndex].pop_front();
+              bool queuedThisConcurrency = false;
+              if (!streams[streamIndex].empty()) {
+                Work* nextWork = (Work*)&streams[streamIndex].front();
+                if (&concurrency[nextWork->concurrencyIndex].front() == nextWork) {
+                  queuedThisConcurrency = nextWork->concurrencyIndex == concurrencyIndex;
+                  activeWorks.push_back(*nextWork);
+                  ++numActiveWorks;
                 }
-                if (!queuedThisConcurrency && !concurrency[concurrencyIndex].empty()) {
-                  Work* nextWork = (Work*)&concurrency[concurrencyIndex].front();
-                  if (&streams[nextWork->streamIndex].front() == nextWork) {
-                    activeWorks.push_back(*nextWork);
-                  }
-                }
-                i = activeWorks.erase(i);
-              } else {
-                ++i;
               }
+              if (!queuedThisConcurrency && !concurrency[concurrencyIndex].empty()) {
+                Work* nextWork = (Work*)&concurrency[concurrencyIndex].front();
+                if (&streams[nextWork->streamIndex].front() == nextWork) {
+                  activeWorks.push_back(*nextWork);
+                  ++numActiveWorks;
+                }
+              }
+              i = activeWorks.erase(i);
+              --numActiveWorks;
+            } else {
+              ++i;
             }
           }
         }
@@ -2796,7 +2802,7 @@ struct CpuThreadImpl {
     } catch (QuitCpuThread) {
     }
   }
-};
+}; 
 
 CpuThread::CpuThread(Group* group) : group(group) {}
 CpuThread::~CpuThread() {
