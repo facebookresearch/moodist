@@ -4,6 +4,7 @@
 #include "clock.h"
 #include "common.h"
 #include "freelist.h"
+#include "group.h"
 #include "ib_common.h"
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
@@ -1359,12 +1360,11 @@ struct CpuThreadImpl {
   struct WorkAllGatherRing : Work {
     QueueEntryAllGather& params;
     size_t i;
-    size_t neighbor;
     size_t di;
     MemoryRegistration* inputMr;
-    // size_t liveSends;
     size_t index;
     size_t index2;
+    bool anyEfa;
 
     const AllGather& allGather = *self.group->allGather;
     const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
@@ -1435,6 +1435,11 @@ struct CpuThreadImpl {
         sendStepValue[i] = stepValue + i;
       }
 
+      anyEfa = false;
+      for (auto& dev : self.devices) {
+        anyEfa |= dev.efa;
+      }
+
       {
         inputMr = self.regMrCuda(params.inputAddress, params.bytes);
 
@@ -1442,51 +1447,56 @@ struct CpuThreadImpl {
 
         // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
         // Thus, we register each ranks output address independently, so they get different MRs.
+        // TODO: split this into chunks of ~2GB instead.
         for (auto [i, neighbor] : ringRecvs) {
-          auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+          auto* mr =
+              self.regMrCuda(params.outputAddress + params.pitch * i, anyEfa ? params.bytes : params.pitch * size);
           self.outDynsMrVector[size * concurrencyIndex + i] = mr;
-          outDyns[i].gatherAddress = params.outputAddress + params.pitch * i;
+          outDyns[i].gatherAddress = params.outputAddress;
           outDyns[i].gatherBytes = params.bytes;
           outDyns[i].stepValue = stepValue;
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
           }
 
-          // log.info("outDyns[%d] address is %#x\n", i, outDyns[i].gatherAddress);
+          if (!anyEfa) {
+            break;
+          }
         }
 
         // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
         // until kernel entry, such that we don't receive data until we're ready.
-        {
-          size_t n = 0;
-          for (auto [i, neighbor] : ringRecvs) {
-            size_t di = (rank + n) % self.devices.size();
-            auto& dev = self.devices[di];
+        size_t n = 0;
+        for (auto [i, neighbor] : ringRecvs) {
+          size_t di = (rank + n) % self.devices.size();
+          auto& dev = self.devices[di];
 
-            auto offset = self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + n]);
+          auto offset = self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + n]);
 
-            CHECK(self.dynReadyVector[size * concurrencyIndex + n] == 0);
+          CHECK(self.dynReadyVector[size * concurrencyIndex + n] == 0);
 
-            self.writeData(
-                dev, neighbor, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
-                (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
-                sizeof(DynamicAddresses),
-                dev.ordered ? nullptr : self.makeCallback([this, di, n, neighbor = neighbor]() {
-                  if (kernelHasEntered) {
-                    self.dynReadyVector[size * concurrencyIndex + n] = 1;
-                    // log.info("dyn index %d sent to %d\n", n, neighbor);
-                    auto& dev = self.devices[di];
-                    self.writeData(dev, neighbor,
+          self.writeData(
+              dev, neighbor, &outDyns[anyEfa ? i : 0], self.outDynsMr->mrs[di]->lkey,
+              (void*)(self.remoteComms[neighbor].address + offset), self.remoteComms[neighbor].keys[di],
+              sizeof(DynamicAddresses), dev.ordered ? nullptr : self.makeCallback([this, di, n, neighbor = neighbor]() {
+                if (kernelHasEntered) {
+                  self.dynReadyVector[size * concurrencyIndex + n] = 1;
+                  // log.info("dyn index %d sent to %d\n", n, neighbor);
+                  auto& dev = self.devices[di];
+                  self.writeData(dev, neighbor,
                             sendStepValue,
                             self.sendStepValues2StorageMr->mrs[di]->lkey,
                             (void*)(self.remoteComms[neighbor].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + n].stepValue)),
                             self.remoteComms[neighbor].keys[di],
                             sizeof(stepValue));
-                  } else {
-                    self.dynReadyVector[size * concurrencyIndex + n] = 2;
-                  }
-                }));
-            ++n;
+                } else {
+                  self.dynReadyVector[size * concurrencyIndex + n] = 2;
+                }
+              }));
+          ++n;
+
+          if (!anyEfa) {
+            break;
           }
         }
       }
@@ -1514,6 +1524,10 @@ struct CpuThreadImpl {
               sizeof(stepValue));
           self.dynReadyVector[size * concurrencyIndex + index] = 3;
         }
+
+        if (!anyEfa) {
+          break;
+        }
       }
 
       // log.info("enter kernel %d ok\n", stepValue);
@@ -1533,8 +1547,11 @@ struct CpuThreadImpl {
           size_t nDone = 0;
           for (size_t i = 0; i != nDevices; ++i) {
             auto& state = sendStates[i];
-            if (state.liveSends >= numParallel) {
-              continue;
+            auto& dev = self.devices[i];
+            if (!dev.ordered) {
+              if (state.liveSends >= numParallel) {
+                continue;
+              }
             }
             if (state.sendIndex == ringSends.size()) {
               if (state.liveSends) {
@@ -1544,7 +1561,7 @@ struct CpuThreadImpl {
               continue;
             }
             // wait for dyns
-            if (self.localProgress2[size * concurrencyIndex + state.sendIndex].stepValue < stepValue) {
+            if (self.localProgress2[size * concurrencyIndex + (anyEfa ? state.sendIndex : 0)].stepValue < stepValue) {
               continue;
             }
             size_t index = state.sendIndex;
@@ -1574,16 +1591,18 @@ struct CpuThreadImpl {
               }
               uintptr_t srcAddr =
                   source == rank ? (uintptr_t)params.inputAddress : params.outputAddress + params.pitch * source;
-              auto* srcMr = source == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + source];
+              auto* srcMr =
+                  source == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + (anyEfa ? source : 0)];
 
-              auto& dev = self.devices[i];
               std::chrono::system_clock::time_point sendStart;
               if (profilingEnabled) {
                 sendStart = std::chrono::system_clock::now();
               }
               ++state.liveSends;
-              uintptr_t dstAddr = self.localDyns[size * concurrencyIndex + index].gatherAddress;
-              auto key = self.localDyns[size * concurrencyIndex + index].gatherKey;
+              DynamicAddresses& dyn = self.localDyns[size * concurrencyIndex + (anyEfa ? index : 0)];
+              CHECK(dyn.gatherBytes == params.bytes);
+              uintptr_t dstAddr = dyn.gatherAddress + params.pitch * source;
+              auto key = dyn.gatherKey;
               bool efa = dev.ib->qpex != nullptr;
               self.writeData(
                   dev, neighbor, (void*)(srcAddr + chunkSize * chunkIndex + offset), srcMr->mrs[i]->lkey,
@@ -1616,6 +1635,8 @@ struct CpuThreadImpl {
         CHECK(sendStates[i].sendIndex == ringSends.size());
       }
 
+      cpuOut[0] = stepValue;
+
       self.trace("wait for recvs");
       for (index = 0; index != ringRecvs.size(); ++index) {
         i = std::get<0>(ringRecvs[index]);
@@ -1635,7 +1656,6 @@ struct CpuThreadImpl {
 
       self.trace("kernel-exit");
 
-      cpuOut[0] = stepValue;
       while (cpuIn[0] < stepValue + 1) {
         YIELD
       }
@@ -2802,7 +2822,7 @@ struct CpuThreadImpl {
     } catch (QuitCpuThread) {
     }
   }
-}; 
+};
 
 CpuThread::CpuThread(Group* group) : group(group) {}
 CpuThread::~CpuThread() {

@@ -507,8 +507,8 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
 
 )z";
 
-  gridSize = 16;
-  blockSize = 256;
+    gridSize = 16;
+    blockSize = 256;
   size_t blocksPerSm = 1;
 
   // source = replace(
@@ -636,9 +636,9 @@ __device__ void generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   volatile uint32_t* __restrict__ cpuIn = $cpuIn;
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   cpuIn[0] = stepValue + 1;
-  while (cpuOut[0] < stepValue);
   $waitForCopyDones
   $waitForRecvs
+  while (cpuOut[0] < stepValue);
 }
 
 __device__ uint32_t entryCounter[$maxConcurrency];
