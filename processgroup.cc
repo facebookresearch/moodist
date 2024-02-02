@@ -44,7 +44,6 @@ void registerFreeMemoryCallback();
 
 std::once_flag globalInitFlag;
 void globalInit() {
-
   const char* logLevel = std::getenv("MOODIST_LOG_LEVEL");
   if (logLevel) {
     std::string s = logLevel;
@@ -67,10 +66,36 @@ void globalInit() {
     if (currentLogLevel < LOG_ERROR) {
       currentLogLevel = LOG_ERROR;
     }
-
-    fmt::printf("currentLogLevel set to %d\n", (int)currentLogLevel);
   }
 }
+
+// Work objects can outlive ProcessGroupImpl and hold a pointer to WorkStream.
+// A proper solution would be to hold a shared_ptr to WorkStreams in Work.
+// Instead, we intentionally leak WorkStreams objects through a circular std::shared_ptr.
+struct WorkStreams;
+struct WorkStream {
+  IntrusiveListLink<WorkStream> link;
+  CUstream stream = nullptr;
+  CUevent event = nullptr;
+  std::shared_ptr<WorkStreams> owner;
+  WorkStream() = default;
+  WorkStream(const WorkStream&) = delete;
+  WorkStream& operator=(const WorkStream&) = delete;
+  ~WorkStream() {
+    if (event) {
+      CHECK_CU(cuEventDestroy(event));
+    }
+    if (stream) {
+      CHECK_CU(cuStreamDestroy(stream));
+    }
+  }
+};
+
+struct WorkStreams {
+  SpinMutex mutex;
+  Vector<std::unique_ptr<WorkStream>> all;
+  IntrusiveList<WorkStream, &WorkStream::link> free;
+};
 
 struct ProcessGroupImpl {
   size_t rank = 0;
@@ -82,6 +107,8 @@ struct ProcessGroupImpl {
   uint32_t nextStepValue = 1;
   uint32_t nextConcurrencyIndex = 0;
   uint32_t nextInternalStepValue = 1;
+
+  HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -99,6 +126,39 @@ struct ProcessGroupImpl {
       std::lock_guard l(activeProcessGroupsMutex);
       activeProcessGroups.push_back(this);
     }
+  }
+
+  WorkStreams* getWorkStreams(CUstream stream) {
+    auto& ptr = workStreams[stream];
+    if (!ptr) {
+      ptr = std::make_unique<WorkStreams>();
+    }
+    return &*ptr;
+  }
+
+  WorkStream* getWorkStream(CUstream stream) {
+    WorkStreams* ws = getWorkStreams(stream);
+    std::unique_lock l(ws->mutex);
+    WorkStream* w;
+    if (!ws->free.empty() && ws->all.size() >= 2) {
+      w = &ws->free.front();
+      ws->free.pop_front();
+    } else {
+      auto ptr = std::make_unique<WorkStream>();
+      w = &*ptr;
+      ws->all.push_back(std::move(ptr));
+
+      w->owner = workStreams[stream];
+      CHECK_CU(cuStreamCreate(&w->stream, CU_STREAM_NON_BLOCKING));
+      CHECK_CU(cuEventCreate(&w->event, CU_EVENT_DISABLE_TIMING));
+      // unsigned long long id1;
+      // unsigned long long id2;
+      // CHECK_CU(cuStreamGetId(w->stream, &id1));
+      // CHECK_CU(cuStreamGetId(stream, &id2));
+      log.info("New work stream %#x created for stream %#x\n", (uintptr_t)w->stream, (uintptr_t)stream);
+    }
+    l.unlock();
+    return w;
   }
 
   void freeMemory() {
@@ -422,9 +482,9 @@ struct ProcessGroupImpl {
     ipcMapper->setStepValue(stepValue);
   }
 
-  void all_gather(at::Tensor& output, const at::Tensor& input) {
-    trace("all_gather");
+  void all_gather(at::Tensor& output, const at::Tensor& input, CUstream stream) {
     std::unique_lock l(mutex);
+    trace("all_gather");
 
     size_t size = this->size;
 
@@ -447,6 +507,8 @@ struct ProcessGroupImpl {
     size_t bytes = input.numel() * input.itemsize();
     size_t outputBytes = bytes * size;
     size_t pitch = bytes;
+
+    // log.info("group size %d doing all-gather of size %d bytes\n", size, bytes);
 
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
@@ -476,7 +538,7 @@ struct ProcessGroupImpl {
       return;
     }
 
-    CUstream stream = c10::cuda::getCurrentCUDAStream();
+    // CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     StreamData& sd = group->getStreamData(stream);
 
@@ -597,9 +659,9 @@ struct ProcessGroupImpl {
     trace("post");
   }
 
-  void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp) {
-    trace("_reduce_scatter_base");
+  void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp, CUstream stream) {
     std::unique_lock l(mutex);
+    trace("_reduce_scatter_base");
 
     size_t size = this->size;
 
@@ -626,6 +688,8 @@ struct ProcessGroupImpl {
     size_t bytes = numel * output.itemsize();
     size_t inputBytes = bytes * size;
     size_t pitch = bytes;
+
+    // log.info("group size %d doing reduce-scatter of size %d bytes\n", size, bytes);
 
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(input.numel() * input.itemsize() == inputBytes);
@@ -703,7 +767,7 @@ struct ProcessGroupImpl {
       return;
     }
 
-    CUstream stream = c10::cuda::getCurrentCUDAStream();
+    // CUstream stream = c10::cuda::getCurrentCUDAStream();
 
     StreamData& sd = group->getStreamData(stream);
 
@@ -1004,15 +1068,37 @@ ProcessGroup::~ProcessGroup() {
 
 struct WorkImpl : c10d::Work {
   std::variant<torch::Tensor, std::vector<torch::Tensor>> var;
+  WorkStream* w = nullptr;
   virtual void synchronize() override {}
   virtual bool wait(std::chrono::milliseconds timeout) override {
+    if (w) {
+      CHECK(w->stream != nullptr);
+      auto currentStream = c10::cuda::getCurrentCUDAStream();
+      CHECK_CU(cuStreamWaitEvent(currentStream, w->event, CU_EVENT_WAIT_DEFAULT));
+      if (var.index() == 0) {
+        std::get<0>(var).record_stream(currentStream);
+      } else {
+        for (auto& t : std::get<1>(var)) {
+          t.record_stream(currentStream);
+        }
+      }
+    }
     return true;
   }
 
-  WorkImpl(torch::Tensor result) : var(result) {}
-  WorkImpl(std::vector<torch::Tensor> result) : var(result) {}
+  WorkImpl(torch::Tensor result, WorkStream* w = nullptr) : var(result), w(w) {}
+  WorkImpl(std::vector<torch::Tensor> result, WorkStream* w = nullptr) : var(result), w(w) {}
+
+  ~WorkImpl() {
+    if (w) {
+      CHECK(w->stream != nullptr);
+      std::lock_guard l(w->owner->mutex);
+      w->owner->free.push_back(*w);
+    }
+  }
 
   virtual c10::intrusive_ptr<c10::ivalue::Future> getFuture() override {
+    CHECK(false);
     std::vector<torch::Tensor> result;
     if (var.index() == 0) {
       result = {std::get<0>(var)};
@@ -1039,13 +1125,12 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(
   }
   auto output =
       torch::empty({(int64_t)impl->size, numel}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
-  impl->all_gather(output, input);
+  CUstream stream = input.is_cuda() ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
+  impl->all_gather(output, input, stream);
   if (input.is_cuda()) {
     size_t n = impl->size;
     for (size_t i = 0; i != n; ++i) {
-      CHECK_CU(cuMemcpyAsync(
-          (uintptr_t)outputList[i].data_ptr(), (uintptr_t)output[i].data_ptr(), bytes,
-          c10::cuda::getCurrentCUDAStream()));
+      CHECK_CU(cuMemcpyAsync((uintptr_t)outputList[i].data_ptr(), (uintptr_t)output[i].data_ptr(), bytes, stream));
     }
   } else {
     size_t n = impl->size;
@@ -1058,14 +1143,40 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(
 
 c10::intrusive_ptr<Work>
 ProcessGroup::_allgather_base(at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
-  impl->all_gather(outputbuffer, inputbuffer);
-  return c10::make_intrusive<WorkImpl>(outputbuffer);
+  bool isCuda = outputbuffer.is_cuda();
+  CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
+  if (isCuda) {
+    WorkStream* w = impl->getWorkStream(stream);
+    CHECK_CU(cuEventRecord(w->event, stream));
+    CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
+    impl->all_gather(outputbuffer, inputbuffer, w->stream);
+    outputbuffer.record_stream(c10::Stream(c10::Stream::UNSAFE, outputbuffer.device(), (c10::StreamId)w->stream));
+    inputbuffer.record_stream(c10::Stream(c10::Stream::UNSAFE, inputbuffer.device(), (c10::StreamId)w->stream));
+    CHECK_CU(cuEventRecord(w->event, w->stream));
+    return c10::make_intrusive<WorkImpl>(outputbuffer, w);
+  } else {
+    impl->all_gather(outputbuffer, inputbuffer, nullptr);
+    return c10::make_intrusive<WorkImpl>(outputbuffer);
+  }
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
     at::Tensor& outputTensor, at::Tensor& inputTensor, const c10d::ReduceScatterOptions& opts) {
-  impl->reduce_scatter(outputTensor, inputTensor, opts.reduceOp);
-  return c10::make_intrusive<WorkImpl>(outputTensor);
+  bool isCuda = outputTensor.is_cuda();
+  CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
+  if (isCuda) {
+    WorkStream* w = impl->getWorkStream(stream);
+    CHECK_CU(cuEventRecord(w->event, stream));
+    CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
+    impl->reduce_scatter(outputTensor, inputTensor, opts.reduceOp, w->stream);
+    outputTensor.record_stream(c10::Stream(c10::Stream::UNSAFE, outputTensor.device(), (c10::StreamId)w->stream));
+    inputTensor.record_stream(c10::Stream(c10::Stream::UNSAFE, inputTensor.device(), (c10::StreamId)w->stream));
+    CHECK_CU(cuEventRecord(w->event, w->stream));
+    return c10::make_intrusive<WorkImpl>(outputTensor, w);
+  } else {
+    impl->reduce_scatter(outputTensor, inputTensor, opts.reduceOp, nullptr);
+    return c10::make_intrusive<WorkImpl>(outputTensor);
+  }
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts) {
@@ -1084,38 +1195,49 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   auto& tensor = tensors[0];
   int64_t numel = tensor.numel();
   TORCH_CHECK(numel > 0);
+  bool isCuda = tensor.is_cuda();
+  CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
+  WorkStream* w = nullptr;
+  if (isCuda) {
+    w = impl->getWorkStream(stream);
+    CHECK_CU(cuEventRecord(w->event, stream));
+    CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
+    stream = w->stream;
+  }
   if (numel % impl->size == 0) {
     auto t = tensor.view({(int64_t)impl->size, -1});
     auto o = t[impl->rank];
-    impl->reduce_scatter(o, t, opts.reduceOp);
-    impl->all_gather(t, o);
-    return c10::make_intrusive<WorkImpl>(tensors);
+    impl->reduce_scatter(o, t, opts.reduceOp, stream);
+    impl->all_gather(t, o, stream);
   } else {
     int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
     size_t bytes = numel * tensor.itemsize();
     torch::Tensor temporary =
         torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
     if (tensor.device().is_cuda()) {
-      CHECK_CU(cuMemcpyAsync(
-          (uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+      CHECK_CU(cuMemcpyAsync((uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, stream));
     } else {
       std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
     }
 
     auto t = temporary.view({(int64_t)impl->size, -1});
     auto o = t[impl->rank];
-    impl->reduce_scatter(o, t, opts.reduceOp);
-    impl->all_gather(t, o);
+    impl->reduce_scatter(o, t, opts.reduceOp, stream);
+    impl->all_gather(t, o, stream);
 
     if (tensor.device().is_cuda()) {
-      CHECK_CU(cuMemcpyAsync(
-          (uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, c10::cuda::getCurrentCUDAStream()));
+      CHECK_CU(cuMemcpyAsync((uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, stream));
     } else {
       std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
     }
-
-    return c10::make_intrusive<WorkImpl>(tensors);
   }
+  if (w) {
+    CHECK(stream == w->stream);
+    tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
+    CHECK_CU(cuEventRecord(w->event, w->stream));
+  }
+
+  return c10::make_intrusive<WorkImpl>(tensors, w);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::gather(
