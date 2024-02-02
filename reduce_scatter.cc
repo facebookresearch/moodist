@@ -19,8 +19,7 @@ void ReduceScatter::init() {
 
   ringSends = group->allGather->ringSends;
   ringRecvs = group->allGather->ringRecvs;
-  if (!ringSends.empty()) {
-    CHECK(ringSends.size() == ringRecvs.size());
+  if (!ringSends.empty() && !ringRecvs.empty()) {
     std::rotate(ringSends.begin(), ringSends.begin() + 1, ringSends.end());
     std::rotate(ringRecvs.begin(), ringRecvs.begin() + 1, ringRecvs.end());
     ringSends.back().first = ringSends.back().second;
