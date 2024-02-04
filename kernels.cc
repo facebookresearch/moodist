@@ -507,8 +507,8 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
 
 )z";
 
-    gridSize = 16;
-    blockSize = 256;
+  gridSize = 16;
+  blockSize = 256;
   size_t blocksPerSm = 1;
 
   // source = replace(

@@ -318,12 +318,12 @@ struct CpuThreadImpl {
   std::vector<RemoteAddressAndKey> remoteCpuCommsDeviceDataSent2 =
       distributeAddressAndKeys((uintptr_t)group->cpuCommsDeviceDataSent2.buffer.cpuPointer, cpuCommsDeviceDataSent2Mr);
 
-  AllocatedArray sendStepValuesStorage = group->allocateArrayHost(sizeof(uint32_t), Group::maxConcurrency);
-  MemoryRegistration* sendStepValuesStorageMr =
-      regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
-  uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
+  // AllocatedArray sendStepValuesStorage = group->allocateArrayHost(sizeof(uint32_t), Group::maxConcurrency);
+  // MemoryRegistration* sendStepValuesStorageMr =
+  //     regMr((uintptr_t)sendStepValuesStorage.buffer.cpuPointer, sendStepValuesStorage.buffer.bytes);
+  // uint32_t* sendStepValues = (uint32_t*)sendStepValuesStorage.buffer.cpuPointer;
 
-  AllocatedArray sendStepValues2Storage = group->allocateArrayHost(sizeof(uint32_t), 32 * 32 * Group::maxConcurrency);
+  AllocatedArray sendStepValues2Storage = group->allocateArrayHost(sizeof(uint32_t), 32 * 1024 * Group::maxConcurrency);
   MemoryRegistration* sendStepValues2StorageMr =
       regMr((uintptr_t)sendStepValues2Storage.buffer.cpuPointer, sendStepValues2Storage.buffer.bytes);
   uint32_t* sendStepValues2 = (uint32_t*)sendStepValues2Storage.buffer.cpuPointer;
@@ -437,8 +437,29 @@ struct CpuThreadImpl {
         } else {
           --dev.currentCqEntries;
           if (dev.currentCqEntries == 0) {
+            bool found = false;
+            for (auto& v : activeDevices) {
+              if (&v == &dev) {
+                found = true;
+              }
+            }
+            CHECK(found);
             activeDevices.erase(dev);
+            // log.info(
+            //     "%d: pop dev %d, active -> %d\n", rank, &dev - devices.data(),
+            //     std::distance(activeDevices.begin(), activeDevices.end()));
+
+            found = false;
+            for (auto& v : activeDevices) {
+              if (&v == &dev) {
+                found = true;
+              }
+            }
+            CHECK(!found);
           }
+          // log.info(
+          //     "%d: wr %#x (dev %d) done, cq -> %d (active %d)\n", rank, wc.wr_id, &dev - devices.data(),
+          //     dev.currentCqEntries, std::distance(activeDevices.begin(), activeDevices.end()));
           if (wc.wr_id) {
             Callback* callback = (Callback*)(void*)wc.wr_id;
             callback->decref();
@@ -470,14 +491,24 @@ struct CpuThreadImpl {
       }
       ++dev.currentCqEntries;
       if (dev.currentCqEntries == 1) {
+        bool found = false;
+        for (auto& v : activeDevices) {
+          if (&v == &dev) {
+            found = true;
+          }
+        }
+        CHECK(!found);
         activeDevices.push_back(dev);
+        // log.info(
+        //     "%d: add dev %d, active -> %d\n", rank, &dev - devices.data(),
+        //     std::distance(activeDevices.begin(), activeDevices.end()));
       }
 
       ibv_qp_ex* qp = dev.ib->qpex;
 
       // fmt::printf(
-      //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
-      //     remoteAddress, rkey, &dev - devices.data(), i);
+      //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes, localAddress,
+      //     remoteAddress, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
 
       bool efa = qp != nullptr;
       if (!efa) {
@@ -666,8 +697,12 @@ struct CpuThreadImpl {
     // localProgress[size * concurrencyIndex + rank].stepValue = stepValue;
     if (writeStepBusy[size * concurrencyIndex + dst]) {
       writeStepQueue[size * concurrencyIndex + dst].emplace_back(deviceIndex, stepValue);
+      // log.info(
+      //     "Rank %d write step %d %d %#x %d busy, enqueue -> %d\n", rank, deviceIndex, dst, stepValue,
+      //     concurrencyIndex, writeStepQueue[size * concurrencyIndex + dst].size());
       return;
     }
+    // log.info("Rank %d write step %d %d %#x %d!\n", rank, deviceIndex, dst, stepValue, concurrencyIndex);
     writeStepBusy[size * concurrencyIndex + dst] = 1;
     uint32_t& val = ((uint32_t*)writeStepStorage.cpu(concurrencyIndex))[dst];
     val = stepValue;
@@ -676,6 +711,7 @@ struct CpuThreadImpl {
         remoteComms[dst].keys[deviceIndex], sizeof(stepValue), makeCallback([this, concurrencyIndex, dst] {
           writeStepBusy[size * concurrencyIndex + dst] = 0;
           auto& q = writeStepQueue[size * concurrencyIndex + dst];
+          // log.info("Rank %d write step ? %d ? %d  done, q.size() %d\n", rank, dst, concurrencyIndex, q.size());
           if (!q.empty()) {
             auto [deviceIndex, stepValue] = q.front();
             q.pop_front();
@@ -915,9 +951,28 @@ struct CpuThreadImpl {
     }
   };
 
+#define SENDSTEPVALUE_SETUP                                                                                            \
+  if (self.sendStepValues2Counter == 0) {                                                                              \
+    while (true) {                                                                                                     \
+      {                                                                                                                \
+        size_t n = 0;                                                                                                  \
+        for (auto& dev : self.devices) {                                                                               \
+          n += dev.currentCqEntries;                                                                                   \
+        }                                                                                                              \
+        if (n == 0) {                                                                                                  \
+          break;                                                                                                       \
+        }                                                                                                              \
+      }                                                                                                                \
+      YIELD                                                                                                            \
+    }                                                                                                                  \
+  }                                                                                                                    \
+  sendStepValue = &self.sendStepValues2[32 * 1024 * concurrencyIndex + 32 * ((self.sendStepValues2Counter++) % 1024)]; \
+  *sendStepValue = stepValue;
+
   struct WorkInternalBarrier : Work {
     QueueEntryBarrier& params;
     size_t i;
+    uint32_t* sendStepValue;
 
     WorkInternalBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self, params), params(params) {}
 
@@ -927,6 +982,9 @@ struct CpuThreadImpl {
 
     void step() {
       ENTER
+
+      SENDSTEPVALUE_SETUP;
+
       for (size_t i = 0; i != size; ++i) {
         if (i == rank) {
           continue;
@@ -934,9 +992,8 @@ struct CpuThreadImpl {
 
         size_t deviceIndex = (rank + i) % self.devices.size();
         Device& dev = self.devices[deviceIndex];
-        self.sendStepValues[concurrencyIndex] = stepValue;
         self.writeData(
-            dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[deviceIndex]->lkey,
+            dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[deviceIndex]->lkey,
             (void*)(self.remoteInternalLocalProgressBuffer[i].address + sizeof(uint32_t) * (size * concurrencyIndex + rank)),
             self.remoteInternalLocalProgressBuffer[i].keys[deviceIndex], sizeof(stepValue));
       }
@@ -962,6 +1019,7 @@ struct CpuThreadImpl {
     MemoryRegistration* inputMr;
     size_t liveSends;
     size_t index;
+    uint32_t* sendStepValue;
 
     const AllGather& allGather = *self.group->allGather;
     const Vector<size_t>& sendRanks = allGather.sendRanks;
@@ -1009,7 +1067,7 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      self.sendStepValues[concurrencyIndex] = stepValue;
+      SENDSTEPVALUE_SETUP;
 
       CHECK(recvRanks.size() == sendRanks.size());
 
@@ -1046,7 +1104,7 @@ struct CpuThreadImpl {
                 if (ordered) {
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
@@ -1141,11 +1199,7 @@ struct CpuThreadImpl {
 
       self.trace("reduce-scatter ring %#x", stepValue);
 
-      sendStepValue = &self.sendStepValues2[32 * 32 * concurrencyIndex + 32 * ((self.sendStepValues2Counter++) % 32)];
-      *sendStepValue = stepValue;
-      for (size_t i = 0; i != numChunks; ++i) {
-        sendStepValue[i] = stepValue + i;
-      }
+      SENDSTEPVALUE_SETUP;
 
       {
         uintptr_t recvAddress = params.sd->recvBuffer.cudaPointer;
@@ -1429,11 +1483,7 @@ struct CpuThreadImpl {
 
       self.trace("ring %#x", stepValue);
 
-      sendStepValue = &self.sendStepValues2[32 * 32 * concurrencyIndex + 32 * ((self.sendStepValues2Counter++) % 32)];
-      *sendStepValue = stepValue;
-      for (size_t i = 0; i != numChunks; ++i) {
-        sendStepValue[i] = stepValue + i;
-      }
+      SENDSTEPVALUE_SETUP;
 
       anyEfa = false;
       for (auto& dev : self.devices) {
@@ -1685,6 +1735,9 @@ struct CpuThreadImpl {
     TemporaryBufferHandle outputBuffer;
     size_t liveSends;
     size_t index;
+    size_t recvIndex;
+    size_t proxyIndex;
+    uint32_t* sendStepValue;
 
     const AllGather& allGather = *self.group->allGather;
     const Vector<size_t>& sendRanks = allGather.sendRanks;
@@ -1713,6 +1766,8 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
+      // log.info("Rank %d enter step %#x\n", rank, stepValue);
+
       {
         // Registering the input/output addrs directly here would be fragile, as we cannot
         // check if a previous registration for this address corresponds to the same
@@ -1728,6 +1783,7 @@ struct CpuThreadImpl {
         for (size_t i : recvRanks) {
           outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + params.pitch * i;
           outDyns[i].gatherBytes = params.bytes;
+          outDyns[i].stepValue = stepValue;
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = outputBuffer.mr->mrs[di]->rkey;
           }
@@ -1736,6 +1792,7 @@ struct CpuThreadImpl {
         {
           size_t n = 0;
           for (size_t i : recvRanks) {
+            // log.info("Rank %d step %#x send dyn to %d\n", rank, stepValue, i);
             size_t di = (rank + n) % self.devices.size();
             auto& dev = self.devices[di];
             self.writeData(
@@ -1762,12 +1819,13 @@ struct CpuThreadImpl {
         }
       }
 
-      self.sendStepValues[concurrencyIndex] = stepValue;
+      SENDSTEPVALUE_SETUP;
 
       liveSends = 0;
       for (index = 0; index != sendRanks.size(); ++index) {
         i = sendRanks[index];
-        // wait for dyns
+        // log.info("Rank %d step %#x wait for dyn from %d\n", rank, stepValue, i);
+        //  wait for dyns
         while (self.localProgress[size * concurrencyIndex + i].stepValue < stepValue) {
           YIELD
         }
@@ -1776,6 +1834,8 @@ struct CpuThreadImpl {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
           CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
+
+          // log.info("Rank %d begin send to %d\n", self.rank, i);
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
@@ -1786,9 +1846,10 @@ struct CpuThreadImpl {
                   --liveSends;
                 }
                 if (ordered) {
+                  // log.info("Rank %d finished send to %d\n", self.rank, i);
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
@@ -1803,44 +1864,97 @@ struct CpuThreadImpl {
       for (size_t peerIndex : peerIndices) {
         auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
         CHECK(x->bytes == params.bytes);
+        CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
         size_t i = ipcRanks[peerIndex];
         vmcopy(params.outputAddress + params.pitch * i, x->pid, x->inputAddress, params.bytes);
       }
 
-      {
-        for (index = 0; index != std::max(proxyDestinationInfo.size(), proxyInfo.size()); ++index) {
-          if (index < proxyInfo.size()) {
-            i = proxyInfo[index].source;
-            if (prevRecvSource != i) {
-              for (di = 0; di != self.devices.size(); ++di) {
-                while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) <
-                       stepValue) {
-                  YIELD
-                }
+      recvIndex = 0;
+      proxyIndex = 0;
+      while (recvIndex != proxyInfo.size() || proxyIndex != proxyDestinationInfo.size()) {
+        if (recvIndex != proxyInfo.size()) {
+          size_t i = proxyInfo[recvIndex].source;
+          if (prevRecvSource != i) {
+            bool received = true;
+            for (size_t di = 0; di != self.devices.size(); ++di) {
+              if (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+                received = false;
+                break;
               }
+            }
+            if (received) {
               prevRecvSource = i;
+              continue;
             }
-
+          } else {
+            // log.info("rank %d got recv source %d (forward to %d)\n", rank, i, proxyInfo[recvIndex].destination);
             self.group->getPeerVar(
-                proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
+                proxyInfo[recvIndex].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
                 stepValue;
+            ++recvIndex;
 
-            // std::memcpy(
-            //     (void*)(params.outputAddress + params.pitch * i),
-            //     (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
-          }
-          if (index < proxyDestinationInfo.size()) {
-            i = proxyDestinationInfo[index].source;
-            while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
-              YIELD
-            }
-
-            auto& pdi = proxyDestinationInfo[index];
-
-            auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
-            vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
+            // log.info(
+            //     "rank %d next recv source is %d\n", rank,
+            //     recvIndex == proxyInfo.size() ? -1 : proxyInfo[recvIndex].source);
+            continue;
           }
         }
+        if (proxyIndex != proxyDestinationInfo.size()) {
+          size_t i = proxyDestinationInfo[proxyIndex].source;
+          if (self.group->cpuProxyReady[size * concurrencyIndex + i] >= stepValue) {
+            // log.info("rank %d got proxy source %d\n", rank, i);
+
+            auto& pdi = proxyDestinationInfo[proxyIndex];
+
+            auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+            CHECK(x->bytes == params.bytes);
+            CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
+            vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
+            ++proxyIndex;
+            // log.info(
+            //     "rank %d next proxy source is %d\n", rank,
+            //     proxyIndex == proxyDestinationInfo.size() ? -1 : proxyDestinationInfo[proxyIndex].source);
+            continue;
+          }
+        }
+        YIELD
+        // for (index = 0; index != std::max(proxyDestinationInfo.size(), proxyInfo.size()); ++index) {
+        //   if (index < proxyInfo.size()) {
+        //     i = proxyInfo[index].source;
+        //     if (prevRecvSource != i) {
+        //       for (di = 0; di != self.devices.size(); ++di) {
+        //         log.info("rank %d wait for recv source %d\n", rank, i);
+        //         while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) <
+        //                stepValue) {
+        //           YIELD
+        //         }
+        //         log.info("rank %d got recv source %d\n", rank, i);
+        //       }
+        //       prevRecvSource = i;
+        //     }
+
+        //     self.group->getPeerVar(
+        //         proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
+        //         stepValue;
+
+        //     // std::memcpy(
+        //     //     (void*)(params.outputAddress + params.pitch * i),
+        //     //     (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
+        //   }
+        // if (index < proxyDestinationInfo.size()) {
+        //   i = proxyDestinationInfo[index].source;
+        //   log.info("rank %d wait for proxy source %d\n", rank, i);
+        //   while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
+        //     YIELD
+        //   }
+        //   log.info("rank %d got proxy source %d\n", rank, i);
+
+        //   auto& pdi = proxyDestinationInfo[index];
+
+        //   auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+        //   CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
+        //   vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
+        // }
       }
 
       for (index = 0; index != recvRanks.size(); ++index) {
@@ -1886,6 +2000,7 @@ struct CpuThreadImpl {
     size_t index;
     size_t nDynReady = 0;
     uintptr_t sendAddress;
+    uint32_t* sendStepValue;
 
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
     const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
@@ -1948,7 +2063,7 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      self.sendStepValues[concurrencyIndex] = stepValue;
+      SENDSTEPVALUE_SETUP;
 
       CHECK(recvRanks.size() == sendRanks.size());
 
@@ -1986,7 +2101,7 @@ struct CpuThreadImpl {
                 if (ordered) {
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCudaCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCudaCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
@@ -2025,6 +2140,8 @@ struct CpuThreadImpl {
 
     TemporaryBufferHandle sendBuffer;
     TemporaryBufferHandle recvBuffer;
+
+    uint32_t* sendStepValue;
 
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
     const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
@@ -2138,7 +2255,7 @@ struct CpuThreadImpl {
         }
       }
 
-      self.sendStepValues[concurrencyIndex] = stepValue;
+      SENDSTEPVALUE_SETUP;
 
       // CHECK(recvRanks.size() == sendRanks.size());
 
@@ -2150,6 +2267,7 @@ struct CpuThreadImpl {
           reduceAdd<dtype, reduction>(addr, params.inputAddress + params.pitch * i);
           for (size_t peerIndex : peerIndices) {
             auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+            CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
             reduceAdd<dtype, reduction>(addr, vmread(x->pid, x->inputAddress + params.pitch * i, params.bytes));
           }
         }
@@ -2175,7 +2293,7 @@ struct CpuThreadImpl {
                 if (ordered) {
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
@@ -2189,6 +2307,7 @@ struct CpuThreadImpl {
       reduceAdd<dtype, reduction>(params.outputAddress, params.inputAddress + params.pitch * rank);
       for (size_t peerIndex : peerIndices) {
         auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+        CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
         reduceAdd<dtype, reduction>(
             params.outputAddress, vmread(x->pid, x->inputAddress + params.pitch * rank, params.bytes));
       }
@@ -2356,6 +2475,7 @@ struct CpuThreadImpl {
     TemporaryBufferHandle temporaryBuffer;
     size_t liveSends;
     size_t index;
+    uint32_t* sendStepValue;
 
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
@@ -2435,7 +2555,7 @@ struct CpuThreadImpl {
           std::memcpy((void*)params.tensorAddress, (void*)(uintptr_t)temporaryBuffer->cpuPointer, params.bytes);
         }
       } else if (rank == params.sourceRank) {
-        self.sendStepValues[concurrencyIndex] = stepValue;
+        SENDSTEPVALUE_SETUP;
 
         for (i = 0; i != size; ++i) {
           if (i == rank || self.group->ipcAccess[i]) {
@@ -2462,7 +2582,7 @@ struct CpuThreadImpl {
                   if (ordered) {
                     auto& dev = self.devices[di];
                     self.writeData(
-                        dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                        dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                         (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                         self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                   }
@@ -2505,6 +2625,7 @@ struct CpuThreadImpl {
     TemporaryBufferHandle outputBuffer;
     size_t liveSends;
     size_t index;
+    uint32_t* sendStepValue;
 
     const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
     const std::vector<size_t>& peerIndices = self.group->peerIndices;
@@ -2588,7 +2709,7 @@ struct CpuThreadImpl {
 
       if (rank == params.destinationRank) {
       } else if (!self.group->ipcAccess[params.destinationRank]) {
-        self.sendStepValues[concurrencyIndex] = stepValue;
+        SENDSTEPVALUE_SETUP;
 
         i = params.destinationRank;
         // wait for dyns
@@ -2612,7 +2733,7 @@ struct CpuThreadImpl {
                 if (ordered) {
                   auto& dev = self.devices[di];
                   self.writeData(
-                      dev, i, &self.sendStepValues[concurrencyIndex], self.sendStepValuesStorageMr->mrs[di]->lkey,
+                      dev, i, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
                       (void*)(self.remoteCpuCommsDeviceDataSent[i].address + sizeof(uint32_t) * (32 * size * concurrencyIndex + 32 * self.rank + di)),
                       self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
