@@ -110,6 +110,8 @@ struct ProcessGroupImpl {
 
   HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
 
+  WorkStream copyWorkStream;
+
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
 
@@ -637,8 +639,18 @@ struct ProcessGroupImpl {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     } else if (isNoLocal) {
+      if (!copyWorkStream.stream) {
+        CHECK_CU(cuStreamCreate(&copyWorkStream.stream, CU_STREAM_NON_BLOCKING));
+        CHECK_CU(cuEventCreate(&copyWorkStream.event, CU_EVENT_DISABLE_TIMING));
+      }
+      CHECK_CU(cuEventRecord(copyWorkStream.event, stream));
+
       CHECK_CU(cuLaunchKernel(group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
-      CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, stream));
+
+      CHECK_CU(cuStreamWaitEvent(copyWorkStream.stream, copyWorkStream.event, CU_EVENT_WAIT_DEFAULT));
+      CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, copyWorkStream.stream));
+      CHECK_CU(cuEventRecord(copyWorkStream.event, copyWorkStream.stream));
+      CHECK_CU(cuStreamWaitEvent(stream, copyWorkStream.event, CU_EVENT_WAIT_DEFAULT));
     } else {
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
@@ -973,7 +985,7 @@ struct ProcessGroupImpl {
   }
 
   void gather(const std::vector<at::Tensor>& outputList, const at::Tensor& input, uint32_t destinationRank) {
-    trace("all_gather");
+    trace("gather");
     std::unique_lock l(mutex);
 
     size_t size = this->size;
