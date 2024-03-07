@@ -1930,43 +1930,6 @@ struct CpuThreadImpl {
           }
         }
         YIELD
-        // for (index = 0; index != std::max(proxyDestinationInfo.size(), proxyInfo.size()); ++index) {
-        //   if (index < proxyInfo.size()) {
-        //     i = proxyInfo[index].source;
-        //     if (prevRecvSource != i) {
-        //       for (di = 0; di != self.devices.size(); ++di) {
-        //         log.info("rank %d wait for recv source %d\n", rank, i);
-        //         while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) <
-        //                stepValue) {
-        //           YIELD
-        //         }
-        //         log.info("rank %d got recv source %d\n", rank, i);
-        //       }
-        //       prevRecvSource = i;
-        //     }
-
-        //     self.group->getPeerVar(
-        //         proxyInfo[index].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
-        //         stepValue;
-
-        //     // std::memcpy(
-        //     //     (void*)(params.outputAddress + params.pitch * i),
-        //     //     (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
-        //   }
-        // if (index < proxyDestinationInfo.size()) {
-        //   i = proxyDestinationInfo[index].source;
-        //   log.info("rank %d wait for proxy source %d\n", rank, i);
-        //   while (self.group->cpuProxyReady[size * concurrencyIndex + i] < stepValue) {
-        //     YIELD
-        //   }
-        //   log.info("rank %d got proxy source %d\n", rank, i);
-
-        //   auto& pdi = proxyDestinationInfo[index];
-
-        //   auto* x = self.group->getPeerVar(pdi.proxyPeerIndex, &self.group->cpuAddresses[concurrencyIndex]);
-        //   CHECK(x->stepValue == stepValue || x->stepValue == stepValue + 1);
-        //   vmcopy(params.outputAddress + params.pitch * i, x->pid, x->outputAddress + params.pitch * i, params.bytes);
-        // }
       }
 
       for (index = 0; index != recvRanks.size(); ++index) {
