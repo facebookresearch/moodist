@@ -1498,19 +1498,25 @@ struct CpuThreadImpl {
         // EFA throws a IBV_WC_BAD_RESP_ERR if we try to write into a MR at an offset > 2GB.
         // Thus, we register each ranks output address independently, so they get different MRs.
         // TODO: split this into chunks of ~2GB instead.
-        for (auto [i, neighbor] : ringRecvs) {
-          auto* mr =
-              self.regMrCuda(params.outputAddress + params.pitch * i, anyEfa ? params.bytes : params.pitch * size);
-          self.outDynsMrVector[size * concurrencyIndex + i] = mr;
-          outDyns[i].gatherAddress = params.outputAddress;
-          outDyns[i].gatherBytes = params.bytes;
-          outDyns[i].stepValue = stepValue;
-          for (size_t di = 0; di != self.devices.size(); ++di) {
-            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+        if (anyEfa) {
+          for (auto [i, neighbor] : ringRecvs) {
+            auto* mr = self.regMrCuda(params.outputAddress + params.pitch * i, params.bytes);
+            self.outDynsMrVector[size * concurrencyIndex + i] = mr;
+            outDyns[i].gatherAddress = params.outputAddress;
+            outDyns[i].gatherBytes = params.bytes;
+            outDyns[i].stepValue = stepValue;
+            for (size_t di = 0; di != self.devices.size(); ++di) {
+              outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+            }
           }
-
-          if (!anyEfa) {
-            break;
+        } else {
+          auto* mr = self.regMrCuda(params.outputAddress, params.pitch * size);
+          self.outDynsMrVector[size * concurrencyIndex + 0] = mr;
+          outDyns[0].gatherAddress = params.outputAddress;
+          outDyns[0].gatherBytes = params.bytes;
+          outDyns[0].stepValue = stepValue;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[0].gatherKey[di] = mr->mrs[di]->rkey;
           }
         }
 
@@ -1650,6 +1656,7 @@ struct CpuThreadImpl {
               }
               ++state.liveSends;
               DynamicAddresses& dyn = self.localDyns[size * concurrencyIndex + (anyEfa ? index : 0)];
+              CHECK(dyn.stepValue == stepValue);
               CHECK(dyn.gatherBytes == params.bytes);
               uintptr_t dstAddr = dyn.gatherAddress + params.pitch * source;
               auto key = dyn.gatherKey;
@@ -1715,6 +1722,10 @@ struct CpuThreadImpl {
         CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 0);
         CHECK(self.dynReadyVector[size * concurrencyIndex + index] != 2);
         self.dynReadyVector[size * concurrencyIndex + index] = 0;
+
+        if (!anyEfa) {
+          break;
+        }
       }
 
       // log.info("exit kernel %d ok\n", stepValue);
@@ -1834,6 +1845,7 @@ struct CpuThreadImpl {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
           CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
+          CHECK(self.localDyns[size * concurrencyIndex + i].stepValue == stepValue);
 
           // log.info("Rank %d begin send to %d\n", self.rank, i);
 
