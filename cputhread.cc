@@ -2622,6 +2622,290 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkBroadcastRingCpu : Work {
+    QueueEntryBroadcastCpu& params;
+    // size_t i;
+    // size_t di;
+    size_t offset;
+    TemporaryBufferHandle temporaryBuffer;
+    size_t liveSends;
+    size_t index;
+    uint32_t* sendStepValue;
+
+    const std::vector<size_t>& ipcRanks = self.group->ipcRanks;
+    const std::vector<size_t>& peerIndices = self.group->peerIndices;
+
+    const AllGather& allGather = *self.group->allGather;
+    size_t recvFrom = rank;
+    size_t sendTo = rank;
+    Vector<ProxyInfo*>* proxyInfo = nullptr;
+    ProxyDestinationInfo* proxyDestination = nullptr;
+
+    static const size_t numChunks = 8;
+    const size_t chunkSize = params.bytes < (size_t)65536 * 96
+                                 ? params.bytes
+                                 : std::max((params.bytes + numChunks - 1) / numChunks, (size_t)65536 * 72);
+    const size_t numParallel = std::max(std::min((params.bytes + chunkSize - 1) / chunkSize / 2, (size_t)2), (size_t)1);
+
+    struct SendState {
+      size_t chunkIndex;
+      size_t liveSends;
+    };
+    const size_t nDevices = self.devices.size();
+    std::array<SendState, 32> sendStates;
+
+    WorkBroadcastRingCpu(CpuThreadImpl& self, QueueEntryBroadcastCpu& params) : Work(self, params), params(params) {
+      auto recvi = allGather.ringRecvsBySource.find(params.sourceRank);
+      if (recvi != allGather.ringRecvsBySource.end()) {
+        recvFrom = recvi->second;
+      }
+      auto sendi = allGather.ringSendsBySource.find(params.sourceRank);
+      if (sendi != allGather.ringSendsBySource.end()) {
+        sendTo = sendi->second;
+      }
+      auto pi = allGather.proxyInfoBySource.find(params.sourceRank);
+      if (pi != allGather.proxyInfoBySource.end()) {
+        proxyInfo = &pi->second;
+      }
+      auto pdi = allGather.proxyDestinationInfoBySource.find(params.sourceRank);
+      if (pdi != allGather.proxyDestinationInfoBySource.end()) {
+        proxyDestination = pdi->second;
+      }
+    }
+
+    void callback(size_t di, size_t source, size_t chunkIndex, size_t neighbor, bool ordered, bool done) {
+      if (done) {
+        --sendStates[di].liveSends;
+      }
+      if (ordered) {
+        auto& dev = self.devices[di];
+        self.writeData(
+            dev, neighbor, sendStepValue, self.sendStepValues2StorageMr->mrs[di]->lkey,
+            (void*)(self.remoteCpuCommsDeviceDataSent2[neighbor].address + sizeof(uint32_t) * (32 * 32 * size * concurrencyIndex + 32 * 32 * source + 32 * di + chunkIndex)),
+            self.remoteCpuCommsDeviceDataSent2[neighbor].keys[di], sizeof(stepValue));
+      }
+    }
+
+    void vmcopy(uintptr_t dst, int pid, uintptr_t src, size_t bytes) {
+      iovec local;
+      local.iov_base = (void*)dst;
+      local.iov_len = bytes;
+      iovec remote;
+      remote.iov_base = (void*)src;
+      remote.iov_len = bytes;
+      if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != bytes) {
+        fatal("process_vm_readv failed with error: %s", std::strerror(errno));
+      }
+    }
+
+    void step() {
+      ENTER
+
+      SENDSTEPVALUE_SETUP;
+
+      if (rank != params.sourceRank && !self.group->ipcAccess[params.sourceRank]) {
+
+        if (recvFrom != rank) {
+          // log.info("I will receive the broadcast data directly from neighbor %d!", recvFrom);
+
+          CHECK(proxyDestination == nullptr);
+
+          temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+
+          DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+          outDyns[0].gatherAddress = (uintptr_t)temporaryBuffer->cpuPointer;
+          outDyns[0].gatherBytes = params.bytes;
+          outDyns[0].stepValue = params.stepValue;
+          outDyns[0].opType = opTypeBroadcastRingCpu;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[0].gatherKey[di] = temporaryBuffer.mr->mrs[di]->rkey;
+          }
+
+          size_t di = (rank + 0) % self.devices.size();
+          auto& dev = self.devices[di];
+
+          auto offset = self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + 0]);
+
+          CHECK(self.dynReadyVector[size * concurrencyIndex + 0] == 0);
+
+          auto dynCompletion = [this, di, recvFrom = recvFrom]() {
+            auto& dev = self.devices[di];
+            self.writeData(dev, recvFrom,
+                            sendStepValue,
+                            self.sendStepValues2StorageMr->mrs[di]->lkey,
+                            (void*)(self.remoteComms[recvFrom].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + 0].stepValue)),
+                            self.remoteComms[recvFrom].keys[di],
+                            sizeof(stepValue));
+          };
+          self.writeData(
+              dev, recvFrom, &outDyns[0], self.outDynsMr->mrs[di]->lkey,
+              (void*)(self.remoteComms[recvFrom].address + offset), self.remoteComms[recvFrom].keys[di],
+              sizeof(DynamicAddresses), dev.ordered ? nullptr : self.makeCallback(dynCompletion));
+          if (dev.ordered) {
+            dynCompletion();
+          }
+        } else {
+          CHECK(proxyInfo == nullptr);
+          CHECK(proxyDestination != nullptr);
+          CHECK(sendTo == rank);
+          // log.info("I will receive the broadcast data indirectly from peer rank %d!", proxyDestination->proxy);
+        }
+      } else if (rank == params.sourceRank) {
+        temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+        std::memcpy(temporaryBuffer->cpuPointer, (void*)params.tensorAddress, params.bytes);
+        CHECK(proxyInfo == nullptr);
+        CHECK(proxyDestination == nullptr);
+        CHECK(recvFrom == rank);
+      } else {
+        CHECK(self.group->ipcAccess[params.sourceRank]);
+        CHECK(proxyInfo == nullptr);
+        CHECK(proxyDestination == nullptr);
+        CHECK(recvFrom == rank);
+        CHECK(sendTo == rank);
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].inputAddress = params.tensorAddress;
+      self.group->cpuAddresses[concurrencyIndex].outputAddress = params.tensorAddress;
+      self.group->cpuAddresses[concurrencyIndex].bytes = params.bytes;
+      self.group->cpuAddresses[concurrencyIndex].pid = self.group->pid;
+
+      liveSends = 0;
+
+      if (sendTo != rank || recvFrom != rank) {
+
+        for (size_t i = 0; i != nDevices; ++i) {
+          sendStates[i].chunkIndex = 0;
+          sendStates[i].liveSends = 0;
+        }
+
+        if (sendTo != rank) {
+          // wait for dyns
+          while (self.localProgress2[size * concurrencyIndex + 0].stepValue < stepValue) {
+            YIELD
+          }
+          DynamicAddresses& dyn = self.localDyns[size * concurrencyIndex + 0];
+          CHECK_DYN(dyn, opTypeBroadcastRingCpu, stepValue, params.bytes);
+        }
+
+        while (true) {
+          {
+            size_t nDone = 0;
+            for (size_t i = 0; i != nDevices; ++i) {
+              auto& state = sendStates[i];
+              auto& dev = self.devices[i];
+              if (!dev.ordered) {
+                if (state.liveSends >= numParallel) {
+                  continue;
+                }
+              }
+              if (state.chunkIndex == numChunks) {
+                if (state.liveSends) {
+                  continue;
+                }
+                ++nDone;
+                continue;
+              }
+
+              size_t chunkIndex = state.chunkIndex;
+              size_t source = params.sourceRank;
+              size_t neighbor = sendTo;
+
+              size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+              const size_t devChunkSize = currentChunkSize / nDevices / 1024u * 1024u;
+              size_t offset = devChunkSize * i;
+              size_t n = i == nDevices - 1 ? currentChunkSize - offset : devChunkSize;
+              bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+              size_t sendOffset = chunkSize * chunkIndex + offset;
+              if (sendTo != rank) {
+                if (n == 0) {
+                  ++state.liveSends;
+                  callback(i, source, chunkIndex, neighbor, true, true);
+                } else {
+                  if (source != rank) {
+                    if (*(&self.group->cpuCommsDeviceDataSent2.at<uint32_t>(concurrencyIndex) + 32 * 32 * source +
+                          32 * i + chunkIndex) < stepValue) {
+                      continue;
+                    }
+                  }
+                  uintptr_t srcAddr = (uintptr_t)temporaryBuffer->cpuPointer;
+                  auto* srcMr = temporaryBuffer.mr;
+
+                  DynamicAddresses& dyn = self.localDyns[size * concurrencyIndex + 0];
+
+                  ++state.liveSends;
+                  uintptr_t dstAddr = dyn.gatherAddress;
+                  auto key = dyn.gatherKey;
+                  bool efa = dev.ib->qpex != nullptr;
+                  self.writeData(
+                      dev, neighbor, (void*)(srcAddr + sendOffset), srcMr->mrs[i]->lkey, (void*)(dstAddr + sendOffset),
+                      key[i], n, self.makeCallback([me = this, i, efa, source, chunkIndex, neighbor]() {
+                        me->callback(i, source, chunkIndex, neighbor, efa, true);
+                      }));
+                  if (!efa) {
+                    callback(i, source, chunkIndex, neighbor, true, false);
+                  }
+                }
+              } else {
+                CHECK(source != rank);
+                if (*(&self.group->cpuCommsDeviceDataSent2.at<uint32_t>(concurrencyIndex) + 32 * 32 * source + 32 * i +
+                      chunkIndex) < stepValue) {
+                  continue;
+                }
+              }
+              std::memcpy(
+                  (void*)(params.tensorAddress + sendOffset),
+                  (void*)((uintptr_t)temporaryBuffer->cpuPointer + sendOffset), n);
+
+              if (isLastChunk) {
+                state.chunkIndex = numChunks;
+              } else {
+                ++state.chunkIndex;
+                CHECK(state.chunkIndex < numChunks);
+              }
+            }
+            if (nDone == nDevices) {
+              break;
+            }
+          }
+          YIELD
+        }
+      }
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue;
+
+      if (proxyDestination != nullptr || self.group->ipcAccess[params.sourceRank]) {
+        index = proxyDestination ? proxyDestination->proxyPeerIndex : self.group->getPeerIndex(params.sourceRank);
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue) {
+          YIELD
+        }
+        auto* x = self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex]);
+        CHECK(x->bytes == params.bytes);
+        vmcopy(params.tensorAddress, x->pid, x->inputAddress, params.bytes);
+      }
+
+      while (liveSends) {
+        YIELD
+      }
+
+      self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
+      for (index = 0; index != ipcRanks.size(); ++index) {
+        while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+
+      temporaryBuffer = {};
+
+      self.cpuThread->freelistBroadcastCpu.push(&params);
+      self.allocatorBroadcastRingCpu.deallocate(this);
+      DONE
+    }
+  };
+
   struct WorkGatherCpu : Work {
     QueueEntryGatherCpu& params;
     size_t i;
@@ -2829,6 +3113,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
   WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
   WorkAllocator<WorkBroadcastCpu> allocatorBroadcastCpu;
+  WorkAllocator<WorkBroadcastRingCpu> allocatorBroadcastRingCpu;
 
   size_t numActiveWorks = 0;
 
@@ -2899,7 +3184,8 @@ struct CpuThreadImpl {
             } else if (queueEntry.task == taskGatherCpu) {
               enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskBroadcastCpu) {
-              enqueue(allocatorBroadcastCpu, (QueueEntryBroadcastCpu&)queueEntry);
+              // enqueue(allocatorBroadcastCpu, (QueueEntryBroadcastCpu&)queueEntry);
+              enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
             } else if (queueEntry.task == taskInternalBarrier) {
               enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
             } else {

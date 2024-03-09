@@ -195,6 +195,14 @@ void AllGather::init() {
     }
   }
 
+  for (auto& pi : proxyInfo) {
+    proxyInfoBySource[pi.source].push_back(&pi);
+  }
+  for (auto& pdi : proxyDestinationInfo) {
+    CHECK(proxyDestinationInfoBySource.find(pdi.source) == proxyDestinationInfoBySource.end());
+    proxyDestinationInfoBySource[pdi.source] = &pdi;
+  }
+
   std::vector<size_t> rankNodes;
   rankNodes.resize(size);
   for (size_t i = 0; i != nodeRanks.size(); ++i) {
@@ -285,6 +293,15 @@ void AllGather::init() {
     // for (auto& x : ringRecvs) {
     //   CHECK(std::get<2>(x) != (size_t)-1 && std::get<2>(x) < size);
     // }
+  }
+
+  for (auto [i, neighbor] : ringSends) {
+    CHECK(ringSendsBySource.find(i) == ringSendsBySource.end());
+    ringSendsBySource[i] = neighbor;
+  }
+  for (auto [i, neighbor] : ringRecvs) {
+    CHECK(ringRecvsBySource.find(i) == ringRecvsBySource.end());
+    ringRecvsBySource[i] = neighbor;
   }
 
   // CHECK(proxyInfo.size() == proxyDestinationInfo.size());
