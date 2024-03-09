@@ -252,6 +252,37 @@ struct TemporaryBufferHandle {
   }
 };
 
+HashMap<uint32_t, const char*> opTypeToName;
+#define OPTYPE(name)                                                                                                   \
+  constexpr uint32_t opType##name = __LINE__;                                                                          \
+  struct ctor##name {                                                                                                  \
+    ctor##name() { opTypeToName[opType##name] = #name; }                                                               \
+  } instance##name;
+
+std::string getOpTypeName(uint32_t value) {
+  auto i = opTypeToName.find(value);
+  if (i != opTypeToName.end()) {
+    return i->second;
+  }
+  return "unknown value " + std::to_string(value);
+}
+OPTYPE(AllGatherCpu);
+OPTYPE(BroadcastRingCpu);
+
+inline void badOp(
+    const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
+    size_t bytes) {
+  fatal(
+      "Mismatched collectives detected at %s:%d.\nLocal parameters: op %s, step %#x, bytes %#x\nRemote parameters: op "
+      "%s, step "
+      "%#x, bytes %#x\n",
+      filename, line, getOpTypeName(opType), stepValue, bytes, getOpTypeName(dyn.opType), dyn.stepValue,
+      dyn.gatherBytes);
+}
+#define CHECK_DYN(dyn, optype, stepValue, bytes)                                                                       \
+  if (dyn.opType != optype || dyn.stepValue != stepValue || dyn.gatherBytes != bytes) [[unlikely]]                     \
+    badOp(__FILE__, __LINE__, dyn, optype, stepValue, bytes);
+
 struct CpuThreadImpl {
   CpuThread* cpuThread;
   Group* group;
@@ -1795,6 +1826,7 @@ struct CpuThreadImpl {
           outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + params.pitch * i;
           outDyns[i].gatherBytes = params.bytes;
           outDyns[i].stepValue = stepValue;
+          outDyns[i].opType = opTypeAllGatherCpu;
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = outputBuffer.mr->mrs[di]->rkey;
           }
@@ -1844,15 +1876,14 @@ struct CpuThreadImpl {
         if (params.bytes > 0) {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
-          CHECK(self.localDyns[size * concurrencyIndex + i].gatherBytes == params.bytes);
-          CHECK(self.localDyns[size * concurrencyIndex + i].stepValue == stepValue);
+          auto& dyn = self.localDyns[size * concurrencyIndex + i];
+          CHECK_DYN(dyn, opTypeAllGatherCpu, stepValue, params.bytes);
 
           // log.info("Rank %d begin send to %d\n", self.rank, i);
 
           liveSends += self.devices.size();
           self.writeDataDistributed2(
-              i, srcAddr, params.bytes, inputBuffer.mr, self.localDyns[size * concurrencyIndex + i].gatherAddress,
-              self.localDyns[size * concurrencyIndex + i].gatherKey,
+              i, srcAddr, params.bytes, inputBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
               [this, i = this->i](size_t di, bool ordered, bool done) {
                 if (done) {
                   --liveSends;

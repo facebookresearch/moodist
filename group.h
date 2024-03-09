@@ -36,10 +36,11 @@ struct alignas(64) CpuAddresses {
 };
 
 struct alignas(64) DynamicAddresses {
-  std::array<uint32_t, 32> gatherKey;
+  uint32_t opType;
   uintptr_t gatherAddress;
   size_t gatherBytes;
   uint32_t stepValue;
+  std::array<uint32_t, 32> gatherKey;
 };
 
 struct AddressPair {
