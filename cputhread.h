@@ -125,9 +125,9 @@ struct CpuThread {
   SpinMutex mutex;
   IntrusiveList<QueueEntry, &QueueEntry::link> queue;
   std::atomic_uint32_t queueSize = 0;
-  std::atomic_bool terminate = false;
 
   std::atomic_bool ready = false;
+  std::atomic_bool busy = false;
 
   QueueEntryFreeList<QueueEntry> freelistTerminate;
   QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
@@ -145,6 +145,7 @@ struct CpuThread {
   void start();
   void enqueue(QueueEntry* e) {
     std::unique_lock l(mutex);
+    busy.store(true, std::memory_order_relaxed);
     queue.push_back(*e);
     l.unlock();
     ++queueSize;

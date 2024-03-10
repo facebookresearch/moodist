@@ -33,8 +33,6 @@ struct CpuThreadImpl;
 
 namespace {
 
-struct QuitCpuThread {};
-
 struct MemoryRegistration {
   std::array<ibv_mr*, 32> mrs{};
 };
@@ -2805,17 +2803,22 @@ struct CpuThreadImpl {
         }
         streams[work->streamIndex].push_back(*work);
         concurrency[work->concurrencyIndex].push_back(*work);
-
-        auto s = [&](auto& v) { return std::distance(v.begin(), v.end()); };
-        log.info(
-            "enqueue work %d on stream %d concurrency %d (num active %d, stream %d, concurrency %d)\n", params.task,
-            work->streamIndex, work->concurrencyIndex, s(activeWorks), s(streams[work->streamIndex]),
-            s(concurrency[work->concurrencyIndex]));
       };
 
-      while (!cpuThread->terminate.load(std::memory_order_relaxed)) {
+      bool terminate = false;
+      while (true) {
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
           if (activeWorks.empty() && activeDevices.empty()) {
+            {
+              std::unique_lock l(cpuThread->mutex);
+              if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
+                continue;
+              }
+              cpuThread->busy.store(false, std::memory_order_relaxed);
+            }
+            if (terminate) {
+              break;
+            }
             futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
             continue;
           }
@@ -2839,6 +2842,7 @@ struct CpuThreadImpl {
             } else if (queueEntry.task == taskReduceScatter) {
               enqueue(allocatorReduceScatterRing, (QueueEntryReduceScatter&)queueEntry);
             } else if (queueEntry.task == taskTerminate) {
+              terminate = true;
               cpuThread->freelistTerminate.push(&queueEntry);
             } else if (queueEntry.task == taskBroadcast) {
               // enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
@@ -2897,7 +2901,6 @@ struct CpuThreadImpl {
 
     } catch (const std::exception& e) {
       fatal("CPU thread error: %s\n", e.what());
-    } catch (QuitCpuThread) {
     }
   }
 };
@@ -2910,7 +2913,6 @@ CpuThread::~CpuThread() {
     std::unique_lock l(mutex);
     queue.push_back(*e);
     l.unlock();
-    terminate = true;
     ++queueSize;
     futexWakeAll(&queueSize);
 
