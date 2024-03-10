@@ -97,13 +97,26 @@ struct WorkStreams {
   IntrusiveList<WorkStream, &WorkStream::link> free;
 };
 
+struct ThreadUnsafe {
+  SpinMutex mutex;
+  void lock() {
+    if (!mutex.try_lock()) {
+      throw std::runtime_error("Concurrent use of process group detected - this is not supported. Moodist process "
+                               "groups are not thread-safe.");
+    }
+  }
+  void unlock() {
+    mutex.unlock();
+  }
+};
+
 struct ProcessGroupImpl {
   size_t rank = 0;
   size_t size = 0;
 
   std::shared_ptr<Group> group;
 
-  SpinMutex mutex;
+  ThreadUnsafe threadUnsafe;
   uint32_t nextStepValue = 1;
   uint32_t nextConcurrencyIndex = 0;
   uint32_t nextInternalStepValue = 1;
@@ -164,10 +177,7 @@ struct ProcessGroupImpl {
   }
 
   void freeMemory() {
-    std::lock_guard l(mutex);
     group->ipcMapper->enqueueUnmapAll();
-    // CHECK_CU(cuCtxSynchronize());
-    // group->ipcMapper->unmapAll();
   }
 
   uint32_t getNextStepValue() {
@@ -185,8 +195,12 @@ struct ProcessGroupImpl {
     // but this is simpler.
 
     log.verbose("Reset step value begin\n");
+    while (group->cpuThread->busy) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     internalBarrier();
 
+    CHECK_CU(cuCtxPushCurrent(group->cuContext));
     CHECK_CU(cuCtxSynchronize());
     std::memset(group->mySharedMem, 0, group->mySharedMemSize);
     nextStepValue = 1 + 0x1000;
@@ -199,6 +213,8 @@ struct ProcessGroupImpl {
       }
     }
     CHECK_CU(cuCtxSynchronize());
+    CUcontext poppedContext;
+    CHECK_CU(cuCtxPopCurrent(&poppedContext));
 
     log.verbose("Reset step value done, syncing\n");
     internalBarrier();
@@ -279,7 +295,7 @@ struct ProcessGroupImpl {
 
     auto start = Clock::now();
 
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
 
     std::string key = randomName();
 
@@ -396,7 +412,7 @@ struct ProcessGroupImpl {
   }
 
   void barrier() {
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
@@ -485,7 +501,7 @@ struct ProcessGroupImpl {
   }
 
   void all_gather(at::Tensor& output, const at::Tensor& input, CUstream stream) {
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
     trace("all_gather");
 
     size_t size = this->size;
@@ -672,7 +688,7 @@ struct ProcessGroupImpl {
   }
 
   void reduce_scatter(at::Tensor& output, const at::Tensor& input, c10d::ReduceOp reduceOp, CUstream stream) {
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
     trace("_reduce_scatter_base");
 
     size_t size = this->size;
@@ -907,7 +923,7 @@ struct ProcessGroupImpl {
   }
 
   void broadcast(const torch::Tensor& tensor, uint32_t sourceRank) {
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
 
     size_t size = this->size;
 
@@ -986,7 +1002,7 @@ struct ProcessGroupImpl {
 
   void gather(const std::vector<at::Tensor>& outputList, const at::Tensor& input, uint32_t destinationRank) {
     trace("gather");
-    std::unique_lock l(mutex);
+    std::unique_lock l(threadUnsafe);
 
     size_t size = this->size;
 
