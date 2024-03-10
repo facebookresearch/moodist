@@ -45,6 +45,11 @@ struct CudaMapping {
   MemoryRegistration mr;
 };
 
+struct CpuMapping {
+  size_t bytes;
+  MemoryRegistration mr;
+};
+
 struct Device {
   IntrusiveListLink<Device> link;
   IbCommon* ib;
@@ -308,7 +313,7 @@ struct CpuThreadImpl {
 
   size_t bytesWritten = 0;
 
-  HashMap<uintptr_t, std::unique_ptr<MemoryRegistration>> mrMap;
+  HashMap<uintptr_t, std::unique_ptr<CpuMapping>> mrMap;
   HashMap<uintptr_t, std::unique_ptr<CudaMapping>> mrMapCuda;
 
   std::vector<IbvMr> localMrs;
@@ -589,25 +594,46 @@ struct CpuThreadImpl {
   MemoryRegistration* regMr(uintptr_t address, size_t bytes) {
     auto i = mrMap.find(address);
     if (i != mrMap.end()) {
-      return &*i->second;
+      CHECK(i->second->bytes >= bytes);
+      return &i->second->mr;
     }
-    auto ptr = std::make_unique<MemoryRegistration>();
-    ptr->mrs.fill(nullptr);
-    CHECK(devices.size() <= ptr->mrs.size());
+    auto ptr = std::make_unique<CpuMapping>();
+    ptr->mr.mrs.fill(nullptr);
+    CHECK(devices.size() <= ptr->mr.mrs.size());
     for (size_t i = 0; i != devices.size(); ++i) {
-      IbvMr mr = ibv_reg_mr(
+      ibv_mr* mr = ibv_reg_mr(
           devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
       if (!mr) {
         perror("ibv_reg_mr");
         log.error("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
         TORCH_CHECK(false);
       }
-      ptr->mrs[i] = mr;
-      localMrs.push_back(std::move(mr));
+      ptr->mr.mrs[i] = mr;
+      localMrs.push_back(mr);
+      log.debug("new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x)\n", bytes, address, mr->lkey, mr->rkey);
     }
-    MemoryRegistration* r = &*ptr;
+    MemoryRegistration* r = &ptr->mr;
     mrMap[address] = std::move(ptr);
     return r;
+  }
+
+  void deregMr(uintptr_t address) {
+    auto i = mrMap.find(address);
+    if (i == mrMap.end()) {
+      return;
+    }
+    MemoryRegistration* mr = &i->second->mr;
+    for (size_t i = 0; i != devices.size(); ++i) {
+      if (mr->mrs[i]) {
+        for (auto& v : localMrs) {
+          if (&*v == mr->mrs[i]) {
+            localMrs.erase(localMrs.begin() + (&v - localMrs.data()));
+            break;
+          }
+        }
+      }
+    }
+    mrMap.erase(i);
   }
 
   MemoryRegistration* regMrCuda(uintptr_t address, size_t bytes) {
@@ -632,18 +658,18 @@ struct CpuThreadImpl {
     ptr->mr.mrs.fill(nullptr);
     CHECK(devices.size() <= ptr->mr.mrs.size());
     for (size_t i = 0; i != devices.size(); ++i) {
-      auto* mr = ibv_reg_mr(
+      ibv_mr* mr = ibv_reg_mr(
           devices[i].ib->protectionDomain, (void*)address, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
       if (!mr) {
         perror("ibv_reg_mr");
         log.error("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
         TORCH_CHECK(false);
       }
-      localMrs.push_back(std::move(mr));
       ptr->mr.mrs[i] = mr;
+      localMrs.push_back(mr);
       log.debug(
-          "new mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId, mr->lkey,
-          mr->rkey);
+          "new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
+          mr->lkey, mr->rkey);
     }
     MemoryRegistration* r = &ptr->mr;
     mrMapCuda[address] = std::move(ptr);
@@ -770,6 +796,8 @@ struct CpuThreadImpl {
           CHECK(testPtr[512 * i + j] == v);
         }
       }
+
+      deregMr((uintptr_t)testBuffer.cpuPointer);
 
       log.debug("rank %d CPU test done!\n", rank);
     }
@@ -2607,7 +2635,8 @@ struct CpuThreadImpl {
   //         i = params.sourceRank;
 
   //         for (di = 0; di != self.devices.size(); ++di) {
-  //           while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+  //           while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue)
+  //           {
   //             YIELD
   //           }
   //         }
@@ -2660,7 +2689,8 @@ struct CpuThreadImpl {
 
   //     self.group->cpuAddresses[concurrencyIndex].stepValue = stepValue + 1;
   //     for (index = 0; index != ipcRanks.size(); ++index) {
-  //       while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue + 1)
+  //       while (self.group->getPeerVar(index, &self.group->cpuAddresses[concurrencyIndex])->stepValue < stepValue +
+  //       1)
   //       {
   //         YIELD
   //       }
@@ -3007,11 +3037,10 @@ struct CpuThreadImpl {
             offset += (params.outputList[i].bytes + 63) / 64u * 64u;
             continue;
           }
-          auto* mr = self.regMr((uintptr_t)outputBuffer->cpuPointer + offset, params.bytes);
           outDyns[i].gatherAddress = (uintptr_t)outputBuffer->cpuPointer + offset;
           outDyns[i].gatherBytes = params.outputList[i].bytes;
           for (size_t di = 0; di != self.devices.size(); ++di) {
-            outDyns[i].gatherKey[di] = mr->mrs[di]->rkey;
+            outDyns[i].gatherKey[di] = outputBuffer.mr->mrs[di]->rkey;
           }
           outDyns[i].opType = opTypeGatherCpu;
           outDyns[i].stepValue = stepValue;
@@ -3059,6 +3088,32 @@ struct CpuThreadImpl {
       liveSends = 0;
 
       if (rank == params.destinationRank) {
+        CHECK(params.outputList[rank].bytes == params.bytes);
+        std::memcpy((void*)params.outputList[rank].address, (void*)params.inputAddress, params.bytes);
+        for (size_t peerIndex : peerIndices) {
+          auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
+          size_t i = ipcRanks[peerIndex];
+          vmcopy(params.outputList[i].address, x->pid, x->inputAddress, params.bytes);
+        }
+
+        offset = 0;
+        for (i = 0; i != size; ++i) {
+          if (i == rank || self.group->ipcAccess[i]) {
+            offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+            continue;
+          }
+          for (di = 0; di != self.devices.size(); ++di) {
+            while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
+              YIELD
+            }
+          }
+          DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+          CHECK(outDyns[i].gatherAddress == (uintptr_t)outputBuffer->cpuPointer + offset);
+          CHECK(params.outputList[i].bytes == params.bytes);
+          std::memcpy(
+              (void*)params.outputList[i].address, (void*)((uintptr_t)outputBuffer->cpuPointer + offset), params.bytes);
+          offset += (params.outputList[i].bytes + 63) / 64u * 64u;
+        }
       } else if (!self.group->ipcAccess[params.destinationRank]) {
 
         i = params.destinationRank;
@@ -3087,32 +3142,6 @@ struct CpuThreadImpl {
                       self.remoteCpuCommsDeviceDataSent[i].keys[di], sizeof(stepValue));
                 }
               });
-        }
-      }
-
-      if (rank == params.destinationRank) {
-        CHECK(params.outputList[rank].bytes == params.bytes);
-        std::memcpy((void*)params.outputList[rank].address, (void*)params.inputAddress, params.bytes);
-        for (size_t peerIndex : peerIndices) {
-          auto* x = self.group->getPeerVar(peerIndex, &self.group->cpuAddresses[concurrencyIndex]);
-          size_t i = ipcRanks[peerIndex];
-          vmcopy(params.outputList[i].address, x->pid, x->inputAddress, params.bytes);
-        }
-
-        offset = 0;
-        for (i = 0; i != size; ++i) {
-          if (i == rank || self.group->ipcAccess[i]) {
-            offset += (params.outputList[i].bytes + 63) / 64u * 64u;
-            continue;
-          }
-          for (di = 0; di != self.devices.size(); ++di) {
-            while (*(&self.group->cpuCommsDeviceDataSent.at<uint32_t>(concurrencyIndex) + 32 * i + di) < stepValue) {
-              YIELD
-            }
-          }
-          std::memcpy(
-              (void*)params.outputList[i].address, (void*)((uintptr_t)outputBuffer->cpuPointer + offset), params.bytes);
-          offset += (params.outputList[i].bytes + 63) / 64u * 64u;
         }
       }
 
