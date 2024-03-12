@@ -285,16 +285,20 @@ inline void badOp(
       filename, line, getOpTypeName(opType), stepValue, bytes, getOpTypeName(dyn.opType), dyn.stepValue,
       dyn.gatherBytes);
 }
-#define CHECK_DYN(dyn, optype, stepValue, bytes)                                                                       \
-  if (dyn.opType != optype || dyn.stepValue != stepValue || dyn.gatherBytes != bytes) [[unlikely]]                     \
-    badOp(__FILE__, __LINE__, dyn, optype, stepValue, bytes);
+#define CHECK_DYN(dyn, optype, stepvalue, bytes)                                                                       \
+  if (dyn.opType != (optype) || dyn.stepValue != (stepvalue) || dyn.gatherBytes != (bytes)) [[unlikely]]               \
+    badOp(__FILE__, __LINE__, dyn, optype, stepvalue, bytes);
 
 struct CpuThreadImpl {
   CpuThread* cpuThread;
-  Group* group;
+  Group* group = cpuThread->group;
   bool dead = false;
 
-  CpuThreadImpl(CpuThread* cpuThread) : cpuThread(cpuThread), group(cpuThread->group), devices(initDevices()) {}
+  CpuThreadImpl(CpuThread* cpuThread) : cpuThread(cpuThread) {
+    group->buffersToReset.push_back(&uInDynsBuffer);
+
+    CHECK(devices.size() <= 8);
+  }
   ~CpuThreadImpl() {
     dead = true;
   }
@@ -306,7 +310,7 @@ struct CpuThreadImpl {
   static constexpr size_t maxCqEntries = IbCommon::maxCqEntries;
 
   SetupComms* setupComms = &*group->setupComms;
-  SimpleVector<Device> devices;
+  SimpleVector<Device> devices = initDevices();
   IntrusiveList<Device, &Device::link> activeDevices;
 
   size_t bytesWritten = 0;
@@ -366,6 +370,27 @@ struct CpuThreadImpl {
 
   Vector<uint8_t> dynReadyVector{size * Group::maxConcurrency};
   Vector<MemoryRegistration*> outDynsMrVector{size * Group::maxConcurrency};
+
+  Vector<uint32_t> debugVector{size};
+
+  size_t uniqueIndexOffset = 0;
+  const size_t numUniqueIndices = std::max((size_t)1024, size * 2);
+
+  AllocatedArray uOutDynsBuffer =
+      group->allocateArrayHost(sizeof(DynamicAddresses) * numUniqueIndices, Group::maxConcurrency);
+  MemoryRegistration* uOutDynsMr = regMr((uintptr_t)uOutDynsBuffer.buffer.cpuPointer, uOutDynsBuffer.buffer.bytes);
+  AllocatedArray uInDynsBuffer =
+      group->allocateArrayHost(sizeof(DynamicAddresses) * numUniqueIndices, Group::maxConcurrency);
+  MemoryRegistration* uInDynsMr = regMr((uintptr_t)uInDynsBuffer.buffer.cpuPointer, uInDynsBuffer.buffer.bytes);
+  std::vector<RemoteAddressAndKey> remoteUInDyns =
+      distributeAddressAndKeys((uintptr_t)uInDynsBuffer.buffer.cpuPointer, uInDynsMr);
+
+  DynamicAddresses& uOutDyn(size_t concurrencyIndex, size_t uindex) {
+    return *((DynamicAddresses*)uOutDynsBuffer.buffer.cpuPointer + numUniqueIndices * concurrencyIndex + uindex);
+  }
+  DynamicAddresses& uInDyn(size_t concurrencyIndex, size_t uindex) {
+    return *((DynamicAddresses*)uInDynsBuffer.buffer.cpuPointer + numUniqueIndices * concurrencyIndex + uindex);
+  }
 
   Vector<TemporaryBufferHandle> vmreadBuffers;
   Vector<TemporaryBufferHandle> sendRecvBuffers;
@@ -686,7 +711,7 @@ struct CpuThreadImpl {
   template<typename Callback>
   void writeDataDistributed2(
       size_t dst, uintptr_t srcAddr, size_t len, MemoryRegistration* mr, uint64_t dstAddr,
-      const std::array<uint32_t, 32>& key, Callback&& callback) {
+      const std::array<uint32_t, 8>& key, Callback&& callback) {
     CHECK(len > 0);
     size_t offset = 0;
     const size_t chunks = devices.size();
@@ -712,7 +737,7 @@ struct CpuThreadImpl {
   template<typename Callback>
   void writeDataDistributed3(
       size_t dst, uintptr_t srcAddr, size_t len, MemoryRegistration* mr, uint64_t dstAddr,
-      const std::array<uint32_t, 32>& key, Callback&& callback) {
+      const std::array<uint32_t, 8>& key, Callback&& callback) {
     CHECK(len > 0);
     size_t offset = 0;
     const size_t chunks = devices.size();
@@ -952,76 +977,72 @@ struct CpuThreadImpl {
   sendStepValue = &self.sendStepValues2[32 * 1024 * concurrencyIndex + 32 * ((self.sendStepValues2Counter++) % 1024)]; \
   *sendStepValue = stepValue;
 
+  size_t allocateIndices(size_t n) {
+    if (numUniqueIndices - uniqueIndexOffset <= n) {
+      // log.info("unique index overflow, reset!\n");
+      uniqueIndexOffset = 0;
+      CHECK(numUniqueIndices >= n);
+      while (true) {
+        {
+          size_t n = 0;
+          for (auto& dev : devices) {
+            n += dev.currentCqEntries;
+          }
+          if (n == 0) {
+            break;
+          }
+        }
+        poll();
+      }
+    }
+    return std::exchange(uniqueIndexOffset, uniqueIndexOffset + n);
+  }
+
+  void writeDyn(size_t concurrencyIndex, size_t i, size_t uindex, size_t fromOffset, size_t toOffset) {
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    writeData(
+        dev, i, &uOutDyn(concurrencyIndex, uindex + fromOffset), uOutDynsMr->mrs[di]->lkey,
+        (void*)(remoteUInDyns[i].address + sizeof(DynamicAddresses) * (numUniqueIndices * concurrencyIndex + uindex + toOffset)),
+        remoteUInDyns[i].keys[di], sizeof(DynamicAddresses));
+  }
+
   struct WorkBarrier : Work {
     QueueEntryBarrier& params;
     size_t i;
-    uint32_t* sendStepValue;
+    size_t iteration;
+    size_t uindex;
 
     WorkBarrier(CpuThreadImpl& self, QueueEntryBarrier& params) : Work(self, params), params(params) {}
 
     void step() {
       ENTER
 
-      SENDSTEPVALUE_SETUP;
-
-      for (size_t i = 0; i != size; ++i) {
-        if (i == rank) {
-          continue;
+      for (iteration = 0; iteration != 2; ++iteration) {
+        uindex = self.allocateIndices(size);
+        {
+          DynamicAddresses& out = self.uOutDyn(concurrencyIndex, uindex);
+          out.opType = opTypeBarrier;
+          out.gatherAddress = 0;
+          out.gatherBytes = 0;
+          out.stepValue = stepValue + iteration;
         }
-        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
 
-        outDyns[i].gatherAddress = 0;
-        outDyns[i].gatherBytes = 0;
-        outDyns[i].stepValue = params.stepValue;
-        outDyns[i].opType = opTypeBarrier;
-
-        size_t di = (rank + i) % self.devices.size();
-        auto& dev = self.devices[di];
-
-        auto dynCompletion = [this, di, i]() {
-          auto& dev = self.devices[di];
-          self.writeData(dev, i,
-                            sendStepValue,
-                            self.sendStepValues2StorageMr->mrs[di]->lkey,
-                            (void*)(self.remoteComms[i].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + rank].stepValue)),
-                            self.remoteComms[i].keys[di],
-                            sizeof(stepValue));
-        };
-        self.writeData(
-            dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
-            (void*)(self.remoteComms[i].address + self.group->getSharedOffset(&self.group->localDyns[size * concurrencyIndex + rank])),
-            self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
-            dev.ordered ? nullptr : self.makeCallback(dynCompletion));
-        if (dev.ordered) {
-          dynCompletion();
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank) {
+            continue;
+          }
+          self.writeDyn(concurrencyIndex, i, uindex, 0, rank);
         }
-      }
-      for (i = 0; i != size; ++i) {
-        if (i == self.rank) {
-          continue;
-        }
-        while (self.localProgress2[size * concurrencyIndex + i].stepValue < stepValue) {
-          YIELD
-        }
-        DynamicAddresses& dyn = self.localDyns[size * concurrencyIndex + i];
-        CHECK_DYN(dyn, opTypeBarrier, stepValue, 0);
-
-        sendStepValue[1] = stepValue + 1;
-        size_t di = (rank + i) % self.devices.size();
-        auto& dev = self.devices[di];
-        self.writeData(dev, i,
-                            sendStepValue + 1,
-                            self.sendStepValues2StorageMr->mrs[di]->lkey,
-                            (void*)(self.remoteComms[i].address + self.group->getSharedOffset(&self.localProgress2[size * concurrencyIndex + rank].stepValue)),
-                            self.remoteComms[i].keys[di],
-                            sizeof(stepValue));
-      }
-      for (i = 0; i != size; ++i) {
-        if (i == self.rank) {
-          continue;
-        }
-        while (self.localProgress2[size * concurrencyIndex + i].stepValue < stepValue + 1) {
-          YIELD
+        for (i = 0; i != size; ++i) {
+          if (i == self.rank) {
+            continue;
+          }
+          while (self.uInDyn(concurrencyIndex, uindex + i).stepValue != stepValue + iteration) {
+            YIELD
+          }
+          DynamicAddresses dyn = self.uInDyn(concurrencyIndex, uindex + i);
+          CHECK_DYN(dyn, opTypeBarrier, stepValue + iteration, 0);
         }
       }
       params.cpuDone->store(1);
@@ -2890,6 +2911,7 @@ struct CpuThreadImpl {
                   ++numActiveWorks;
                 }
               }
+              CHECK(numActiveWorks == 1);
               i = activeWorks.erase(i);
               --numActiveWorks;
             } else {

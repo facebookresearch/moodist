@@ -596,7 +596,7 @@ void Group::init() {
 
   size_t offset = 0;
   uintptr_t addr = (uintptr_t)mySharedMem;
-  CHECK(addr % 64 == 0);
+  CHECK(addr % 128 == 0);
   auto get = [&](auto*& ptr, size_t n) {
     using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
     if (offset % alignof(T) != 0) {
@@ -665,6 +665,7 @@ void Group::init() {
   // This list MUST contain all buffers that should be reset on step value reset.
   // Any buffers which receive step values from peers should be reset.
   // All such buffers should be allocated in this function.
+  // TODO: I broke this requirement in cpuThread, improve this in some way?
   buffersToReset = {
       &cpuOutBuffer,
       &cpuInBuffer,
