@@ -119,7 +119,6 @@ struct ProcessGroupImpl {
   ThreadUnsafe threadUnsafe;
   uint32_t nextStepValue = 1;
   uint32_t nextConcurrencyIndex = 0;
-  uint32_t nextInternalStepValue = 1;
 
   HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
 
@@ -395,13 +394,11 @@ struct ProcessGroupImpl {
   }
 
   void internalBarrier() {
-    uint32_t stepValue = std::exchange(nextInternalStepValue, nextInternalStepValue + 1);
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-    CHECK(stepValue < 0x80000000);
     std::atomic_uint32_t cpuDone = 0;
     QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
     e->task = taskInternalBarrier;
-    e->stepValue = stepValue;
+    e->stepValue = 0;
     e->sd = &group->getStreamData(nullptr);
     e->concurrencyIndex = concurrencyIndex;
     e->cpuDone = &cpuDone;

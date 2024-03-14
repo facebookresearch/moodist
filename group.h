@@ -132,6 +132,8 @@ struct Group {
 
   Progress* localProgress2 = nullptr;
 
+  uint32_t* cpuStepValues = nullptr;
+
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
     size_t offset = (uintptr_t)(void*)myVar - (uintptr_t)mySharedMem;

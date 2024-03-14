@@ -40,6 +40,9 @@ struct SimpleVector {
       ++i;
     }
   }
+  SimpleVector(size_t size) {
+    resize(size);
+  }
   SimpleVector& operator=(const SimpleVector& n) {
     resize(n.msize);
     for (size_t i = msize; i;) {
