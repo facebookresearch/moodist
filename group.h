@@ -20,8 +20,6 @@ struct DynamicAddresses;
 enum class Dtype { float32, float64, int32, int64, bfloat16, count };
 enum class Reduction { sum, min, max, avg, count };
 
-static constexpr size_t maxConcurrency = 16;
-
 struct alignas(64) Progress {
   uint32_t stepValue;
   uint32_t cpuStepValue;
@@ -79,6 +77,8 @@ struct Group {
 
   HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
   static constexpr size_t maxConcurrency = 16;
+  static constexpr size_t maxDevices = 8;
+  static constexpr size_t maxChunks = 8;
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
@@ -133,6 +133,7 @@ struct Group {
   Progress* localProgress2 = nullptr;
 
   uint32_t* cpuStepValues = nullptr;
+  uint32_t* cpuStepValuesDeviceChunks = nullptr;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
