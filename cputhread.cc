@@ -443,9 +443,13 @@ struct CpuThreadImpl {
     return cpuStepValues[size * concurrencyIndex + index];
   }
 
+  size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
+    return Group::maxChunks * Group::maxDevices * size * concurrencyIndex + Group::maxChunks * size * device + size * chunk + index;
+  }
+
   uint32_t& inStepValueDeviceChunk(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
     CHECK(index < size);
-    return cpuStepValues[size * concurrencyIndex + index];
+    return cpuStepValuesDeviceChunks[stepValueDeviceChunkIndex(concurrencyIndex, index, device, chunk)];
   }
 
   Vector<TemporaryBufferHandle> vmreadBuffers;
