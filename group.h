@@ -135,6 +135,9 @@ struct Group {
   uint32_t* cpuStepValues = nullptr;
   uint32_t* cpuStepValuesDeviceChunks = nullptr;
 
+  AllocatedArray cudaStepValuesBuffer;
+  AllocatedArray cudaStepValuesDeviceChunksBuffer;
+
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
     size_t offset = (uintptr_t)(void*)myVar - (uintptr_t)mySharedMem;
