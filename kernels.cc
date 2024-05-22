@@ -498,6 +498,12 @@ __device__ uint32_t smid() {
   return r;
 }
 
+$constantDefs
+
+__device__ size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
+  return $maxChunks * $maxDevices * $size * concurrencyIndex + $maxChunks * $size * device + $size * chunk + index;
+}
+
 __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
   $copyCode
 }
@@ -506,6 +512,19 @@ template<typename T, typename R>
 __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2);
 
 )z";
+
+  std::string constantDefs;
+
+  const auto& peerCudaProxyReady = group->peerCudaProxyReady;
+  std::vector<std::string> peerCudaProxyReadyArray;
+  for (auto& v : peerCudaProxyReady) {
+    peerCudaProxyReadyArray.push_back(replace("$base", "$base", v.base));
+  }
+  constantDefs += fmt::sprintf(
+      "__constant__ uintptr_t peerCudaProxyReady[%d] = {%s};", peerCudaProxyReady.size(),
+      fmt::to_string(fmt::join(peerCudaProxyReadyArray, ", ")));
+
+  source = replace(source, "$constantDefs", constantDefs);
 
   gridSize = 16;
   blockSize = 256;
@@ -585,11 +604,6 @@ __device__ void reduce2(T* __restrict__ dst, const T* __restrict__ src1, const T
     return s;
   };
 
-  std::string waitForRecvs;
-  for (size_t i : group->allGather->recvRanks) {
-    waitForRecvs += waitForRecv(i);
-  }
-
   std::string copyDoneAllCode;
   std::string waitForCopyDones;
   for (size_t i : group->peerIndices) {
@@ -637,7 +651,6 @@ __device__ void generic_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   cpuIn[0] = stepValue + 1;
   $waitForCopyDones
-  $waitForRecvs
   while (cpuOut[0] < stepValue);
 }
 
@@ -692,7 +705,6 @@ __device__ void grid_generic_exit(uint32_t stepValue, uint32_t concurrencyIndex)
     cpuIn[0] = stepValue + 1;
     while (cpuOut[0] < stepValue);
     $waitForCopyDones
-    $waitForRecvs
   }
 }
 
@@ -718,8 +730,8 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   while (cpuOut[0] < stepValue);
 }
   )",
-      "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones, "$waitForRecvs",
-      waitForRecvs, "$copyDoneAllCode", copyDoneAllCode);
+      "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones,
+      "$copyDoneAllCode", copyDoneAllCode);
 
   auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
 
@@ -752,7 +764,9 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   source = replace(
       source, "$cpuOut", cast("volatile uint32_t*", concurrencyIndex(cpuOutBuffer)), "$cpuIn",
       cast("volatile uint32_t*", concurrencyIndex(cpuInBuffer)));
-  source = replace(source, "$rank", rank, "$size", size, "$maxConcurrency", Group::maxConcurrency);
+  source = replace(
+      source, "$rank", rank, "$size", size, "$maxConcurrency", Group::maxConcurrency, "$maxChunks", Group::maxChunks,
+      "$maxDevices", Group::maxDevices);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);

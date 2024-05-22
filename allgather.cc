@@ -349,24 +349,24 @@ std::string AllGather::generate() {
 
   auto waitFor32 = [&](std::string address, std::string value) {
     return replace(
-        R"(while (*(volatile uint32_t*)($ptr) < $value);
+        R"(
+          while (*(volatile uint32_t*)($ptr) < $value);
     )",
         "$ptr", address, "$value", value);
   };
 
   static const size_t numChunks = 8;
 
-  auto waitForRecv = [&](size_t i, size_t chunkIndex, bool isLastChunk) {
+  auto waitForRecv = [&](std::string i, size_t chunkIndex) {
     std::string s;
     s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
     for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      if (isLastChunk) {
-        s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
-      } else {
-        s += waitFor32(
-            concurrencyIndex(group->cudaCommsDeviceDataSent2, sizeof(uint32_t) * (i * 32 * 32 + 32 * di + chunkIndex)),
-            "stepValue");
-      }
+      s += waitFor32(
+          replace(
+              "$base + sizeof(uint32_t) * stepValueDeviceChunkIndex(concurrencyIndex, $i, $di, $chunkIndex)", "$base",
+              group->cudaStepValuesDeviceChunksBuffer.buffer.cudaPointer, "$i", i, "$di", di, "$chunkIndex",
+              chunkIndex),
+          "stepValue");
     }
     return s;
   };
@@ -416,78 +416,134 @@ std::string AllGather::generate() {
     groupedProxyMap.back().emplace_back(&pdi, &pi);
   }
 
+  std::vector<uint32_t> instructions;
+
+  size_t numProxies = 0;
+  if (!groupedProxyMap.empty()) {
+    numProxies = groupedProxyMap[0].size();
+  }
+
   for (auto& gg : groupedProxyMap) {
-    for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
-      recvCopies += R"(
-          {
-            // chunk $chunkIndex
-            const size_t currentChunkSize = $currentChunkSize;
-            const size_t chunkOffset = chunkSize * $chunkIndex;
-        )";
-      for (auto& vv : gg) {
-        auto& pi = *vv.second;
-        auto& pdi = *vv.first;
-        // recvCopies += replace("{\n// chunk $chunkIndex\n", "$chunkIndex", chunkIndex);
-
-        if (isInGrid) {
-          recvCopies += "if (threadIdx.x == 0) {\n";
-        }
-
-        if (!hasWaitedForRecv[pi.source * numChunks + chunkIndex]) {
-          if (!isInGrid) {
-            // recvCopies += "allgather_copy_flush(copies);\n";
-          }
-          hasWaitedForRecv[pi.source * numChunks + chunkIndex] = true;
-          recvCopies += replace(
-              R"(
-            if (chunkOffset + currentChunkSize == params.bytes) {
-              $waitlast
-            } else {
-              $waitnotlast
-            }
-            )",
-              "$waitlast", waitForRecv(pi.source, chunkIndex, true), "$waitnotlast",
-              waitForRecv(pi.source, chunkIndex, false));
-        }
-
-        recvCopies += replace(
-            R"(
-          if (isFirstThread) {
-            *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
-          }
-          while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
-        )",
-            "$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
-            "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$chunkIndex", chunkIndex);
-
-        if (isInGrid) {
-          recvCopies += "}\nsyncthreads();\n";
-        }
-
-        recvCopies += addCopy(
-            replace("(void*)(params.outputAddress + params.pitch * $source + chunkOffset)", "$source", pdi.source),
-            replace(
-                "(void*)(*(uintptr_t*)$src + params.pitch * $source + chunkOffset)", "$source", pdi.source, "$src",
-                concurrencyIndex(
-                    group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * pdi.proxyPeerIndex + sizeof(uintptr_t)))),
-            "currentChunkSize");
-      }
-      if (chunkIndex != numChunks - 1) {
-        recvCopies += "if (chunkSize * $chunkIndex + $currentChunkSize != params.bytes) {\n";
-      } else {
-        recvCopies += "assert(chunkSize * $chunkIndex + $currentChunkSize == params.bytes);\n";
-      }
-
-      recvCopies = replace(recvCopies, "$currentChunkSize", "min(chunkSize, params.bytes - chunkSize * $chunkIndex)");
-      recvCopies = replace(recvCopies, "$chunkIndex", chunkIndex);
-    }
-    for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
-      recvCopies += "}\n";
-      if (chunkIndex != numChunks - 1) {
-        recvCopies += "}\n";
-      }
+    CHECK(!gg.empty());
+    size_t source = gg[0].second->source;
+    CHECK(!hasWaitedForRecv[source]);
+    hasWaitedForRecv[source] = true;
+    instructions.push_back(source);
+    CHECK(gg.size() == numProxies);
+    for (auto& vv : gg) {
+      auto& pi = *vv.second;
+      CHECK(pi.source == source);
+      auto& pdi = *vv.first;
+      CHECK(pdi.proxyPeerIndex < 256);
+      CHECK(pi.destinationPeerIndex < 256);
+      CHECK(pdi.source < 65536);
+      instructions.push_back((pdi.proxyPeerIndex << 24) | (pi.destinationPeerIndex << 16) | pdi.source);
     }
   }
+  instructions.push_back(-1);
+
+  std::vector<std::string> instructionsHex;
+  for (auto& v : instructions) {
+    instructionsHex.push_back(fmt::sprintf("%#x", v));
+  }
+  std::string instructionsArray = fmt::sprintf(
+      "__constant__ uint32_t allGatherInstructions[%d] = {%s};", instructions.size(),
+      fmt::to_string(fmt::join(instructionsHex, ", ")));
+
+  for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+    recvCopies += R"(
+        {
+          // chunk $chunkIndex
+          const size_t currentChunkSize = $currentChunkSize;
+          const size_t chunkOffset = chunkSize * $chunkIndex;
+      )";
+    if (chunkIndex == 0) {
+      recvCopies += "uint32_t* entryPtr = ptr;\n";
+    } else {
+      recvCopies += "ptr = entryPtr;\n";
+    }
+    for (size_t proxyIndex = 0; proxyIndex != numProxies; ++proxyIndex) {
+      // auto& pi = *vv.second;
+      // auto& pdi = *vv.first;
+      // recvCopies += replace("{\n// chunk $chunkIndex\n", "$chunkIndex", chunkIndex);
+
+      recvCopies += R"(
+        {
+        uint32_t value = *ptr++;
+        uint32_t pdi_source = value & 0xffff;
+        uint32_t destinationPeerIndex = (value >> 16) & 0xff;
+        uint32_t proxyPeerIndex = (value >> 24) & 0xff;
+      )";
+
+      if (isInGrid) {
+        recvCopies += "if (threadIdx.x == 0) {\n";
+      }
+
+      if (proxyIndex == 0) {
+        if (!isInGrid) {
+          // recvCopies += "allgather_copy_flush(copies);\n";
+        }
+        recvCopies += waitForRecv("source", chunkIndex);
+      }
+
+      recvCopies += replace(
+          R"(
+        if (isFirstThread) {
+          *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
+        }
+        while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
+      )",
+          "$forwardPtr",
+          "(peerCudaProxyReady[destinationPeerIndex] + sizeof(uint32_t) * ($size * concurrencyIndex + source))",
+          "$readyPtr",
+          replace(
+              "($base + sizeof(uint32_t) * ($size * concurrencyIndex + pdi_source))", "$base",
+              cudaProxyReady.buffer.cudaPointer),
+          "$chunkIndex", chunkIndex);
+      //"$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
+      //"$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$chunkIndex", chunkIndex);
+
+      if (isInGrid) {
+        recvCopies += "}\nsyncthreads();\n";
+      }
+
+      recvCopies += addCopy(
+          "(void*)(params.outputAddress + params.pitch * pdi_source + chunkOffset)",
+          replace(
+              "(void*)(*(uintptr_t*)$src + params.pitch * pdi_source + chunkOffset)", "$src",
+              concurrencyIndex(
+                  group->cudaPeerAddresses, "(sizeof(uintptr_t) * 2 * proxyPeerIndex + sizeof(uintptr_t))")),
+          "currentChunkSize");
+
+      recvCopies += "}\n";
+    }
+    if (chunkIndex != numChunks - 1) {
+      recvCopies += "if (chunkSize * $chunkIndex + $currentChunkSize != params.bytes) {\n";
+    } else {
+      recvCopies += "assert(chunkSize * $chunkIndex + $currentChunkSize == params.bytes);\n";
+    }
+
+    recvCopies = replace(recvCopies, "$currentChunkSize", "min(chunkSize, params.bytes - chunkSize * $chunkIndex)");
+    recvCopies = replace(recvCopies, "$chunkIndex", chunkIndex);
+  }
+  for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+    recvCopies += "}\n";
+    if (chunkIndex != numChunks - 1) {
+      recvCopies += "}\n";
+    }
+  }
+
+  recvCopies = replace(
+      R"(
+    for (auto* ptr = &allGatherInstructions[0];;) {
+      uint32_t source = *ptr++;
+      if (source == -1) {
+        break;
+      }
+      $recvCopies
+    }
+  )",
+      "$recvCopies", recvCopies);
 
   std::string source;
 
@@ -526,25 +582,25 @@ extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyPara
 
 namespace {
 
-__device__ void allgather_copy_flush(AllGatherCopyParameters& params) {
-  if (params.n) {
-    // work around compiler bug
-    AllGatherCopyParameters params2;
-    memcpy(&params2, &params, sizeof(params2));
-    allgather_copy_kernel<<<$gridSize, $blockSize>>>(params2);
-    params.n = 0;
-  }
-}
+// __device__ void allgather_copy_flush(AllGatherCopyParameters& params) {
+//   if (params.n) {
+//     // work around compiler bug
+//     AllGatherCopyParameters params2;
+//     memcpy(&params2, &params, sizeof(params2));
+//     allgather_copy_kernel<<<$gridSize, $blockSize>>>(params2);
+//     params.n = 0;
+//   }
+// }
 
-__device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, const void* src, size_t bytes) {
-  params.dst[params.n] = dst;
-  params.src[params.n] = src;
-  params.bytes[params.n] = bytes;
-  ++params.n;
-  if (params.n == copyQueueSize) {
-    allgather_copy_flush(params);
-  }
-}
+// __device__ void allgather_copy_add(AllGatherCopyParameters& params, void* dst, const void* src, size_t bytes) {
+//   params.dst[params.n] = dst;
+//   params.src[params.n] = src;
+//   params.bytes[params.n] = bytes;
+//   ++params.n;
+//   if (params.n == copyQueueSize) {
+//     allgather_copy_flush(params);
+//   }
+// }
 
 }
 
@@ -575,6 +631,8 @@ extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters par
 extern "C" __global__ void allgather_exit(uint32_t stepValue, uint32_t concurrencyIndex) {
   generic_exit(stepValue, concurrencyIndex);
 }
+
+$instructionsArray
 
 __device__ uint32_t firstThreadCounter[$maxConcurrency];
 
@@ -616,7 +674,8 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 }
 
   )zz",
-      "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs);
+      "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs, "$instructionsArray",
+      instructionsArray);
 
   source = replace(source, "$numChunks", numChunks);
 

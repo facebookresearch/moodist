@@ -25,7 +25,7 @@ if "LOCAL_RANK" not in os.environ:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
-os.environ["NCCL_PROTO"] = "LL128"
+os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
 
 def f(n):
@@ -35,7 +35,8 @@ def f(n):
     if n == "moodist":
         import sys
 
-        sys.path.append("/home/vegardmella/moodist/py")
+        # sys.path.append("/home/vegardmella/moolib/py")
+        # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
 
         # moodist.enable_profiling(True)
@@ -52,8 +53,8 @@ def f(n):
         backend=n,
     )
 
-    # group1 = dist.new_group()
-    # group2 = dist.new_group()
+    group1 = dist.new_group()
+    group2 = dist.new_group()
 
     rank = dist.get_rank()
     size = dist.get_world_size()
@@ -61,15 +62,12 @@ def f(n):
     print("%d: world size is %d\n" % (rank, size))
 
     dist.barrier()
-    torch.cuda.synchronize()
     dist.barrier()
-    torch.cuda.synchronize()
     if rank == 0:
         print("init ok")
 
     torch.manual_seed(42 + rank)
 
-    device = torch.device("cuda:0")
     world_size = size
 
     # process_group = torch.distributed.new_group("foo")
@@ -98,16 +96,13 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        data = torch.randn(1024 * 1024 * 4).cuda() + 1
+        # data = torch.randn(4).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         # data = torch.randn(442416).cuda() + 1
-        # data = torch.randn(18874368).cuda() + 1
-        # data = torch.randn(589824).cuda() + 1
-        # data = torch.randn(294912).cuda() + 1
-        # data = torch.randn(353028).cuda() + 1
-        # data = torch.randn(8388608).cuda() + 1
+        # data = torch.randn(589824) + 1
+        data = torch.randn(16) + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -133,12 +128,12 @@ def f(n):
         correct_result = []
         for r in range(size):
             torch.manual_seed(42 + r)
-            rdata = torch.randn(data.numel()).cuda() + 1
+            rdata = torch.randn(data.numel()) + 1
             correct_result.append(rdata)
 
         torch.manual_seed(420 + rank)
 
-        datax = torch.randn(20, 1024 * 1024 * 10).cuda()
+        datax = torch.randn(20, 1024 * 1024 * 10)
 
         # for i in range(20):
         #     print(rank, i)
@@ -154,33 +149,31 @@ def f(n):
 
         print("result0 is at %#x" % result0.data_ptr())
 
-        stream1 = torch.cuda.Stream()
-        stream2 = torch.cuda.Stream()
-
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
-        for _ in range(1000):
-            #print("rank %d warmup %d" % (rank, _))
+        dstrank = 0
+
+        for _ in range(100):
+            # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
-            result = [torch.zeros_like(data) for _ in range(size)]
+            # result = [torch.zeros_like(data) for _ in range(size)]
+            result = [None] * size
             result0 -= 1
             if _ % 3 == 0:
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
-            ostream = torch.cuda.current_stream()
             # dist.all_gather(result, tmp)
-            dist._all_gather_base(result0, tmp)
-            # with torch.cuda.stream(stream1):
-            #     stream1.wait_stream(ostream)
-            #     dist._all_gather_base(result0, tmp)
-            # with torch.cuda.stream(stream2):
-            #     dist._all_gather_base(result02, tmp2)
-            #torch.cuda.current_stream().wait_stream(stream1)
+            dist.gather_object(tmp, result if rank == dstrank else None, dstrank)
+            # if rank == 0:
+            #     object_list = [None] * world_size
+            #     dist.gather_object(None, object_list, dst=dstrank)
+            # else:
+            #     dist.gather_object({"foo": _}, dst=dstrank)
             tmp.zero_()
-            result = result0.chunk(size)
+            # result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if rank == dstrank:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -214,22 +207,20 @@ def f(n):
                         )
                         print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                         raise RuntimeError("%d: wrong result for index %d" % (rank, i))
-            torch.cuda.synchronize()
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
-        #print("rank %d warmup done" % (rank))
+        print("rank %d warmup done" % (rank))
 
         if False:
             tmpz = []
             for x in range(10):
                 print("rank %d enter test2 %d\n" % (rank, x))
-                test2_data = torch.randn(3072048, device="cuda")
-                test2_result = torch.zeros(3072048 * size, device="cuda")
+                test2_data = torch.randn(3072048)
+                test2_result = torch.zeros(3072048 * size)
 
                 for i in range(10):
                     dist._all_gather_base(test2_result, test2_data)
-                torch.cuda.synchronize()
                 print("rank %d test2 done" % rank)
 
                 tmpz.append(test2_data)
@@ -244,24 +235,21 @@ def f(n):
             tmpz = torch.randn(1024 + 1024 * 1024 * rank)
 
             random.seed(42)
-            for x in range(1000):
+            for x in range(10):
                 print("rank %d enter test3 %d\n" % (rank, x))
                 s = random.randint(1024, 1024 * 1024 * 10) * 4
-                test3_data = torch.randn(s, device="cuda")
-                test3_result = torch.zeros(s * size, device="cuda")
+                test3_data = torch.randn(s)
+                test3_result = torch.zeros(s * size)
 
                 for i in range(10):
                     dist._all_gather_base(test3_result, test3_data)
-                torch.cuda.synchronize()
                 print("rank %d test3 done" % rank)
 
                 print("rank %d exit test3 %d\n" % (rank, x))
 
-        warmup_result = [t.clone() for t in result]
+        #warmup_result = [t.clone() for t in result]
         dist.barrier()
-        torch.cuda.synchronize()
         dist.barrier()
-        torch.cuda.synchronize()
         start = time.time()
         if 1 == 13:
             lin = torch.nn.Linear(4096, 4096).cuda()
@@ -375,47 +363,20 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 12:
+        elif 1 == 11:
             loopcount = 1000
-            freeevents = [
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-            ]
             events = []
-            # if n == "moodist":
-            #    moodist.enable_profiling(True)
-            for _ in range(loopcount):
+            for i in range(loopcount):
                 if len(events) >= 2:
-                    e = events.pop(0)
-                    e.synchronize()
-                    freeevents.append(e)
+                    events.pop(0).synchronize()
                 dist.all_gather_into_tensor(result0, tmp)
-                # dist.all_gather(result, tmp)
-                e = freeevents.pop(0)
+                e = torch.cuda.Event()
                 e.record()
                 events.append(e)
-            # if n == "moodist":
-            #    moodist.enable_profiling(False)
-
-            dist.all_gather_into_tensor(result0, tmp)
-            # for i in range(loopcount):
-            #     if len(events) >= 2:
-            #         events.pop(0).synchronize()
-            #     dist.all_gather_into_tensor(result0, tmp)
-            #     e = torch.cuda.Event()
-            #     e.record()
-            #     events.append(e)
         elif 1 == 1:
-            # moodist.enable_profiling(True)
             loopcount = 1000
             for _ in range(loopcount):
-                dist.all_gather_into_tensor(result0, tmp)
-                torch.cuda.synchronize()
-            # moodist.enable_profiling(False)
-
-            dist.all_gather_into_tensor(result0, tmp)
+                dist.gather_object(tmp, result if rank == dstrank else None, dstrank)
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000
@@ -478,7 +439,6 @@ def f(n):
         #     # #print("rank %d result %d: %s" % (rank, _, s))
         #     # print("rank %d result %d: %s (should be %f)" % (rank, _, s, data.sum()))
 
-        torch.cuda.synchronize()
         t = time.time() - start
         print("rank %d all done!" % rank)
         dist.barrier()
@@ -510,15 +470,13 @@ def f(n):
         # items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
         # items = 1024 * 1024 * 40
-        items = 1024 * 64
-        # items = 294912 * size
+        items = 1
+        # items = 128
         sum = 0
-        # dtype = torch.bfloat16
-        dtype = torch.float
-        sumdata = torch.zeros(items).cuda().to(dtype)
+        sumdata = torch.zeros(items)
         for i in range(size):
             torch.manual_seed(42 + i)
-            data = torch.randn(items).cuda().to(dtype)
+            data = torch.randn(items)
             sumdata += data
             sum += data.sum().item()
         if rank == 0:
@@ -526,7 +484,7 @@ def f(n):
             # for i, v in zip(range(4), sumdata.split(items // size)):
             #     print("%d: chunk %d should be " % (rank, i), v)
         torch.manual_seed(42 + rank)
-        data = torch.randn(items).cuda().to(dtype)
+        data = torch.randn(items)
         data2 = data.clone()
         tmp = data.clone()
         tmp2 = tmp.clone()
@@ -538,7 +496,7 @@ def f(n):
 
         print(">=10 ? ", (data >= 10).sum())
 
-        for _ in range(50):
+        for _ in range(500):
             # if rank == _ % size:
             #     time.sleep(0.15)
             # print("%d: start allreduce %d, data is " % (rank, _), data)
@@ -555,8 +513,8 @@ def f(n):
             tmpsum = tmp.sum()
             if True and not torch.allclose(tmp, sumdata, 1e-3, 1e-2):
                 print("%d: sum %f" % (rank, tmpsum))
-                # for i, v in zip(range(4), tmp.split(items // size)):
-                #     print("%d: chunk %d is " % (rank, i), v)
+                for i, v in zip(range(4), tmp.split(items // size)):
+                    print("%d: chunk %d is " % (rank, i), v)
                 print(
                     "%d: indices " % rank,
                     ((sumdata - tmp).abs() >= 1e-3).nonzero(as_tuple=True)[0],
@@ -576,36 +534,17 @@ def f(n):
 
         start = time.time()
         sum = 0
-        if 1 == 12:
-            loopcount = 1000
-            freeevents = [
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-            ]
-            events = []
-            for _ in range(loopcount):
-                if len(events) >= 2:
-                    e = events.pop(0)
-                    e.synchronize()
-                    freeevents.append(e)
-                dist.all_reduce(tmp)
-                e = freeevents.pop(0)
-                e.record()
-                events.append(e)
-        else:
-            loopcount = 1000
-            for _ in range(loopcount):
-                # tmp.copy_(data)
-                # tmp2.copy_(data2)
-                dist.all_reduce(tmp)
-                # dist.all_reduce(tmp2)
-                # si = tmp.sum().item() + tmp2.sum().item()
-                ##si = tmp.sum().item()
-                # print("-> %f" % si)
-                # sum += si
-                # torch.cuda.synchronize()
+        loopcount = 1000
+        for _ in range(loopcount):
+            # tmp.copy_(data)
+            # tmp2.copy_(data2)
+            dist.all_reduce(tmp)
+            # dist.all_reduce(tmp2)
+            # si = tmp.sum().item() + tmp2.sum().item()
+            ##si = tmp.sum().item()
+            # print("-> %f" % si)
+            # sum += si
+            # torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)
@@ -666,8 +605,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist", "nccl"):
-#for n in ("moodist",):
+# for n in ("moodist", "nccl"):
+for n in ("moodist",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

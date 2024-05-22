@@ -77,7 +77,7 @@ struct Group {
 
   HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
   static constexpr size_t maxConcurrency = 16;
-  static constexpr size_t maxDevices = 8;
+  static constexpr size_t maxDevices = 4;
   static constexpr size_t maxChunks = 8;
 
   std::unique_ptr<SetupComms> setupComms;

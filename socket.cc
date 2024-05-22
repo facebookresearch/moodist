@@ -444,8 +444,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
           ql.unlock();
           return;
         }
-        wl.try_lock();
-        if (!wl.owns_lock()) {
+        if (!wl.try_lock()) {
           ql.unlock();
           return;
         }
@@ -699,8 +698,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
             ql.unlock();
             return;
           }
-          wl.try_lock();
-          if (!wl.owns_lock()) {
+          if (!wl.try_lock()) {
             ql.unlock();
             return;
           }

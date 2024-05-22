@@ -53,8 +53,8 @@ def f(n):
         backend=n,
     )
 
-    group1 = dist.new_group()
-    group2 = dist.new_group()
+    # group1 = dist.new_group()
+    # group2 = dist.new_group()
 
     rank = dist.get_rank()
     size = dist.get_world_size()
@@ -100,6 +100,7 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 32).cuda() + 1
     # data = torch.randn(1024 * 1024 * 256).cuda() + 1
     # data = torch.randn(263520).cuda() + 1
+    #data = torch.randn(442416 * 20) + 1
     data = torch.randn(442416) + 1
     # data = torch.randn(262144 - 1024).cuda() + 1
     # data = torch.randn(262144 - 64).cuda() + 1
@@ -111,7 +112,7 @@ def f(n):
     # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
     # data = torch.randn(1024 * 1024 * 4).cuda() + 1
     if rank == 0:
-        print("all-gather")
+        print("broadcast cpu")
     result = [torch.zeros_like(data) for _ in range(size)]
     # data2 = data.clone() + 1
     # result2 = [torch.empty_like(data2) for _ in range(size)]
@@ -154,7 +155,7 @@ def f(n):
     result02 = result0.clone()
 
     for _ in range(100):
-        # print("rank %d warmup %d" % (rank, _))
+        print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result = [torch.zeros_like(data) for _ in range(size)]
         result0 -= 1
@@ -165,7 +166,7 @@ def f(n):
         dist.broadcast(tmp, 0)
         result = [tmp.clone()]
         tmp.zero_()
-        #result = result0.chunk(size)
+        # result = result0.chunk(size)
         # dist._all_gather_base(result, tmp)
         if True:
             for i, v in zip(range(size), correct_result):
@@ -177,9 +178,7 @@ def f(n):
                     print("%d: data.data_ptr() is %#x" % (rank, data.data_ptr()))
                     print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                     print("%d: should be %f" % (rank, v.sum()))
-                    indices = ((result[i] - v).abs() >= 1e-3).nonzero(
-                        as_tuple=True
-                    )[0]
+                    indices = ((result[i] - v).abs() >= 1e-3).nonzero(as_tuple=True)[0]
                     print(
                         "%d: indices " % rank,
                         indices,
@@ -202,7 +201,7 @@ def f(n):
                     print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                     raise RuntimeError("%d: wrong result for index %d" % (rank, i))
         torch.cuda.synchronize()
-        # print("rank %d warmup %d done" % (rank, _))
+        print("rank %d warmup %d done" % (rank, _))
     tmp.copy_(data)
 
     print("rank %d warmup done" % (rank))
@@ -269,13 +268,7 @@ def f(n):
             % (
                 t,
                 loopcount / t,
-                data.numel()
-                * data.element_size()
-                / 1024
-                / 1024
-                / 1024
-                * loopcount
-                / t,
+                data.numel() * data.element_size() / 1024 / 1024 / 1024 * loopcount / t,
             )
         )
 

@@ -96,13 +96,13 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        #data = torch.randn(4).cuda() + 1
+        # data = torch.randn(4).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
-        #data = torch.randn(442416).cuda() + 1
-        #data = torch.randn(589824) + 1
-        data = torch.randn(589824) + 1
+        # data = torch.randn(442416).cuda() + 1
+        # data = torch.randn(589824) + 1
+        data = torch.randn(1024 * 1024) + 1
         # data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
@@ -203,6 +203,22 @@ def f(n):
         tmp.copy_(data)
 
         print("rank %d warmup done" % (rank))
+
+        if False:
+            print("object begin")
+            for x in range(1000):
+                if x < 100 or x > 900:
+                    n_busy = torch.Tensor([x % 4])
+                    torch.distributed.all_reduce(n_busy)
+                    assert n_busy.item() == (x % 4) * size
+                output = [None for _ in range(size)]
+                input_list = list(
+                    list(range(x * i - i, x * i + i + 14)) for i in range(size)
+                )
+                dist.all_gather_object(output, input_list[rank])
+                for i in range(size):
+                    assert input_list[i] == output[i]
+            print("object end")
 
         if False:
             tmpz = []
@@ -461,9 +477,9 @@ def f(n):
         # items = 1024 * 1024 * 64 * size
         # items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
-        #items = 1024 * 1024 * 40
+        # items = 1024 * 1024 * 40
         items = 1
-        #items = 128
+        # items = 128
         sum = 0
         sumdata = torch.zeros(items)
         for i in range(size):
@@ -491,15 +507,15 @@ def f(n):
         for _ in range(500):
             # if rank == _ % size:
             #     time.sleep(0.15)
-            #print("%d: start allreduce %d, data is " % (rank, _), data)
+            # print("%d: start allreduce %d, data is " % (rank, _), data)
             datax = data.clone()
             tmp2.copy_(datax)
             datax.zero_()
             dist.all_reduce(tmp2)
             tmp.copy_(tmp2)
             tmp2.zero_()
-            #torch.cuda.synchronize()
-            #print("%d: finished allreduce %d!" % (rank, _))
+            # torch.cuda.synchronize()
+            # print("%d: finished allreduce %d!" % (rank, _))
 
             # print("%d:" % rank, tmp)
             tmpsum = tmp.sum()

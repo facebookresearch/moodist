@@ -282,14 +282,17 @@ struct CollectiveBase {
     return replace("(($type)($address))", "$type", type, "$address", address);
   }
 
-  std::string concurrencyIndex(uintptr_t base, size_t itembytes, size_t offset = 0) {
+  template<typename offsetT = size_t>
+  std::string concurrencyIndex(uintptr_t base, size_t itembytes, offsetT offset = 0) {
     return replace(
         "($base + $itembytes * concurrencyIndex + $offset)", "$base", base, "$itembytes", itembytes, "$offset", offset);
   }
-  std::string concurrencyIndex(const AllocatedArray& arr, size_t offset = 0) {
+  template<typename offsetT = size_t>
+  std::string concurrencyIndex(const AllocatedArray& arr, offsetT offset = 0) {
     return concurrencyIndex(arr.buffer.cudaPointer, arr.itembytes, offset);
   }
-  std::string concurrencyIndex(const PeerArrayRef& arr, size_t offset = 0) {
+  template<typename offsetT = size_t>
+  std::string concurrencyIndex(const PeerArrayRef& arr, offsetT offset = 0) {
     return concurrencyIndex(arr.base, arr.itembytes, offset);
   }
 

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <cstdio>
 
 #include <linux/futex.h>
 #include <semaphore.h>

@@ -35,8 +35,7 @@ def f(n):
     if n == "moodist":
         import sys
 
-        # sys.path.append("/home/vegardmella/moolib/py")
-        # sys.path.append("/private/home/vegardmella/moolib/py")
+        sys.path.append("/home/vegardmella/moodist/py")
         import moodist
 
         # moodist.enable_profiling(True)
