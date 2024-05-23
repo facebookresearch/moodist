@@ -180,7 +180,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if False:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -375,7 +375,7 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 12:
+        elif 1 == 1:
             loopcount = 1000
             freeevents = [
                 torch.cuda.Event(),
@@ -384,8 +384,8 @@ def f(n):
                 torch.cuda.Event(),
             ]
             events = []
-            # if n == "moodist":
-            #    moodist.enable_profiling(True)
+            if n == "moodist":
+               moodist.enable_profiling(True)
             for _ in range(loopcount):
                 if len(events) >= 2:
                     e = events.pop(0)
@@ -396,8 +396,8 @@ def f(n):
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)
-            # if n == "moodist":
-            #    moodist.enable_profiling(False)
+            if n == "moodist":
+               moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp)
             # for i in range(loopcount):
@@ -667,6 +667,7 @@ for i in range(ngpus):
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 for n in ("moodist", "nccl"):
+#for n in ("nccl", "moodist"):
 #for n in ("moodist",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)

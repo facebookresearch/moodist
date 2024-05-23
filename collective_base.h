@@ -299,6 +299,11 @@ struct CollectiveBase {
   size_t getPeerIndex(size_t rank) {
     return group->getPeerIndex(rank);
   }
+
+  size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
+    return Group::maxChunks * Group::maxDevices * size * concurrencyIndex + Group::maxChunks * size * device +
+           size * chunk + index;
+  }
 };
 
 } // namespace moodist

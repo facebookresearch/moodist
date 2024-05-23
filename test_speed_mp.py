@@ -53,7 +53,7 @@ def f(n):
 
     rank = dist.get_rank()
 
-    op = "reduce_scatter"
+    op = "all_gather"
 
     def t(i):
         if rank == 0:

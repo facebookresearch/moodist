@@ -944,7 +944,7 @@ struct CpuThreadImpl {
         }
         fmt::fprintf(f, "]}\n");
         fclose(f);
-        fmt::printf("Chrome trace dumped to %s\n", fn);
+        log.info("Chrome trace dumped to %s\n", fn);
         traceEvents.clear();
       }
       return;
@@ -1565,6 +1565,9 @@ struct CpuThreadImpl {
             std::string i;
             auto& state = sendStates[di];
             auto& dev = self.devices[di];
+            if (state.liveSends >= numParallel) {
+              continue;
+            }
             if (state.sendIndex == ringSends.size()) {
               if (state.liveSends) {
                 continue;

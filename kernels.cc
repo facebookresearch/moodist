@@ -865,13 +865,13 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   ptx.resize(ptxSize);
   CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
 
-  if (false) {
+  if (boolenv("MOODIST_DUMP_KERNELS")) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d-ptx.s", rank);
     FILE* f = fopen(fn.c_str(), "wb");
     if (f) {
       fwrite(ptx.data(), ptx.size(), 1, f);
       fclose(f);
-      fmt::printf("ptx dumped to %s\n", fn);
+      log.info("ptx dumped to %s\n", fn);
     }
   }
 
@@ -886,13 +886,13 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   log.debug("cubin size is %d\n", cubin.size());
   CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
 
-  if (false) {
+  if (boolenv("MOODIST_DUMP_KERNELS")) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d.o", rank);
     FILE* f = fopen(fn.c_str(), "wb");
     if (f) {
       fwrite(cubin.data(), cubin.size(), 1, f);
       fclose(f);
-      log.debug("cubin dumped to %s\n", fn);
+      log.info("cubin dumped to %s\n", fn);
     }
   }
 

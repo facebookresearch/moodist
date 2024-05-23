@@ -469,7 +469,11 @@ std::string AllGather::generate() {
 
       recvCopies += R"(
         {
-        uint32_t value = *ptr++;
+        if (threadIdx.x == 0) {
+          sharedValue = *ptr++;
+        }
+        syncthreads();
+        uint32_t value = sharedValue;
         uint32_t pdi_source = value & 0xffff;
         uint32_t destinationPeerIndex = (value >> 16) & 0xff;
         uint32_t proxyPeerIndex = (value >> 24) & 0xff;
@@ -535,8 +539,13 @@ std::string AllGather::generate() {
 
   recvCopies = replace(
       R"(
+        __shared__ uint32_t sharedValue;
     for (auto* ptr = &allGatherInstructions[0];;) {
-      uint32_t source = *ptr++;
+      if (threadIdx.x == 0) {
+        sharedValue = *ptr++;
+      }
+      syncthreads();
+      uint32_t source = sharedValue;
       if (source == -1) {
         break;
       }
