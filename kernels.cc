@@ -595,15 +595,6 @@ __device__ void reduce2(T* __restrict__ dst, const T* __restrict__ src1, const T
         "$ptr", concurrencyIndex(group->peerCudaStepValue[i], sizeof(uint32_t) * rank));
   }
 
-  auto waitForRecv = [&](size_t i) {
-    std::string s;
-    s = replace("// wait for recv from $i\n", "$i", i);
-    for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
-    }
-    return s;
-  };
-
   std::string copyDoneAllCode;
   std::string waitForCopyDones;
   for (size_t i : group->peerIndices) {

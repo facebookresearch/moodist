@@ -37,7 +37,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       initAttributes.cap.max_inline_data = 32;
       initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
       initAttributes.pd = protectionDomain;
-      initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+      initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ;
 
       IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
       if (!qp) {
@@ -173,7 +173,7 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   initAttributes.cap.max_inline_data = 32;
   initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
   initAttributes.pd = protectionDomain;
-  initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+  initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ;
   efadv_qp_init_attr efaAttr;
   std::memset(&efaAttr, 0, sizeof(efaAttr));
   efaAttr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;

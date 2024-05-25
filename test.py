@@ -375,7 +375,7 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 1:
+        elif 1 == 14:
             loopcount = 1000
             freeevents = [
                 torch.cuda.Event(),

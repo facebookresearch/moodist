@@ -20,6 +20,10 @@ struct DynamicAddresses;
 enum class Dtype { float32, float64, int32, int64, bfloat16, count };
 enum class Reduction { sum, min, max, avg, count };
 
+static constexpr size_t maxConcurrency = 16;
+static constexpr size_t maxDevices = 4;
+static constexpr size_t maxChunks = 8;
+
 struct alignas(64) Progress {
   uint32_t stepValue;
   uint32_t cpuStepValue;
@@ -34,12 +38,13 @@ struct alignas(64) CpuAddresses {
 };
 
 struct alignas(128) DynamicAddresses {
+  uint32_t stepValue;
   uint32_t opType;
   uintptr_t gatherAddress;
   size_t gatherBytes;
-  std::array<uint32_t, 8> gatherKey;
-  uint32_t stepValue;
+  std::array<uint32_t, maxDevices> gatherKey;
 };
+static_assert(sizeof(DynamicAddresses) <= 128);
 
 struct AddressPair {
   uintptr_t inputAddress;
@@ -76,9 +81,10 @@ struct Group {
   CUdevice cuDevice;
 
   HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
-  static constexpr size_t maxConcurrency = 16;
-  static constexpr size_t maxDevices = 4;
-  static constexpr size_t maxChunks = 8;
+
+  static constexpr size_t maxConcurrency = moodist::maxConcurrency;
+  static constexpr size_t maxDevices = moodist::maxDevices;
+  static constexpr size_t maxChunks = moodist::maxChunks;
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;

@@ -171,106 +171,108 @@ void Group::init() {
 
   ibv_fork_init();
 
-  ibv_device** list = ibv_get_device_list(nullptr);
-  for (ibv_device** i = list; *i; ++i) {
-    ibv_device* di = *i;
+  for (size_t ic = 0; ic != 4; ++ic) {
+    ibv_device** list = ibv_get_device_list(nullptr);
+    for (ibv_device** i = list; *i; ++i) {
+      ibv_device* di = *i;
 
-    // fmt::printf("device %s\n", di->name);
-    IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
-    if (ctx) {
-      ibv_device_attr attributes;
-      std::memset(&attributes, 0, sizeof(attributes));
-      if (ibv_query_device(ctx, &attributes) != 0) {
-        continue;
-      }
-
-      log.debug("max_mr_size is %d\n", attributes.max_mr_size);
-      log.debug("max_mr is %d\n", attributes.max_mr);
-
-      int portNum = -1;
-      ibv_port_attr portAttributes;
-      int bestSpeed = -1;
-      for (size_t i = 0; i != attributes.phys_port_cnt; ++i) {
-        ibv_port_attr attributes;
+      // fmt::printf("device %s\n", di->name);
+      IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
+      if (ctx) {
+        ibv_device_attr attributes;
         std::memset(&attributes, 0, sizeof(attributes));
-        if (ibv_query_port(ctx, 1 + i, &attributes) == 0) {
-          if (attributes.state != IBV_PORT_ACTIVE) {
-            continue;
-          }
-          log.debug("got a port with link layer %d\n", attributes.link_layer);
-          log.debug("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
-          int speed = attributes.active_speed;
-          if (attributes.link_layer == IBV_LINK_LAYER_INFINIBAND) {
-            speed += 0x100000;
-          }
-          if (speed > bestSpeed) {
-            bestSpeed = speed;
-            portNum = 1 + i;
-            portAttributes = attributes;
-          }
+        if (ibv_query_device(ctx, &attributes) != 0) {
+          continue;
         }
-        // fmt::printf("queried port %d\n", 1 + i);
-      }
-      if (portNum == -1) {
-        continue;
-      }
 
-      std::string ibPath = fmt::sprintf("%s/device", di->ibdev_path);
-      char* path = realpath(ibPath.c_str(), nullptr);
-      if (path) {
-        ibPath = path;
-        free(path);
-      }
-      ibPath = removePciPathPrefix(ibPath);
-      // fmt::printf("ib path is %s\n", ibPath);
+        log.debug("max_mr_size is %d\n", attributes.max_mr_size);
+        log.debug("max_mr is %d\n", attributes.max_mr);
 
-      auto getScore = [&](std::string cudaPath) {
-        int nmatch = 0;
-        for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
-          if (cudaPath[i] == ibPath[i]) {
-            if (cudaPath[i] == '/') {
-              ++nmatch;
+        int portNum = -1;
+        ibv_port_attr portAttributes;
+        int bestSpeed = -1;
+        for (size_t i = 0; i != attributes.phys_port_cnt; ++i) {
+          ibv_port_attr attributes;
+          std::memset(&attributes, 0, sizeof(attributes));
+          if (ibv_query_port(ctx, 1 + i, &attributes) == 0) {
+            if (attributes.state != IBV_PORT_ACTIVE) {
+              continue;
             }
-          } else {
-            break;
+            log.debug("got a port with link layer %d\n", attributes.link_layer);
+            log.debug("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
+            int speed = attributes.active_speed;
+            if (attributes.link_layer == IBV_LINK_LAYER_INFINIBAND) {
+              speed += 0x100000;
+            }
+            if (speed > bestSpeed) {
+              bestSpeed = speed;
+              portNum = 1 + i;
+              portAttributes = attributes;
+            }
           }
+          // fmt::printf("queried port %d\n", 1 + i);
         }
-        return nmatch;
-      };
+        if (portNum == -1) {
+          continue;
+        }
 
-      log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
+        std::string ibPath = fmt::sprintf("%s/device", di->ibdev_path);
+        char* path = realpath(ibPath.c_str(), nullptr);
+        if (path) {
+          ibPath = path;
+          free(path);
+        }
+        ibPath = removePciPathPrefix(ibPath) + fmt::sprintf("-%d\n", ic);
+        // fmt::printf("ib path is %s\n", ibPath);
 
-      for (auto& v : localDevices) {
-        CHECK(v.ibPath != ibPath);
-      }
+        auto getScore = [&](std::string cudaPath) {
+          int nmatch = 0;
+          for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
+            if (cudaPath[i] == ibPath[i]) {
+              if (cudaPath[i] == '/') {
+                ++nmatch;
+              }
+            } else {
+              break;
+            }
+          }
+          return nmatch;
+        };
 
-      LocalDevice lc;
-      lc.ctx = std::move(ctx);
-      lc.portNum = portNum;
-      lc.ibPath = ibPath;
-      lc.portAttributes = portAttributes;
-      localDevices.push_back(std::move(lc));
+        log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
 
-      for (auto& v : localDeviceNodes) {
-        CHECK(v.ibPath != ibPath);
-      }
+        for (auto& v : localDevices) {
+          CHECK(v.ibPath != ibPath);
+        }
 
-      std::tuple<int, int, int> score = {getScore(cudaPath), 0, bestSpeed};
-      LocalDeviceNode n;
-      n.ibPath = ibPath;
-      n.score = score;
-      localDeviceNodes.push_back(n);
+        LocalDevice lc;
+        lc.ctx = std::move(ctx);
+        lc.portNum = portNum;
+        lc.ibPath = ibPath;
+        lc.portAttributes = portAttributes;
+        localDevices.push_back(std::move(lc));
 
-      for (size_t i = 0; i != allCudaPaths.size(); ++i) {
-        std::tuple<int, int, int> score = {getScore(allCudaPaths[i]), 0, bestSpeed};
+        for (auto& v : localDeviceNodes) {
+          CHECK(v.ibPath != ibPath);
+        }
+
+        std::tuple<int, int, int> score = {getScore(cudaPath), 0, bestSpeed};
         LocalDeviceNode n;
         n.ibPath = ibPath;
         n.score = score;
-        allDeviceNodes.at(i).push_back(n);
+        localDeviceNodes.push_back(n);
+
+        for (size_t i = 0; i != allCudaPaths.size(); ++i) {
+          std::tuple<int, int, int> score = {getScore(allCudaPaths[i]), 0, bestSpeed};
+          LocalDeviceNode n;
+          n.ibPath = ibPath;
+          n.score = score;
+          allDeviceNodes.at(i).push_back(n);
+        }
       }
     }
+    ibv_free_device_list(list);
   }
-  ibv_free_device_list(list);
 
   RankForIbSetup localRankForIbSetup;
   localRankForIbSetup.bootId = bootId;
@@ -438,10 +440,9 @@ void Group::init() {
     bestCtx = std::move(d->ctx);
     bestPortNum = d->portNum;
     bestPortAttributes = d->portAttributes;
-    TORCH_CHECK(bestCtx != nullptr);
+    CHECK(bestCtx != nullptr);
 
     log.verbose("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
-    std::string devId = bestCtx->device->ibdev_path;
 
     ibCommon->init(bestPortNum, bestPortAttributes);
 

@@ -15,6 +15,7 @@
 #include "fmt/printf.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <libibverbs/verbs.h>
 #include <memory>
@@ -34,7 +35,7 @@ struct CpuThreadImpl;
 namespace {
 
 struct MemoryRegistration {
-  std::array<ibv_mr*, 32> mrs{};
+  std::array<ibv_mr*, Group::maxDevices> mrs{};
 };
 
 struct CudaMapping {
@@ -321,6 +322,7 @@ struct CpuThreadImpl {
   IntrusiveList<Device, &Device::link> activeDevices;
 
   size_t bytesWritten = 0;
+  size_t bytesRead = 0;
 
   HashMap<uintptr_t, std::unique_ptr<CpuMapping>> mrMap;
   HashMap<uintptr_t, std::unique_ptr<CudaMapping>> mrMapCuda;
@@ -647,6 +649,78 @@ struct CpuThreadImpl {
     }
   }
 
+  void readData(
+      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      Callback* callback = nullptr) {
+    CHECK(i >= 0 && i < size);
+    CHECK(i != rank);
+    auto post = [&]() {
+      ibv_sge sge;
+      sge.addr = (uintptr_t)localAddress;
+      sge.length = bytes;
+      sge.lkey = lkey;
+
+      bytesRead += bytes;
+
+      if (callback) {
+        ++callback->refcount;
+      }
+
+      while (dev.currentCqEntries == maxCqEntries) {
+        poll();
+      }
+      ++dev.currentCqEntries;
+      if (dev.currentCqEntries == 1) {
+        activeDevices.push_back(dev);
+      }
+
+      ibv_qp_ex* qp = dev.ib->qpex;
+
+      // log.info(
+      //     "%d: rdma read %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes, localAddress,
+      //     remoteAddress, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+
+      bool efa = qp != nullptr;
+      if (!efa) {
+        qp = dev.ib->qpexs[i];
+        CHECK(qp != nullptr);
+      }
+
+      ibv_wr_start(qp);
+      qp->wr_id = (uint64_t)(void*)callback;
+      qp->wr_flags = IBV_SEND_SIGNALED;
+      ibv_wr_rdma_read(qp, rkey, (uintptr_t)remoteAddress);
+      ibv_wr_set_sge_list(qp, 1, &sge);
+
+      if (efa) {
+        ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
+      }
+      int error = ibv_wr_complete(qp);
+      if (error) {
+        fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
+      }
+    };
+
+    const size_t threshold = 1024ull * 1024 * 896;
+    const size_t chunkSize = 1024ull * 1024 * 768;
+    if (bytes >= threshold) {
+      size_t remaining = bytes;
+      bytes = chunkSize;
+      while (remaining > 0) {
+        if (remaining < threshold) {
+          bytes = remaining;
+        }
+        post();
+
+        localAddress = (void*)((uintptr_t)localAddress + bytes);
+        remoteAddress = (void*)((uintptr_t)remoteAddress + bytes);
+        remaining -= bytes;
+      }
+    } else {
+      post();
+    }
+  }
+
   void writeControl(
       size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
       uint32_t rkey, size_t bytes) {
@@ -708,7 +782,7 @@ struct CpuThreadImpl {
     for (size_t i = 0; i != devices.size(); ++i) {
       ibv_mr* mr = ibv_reg_mr(
           devices[i].ib->protectionDomain, (void*)address, bytes,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_RELAXED_ORDERING);
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
       if (!mr) {
         perror("ibv_reg_mr");
         log.error("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
@@ -766,7 +840,7 @@ struct CpuThreadImpl {
     for (size_t i = 0; i != devices.size(); ++i) {
       ibv_mr* mr = ibv_reg_mr(
           devices[i].ib->protectionDomain, (void*)address, bytes,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_RELAXED_ORDERING);
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
       if (!mr) {
         perror("ibv_reg_mr");
         log.error("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
@@ -805,7 +879,7 @@ struct CpuThreadImpl {
 
   void writeDataDistributed(
       size_t dst, uintptr_t srcAddr, size_t len, MemoryRegistration* mr, uint64_t dstAddr,
-      const std::array<uint32_t, 8>& key, Callback* callback) {
+      const std::array<uint32_t, maxDevices>& key, Callback* callback) {
     CHECK(len > 0);
     size_t offset = 0;
     const size_t chunks = devices.size();
@@ -1508,7 +1582,7 @@ struct CpuThreadImpl {
       size_t liveSends;
     };
     const size_t nDevices = self.devices.size();
-    std::array<SendState, 32> sendStates;
+    std::array<SendState, maxDevices> sendStates;
 
     WorkAllGatherRing(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {}
 
@@ -1633,8 +1707,6 @@ struct CpuThreadImpl {
         CHECK(sendStates[i].sendIndex == ringSends.size());
       }
 
-      cpuOut[0] = stepValue;
-
       self.trace("wait for recvs");
       for (index = 0; index != ringRecvs.size(); ++index) {
         i = std::get<0>(ringRecvs[index]);
@@ -1656,6 +1728,8 @@ struct CpuThreadImpl {
 
       // log.info("wait for exit kernel %d\n", stepValue);
 
+      cpuOut[0] = stepValue;
+
       self.trace("kernel-exit");
 
       while (cpuIn[0] < stepValue + 1) {
@@ -1668,6 +1742,251 @@ struct CpuThreadImpl {
 
       self.cpuThread->freelistAllGather.push(&params);
       self.allocatorAllGatherRing.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkAllGatherRingRead : Work {
+    QueueEntryAllGather& params;
+    size_t di;
+    MemoryRegistration* inputMr;
+
+    size_t recvNeighbor;
+    size_t sendNeighbor;
+
+    size_t readBegin;
+    std::chrono::steady_clock::time_point startTime;
+
+    const AllGather& allGather = *self.group->allGather;
+    const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
+    const Vector<std::pair<size_t, size_t>>& ringSends = allGather.ringSends;
+
+    static const size_t numChunks = maxChunks;
+    const size_t chunkSize = params.bytes < (size_t)65536 * 96
+                                 ? params.bytes
+                                 : std::max((params.bytes + numChunks - 1) / numChunks, (size_t)65536 * 72);
+    // const size_t numParallel = std::max(std::min((params.bytes + chunkSize - 1) / chunkSize / 2, (size_t)2),
+    // (size_t)1);
+    static constexpr size_t numParallel = 2;
+
+    struct DataTime {
+      bool inProgress = false;
+      std::chrono::steady_clock::time_point startTime;
+      std::chrono::steady_clock::duration prevDuration{};
+    };
+    std::array<DataTime, numParallel> times;
+
+    struct ReadState {
+      size_t readIndex;
+      size_t chunkIndex;
+      size_t liveReads;
+    };
+    const size_t nDevices = self.devices.size();
+    std::array<ReadState, maxDevices> readStates;
+    size_t parallelCounter = 0;
+    size_t waitCounter = 0;
+    size_t readCounter = 0;
+
+    WorkAllGatherRingRead(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {
+      CHECK(ringSends.size() != 0);
+      CHECK(ringRecvs.size() != 0);
+      recvNeighbor = std::get<1>(ringRecvs[0]);
+      sendNeighbor = std::get<1>(ringSends[0]);
+    }
+
+    void step() {
+      ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        auto* mr = self.regMrCuda(params.outputAddress, params.pitch * size);
+        self.outDynsMrVector[size * concurrencyIndex + 0] = mr;
+        outDyns[0].gatherAddress = params.outputAddress;
+        outDyns[0].gatherBytes = params.bytes;
+        outDyns[0].stepValue = stepValue;
+        outDyns[0].opType = opTypeAllGatherRingCuda;
+        for (size_t di = 0; di != self.devices.size(); ++di) {
+          outDyns[0].gatherKey[di] = mr->mrs[di]->rkey;
+        }
+
+        outDyns[1].gatherAddress = params.inputAddress;
+        outDyns[1].gatherBytes = params.bytes;
+        outDyns[1].stepValue = stepValue;
+        outDyns[1].opType = opTypeAllGatherRingCuda;
+        for (size_t di = 0; di != self.devices.size(); ++di) {
+          outDyns[1].gatherKey[di] = inputMr->mrs[di]->rkey;
+        }
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0);
+      self.writeDyn(concurrencyIndex, sendNeighbor, 1, 1);
+      { WAIT_DYN(opTypeAllGatherRingCuda, 0); }
+      { WAIT_DYN(opTypeAllGatherRingCuda, 1); }
+
+      for (size_t i = 0; i != nDevices; ++i) {
+        readStates[i].readIndex = 0;
+        readStates[i].chunkIndex = 0;
+        readStates[i].liveReads = 0;
+      }
+
+      self.trace("read loop");
+      // log.info("enter read loop\n");
+
+      readBegin = self.bytesRead;
+      startTime = std::chrono::steady_clock::now();
+
+      for (auto& v : times) {
+        v.startTime = startTime;
+        v.prevDuration = {};
+        v.inProgress = false;
+      }
+
+      while (true) {
+        {
+          size_t nDone = 0;
+          for (size_t di = 0; di != nDevices; ++di) {
+            std::string i;
+            auto& state = readStates[di];
+            auto& dev = self.devices[di];
+            if (state.liveReads >= numParallel) {
+              continue;
+            }
+            if (state.readIndex == ringRecvs.size()) {
+              if (state.liveReads) {
+                continue;
+              }
+              ++nDone;
+              continue;
+            }
+            // size_t parallelIndex = parallelCounter % numParallel;
+
+            // CHECK(!times[parallelIndex].inProgress);
+            size_t index = state.readIndex;
+            size_t chunkIndex = state.chunkIndex;
+            size_t source = std::get<0>(ringRecvs[index]);
+
+            size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+            const size_t devChunkSize = currentChunkSize / nDevices / 1024u * 1024u;
+            size_t offset = devChunkSize * di;
+            size_t n = di == nDevices - 1 ? currentChunkSize - offset : devChunkSize;
+            bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+            size_t readOffset = chunkSize * chunkIndex + offset;
+            if (n == 0) {
+              CHECK(false);
+              self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, di, chunkIndex);
+              // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
+            } else {
+              if (source != recvNeighbor) {
+                if (self.inStepValueDeviceChunk(concurrencyIndex, source, di, chunkIndex) != stepValue) {
+                  continue;
+                }
+              }
+              // size_t prevParallelIndex = (parallelIndex + numParallel - 1) % numParallel;
+              // auto now = std::chrono::steady_clock::now();
+              // if (times[prevParallelIndex].inProgress &&
+              //     now - times[prevParallelIndex].startTime < times[prevParallelIndex].prevDuration / 2) {
+              //   // log.info("read wait!\n");
+              //   ++waitCounter;
+              //   continue;
+              // }
+              // times[parallelIndex].startTime = now;
+              // ++parallelCounter;
+              uintptr_t dstAddr = params.outputAddress + params.pitch * source;
+              auto* srcMr = source == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + 0];
+
+              ++state.liveReads;
+              const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, source == recvNeighbor ? 1 : 0);
+              uintptr_t srcAddr =
+                  source == recvNeighbor ? dyn.gatherAddress : dyn.gatherAddress + params.pitch * source;
+              auto key = dyn.gatherKey;
+              //times[parallelIndex].inProgress = true;
+              ++readCounter;
+              self.readData(
+                  dev, recvNeighbor, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
+                  key[di], n, self.makeCallback([this, di, source, chunkIndex/*, parallelIndex*/]() {
+                    // auto now = std::chrono::steady_clock::now();
+                    // times[parallelIndex].inProgress = false;
+                    // times[parallelIndex].prevDuration = now - times[parallelIndex].startTime;
+                    // log.info("duration[%d] set to %d\n", parallelIndex, times[parallelIndex].prevDuration.count());
+                    --readStates[di].liveReads;
+                    if (source != sendNeighbor) {
+                      self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, di, chunkIndex);
+                    }
+                    // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
+                  }));
+            }
+
+            if (isLastChunk) {
+              state.chunkIndex = 0;
+              ++state.readIndex;
+              if (state.readIndex == ringRecvs.size()) {
+                self.writeStepValueDeviceChunk(concurrencyIndex, recvNeighbor, 0, recvNeighbor, di, 0);
+              }
+            } else {
+              ++state.chunkIndex;
+              CHECK(state.chunkIndex < numChunks);
+            }
+          }
+          if (nDone == nDevices) {
+            break;
+          }
+        }
+        YIELD
+      }
+
+      for (size_t i = 0; i != nDevices; ++i) {
+        CHECK(readStates[i].liveReads == 0);
+        CHECK(readStates[i].readIndex == ringRecvs.size());
+      }
+
+      {
+        size_t r = self.bytesRead - readBegin;
+        float t = seconds(std::chrono::steady_clock::now() - startTime);
+        log.info(
+            "read %d bytes in %gs - %gG/s (with %d waits, %d reads)\n", r, t, (float)r / 1024 / 1024 / 1024 / t,
+            waitCounter, readCounter);
+      }
+      // log.info("wait for remote reads\n");
+      self.trace("wait for remote reads");
+      for (di = 0; di != self.devices.size(); ++di) {
+        while (self.inStepValueDeviceChunk(concurrencyIndex, rank, di, 0) != stepValue) {
+          YIELD
+        }
+      }
+
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      cpuOut[0] = stepValue;
+
+      self.trace("kernel-exit");
+
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
+
+      self.cpuThread->freelistAllGather.push(&params);
+      self.allocatorAllGatherRingRead.deallocate(this);
       DONE
     }
   };
@@ -2198,7 +2517,7 @@ struct CpuThreadImpl {
       size_t liveSends;
     };
     const size_t nDevices = self.devices.size();
-    std::array<SendState, 32> sendStates;
+    std::array<SendState, maxDevices> sendStates;
 
     WorkBroadcastRingCpu(CpuThreadImpl& self, QueueEntryBroadcastCpu& params) : Work(self, params), params(params) {
       auto recvi = allGather.ringRecvsBySource.find(params.sourceRank);
@@ -2580,6 +2899,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkBarrier> allocatorBarrier;
   WorkAllocator<WorkInternalBarrier> allocatorInternalBarrier;
   WorkAllocator<WorkAllGatherRing> allocatorAllGatherRing;
+  WorkAllocator<WorkAllGatherRingRead> allocatorAllGatherRingRead;
   // WorkAllocator<WorkReduceScatterRing> allocatorReduceScatterRing;
   //  WorkAllocator<WorkBroadcast> allocatorBroadcast;
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
@@ -2651,7 +2971,8 @@ struct CpuThreadImpl {
             if (queueEntry.task == taskBarrier) {
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
             } else if (queueEntry.task == taskAllGather) {
-              enqueue(allocatorAllGatherRing, (QueueEntryAllGather&)queueEntry);
+              // enqueue(allocatorAllGatherRing, (QueueEntryAllGather&)queueEntry);
+              enqueue(allocatorAllGatherRingRead, (QueueEntryAllGather&)queueEntry);
             } else if (queueEntry.task == taskReduceScatter) {
               // enqueue(allocatorReduceScatterRing, (QueueEntryReduceScatter&)queueEntry);
               fatal("cuda ops temporarily disabled");
