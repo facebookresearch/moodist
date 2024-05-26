@@ -44,6 +44,10 @@ struct QueueEntryAllGather : QueueEntry {
   uintptr_t outputAddress = 0;
   size_t bytes = 0;
   size_t pitch = 0;
+
+  size_t numDevices = 0;
+  size_t numChunks = 0;
+  size_t numParallel = 0;
 };
 
 struct QueueEntryReduceScatter : QueueEntry {

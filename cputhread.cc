@@ -13,6 +13,7 @@
 #include "simple_vector.h"
 
 #include "fmt/printf.h"
+#include "synchronization.h"
 
 #include <atomic>
 #include <chrono>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <numa.h>
 #include <random>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -305,7 +307,7 @@ struct CpuThreadImpl {
   bool dead = false;
 
   CpuThreadImpl(CpuThread* cpuThread) : cpuThread(cpuThread) {
-    CHECK(devices.size() <= 8);
+    CHECK(devices.size() <= maxDevices);
   }
   ~CpuThreadImpl() {
     dead = true;
@@ -1761,27 +1763,37 @@ struct CpuThreadImpl {
     const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
     const Vector<std::pair<size_t, size_t>>& ringSends = allGather.ringSends;
 
-    static const size_t numChunks = maxChunks;
-    const size_t chunkSize = params.bytes < (size_t)65536 * 96
-                                 ? params.bytes
-                                 : std::max((params.bytes + numChunks - 1) / numChunks, (size_t)65536 * 72);
+    // static const size_t numChunks = maxChunks;
+    // const size_t chunkSize = params.bytes < (size_t)65536 * 96
+    //                              ? params.bytes
+    //                              : std::max((params.bytes + numChunks - 1) / numChunks, (size_t)65536 * 72);
     // const size_t numParallel = std::max(std::min((params.bytes + chunkSize - 1) / chunkSize / 2, (size_t)2),
     // (size_t)1);
-    static constexpr size_t numParallel = 2;
+    // const size_t numChunks = PARAMETER("num_chunks", 2, {1, 2, 4, 8});
+    // const size_t chunkSize = (params.bytes + numChunks - 1) / numChunks;
+    // const size_t numParallel = PARAMETER("num_parallel", 2, {1, 2, 4});
+
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = (params.bytes + numChunks - 1) / numChunks;
+    const size_t numParallel = params.numParallel;
+
+    // const size_t numChunks = maxChunks;
+    // const size_t chunkSize = (params.bytes + numChunks - 1) / numChunks;
+    // const size_t numParallel = 2;
 
     struct DataTime {
       bool inProgress = false;
       std::chrono::steady_clock::time_point startTime;
       std::chrono::steady_clock::duration prevDuration{};
     };
-    std::array<DataTime, numParallel> times;
+    std::array<DataTime, 4> times;
 
     struct ReadState {
       size_t readIndex;
       size_t chunkIndex;
       size_t liveReads;
     };
-    const size_t nDevices = self.devices.size();
     std::array<ReadState, maxDevices> readStates;
     size_t parallelCounter = 0;
     size_t waitCounter = 0;
@@ -1792,6 +1804,12 @@ struct CpuThreadImpl {
       CHECK(ringRecvs.size() != 0);
       recvNeighbor = std::get<1>(ringRecvs[0]);
       sendNeighbor = std::get<1>(ringSends[0]);
+
+      CHECK(numDevices <= self.devices.size());
+      CHECK(numChunks != 0);
+      CHECK(numParallel != 0);
+
+      log.info("allgather ring read numDevices %d, numChunks %d, numParallel %d\n", numDevices, numChunks, numParallel);
     }
 
     void step() {
@@ -1812,7 +1830,7 @@ struct CpuThreadImpl {
         outDyns[0].gatherBytes = params.bytes;
         outDyns[0].stepValue = stepValue;
         outDyns[0].opType = opTypeAllGatherRingCuda;
-        for (size_t di = 0; di != self.devices.size(); ++di) {
+        for (size_t di = 0; di != numDevices; ++di) {
           outDyns[0].gatherKey[di] = mr->mrs[di]->rkey;
         }
 
@@ -1820,7 +1838,7 @@ struct CpuThreadImpl {
         outDyns[1].gatherBytes = params.bytes;
         outDyns[1].stepValue = stepValue;
         outDyns[1].opType = opTypeAllGatherRingCuda;
-        for (size_t di = 0; di != self.devices.size(); ++di) {
+        for (size_t di = 0; di != numDevices; ++di) {
           outDyns[1].gatherKey[di] = inputMr->mrs[di]->rkey;
         }
       }
@@ -1839,7 +1857,7 @@ struct CpuThreadImpl {
       { WAIT_DYN(opTypeAllGatherRingCuda, 0); }
       { WAIT_DYN(opTypeAllGatherRingCuda, 1); }
 
-      for (size_t i = 0; i != nDevices; ++i) {
+      for (size_t i = 0; i != numDevices; ++i) {
         readStates[i].readIndex = 0;
         readStates[i].chunkIndex = 0;
         readStates[i].liveReads = 0;
@@ -1860,7 +1878,7 @@ struct CpuThreadImpl {
       while (true) {
         {
           size_t nDone = 0;
-          for (size_t di = 0; di != nDevices; ++di) {
+          for (size_t di = 0; di != numDevices; ++di) {
             std::string i;
             auto& state = readStates[di];
             auto& dev = self.devices[di];
@@ -1883,9 +1901,9 @@ struct CpuThreadImpl {
 
             size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
 
-            const size_t devChunkSize = currentChunkSize / nDevices / 1024u * 1024u;
+            const size_t devChunkSize = currentChunkSize / numDevices / 1024u * 1024u;
             size_t offset = devChunkSize * di;
-            size_t n = di == nDevices - 1 ? currentChunkSize - offset : devChunkSize;
+            size_t n = di == numDevices - 1 ? currentChunkSize - offset : devChunkSize;
             bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
             size_t readOffset = chunkSize * chunkIndex + offset;
             if (n == 0) {
@@ -1916,11 +1934,11 @@ struct CpuThreadImpl {
               uintptr_t srcAddr =
                   source == recvNeighbor ? dyn.gatherAddress : dyn.gatherAddress + params.pitch * source;
               auto key = dyn.gatherKey;
-              //times[parallelIndex].inProgress = true;
+              // times[parallelIndex].inProgress = true;
               ++readCounter;
               self.readData(
                   dev, recvNeighbor, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
-                  key[di], n, self.makeCallback([this, di, source, chunkIndex/*, parallelIndex*/]() {
+                  key[di], n, self.makeCallback([this, di, source, chunkIndex /*, parallelIndex*/]() {
                     // auto now = std::chrono::steady_clock::now();
                     // times[parallelIndex].inProgress = false;
                     // times[parallelIndex].prevDuration = now - times[parallelIndex].startTime;
@@ -1944,14 +1962,14 @@ struct CpuThreadImpl {
               CHECK(state.chunkIndex < numChunks);
             }
           }
-          if (nDone == nDevices) {
+          if (nDone == numDevices) {
             break;
           }
         }
         YIELD
       }
 
-      for (size_t i = 0; i != nDevices; ++i) {
+      for (size_t i = 0; i != numDevices; ++i) {
         CHECK(readStates[i].liveReads == 0);
         CHECK(readStates[i].readIndex == ringRecvs.size());
       }
@@ -1965,7 +1983,7 @@ struct CpuThreadImpl {
       }
       // log.info("wait for remote reads\n");
       self.trace("wait for remote reads");
-      for (di = 0; di != self.devices.size(); ++di) {
+      for (di = 0; di != numDevices; ++di) {
         while (self.inStepValueDeviceChunk(concurrencyIndex, rank, di, 0) != stepValue) {
           YIELD
         }
@@ -2972,6 +2990,7 @@ struct CpuThreadImpl {
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
             } else if (queueEntry.task == taskAllGather) {
               // enqueue(allocatorAllGatherRing, (QueueEntryAllGather&)queueEntry);
+              // allGatherParameters(((QueueEntryAllGather&)queueEntry).bytes);
               enqueue(allocatorAllGatherRingRead, (QueueEntryAllGather&)queueEntry);
             } else if (queueEntry.task == taskReduceScatter) {
               // enqueue(allocatorReduceScatterRing, (QueueEntryReduceScatter&)queueEntry);

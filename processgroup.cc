@@ -7,6 +7,7 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "parameters.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
@@ -123,6 +124,9 @@ struct ProcessGroupImpl {
   HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
 
   WorkStream copyWorkStream;
+
+  ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
+      allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -503,10 +507,6 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    uint32_t stepValue = getNextStepValue();
-    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-    CHECK(stepValue < 0x80000000);
-
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(output.is_contiguous());
 
@@ -527,6 +527,12 @@ struct ProcessGroupImpl {
 
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
+
+    auto& paramValues = allGatherParameters(this, bytes);
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
@@ -621,6 +627,9 @@ struct ProcessGroupImpl {
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
+      e->numDevices = paramValues.get(paramNumDevices);
+      e->numChunks = paramValues.get(paramNumChunks);
+      e->numParallel = paramValues.get(paramNumParallel);
       group->cpuThread->enqueue(e);
     }
 

@@ -162,9 +162,9 @@ def f(n):
                 #     group._reduce_scatter_base(output, input)
                 #     #torch.cuda.synchronize()
                 if op == "all_gather":
-                    if False:
+                    if True:
                         for _ in range(iterations):
-                            dist.all_gather_into_tensor(output, input)
+                            dist.all_gather_into_tensor(output, input, group=group)
                             torch.cuda.synchronize()
                     else:
                         #if x == 1:
