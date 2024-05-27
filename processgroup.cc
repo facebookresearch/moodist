@@ -125,8 +125,9 @@ struct ProcessGroupImpl {
 
   WorkStream copyWorkStream;
 
-  ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
-      allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
+  // ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
+  //     allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
+  ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -627,6 +628,9 @@ struct ProcessGroupImpl {
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
+      // e->numDevices = 4;
+      // e->numChunks = 1;
+      // e->numParallel = 2;
       e->numDevices = paramValues.get(paramNumDevices);
       e->numChunks = paramValues.get(paramNumChunks);
       e->numParallel = paramValues.get(paramNumParallel);

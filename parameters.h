@@ -28,6 +28,44 @@ struct Parameter {
   }
 };
 
+template<typename... Parameter>
+struct SuperParameter {
+  std::tuple<Parameter&...> params;
+  using T = size_t;
+  static constexpr size_t numOptions = (Parameter::numOptions * ...);
+  std::string name;
+  T defaultValue = 0;
+  std::array<T, numOptions> options;
+  SuperParameter(std::string name, Parameter&... p) : name(name), params(p...) {
+    for (size_t i = 0; i != numOptions; ++i) {
+      options[i] = i;
+    }
+  }
+
+  template<typename P, size_t index = sizeof...(Parameter) - 1>
+  typename P::T get(P& p, size_t value) {
+    if constexpr (std::is_same_v<P, std::decay_t<decltype(std::get<index>(params))>>) {
+      return std::get<index>(params).options[value % std::decay_t<decltype(std::get<index>(params))>::numOptions];
+    } else {
+      value /= std::decay_t<decltype(std::get<index>(params))>::numOptions;
+      return get<P, index - 1>(p, value);
+    }
+  }
+};
+
+template<typename T>
+struct is_super_t {
+  static const bool value = false;
+};
+
+template<typename... P>
+struct is_super_t<SuperParameter<P...>> {
+  static const bool value = true;
+};
+
+template<typename T>
+constexpr bool is_super = is_super_t<T>::value;
+
 // template<typename T>
 // struct ParameterInstance {
 //   T currentValue;
@@ -42,6 +80,12 @@ struct Parameter {
 inline Parameter<__LINE__, size_t, 3> paramNumDevices("num_devices", 2, {1, 2, 4});
 inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
 inline Parameter<__LINE__, size_t, 3> paramNumParallel("num_paralllel", 2, {1, 2, 4});
+
+// inline Parameter<__LINE__, size_t, 1> paramNumDevices("num_devices", 2, {2});
+// inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
+// inline Parameter<__LINE__, size_t, 1> paramNumParallel("num_paralllel", 2, {2});
+
+inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel);
 
 template<typename F, typename Tuple>
 void forEach(F&& f, Tuple& tuple) {
@@ -172,8 +216,12 @@ struct ParametersOptimizer {
           float t = seconds(elapsed);
           forEach(
               [&](auto& v) {
-                // v.times[v.index] = v.times[v.index] * 0.9f + t * 0.1f;
-                v.times[v.index] = t;
+                if (v.times[v.index] == 0) {
+                  v.times[v.index] = t;
+                } else {
+                  v.times[v.index] = v.times[v.index] * 0.99f + t * 0.01f;
+                }
+                // v.times[v.index] = t;
 
                 for (size_t i = 0; i != v.times.size(); ++i) {
                   if (v.times[i] < v.times[v.bestIndex]) {
@@ -181,10 +229,11 @@ struct ParametersOptimizer {
                   }
                 }
 
-                float reward = -1.0f;
-                if (v.times[v.index] <= v.times[v.bestIndex]) {
-                  reward = 1.0f;
-                }
+                // float reward = -1.0f;
+                // if (v.times[v.index] <= v.times[v.bestIndex]) {
+                //   reward = 1.0f;
+                // }
+                float reward = v.times[v.bestIndex] / v.times[v.index];
 
                 log.info("%s times: [%s]\n", v.p->name, fmt::to_string(fmt::join(v.times, ", ")));
                 log.info("%s best index: %d\n", v.p->name, v.bestIndex);
@@ -201,15 +250,19 @@ struct ParametersOptimizer {
                 constexpr float maxLogValue = std::log(1000 * sf.size());
                 constexpr float decay = maxLogValue / (maxLogValue + lr);
 
-                for (size_t i = 0; i != v.weights.size(); ++i) {
-                  float prob = sf[i];
-                  if (i == v.index) {
-                    v.weights[i] += (1 - prob) * reward * lr;
-                  } else {
-                    v.weights[i] -= prob * reward * lr;
-                  }
-                  v.weights[i] *= decay;
-                }
+                // for (size_t i = 0; i != v.weights.size(); ++i) {
+                //   float prob = sf[i];
+                //   // if (i == v.index) {
+                //   //   // v.weights[i] += lr * reward;
+                //   //   v.weights[i] = v.weights[i] * 0.99f + (reward * 0.01f * maxLogValue);
+                //   // }
+                //   if (i == v.index) {
+                //     v.weights[i] += (1 - prob) * reward * lr;
+                //   } else {
+                //     v.weights[i] -= prob * reward * lr;
+                //   }
+                //   // v.weights[i] *= decay;
+                // }
 
                 // v.weights[v.index] = v.weights[v.index] * 0.98f + reward * 0.02f;
 
@@ -295,7 +348,9 @@ struct ParametersOptimizer {
 
     template<typename Parameter, size_t index = sizeof...(P) - 1>
     typename Parameter::T get(Parameter& p) const {
-      if constexpr (std::is_same_v<Parameter, std::decay_t<decltype(*std::get<index>(params))>>) {
+      if constexpr (is_super<std::decay_t<decltype(*std::get<index>(params))>>) {
+        return std::get<index>(data).p->get(p, std::get<index>(values));
+      } else if constexpr (std::is_same_v<Parameter, std::decay_t<decltype(*std::get<index>(params))>>) {
         return std::get<index>(values);
       } else {
         return get<Parameter, index - 1>(p);

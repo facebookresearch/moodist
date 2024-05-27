@@ -1907,7 +1907,6 @@ struct CpuThreadImpl {
             bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
             size_t readOffset = chunkSize * chunkIndex + offset;
             if (n == 0) {
-              CHECK(false);
               self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, di, chunkIndex);
               // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
             } else {

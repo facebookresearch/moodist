@@ -98,7 +98,8 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        data = torch.randn(1024 * 1024 * 4).cuda() + 1
+        data = torch.randn(1024 * 512).cuda() + 1
+        #data = torch.randn(36864).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
@@ -409,7 +410,7 @@ def f(n):
             #     events.append(e)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 1000
+            loopcount = 100000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
