@@ -73,6 +73,40 @@ struct IbvPtr {
   }
 };
 
+template<typename T, int (*destroy)(T*)>
+struct IbvSharedPtr {
+  std::shared_ptr<IbvPtr<T, destroy>> ptr;
+  IbvSharedPtr() = default;
+  IbvSharedPtr(T* value) : ptr(std::make_shared<IbvPtr<T, destroy>>(value)) {}
+  IbvSharedPtr(IbvPtr<T, destroy>&& n) {
+    ptr = std::make_shared<IbvPtr<T, destroy>>(std::move(n));
+  }
+  operator T*() {
+    if (!ptr) {
+      return nullptr;
+    }
+    return &**ptr;
+  }
+  T& operator*() {
+    return **ptr;
+  }
+  T* operator->() {
+    return &**ptr;
+  }
+  operator const T*() const {
+    if (!ptr) {
+      return nullptr;
+    }
+    return &**ptr;
+  }
+  const T& operator*() const {
+    return **ptr;
+  }
+  const T* operator->() const {
+    return &**ptr;
+  }
+};
+
 using IbvCq = IbvPtr<ibv_cq, ibv_destroy_cq>;
 using IbvQp = IbvPtr<ibv_qp, ibv_destroy_qp>;
 using IbvMr = IbvPtr<ibv_mr, ibv_dereg_mr>;
@@ -86,8 +120,8 @@ struct IbCommon {
   static constexpr size_t maxWr = 1024;
   static constexpr size_t maxCqEntries = 1024;
 
-  IbvPtr<ibv_context, ibv_close_device> context;
-  IbvPtr<ibv_pd, ibv_dealloc_pd> protectionDomain;
+  IbvSharedPtr<ibv_context, ibv_close_device> context;
+  IbvSharedPtr<ibv_pd, ibv_dealloc_pd> protectionDomain;
   IbvCq cq;
   IbvQp qp;
   ibv_qp_ex* qpex = nullptr;

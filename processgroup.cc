@@ -529,7 +529,7 @@ struct ProcessGroupImpl {
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
 
-    auto& paramValues = allGatherParameters(this, bytes);
+    // auto& paramValues = allGatherParameters(this, bytes);
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -631,9 +631,14 @@ struct ProcessGroupImpl {
       // e->numDevices = 4;
       // e->numChunks = 1;
       // e->numParallel = 2;
-      e->numDevices = paramValues.get(paramNumDevices);
-      e->numChunks = paramValues.get(paramNumChunks);
-      e->numParallel = paramValues.get(paramNumParallel);
+      // e->numDevices = paramValues.get(paramNumDevices);
+      // e->numChunks = paramValues.get(paramNumChunks);
+      // e->numParallel = paramValues.get(paramNumParallel);
+      // e->algo = paramValues.get(paramAlgo);
+      e->numDevices = bytes < 262144 ? 1 : 2;
+      e->numChunks = std::min(bytes / 131072, (size_t)4);
+      e->numParallel = 4;
+      e->algo = 1;
       group->cpuThread->enqueue(e);
     }
 

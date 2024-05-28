@@ -98,7 +98,8 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        data = torch.randn(1024 * 512).cuda() + 1
+        #data = torch.randn(32768).cuda() + 1
+        data = torch.randn(1024 * 1024 * 2).cuda() + 1
         #data = torch.randn(36864).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
@@ -181,7 +182,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if False:
+            if True:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -410,7 +411,7 @@ def f(n):
             #     events.append(e)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 100000
+            loopcount = 10000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
@@ -655,7 +656,7 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
-ngpus = 8
+ngpus = 1
 
 fds = []
 for i in range(ngpus):
@@ -667,9 +668,9 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist", "nccl"):
+#for n in ("moodist", "nccl"):
 #for n in ("nccl", "moodist"):
-#for n in ("moodist",):
+for n in ("moodist",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

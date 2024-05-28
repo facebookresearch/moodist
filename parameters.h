@@ -81,11 +81,13 @@ inline Parameter<__LINE__, size_t, 3> paramNumDevices("num_devices", 2, {1, 2, 4
 inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
 inline Parameter<__LINE__, size_t, 3> paramNumParallel("num_paralllel", 2, {1, 2, 4});
 
+inline Parameter<__LINE__, size_t, 4> paramAlgo("algo", 0, {0, 1, 2, 3});
+
 // inline Parameter<__LINE__, size_t, 1> paramNumDevices("num_devices", 2, {2});
 // inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
 // inline Parameter<__LINE__, size_t, 1> paramNumParallel("num_paralllel", 2, {2});
 
-inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel);
+inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel, paramAlgo);
 
 template<typename F, typename Tuple>
 void forEach(F&& f, Tuple& tuple) {
@@ -221,6 +223,11 @@ struct ParametersOptimizer {
                 } else {
                   v.times[v.index] = v.times[v.index] * 0.99f + t * 0.01f;
                 }
+                // if (v.times[v.index] == 0) {
+                //   v.times[v.index] = t;
+                // } else {
+                //   v.times[v.index] = std::min(v.times[v.index], t);
+                // }
                 // v.times[v.index] = t;
 
                 for (size_t i = 0; i != v.times.size(); ++i) {

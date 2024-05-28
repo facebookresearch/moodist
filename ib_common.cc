@@ -147,10 +147,12 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
 
   log.debug("IbCommon %p init (group size %d)\n", (void*)this, group->size);
 
-  protectionDomain = ibv_alloc_pd(context);
   if (!protectionDomain) {
-    perror("ibv_alloc_pd");
-    CHECK(false);
+    protectionDomain = ibv_alloc_pd(context);
+    if (!protectionDomain) {
+      perror("ibv_alloc_pd");
+      CHECK(false);
+    }
   }
 
   cq = ibv_create_cq(context, maxCqEntries, nullptr, nullptr, 0);
