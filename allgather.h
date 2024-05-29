@@ -14,6 +14,7 @@ struct AllGatherParameters {
   uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
+  size_t chunkSize;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   std::array<uintptr_t, 8> peerInputAddresses;

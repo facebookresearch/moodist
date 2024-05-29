@@ -355,19 +355,23 @@ std::string AllGather::generate() {
         "$ptr", address, "$value", value);
   };
 
-  static const size_t numChunks = 8;
-
   auto waitForRecv = [&](std::string i, size_t chunkIndex) {
     std::string s;
     s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
-    for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      s += waitFor32(
-          replace(
-              "$base + sizeof(uint32_t) * stepValueDeviceChunkIndex(concurrencyIndex, $i, $di, $chunkIndex)", "$base",
-              group->cudaStepValuesDeviceChunksBuffer.buffer.cudaPointer, "$i", i, "$di", di, "$chunkIndex",
-              chunkIndex),
-          "stepValue");
-    }
+    s += waitFor32(replace("&cpuOut[$offset + $i]", "$i", i, "$offset", 16 + size * chunkIndex), "stepValue");
+    // s += waitFor32(
+    //     replace(
+    //         "$base + sizeof(uint32_t) * (16 + stepValueChunkIndex(concurrencyIndex, $i, $chunkIndex))", "$base",
+    //         cpuOutBuffer.buffer.cudaPointer, "$i", i, "$chunkIndex", chunkIndex),
+    //     "stepValue");
+    // for (size_t di = 0; di != group->ibDevs.size(); ++di) {
+    //   s += waitFor32(
+    //       replace(
+    //           "$base + sizeof(uint32_t) * stepValueDeviceChunkIndex(concurrencyIndex, $i, $di, $chunkIndex)",
+    //           "$base", group->cudaStepValuesDeviceChunksBuffer.buffer.cudaPointer, "$i", i, "$di", di, "$chunkIndex",
+    //           chunkIndex),
+    //       "stepValue");
+    // }
     return s;
   };
 
@@ -450,7 +454,7 @@ std::string AllGather::generate() {
       "__constant__ uint32_t allGatherInstructions[%d] = {%s};", instructions.size(),
       fmt::to_string(fmt::join(instructionsHex, ", ")));
 
-  for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+  for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
     recvCopies += R"(
         {
           // chunk $chunkIndex
@@ -521,8 +525,9 @@ std::string AllGather::generate() {
 
       recvCopies += "}\n";
     }
-    if (chunkIndex != numChunks - 1) {
+    if (chunkIndex != maxChunks - 1) {
       recvCopies += "if (chunkSize * $chunkIndex + $currentChunkSize != params.bytes) {\n";
+      recvCopies += "assert(chunkSize * $chunkIndex + $currentChunkSize < params.bytes);\n";
     } else {
       recvCopies += "assert(chunkSize * $chunkIndex + $currentChunkSize == params.bytes);\n";
     }
@@ -530,9 +535,9 @@ std::string AllGather::generate() {
     recvCopies = replace(recvCopies, "$currentChunkSize", "min(chunkSize, params.bytes - chunkSize * $chunkIndex)");
     recvCopies = replace(recvCopies, "$chunkIndex", chunkIndex);
   }
-  for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+  for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
     recvCopies += "}\n";
-    if (chunkIndex != numChunks - 1) {
+    if (chunkIndex != maxChunks - 1) {
       recvCopies += "}\n";
     }
   }
@@ -564,6 +569,7 @@ struct AllGatherParameters {
   uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
+  size_t chunkSize;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   uintptr_t peerInputAddresses[8];
@@ -648,6 +654,7 @@ __device__ uint32_t firstThreadCounter[$maxConcurrency];
 extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
+  [[maybe_unused]] volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   grid_generic_entry(params);
 
   $localCopies
@@ -663,7 +670,8 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   // copies.n = 0;
   //bool isFirstThread = true;
 
-  const size_t chunkSize = params.bytes < (size_t)65536 * 96 ? params.bytes : max((params.bytes + $numChunks - 1) / $numChunks, (size_t)65536 * 72);
+  //const size_t chunkSize = params.bytes < (size_t)65536 * 96 ? params.bytes : max((params.bytes + $numChunks - 1) / $numChunks, (size_t)65536 * 72);
+  const size_t chunkSize = params.chunkSize;
   bool isFirstThread = false;
 
   if (threadIdx.x == 0) {
@@ -685,8 +693,6 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   )zz",
       "$localCopies", localCopies, "$recvCopies", recvCopies, "$globaldefs", globaldefs, "$instructionsArray",
       instructionsArray);
-
-  source = replace(source, "$numChunks", numChunks);
 
   return source;
 }

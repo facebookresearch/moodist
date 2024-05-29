@@ -504,6 +504,10 @@ __device__ size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t inde
   return $maxChunks * $maxDevices * $size * concurrencyIndex + $maxChunks * $size * device + $size * chunk + index;
 }
 
+__device__ size_t stepValueChunkIndex(size_t concurrencyIndex, size_t index, size_t chunk) {
+  return $maxChunks * $size * concurrencyIndex + $size * chunk + index;
+}
+
 __device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
   $copyCode
 }

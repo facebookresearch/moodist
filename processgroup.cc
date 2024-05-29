@@ -159,6 +159,7 @@ struct ProcessGroupImpl {
     WorkStreams* ws = getWorkStreams(stream);
     std::unique_lock l(ws->mutex);
     WorkStream* w;
+    // TODO: use cuEventQuery here to see if we should reuse an existing stream or create a new one
     if (!ws->free.empty() && ws->all.size() >= 2) {
       w = &ws->free.front();
       ws->free.pop_front();
@@ -618,6 +619,8 @@ struct ProcessGroupImpl {
 
     trace("enqueue");
 
+    size_t chunkSize = 0;
+
     if (!isLocalOnly) {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
       e->task = taskAllGather;
@@ -635,10 +638,11 @@ struct ProcessGroupImpl {
       // e->numChunks = paramValues.get(paramNumChunks);
       // e->numParallel = paramValues.get(paramNumParallel);
       // e->algo = paramValues.get(paramAlgo);
-      e->numDevices = bytes < 262144 ? 1 : 2;
-      e->numChunks = std::min(bytes / 131072, (size_t)4);
+      e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
+      e->numChunks = e->numDevices * std::min(bytes / 131072, (size_t)4);
       e->numParallel = 4;
       e->algo = 1;
+      chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);
     }
 
@@ -656,6 +660,7 @@ struct ProcessGroupImpl {
     parameters.concurrencyIndex = concurrencyIndex;
     parameters.bytes = bytes;
     parameters.pitch = pitch;
+    parameters.chunkSize = chunkSize;
     parameters.inputAddress = inputAddress;
     parameters.outputAddress = outputAddress;
     parameters.peerInputAddresses = peerInputAddresses;
@@ -683,6 +688,7 @@ struct ProcessGroupImpl {
       CHECK_CU(cuEventRecord(copyWorkStream.event, copyWorkStream.stream));
       CHECK_CU(cuStreamWaitEvent(stream, copyWorkStream.event, CU_EVENT_WAIT_DEFAULT));
     } else {
+      CHECK(chunkSize != 0);
       CHECK_CU(cuLaunchKernel(
           group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
     }

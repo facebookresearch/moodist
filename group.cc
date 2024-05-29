@@ -450,6 +450,7 @@ void Group::init() {
       break;
     }
   }
+  numTrueIbDevs = ibDevs.size();
   while (ibDevs.size() >= 1 && ibDevs.size() + useDevices.size() <= maxDevices) {
     for (size_t i = 0; i != useDevices.size(); ++i) {
       auto ibCommon = std::make_unique<IbCommon>(this);
@@ -647,8 +648,8 @@ void Group::init() {
 
   ipcMapper->getMySharedMem(0, offset);
 
-  cpuOutBuffer = allocateArrayHostMapped(4096 + 16 * size, Group::maxConcurrency);
-  cpuInBuffer = allocateArrayHostMapped(4096 + 16 * size, Group::maxConcurrency);
+  cpuOutBuffer = allocateArrayHostMapped(4096 + maxChunks * size, Group::maxConcurrency);
+  cpuInBuffer = allocateArrayHostMapped(4096 + maxChunks * size, Group::maxConcurrency);
 
   auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
     peerPtrs.fill({});

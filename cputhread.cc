@@ -2712,8 +2712,8 @@ struct CpuThreadImpl {
     const Vector<std::pair<size_t, size_t>>& ringSends = allGather.ringSends;
 
     const size_t numDevices = params.numDevices;
-    const size_t numChunks = numDevices * params.numChunks;
-    const size_t chunkSize = (params.bytes + numChunks - 1) / numChunks;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
     const size_t numParallel = params.numParallel;
 
     // struct DataTime {
@@ -2737,8 +2737,10 @@ struct CpuThreadImpl {
       CHECK(numDevices <= self.devices.size());
       CHECK(numChunks != 0 && numChunks <= maxChunks);
       CHECK(numParallel != 0);
+      CHECK(chunkSize > 0);
 
-      //log.info("allgather ring read numDevices %d, numChunks %d, numParallel %d\n", numDevices, numChunks, numParallel);
+      // log.info("allgather ring read numDevices %d, numChunks %d, numParallel %d\n", numDevices, numChunks,
+      // numParallel);
     }
 
     void tryRead(size_t di) {
@@ -2803,6 +2805,8 @@ struct CpuThreadImpl {
               if (readIndex != ringRecvs.size()) {
                 tryRead(di);
               }
+
+              cpuOut[16 + size * chunkIndex + source] = stepValue;
             }));
       }
 

@@ -89,6 +89,7 @@ struct Group {
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
   std::vector<std::unique_ptr<IbCommon>> ibDevs;
+  size_t numTrueIbDevs = 0;
   std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
