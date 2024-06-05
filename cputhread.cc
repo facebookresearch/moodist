@@ -302,6 +302,26 @@ inline void badOp(
   const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, i);                                                       \
   CHECK_DYN(dyn, optype, stepValue, params.bytes);
 
+struct Stats {
+  SpinMutex mutex;
+  Vector<std::array<float, 7>> values;
+
+  ~Stats() {
+    if (!values.empty()) {
+      std::string fn = fmt::sprintf("stats-%s.txt", randomName());
+      FILE* f = fopen(fn.c_str(), "wb");
+      CHECK(f);
+      for (auto& v : values) {
+        fmt::fprintf(f, "%s\n", fmt::to_string(fmt::join(v, " ")));
+      }
+      fclose(f);
+
+      log.info("stats dumped to %s (%d entries)\n", fn, values.size());
+    }
+  }
+};
+Stats stats;
+
 struct CpuThreadImpl {
   CpuThread* cpuThread;
   Group* group = cpuThread->group;
@@ -402,6 +422,8 @@ struct CpuThreadImpl {
 
   // Vector<uint8_t> dynReadyVector{size * Group::maxConcurrency};
   Vector<MemoryRegistration*> outDynsMrVector{size * Group::maxConcurrency};
+
+  MemoryRegistration* cpuOutMr = regMrCuda(group->cpuOutBuffer.buffer.cudaPointer, group->cpuOutBuffer.buffer.bytes);
 
   // Vector<uint32_t> debugVector{size};
 
@@ -607,7 +629,7 @@ struct CpuThreadImpl {
 
       ibv_qp_ex* qp = dev.ib->qpex;
 
-      // fmt::printf(
+      // log.info(
       //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes, localAddress,
       //     remoteAddress, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
 
@@ -728,7 +750,7 @@ struct CpuThreadImpl {
       size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
       uint32_t rkey, size_t bytes) {
     CHECK(i >= 0 && i < size);
-    CHECK(i != rank);
+    // CHECK(i != rank);
     ibv_sge sge;
     sge.addr = (uintptr_t)localAddress;
     sge.length = bytes;
@@ -748,9 +770,9 @@ struct CpuThreadImpl {
 
     ibv_qp_ex* qp = dev.ib->qpex;
 
-    // fmt::printf(
-    //     "%d: rdma write %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes, localAddress,
-    //     remoteAddress, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+    // log.info(
+    //     "%d: rdma write control %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
+    //     remoteAddress, rkey, &dev - devices.data(), i);
 
     bool efa = qp != nullptr;
     if (!efa) {
@@ -1196,6 +1218,16 @@ struct CpuThreadImpl {
         concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteCudaStepValuesDeviceChunks[i].address + offset),
         remoteCudaStepValuesDeviceChunks[i].keys[di], sizeof(uint32_t));
+  }
+
+  void writeCpuOut(size_t concurrencyIndex, size_t dstIndex, size_t srcIndex) {
+    size_t di = 0;
+    auto& dev = devices[di];
+    auto offset = sizeof(uint32_t) * dstIndex;
+    writeControl(
+        concurrencyIndex, dev, rank, (void*)&outStepValue(concurrencyIndex, srcIndex),
+        outStepValuesStorageMr->mrs[di]->lkey, (void*)(group->cpuOutBuffer.cuda(concurrencyIndex) + offset),
+        cpuOutMr->mrs[di]->rkey, sizeof(uint32_t));
   }
 
   struct WorkBarrier : Work {
@@ -2722,6 +2754,7 @@ struct CpuThreadImpl {
     //   std::chrono::steady_clock::duration prevDuration{};
     // };
     // std::array<DataTime, 4> times;
+    std::chrono::steady_clock::time_point startTime;
 
     size_t readIndex = 0;
     size_t chunkIndex = 0;
@@ -2739,8 +2772,9 @@ struct CpuThreadImpl {
       CHECK(numParallel != 0);
       CHECK(chunkSize > 0);
 
-      // log.info("allgather ring read numDevices %d, numChunks %d, numParallel %d\n", numDevices, numChunks,
-      // numParallel);
+      // log.info(
+      //     "allgather ring read bytes %d numDevices %d, numChunks %d, numParallel %d\n", params.bytes, numDevices,
+      //     numChunks, numParallel);
     }
 
     void tryRead(size_t di) {
@@ -2768,6 +2802,8 @@ struct CpuThreadImpl {
             return;
           }
         }
+        // allgather ring read bytes 139985192 numDevices 4, numChunks 32, numParallel 2
+
         // size_t prevParallelIndex = (parallelIndex + numParallel - 1) % numParallel;
         // auto now = std::chrono::steady_clock::now();
         // if (times[prevParallelIndex].inProgress &&
@@ -2802,11 +2838,12 @@ struct CpuThreadImpl {
                 self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, 0, chunkIndex);
               }
               // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
-              if (readIndex != ringRecvs.size()) {
-                tryRead(di);
-              }
+              // if (readIndex != ringRecvs.size()) {
+              //   tryRead(di);
+              // }
 
-              cpuOut[16 + size * chunkIndex + source] = stepValue;
+              // cpuOut[16 + size * chunkIndex + source] = stepValue;
+              self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
             }));
       }
 
@@ -2823,6 +2860,8 @@ struct CpuThreadImpl {
       ENTER
 
       self.trace("ring %#x", stepValue);
+
+      startTime = std::chrono::steady_clock::now();
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
@@ -2927,7 +2966,8 @@ struct CpuThreadImpl {
 
       // log.info("wait for exit kernel %d\n", stepValue);
 
-      cpuOut[0] = stepValue;
+      // cpuOut[0] = stepValue;
+      self.writeCpuOut(concurrencyIndex, 0, 0);
 
       self.trace("kernel-exit");
 
@@ -2936,6 +2976,14 @@ struct CpuThreadImpl {
       }
 
       // log.info("exit kernel %d ok\n", stepValue);
+
+      float t = seconds(std::chrono::steady_clock::now() - startTime);
+      if (rank == 0) {
+        std::lock_guard l(stats.mutex);
+        stats.values.push_back(
+            {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+             (float)numChunks, (float)numParallel, t});
+      }
 
       self.trace("");
 

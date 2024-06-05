@@ -177,6 +177,7 @@ struct Group {
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);
+  AllocatedBuffer allocateDeviceMapped(size_t bytes);
 
   AllocatedCpuBuffer allocateCpu(size_t bytes);
 
@@ -185,6 +186,8 @@ struct Group {
   AllocatedArray allocateArrayDevice(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayManaged(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayWriteCombined(size_t itembytes, size_t numel);
+  AllocatedArray allocateArrayDeviceMapped(size_t itembytes, size_t numel);
+  
 
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {

@@ -68,6 +68,7 @@ pybind11_add_module(_C
   allgather.cc
   kernels.cc
   reduce_scatter.cc
+  model.cc
 )
 target_link_libraries(
   _C

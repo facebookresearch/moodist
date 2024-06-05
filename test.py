@@ -98,9 +98,10 @@ def f(n):
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-        #data = torch.randn(32768).cuda() + 1
-        data = torch.randn(1024 * 1024 * 2).cuda() + 1
-        #data = torch.randn(36864).cuda() + 1
+        # data = torch.randn(32768).cuda() + 1
+        #data = torch.randn(73728).cuda() + 1
+        data = torch.randn(1179648).cuda() + 1
+        # data = torch.randn(36864).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
@@ -163,7 +164,7 @@ def f(n):
         result02 = result0.clone()
 
         for _ in range(1000):
-            #print("rank %d warmup %d" % (rank, _))
+            # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
             result0 -= 1
@@ -178,7 +179,7 @@ def f(n):
             #     dist._all_gather_base(result0, tmp)
             # with torch.cuda.stream(stream2):
             #     dist._all_gather_base(result02, tmp2)
-            #torch.cuda.current_stream().wait_stream(stream1)
+            # torch.cuda.current_stream().wait_stream(stream1)
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
@@ -220,7 +221,7 @@ def f(n):
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
 
-        #print("rank %d warmup done" % (rank))
+        # print("rank %d warmup done" % (rank))
 
         if False:
             tmpz = []
@@ -377,7 +378,7 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 14:
+        elif 1 == 1:
             loopcount = 1000
             freeevents = [
                 torch.cuda.Event(),
@@ -387,7 +388,7 @@ def f(n):
             ]
             events = []
             if n == "moodist":
-               moodist.enable_profiling(True)
+                moodist.enable_profiling(True)
             for _ in range(loopcount):
                 if len(events) >= 2:
                     e = events.pop(0)
@@ -399,7 +400,7 @@ def f(n):
                 e.record()
                 events.append(e)
             if n == "moodist":
-               moodist.enable_profiling(False)
+                moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp)
             # for i in range(loopcount):
@@ -411,7 +412,7 @@ def f(n):
             #     events.append(e)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 10000
+            loopcount = 100000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
@@ -656,7 +657,7 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
-ngpus = 1
+ngpus = 8
 
 fds = []
 for i in range(ngpus):
@@ -668,8 +669,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
-#for n in ("nccl", "moodist"):
+# for n in ("moodist", "nccl"):
+# for n in ("nccl", "moodist"):
 for n in ("moodist",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)

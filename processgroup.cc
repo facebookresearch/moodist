@@ -7,6 +7,7 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "model.h"
 #include "parameters.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
@@ -22,6 +23,7 @@
 #include <random>
 #include <stdexcept>
 #include <torch/types.h>
+#include <tuple>
 #include <variant>
 
 #include <cublas.h>
@@ -78,6 +80,7 @@ struct WorkStream {
   IntrusiveListLink<WorkStream> link;
   CUstream stream = nullptr;
   CUevent event = nullptr;
+  std::atomic<CUstream> joinedStream = nullptr;
   std::shared_ptr<WorkStreams> owner;
   WorkStream() = default;
   WorkStream(const WorkStream&) = delete;
@@ -127,7 +130,9 @@ struct ProcessGroupImpl {
 
   // ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
   //     allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
-  ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
+  //ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
+
+  ParametersOptimizer<decltype(reducedAllGatherParams8r)> allGathesParameters8r{reducedAllGatherParams8r};
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -158,12 +163,23 @@ struct ProcessGroupImpl {
   WorkStream* getWorkStream(CUstream stream) {
     WorkStreams* ws = getWorkStreams(stream);
     std::unique_lock l(ws->mutex);
-    WorkStream* w;
+    WorkStream* w = nullptr;
+    for (auto& v : ws->free) {
+      if (v.joinedStream.load(std::memory_order_relaxed) == stream) {
+        w = &v;
+        break;
+      }
+      if (cuEventQuery(v.event) == CUDA_SUCCESS) {
+        w = &v;
+        break;
+      }
+    }
     // TODO: use cuEventQuery here to see if we should reuse an existing stream or create a new one
-    if (!ws->free.empty() && ws->all.size() >= 2) {
-      w = &ws->free.front();
-      ws->free.pop_front();
-    } else {
+    // if (!ws->free.empty() && ws->all.size() >= 2) {
+    //   w = &ws->free.front();
+    //   ws->free.pop_front();
+    // } else {
+    if (!w) {
       auto ptr = std::make_unique<WorkStream>();
       w = &*ptr;
       ws->all.push_back(std::move(ptr));
@@ -171,12 +187,9 @@ struct ProcessGroupImpl {
       w->owner = workStreams[stream];
       CHECK_CU(cuStreamCreate(&w->stream, CU_STREAM_NON_BLOCKING));
       CHECK_CU(cuEventCreate(&w->event, CU_EVENT_DISABLE_TIMING));
-      // unsigned long long id1;
-      // unsigned long long id2;
-      // CHECK_CU(cuStreamGetId(w->stream, &id1));
-      // CHECK_CU(cuStreamGetId(stream, &id2));
       log.info("New work stream %#x created for stream %#x\n", (uintptr_t)w->stream, (uintptr_t)stream);
     }
+    w->joinedStream.store(nullptr, std::memory_order_relaxed);
     l.unlock();
     return w;
   }
@@ -503,6 +516,14 @@ struct ProcessGroupImpl {
     ipcMapper->setStepValue(stepValue);
   }
 
+  struct modelOutputKeyHash {
+    size_t operator()(std::tuple<size_t, size_t, size_t> v) const {
+      return std::get<0>(v) * 37 + std::get<1>(v) * 97 + std::get<2>(v);
+    }
+  };
+
+  HashMap<std::tuple<size_t, size_t, size_t>, ModelOutput, modelOutputKeyHash> modelOutputs;
+
   void all_gather(at::Tensor& output, const at::Tensor& input, CUstream stream) {
     std::unique_lock l(threadUnsafe);
     trace("all_gather");
@@ -530,7 +551,8 @@ struct ProcessGroupImpl {
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
 
-    // auto& paramValues = allGatherParameters(this, bytes);
+    //auto& paramValues = allGatherParameters(this, bytes);
+    auto& paramValues = allGathesParameters8r(this, bytes);
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -634,13 +656,36 @@ struct ProcessGroupImpl {
       // e->numDevices = 4;
       // e->numChunks = 1;
       // e->numParallel = 2;
+
+      auto key = std::make_tuple(size, 1 + group->ipcRanks.size(), bytes);
+      auto it = modelOutputs.find(key);
+      ModelOutput o;
+      if (it != modelOutputs.end()) {
+        o = it->second;
+      } else {
+        o = evalModel(std::get<0>(key), std::get<1>(key), std::get<2>(key));
+        modelOutputs[key] = o;
+      }
+
+      // e->numDevices = o.numDevices;
+      // e->numChunks = o.numChunks;
+      // e->numParallel = o.numParallel;
+
+      // e->numDevices = 1;
+      // e->numChunks = e->numDevices * 2;
+      // e->numParallel = 2;
+
+      std::tie(e->numDevices, e->numChunks, e->numParallel) = paramValues.get(reducedAllGatherParams8r);
       // e->numDevices = paramValues.get(paramNumDevices);
-      // e->numChunks = paramValues.get(paramNumChunks);
+      // e->numChunks = e->numDevices * paramValues.get(paramNumChunks);
       // e->numParallel = paramValues.get(paramNumParallel);
       // e->algo = paramValues.get(paramAlgo);
-      e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
-      e->numChunks = e->numDevices * std::min(bytes / 131072, (size_t)4);
-      e->numParallel = 4;
+      // e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
+      // e->numChunks = e->numDevices * std::min(bytes / 131072, (size_t)4);
+      // e->numParallel = 4;
+      // e->numDevices = 1;
+      // e->numChunks = 1;
+      // e->numParallel = 2;
       e->algo = 1;
       chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);
@@ -1124,6 +1169,7 @@ struct WorkImpl : c10d::Work {
       CHECK(w->stream != nullptr);
       auto currentStream = c10::cuda::getCurrentCUDAStream();
       CHECK_CU(cuStreamWaitEvent(currentStream, w->event, CU_EVENT_WAIT_DEFAULT));
+      w->joinedStream.store(currentStream, std::memory_order_relaxed);
       if (var.index() == 0) {
         std::get<0>(var).record_stream(currentStream);
       } else {

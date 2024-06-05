@@ -81,13 +81,23 @@ inline Parameter<__LINE__, size_t, 3> paramNumDevices("num_devices", 2, {1, 2, 4
 inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
 inline Parameter<__LINE__, size_t, 3> paramNumParallel("num_paralllel", 2, {1, 2, 4});
 
-inline Parameter<__LINE__, size_t, 4> paramAlgo("algo", 0, {0, 1, 2, 3});
+// inline Parameter<__LINE__, size_t, 4> paramAlgo("algo", 0, {0, 1, 2, 3});
 
 // inline Parameter<__LINE__, size_t, 1> paramNumDevices("num_devices", 2, {2});
 // inline Parameter<__LINE__, size_t, 4> paramNumChunks("num_chunks", 2, {1, 2, 4, 8});
 // inline Parameter<__LINE__, size_t, 1> paramNumParallel("num_paralllel", 2, {2});
 
-inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel, paramAlgo);
+// inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel,
+// paramAlgo);
+inline SuperParameter allGatherSuper("all_gather_params", paramNumDevices, paramNumChunks, paramNumParallel);
+
+inline Parameter<__LINE__, std::tuple<int, int, int>, 3> reducedAllGatherParams8r(
+    "reduced_all_gather_params_8r", {1, 1, 1},
+    {
+        std::make_tuple(1, 1, 1),
+        {1, 1, 2},
+        {2, 2, 4},
+    });
 
 template<typename F, typename Tuple>
 void forEach(F&& f, Tuple& tuple) {
@@ -140,7 +150,7 @@ struct ParametersOptimizer {
 
     std::chrono::steady_clock::time_point syncTime;
 
-    std::minstd_rand rng{(std::minstd_rand::result_type)std::chrono::steady_clock::now().time_since_epoch().count()};
+    // std::minstd_rand rng{(std::minstd_rand::result_type)std::chrono::steady_clock::now().time_since_epoch().count()};
 
     template<size_t index = sizeof...(P) - 1>
     void init(std::tuple<P*...>& params) {
@@ -242,20 +252,20 @@ struct ParametersOptimizer {
                 // }
                 float reward = v.times[v.bestIndex] / v.times[v.index];
 
-                log.info("%s times: [%s]\n", v.p->name, fmt::to_string(fmt::join(v.times, ", ")));
-                log.info("%s best index: %d\n", v.p->name, v.bestIndex);
+                // log.info("%s times: [%s]\n", v.p->name, fmt::to_string(fmt::join(v.times, ", ")));
+                //  log.info("%s best index: %d\n", v.p->name, v.bestIndex);
 
-                log.info("%s update index %d reward %g\n", v.p->name, v.index, reward);
+                // log.info("%s update index %d reward %g\n", v.p->name, v.index, reward);
 
-                log.info("%s pre weights [%s]\n", v.p->name, fmt::to_string(fmt::join(v.weights, ", ")));
+                // log.info("%s pre weights [%s]\n", v.p->name, fmt::to_string(fmt::join(v.weights, ", ")));
 
-                auto sf = softmax(v.weights);
+                // auto sf = softmax(v.weights);
 
-                log.info("%s softmax [%s]\n", v.p->name, fmt::to_string(fmt::join(sf, ", ")));
+                // // log.info("%s softmax [%s]\n", v.p->name, fmt::to_string(fmt::join(sf, ", ")));
 
-                constexpr float lr = 0.1f;
-                constexpr float maxLogValue = std::log(1000 * sf.size());
-                constexpr float decay = maxLogValue / (maxLogValue + lr);
+                // constexpr float lr = 0.1f;
+                // constexpr float maxLogValue = std::log(1000 * sf.size());
+                // constexpr float decay = maxLogValue / (maxLogValue + lr);
 
                 // for (size_t i = 0; i != v.weights.size(); ++i) {
                 //   float prob = sf[i];
@@ -273,7 +283,7 @@ struct ParametersOptimizer {
 
                 // v.weights[v.index] = v.weights[v.index] * 0.98f + reward * 0.02f;
 
-                log.info("%s post weights [%s]\n", v.p->name, fmt::to_string(fmt::join(v.weights, ", ")));
+                // log.info("%s post weights [%s]\n", v.p->name, fmt::to_string(fmt::join(v.weights, ", ")));
 
                 // log("%s weight[%d] -> %f\n", v.p->name, v.index, v.weights[v.index]);
               },
@@ -287,16 +297,16 @@ struct ParametersOptimizer {
         syncing = false;
         values = newValues;
 
-        std::string str;
-        forEach(
-            [&](auto& v) {
-              if (!str.empty()) {
-                str += " ";
-              }
-              str += std::to_string(v);
-            },
-            values);
-        log.info("got new values: [%s]\n", str);
+        // std::string str;
+        // forEach(
+        //     [&](auto& v) {
+        //       if (!str.empty()) {
+        //         str += " ";
+        //       }
+        //       str += std::to_string(v);
+        //     },
+        //     values);
+        // log.info("got new values: [%s]\n", str);
 
         forEach([&](auto& v) { v.index = v.newIndex; }, data);
       }
@@ -304,36 +314,37 @@ struct ParametersOptimizer {
       if (pg->rank == 0) {
         forEach(
             [&](auto& v) {
-              std::array<float, v.weights.size()> probs{};
-              float sum = 0.0f;
-              for (size_t i = 0; i != probs.size(); ++i) {
-                probs[i] = std::exp(v.weights[i]);
-                sum += probs[i];
-              }
-              float value = std::uniform_real_distribution<float>(0.0f, sum)(rng);
-              log.info(
-                  "%s: probs [%s] sum %g value %g\n", v.p->name, fmt::to_string(fmt::join(probs, ", ")), sum, value);
-              size_t i = 0;
-              while (i != probs.size() && value > probs[i]) {
-                value -= probs[i];
-                ++i;
-              }
-              log.info("%s sampled index %d\n", v.p->name, i);
+              // std::array<float, v.weights.size()> probs{};
+              // float sum = 0.0f;
+              // for (size_t i = 0; i != probs.size(); ++i) {
+              //   probs[i] = std::exp(v.weights[i]);
+              //   sum += probs[i];
+              // }
+              // float value = std::uniform_real_distribution<float>(0.0f, sum)(getRng());
+              // log.info(
+              //     "%s: probs [%s] sum %g value %g\n", v.p->name, fmt::to_string(fmt::join(probs, ", ")), sum, value);
+              // size_t i = 0;
+              // while (i != probs.size() && value > probs[i]) {
+              //   value -= probs[i];
+              //   ++i;
+              // }
+              // log.info("%s sampled index %d\n", v.p->name, i);
+              //size_t i = random<size_t>(0, v.weights.size() - 1);
               v.newIndex = i;
             },
             data);
         setNewValues();
 
-        std::string str;
-        forEach(
-            [&](auto& v) {
-              if (!str.empty()) {
-                str += " ";
-              }
-              str += std::to_string(v);
-            },
-            newValues);
-        log.info("sync new values: [%s]\n", str);
+        // std::string str;
+        // forEach(
+        //     [&](auto& v) {
+        //       if (!str.empty()) {
+        //         str += " ";
+        //       }
+        //       str += std::to_string(v);
+        //     },
+        //     newValues);
+        // log.info("sync new values: [%s]\n", str);
       }
       syncTime = now;
       syncing = true;

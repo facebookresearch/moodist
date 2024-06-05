@@ -27,6 +27,8 @@ else:
 
 os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
+ngpus = 8
+
 
 def f(n):
     import torch
@@ -70,7 +72,7 @@ def f(n):
             f = open("speed-%d-%s.txt" % (i, dist.get_backend(group)), "w")
 
         s = 73728 // 4
-        #s = 9437184
+        # s = 9437184
         xi = 0
         while True:
             xi += 1
@@ -155,9 +157,9 @@ def f(n):
                 #     group._reduce_scatter_base(output, input)
                 #     #torch.cuda.synchronize()
                 if op == "all_gather":
-                    if False:
+                    if True:
                         for _ in range(iterations):
-                            dist.all_gather_into_tensor(output, input)
+                            dist.all_gather_into_tensor(output, input, group=group)
                             torch.cuda.synchronize()
                     else:
                         # if x == 1:
@@ -220,7 +222,8 @@ def f(n):
 
     torch.manual_seed(42 + rank)
 
-    i = min(8, world_size)
+    # i = min(ngpus, world_size)
+    i = min(1024, world_size)
     while True:
         t(i)
 
@@ -228,16 +231,14 @@ def f(n):
             break
         # i = i + (i + 1) // 2
         i = max(i * 2, 1)
-        if i >= 8:
-            i = (i + 7) // 8 * 8
+        if i >= ngpus:
+            i = (i + ngpus - 1) // ngpus * ngpus
         i = min(i, world_size)
 
 
 if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
-
-ngpus = 8
 
 fds = []
 for i in range(ngpus):
@@ -249,10 +250,10 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
-for n in ("moodist", "nccl"):
-    # for n in ("nccl",):
-    # for n in ("moodist",):
+# for n in ("moodist", "nccl"):
+# for n in ("moodist", "nccl"):
+# for n in ("nccl",):
+for n in ("nccl",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []
@@ -269,8 +270,28 @@ for n in ("moodist", "nccl"):
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             f(n)
-            os._exit(0)
+            sys.exit(0)
         pids.append(pid)
+    import threading
+
+    threads = []
     for pid in pids:
-        os.waitpid(pid, 0)
+
+        def f(pid):
+            try:
+                import traceback
+
+                _, ec = os.waitpid(pid, 0)
+                if ec != 0:
+                    print("process exited with exit code %d" % ec)
+                    os._exit(ec)
+            except:
+                traceback.print_exc()
+                os._exit(1)
+
+        t = threading.Thread(target=f, args=(pid,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 print("bye")

@@ -77,8 +77,10 @@ struct AllocatedBuffer {
   void* cpuPointer = nullptr;
   uintptr_t cudaPointer = 0;
   size_t bytes = 0;
+  CUmemGenericAllocationHandle handle;
   bool hostAllocated = false;
   bool numaAllocated = false;
+  bool handleAllocated = false;
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
@@ -105,6 +107,13 @@ struct AllocatedBuffer {
       if (cpuPointer) {
         log.verbose("free %d bytes of host memory %p\n", bytes, cpuPointer);
         cuMemFreeHost(cpuPointer);
+      }
+    } else if (handleAllocated) {
+      if (cudaPointer) {
+        log.verbose("free %d bytes of mapped memory at %#x\n", bytes, cudaPointer);
+        cuMemUnmap(cudaPointer, bytes);
+        cuMemAddressFree(cudaPointer, bytes);
+        cuMemRelease(handle);
       }
     } else {
       if (cudaPointer) {

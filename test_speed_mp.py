@@ -167,7 +167,7 @@ def f(n):
                             dist.all_gather_into_tensor(output, input, group=group)
                             torch.cuda.synchronize()
                     else:
-                        #if x == 1:
+                        # if x == 1:
                         #    moodist.enable_profiling(True)
                         for _ in range(iterations):
                             if len(events) >= 2:
@@ -178,7 +178,7 @@ def f(n):
                             e = freeevents.pop(0)
                             e.record()
                             events.append(e)
-                        #if x == 1:
+                        # if x == 1:
                         #    moodist.enable_profiling(False)
                 elif op == "reduce_scatter":
                     for _ in range(iterations):
@@ -209,7 +209,7 @@ def f(n):
 
             if s == max_size:
                 break
-            #break
+            # break
 
         dist.destroy_process_group(group)
 
@@ -257,8 +257,8 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-#for n in ("moodist", "nccl"):
-for n in ("nccl", "moodist"):
+for n in ("moodist", "nccl"):
+    # for n in ("nccl", "moodist"):
     # for n in ("nccl",):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
@@ -277,7 +277,7 @@ for n in ("nccl", "moodist"):
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             f(n)
-            os._exit(0)
+            sys.exit(0)
         pids.append(pid)
     for pid in pids:
         os.waitpid(pid, 0)

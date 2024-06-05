@@ -18,8 +18,10 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
   log.debug("Init IB\n");
 
+  IbAddress loopbackAddress;
+
   for (size_t i = 0; i != size; ++i) {
-    if (i == rank) {
+    if (i == rank && false) {
       qps.emplace_back();
       qpexs.emplace_back();
     } else {
@@ -74,7 +76,11 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
         CHECK(false);
       }
 
-      group->setupComms->sendTo(i, address);
+      if (i != rank) {
+        group->setupComms->sendTo(i, address);
+      } else {
+        loopbackAddress = address;
+      }
 
       qpexs.push_back(ibv_qp_to_qp_ex(qp));
       qps.push_back(std::move(qp));
@@ -82,13 +88,13 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   }
 
   for (size_t i = 0; i != size; ++i) {
-    if (i == rank) {
-      continue;
-    }
+    // if (i == rank) {
+    //   continue;
+    // }
 
     auto& qp = qps.at(i);
 
-    auto remoteAddress = group->setupComms->recvFrom<IbAddress>(i);
+    auto remoteAddress = i == rank ? loopbackAddress : group->setupComms->recvFrom<IbAddress>(i);
 
     ibv_qp_attr attr;
     ibv_qp_init_attr initAttr;
@@ -102,7 +108,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     attr.path_mtu = portAttributes.active_mtu;
     attr.dest_qp_num = remoteAddress.qpNum;
     attr.rq_psn = 4979;
-    attr.max_dest_rd_atomic = 16;
+    attr.max_dest_rd_atomic = 8;
     attr.min_rnr_timer = 5; // 0.06ms
     // attr.min_rnr_timer = 22;
     error = ibv_modify_qp(
@@ -111,7 +117,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
             IBV_QP_MIN_RNR_TIMER);
     if (error) {
       log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      TORCH_CHECK(false);
+      CHECK(false);
     }
 
     std::memset(&attr, 0, sizeof(attr));
@@ -126,7 +132,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     // attr.timeout = 17;
     // attr.retry_cnt = 7;
     // attr.rnr_retry = 7; // infinite
-    attr.max_rd_atomic = 16;
+    attr.max_rd_atomic = 8;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
     error = ibv_modify_qp(
         qp, &attr,
@@ -134,7 +140,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
             IBV_QP_ACCESS_FLAGS);
     if (error) {
       log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      TORCH_CHECK(false);
+      CHECK(false);
     }
 
     // fmt::printf("connected, yey!\n");

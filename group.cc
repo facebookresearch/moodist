@@ -90,6 +90,11 @@ void Group::init() {
     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
   }
 
+  int driverVersion = 5000;
+  CHECK_CU(cuDriverGetVersion(&driverVersion));
+
+  log.verbose("cuda driver version is %d\n", driverVersion);
+
   int clockRate;
   CHECK_CU(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, cuDevice));
   log.verbose("device clock rate: %dkhz\n", clockRate);
@@ -159,6 +164,8 @@ void Group::init() {
   }
 
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
+
+  CHECK(numa_run_on_node(allocationNode) == 0);
 
   std::vector<LocalDevice> localDevices;
 
@@ -648,8 +655,13 @@ void Group::init() {
 
   ipcMapper->getMySharedMem(0, offset);
 
-  cpuOutBuffer = allocateArrayHostMapped(4096 + maxChunks * size, Group::maxConcurrency);
-  cpuInBuffer = allocateArrayHostMapped(4096 + maxChunks * size, Group::maxConcurrency);
+  cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+  cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+
+  {
+    unsigned int value = 1;
+    CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
+  }
 
   auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
     peerPtrs.fill({});
@@ -825,6 +837,71 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   log.verbose("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
+AllocatedBuffer Group::allocateDeviceMapped(size_t bytes) {
+  if (bytes < 4096) {
+    bytes = 4096;
+  }
+  AllocatedBuffer r;
+  r.bytes = bytes;
+
+  size_t allocationGranularity = 1;
+  CUmemAllocationProp prop;
+  std::memset(&prop, 0, sizeof(prop));
+  prop.location.id = deviceIndex;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  CHECK_CU(cuMemGetAllocationGranularity(&allocationGranularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+  log.info("allocation granularity is %#x\n", allocationGranularity);
+
+  size_t alignment = std::max((size_t)4096, allocationGranularity);
+  r.bytes = (bytes + alignment - 1) / alignment * alignment;
+
+  CHECK_CU(cuMemCreate(&r.handle, r.bytes, &prop, 0));
+
+  log.info("handle created\n");
+
+  CUdeviceptr ptr = 0;
+  CHECK_CU(cuMemAddressReserve(&ptr, r.bytes, alignment, 0, 0));
+  log.info("reserved address %#x\n", ptr);
+  CHECK_CU(cuMemMap(ptr, r.bytes, 0, r.handle, 0));
+  log.info("mapped moo!\n");
+
+  // std::array<CUmemAccessDesc, 2> desc;
+  // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+  // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  // desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+  // desc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  // desc[1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  // desc[1].location.id = deviceIndex;
+  // CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 2));
+
+  std::array<CUmemAccessDesc, 2> desc;
+  std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+  desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  desc[0].location.id = deviceIndex;
+  CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
+
+  log.info("access 1 ok\n");
+
+  std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+  desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+  desc[0].location.id = allocationNode;
+  CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
+
+  log.info("access 2 ok\n");
+
+  r.cudaPointer = ptr;
+  r.cpuPointer = (void*)ptr;
+
+  std::memset(r.cpuPointer, 0, bytes);
+  r.handleAllocated = true;
+  log.verbose("allocated host mapped device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  return r;
+}
 
 AllocatedCpuBuffer Group::allocateCpu(size_t bytes) {
   if (bytes < 4096) {
@@ -869,6 +946,13 @@ AllocatedArray Group::allocateArrayWriteCombined(size_t itembytes, size_t numel)
 AllocatedArray Group::allocateArrayManaged(size_t itembytes, size_t numel) {
   AllocatedArray r;
   r.buffer = allocateManaged(itembytes * numel);
+  r.itembytes = itembytes;
+  r.numel = numel;
+  return r;
+}
+AllocatedArray Group::allocateArrayDeviceMapped(size_t itembytes, size_t numel) {
+  AllocatedArray r;
+  r.buffer = allocateDeviceMapped(itembytes * numel);
   r.itembytes = itembytes;
   r.numel = numel;
   return r;
