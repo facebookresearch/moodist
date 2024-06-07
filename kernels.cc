@@ -37,16 +37,27 @@ std::string Kernels::emitCopySeq(
     s = replace(
         R"(
     %count = (%bytes - %offset) / $nbytes;
+    // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
+    //   printf("block %d, block %d thread %d, copy? %d %d %d\n", blockIdx.x, $blockIndex, %threadIndex, (int)$typesize, (int)$unroll, (int)%count);
+    // }
+    if ($unroll != 1) {
+      dynamicBlockIndex = (dynamicBlockIndex + %count) % $gridSize;
+    }
     %i = %blockIndex;
     assert(%offset + $nbytes * %count <= %bytes);
     if ($cond < %count) {
+      // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
+      //   printf("block %d, block %d thread %d, ENTER COPY %d %d %d\n", blockIdx.x, $blockIndex, %threadIndex, (int)$typesize, (int)$unroll, (int)%count);
+      // }
       $preloop
       while ($cond < %count) {
         $loop
       }
       $postloop
       if ($unroll != 1 && %count < %numBlocks) {
-        return;
+        %numBlocks -= %count;
+        %blockIndex -= %count;
+        //return dynamicBlockIndex;
       }
     } else {
       if ($unroll != 1 && %count < %numBlocks) {
@@ -57,7 +68,7 @@ std::string Kernels::emitCopySeq(
     %offset += $nbytes * %count;
     assert(%offset <= %bytes);
     if (%offset == %bytes) {
-      return;
+      return dynamicBlockIndex;
     }
   )",
         "$nbytes", nbytes, "$cond", condi);
@@ -127,6 +138,9 @@ std::string Kernels::emitCopySeq(
   static_assert($gridSize % $blocksPerSm == 0);
   uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
+  // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
+  //   printf("block %d doing copy as block %d thread %d\n", blockIdx.x, $blockIndex, %threadIndex);
+  // }
   size_t %offset = 0;
   size_t %count = 0;
   size_t %i;
@@ -508,8 +522,9 @@ __device__ size_t stepValueChunkIndex(size_t concurrencyIndex, size_t index, siz
   return $maxChunks * $size * concurrencyIndex + $size * chunk + index;
 }
 
-__device__ void copy_impl(void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
+__device__ uint32_t copy_impl(uint32_t dynamicBlockIndex, void* __restrict__ dst, const void* __restrict__ src, size_t bytes) {
   $copyCode
+  return dynamicBlockIndex;
 }
 
 template<typename T, typename R>
@@ -536,11 +551,16 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
 
   // source = replace(
   //     source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
+
+  // source = replace(
+  //     source, "$copyCode",
+  //     emitCopySeq(
+  //         {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u",
+  //         "$gridSize * (threadIdx.x / 32u) + blockIdx.x"));
   source = replace(
       source, "$copyCode",
-      emitCopySeq(
-          {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u",
-          "$gridSize * (threadIdx.x / 32u) + blockIdx.x"));
+      emitCopySeq({"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex"));
+
   // source = replace(
   //     source, "$copyCode",
   //     emitCopySeq(

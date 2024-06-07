@@ -5,6 +5,7 @@
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "vector.h"
+#include "parameters_data.h"
 
 #include <forward_list>
 #include <memory>
@@ -49,6 +50,9 @@ struct QueueEntryAllGather : QueueEntry {
   size_t numChunks = 0;
   size_t numParallel = 0;
   size_t algo = 0;
+
+  size_t paramsIndex = 0;
+  ParametersData* paramsData = nullptr;
 };
 
 struct QueueEntryReduceScatter : QueueEntry {

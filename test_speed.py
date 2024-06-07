@@ -253,7 +253,7 @@ for i in range(ngpus):
 # for n in ("moodist", "nccl"):
 # for n in ("moodist", "nccl"):
 # for n in ("nccl",):
-for n in ("nccl",):
+for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

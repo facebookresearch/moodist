@@ -379,7 +379,9 @@ std::string AllGather::generate() {
 
   auto addCopy = [&](std::string dst, std::string src, std::string bytes) {
     if (isInGrid) {
-      return replace("copy_impl($dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes", bytes);
+      return replace(
+          "dynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes",
+          bytes);
     } else {
       // return replace("cudaMemcpyAsync($dst, $src, $bytes, cudaMemcpyDeviceToDevice, 0);\n", "$dst", dst, "$src", src,
       // "$bytes", bytes);
@@ -473,18 +475,19 @@ std::string AllGather::generate() {
 
       recvCopies += R"(
         {
-        if (threadIdx.x == 0) {
-          sharedValue = *ptr++;
-        }
-        syncthreads();
-        uint32_t value = sharedValue;
+        // if (threadIdx.x == 0) {
+        //   sharedValue = *ptr++;
+        // }
+        // syncthreads();
+        // uint32_t value = sharedValue;
+        uint32_t value = *ptr++;
         uint32_t pdi_source = value & 0xffff;
         uint32_t destinationPeerIndex = (value >> 16) & 0xff;
         uint32_t proxyPeerIndex = (value >> 24) & 0xff;
       )";
 
       if (isInGrid) {
-        recvCopies += "if (threadIdx.x == 0) {\n";
+        recvCopies += "if (threadIdx.x % 32 == 0) {\n";
       }
 
       if (proxyIndex == 0) {
@@ -496,7 +499,7 @@ std::string AllGather::generate() {
 
       recvCopies += replace(
           R"(
-        if (isFirstThread) {
+        if (dynamicBlockIndex == $gridSize * $blockSize / 32u - 1) {
           *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
         }
         while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
@@ -512,7 +515,18 @@ std::string AllGather::generate() {
       //"$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * pdi.source), "$chunkIndex", chunkIndex);
 
       if (isInGrid) {
-        recvCopies += "}\nsyncthreads();\n";
+        // recvCopies += "}\n";
+        // recvCopies += replace(
+        //     R"(
+        //   if (dynamicBlockIndex == 0 && threadIdx.x % 32 == 0) {
+        //     *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
+        //   }
+        //   )",
+        //     "$forwardPtr",
+        //     "(peerCudaProxyReady[destinationPeerIndex] + sizeof(uint32_t) * ($size * concurrencyIndex + source))");
+        // recvCopies += "syncthreads();\n";
+        // recvCopies += "}\nsyncthreads();\n";
+        recvCopies += "}\n__syncwarp();\n";
       }
 
       recvCopies += addCopy(
@@ -544,13 +558,14 @@ std::string AllGather::generate() {
 
   recvCopies = replace(
       R"(
-        __shared__ uint32_t sharedValue;
+        //__shared__ uint32_t sharedValue;
     for (auto* ptr = &allGatherInstructions[0];;) {
-      if (threadIdx.x == 0) {
-        sharedValue = *ptr++;
-      }
-      syncthreads();
-      uint32_t source = sharedValue;
+      // if (threadIdx.x == 0) {
+      //   sharedValue = *ptr++;
+      // }
+      // syncthreads();
+      // uint32_t source = sharedValue;
+      uint32_t source = *ptr++;
       if (source == -1) {
         break;
       }
@@ -588,10 +603,11 @@ struct AllGatherCopyParameters {
 }
 
 extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
+  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
 #pragma unroll 1
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
-    copy_impl(params.dst[i], params.src[i], params.bytes[i]);
+    dynamicBlockIndex = copy_impl(dynamicBlockIndex, params.dst[i], params.src[i], params.bytes[i]);
   }
 }
 
@@ -638,6 +654,8 @@ extern "C" __global__ void $launchBounds allgather_local(AllGatherParameters par
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   grid_generic_entry_local(params);
 
+  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
+
   $localCopies
 
   grid_generic_exit_local(stepValue, concurrencyIndex);
@@ -656,6 +674,8 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   [[maybe_unused]] volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   grid_generic_entry(params);
+
+  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
 
   $localCopies
 

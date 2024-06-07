@@ -149,8 +149,8 @@ def main():
                     # print(v)
                     # if v[-1] / min_t < 1.75:
                     #if v[-1] / min_t < 10:
-                    if v[-1] / min_t < 1.01:
-                        # if True:
+                    #if v[-1] / min_t < 1.5:
+                    if True:
                         new_list.append(torch.Tensor(v))
                     else:
                         removed += 1
@@ -158,7 +158,8 @@ def main():
                 if total < 64:
                     continue
                 # print("removed %d/%d outliers" % (len(l) - len(new_list), len(l)))
-                v = torch.stack(new_list).mean(0)
+                #v = torch.stack(new_list).mean(0)
+                v = torch.stack(new_list).quantile(0.5, 0)
                 # print(v)
 
                 v = tuple(v.item() for v in v.unbind())
@@ -217,8 +218,8 @@ def main():
 
         sorted_x.sort()
 
-        print("top 4:")
-        for xv in sorted_x[:4]:
+        print("top 8:")
+        for xv in sorted_x[:8]:
             print("  %s  %.02f%%" % (str(xv[1]), best_t / xv[1][-1] * 100))
 
         inputs = []

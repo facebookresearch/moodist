@@ -2,6 +2,7 @@
 
 #include "cputhread.h"
 #include "group.h"
+#include "parameters_data.h"
 
 #include <atomic>
 #include <chrono>
@@ -140,6 +141,9 @@ struct ParametersOptimizer {
       size_t bestIndex = 0;
       std::array<float, PT::numOptions> weights{};
       std::array<float, PT::numOptions> times{};
+
+      size_t numUpdates = 0;
+      ParametersData timings;
     };
 
     std::tuple<Data<P>...> data;
@@ -148,7 +152,9 @@ struct ParametersOptimizer {
 
     size_t counter = 0;
 
-    std::chrono::steady_clock::time_point syncTime;
+    // std::chrono::steady_clock::time_point syncTime;
+
+    Vector<std::tuple<size_t, float>> tmpTimings;
 
     // std::minstd_rand rng{(std::minstd_rand::result_type)std::chrono::steady_clock::now().time_since_epoch().count()};
 
@@ -223,16 +229,38 @@ struct ParametersOptimizer {
       auto now = std::chrono::steady_clock::now();
       if (syncing) {
         if (pg->rank == 0) {
-          auto elapsed = now - syncTime;
+          // auto elapsed = now - syncTime;
 
-          float t = seconds(elapsed);
+          // float t = seconds(elapsed);
           forEach(
               [&](auto& v) {
-                if (v.times[v.index] == 0) {
-                  v.times[v.index] = t;
-                } else {
-                  v.times[v.index] = v.times[v.index] * 0.99f + t * 0.01f;
+                {
+                  std::lock_guard l(v.timings.mutex);
+                  std::swap(tmpTimings, v.timings.timings);
                 }
+
+                // log.info("got %d new timings\n", tmpTimings.size());
+
+                float timingDecay = 0.95f;
+                if (v.numUpdates >= 20) {
+                  timingDecay = 0.975f;
+                }
+                if (v.numUpdates >= 40) {
+                  timingDecay = 0.99f;
+                }
+                for (auto [index, t] : tmpTimings) {
+                  if (v.times[v.index] == 0 || (t <= v.times[v.index] * 0.75f)) {
+                    v.times[index] = t;
+                  } else {
+                    v.times[index] = v.times[index] * timingDecay + t * (1 - timingDecay);
+                  }
+                }
+                for (size_t i = 0; i != v.times.size(); ++i) {
+                  if (v.times[i] < v.times[v.bestIndex]) {
+                    v.bestIndex = i;
+                  }
+                }
+                tmpTimings.clear();
                 // if (v.times[v.index] == 0) {
                 //   v.times[v.index] = t;
                 // } else {
@@ -240,46 +268,48 @@ struct ParametersOptimizer {
                 // }
                 // v.times[v.index] = t;
 
-                for (size_t i = 0; i != v.times.size(); ++i) {
-                  if (v.times[i] < v.times[v.bestIndex]) {
-                    v.bestIndex = i;
-                  }
-                }
-
                 // float reward = -1.0f;
                 // if (v.times[v.index] <= v.times[v.bestIndex]) {
                 //   reward = 1.0f;
                 // }
-                float reward = v.times[v.bestIndex] / v.times[v.index];
+                // float reward = v.times[v.bestIndex] / v.times[v.index];
 
                 // log.info("%s times: [%s]\n", v.p->name, fmt::to_string(fmt::join(v.times, ", ")));
-                //  log.info("%s best index: %d\n", v.p->name, v.bestIndex);
+                //   log.info("%s best index: %d\n", v.p->name, v.bestIndex);
 
                 // log.info("%s update index %d reward %g\n", v.p->name, v.index, reward);
 
                 // log.info("%s pre weights [%s]\n", v.p->name, fmt::to_string(fmt::join(v.weights, ", ")));
 
-                // auto sf = softmax(v.weights);
+                auto sf = softmax(v.weights);
 
-                // // log.info("%s softmax [%s]\n", v.p->name, fmt::to_string(fmt::join(sf, ", ")));
+                // log.info("%s softmax [%s]\n", v.p->name, fmt::to_string(fmt::join(sf, ", ")));
 
-                // constexpr float lr = 0.1f;
-                // constexpr float maxLogValue = std::log(1000 * sf.size());
-                // constexpr float decay = maxLogValue / (maxLogValue + lr);
+                float lr = 0.5f;
+                if (v.numUpdates >= 20) {
+                  lr = 0.25;
+                }
+                if (v.numUpdates >= 40) {
+                  lr = 0.1f;
+                }
+                // constexpr float maxLogValue = std::log(100000 * sf.size());
+                // constexpr float decay = maxLogValue / (maxLogValue + 0.1f);
 
-                // for (size_t i = 0; i != v.weights.size(); ++i) {
-                //   float prob = sf[i];
-                //   // if (i == v.index) {
-                //   //   // v.weights[i] += lr * reward;
-                //   //   v.weights[i] = v.weights[i] * 0.99f + (reward * 0.01f * maxLogValue);
-                //   // }
-                //   if (i == v.index) {
-                //     v.weights[i] += (1 - prob) * reward * lr;
-                //   } else {
-                //     v.weights[i] -= prob * reward * lr;
-                //   }
-                //   // v.weights[i] *= decay;
-                // }
+                ++v.numUpdates;
+
+                for (size_t i = 0; i != v.weights.size(); ++i) {
+                  float prob = sf[i];
+                  // if (i == v.index) {
+                  //   // v.weights[i] += lr * reward;
+                  //   v.weights[i] = v.weights[i] * 0.99f + (reward * 0.01f * maxLogValue);
+                  // }
+                  if (i == v.bestIndex) {
+                    v.weights[i] += (1 - prob) * lr;
+                  } else {
+                    v.weights[i] -= prob * lr;
+                  }
+                  //v.weights[i] *= decay;
+                }
 
                 // v.weights[v.index] = v.weights[v.index] * 0.98f + reward * 0.02f;
 
@@ -321,15 +351,15 @@ struct ParametersOptimizer {
               //   sum += probs[i];
               // }
               // float value = std::uniform_real_distribution<float>(0.0f, sum)(getRng());
-              // log.info(
-              //     "%s: probs [%s] sum %g value %g\n", v.p->name, fmt::to_string(fmt::join(probs, ", ")), sum, value);
+              // // log.info(
+              // //     "%s: probs [%s] sum %g value %g\n", v.p->name, fmt::to_string(fmt::join(probs, ", ")), sum, value);
               // size_t i = 0;
               // while (i != probs.size() && value > probs[i]) {
               //   value -= probs[i];
               //   ++i;
               // }
               // log.info("%s sampled index %d\n", v.p->name, i);
-              //size_t i = random<size_t>(0, v.weights.size() - 1);
+              size_t i = random<size_t>(0, v.weights.size() - 1);
               v.newIndex = i;
             },
             data);
@@ -346,7 +376,7 @@ struct ParametersOptimizer {
         //     newValues);
         // log.info("sync new values: [%s]\n", str);
       }
-      syncTime = now;
+      // syncTime = now;
       syncing = true;
       uint32_t stepValue = pg->getNextStepValue();
       uint32_t concurrencyIndex =

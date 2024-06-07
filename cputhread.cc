@@ -9,6 +9,7 @@
 #include "ib_common.h"
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
+#include "parameters.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
 #include "simple_vector.h"
@@ -1178,13 +1179,13 @@ struct CpuThreadImpl {
   //   return std::exchange(uniqueIndexOffset, uniqueIndexOffset + n);
   // }
 
-  void writeDyn(size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex) {
+  void writeDyn(size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex, size_t numDyns = 1) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inDyn(concurrencyIndex, dstIndex));
     writeControl(
         concurrencyIndex, dev, i, (void*)&outDyn(concurrencyIndex, srcIndex), outDynsMr->mrs[di]->lkey,
-        (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses));
+        (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses) * numDyns);
   }
 
   void writeStepValue(size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex) {
@@ -2861,8 +2862,6 @@ struct CpuThreadImpl {
 
       self.trace("ring %#x", stepValue);
 
-      startTime = std::chrono::steady_clock::now();
-
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
       {
@@ -2898,10 +2897,13 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0);
-      self.writeDyn(concurrencyIndex, sendNeighbor, 1, 1);
+      self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0, 2);
       { WAIT_DYN(opTypeAllGatherRingCuda, 0); }
       { WAIT_DYN(opTypeAllGatherRingCuda, 1); }
+
+      tryRead(0);
+
+      startTime = std::chrono::steady_clock::now();
 
       self.trace("read loop");
       // log.info("enter read loop\n");
@@ -2971,19 +2973,24 @@ struct CpuThreadImpl {
 
       self.trace("kernel-exit");
 
+      {
+        float t = seconds(std::chrono::steady_clock::now() - startTime);
+        if (rank == 0) {
+          if (params.paramsData) {
+            params.paramsData->addTiming(params.paramsIndex, t);
+          }
+          std::lock_guard l(stats.mutex);
+          stats.values.push_back(
+              {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+               (float)numChunks, (float)numParallel, t});
+        }
+      }
+
       while (cpuIn[0] < stepValue + 1) {
         YIELD
       }
 
       // log.info("exit kernel %d ok\n", stepValue);
-
-      float t = seconds(std::chrono::steady_clock::now() - startTime);
-      if (rank == 0) {
-        std::lock_guard l(stats.mutex);
-        stats.values.push_back(
-            {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
-             (float)numChunks, (float)numParallel, t});
-      }
 
       self.trace("");
 
@@ -4080,6 +4087,7 @@ CpuThread::~CpuThread() {
 void CpuThread::start() {
   thread = std::thread([this] {
     async::setCurrentThreadName("moodist-cputhread");
+    CHECK(numa_run_on_node(group->allocationNode) == 0);
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
     CpuThreadImpl impl(this);
     impl.entry();

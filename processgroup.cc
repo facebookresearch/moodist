@@ -130,9 +130,9 @@ struct ProcessGroupImpl {
 
   // ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
   //     allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
-  //ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
+  ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
 
-  ParametersOptimizer<decltype(reducedAllGatherParams8r)> allGathesParameters8r{reducedAllGatherParams8r};
+  // ParametersOptimizer<decltype(reducedAllGatherParams8r)> allGathesParameters8r{reducedAllGatherParams8r};
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -551,8 +551,8 @@ struct ProcessGroupImpl {
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
 
-    //auto& paramValues = allGatherParameters(this, bytes);
-    auto& paramValues = allGathesParameters8r(this, bytes);
+    // auto& paramValues = allGatherParameters(this, bytes);
+    // auto& paramValues = allGathesParameters8r(this, bytes);
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -675,7 +675,9 @@ struct ProcessGroupImpl {
       // e->numChunks = e->numDevices * 2;
       // e->numParallel = 2;
 
-      std::tie(e->numDevices, e->numChunks, e->numParallel) = paramValues.get(reducedAllGatherParams8r);
+      // std::tie(e->numDevices, e->numChunks, e->numParallel) = paramValues.get(reducedAllGatherParams8r);
+      // e->paramsData = &std::get<0>(paramValues.data).timings;
+      // e->paramsIndex = std::get<0>(paramValues.data).index;
       // e->numDevices = paramValues.get(paramNumDevices);
       // e->numChunks = e->numDevices * paramValues.get(paramNumChunks);
       // e->numParallel = paramValues.get(paramNumParallel);
@@ -683,9 +685,9 @@ struct ProcessGroupImpl {
       // e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
       // e->numChunks = e->numDevices * std::min(bytes / 131072, (size_t)4);
       // e->numParallel = 4;
-      // e->numDevices = 1;
-      // e->numChunks = 1;
-      // e->numParallel = 2;
+      e->numDevices = 4;
+      e->numChunks = 4;
+      e->numParallel = 1;
       e->algo = 1;
       chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);

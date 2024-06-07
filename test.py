@@ -99,8 +99,8 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(32768).cuda() + 1
-        #data = torch.randn(73728).cuda() + 1
-        data = torch.randn(1179648).cuda() + 1
+        data = torch.randn(36864).cuda() + 1
+        #data = torch.randn(1048576 // 16).cuda() + 1
         # data = torch.randn(36864).cuda() + 1
         # data = torch.randn(1024 * 1024 * 32).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
@@ -378,8 +378,8 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 1:
-            loopcount = 1000
+        elif 1 == 12:
+            loopcount = 2000
             freeevents = [
                 torch.cuda.Event(),
                 torch.cuda.Event(),
@@ -387,8 +387,8 @@ def f(n):
                 torch.cuda.Event(),
             ]
             events = []
-            if n == "moodist":
-                moodist.enable_profiling(True)
+            # if n == "moodist":
+            #     moodist.enable_profiling(True)
             for _ in range(loopcount):
                 if len(events) >= 2:
                     e = events.pop(0)
@@ -399,8 +399,8 @@ def f(n):
                 e = freeevents.pop(0)
                 e.record()
                 events.append(e)
-            if n == "moodist":
-                moodist.enable_profiling(False)
+            # if n == "moodist":
+            #     moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp)
             # for i in range(loopcount):
@@ -412,7 +412,7 @@ def f(n):
             #     events.append(e)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 100000
+            loopcount = 2000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
