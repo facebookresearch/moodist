@@ -7,8 +7,6 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "model.h"
-#include "parameters.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
@@ -127,12 +125,6 @@ struct ProcessGroupImpl {
   HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
 
   WorkStream copyWorkStream;
-
-  // ParametersOptimizer<decltype(paramNumDevices), decltype(paramNumChunks), decltype(paramNumParallel)>
-  //     allGatherParameters{paramNumDevices, paramNumChunks, paramNumParallel};
-  ParametersOptimizer<decltype(allGatherSuper)> allGatherParameters{allGatherSuper};
-
-  // ParametersOptimizer<decltype(reducedAllGatherParams8r)> allGathesParameters8r{reducedAllGatherParams8r};
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -516,14 +508,6 @@ struct ProcessGroupImpl {
     ipcMapper->setStepValue(stepValue);
   }
 
-  struct modelOutputKeyHash {
-    size_t operator()(std::tuple<size_t, size_t, size_t> v) const {
-      return std::get<0>(v) * 37 + std::get<1>(v) * 97 + std::get<2>(v);
-    }
-  };
-
-  HashMap<std::tuple<size_t, size_t, size_t>, ModelOutput, modelOutputKeyHash> modelOutputs;
-
   void all_gather(at::Tensor& output, const at::Tensor& input, CUstream stream) {
     std::unique_lock l(threadUnsafe);
     trace("all_gather");
@@ -550,9 +534,6 @@ struct ProcessGroupImpl {
 
     TORCH_CHECK(bytes > 0);
     TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
-
-    // auto& paramValues = allGatherParameters(this, bytes);
-    // auto& paramValues = allGathesParameters8r(this, bytes);
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -657,16 +638,6 @@ struct ProcessGroupImpl {
       // e->numChunks = 1;
       // e->numParallel = 2;
 
-      auto key = std::make_tuple(size, 1 + group->ipcRanks.size(), bytes);
-      auto it = modelOutputs.find(key);
-      ModelOutput o;
-      if (it != modelOutputs.end()) {
-        o = it->second;
-      } else {
-        o = evalModel(std::get<0>(key), std::get<1>(key), std::get<2>(key));
-        modelOutputs[key] = o;
-      }
-
       // e->numDevices = o.numDevices;
       // e->numChunks = o.numChunks;
       // e->numParallel = o.numParallel;
@@ -682,13 +653,14 @@ struct ProcessGroupImpl {
       // e->numChunks = e->numDevices * paramValues.get(paramNumChunks);
       // e->numParallel = paramValues.get(paramNumParallel);
       // e->algo = paramValues.get(paramAlgo);
-      // e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
-      // e->numChunks = e->numDevices * std::min(bytes / 131072, (size_t)4);
-      // e->numParallel = 4;
-      e->numDevices = 4;
-      e->numChunks = 4;
+      e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
+      e->numChunks = std::min(bytes / 131072, (size_t)4);
       e->numParallel = 1;
-      e->algo = 1;
+      if (isNoLocal && bytes > 65536) {
+        e->numDevices = std::max((size_t)4, group->numTrueIbDevs);
+        e->numChunks = 4;
+        e->numParallel = 1;
+      }
       chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);
     }

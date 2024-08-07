@@ -257,7 +257,7 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("moodist", "nccl"):
+for n in ("nccl",):
     # for n in ("nccl", "moodist"):
     # for n in ("nccl",):
     # for n in ("moodist",):

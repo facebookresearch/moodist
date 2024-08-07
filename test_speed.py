@@ -223,7 +223,7 @@ def f(n):
     torch.manual_seed(42 + rank)
 
     # i = min(ngpus, world_size)
-    i = min(1024, world_size)
+    i = min(102400, world_size)
     while True:
         t(i)
 
@@ -249,11 +249,15 @@ for i in range(ngpus):
         )
     )
 
+if not os.path.exists("/dev/infiniband"):
+    import socket
+    raise RuntimeError("%s: no infiniband" % socket.gethostname())
+
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
 # for n in ("moodist", "nccl"):
 # for n in ("nccl",):
-for n in ("moodist",):
+for n in ("nccl",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

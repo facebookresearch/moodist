@@ -755,7 +755,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     fn(cuAllGatherLocal, "allgather_local");
     fn(cuAllGather, "allgather");
     fn(cuAllGatherNoLocal, "allgather_no_local");
-    fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
+    //fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
   }
   if (flags & CompileReduceScatter) {
     source += group->reduceScatter->generate({compileType}, {compileReduction});

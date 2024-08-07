@@ -499,16 +499,17 @@ std::string AllGather::generate() {
 
       recvCopies += replace(
           R"(
-        if (dynamicBlockIndex == $gridSize * $blockSize / 32u - 1) {
-          *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
-        }
-        while (*(volatile uint32_t*)$readyPtr < stepValue + $chunkIndex);
+        // if (dynamicBlockIndex == $gridSize * $blockSize / 32u - 1) {
+        //   *(volatile uint32_t*)$forwardPtr = stepValue + $chunkIndex;
+        // }
+        *(volatile uint32_t*)$forwardPtr = stepValue;
+        while (*(volatile uint32_t*)$readyPtr != stepValue);
       )",
           "$forwardPtr",
-          "(peerCudaProxyReady[destinationPeerIndex] + sizeof(uint32_t) * ($size * concurrencyIndex + source))",
+          "(peerCudaProxyReady[destinationPeerIndex] + sizeof(uint32_t) * ($size * $maxChunks * concurrencyIndex + $size * $chunkIndex + source))",
           "$readyPtr",
           replace(
-              "($base + sizeof(uint32_t) * ($size * concurrencyIndex + pdi_source))", "$base",
+              "($base + sizeof(uint32_t) * ($size * $maxChunks * concurrencyIndex + $size * $chunkIndex + pdi_source))", "$base",
               cudaProxyReady.buffer.cudaPointer),
           "$chunkIndex", chunkIndex);
       //"$forwardPtr", concurrencyIndex(peerCudaProxyReady[pi.destinationPeerIndex], sizeof(uint32_t) * pi.source),
@@ -602,14 +603,14 @@ struct AllGatherCopyParameters {
 
 }
 
-extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
-  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
-#pragma unroll 1
-  for (uint32_t i = 0; i != params.n; ++i) {
-    syncthreads();
-    dynamicBlockIndex = copy_impl(dynamicBlockIndex, params.dst[i], params.src[i], params.bytes[i]);
-  }
-}
+// extern "C" __global__ void $launchBounds allgather_copy_kernel(AllGatherCopyParameters params) {
+//   uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
+// #pragma unroll 1
+//   for (uint32_t i = 0; i != params.n; ++i) {
+//     syncthreads();
+//     dynamicBlockIndex = copy_impl(dynamicBlockIndex, params.dst[i], params.src[i], params.bytes[i]);
+//   }
+// }
 
 namespace {
 

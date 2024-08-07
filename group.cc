@@ -699,7 +699,7 @@ void Group::init() {
   cudaCommsDeviceDataSent2 = allocateArrayDevice(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
   cpuCommsDeviceDataSent2 = allocateArrayHost(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
 
-  cudaProxyReady = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
+  cudaProxyReady = allocateArrayDevice(sizeof(uint32_t) * size * maxChunks, Group::maxConcurrency);
   mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
 
   cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
