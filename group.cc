@@ -838,69 +838,71 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   return r;
 }
 AllocatedBuffer Group::allocateDeviceMapped(size_t bytes) {
-  if (bytes < 4096) {
-    bytes = 4096;
-  }
-  AllocatedBuffer r;
-  r.bytes = bytes;
+  CHECK(false);
+  return {};
+  // if (bytes < 4096) {
+  //   bytes = 4096;
+  // }
+  // AllocatedBuffer r;
+  // r.bytes = bytes;
 
-  size_t allocationGranularity = 1;
-  CUmemAllocationProp prop;
-  std::memset(&prop, 0, sizeof(prop));
-  prop.location.id = deviceIndex;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  CHECK_CU(cuMemGetAllocationGranularity(&allocationGranularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+  // size_t allocationGranularity = 1;
+  // CUmemAllocationProp prop;
+  // std::memset(&prop, 0, sizeof(prop));
+  // prop.location.id = deviceIndex;
+  // prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+  // prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  // CHECK_CU(cuMemGetAllocationGranularity(&allocationGranularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
 
-  log.info("allocation granularity is %#x\n", allocationGranularity);
+  // log.info("allocation granularity is %#x\n", allocationGranularity);
 
-  size_t alignment = std::max((size_t)4096, allocationGranularity);
-  r.bytes = (bytes + alignment - 1) / alignment * alignment;
+  // size_t alignment = std::max((size_t)4096, allocationGranularity);
+  // r.bytes = (bytes + alignment - 1) / alignment * alignment;
 
-  CHECK_CU(cuMemCreate(&r.handle, r.bytes, &prop, 0));
+  // CHECK_CU(cuMemCreate(&r.handle, r.bytes, &prop, 0));
 
-  log.info("handle created\n");
+  // log.info("handle created\n");
 
-  CUdeviceptr ptr = 0;
-  CHECK_CU(cuMemAddressReserve(&ptr, r.bytes, alignment, 0, 0));
-  log.info("reserved address %#x\n", ptr);
-  CHECK_CU(cuMemMap(ptr, r.bytes, 0, r.handle, 0));
-  log.info("mapped moo!\n");
+  // CUdeviceptr ptr = 0;
+  // CHECK_CU(cuMemAddressReserve(&ptr, r.bytes, alignment, 0, 0));
+  // log.info("reserved address %#x\n", ptr);
+  // CHECK_CU(cuMemMap(ptr, r.bytes, 0, r.handle, 0));
+  // log.info("mapped moo!\n");
+
+  // // std::array<CUmemAccessDesc, 2> desc;
+  // // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+  // // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  // // desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+  // // desc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  // // desc[1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  // // desc[1].location.id = deviceIndex;
+  // // CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 2));
 
   // std::array<CUmemAccessDesc, 2> desc;
   // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
   // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  // desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  // desc[0].location.id = deviceIndex;
+  // CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
+
+  // log.info("access 1 ok\n");
+
+  // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+  // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   // desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-  // desc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  // desc[1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  // desc[1].location.id = deviceIndex;
-  // CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 2));
+  // desc[0].location.id = allocationNode;
+  // CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
 
-  std::array<CUmemAccessDesc, 2> desc;
-  std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-  desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  desc[0].location.id = deviceIndex;
-  CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
+  // log.info("access 2 ok\n");
 
-  log.info("access 1 ok\n");
+  // r.cudaPointer = ptr;
+  // r.cpuPointer = (void*)ptr;
 
-  std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-  desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-  desc[0].location.id = allocationNode;
-  CHECK_CU(cuMemSetAccess(ptr, r.bytes, desc.data(), 1));
-
-  log.info("access 2 ok\n");
-
-  r.cudaPointer = ptr;
-  r.cpuPointer = (void*)ptr;
-
-  std::memset(r.cpuPointer, 0, bytes);
-  r.handleAllocated = true;
-  log.verbose("allocated host mapped device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
-  return r;
+  // std::memset(r.cpuPointer, 0, bytes);
+  // r.handleAllocated = true;
+  // log.verbose("allocated host mapped device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+  // return r;
 }
 
 AllocatedCpuBuffer Group::allocateCpu(size_t bytes) {

@@ -71,7 +71,7 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     #data = torch.randn(1024 * 1024 * 40).cuda() + 1
     #data = torch.randn(589824 * 8 * size).cuda() + 1
-    data = torch.randn(353028 * 2 * size).cuda() + 1
+    data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     #data = torch.randn((442416 - 4) * size).cuda() + 1
@@ -125,8 +125,8 @@ def f(n):
 
     #print("result0 is at %#x" % result0.data_ptr())
 
-    x = torch.randn(1024 * 1024).cuda()
-    y = torch.zeros(x.numel() * size).cuda()
+    #x = torch.randn(1024 * 1024).cuda()
+    #y = torch.zeros(x.numel() * size).cuda()
 
     for _ in range(100):
         #print("rank %d warmup %d" % (rank, _))
@@ -265,7 +265,7 @@ def f(n):
             #    x2(y)
 
             torch.cuda.synchronize()
-    elif 1 == 12:
+    elif 1 == 1:
         loopcount = 1000
         events = []
         for i in range(loopcount):

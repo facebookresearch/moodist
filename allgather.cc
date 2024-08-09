@@ -693,14 +693,14 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
 
   //const size_t chunkSize = params.bytes < (size_t)65536 * 96 ? params.bytes : max((params.bytes + $numChunks - 1) / $numChunks, (size_t)65536 * 72);
   const size_t chunkSize = params.chunkSize;
-  bool isFirstThread = false;
+  // bool isFirstThread = false;
 
-  if (threadIdx.x == 0) {
-    if (atomicInc(&firstThreadCounter[concurrencyIndex], $gridSize - 1) == 0) {
-      isFirstThread = true;
-    }
-  }
-  syncthreads();
+  // if (threadIdx.x == 0) {
+  //   if (atomicInc(&firstThreadCounter[concurrencyIndex], $gridSize - 1) == 0) {
+  //     isFirstThread = true;
+  //   }
+  // }
+  // syncthreads();
 
   $recvCopies
 

@@ -102,7 +102,7 @@ def f(n):
         #data = torch.randn(36864).cuda() + 1
         #data = torch.randn(1048576 // 16).cuda() + 1
         # data = torch.randn(36864).cuda() + 1
-        data = torch.randn(1024 * 512).cuda() + 1
+        data = torch.randn(1024 * 512 - 16).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         # data = torch.randn(442416).cuda() + 1

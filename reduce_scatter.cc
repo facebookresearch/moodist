@@ -108,8 +108,11 @@ ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std:
   auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2) {
     if (isInGrid) {
       reduceCode += replace(
-          "reduce2<T, R>((T*)$dst, (const T*)$src1, (const T*)$src2, params.bytes / sizeof(T));\n", "$dst", dst,
-          "$src1", src1, "$src2", src2);
+          "dynamicBlockIndex = reduce2<T, R>(dynamicBlockIndex, (T*)$dst, (const T*)$src1, (const T*)$src2, "
+          "params.bytes / sizeof(T));\n",
+          "$dst", dst, "$src1", src1, "$src2", src2);
+      // reduceCode += R"(if (threadIdx.x % 32 == 0) printf("%d:%d: dynamicBlockIndex is now %d\n", blockIdx.x, threadIdx.x, dynamicBlockIndex);
+      // )";
     } else {
       reduceCode +=
           replace("reduce_add<T, R>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
@@ -320,7 +323,8 @@ __global__ void $launchBounds reduce_kernel(ReduceParameters params) {
   for (uint32_t i = 0; i != params.n; ++i) {
     syncthreads();
     if (params.src2[i] != nullptr) {
-      reduce2<T, R>((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+      //reduce2<T, R>((T*)params.dst[i], (const T*)params.src1[i], (const T*)params.src2[i], params.bytes / sizeof(T));
+      assert(0);
     } else {
       copy_impl(params.dst[i], params.src1[i], params.bytes);
     }
@@ -371,6 +375,8 @@ __device__ bool reduce_scatter_impl(ReduceScatterParameters& params, bool isFirs
   // ReduceParameters reduces;
   // reduces.bytes = params.bytes;
   // reduces.n = 0;
+
+  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
 
   $reduceCode
 

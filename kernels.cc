@@ -304,6 +304,9 @@ std::string Kernels::emitReduceFunctionSeq(
     s = replace(
         R"(
     %count = (%bytes - %offset) / $nbytes;
+    if ($unroll != 1) {
+      dynamicBlockIndex = (dynamicBlockIndex + %count) % $gridSize;
+    }
     %i = %blockIndex;
     assert(%offset + $nbytes * %count <= %bytes);
     if ($cond < %count) {
@@ -313,7 +316,9 @@ std::string Kernels::emitReduceFunctionSeq(
       }
       $postloop
       if ($unroll != 1 && %count < %numBlocks) {
-        return;
+        %numBlocks -= %count;
+        %blockIndex -= %count;
+        //return dynamicBlockIndex;
       }
     } else {
       if ($unroll != 1 && %count < %numBlocks) {
@@ -324,7 +329,7 @@ std::string Kernels::emitReduceFunctionSeq(
     %offset += $nbytes * %count;
     assert(%offset <= %bytes);
     if (%offset == %bytes) {
-      return;
+      return dynamicBlockIndex;
     }
   )",
         "$nbytes", nbytes, "$cond", condi);
@@ -393,18 +398,20 @@ std::string Kernels::emitReduceFunctionSeq(
   std::string s = replace(
       R"(
 template<>
-__device__ void reduce_n$nsources<$typename, $op>(size_t size, $typename* destination, $sourcesargs) {
+__device__ uint32_t reduce_n$nsources<$typename, $op>(uint32_t dynamicBlockIndex, size_t size, $typename* destination, $sourcesargs) {
   $addressesdefs
   const size_t %bytes = $sourcetypesize * size;
   const uint32_t %threadIndex = $threadIndex;
   static_assert($gridSize % $blocksPerSm == 0);
   uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
+  assert(%blockIndex < %numBlocks);
   size_t %offset = 0;
   size_t %count = 0;
   size_t %i;
   $reduce1
   assert(false);
+  return dynamicBlockIndex;
 }
   )",
       "$sourcesargs", sourcesargs, "$op", op, "$nsources", nsources, "$typename", sourcetype, "$sourcetypesize",
@@ -528,7 +535,7 @@ __device__ uint32_t copy_impl(uint32_t dynamicBlockIndex, void* __restrict__ dst
 }
 
 template<typename T, typename R>
-__device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2);
+__device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2);
 
 )z";
 
@@ -581,14 +588,14 @@ __device__ void reduce_n2(size_t numel, T* __restrict__ dst, const T* __restrict
     // gridSize, blockSize);
     source += emitReduceFunctionSeq(
         compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize * blockSize / 32, 32,
-        "threadIdx.x % 32u", "$gridSize * (threadIdx.x / 32u) + blockIdx.x");
+        "threadIdx.x % 32u", "dynamicBlockIndex");
   }
 
   source += R"(
 
 template<typename T, typename R>
-__device__ void reduce2(T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
-  reduce_n2<T, R>(numel, dst, src1, src2);
+__device__ uint32_t reduce2(uint32_t dynamicBlockIndex, T* __restrict__ dst, const T* __restrict__ src1, const T* __restrict__ src2, size_t numel) {
+  return reduce_n2<T, R>(dynamicBlockIndex, numel, dst, src1, src2);
 }
 )";
 
@@ -755,7 +762,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     fn(cuAllGatherLocal, "allgather_local");
     fn(cuAllGather, "allgather");
     fn(cuAllGatherNoLocal, "allgather_no_local");
-    //fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
+    // fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
   }
   if (flags & CompileReduceScatter) {
     source += group->reduceScatter->generate({compileType}, {compileReduction});
