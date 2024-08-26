@@ -53,7 +53,7 @@ def f(n):
 
     rank = dist.get_rank()
 
-    op = "all_gather"
+    op = "reduce_scatter"
 
     def t(i):
         if rank == 0:
@@ -257,7 +257,7 @@ for i in range(ngpus):
     )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
-for n in ("nccl",):
+for n in ("moodist",):
     # for n in ("nccl", "moodist"):
     # for n in ("nccl",):
     # for n in ("moodist",):

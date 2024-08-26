@@ -66,7 +66,9 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
 
-Group::~Group() {}
+Group::~Group() {
+  cpuThread.reset();
+}
 
 void Group::init() {
 
@@ -584,6 +586,22 @@ void Group::init() {
       peerIpcAccess[i][n] = true;
     }
   }
+
+  // int localSupportsMulticast = 0;
+  // CHECK_CU(cuDeviceGetAttribute(&localSupportsMulticast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
+  // supportsMulticast = localSupportsMulticast;
+  // for (size_t i : peerIndices) {
+  //   setupComms->sendTo(ipcRanks[i], supportsMulticast);
+  // }
+  // for (size_t i : peerIndices) {
+  //   supportsMulticast &= setupComms->recvFrom<bool>(ipcRanks[i]);
+  // }
+
+  // if (supportsMulticast) {
+  //   log.info("Multicast supported by all local devices\n");
+  // } else {
+  //   log.info("Multicast not supported by all local devices\n");
+  // }
 
   if (rank == 0) {
     log.debug("final connection setup and sync took %g ms\n", seconds(Clock::now() - start) * 1000);

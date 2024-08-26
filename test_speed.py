@@ -54,7 +54,7 @@ def f(n):
 
     rank = dist.get_rank()
 
-    op = "all_gather"
+    op = "reduce_scatter"
 
     def t(i):
         if rank == 0:
@@ -257,7 +257,7 @@ if not os.path.exists("/dev/infiniband"):
 # for n in ("moodist", "nccl"):
 # for n in ("moodist", "nccl"):
 # for n in ("nccl",):
-for n in ("nccl",):
+for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

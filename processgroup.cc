@@ -564,8 +564,6 @@ struct ProcessGroupImpl {
       return;
     }
 
-    // CUstream stream = c10::cuda::getCurrentCUDAStream();
-
     StreamData& sd = group->getStreamData(stream);
 
     auto allocbuffer = [&](auto& buffer, size_t size) {
@@ -634,25 +632,7 @@ struct ProcessGroupImpl {
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
-      // e->numDevices = 4;
-      // e->numChunks = 1;
-      // e->numParallel = 2;
 
-      // e->numDevices = o.numDevices;
-      // e->numChunks = o.numChunks;
-      // e->numParallel = o.numParallel;
-
-      // e->numDevices = 1;
-      // e->numChunks = e->numDevices * 2;
-      // e->numParallel = 2;
-
-      // std::tie(e->numDevices, e->numChunks, e->numParallel) = paramValues.get(reducedAllGatherParams8r);
-      // e->paramsData = &std::get<0>(paramValues.data).timings;
-      // e->paramsIndex = std::get<0>(paramValues.data).index;
-      // e->numDevices = paramValues.get(paramNumDevices);
-      // e->numChunks = e->numDevices * paramValues.get(paramNumChunks);
-      // e->numParallel = paramValues.get(paramNumParallel);
-      // e->algo = paramValues.get(paramAlgo);
       e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
       e->numChunks = std::min(bytes / 131072, (size_t)4);
       e->numParallel = 1;
@@ -661,6 +641,8 @@ struct ProcessGroupImpl {
         e->numChunks = 4;
         e->numParallel = 1;
       }
+      e->numDevices = std::max(e->numDevices, (size_t)1);
+      e->numChunks = std::max(e->numChunks, (size_t)1);
       chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);
     }
@@ -898,6 +880,8 @@ struct ProcessGroupImpl {
 
     bool isLocalOnly = reduceScatter.recvRanks.empty();
 
+    size_t chunkSize = 0;
+
     if (!isLocalOnly) {
       QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();
       e->task = taskReduceScatter;
@@ -908,6 +892,24 @@ struct ProcessGroupImpl {
       e->outputAddress = outputAddress;
       e->bytes = bytes;
       e->pitch = pitch;
+
+      // e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
+      e->numDevices = std::min(bytes / 262144, std::max((size_t)4, group->numTrueIbDevs));
+      e->numChunks = std::min(bytes / 131072, (size_t)4);
+      if (peerIndices.empty()) {
+        e->numDevices = std::min(bytes / 65536, std::max((size_t)4, group->numTrueIbDevs));
+        e->numChunks = std::min(bytes / 65536, (size_t)4);
+      }
+      // e->numDevices = 4;
+      e->numDevices = std::max(e->numDevices, (size_t)1);
+      e->numChunks = std::max(e->numChunks, (size_t)1);
+      e->numParallel = 1;
+      // if (isNoLocal && bytes > 65536) {
+      //   e->numDevices = std::max((size_t)4, group->numTrueIbDevs);
+      //   e->numChunks = 4;
+      //   e->numParallel = 1;
+      // }
+      chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
       group->cpuThread->enqueue(e);
     }
 
@@ -933,6 +935,7 @@ struct ProcessGroupImpl {
     parameters.concurrencyIndex = concurrencyIndex;
     parameters.bytes = bytes;
     parameters.pitch = pitch;
+    parameters.chunkSize = chunkSize;
     parameters.inputAddress = inputAddress;
     parameters.outputAddress = outputAddress;
     parameters.peerInputAddresses = peerInputAddresses;

@@ -71,7 +71,8 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     #data = torch.randn(1024 * 1024 * 40).cuda() + 1
     #data = torch.randn(589824 * 8 * size).cuda() + 1
-    data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
+    #data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
+    data = torch.randn(32768 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
     #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     #data = torch.randn((442416 - 4) * size).cuda() + 1
@@ -103,7 +104,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = True
+    check = False
 
     if check:
         all_inputs = []
@@ -128,7 +129,7 @@ def f(n):
     #x = torch.randn(1024 * 1024).cuda()
     #y = torch.zeros(x.numel() * size).cuda()
 
-    for _ in range(100):
+    for _ in range(1000):
         #print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result0 -= 1
@@ -265,8 +266,8 @@ def f(n):
             #    x2(y)
 
             torch.cuda.synchronize()
-    elif 1 == 1:
-        loopcount = 1000
+    elif 1 == 12:
+        loopcount = 10000
         events = []
         for i in range(loopcount):
             dist.reduce_scatter_tensor(result0, tmp)
@@ -296,7 +297,7 @@ def f(n):
 
         dist.reduce_scatter_tensor(result0, tmp)
     elif True:
-        loopcount = 1000
+        loopcount = 10000
         events = []
         for i in range(loopcount):
             if len(events) >= 2:
@@ -344,7 +345,7 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
-ngpus = 8
+ngpus = 1
 
 fds = []
 for i in range(ngpus):

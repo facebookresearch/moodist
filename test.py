@@ -93,7 +93,7 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = True
+    test_gather = False
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
@@ -102,7 +102,8 @@ def f(n):
         #data = torch.randn(36864).cuda() + 1
         #data = torch.randn(1048576 // 16).cuda() + 1
         # data = torch.randn(36864).cuda() + 1
-        data = torch.randn(1024 * 512 - 16).cuda() + 1
+        data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
+        #data = torch.randn(1024 * 1024 * 20).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         # data = torch.randn(442416).cuda() + 1
@@ -412,7 +413,7 @@ def f(n):
             #     events.append(e)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 2000
+            loopcount = 10000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
                 torch.cuda.synchronize()
@@ -510,10 +511,10 @@ def f(n):
 
     else:
         # items = 1024 * 1024 * 64 * size
-        # items = 1024 * 1024 * 20 * size
+        items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
         # items = 1024 * 1024 * 40
-        items = 1024 * 64
+        #items = (1024 * 512 - 1024 * 8) * size
         # items = 294912 * size
         sum = 0
         # dtype = torch.bfloat16
@@ -608,7 +609,7 @@ def f(n):
                 ##si = tmp.sum().item()
                 # print("-> %f" % si)
                 # sum += si
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
         torch.cuda.synchronize()
         if rank == 0:
             print("sum: %f" % sum)
@@ -671,7 +672,7 @@ for i in range(ngpus):
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
 # for n in ("nccl", "moodist"):
-for n in ("moodist",):
+for n in ("moodist", "nccl"):
     # for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

@@ -22,7 +22,7 @@ enum class Reduction { sum, min, max, avg, count };
 
 static constexpr size_t maxConcurrency = 16;
 static constexpr size_t maxDevices = 4;
-static constexpr size_t maxChunks = 4 * 8;
+static constexpr size_t maxChunks = 8;
 
 struct alignas(64) Progress {
   uint32_t stepValue;
@@ -144,6 +144,8 @@ struct Group {
 
   AllocatedArray cudaStepValuesBuffer;
   AllocatedArray cudaStepValuesDeviceChunksBuffer;
+
+  bool supportsMulticast = false;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {

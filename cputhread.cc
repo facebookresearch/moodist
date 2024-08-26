@@ -263,7 +263,9 @@ HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
   constexpr uint32_t opType##name = __LINE__;                                                                          \
   struct ctor##name {                                                                                                  \
-    ctor##name() { opTypeToName[opType##name] = #name; }                                                               \
+    ctor##name() {                                                                                                     \
+      opTypeToName[opType##name] = #name;                                                                              \
+    }                                                                                                                  \
   } instance##name;
 
 std::string getOpTypeName(uint32_t value) {
@@ -281,6 +283,7 @@ OPTYPE(BroadcastRingCpu);
 OPTYPE(GatherCpu);
 
 OPTYPE(AllGatherRingCuda);
+OPTYPE(ReduceScatterRingCuda);
 
 inline void badOp(
     const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
@@ -1308,7 +1311,8 @@ struct CpuThreadImpl {
         self.writeControl(
             concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
             self.outStepValuesStorageMr->mrs[di]->lkey,
-            (void*)(self.remoteInternalInStepValueBuffer[i].address + sizeof(uint32_t) * (size * concurrencyIndex + rank)),
+            (void*)(self.remoteInternalInStepValueBuffer[i].address +
+                    sizeof(uint32_t) * (size * concurrencyIndex + rank)),
             self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
       }
       for (i = 0; i != size; ++i) {
@@ -1612,6 +1616,238 @@ struct CpuThreadImpl {
   //   }
   // };
 
+  struct WorkReduceScatterRingRead : Work {
+    QueueEntryReduceScatter& params;
+    MemoryRegistration* recvMr;
+    uintptr_t recvAddress;
+
+    size_t recvNeighbor;
+    size_t sendNeighbor;
+
+    const ReduceScatter& reduceScatter = *self.group->reduceScatter;
+    const Vector<std::pair<size_t, size_t>>& ringRecvs = reduceScatter.ringRecvs;
+    const Vector<std::pair<size_t, size_t>>& ringSends = reduceScatter.ringSends;
+
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    const size_t numParallel = params.numParallel;
+
+    size_t readIndex = 0;
+    size_t chunkIndex = 0;
+    size_t liveReads = 0;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+    size_t reduceIndex = 0;
+    size_t reduceChunkIndex = 0;
+
+    WorkReduceScatterRingRead(CpuThreadImpl& self, QueueEntryReduceScatter& params)
+        : Work(self, params), params(params) {
+      CHECK(ringSends.size() != 0);
+      CHECK(ringRecvs.size() != 0);
+      recvNeighbor = std::get<1>(ringRecvs[0]);
+      sendNeighbor = std::get<1>(ringSends[0]);
+
+      CHECK(numDevices <= self.devices.size());
+      CHECK(numChunks != 0 && numChunks <= maxChunks);
+      CHECK(numParallel != 0);
+      CHECK(chunkSize > 0);
+
+      // log.info(
+      //     "reduce-scatter ring read bytes %d numDevices %d, numChunks %d, numParallel %d\n", params.bytes,
+      //     numDevices, numChunks, numParallel);
+    }
+
+    void tryRead(size_t di) {
+      size_t index = readIndex;
+      size_t chunkIndex = this->chunkIndex;
+      size_t source = std::get<0>(ringRecvs[index]);
+
+      size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+      size_t n = currentChunkSize;
+      bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+      size_t readOffset = chunkSize * chunkIndex;
+      if (n != 0) {
+        if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
+          return;
+        }
+
+        uintptr_t dstAddr = recvAddress + params.pitch * index;
+
+        ++liveReads;
+        ++deviceLiveReads[di];
+        const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, 0);
+        uintptr_t srcAddr = dyn.gatherAddress + params.pitch * index;
+        auto key = dyn.gatherKey;
+        auto& dev = self.devices[di];
+        self.readData(
+            dev, recvNeighbor, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
+            key[di], n, self.makeCallback([this, di, source, chunkIndex]() {
+              --liveReads;
+              --deviceLiveReads[di];
+              self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
+            }));
+      }
+
+      if (isLastChunk) {
+        this->chunkIndex = 0;
+        ++readIndex;
+      } else {
+        ++this->chunkIndex;
+        CHECK(this->chunkIndex < numChunks);
+      }
+    }
+
+    void step() {
+      ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        recvAddress = params.sd->recvBuffer.cudaPointer;
+        CHECK(params.sd->recvBuffer.bytes >= params.pitch * ringRecvs.size());
+
+        uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
+        CHECK(params.sd->sendBuffer.bytes >= params.pitch * ringSends.size());
+
+        CHECK(sendAddress && recvAddress);
+
+        recvMr = self.regMrCuda(recvAddress, params.pitch * ringSends.size());
+        auto* sendMr = self.regMrCuda(sendAddress, params.pitch * ringSends.size());
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        outDyns[0].gatherAddress = sendAddress;
+        outDyns[0].gatherBytes = params.bytes;
+        outDyns[0].stepValue = stepValue;
+        outDyns[0].opType = opTypeReduceScatterRingCuda;
+        for (size_t di = 0; di != numDevices; ++di) {
+          outDyns[0].gatherKey[di] = sendMr->mrs[di]->rkey;
+        }
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0, 1);
+      { WAIT_DYN(opTypeReduceScatterRingCuda, 0); }
+
+      tryRead(0);
+
+      self.trace("read loop");
+      // log.info("enter read loop\n");
+
+      // readBegin = self.bytesRead;
+      // startTime = std::chrono::steady_clock::now();
+
+      while (true) {
+        {
+          bool done = false;
+          do {
+            if (reduceIndex != ringSends.size()) {
+              if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
+                // log.info("send reduce source %d chunk %d\n", ringSends[reduceIndex].first, reduceChunkIndex);
+                CHECK(ringSends[reduceIndex].first != rank);
+                self.writeStepValueDeviceChunk(
+                    concurrencyIndex, sendNeighbor, 0, ringSends[reduceIndex].first, 0, reduceChunkIndex);
+                size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * reduceChunkIndex);
+                if (chunkSize * reduceChunkIndex + currentChunkSize == params.bytes) {
+                  ++reduceIndex;
+                  reduceChunkIndex = 0;
+                } else {
+                  ++reduceChunkIndex;
+                }
+              }
+            }
+            if (readIndex == ringRecvs.size()) {
+              if (liveReads || reduceIndex != ringSends.size()) {
+                continue;
+              }
+              self.writeStepValueDeviceChunk(concurrencyIndex, recvNeighbor, 0, rank, 0, 0);
+              done = true;
+              continue;
+            }
+
+            size_t bestDevice = 0;
+            size_t bestLiveReads = numParallel;
+            for (size_t di = 0; di != numDevices; ++di) {
+              if (deviceLiveReads[di] < bestLiveReads) {
+                bestLiveReads = deviceLiveReads[di];
+                bestDevice = di;
+              }
+            }
+            if (bestLiveReads >= numParallel) {
+              continue;
+            }
+            size_t di = bestDevice;
+
+            tryRead(di);
+          } while (false);
+          if (done) {
+            break;
+          }
+        }
+        YIELD
+      }
+
+      CHECK(liveReads == 0);
+      CHECK(readIndex == ringRecvs.size());
+
+      // {
+      //   size_t r = self.bytesRead - readBegin;
+      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
+      //   log.info(
+      //       "read %d bytes in %gs - %gG/s (with %d waits, %d reads)\n", r, t, (float)r / 1024 / 1024 / 1024 / t,
+      //       waitCounter, readCounter);
+      // }
+      // log.info("wait for remote reads\n");
+      self.trace("wait for remote reads");
+      while (self.inStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, 0) != stepValue) {
+        YIELD
+      }
+
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      // cpuOut[0] = stepValue;
+      self.writeCpuOut(concurrencyIndex, 0, 0);
+
+      self.trace("kernel-exit");
+
+      // {
+      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
+      //   if (rank == 0) {
+      //     if (params.paramsData) {
+      //       params.paramsData->addTiming(params.paramsIndex, t);
+      //     }
+      //     std::lock_guard l(stats.mutex);
+      //     stats.values.push_back(
+      //         {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+      //          (float)numChunks, (float)numParallel, t});
+      //   }
+      // }
+
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
+
+      self.cpuThread->freelistReduceScatter.push(&params);
+      self.allocatorReduceScatterRingRead.deallocate(this);
+      DONE
+    }
+  };
+
   struct WorkAllGatherRingRead4 : Work {
     QueueEntryAllGather& params;
     // size_t di;
@@ -1856,18 +2092,18 @@ struct CpuThreadImpl {
 
       self.trace("kernel-exit");
 
-      {
-        float t = seconds(std::chrono::steady_clock::now() - startTime);
-        if (rank == 0) {
-          if (params.paramsData) {
-            params.paramsData->addTiming(params.paramsIndex, t);
-          }
-          std::lock_guard l(stats.mutex);
-          stats.values.push_back(
-              {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
-               (float)numChunks, (float)numParallel, t});
-        }
-      }
+      // {
+      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
+      //   if (rank == 0) {
+      //     if (params.paramsData) {
+      //       params.paramsData->addTiming(params.paramsIndex, t);
+      //     }
+      //     std::lock_guard l(stats.mutex);
+      //     stats.values.push_back(
+      //         {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+      //          (float)numChunks, (float)numParallel, t});
+      //   }
+      // }
 
       while (cpuIn[0] < stepValue + 1) {
         YIELD
@@ -2791,7 +3027,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkBarrier> allocatorBarrier;
   WorkAllocator<WorkInternalBarrier> allocatorInternalBarrier;
   WorkAllocator<WorkAllGatherRingRead4> allocatorAllGatherRingRead4;
-  // WorkAllocator<WorkReduceScatterRing> allocatorReduceScatterRing;
+  WorkAllocator<WorkReduceScatterRingRead> allocatorReduceScatterRingRead;
   //  WorkAllocator<WorkBroadcast> allocatorBroadcast;
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
@@ -2830,7 +3066,7 @@ struct CpuThreadImpl {
       };
 
       bool terminate = false;
-      while (true) {
+      while (!terminate) {
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
           if (activeWorks.empty() && activeDevices.empty()) {
             {
@@ -2862,13 +3098,10 @@ struct CpuThreadImpl {
             if (queueEntry.task == taskBarrier) {
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
             } else if (queueEntry.task == taskAllGather) {
-              // enqueue(allocatorAllGatherRing, (QueueEntryAllGather&)queueEntry);
-              // enqueue(allocatorAllGatherRing2, (QueueEntryAllGather&)queueEntry);
               QueueEntryAllGather& e = (QueueEntryAllGather&)queueEntry;
               enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
             } else if (queueEntry.task == taskReduceScatter) {
-              // enqueue(allocatorReduceScatterRing, (QueueEntryReduceScatter&)queueEntry);
-              fatal("cuda ops temporarily disabled");
+              enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
             } else if (queueEntry.task == taskTerminate) {
               terminate = true;
               cpuThread->freelistTerminate.push(&queueEntry);
@@ -2888,6 +3121,9 @@ struct CpuThreadImpl {
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }
+          }
+          if (terminate) {
+            break;
           }
           poll();
 

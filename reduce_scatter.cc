@@ -77,76 +77,62 @@ ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std:
         "$ptr", address, "$value", value);
   };
 
-  auto waitForRecv = [&](size_t i, size_t chunkIndex, bool isLastChunk) {
+  auto waitForRecv = [&](std::string i, size_t chunkIndex) {
     std::string s;
     s = replace("// wait for recv from $i, chunk $chunkIndex\n", "$i", i, "$chunkIndex", chunkIndex);
-    for (size_t di = 0; di != group->ibDevs.size(); ++di) {
-      if (isLastChunk) {
-        s += waitFor32(concurrencyIndex(group->cudaCommsDeviceDataSent, sizeof(uint32_t) * (i * 32 + di)), "stepValue");
-      } else {
-        s += waitFor32(
-            concurrencyIndex(group->cudaCommsDeviceDataSent2, sizeof(uint32_t) * (i * 32 * 32 + 32 * di + chunkIndex)),
-            "stepValue");
-      }
-    }
+    s += waitFor32(replace("&cpuOut[$offset + $i]", "$i", i, "$offset", 16 + size * chunkIndex), "stepValue");
     return s;
   };
 
   std::string reduceCode;
 
+  std::string globaldefs;
+
   std::unordered_map<std::string, bool> dstVisited;
   std::string prevReduceDst;
   std::string prevReduceSrc;
+  std::string prevReduceBytes;
   bool isInGrid = true;
-  auto callMemcpy = [&](std::string dst, std::string src) {
-    if (isInGrid) {
-      reduceCode += replace("copy_impl($dst, $src, params.bytes);\n", "$dst", dst, "$src", src);
-    } else {
-      reduceCode += replace("reduce_add<T, R>(reduces, $dst, $src, nullptr);\n", "$dst", dst, "$src", src);
-    }
+  auto callMemcpy = [&](std::string dst, std::string src, std::string bytes) {
+    reduceCode += replace(
+        "newDynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src,
+        "$bytes", bytes);
   };
-  auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2) {
-    if (isInGrid) {
-      reduceCode += replace(
-          "dynamicBlockIndex = reduce2<T, R>(dynamicBlockIndex, (T*)$dst, (const T*)$src1, (const T*)$src2, "
-          "params.bytes / sizeof(T));\n",
-          "$dst", dst, "$src1", src1, "$src2", src2);
-      // reduceCode += R"(if (threadIdx.x % 32 == 0) printf("%d:%d: dynamicBlockIndex is now %d\n", blockIdx.x, threadIdx.x, dynamicBlockIndex);
-      // )";
-    } else {
-      reduceCode +=
-          replace("reduce_add<T, R>(reduces, $dst, $src1, $src2);\n", "$dst", dst, "$src1", src1, "$src2", src2);
-    }
+  auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2, std::string bytes) {
+    reduceCode += replace(
+        "newDynamicBlockIndex = reduce2<T, R>(dynamicBlockIndex, (T*)$dst, (const T*)$src1, (const T*)$src2, "
+        "($bytes) / sizeof(T));\n",
+        "$dst", dst, "$src1", src1, "$src2", src2, "$bytes", bytes);
   };
   auto reduceFlush = [&]() {
     if (prevReduceDst != "" && prevReduceSrc != "") {
-      callMemcpy(prevReduceDst, prevReduceSrc);
+      callMemcpy(prevReduceDst, prevReduceSrc, prevReduceBytes);
     }
     prevReduceSrc = "";
     prevReduceDst = "";
   };
-  auto reduceAdd = [&](std::string dst, std::string src) {
+  auto reduceAdd = [&](std::string dst, std::string src, std::string bytes) {
     std::string r;
     if (dst != prevReduceDst) {
       reduceFlush();
       if (dstVisited[dst]) {
-        callReduceAdd(dst, dst, src);
+        callReduceAdd(dst, dst, src, bytes);
       } else {
         prevReduceDst = dst;
         prevReduceSrc = src;
+        prevReduceBytes = bytes;
         dstVisited[dst] = true;
       }
     } else {
+      CHECK(bytes == prevReduceBytes);
       if (prevReduceSrc == "") {
-        callReduceAdd(dst, dst, src);
+        callReduceAdd(dst, dst, src, bytes);
       } else {
-        callReduceAdd(dst, prevReduceSrc, src);
+        callReduceAdd(dst, prevReduceSrc, src, bytes);
         prevReduceSrc = "";
       }
     }
   };
-
-  std::string globaldefs;
 
   // auto peerSync = [&](size_t peerIndex, size_t syncIndex) {
   //   if (peerIndices.empty()) {
@@ -168,42 +154,44 @@ ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std:
   //       concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * syncIndex), "$peerIndex", peerIndex);
   // };
 
-  auto peerSync = [&](size_t syncIndex) {
+  auto peerSync = [&]() {
     if (peerIndices.empty()) {
       return;
     }
     if (ringSends.empty()) {
       return;
     }
-    CHECK(syncIndex < size);
+    CHECK(peerIndices.size() < 32);
     std::string forwards;
     std::string waits;
+    size_t stride = size * maxChunks / peerIndices.size();
     for (size_t peerIndex : peerIndices) {
       forwards += replace(
-          "if (threadIdx.x == $peerIndex) *(volatile uint32_t*)$forwardPtr = stepValue + $syncIndex;\n", "$forwardPtr",
-          concurrencyIndex(peerCudaProxyReady[peerIndex], sizeof(uint32_t) * peerMyRemoteIndex[peerIndex]),
+          "if (threadIdx.x % 32 == $peerIndex) *(volatile uint32_t*)($forwardPtr + 4 * syncIndex) = stepValue;\n",
+          "$forwardPtr",
+          concurrencyIndex(peerCudaProxyReady[peerIndex], sizeof(uint32_t) * stride * peerMyRemoteIndex[peerIndex]),
           "$peerIndex", peerIndex);
       waits += replace(
-          "if (threadIdx.x == $peerIndex) while (*(volatile uint32_t*)$readyPtr < stepValue + $syncIndex);\n",
-          "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * peerIndex), "$peerIndex", peerIndex);
+          "if (threadIdx.x % 32 == $peerIndex) while (*(volatile uint32_t*)($readyPtr + 4 * syncIndex) < stepValue);\n",
+          "$readyPtr", concurrencyIndex(cudaProxyReady, sizeof(uint32_t) * stride * peerIndex), "$peerIndex",
+          peerIndex);
     }
     std::string code = replace(
         R"(
       static_assert($blockSize >= $nPeers);
-      if (isFirstThreadBlock) {
-        $forwards
-      }
+      assert(syncIndex < $size * $maxChunks / $nPeers);
+      $forwards
       $waits
-      syncthreads();
+      __syncwarp();
+      ++syncIndex;
     )",
         "$forwards", forwards, "$waits", waits, "$nPeers", peerIndices.size());
-    code = replace(code, "$syncIndex", syncIndex);
     reduceCode += code;
   };
 
   auto addLocals = [&]() {
-    reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.pitch * $rank)");
-    peerSync(ringSends.size());
+    reduceAdd("(T*)params.outputAddress", "(const T*)(params.inputAddress + params.pitch * $rank)", "params.bytes");
+    // peerSync(ringSends.size());
     for (size_t peerIndex : peerIndices) {
       // peerSync(peerIndex, ringSends.size());
       size_t i = ipcRanks[peerIndex];
@@ -211,79 +199,244 @@ ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std:
           "(T*)params.outputAddress",
           replace(
               "(const T*)(*(uintptr_t*)$src + params.pitch * $rank)", "$src",
-              concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
+              concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))),
+          "params.bytes");
     }
   };
 
+  std::vector<uint32_t> instructions;
+
+  for (auto [i, neighbor] : ringSends) {
+    instructions.push_back(i);
+  }
+
+  std::vector<std::string> instructionsHex;
+  for (auto& v : instructions) {
+    instructionsHex.push_back(fmt::sprintf("%#x", v));
+  }
+  std::string instructionsArray = fmt::sprintf(
+      "__constant__ uint32_t reduceScatterInstructions[%d] = {%s};", instructions.size(),
+      fmt::to_string(fmt::join(instructionsHex, ", ")));
+
   if (recvRanks.empty()) {
     addLocals();
+    reduceFlush();
   } else {
 
     reduceCode += "static_assert($blockSize >= $gridSize);\n";
-    size_t n = 0;
-    for (auto [i, neighbor] : ringSends) {
-      CHECK(i != rank);
-      std::string addr = replace("(T*)(params.sendAddress + params.pitch * $n)", "$n", n);
-      reduceAdd(addr, replace("(const T*)(params.inputAddress + params.pitch * $i)", "$i", i));
-      peerSync(n);
-      for (size_t peerIndex : peerIndices) {
-        // peerSync(peerIndex, n);
-        reduceAdd(
-            addr, replace(
-                      "(const T*)(*(uintptr_t*)$src + params.pitch * $i)", "$i", i, "$src",
-                      concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
-      }
 
-      reduceFlush();
-      if (n != 0) {
-        reduceCode += replace(
-            R"(
-          if (threadIdx.x == 0) {
-            $wait
-          }
-          syncthreads();
-        )",
-            "$wait", waitForRecv(i, 0, true));
-        reduceAdd(addr, replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", n - 1));
-        reduceFlush();
-      }
-      globaldefs +=
-          replace("__device__ volatile uint32_t sendReadyCounter_$n[$gridSize * $maxConcurrency];\n", "$n", n);
-      reduceCode += replace(
-          R"(
-        __threadfence_system();
-        syncthreads();
-        if (threadIdx.x == 0) {
-          sendReadyCounter_$n[$gridSize * concurrencyIndex + blockIdx.x] = stepValue;
-        }
-        if (isFirstThreadBlock) {
-          if (threadIdx.x < $gridSize) {
-            while (sendReadyCounter_$n[$gridSize * concurrencyIndex + threadIdx.x] < stepValue);
-          }
-          syncthreads();
-          if (threadIdx.x == 0) {
-            $cpuIn[1] = stepValue + $n + 1;
-          }
-        }
-      )",
-          "$n", n);
-      ++n;
-    }
-    CHECK(prevReduceDst == "");
-    addLocals();
     reduceCode += replace(
         R"(
-          if (threadIdx.x == 0) {
+      for (uint32_t n = 0; n != $n; ++n) {
+        uint32_t source = reduceScatterInstructions[n];
+    )",
+        "$n", instructions.size());
+
+    auto forEachChunk = [&](auto&& f) {
+      for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
+        reduceCode += replace(
+            R"(
+          {
+            // chunk $chunkIndex
+            const size_t currentChunkSize = $currentChunkSize;
+            const size_t chunkOffset = chunkSize * $chunkIndex;
+            const uint32_t chunkIndex = $chunkIndex;
+        )",
+            "$currentChunkSize", "min(chunkSize, params.bytes - chunkSize * $chunkIndex)", "$chunkIndex", chunkIndex);
+
+        f(chunkIndex);
+
+        if (chunkIndex != maxChunks - 1) {
+          reduceCode += "if (chunkSize * $chunkIndex + currentChunkSize != params.bytes) {\n";
+          reduceCode += "assert(chunkSize * $chunkIndex + currentChunkSize < params.bytes);\n";
+        } else {
+          reduceCode += "assert(chunkSize * $chunkIndex + currentChunkSize == params.bytes);\n";
+        }
+
+        reduceCode = replace(reduceCode, "$chunkIndex", chunkIndex);
+      }
+
+      for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
+        if (chunkIndex != maxChunks - 1) {
+          reduceCode += "}\n";
+        }
+        reduceCode += "}\n";
+      }
+    };
+
+    globaldefs +=
+        replace("__device__ uint32_t sendReadyCounter[$n][$maxChunks][$maxConcurrency];\n", "$n", instructions.size());
+
+    forEachChunk([&](size_t chunkIndex) {
+      CHECK(prevReduceDst == "" && prevReduceSrc == "");
+      dstVisited.clear();
+      std::string addr = "(T*)(params.sendAddress + params.pitch * n + chunkOffset)";
+      if (peerIndices.empty()) {
+        reduceCode += "if (n == 0) {\n";
+      }
+      reduceAdd(addr, "(const T*)(params.inputAddress + params.pitch * source + chunkOffset)", "currentChunkSize");
+      //peerSync();
+      for (size_t peerIndex : peerIndices) {
+        reduceAdd(
+            addr,
+            replace(
+                "(const T*)(*(uintptr_t*)$src + params.pitch * source + chunkOffset)", "$src",
+                concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))),
+            "currentChunkSize");
+      }
+      reduceFlush();
+      if (peerIndices.empty()) {
+        dstVisited.clear();
+        reduceCode += "} else {\n";
+      } else {
+        reduceCode += "if (n != 0) {\n";
+      }
+      reduceCode += replace(
+          R"(
+          if (threadIdx.x % 32 == 0) {
             $wait
           }
-          syncthreads();
+          __syncwarp();
         )",
-        "$wait", waitForRecv(rank, 0, true));
-    reduceAdd(
-        "(T*)params.outputAddress",
-        replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", ringSends.size() - 1));
+          "$wait", waitForRecv("source", chunkIndex));
+      if (peerIndices.empty()) {
+        reduceAdd(addr, "(const T*)(params.inputAddress + params.pitch * source + chunkOffset)", "currentChunkSize");
+      }
+      reduceAdd(addr, "(const T*)(params.recvAddress + params.pitch * (n - 1) + chunkOffset)", "currentChunkSize");
+      reduceFlush();
+      reduceCode += "}\n";
+      reduceCode += R"(
+        //__threadfence_system();
+        //syncthreads();
+        __syncwarp();
+        if (threadIdx.x % 32 == 0) {
+          if (atomicInc(&sendReadyCounter[n][$chunkIndex][concurrencyIndex], $gridSize * $blockSize / 32 - 1) == $gridSize * $blockSize / 32 - 1) {
+            //printf("$rank: set cpuin send ready n %d chunk %d\n", n, $chunkIndex);
+            $cpuIn[16 + $size * $chunkIndex + n] = stepValue;
+          }
+        }
+        __syncwarp();
+      )";
+      reduceCode += "dynamicBlockIndex = newDynamicBlockIndex;\n";
+      // reduceCode += R"(
+      //   __threadfence_system();
+      //   syncthreads();
+      //   if (threadIdx.x == 0) {
+      //     sendReadyCounter[n][$gridSize * concurrencyIndex + blockIdx.x] = stepValue;
+      //   }
+      //   if (isFirstThreadBlock) {
+      //     if (threadIdx.x < $gridSize) {
+      //       while (sendReadyCounter[n][$gridSize * concurrencyIndex + threadIdx.x] < stepValue);
+      //     }
+      //     syncthreads();
+      //     if (threadIdx.x == 0) {
+      //       $cpuIn[16 + $size * $chunkIndex + n] = stepValue;
+      //     }
+      //   }
+      // )";
+    });
+
+    reduceCode += "}\n";
+
+    // addLocals();
+    // reduceFlush();
+    forEachChunk([&](size_t chunkIndex) {
+      CHECK(prevReduceDst == "" && prevReduceSrc == "");
+      dstVisited.clear();
+      std::string addr = "(T*)(params.outputAddress + chunkOffset)";
+      reduceAdd(addr, "(const T*)(params.inputAddress + params.pitch * $rank + chunkOffset)", "currentChunkSize");
+      //peerSync();
+      for (size_t peerIndex : peerIndices) {
+        size_t i = ipcRanks[peerIndex];
+        reduceAdd(
+            addr,
+            replace(
+                "(const T*)(*(uintptr_t*)$src + params.pitch * $rank + chunkOffset)", "$src",
+                concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))),
+            "currentChunkSize");
+      }
+      reduceCode += replace(
+          R"(
+            if (threadIdx.x % 32 == 0) {
+              $wait
+            }
+            __syncwarp();
+          )",
+          "$wait", waitForRecv("$rank", chunkIndex));
+      reduceAdd(
+          addr, replace("(const T*)(params.recvAddress + params.pitch * $n + chunkOffset)", "$n", ringSends.size() - 1),
+          "currentChunkSize");
+      reduceFlush();
+      reduceCode += "dynamicBlockIndex = newDynamicBlockIndex;\n";
+    });
   }
-  reduceFlush();
+
+  //   size_t n = 0;
+  //   for (auto [i, neighbor] : ringSends) {
+  //     CHECK(i != rank);
+  //     std::string addr = replace("(T*)(params.sendAddress + params.pitch * $n)", "$n", n);
+  //     reduceAdd(addr, replace("(const T*)(params.inputAddress + params.pitch * $i)", "$i", i));
+  //     peerSync(n);
+  //     for (size_t peerIndex : peerIndices) {
+  //       // peerSync(peerIndex, n);
+  //       reduceAdd(
+  //           addr, replace(
+  //                     "(const T*)(*(uintptr_t*)$src + params.pitch * $i)", "$i", i, "$src",
+  //                     concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))));
+  //     }
+
+  //     reduceFlush();
+  //     if (n != 0) {
+  //       reduceCode += replace(
+  //           R"(
+  //         if (threadIdx.x == 0) {
+  //           $wait
+  //         }
+  //         syncthreads();
+  //       )",
+  //           "$wait", waitForRecv(i, 0, true));
+  //       reduceAdd(addr, replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", n - 1));
+  //       reduceFlush();
+  //     }
+  //     globaldefs +=
+  //         replace("__device__ volatile uint32_t sendReadyCounter_$n[$gridSize * $maxConcurrency];\n", "$n", n);
+  //     reduceCode += replace(
+  //         R"(
+  //       __threadfence_system();
+  //       syncthreads();
+  //       if (threadIdx.x == 0) {
+  //         sendReadyCounter_$n[$gridSize * concurrencyIndex + blockIdx.x] = stepValue;
+  //       }
+  //       if (isFirstThreadBlock) {
+  //         if (threadIdx.x < $gridSize) {
+  //           while (sendReadyCounter_$n[$gridSize * concurrencyIndex + threadIdx.x] < stepValue);
+  //         }
+  //         syncthreads();
+  //         if (threadIdx.x == 0) {
+  //           $cpuIn[1] = stepValue + $n + 1;
+  //         }
+  //       }
+  //     )",
+  //         "$n", n);
+  //     ++n;
+  //   }
+  //   CHECK(prevReduceDst == "");
+  //   addLocals();
+  //   reduceCode += replace(
+  //       R"(
+  //         if (threadIdx.x == 0) {
+  //           $wait
+  //         }
+  //         syncthreads();
+  //       )",
+  //       "$wait", waitForRecv(rank, 0, true));
+  //   reduceAdd(
+  //       "(T*)params.outputAddress",
+  //       replace("(const T*)(params.recvAddress + params.pitch * $n)", "$n", ringSends.size() - 1));
+  // }
+  // reduceFlush();
+
+  // reduceCode += "if (threadIdx.x % 32 == 0) dynamicBlockDone[dynamicBlockIndex] = 0;\n";
 
   std::string kernels;
   for (auto& type : generateTypes) {
@@ -360,6 +513,7 @@ struct ReduceScatterParameters {
   uint32_t concurrencyIndex;
   size_t bytes;
   size_t pitch;
+  size_t chunkSize;
   uintptr_t inputAddress;
   uintptr_t outputAddress;
   uintptr_t peerInputAddresses[8];
@@ -368,15 +522,23 @@ struct ReduceScatterParameters {
   uintptr_t recvAddress;
 };
 
+$instructionsArray
+
 template<typename T, typename R>
-__device__ bool reduce_scatter_impl(ReduceScatterParameters& params, bool isFirstThreadBlock) {
+__device__ bool reduce_scatter_impl(ReduceScatterParameters& params) {
   [[maybe_unused]] const uint32_t stepValue = params.stepValue;
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
+  [[maybe_unused]] volatile uint32_t* __restrict__ cpuOut = $cpuOut;
   // ReduceParameters reduces;
   // reduces.bytes = params.bytes;
   // reduces.n = 0;
 
   uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
+  uint32_t newDynamicBlockIndex = dynamicBlockIndex;
+  uint32_t dynamicBlockCounter = 0;
+  uint32_t syncIndex = 0;
+
+  const size_t chunkSize = params.chunkSize;
 
   $reduceCode
 
@@ -395,21 +557,21 @@ __device__ uint32_t firstThreadCounter[$maxConcurrency];
 template<typename T, typename R>
 __device__ void reduce_scatter_local(ReduceScatterParameters params) {
   grid_generic_entry_local(params);
-  reduce_scatter_impl<T, R>(params, false);
+  reduce_scatter_impl<T, R>(params);
   grid_generic_exit_local(params.stepValue, params.concurrencyIndex);
 }
 
 template<typename T, typename R>
 __device__ void reduce_scatter(ReduceScatterParameters params) {
-  bool isFirstThreadBlock = false;
-  if (threadIdx.x == 0) {
-    if (atomicInc(&firstThreadCounter[params.concurrencyIndex], $gridSize - 1) == 0) {
-      isFirstThreadBlock = true;
-    }
-  }
-  isFirstThreadBlock = syncthreads_or(isFirstThreadBlock);
+  // bool isFirstThreadBlock = false;
+  // if (threadIdx.x == 0) {
+  //   if (atomicInc(&firstThreadCounter[params.concurrencyIndex], $gridSize - 1) == 0) {
+  //     isFirstThreadBlock = true;
+  //   }
+  // }
+  // isFirstThreadBlock = syncthreads_or(isFirstThreadBlock);
   grid_generic_entry(params);
-  reduce_scatter_impl<T, R>(params, isFirstThreadBlock);
+  reduce_scatter_impl<T, R>(params);
   grid_generic_exit_no_recv(params.stepValue, params.concurrencyIndex);
   // if (reduce_scatter_impl<T, R>(params, isFirstThreadBlock)) {
   //   reduce_scatter_exit<<<1, 1>>>(params.stepValue, params.concurrencyIndex);
@@ -419,7 +581,8 @@ __device__ void reduce_scatter(ReduceScatterParameters params) {
 $kernels
 
   )zz",
-      "$reduceCode", reduceCode, "$globaldefs", globaldefs, "$kernels", kernels);
+      "$reduceCode", reduceCode, "$globaldefs", globaldefs, "$kernels", kernels, "$instructionsArray",
+      instructionsArray);
 
   return source;
 }

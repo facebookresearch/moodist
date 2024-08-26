@@ -11,7 +11,7 @@ def create_moodist_backend(
     return MoodistProcessGroup(store, rank, size)
 
 
-torch.distributed.Backend.register_backend("moodist", create_moodist_backend)
+torch.distributed.Backend.register_backend("moodist", create_moodist_backend, devices=("cpu", "cuda"))
 
 
 def enable_profiling(b):
