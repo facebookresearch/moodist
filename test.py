@@ -25,7 +25,7 @@ if "LOCAL_RANK" not in os.environ:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
-os.environ["NCCL_PROTO"] = "LL128"
+os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
 
 def f(n):
@@ -102,8 +102,8 @@ def f(n):
         #data = torch.randn(36864).cuda() + 1
         #data = torch.randn(1048576 // 16).cuda() + 1
         # data = torch.randn(36864).cuda() + 1
-        data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
-        #data = torch.randn(1024 * 1024 * 20).cuda() + 1
+        #data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
+        data = torch.randn(1024 * 1024 * 20).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         # data = torch.randn(442416).cuda() + 1
@@ -578,6 +578,10 @@ def f(n):
             tmp = data.clone()
             # os._exit(1)
 
+        for _ in range(500):
+            dist.all_reduce(tmp)
+            torch.cuda.synchronize()
+
         start = time.time()
         sum = 0
         if 1 == 12:
@@ -599,7 +603,7 @@ def f(n):
                 e.record()
                 events.append(e)
         else:
-            loopcount = 1000
+            loopcount = 2000
             for _ in range(loopcount):
                 # tmp.copy_(data)
                 # tmp2.copy_(data2)

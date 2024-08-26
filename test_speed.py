@@ -106,6 +106,9 @@ def f(n):
             elif op == "reduce_scatter":
                 output = torch.randn(s).cuda()
                 input = torch.randn(s * i).cuda()
+            elif op == "all_reduce":
+                output = torch.randn(s * i).cuda()
+                input = torch.randn(s * i).cuda()
             else:
                 assert False
 
@@ -126,6 +129,11 @@ def f(n):
                 events = []
                 for _ in range(iterations):
                     group._reduce_scatter_base(output, input).wait()
+                    torch.cuda.synchronize()
+            elif op == "all_reduce":
+                events = []
+                for _ in range(iterations):
+                    group.allreduce(input).wait()
                     torch.cuda.synchronize()
             else:
                 assert False
@@ -182,6 +190,16 @@ def f(n):
                             e.synchronize()
                             freeevents.append(e)
                         group._reduce_scatter_base(output, input).wait()
+                        e = freeevents.pop(0)
+                        e.record()
+                        events.append(e)
+                elif op == "all_reduce":
+                    for _ in range(iterations):
+                        if len(events) >= 2:
+                            e = events.pop(0)
+                            e.synchronize()
+                            freeevents.append(e)
+                            group.allreduce(input).wait()
                         e = freeevents.pop(0)
                         e.record()
                         events.append(e)
@@ -255,8 +273,8 @@ if not os.path.exists("/dev/infiniband"):
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 # for n in ("moodist", "nccl"):
-# for n in ("moodist", "nccl"):
-# for n in ("nccl",):
+#for n in ("nccl", "moodist"):
+#for n in ("nccl",):
 for n in ("moodist",):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1

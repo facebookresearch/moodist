@@ -37,18 +37,12 @@ std::string Kernels::emitCopySeq(
     s = replace(
         R"(
     %count = (%bytes - %offset) / $nbytes;
-    // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
-    //   printf("block %d, block %d thread %d, copy? %d %d %d\n", blockIdx.x, $blockIndex, %threadIndex, (int)$typesize, (int)$unroll, (int)%count);
-    // }
     if ($unroll != 1) {
       dynamicBlockIndex = (dynamicBlockIndex + %count) % $gridSize;
     }
     %i = %blockIndex;
     assert(%offset + $nbytes * %count <= %bytes);
     if ($cond < %count) {
-      // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
-      //   printf("block %d, block %d thread %d, ENTER COPY %d %d %d\n", blockIdx.x, $blockIndex, %threadIndex, (int)$typesize, (int)$unroll, (int)%count);
-      // }
       $preloop
       while ($cond < %count) {
         $loop
@@ -57,7 +51,6 @@ std::string Kernels::emitCopySeq(
       if ($unroll != 1 && %count < %numBlocks) {
         %numBlocks -= %count;
         %blockIndex -= %count;
-        //return dynamicBlockIndex;
       }
     } else {
       if ($unroll != 1 && %count < %numBlocks) {
@@ -138,9 +131,6 @@ std::string Kernels::emitCopySeq(
   static_assert($gridSize % $blocksPerSm == 0);
   uint32_t %blockIndex = $blockIndex;
   uint32_t %numBlocks = $gridSize;
-  // if (threadIdx.x == 0 && $rank == 1 && blockIdx.x == 0) {
-  //   printf("block %d doing copy as block %d thread %d\n", blockIdx.x, $blockIndex, %threadIndex);
-  // }
   size_t %offset = 0;
   size_t %count = 0;
   size_t %i;
@@ -160,9 +150,6 @@ std::string Kernels::emitCopySeq(
     v = var;
   }
   std::string copy1;
-  // 16 uint4 uses 64 registers. we could go higher to hide more latency,
-  // but it seems to not improve performance
-  // copy1 += genCopy("uint4", 16, 32);
   copy1 += genCopy("uint4", 16, 16);
   copy1 += genCopy("uint4", 16, 8);
   copy1 += genCopy("uint4", 16, 4);
@@ -318,7 +305,6 @@ std::string Kernels::emitReduceFunctionSeq(
       if ($unroll != 1 && %count < %numBlocks) {
         %numBlocks -= %count;
         %blockIndex -= %count;
-        //return dynamicBlockIndex;
       }
     } else {
       if ($unroll != 1 && %count < %numBlocks) {
@@ -376,7 +362,7 @@ std::string Kernels::emitReduceFunctionSeq(
         sourcetypesize, "$loopbytes", loopbytes, "$unroll", unroll);
     return s;
   };
-  std::string reduce1; // = generate("uint4", 16, 32);
+  std::string reduce1;
   if (sourcetypesize == 8) {
     reduce1 += generate("ulonglong2", 16, 16);
     reduce1 += generate("ulonglong2", 16, 8);
@@ -556,36 +542,13 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
   blockSize = 256;
   size_t blocksPerSm = 1;
 
-  // source = replace(
-  //     source, "$copyCode", emitCopySeq({"src"}, {"dst"}, "bytes", gridSize, blockSize, "threadIdx.x", "blockIdx.x"));
-
-  // source = replace(
-  //     source, "$copyCode",
-  //     emitCopySeq(
-  //         {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u",
-  //         "$gridSize * (threadIdx.x / 32u) + blockIdx.x"));
   source = replace(
       source, "$copyCode",
       emitCopySeq({"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex"));
 
-  // source = replace(
-  //     source, "$copyCode",
-  //     emitCopySeq(
-  //         {"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "(blockIdx.x * $blockSize + threadIdx.x) % 32u",
-  //         "(blockIdx.x * $blockSize + threadIdx.x) / 32u"));
-
-  // for (auto& type : supportedTypes) {
-  //   for (auto& red : supportedReductions) {
-  //     source +=
-  //         emitReduceFunctionSeq(type, supportedTypeSizes[&type - supportedTypes.data()], 2, red, gridSize,
-  //         blockSize);
-  //   }
-  // }
   if (flags & CompileReduceScatter) {
     auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
     CHECK(i != supportedTypes.end());
-    // source += emitReduceFunctionSeq(compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction,
-    // gridSize, blockSize);
     source += emitReduceFunctionSeq(
         compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize * blockSize / 32, 32,
         "threadIdx.x % 32u", "dynamicBlockIndex");
@@ -762,7 +725,6 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     fn(cuAllGatherLocal, "allgather_local");
     fn(cuAllGather, "allgather");
     fn(cuAllGatherNoLocal, "allgather_no_local");
-    // fn(cuAllGatherCopyKernel, "allgather_copy_kernel");
   }
   if (flags & CompileReduceScatter) {
     source += group->reduceScatter->generate({compileType}, {compileReduction});
@@ -932,15 +894,6 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
       devrtPath = fn;
     }
   }
-
-  // dl_iterate_phdr(
-  //     [](struct dl_phdr_info* info, size_t size, void* data) {
-  //       Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
-  //       return 0;
-  //     },
-  //     Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
-  //       fmt::printf("%s\n", info->dlpi_name);
-  //     }).release());
 
   if (!exists(devrtPath)) {
     std::vector<std::string> modules;
