@@ -288,12 +288,9 @@ ReduceScatter::generate(std::vector<std::string> generateTypes, std::vector<std:
       reduceFlush();
       reduceCode += "}\n";
       reduceCode += R"(
-        //__threadfence_system();
-        //syncthreads();
         __syncwarp();
         if (threadIdx.x % 32 == 0) {
           if (atomicInc(&sendReadyCounter[n][$chunkIndex][concurrencyIndex], $gridSize * $blockSize / 32 - 1) == $gridSize * $blockSize / 32 - 1) {
-            //printf("$rank: set cpuin send ready n %d chunk %d\n", n, $chunkIndex);
             $cpuIn[16 + $size * $chunkIndex + n] = stepValue;
           }
         }

@@ -59,7 +59,7 @@ def main():
 
     setuptools.setup(
         name="moodist",
-        version="0.0.1",
+        version="0.1.1",
         description=("moodist"),
         long_description="",
         long_description_content_type="text/markdown",
@@ -70,7 +70,6 @@ def main():
             "Programming Language :: Python :: 3",
             "License :: OSI Approved :: MIT License",
             "Operating System :: POSIX :: Linux",
-            "Operating System :: MacOS :: MacOS X",
             "Environment :: GPU :: NVIDIA CUDA",
         ],
         packages=["moodist"],

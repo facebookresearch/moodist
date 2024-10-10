@@ -4,6 +4,7 @@ from ._C import MoodistProcessGroup
 
 from datetime import timedelta
 
+__version__ = "0.1.1"
 
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta

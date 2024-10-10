@@ -166,11 +166,6 @@ struct ProcessGroupImpl {
         break;
       }
     }
-    // TODO: use cuEventQuery here to see if we should reuse an existing stream or create a new one
-    // if (!ws->free.empty() && ws->all.size() >= 2) {
-    //   w = &ws->free.front();
-    //   ws->free.pop_front();
-    // } else {
     if (!w) {
       auto ptr = std::make_unique<WorkStream>();
       w = &*ptr;
@@ -1258,6 +1253,12 @@ c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts)
 
 c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
   TORCH_CHECK(tensors.size() == 1);
+  if (tensors[0].is_cuda()) {
+    auto t = tensors[0].cpu();
+    impl->broadcast(t, opts.rootRank);
+    tensors[0].copy_(t);
+    return c10::make_intrusive<WorkImpl>(tensors);
+  }
   impl->broadcast(tensors[0], opts.rootRank);
   return c10::make_intrusive<WorkImpl>(tensors);
 }

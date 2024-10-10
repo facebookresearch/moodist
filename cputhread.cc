@@ -284,6 +284,7 @@ OPTYPE(GatherCpu);
 
 OPTYPE(AllGatherRingCuda);
 OPTYPE(ReduceScatterRingCuda);
+OPTYPE(BroadcastCuda);
 
 inline void badOp(
     const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
@@ -2500,7 +2501,6 @@ struct CpuThreadImpl {
   //   size_t i;
   //   MemoryRegistration* tensorMr;
   //   size_t liveSends;
-  //   size_t nDynReady = 0;
 
   //   WorkBroadcast(CpuThreadImpl& self, QueueEntryBroadcast& params) : Work(self, params), params(params) {}
 
@@ -2517,30 +2517,15 @@ struct CpuThreadImpl {
   //           if (i == rank) {
   //             continue;
   //           }
+  //           outDyns[i].opType = opTypeReduceScatterCpu;
+  //           outDyns[i].stepValue = stepValue;
+  //           outDyns[i].gatherBytes = params.bytes;
   //           outDyns[i].gatherAddress = params.tensorAddress;
   //           for (size_t di = 0; di != self.devices.size(); ++di) {
   //             outDyns[i].gatherKey[di] = tensorMr->mrs[di]->rkey;
   //           }
-  //         }
 
-  //         // We can send the dyn up here, before kernel entry, but we must not signal to remote peers
-  //         // until kernel entry, such that we don't receive data until we're ready.
-  //         nDynReady = 0;
-  //         {
-  //           size_t n = 0;
-  //           for (size_t i = 0; i != size; ++i) {
-  //             if (i == rank) {
-  //               continue;
-  //             }
-  //             size_t di = (rank + n) % self.devices.size();
-  //             auto& dev = self.devices[di];
-  //             self.writeData(
-  //                 dev, i, &outDyns[i], self.outDynsMr->mrs[di]->lkey,
-  //                 (void*)(self.remoteComms[i].address + sizeof(DynamicAddresses) * size * concurrencyIndex +
-  //                 sizeof(DynamicAddresses) * rank), self.remoteComms[i].keys[di], sizeof(DynamicAddresses),
-  //                 self.makeCallback([this]() { ++nDynReady; }));
-  //             ++n;
-  //           }
+  //           self.writeDyn(concurrencyIndex, i, i, rank);
   //         }
   //       }
 
@@ -2549,11 +2534,8 @@ struct CpuThreadImpl {
   //         YIELD
   //       }
 
-  //       while (nDynReady < size - 1) {
-  //         YIELD
-  //       }
-
   //       i = params.sourceRank;
+  //       WAIT_DYN(opTypeBroadcastRingCpu, sendTo);
   //       {
   //         size_t di = (rank + i) % self.devices.size();
   //         self.writeStep(di, i, stepValue, concurrencyIndex);
@@ -3107,7 +3089,7 @@ struct CpuThreadImpl {
               cpuThread->freelistTerminate.push(&queueEntry);
             } else if (queueEntry.task == taskBroadcast) {
               // enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
-              fatal("cuda ops temporarily disabled");
+              fatal("fixme broadcast");
             } else if (queueEntry.task == taskAllGatherCpu) {
               enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskReduceScatterCpu) {

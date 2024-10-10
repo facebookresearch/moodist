@@ -167,7 +167,7 @@ void Group::init() {
 
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
-  CHECK(numa_run_on_node(allocationNode) == 0);
+  // CHECK(numa_run_on_node(allocationNode) == 0);
 
   std::vector<LocalDevice> localDevices;
 
