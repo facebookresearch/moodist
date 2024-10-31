@@ -52,7 +52,7 @@ set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
 set(RDMA_STATIC_PROVIDERS "all" CACHE STRING "")
 add_subdirectory(rdma-core EXCLUDE_FROM_ALL)
 
-find_package(Python REQUIRED)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
 pybind11_add_module(_C
   processgroup.cc
