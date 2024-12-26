@@ -107,48 +107,6 @@ struct CallbackWrapper {
   }
 };
 
-template<typename T, size_t poolSize = 0x1000>
-struct PoolAllocator {
-  std::deque<SimpleVector<std::aligned_storage_t<sizeof(T), alignof(T)>>> all;
-  size_t i0 = 0;
-  size_t i1 = 0;
-  PoolAllocator() {
-    all.emplace_back();
-    all.back().resize(poolSize);
-  }
-  ~PoolAllocator() {
-    reset();
-  }
-  template<typename... Args>
-  T* allocate(Args&&... args) {
-    CHECK(i0 < all.size());
-    CHECK(i1 < poolSize);
-    T* r = (T*)&all[i0][i1];
-    ++i1;
-    if (i1 == poolSize) {
-      i1 = 0;
-      ++i0;
-      if (i0 == all.size()) {
-        all.emplace_back();
-        all.back().resize(poolSize);
-      }
-    }
-    return new (r) T(std::forward<Args>(args)...);
-  }
-  void reset() {
-    for (size_t i = 0; i != i0; ++i) {
-      for (auto& v : all[i]) {
-        ((T*)&v)->~T();
-      }
-    }
-    for (size_t i = 0; i != i1; ++i) {
-      ((T*)&all[i0][i])->~T();
-    }
-    i0 = 0;
-    i1 = 0;
-  }
-};
-
 } // namespace
 
 template<Dtype dtype>
@@ -259,47 +217,6 @@ struct TemporaryBufferHandle {
   }
 };
 
-HashMap<uint32_t, const char*> opTypeToName;
-#define OPTYPE(name)                                                                                                   \
-  constexpr uint32_t opType##name = __LINE__;                                                                          \
-  struct ctor##name {                                                                                                  \
-    ctor##name() {                                                                                                     \
-      opTypeToName[opType##name] = #name;                                                                              \
-    }                                                                                                                  \
-  } instance##name;
-
-std::string getOpTypeName(uint32_t value) {
-  auto i = opTypeToName.find(value);
-  if (i != opTypeToName.end()) {
-    return i->second;
-  }
-  return "unknown value " + std::to_string(value);
-}
-OPTYPE(Barrier);
-OPTYPE(InternalBarrier);
-OPTYPE(AllGatherCpu);
-OPTYPE(ReduceScatterCpu);
-OPTYPE(BroadcastRingCpu);
-OPTYPE(GatherCpu);
-
-OPTYPE(AllGatherRingCuda);
-OPTYPE(ReduceScatterRingCuda);
-OPTYPE(BroadcastCuda);
-
-inline void badOp(
-    const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
-    size_t bytes) {
-  fatal(
-      "Mismatched collectives detected at %s:%d.\nLocal parameters: op %s, step %#x, bytes %#x\nRemote parameters: op "
-      "%s, step "
-      "%#x, bytes %#x\n",
-      filename, line, getOpTypeName(opType), stepValue, bytes, getOpTypeName(dyn.opType), dyn.stepValue,
-      dyn.gatherBytes);
-}
-#define CHECK_DYN(dyn, optype, stepvalue, bytes)                                                                       \
-  if (dyn.opType != (optype) | dyn.stepValue != (stepvalue) | dyn.gatherBytes != (bytes)) [[unlikely]]                 \
-    badOp(__FILE__, __LINE__, dyn, optype, stepvalue, bytes);
-
 #define WAIT_DYN(optype, i)                                                                                            \
   while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {                                                     \
     YIELD                                                                                                              \
@@ -352,10 +269,13 @@ struct CpuThreadImpl {
   size_t bytesWritten = 0;
   size_t bytesRead = 0;
 
-  HashMap<uintptr_t, std::unique_ptr<CpuMapping>> mrMap;
-  HashMap<uintptr_t, std::unique_ptr<CudaMapping>> mrMapCuda;
-
   std::vector<IbvMr> localMrs;
+
+  std::vector<std::unique_ptr<CudaMapping>> cudaMappings;
+  std::vector<std::unique_ptr<CpuMapping>> cpuMappings;
+
+  HashMap<uintptr_t, CpuMapping*> mrMap;
+  HashMap<uintptr_t, CudaMapping*> mrMapCuda;
 
   MemoryRegistration* commsMr = regMr((uintptr_t)group->mySharedMem, group->mySharedMemSize);
 
@@ -707,8 +627,8 @@ struct CpuThreadImpl {
       ibv_qp_ex* qp = dev.ib->qpex;
 
       // log.info(
-      //     "%d: rdma read %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes, localAddress,
-      //     remoteAddress, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+      //     "%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
+      //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
 
       bool efa = qp != nullptr;
       if (!efa) {
@@ -832,7 +752,8 @@ struct CpuThreadImpl {
       log.debug("new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x)\n", bytes, address, mr->lkey, mr->rkey);
     }
     MemoryRegistration* r = &ptr->mr;
-    mrMap[address] = std::move(ptr);
+    mrMap[address] = &*ptr;
+    cpuMappings.push_back(std::move(ptr));
     return r;
   }
 
@@ -900,8 +821,11 @@ struct CpuThreadImpl {
           "new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
           mr->lkey, mr->rkey);
     }
+    // ptr can be destructed here, but r is a plain pointer
+    // fixme: return some kind of handle instead?
     MemoryRegistration* r = &ptr->mr;
-    mrMapCuda[address] = std::move(ptr);
+    mrMapCuda[address] = &*ptr;
+    cudaMappings.push_back(std::move(ptr));
     return r;
   }
 
@@ -1041,7 +965,7 @@ struct CpuThreadImpl {
 
   template<typename... Args>
   void trace(const char* fmt, Args&&... args) {
-    // return;
+    return;
     //  fmt::printf("trace enter '%s'\n", name);
     //   if (opCount < 1000 || opCount >= 1200) {
     if (!profilingEnabled) {
@@ -1204,6 +1128,11 @@ struct CpuThreadImpl {
 
   void writeStepValueDeviceChunk(
       size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex, size_t device, size_t chunk) {
+    CHECK(i < size);
+    CHECK(srcIndex < size);
+    CHECK(dstIndex < size);
+    CHECK(device < devices.size());
+    CHECK(chunk < maxChunks);
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inStepValueDeviceChunk(concurrencyIndex, dstIndex, device, chunk));
@@ -1226,6 +1155,8 @@ struct CpuThreadImpl {
   }
 
   void writeCpuOut(size_t concurrencyIndex, size_t dstIndex, size_t srcIndex) {
+    CHECK(srcIndex < maxChunks * size);
+    CHECK(dstIndex < maxChunks * size);
     size_t di = 0;
     auto& dev = devices[di];
     auto offset = sizeof(uint32_t) * dstIndex;
@@ -2496,6 +2427,328 @@ struct CpuThreadImpl {
     }
   };
 
+  template<typename Parent, typename Params, bool hasReduceStep, uint32_t opType>
+  struct WorkBroadcastReduceBase : Work {
+    Params& params;
+
+    MemoryRegistration* recvMr;
+    size_t source;
+    size_t i;
+
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    const size_t numParallel = params.numParallel;
+
+    size_t readIndex = 0;
+    size_t chunkIndex = 0;
+    size_t liveReads = 0;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+    size_t reduceIndex = 0;
+    size_t reduceChunkIndex = 0;
+    bool hasSentAckReads = false;
+
+    const size_t* sends = nullptr;
+    size_t nSends = 0;
+    const size_t* recvs = nullptr;
+    size_t nRecvs = 0;
+
+    uintptr_t recvAddress;
+
+    WorkBroadcastReduceBase(CpuThreadImpl& self, Params& params) : Work(self, params), params(params) {
+      CHECK(numDevices <= self.devices.size());
+      CHECK(numChunks != 0 && numChunks <= maxChunks);
+      CHECK(numParallel != 0);
+      CHECK(chunkSize > 0);
+
+      recvAddress = params.tensorAddress;
+    }
+
+    void tryRead(size_t di) {
+      size_t index = readIndex;
+      size_t chunkIndex = this->chunkIndex;
+      size_t source = this->source;
+
+      size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+      size_t sendTo = index >= nSends ? rank : sends[index];
+      size_t recvFrom = index >= nRecvs ? rank : recvs[index];
+
+      CHECK(recvFrom != rank);
+
+      size_t n = currentChunkSize;
+      bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+      size_t readOffset = chunkSize * chunkIndex;
+      if (n == 0) {
+        if (sendTo != rank) {
+          self.writeStepValueDeviceChunk(concurrencyIndex, sendTo, 0, rank, 0, chunkIndex);
+        }
+      } else {
+        if (recvFrom != source) {
+          if (self.inStepValueDeviceChunk(concurrencyIndex, recvFrom, 0, chunkIndex) != stepValue) {
+            return;
+          }
+        }
+        uintptr_t dstAddr = recvAddress + params.bytes * index;
+        auto* srcMr = recvMr;
+
+        ++liveReads;
+        ++deviceLiveReads[di];
+        const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, recvFrom);
+        uintptr_t srcAddr = dyn.gatherAddress;
+        auto key = dyn.gatherKey;
+        auto& dev = self.devices[di];
+        // log.info(
+        //     "%s step %#x tensor %#x recv %#x recvMr %#x (%p, %p) doing read! dstAddr %#x, readOffset %#x, "
+        //     "srcMr->mrs[%d]->lkey "
+        //     "is %#x\n",
+        //     hasReduceStep ? "reduce" : "broadcast", stepValue, params.tensorAddress, recvAddress,
+        //     recvMr ? recvMr->mrs[0]->lkey : 0, (void*)recvMr, (void*)recvMr->mrs[0], dstAddr, readOffset, di,
+        //     srcMr->mrs[di]->lkey);
+        self.readData(
+            dev, recvFrom, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
+            n, self.makeCallback([this, di, source, chunkIndex, sendTo, index]() {
+              --liveReads;
+              --deviceLiveReads[di];
+              if (!hasReduceStep && sendTo != rank) {
+                self.writeStepValueDeviceChunk(concurrencyIndex, sendTo, 0, rank, 0, chunkIndex);
+              }
+              self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + (hasReduceStep ? index : source), 0);
+            }));
+      }
+
+      if (isLastChunk) {
+        this->chunkIndex = 0;
+        ++readIndex;
+      } else {
+        ++this->chunkIndex;
+        CHECK(this->chunkIndex < numChunks);
+      }
+    }
+
+    void step() {
+      ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        MemoryRegistration* tensorMr = self.regMrCuda(params.tensorAddress, params.bytes);
+        recvMr = tensorMr;
+        if (nRecvs == 0) {
+          recvMr = nullptr;
+        } else if (recvAddress == params.tensorAddress) {
+          CHECK(!hasReduceStep);
+          CHECK(nRecvs <= 1);
+        } else {
+          CHECK(hasReduceStep);
+          recvMr = self.regMrCuda(recvAddress, params.bytes * nRecvs);
+        }
+
+        // log.info(
+        //     "%s step %#x tensor %#x recv %#x tensorMr %#x (%p, %p) recvMr %#x (%p, %p)\n",
+        //     hasReduceStep ? "reduce" : "broadcast", stepValue, params.tensorAddress, recvAddress,
+        //     tensorMr->mrs[0]->lkey, (void*)tensorMr, tensorMr ? (void*)tensorMr->mrs[0] : 0,
+        //     recvMr ? recvMr->mrs[0]->lkey : 0, (void*)recvMr, recvMr ? (void*)recvMr->mrs[0] : 0);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        outDyns[0].gatherAddress = params.tensorAddress;
+        outDyns[0].gatherBytes = params.bytes;
+        outDyns[0].stepValue = stepValue;
+        outDyns[0].opType = opType;
+        for (size_t di = 0; di != numDevices; ++di) {
+          outDyns[0].gatherKey[di] = tensorMr->mrs[di]->rkey;
+        }
+      }
+
+      if (!hasReduceStep) {
+        CHECK(nRecvs <= 1);
+      } else {
+        CHECK(nSends <= 1);
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      // log.info("%s nSends %d nRecvs %d\n", hasReduceStep ? "reduce" : "broadcast", nSends, nRecvs);
+
+      for (size_t i = 0; i != nSends; ++i) {
+        // log.info("send %d is %d\n", i, sends[i]);
+        self.writeDyn(concurrencyIndex, sends[i], 0, rank);
+      }
+
+      for (i = 0; i != nRecvs; ++i) {
+        // log.info("recv %d is %d\n", i, recvs[i]);
+        WAIT_DYN(opType, recvs[i]);
+      }
+
+      if (nRecvs != 0) {
+        tryRead(0);
+      }
+
+      self.trace("read loop");
+
+      while (true) {
+        {
+          bool done = false;
+          do {
+            if (hasReduceStep && reduceIndex != nSends) {
+              if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
+                self.writeStepValueDeviceChunk(concurrencyIndex, sends[reduceIndex], 0, rank, 0, reduceChunkIndex);
+                size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * reduceChunkIndex);
+                if (chunkSize * reduceChunkIndex + currentChunkSize == params.bytes) {
+                  ++reduceIndex;
+                  reduceChunkIndex = 0;
+                } else {
+                  ++reduceChunkIndex;
+                }
+              }
+            }
+            if (readIndex == nRecvs) {
+              if (liveReads) {
+                continue;
+              }
+              if (!hasSentAckReads) {
+                hasSentAckReads = true;
+                for (size_t i = 0; i != nRecvs; ++i) {
+                  size_t recvFrom = recvs[i];
+                  self.writeStepValueDeviceChunk(concurrencyIndex, recvFrom, 0, recvFrom, 0, chunkIndex);
+                }
+              }
+              if (hasReduceStep && reduceIndex != nSends) {
+                continue;
+              }
+              done = true;
+              continue;
+            }
+
+            size_t bestDevice = 0;
+            size_t bestLiveReads = numParallel;
+            for (size_t di = 0; di != numDevices; ++di) {
+              if (deviceLiveReads[di] < bestLiveReads) {
+                bestLiveReads = deviceLiveReads[di];
+                bestDevice = di;
+              }
+            }
+            if (bestLiveReads >= numParallel) {
+              continue;
+            }
+            tryRead(bestDevice);
+          } while (false);
+          if (done) {
+            break;
+          }
+        }
+        YIELD
+      }
+
+      CHECK(liveReads == 0);
+      CHECK(readIndex == nRecvs);
+      if (hasReduceStep) {
+        CHECK(reduceIndex == nSends);
+      }
+
+      CHECK(nSends <= 1)
+      for (i = 0; i != nSends; ++i) {
+        self.trace("wait for remote reads");
+        while (self.inStepValueDeviceChunk(concurrencyIndex, rank, 0, 0) != stepValue) {
+          YIELD
+        }
+      }
+
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      // cpuOut[0] = stepValue;
+      self.writeCpuOut(concurrencyIndex, 0, 0);
+
+      self.trace("kernel-exit");
+
+      // ?? why did we wait for the kernel here ??
+      //    this would prevent a new op from running that could write some data to the kernel
+      //    but we don't depend on any such data, do we?
+      //    just the cpuOut step values
+      //    the next op cannot do anything until it gets its step value from the kernel, anyways
+      //   could it be legacy leftover from when we sent dyns early?
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
+
+      static_assert(std::is_base_of_v<WorkBroadcastReduceBase, Parent>);
+
+      ((Parent*)this)->deallocate();
+      DONE
+    }
+  };
+
+  struct WorkBroadcastRing
+      : WorkBroadcastReduceBase<WorkBroadcastRing, QueueEntryBroadcast, false, opTypeBroadcastRingCuda> {
+    std::array<size_t, 1> sendsArr;
+    std::array<size_t, 1> recvsArr;
+    WorkBroadcastRing(CpuThreadImpl& self, QueueEntryBroadcast& params) : WorkBroadcastReduceBase(self, params) {
+      size_t sourceRank = params.sourceRank;
+      source = sourceRank;
+      size_t sourceLocalRank = self.group->rankLocalRank.at(sourceRank);
+      size_t nNodes = self.group->nodeRanks.size();
+      CHECK(nNodes > 1);
+      size_t nodeIndex = self.group->rankToNodeIndex.at(rank);
+      auto& node = self.group->nodeRanks.at(nodeIndex);
+      CHECK(!node.empty());
+      CHECK(node[sourceLocalRank % node.size()] == rank);
+      auto& nextNode = self.group->nodeRanks.at((nodeIndex + 1) % nNodes);
+      auto& prevNode = self.group->nodeRanks.at((nodeIndex + nNodes - 1) % nNodes);
+      sendsArr[0] = nextNode.at(sourceLocalRank % nextNode.size());
+      recvsArr[0] = prevNode.at(sourceLocalRank % prevNode.size());
+      sends = sendsArr.data();
+      recvs = recvsArr.data();
+      nSends = sends[0] == sourceRank ? 0 : 1;
+      nRecvs = rank == sourceRank ? 0 : 1;
+    }
+    void deallocate() {
+      self.cpuThread->freelistBroadcast.push(&params);
+      self.allocatorBroadcast.deallocate(this);
+    }
+  };
+
+  struct WorkReduceTree : WorkBroadcastReduceBase<WorkReduceTree, QueueEntryReduce, true, opTypeReduceTreeCuda> {
+    static constexpr size_t nary = 4;
+    std::array<size_t, 1> sendsArr;
+    std::array<size_t, nary> recvsArr;
+    WorkReduceTree(CpuThreadImpl& self, QueueEntryReduce& params) : WorkBroadcastReduceBase(self, params) {
+      source = params.destinationRank;
+      auto* tree = self.group->getTree(nary, params.destinationRank);
+
+      CHECK(tree->sends.size() <= 1);
+      CHECK(tree->recvs.size() <= nary);
+
+      std::copy(tree->sends.begin(), tree->sends.end(), sendsArr.data());
+      std::copy(tree->recvs.begin(), tree->recvs.end(), recvsArr.data());
+
+      nSends = tree->sends.size();
+      nRecvs = tree->recvs.size();
+
+      sends = sendsArr.data();
+      recvs = recvsArr.data();
+
+      recvAddress = params.recvBuffer;
+    }
+    void deallocate() {
+      self.cpuThread->freelistReduce.push(&params);
+      self.allocatorReduce.deallocate(this);
+    }
+  };
+
   // struct WorkBroadcast : Work {
   //   QueueEntryBroadcast& params;
   //   size_t i;
@@ -3010,11 +3263,12 @@ struct CpuThreadImpl {
   WorkAllocator<WorkInternalBarrier> allocatorInternalBarrier;
   WorkAllocator<WorkAllGatherRingRead4> allocatorAllGatherRingRead4;
   WorkAllocator<WorkReduceScatterRingRead> allocatorReduceScatterRingRead;
-  //  WorkAllocator<WorkBroadcast> allocatorBroadcast;
+  WorkAllocator<WorkBroadcastRing> allocatorBroadcast;
   WorkAllocator<WorkAllGatherCpu> allocatorAllGatherCpu;
   WorkAllocator<WorkReduceScatterCpu> allocatorReduceScatterCpu;
   WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
   WorkAllocator<WorkBroadcastRingCpu> allocatorBroadcastRingCpu;
+  WorkAllocator<WorkReduceTree> allocatorReduce;
 
   size_t numActiveWorks = 0;
 
@@ -3088,8 +3342,7 @@ struct CpuThreadImpl {
               terminate = true;
               cpuThread->freelistTerminate.push(&queueEntry);
             } else if (queueEntry.task == taskBroadcast) {
-              // enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
-              fatal("fixme broadcast");
+              enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
             } else if (queueEntry.task == taskAllGatherCpu) {
               enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
             } else if (queueEntry.task == taskReduceScatterCpu) {
@@ -3100,6 +3353,8 @@ struct CpuThreadImpl {
               enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
             } else if (queueEntry.task == taskInternalBarrier) {
               enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
+            } else if (queueEntry.task == taskReduce) {
+              enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
             } else {
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }

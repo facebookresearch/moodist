@@ -4,6 +4,8 @@
 #include "hash_map.h"
 #include "simple_vector.h"
 #include "vector.h"
+#include <ATen/core/ATen_fwd.h>
+#include <torch/types.h>
 
 namespace moodist {
 
@@ -46,6 +48,13 @@ struct alignas(128) DynamicAddresses {
 };
 static_assert(sizeof(DynamicAddresses) <= 128);
 
+struct alignas(64) CpuDynamicAddresses {
+  uint32_t stepValue;
+  uint32_t opType;
+  uintptr_t gatherAddress;
+  size_t gatherBytes;
+};
+
 struct AddressPair {
   uintptr_t inputAddress;
   size_t inputBytes;
@@ -68,6 +77,11 @@ struct SyncData {
   std::atomic_uint32_t syncStepValue = 0;
   std::atomic_uint32_t myStepValue = 0;
   std::atomic_uint32_t syncStepValue2 = 0;
+};
+
+struct TreeSendsRecvs {
+  Vector<size_t> sends;
+  Vector<size_t> recvs;
 };
 
 struct Group {
@@ -125,6 +139,8 @@ struct Group {
   std::array<size_t, 8> peerMyRemoteIndex;
 
   Vector<Vector<size_t>> nodeRanks;
+  Vector<size_t> rankToNodeIndex;
+  Vector<size_t> rankLocalRank;
 
   int allocationNode = -1;
 
@@ -132,6 +148,7 @@ struct Group {
   size_t mySharedMemSize = 0;
   std::array<void*, 8> peerSharedMem;
   DynamicAddresses* localDyns = nullptr;
+  CpuDynamicAddresses* cpuLocalDyns = nullptr;
   Progress* localProgress = nullptr;
   CpuAddresses* cpuAddresses = nullptr;
   SyncData* syncData = nullptr;
@@ -141,6 +158,8 @@ struct Group {
 
   uint32_t* cpuStepValues = nullptr;
   uint32_t* cpuStepValuesDeviceChunks = nullptr;
+
+  std::atomic_uint32_t* atomicStepValue = nullptr;
 
   AllocatedArray cudaStepValuesBuffer;
   AllocatedArray cudaStepValuesDeviceChunksBuffer;
@@ -189,7 +208,6 @@ struct Group {
   AllocatedArray allocateArrayManaged(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayWriteCombined(size_t itembytes, size_t numel);
   AllocatedArray allocateArrayDeviceMapped(size_t itembytes, size_t numel);
-  
 
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {
@@ -198,6 +216,75 @@ struct Group {
       createStreamData(ptr);
     }
     return *ptr;
+  }
+
+  std::atomic_size_t bytesManaged = 0;
+  std::atomic_size_t bytesDevice = 0;
+  std::atomic_size_t bytesHost = 0;
+
+  void reportBytes() {
+    size_t m = bytesManaged;
+    size_t d = bytesDevice;
+    size_t h = bytesHost;
+    double div = 1024 * 1042 * 1024;
+    log.info(
+        "Bytes managed: %d (%gG)\nBytes device: %d (%gG)\nBytes host: %d (%gG)\n", m, m / div, d, d / div, h, h / div);
+  }
+
+  TreeSendsRecvs generateTree(size_t nary, size_t rootRank);
+  HashMap<size_t, std::unique_ptr<TreeSendsRecvs>> cachedTrees;
+  TreeSendsRecvs* getTree(size_t nary, size_t rootRank) {
+    size_t index = size * nary + rootRank;
+    auto it = cachedTrees.find(index);
+    if (it != cachedTrees.end()) {
+      return &*it->second;
+    }
+    auto p = std::make_unique<TreeSendsRecvs>(generateTree(nary, rootRank));
+    auto* r = &*p;
+    cachedTrees[index] = std::move(p);
+    return r;
+  }
+};
+
+template<typename T, size_t poolSize = 0x1000>
+struct PoolAllocator {
+  std::deque<SimpleVector<std::aligned_storage_t<sizeof(T), alignof(T)>>> all;
+  size_t i0 = 0;
+  size_t i1 = 0;
+  PoolAllocator() {
+    all.emplace_back();
+    all.back().resize(poolSize);
+  }
+  ~PoolAllocator() {
+    reset();
+  }
+  template<typename... Args>
+  T* allocate(Args&&... args) {
+    CHECK(i0 < all.size());
+    CHECK(i1 < poolSize);
+    T* r = (T*)&all[i0][i1];
+    ++i1;
+    if (i1 == poolSize) {
+      i1 = 0;
+      ++i0;
+      if (i0 == all.size()) {
+        all.emplace_back();
+        all.back().resize(poolSize);
+      }
+    }
+    return new (r) T(std::forward<Args>(args)...);
+  }
+  void reset() {
+    for (size_t i = 0; i != i0; ++i) {
+      for (auto& v : all[i]) {
+        ((T*)&v)->~T();
+      }
+    }
+    for (size_t i = 0; i != i1; ++i) {
+      ((T*)&all[i0][i])->~T();
+    }
+    i0 = 0;
+    i1 = 0;
   }
 };
 

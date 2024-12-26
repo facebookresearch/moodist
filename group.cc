@@ -498,7 +498,11 @@ void Group::init() {
       nodeMap[id] = nodeRanks.size();
       nodeRanks.emplace_back();
     }
-    nodeRanks.at(nodeMap[id]).push_back(i);
+    size_t index = nodeMap[id];
+    size_t localRank = nodeRanks.at(index).size();
+    nodeRanks.at(index).push_back(i);
+    rankToNodeIndex.push_back(index);
+    rankLocalRank.push_back(localRank);
   }
 
   AllocatedBuffer testMemory = allocateDevice(0x1000);
@@ -661,6 +665,7 @@ void Group::init() {
     offset += sizeof(T) * n;
   };
   get(localDyns, size * Group::maxConcurrency);
+  get(cpuLocalDyns, size * Group::maxConcurrency);
   get(localProgress, size * Group::maxConcurrency);
   get(cpuAddresses, Group::maxConcurrency);
   get(syncData, 1);
@@ -668,6 +673,7 @@ void Group::init() {
   get(localProgress2, size * Group::maxConcurrency);
   get(cpuStepValues, size * Group::maxConcurrency);
   get(cpuStepValuesDeviceChunks, Group::maxChunks * Group::maxDevices * size * Group::maxConcurrency);
+  get(atomicStepValue, size * Group::maxConcurrency);
 
   mySharedMemSize = offset;
 
@@ -774,6 +780,9 @@ AllocatedBuffer Group::allocateManaged(size_t bytes) {
   r.cudaPointer = ptr;
   r.cpuPointer = (void*)ptr;
   log.verbose("allocated managed memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+
+  bytesManaged += bytes;
+  reportBytes();
   return r;
 }
 AllocatedBuffer Group::allocateDevice(size_t bytes) {
@@ -789,6 +798,9 @@ AllocatedBuffer Group::allocateDevice(size_t bytes) {
   r.cudaPointer = ptr;
   r.cpuPointer = nullptr;
   log.verbose("allocated device memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
+
+  bytesDevice += bytes;
+  reportBytes();
   return r;
 }
 
@@ -822,6 +834,8 @@ AllocatedBuffer Group::allocateHostMapped(size_t bytes) {
   log.verbose(
       "allocated device mapped host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer,
       r.bytes, allocationNode);
+  bytesHost += bytes;
+  reportBytes();
   return r;
 }
 AllocatedBuffer Group::allocateHost(size_t bytes) {
@@ -838,6 +852,8 @@ AllocatedBuffer Group::allocateHost(size_t bytes) {
   log.verbose(
       "allocated host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer, r.bytes,
       allocationNode);
+  bytesHost += bytes;
+  reportBytes();
   return r;
 }
 AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
@@ -975,6 +991,38 @@ AllocatedArray Group::allocateArrayDeviceMapped(size_t itembytes, size_t numel) 
   r.buffer = allocateDeviceMapped(itembytes * numel);
   r.itembytes = itembytes;
   r.numel = numel;
+  return r;
+}
+
+TreeSendsRecvs Group::generateTree(size_t nary, size_t rootRank) {
+  log.info("Generating new tree, %d-ary, root %d\n", nary, rootRank);
+  size_t rootLocalRank = rankLocalRank.at(rootRank);
+  size_t nNodes = nodeRanks.size();
+  CHECK(nNodes > 1);
+  size_t rootNode = rankToNodeIndex.at(rootRank);
+  size_t nodeIndex = rankToNodeIndex.at(rank);
+  size_t rotatedNodeIndex = (nodeIndex + nNodes - rootNode) % nNodes;
+  auto& node = nodeRanks.at(nodeIndex);
+  CHECK(node.at(rootLocalRank % node.size()) == rank);
+
+  size_t parent = (rotatedNodeIndex - 1) / nary;
+  size_t childBegin = rotatedNodeIndex * nary + 1;
+
+  TreeSendsRecvs r;
+
+  if (rotatedNodeIndex != 0) {
+    CHECK(parent < nNodes);
+    auto& parentNode = nodeRanks.at((parent + rootNode) % nNodes);
+    r.sends.push_back(parentNode.at(rootLocalRank % parentNode.size()));
+  }
+  for (size_t i = childBegin; i != childBegin + nary; ++i) {
+    if (i >= nNodes) {
+      break;
+    }
+    auto& childNode = nodeRanks.at((i + rootNode) % nNodes);
+    r.recvs.push_back(childNode.at(rootLocalRank % childNode.size()));
+  }
+
   return r;
 }
 

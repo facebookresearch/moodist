@@ -9,9 +9,8 @@
 
 #include "synchronization.h"
 
-#include <unordered_set>
-#include <vector>
 #include <utility>
+#include <vector>
 
 namespace moodist {
 
@@ -30,8 +29,8 @@ struct FreeListGlobalStorage {
   SpinMutex mutex;
   std::vector<std::pair<T*, size_t>> lists;
   static FreeListGlobalStorage& get() {
-    static FreeListGlobalStorage storage;
-    return storage;
+    static FreeListGlobalStorage* storage = new FreeListGlobalStorage();
+    return *storage;
   }
 };
 template<typename T>

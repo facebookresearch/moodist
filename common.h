@@ -22,7 +22,7 @@
 
 namespace moodist {
 
-extern async::Scheduler scheduler;
+extern async::Scheduler& scheduler;
 
 inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
   throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));
@@ -174,10 +174,15 @@ struct AllocatedCpuBuffer {
 struct PeerArrayRef {
   uintptr_t base = 0;
   uintptr_t itembytes = 0;
+
+  uintptr_t get(size_t index) {
+    return (uintptr_t)base + itembytes * index;
+  }
 };
 
 struct IpcMemHash {
-  size_t operator()(const CUipcMemHandle& v) const {
+  template<typename T>
+  size_t operator()(const T& v) const {
     static_assert(sizeof(v) % sizeof(size_t) == 0);
     auto rotl = [&](auto v, int n) {
       static_assert(std::is_unsigned_v<decltype(v)>);
@@ -197,7 +202,8 @@ struct IpcMemHash {
   }
 };
 struct IpcMemEqual {
-  bool operator()(const CUipcMemHandle& a, const CUipcMemHandle& b) const {
+  template<typename T>
+  bool operator()(const T& a, const T& b) const {
     return std::memcmp(&a, &b, sizeof(a)) == 0;
   }
 };

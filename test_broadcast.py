@@ -37,6 +37,7 @@ def f(n):
 
         # sys.path.append("/home/vegardmella/moolib/py")
         # sys.path.append("/private/home/vegardmella/moolib/py")
+        sys.path.insert(0, "/home/vegardmella/moodist/py")
         import moodist
 
         # moodist.enable_profiling(True)
@@ -97,10 +98,10 @@ def f(n):
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(4).cuda() + 1
-    # data = torch.randn(1024 * 1024 * 32).cuda() + 1
+    data = torch.randn(1024 * 1024 * 4).cuda() + 1
     # data = torch.randn(1024 * 1024 * 256).cuda() + 1
     # data = torch.randn(263520).cuda() + 1
-    data = torch.randn(442416).cuda() + 1
+    #data = torch.randn(442416).cuda() + 1
     # data = torch.randn(262144 - 1024).cuda() + 1
     # data = torch.randn(262144 - 64).cuda() + 1
     # data = torch.randn(682678 // 2).cuda() + 1
@@ -153,19 +154,20 @@ def f(n):
     tmp2 = tmp.clone()
     result02 = result0.clone()
 
-    for _ in range(100):
+    for _ in range(1000):
         # print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result = [torch.zeros_like(data) for _ in range(size)]
         result0 -= 1
         if _ % 3 == 0:
             tmp = torch.zeros_like(tmp)
+        torch.randn(1024 * 1024)
         tmp.copy_(data)
         ostream = torch.cuda.current_stream()
         dist.broadcast(tmp, 0)
         result = [tmp.clone()]
         tmp.zero_()
-        #result = result0.chunk(size)
+        # result = result0.chunk(size)
         # dist._all_gather_base(result, tmp)
         if True:
             for i, v in zip(range(size), correct_result):
@@ -177,9 +179,7 @@ def f(n):
                     print("%d: data.data_ptr() is %#x" % (rank, data.data_ptr()))
                     print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                     print("%d: should be %f" % (rank, v.sum()))
-                    indices = ((result[i] - v).abs() >= 1e-3).nonzero(
-                        as_tuple=True
-                    )[0]
+                    indices = ((result[i] - v).abs() >= 1e-3).nonzero(as_tuple=True)[0]
                     print(
                         "%d: indices " % rank,
                         indices,
@@ -201,7 +201,7 @@ def f(n):
                     )
                     print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                     raise RuntimeError("%d: wrong result for index %d" % (rank, i))
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
         # print("rank %d warmup %d done" % (rank, _))
     tmp.copy_(data)
 
@@ -248,8 +248,13 @@ def f(n):
     dist.barrier()
     torch.cuda.synchronize()
     start = time.time()
+    if 1 == 13:
+        loopcount = 8000
+        for i in range(loopcount):
+            dist.broadcast(tmp, 0)
+            torch.cuda.synchronize()
     if 1 == 1:
-        loopcount = 1000
+        loopcount = 8000
         events = []
         for i in range(loopcount):
             if len(events) >= 2:
@@ -269,13 +274,7 @@ def f(n):
             % (
                 t,
                 loopcount / t,
-                data.numel()
-                * data.element_size()
-                / 1024
-                / 1024
-                / 1024
-                * loopcount
-                / t,
+                data.numel() * data.element_size() / 1024 / 1024 / 1024 * loopcount / t,
             )
         )
 

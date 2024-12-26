@@ -22,6 +22,53 @@ constexpr uint8_t taskReduceScatterCpu = 6;
 constexpr uint8_t taskGatherCpu = 7;
 constexpr uint8_t taskBroadcastCpu = 8;
 constexpr uint8_t taskInternalBarrier = 9;
+constexpr uint8_t taskReduce = 10;
+
+inline HashMap<uint32_t, const char*> opTypeToName;
+#define OPTYPE(name)                                                                                                   \
+  constexpr uint32_t opType##name = __LINE__;                                                                          \
+  inline struct ctor##name {                                                                                           \
+    ctor##name() {                                                                                                     \
+      opTypeToName[opType##name] = #name;                                                                              \
+    }                                                                                                                  \
+  } instance##name;
+
+inline std::string getOpTypeName(uint32_t value) {
+  auto i = opTypeToName.find(value);
+  if (i != opTypeToName.end()) {
+    return i->second;
+  }
+  return "unknown value " + std::to_string(value);
+}
+OPTYPE(Barrier);
+OPTYPE(InternalBarrier);
+OPTYPE(AllGatherCpu);
+OPTYPE(ReduceScatterCpu);
+OPTYPE(BroadcastRingCpu);
+OPTYPE(GatherCpu);
+
+OPTYPE(AllGatherRingCuda);
+OPTYPE(ReduceScatterRingCuda);
+OPTYPE(BroadcastCuda);
+OPTYPE(ReduceCuda);
+
+OPTYPE(BroadcastRingCuda);
+OPTYPE(ReduceTreeCuda);
+
+template<typename DynamicAddresses>
+inline void badOp(
+    const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
+    size_t bytes) {
+  fatal(
+      "Mismatched collectives detected at %s:%d.\nLocal parameters: op %s, step %#x, bytes %#x\nRemote parameters: op "
+      "%s, step "
+      "%#x, bytes %#x\n",
+      filename, line, getOpTypeName(opType), stepValue, bytes, getOpTypeName(dyn.opType), dyn.stepValue,
+      dyn.gatherBytes);
+}
+#define CHECK_DYN(dyn, optype, stepvalue, bytes)                                                                       \
+  if (dyn.opType != (optype) | dyn.stepValue != (stepvalue) | dyn.gatherBytes != (bytes)) [[unlikely]]                 \
+    badOp(__FILE__, __LINE__, dyn, optype, stepvalue, bytes);
 
 struct DataRef {
   uintptr_t address = 0;
@@ -66,6 +113,22 @@ struct QueueEntryBroadcast : QueueEntry {
   uintptr_t tensorAddress = 0;
   size_t bytes = 0;
   size_t sourceRank = 0;
+
+  size_t numDevices = 0;
+  size_t numChunks = 0;
+  size_t numParallel = 0;
+};
+
+struct QueueEntryReduce : QueueEntry {
+  uintptr_t tensorAddress = 0;
+  size_t bytes = 0;
+  size_t destinationRank = 0;
+
+  uintptr_t recvBuffer = 0;
+
+  size_t numDevices = 0;
+  size_t numChunks = 0;
+  size_t numParallel = 0;
 };
 
 struct QueueEntryAllGatherCpu : QueueEntry {
@@ -147,6 +210,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryReduceScatterCpu> freelistReduceScatterCpu;
   QueueEntryFreeList<QueueEntryGatherCpu> freelistGatherCpu;
   QueueEntryFreeList<QueueEntryBroadcastCpu> freelistBroadcastCpu;
+  QueueEntryFreeList<QueueEntryReduce> freelistReduce;
 
   CpuThread(Group*);
   ~CpuThread();

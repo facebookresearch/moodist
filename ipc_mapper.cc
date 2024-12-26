@@ -72,6 +72,8 @@ struct Memfd {
   }
 };
 
+enum { requestBad, requestMapAddress, requestMapEvent, requestUnmap };
+
 struct IpcMapperImpl : IpcMapper {
 
   struct alignas(256) SharedStruct {
@@ -81,13 +83,34 @@ struct IpcMapperImpl : IpcMapper {
       std::atomic_size_t sourceRank = -1;
       std::atomic_int stage = 0;
       uint32_t requestStepValue;
-      CUipcMemHandle request;
+
+      int kind = requestBad;
+
+      union {
+        CUipcMemHandle requestMapMemory;
+        CUipcEventHandle requestMapEvent;
+        uintptr_t requestUnmapAddress;
+      };
       size_t requestBytes;
-      uintptr_t requestUnmapAddress;
       CUdeviceptr response;
     };
 
     std::array<Slot, 32> slots;
+
+    struct Queue {
+      std::atomic_size_t front = 0;
+      std::atomic_size_t back = 0;
+      std::array<uint8_t, 256> data;
+    };
+
+    std::array<Queue, 8> queue;
+
+    struct EventQueue {
+      std::atomic_size_t front = 0;
+      std::atomic_size_t back = 0;
+      std::array<uintptr_t, 8> data;
+    };
+    std::array<EventQueue, 8> eventQueue;
   };
 
   IpcMapperImpl(Group* group) {
@@ -172,7 +195,7 @@ struct IpcMapperImpl : IpcMapper {
           if (stage == 2) {
             size_t sourceRank = v.sourceRank;
             CHECK(sourceRank < group->size);
-            if (v.requestUnmapAddress) {
+            if (v.kind == requestUnmap) {
               log.debug(
                   "%d: got ipc unmap request (address %#x size %#x) from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
@@ -208,13 +231,23 @@ struct IpcMapperImpl : IpcMapper {
                 //   log.error("Timed out waiting for unmap\n");
                 // }
               }
-            } else {
-              log.debug("%d: got ipc map request (size %#x) from rank %d!\n", group->rank, v.requestBytes, sourceRank);
-              CHECK_CU(cuIpcOpenMemHandle(&v.response, v.request, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
+            } else if (v.kind == requestMapAddress) {
+              log.debug(
+                  "%d: got ipc map memory request (size %#x) from rank %d!\n", group->rank, v.requestBytes, sourceRank);
+              CHECK_CU(cuIpcOpenMemHandle(&v.response, v.requestMapMemory, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
               log.debug("%d: mapped %#x bytes to %#x\n", group->rank, v.requestBytes, v.response);
 
               ++activeMaps[v.response];
               CHECK(activeMaps[v.response] == 1);
+            } else if (v.kind == requestMapEvent) {
+              log.debug(
+                  "%d: got ipc map event request (size %#x) from rank %d!\n", group->rank, v.requestBytes, sourceRank);
+              CUevent event = nullptr;
+              CHECK_CU(cuIpcOpenEventHandle(&event, v.requestMapEvent));
+              v.response = (uintptr_t)event;
+              log.debug("%d: event mapped to %#x\n", group->rank, v.response);
+            } else {
+              CHECK(false);
             }
             v.stage = 3;
 
@@ -227,12 +260,14 @@ struct IpcMapperImpl : IpcMapper {
         shared->count -= n;
       }
       for (auto& v : activeMaps) {
-        CHECK_CU(cuIpcCloseMemHandle(v.first));
+        auto err = cuIpcCloseMemHandle(v.first);
+        if (err == CUDA_ERROR_DEINITIALIZED) {
+          break;
+        }
+        CHECK_CU(err);
       }
     } catch (const std::exception& e) {
       log.error("ipc mapper got exception %s\n", e.what());
-      while (true)
-        ;
       std::lock_guard l(mutex);
       if (!hasException) {
         hasException = true;
@@ -241,8 +276,8 @@ struct IpcMapperImpl : IpcMapper {
     }
   }
 
-  void
-  sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
+  template<typename F>
+  void enqueue(size_t peerIndex, Function<void(uintptr_t)> callback, F&& f) {
     size_t slotIndex = 0;
     SharedStruct* nshared = peershared.at(peerIndex);
     TORCH_CHECK(nshared != nullptr);
@@ -261,9 +296,7 @@ struct IpcMapperImpl : IpcMapper {
         ++slotIndex;
       }
     }
-    log.debug(
-        "sending ipc map request to rank %d using slot %d (size %#x)\n", group->ipcRanks.at(peerIndex), slotIndex,
-        size);
+
     std::unique_lock l(mutex);
     outgoing.emplace_back();
     OutgoingRequest& req = outgoing.back();
@@ -273,56 +306,43 @@ struct IpcMapperImpl : IpcMapper {
     l.unlock();
 
     auto& slot = nshared->slots[slotIndex];
-    slot.sourceRank = group->rank;
-    slot.requestStepValue = this->stepValue;
-    slot.request = handle;
-    slot.requestBytes = size;
-    slot.requestUnmapAddress = 0;
+    f(slot);
+    log.debug(
+        "sending ipc request (kind %d) to rank %d using slot %d\n", slot.kind, group->ipcRanks.at(peerIndex),
+        slotIndex);
     slot.stage = 2;
     ++nshared->count;
     futexWakeAll(&nshared->count);
   }
 
-  void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback) {
-    size_t slotIndex = 0;
-    SharedStruct* nshared = peershared.at(peerIndex);
-    TORCH_CHECK(nshared != nullptr);
-    while (true) {
-      if (hasException) {
-        std::lock_guard l(mutex);
-        std::rethrow_exception(*exception);
-      }
-      int zero = 0;
-      if (nshared->slots[slotIndex].stage.compare_exchange_strong(zero, 1)) {
-        break;
-      }
-      if (slotIndex == nshared->slots.size() - 1) {
-        slotIndex = 0;
-      } else {
-        ++slotIndex;
-      }
-    }
-    log.debug(
-        "sending ipc unmap request to rank %d using slot %d (base %#x size %#x)\n", group->ipcRanks.at(peerIndex),
-        slotIndex, base, size);
-    std::unique_lock l(mutex);
-    outgoing.emplace_back();
-    OutgoingRequest& req = outgoing.back();
-    req.peerIndex = peerIndex;
-    req.slotIndex = slotIndex;
-    req.callback = std::move(callback);
-    l.unlock();
+  void
+  sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
+    enqueue(peerIndex, std::move(callback), [&](auto& slot) {
+      slot.kind = requestMapAddress;
+      slot.sourceRank = group->rank;
+      slot.requestStepValue = this->stepValue;
+      slot.requestMapMemory = handle;
+      slot.requestBytes = size;
+    });
+  }
 
-    auto& slot = nshared->slots[slotIndex];
-    slot.sourceRank = group->rank;
-    slot.requestStepValue = this->stepValue;
-    slot.request = {};
-    slot.requestBytes = size;
-    slot.requestUnmapAddress = base;
-    CHECK(base != 0);
-    slot.stage = 2;
-    ++nshared->count;
-    futexWakeAll(&nshared->count);
+  void sendRequestEvent(size_t peerIndex, const CUipcEventHandle& handle, Function<void(uintptr_t)> callback) {
+    enqueue(peerIndex, std::move(callback), [&](auto& slot) {
+      slot.kind = requestMapEvent;
+      slot.sourceRank = group->rank;
+      slot.requestStepValue = this->stepValue;
+      slot.requestMapEvent = handle;
+    });
+  }
+
+  void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback) {
+    enqueue(peerIndex, std::move(callback), [&](auto& slot) {
+      slot.kind = requestUnmap;
+      slot.sourceRank = group->rank;
+      slot.requestStepValue = this->stepValue;
+      slot.requestBytes = size;
+      slot.requestUnmapAddress = base;
+    });
   }
 
   void init() {
@@ -452,6 +472,92 @@ struct IpcMapperImpl : IpcMapper {
     TORCH_CHECK(offset + size <= memsize);
     return (void*)((uintptr_t)(void*)(shared + 1) + offset);
   }
+
+  void pushImpl(size_t peerIndex, const void* ptr, size_t n) {
+    SharedStruct* nshared = peershared.at(peerIndex);
+    auto& queue = nshared->queue[group->peerMyRemoteIndex[peerIndex]];
+    while (queue.data.size() - (queue.front - queue.back) < n) {
+      _mm_pause();
+    }
+    size_t offset = queue.front % queue.data.size();
+    size_t c = std::min(queue.data.size() - offset, n);
+    std::memcpy(queue.data.data() + offset, ptr, c);
+    std::memcpy(queue.data.data(), (uint8_t*)ptr + c, n - c);
+    queue.front += n;
+  }
+  void popImpl(size_t peerIndex, void* ptr, size_t n) {
+    auto& queue = shared->queue[peerIndex];
+    while (queue.front - queue.back < n) {
+      _mm_pause();
+    }
+    size_t offset = queue.back % queue.data.size();
+    size_t c = std::min(queue.data.size() - offset, n);
+    std::memcpy(ptr, queue.data.data() + offset, c);
+    std::memcpy((uint8_t*)ptr + c, queue.data.data(), n - c);
+    queue.back += n;
+  }
+
+  void push(size_t peerIndex, const void* ptr, size_t n) {
+    pushImpl(peerIndex, &n, sizeof(n));
+    pushImpl(peerIndex, ptr, n);
+  }
+  void pop(size_t peerIndex, void* ptr, size_t n) {
+    size_t nn;
+    popImpl(peerIndex, &nn, sizeof(nn));
+    CHECK(n == nn);
+    popImpl(peerIndex, ptr, n);
+  }
+
+  void pushEventQueue(size_t peerIndex, uintptr_t value) {
+    SharedStruct* nshared = peershared.at(peerIndex);
+    auto& queue = nshared->eventQueue.at(group->peerMyRemoteIndex.at(peerIndex));
+    while (queue.front - queue.back == queue.data.size()) {
+      _mm_pause();
+    }
+    queue.data[queue.front % queue.data.size()] = value;
+    ++queue.front;
+  }
+  uintptr_t popEventQueue(size_t peerIndex) {
+    auto& queue = shared->eventQueue[peerIndex];
+    while (queue.front == queue.back) {
+      _mm_pause();
+    }
+    uintptr_t r = queue.data[queue.back % queue.data.size()];
+    ++queue.back;
+    return r;
+  }
+
+  std::array<size_t, 8> numIpcEvents{};
+
+  void streamRecord(size_t peerIndex, CUstream stream) {
+    CUevent event = nullptr;
+    if (numIpcEvents[peerIndex] >= 4) {
+      event = (CUevent)popEventQueue(peerIndex);
+    } else {
+      ++numIpcEvents[peerIndex];
+      log.info("%d: Create new ipc event for peer %d!\n", group->rank, peerIndex);
+      CHECK_CU(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS));
+    }
+    CHECK_CU(cuEventRecord(event, stream));
+    IpcMapper::push<uint32_t>(peerIndex, 0xf1020304);
+    pushEvent(peerIndex, event);
+    IpcMapper::push<uint32_t>(peerIndex, 0x01020304);
+    IpcMapper::push<uintptr_t>(peerIndex, (uintptr_t)event);
+  }
+  void streamWait(size_t peerIndex, CUstream stream) {
+    CHECK(IpcMapper::pop<uint32_t>(peerIndex) == 0xf1020304);
+    CHECK_CU(cuStreamWaitEvent(stream, popEvent(peerIndex), CU_EVENT_WAIT_DEFAULT));
+    CHECK(IpcMapper::pop<uint32_t>(peerIndex) == 0x01020304);
+    pushEventQueue(peerIndex, IpcMapper::pop<uintptr_t>(peerIndex));
+
+    // enqueue(
+    //     peerIndex, [](uintptr_t) {},
+    //     [this, ev](auto& slot) {
+    //       slot.kind = requestReturnEvent;
+    //       slot.sourceRank = group->rank;
+    //       slot.returnEventValue = (uintptr_t)ev;
+    //     });
+  }
 };
 
 void IpcMapper::init() {
@@ -461,6 +567,10 @@ void IpcMapper::init() {
 void IpcMapper::sendRequestAddress(
     size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
   ((IpcMapperImpl*)this)->sendRequestAddress(peerIndex, handle, size, std::move(callback));
+}
+
+void IpcMapper::sendRequestEvent(size_t peerIndex, const CUipcEventHandle& handle, Function<void(uintptr_t)> callback) {
+  ((IpcMapperImpl*)this)->sendRequestEvent(peerIndex, handle, std::move(callback));
 }
 
 void IpcMapper::sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback) {
@@ -473,6 +583,21 @@ void* IpcMapper::getMySharedMem(size_t offset, size_t size) {
 
 void* IpcMapper::getPeerSharedMem(size_t peerIndex, size_t offset, size_t size) {
   return ((IpcMapperImpl*)this)->getPeerSharedMem(peerIndex, offset, size);
+}
+
+void IpcMapper::push(size_t peerIndex, const void* ptr, size_t n) {
+  return ((IpcMapperImpl*)this)->push(peerIndex, ptr, n);
+}
+void IpcMapper::pop(size_t peerIndex, void* ptr, size_t n) {
+  return ((IpcMapperImpl*)this)->pop(peerIndex, ptr, n);
+}
+
+void IpcMapper::streamRecord(size_t peerIndex, CUstream stream) {
+  return ((IpcMapperImpl*)this)->streamRecord(peerIndex, stream);
+}
+
+void IpcMapper::streamWait(size_t peerIndex, CUstream stream) {
+  return ((IpcMapperImpl*)this)->streamWait(peerIndex, stream);
 }
 
 std::unique_ptr<IpcMapper> createIpcMapper(Group* group) {

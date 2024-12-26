@@ -37,9 +37,7 @@ public:
   }
 
   c10::intrusive_ptr<Work>
-  reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts = c10d::ReduceOptions()) override {
-    TORCH_CHECK(false, "reduce not supported");
-  }
+  reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts = c10d::ReduceOptions()) override;
 
   c10::intrusive_ptr<Work> allgather(
       std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,

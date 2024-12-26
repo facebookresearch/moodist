@@ -5,6 +5,7 @@
 #include "hash_map.h"
 #include "synchronization.h"
 #include <optional>
+#include <type_traits>
 
 #include "group.h"
 
@@ -32,6 +33,7 @@ struct IpcMapper {
 
   std::array<HashMap<CUipcMemHandle, Mapped, IpcMemHash, IpcMemEqual>, 8> peerIpcMap;
   std::array<HashMap<uintptr_t, std::pair<uintptr_t, unsigned long long>>, 8> peerIpcAddressMap;
+  std::array<HashMap<CUevent, uintptr_t>, 8> peerIpcEventMap;
 
   std::array<HashMap<CUipcMemHandle, bool, IpcMemHash, IpcMemEqual>, 8> peerQueuedUnmaps;
 
@@ -50,9 +52,12 @@ struct IpcMapper {
     uintptr_t base;
     size_t size;
     unsigned long bufferId;
+    CUevent event;
   };
 
   std::array<HashMap<CUipcMemHandle, MapCallbacks, IpcMemHash, IpcMemEqual>, 8> peerMapCallbacks;
+
+  std::array<HashMap<CUipcEventHandle, MapCallbacks, IpcMemHash, IpcMemEqual>, 8> peerEventMapCallbacks;
 
   virtual ~IpcMapper() {}
 
@@ -60,6 +65,7 @@ struct IpcMapper {
 
   void
   sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback);
+  void sendRequestEvent(size_t peerIndex, const CUipcEventHandle& handle, Function<void(uintptr_t)> callback);
 
   void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback);
 
@@ -261,6 +267,61 @@ struct IpcMapper {
     }
   }
 
+  void requestAddress(size_t peerIndex, uintptr_t address, size_t length, uintptr_t* ptr, bool unmappable = false) {
+    return requestAddress(peerIndex, address, length, [ptr](uintptr_t value) { *ptr = value; }, unmappable);
+  }
+
+  template<typename Callback>
+  void requestEvent(size_t peerIndex, CUevent event, Callback&& callback) {
+    CHECK(sizeof(CUevent) == sizeof(uintptr_t));
+    std::unique_lock l(mutex);
+    auto& eventMap = peerIpcEventMap[peerIndex];
+    auto i = eventMap.find(event);
+    if (i != eventMap.end()) {
+      callback(i->second);
+      return;
+    }
+    CUipcEventHandle handle;
+    CHECK_CU(cuIpcGetEventHandle(&handle, event));
+    auto it = peerEventMapCallbacks[peerIndex].find(handle);
+    if (it != peerEventMapCallbacks[peerIndex].end()) {
+      CHECK(waitCount > 0);
+      auto& q = it->second;
+      CHECK(q.event == event);
+      q.list.emplace_back();
+      auto& e = q.list.back();
+      e.callback = std::move(callback);
+      log.debug("requestEvent: already being mapped, adding callback\n");
+      return;
+    }
+    auto& q = peerEventMapCallbacks[peerIndex][handle];
+    q.event = event;
+    q.list.emplace_back();
+    auto& e = q.list.back();
+    e.callback = std::move(callback);
+    l.unlock();
+    ++waitCount;
+    sendRequestEvent(peerIndex, handle, [this, peerIndex, handle, event](uintptr_t mappedAddress) {
+      auto it = peerEventMapCallbacks[peerIndex].find(handle);
+      CHECK(it != peerEventMapCallbacks[peerIndex].end());
+      auto& q = it->second;
+      CHECK(q.event == event);
+      CHECK(!q.list.empty());
+      for (auto& e : q.list) {
+        log.debug(
+            "requestEvent: new mapping -> event at %#x mapped at %#x\n", (uintptr_t)event, mappedAddress, e.offset);
+        peerIpcEventMap[peerIndex][event] = mappedAddress;
+        std::move(e.callback)(mappedAddress);
+      }
+      peerEventMapCallbacks[peerIndex].erase(it);
+      --waitCount;
+    });
+  }
+
+  void requestEvent(size_t peerIndex, CUevent event, uintptr_t* ptr) {
+    return requestEvent(peerIndex, event, [ptr](uintptr_t value) { *ptr = value; });
+  }
+
   void wait() {
     while (waitCount.load(std::memory_order_relaxed)) {
       if (hasException.load(std::memory_order_relaxed)) {
@@ -272,6 +333,34 @@ struct IpcMapper {
       CHECK(v.empty());
     }
   }
+
+  void push(size_t peerIndex, const void* ptr, size_t n);
+  void pop(size_t peerIndex, void* ptr, size_t n);
+
+  template<typename T>
+  void push(size_t peerIndex, const T& value) {
+    static_assert(std::is_trivially_copy_constructible_v<T>);
+    push(peerIndex, &value, sizeof(value));
+  }
+  template<typename T>
+  T pop(size_t peerIndex) {
+    static_assert(std::is_trivially_copy_constructible_v<T>);
+    T r;
+    pop(peerIndex, &r, sizeof(r));
+    return r;
+  }
+
+  void pushEvent(size_t peerIndex, CUevent event) {
+    static_assert(sizeof(CUevent) == sizeof(uintptr_t));
+    requestEvent(peerIndex, event, [this, peerIndex](uintptr_t value) { push(peerIndex, value); });
+    wait();
+  }
+  CUevent popEvent(size_t peerIndex) {
+    return pop<CUevent>(peerIndex);
+  }
+
+  void streamRecord(size_t peerIndex, CUstream stream);
+  void streamWait(size_t peerIndex, CUstream stream);
 };
 
 std::unique_ptr<IpcMapper> createIpcMapper(Group* group);

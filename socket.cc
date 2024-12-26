@@ -947,18 +947,18 @@ struct PollThread {
     return impl->addedInPoll;
   }
 };
-PollThread pollThread;
+PollThread* pollThread = new PollThread();
 
 void add(std::shared_ptr<SocketImpl> impl) {
-  pollThread.add(impl);
+  pollThread->add(impl);
 }
 
 void remove(SocketImpl* impl) {
-  pollThread.remove(impl);
+  pollThread->remove(impl);
 }
 
 bool isAdded(SocketImpl* impl) {
-  return pollThread.isAdded(impl);
+  return pollThread->isAdded(impl);
 }
 
 } // namespace poll

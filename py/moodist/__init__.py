@@ -1,10 +1,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import torch.distributed
-from ._C import MoodistProcessGroup
+from ._C import (
+    MoodistProcessGroup,
+    enable_profiling,
+)
 
 from datetime import timedelta
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
+
 
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
@@ -12,11 +16,12 @@ def create_moodist_backend(
     return MoodistProcessGroup(store, rank, size)
 
 
-torch.distributed.Backend.register_backend("moodist", create_moodist_backend, devices=("cpu", "cuda"))
+torch.distributed.Backend.register_backend(
+    "moodist", create_moodist_backend, devices=("cpu", "cuda")
+)
 
-
-def enable_profiling(b):
-    _C.enable_profiling(b)
-
-
-__all__ = []
+__all__ = [
+    "MoodistProcessGroup",
+    "enable_profiling",
+    "create_moodist_backend",
+]
