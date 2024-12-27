@@ -3,6 +3,7 @@ import torch.distributed
 from ._C import (
     MoodistProcessGroup,
     enable_profiling,
+    enable_cuda_allocator,
 )
 
 from datetime import timedelta
@@ -23,5 +24,6 @@ torch.distributed.Backend.register_backend(
 __all__ = [
     "MoodistProcessGroup",
     "enable_profiling",
+    "enable_cuda_allocator",
     "create_moodist_backend",
 ]

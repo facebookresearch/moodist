@@ -15,7 +15,8 @@
 
 namespace moodist {
 bool profilingEnabled = false;
-}
+void enableCudaAllocator();
+} // namespace moodist
 
 namespace py = pybind11;
 
@@ -31,4 +32,5 @@ PYBIND11_MODULE(_C, m) {
     printf("enable profiling -> %d\n", b);
     moodist::profilingEnabled = b;
   });
+  m.def("enable_cuda_allocator", &moodist::enableCudaAllocator);
 }

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 
 project(moodist)
 
@@ -69,6 +69,7 @@ pybind11_add_module(_C
   kernels.cc
   reduce_scatter.cc
   model.cc
+  allocator.cc
 )
 target_link_libraries(
   _C
