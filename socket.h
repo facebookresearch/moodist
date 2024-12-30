@@ -52,6 +52,7 @@ struct Socket {
   static Socket Tcp();
 
   void close();
+  bool closed() const;
 
   void listen(std::string_view address);
   void accept(Function<void(Error*, Socket)> callback);

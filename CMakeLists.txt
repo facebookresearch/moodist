@@ -70,16 +70,17 @@ pybind11_add_module(_C
   reduce_scatter.cc
   model.cc
   allocator.cc
+  allocator_ipc.cc
 )
 target_link_libraries(
   _C
   PRIVATE
+  CUDA::nvrtc_static CUDA::nvrtc_builtins_static CUDA::cudart CUDA::nvml CUDA::cuda_driver
   ${TORCH_LIBRARIES}
   ${TorchPath}/lib/libtorch_python${CMAKE_SHARED_LIBRARY_SUFFIX}
   Threads::Threads
   fmt
   anl numa ${FABRIC_LIBRARY}
-  CUDA::cudart CUDA::nvml CUDA::nvrtc
 )
 target_include_directories(_C SYSTEM PRIVATE rdma-core ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})

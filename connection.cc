@@ -30,7 +30,8 @@ std::vector<std::string> Listener::localAddresses() const {
   return socket.localAddresses();
 }
 
-const uint32_t sigSocketData = 0x39ec69f4;
+const uint32_t sigSocketData = 0x40ea69f4;
+const uint32_t sigSocketDataFd = 0xf555d4e4;
 
 SharedBufferHandle toShared(SharedBufferHandle h) {
   return h;
@@ -64,27 +65,69 @@ void Connection::write(Buffer buffer, Function<void(Error*)> callback) {
 template void Connection::write(BufferHandle, Function<void(Error*)>);
 template void Connection::write(SharedBufferHandle, Function<void(Error*)>);
 
+template<typename Buffer>
+void Connection::writefd(Buffer buffer, int fd) {
+  uint32_t size = buffer->size();
+  if ((size_t)size != buffer->size()) {
+    throw Error("write: buffer is too large (size does not fit in 32 bits)");
+  }
+
+  int dupfd = ::dup(fd);
+
+  log.info("writefd dupfd is %d\n", dupfd);
+
+  auto buffer0 = serializeToBuffer(sigSocketDataFd, size);
+  std::array<iovec, 2> iovec;
+  iovec[0].iov_base = buffer0->data();
+  iovec[0].iov_len = buffer0->size();
+  iovec[1].iov_base = buffer->data();
+  iovec[1].iov_len = buffer->size();
+  socket.writev(
+      iovec.data(), iovec.size(), [buffer0 = std::move(buffer0), buffer = std::move(buffer)](Error* error) {});
+
+  socket.sendFd(dupfd, [dupfd](Error* error) { ::close(dupfd); });
+}
+
+template void Connection::writefd(BufferHandle, int);
+template void Connection::writefd(SharedBufferHandle, int);
+
 void Connection::close() {
   socket.close();
+}
+bool Connection::closed() const {
+  return socket.closed();
 }
 
 struct ReadState {
   Connection* connection;
   int state = 0;
+  bool recvFd = false;
+  int fd = -1;
   Function<void(Error*, BufferHandle)> callback;
+  Function<void(Error*, BufferHandle, int)> fdcallback;
   BufferHandle buffer;
   CachedReader reader;
   ReadState(Connection* connection, Function<void(Error*, BufferHandle)> callback)
       : connection(connection), reader(&connection->socket), callback(std::move(callback)) {}
+  ReadState(Connection* connection, Function<void(Error*, BufferHandle, int)> fdcallback)
+      : connection(connection), reader(&connection->socket), fdcallback(std::move(fdcallback)) {}
+  void callError(Error* error) {
+    if (fdcallback) {
+      fdcallback(error, nullptr, -1);
+    } else {
+      callback(error, nullptr);
+    }
+  }
   void operator()(Error* error) {
     if (error) {
-      callback(error, nullptr);
+      callError(error);
       return;
     }
 
     static constexpr int stateZero = 0;
     static constexpr int stateSocketReadIovecs = 1;
-    static constexpr int stateAllDone = 2;
+    static constexpr int stateRecvFd = 2;
+    static constexpr int stateAllDone = 3;
 
     while (true) {
       switch (state) {
@@ -102,10 +145,13 @@ struct ReadState {
         switch (recvSignature) {
         case sigSocketData:
           break;
+        case sigSocketDataFd:
+          recvFd = true;
+          break;
         default:
           state = -1;
           Error e("bad signature");
-          callback(&e, nullptr);
+          callError(&e);
           return;
         }
         buffer = makeBuffer(bufferSize);
@@ -119,12 +165,26 @@ struct ReadState {
         if (!reader.done()) {
           return;
         } else {
-          state = stateAllDone;
-          [[fallthrough]];
+          state = recvFd ? stateRecvFd : stateAllDone;
+          recvFd = false;
+          break;
         }
+      case stateRecvFd: {
+        fd = connection->socket.recvFd(reader);
+        if (fd == -1) {
+          return;
+        }
+        state = stateAllDone;
+        [[fallthrough]];
+      }
       case stateAllDone: {
         state = stateZero;
-        callback(nullptr, std::move(buffer));
+        if (fdcallback) {
+          fdcallback(nullptr, std::move(buffer), fd);
+          fd = -1;
+        } else {
+          callback(nullptr, std::move(buffer));
+        }
         break;
       }
       }
@@ -133,6 +193,10 @@ struct ReadState {
 };
 
 void Connection::read(Function<void(Error*, BufferHandle)> callback) {
+  socket.setOnRead(ReadState(this, std::move(callback)));
+}
+
+void Connection::readfd(Function<void(Error*, BufferHandle, int)> callback) {
   socket.setOnRead(ReadState(this, std::move(callback)));
 }
 

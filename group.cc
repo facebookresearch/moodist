@@ -78,19 +78,18 @@ void Group::init() {
   pid = ::getpid();
 
   cuContext = nullptr;
-  // cuCtxGetCurrent(&cuContext);
+  cuCtxGetCurrent(&cuContext);
   if (!cuContext) {
     CHECK_CU(cuInit(0));
 
     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
     CHECK_CU(cuDevicePrimaryCtxRetain(&cuContext, cuDevice));
     CHECK_CU(cuCtxSetCurrent(cuContext));
-
-    cuCtxSetLimit(CU_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT, 0x10000);
-
   } else {
     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
   }
+
+  // cuCtxSetLimit(CU_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT, 0x10000);
 
   int driverVersion = 5000;
   CHECK_CU(cuDriverGetVersion(&driverVersion));

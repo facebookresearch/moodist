@@ -1005,6 +1005,10 @@ void Socket::close() {
   }
 }
 
+bool Socket::closed() const {
+  return impl ? (bool)impl->closed : true;
+}
+
 void Socket::writev(const iovec* vec, size_t veclen, Function<void(Error*)> callback) {
   impl->writev(vec, veclen, std::move(callback));
 }

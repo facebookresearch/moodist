@@ -61,9 +61,13 @@ struct Connection : std::enable_shared_from_this<Connection> {
   ~Connection();
 
   void close();
+  bool closed() const;
   void read(Function<void(Error*, BufferHandle)>);
+  void readfd(Function<void(Error*, BufferHandle, int)>);
   template<typename Buffer>
   void write(Buffer buffer, Function<void(Error*)>);
+  template<typename Buffer>
+  void writefd(Buffer buffer, int fd);
 
   std::string localAddress() const;
   std::string remoteAddress() const;

@@ -351,7 +351,14 @@ struct IpcMapperImpl : IpcMapper {
 
     shared = new (mymem.base) SharedStruct();
 
-    std::string myAddress = "ipc-mapper-" + randomName();
+    for (size_t i : group->ipcRanks) {
+      group->setupComms->sendTo(i, allocator::id());
+    }
+    for (size_t i : group->ipcRanks) {
+      peerMemoryId.at(group->getPeerIndex(i)) = group->setupComms->recvFrom<std::string>(i);
+    }
+
+    std::string myAddress = fmt::sprintf("ipc-mapper-%d-%s", ::getpid(), randomName());
 
     struct SocketHelper {
       Socket socket;
