@@ -70,7 +70,6 @@ pybind11_add_module(_C
   reduce_scatter.cc
   model.cc
   allocator.cc
-  allocator_ipc.cc
 )
 target_link_libraries(
   _C

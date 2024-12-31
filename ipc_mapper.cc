@@ -351,12 +351,12 @@ struct IpcMapperImpl : IpcMapper {
 
     shared = new (mymem.base) SharedStruct();
 
-    for (size_t i : group->ipcRanks) {
-      group->setupComms->sendTo(i, allocator::id());
-    }
-    for (size_t i : group->ipcRanks) {
-      peerMemoryId.at(group->getPeerIndex(i)) = group->setupComms->recvFrom<std::string>(i);
-    }
+    // for (size_t i : group->ipcRanks) {
+    //   group->setupComms->sendTo(i, allocator::id());
+    // }
+    // for (size_t i : group->ipcRanks) {
+    //   peerMemoryId.at(group->getPeerIndex(i)) = group->setupComms->recvFrom<std::string>(i);
+    // }
 
     std::string myAddress = fmt::sprintf("ipc-mapper-%d-%s", ::getpid(), randomName());
 

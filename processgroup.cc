@@ -91,12 +91,20 @@ struct WorkStream {
   WorkStream() = default;
   WorkStream(const WorkStream&) = delete;
   WorkStream& operator=(const WorkStream&) = delete;
+  WorkStream(WorkStream&& n) {
+    *this = std::move(n);
+  }
+  WorkStream& operator=(WorkStream&& n) {
+    std::swap(stream, n.stream);
+    std::swap(event, n.event);
+    return *this;
+  }
   ~WorkStream() {
     if (event) {
-      CHECK_CU(cuEventDestroy(event));
+      cuEventDestroy(event);
     }
     if (stream) {
-      CHECK_CU(cuStreamDestroy(stream));
+      cuStreamDestroy(stream);
     }
   }
 };

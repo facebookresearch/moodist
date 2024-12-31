@@ -1155,8 +1155,8 @@ struct CpuThreadImpl {
   }
 
   void writeCpuOut(size_t concurrencyIndex, size_t dstIndex, size_t srcIndex) {
-    CHECK(srcIndex < maxChunks * size);
-    CHECK(dstIndex < maxChunks * size);
+    CHECK(srcIndex < 32);
+    CHECK(dstIndex < 4096 + maxChunks * size);
     size_t di = 0;
     auto& dev = devices[di];
     auto offset = sizeof(uint32_t) * dstIndex;

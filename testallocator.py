@@ -25,7 +25,7 @@ def f(x):
     zz = []
     for _ in range(32):
         # print(_)
-        #torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         skip = x
         x = lin1(x).relu() + lin1a(x) + lin1b(x.square())
         x = x.clone()
@@ -104,6 +104,7 @@ for i in range(4):
 
     print("grad_sum: %g" % grad_sum)
 
+    print("%gG" % (torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024))
     # os.system("nvidia-smi")
 
 # x = torch.zeros(8, device="cuda")

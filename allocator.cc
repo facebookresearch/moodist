@@ -206,7 +206,8 @@ struct RegionSize {
   mutable typename RegionContainer::iterator regionIterator;
 
   RegionSize() = default;
-  RegionSize(size_t bytes) : bytes(bytes) {}
+  RegionSize(size_t bytes, typename RegionContainer::iterator regionIterator)
+      : bytes(bytes), regionIterator(regionIterator) {}
 };
 
 struct RegionSizeCompare {
@@ -372,14 +373,14 @@ struct CudaAllocatorImpl {
 
   // std::set<Region, RegionCompare> pendingFreeMemory;
 
-  size_t nBytesMapped = 0;
-  std::atomic_size_t reservedSize = 0;
-  std::atomic_uintptr_t reservedBase = 0;
-  size_t nextMapBase = 0;
+  // size_t nBytesMapped = 0;
+  // std::atomic_size_t reservedSize = 0;
+  // std::atomic_uintptr_t reservedBase = 0;
+  // size_t nextMapBase = 0;
 
-  int deviceIndex = -1;
+  // int deviceIndex = -1;
 
-  Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
+  // Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
 
   FreeList<Vector<CUstream>> freeListStreams;
   FreeList<EventRegion> freeListEventRegions;
@@ -393,6 +394,7 @@ struct CudaAllocatorImpl {
 
   void updateSize(Regions& regions, RegionMap::iterator i) {
     auto sizeNode = regions.sizes.extract(i->sizeIterator);
+    CHECK(sizeNode.value().regionIterator == i);
     sizeNode.value().bytes = i->span.end - i->span.begin;
     i->sizeIterator = regions.sizes.insert(std::move(sizeNode));
   }
@@ -474,14 +476,13 @@ struct CudaAllocatorImpl {
     // CHECK(std::is_sorted(
     //     i->events.begin(), i->events.end(), [](auto& a, auto& b) { return a.span.begin < b.span.begin; }));
     if (freeRegionSizeNodes.empty()) {
-      i->sizeIterator = sizeMap.emplace(span.end - span.begin);
-      i->sizeIterator->regionIterator = i;
+      i->sizeIterator = sizeMap.emplace(span.end - span.begin, i);
     } else {
       auto node = std::move(freeRegionSizeNodes.back());
       freeRegionSizeNodes.pop_back();
       node.value().bytes = span.end - span.begin;
+      node.value().regionIterator = i;
       i->sizeIterator = sizeMap.insert(std::move(node));
-      i->sizeIterator->regionIterator = i;
     }
     // memlog.info(
     //     "added span %#x %#x, size %d, i->sizeIterator bytes is %d\n", i->span.begin, i->span.end,
@@ -494,28 +495,33 @@ struct CudaAllocatorImpl {
   }
 
   bool mapMoreMemory(size_t minbytes) {
-    if (reservedBase == 0) {
-      size_t free = 0;
-      size_t total = 0;
-      CHECK_CU(cuMemGetInfo(&free, &total));
-      memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free, total);
+    // if (reservedBase == 0) {
+    //   size_t free = 0;
+    //   size_t total = 0;
+    //   CHECK_CU(cuMemGetInfo(&free, &total));
+    //   memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free,
+    //   total);
 
-      constexpr size_t alignment = (size_t)1024 * 1024 * 1024 * 1024;
-      size_t reserveSize = (total + alignment - 1) / alignment * alignment;
+    //   constexpr size_t alignment = (size_t)1024 * 1024 * 1024 * 1024;
+    //   size_t reserveSize = (total + alignment - 1) / alignment * alignment;
 
-      memlog.info("Moodist CUDA Allocator reserving %d bytes\n", reserveSize);
+    //   memlog.info("Moodist CUDA Allocator reserving %d bytes\n", reserveSize);
 
-      CUdeviceptr base = 0;
-      CHECK_CU(cuMemAddressReserve(&base, reserveSize, alignment, 0, 0));
-      reservedBase = base;
-      reservedSize = reserveSize;
-      nextMapBase = base;
+    //   CUdeviceptr base = 0;
+    //   CHECK_CU(cuMemAddressReserve(&base, reserveSize, alignment, 0, 0));
+    //   reservedBase = base;
+    //   reservedSize = reserveSize;
+    //   nextMapBase = base;
 
-      deviceIndex = c10::cuda::current_device();
-    }
+    //   deviceIndex = c10::cuda::current_device();
+    // }
+    size_t free = 0;
+    size_t total = 0;
+    CHECK_CU(cuMemGetInfo(&free, &total));
+    memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free, total);
 
-    size_t bytes = reservedSize - nextMapBase;
-    size_t safebytes = reservedSize - 1024 * 1024 * 1024 - nextMapBase;
+    size_t bytes = free;
+    size_t safebytes = free - 1024 * 1024 * 1024;
     if (safebytes >= minbytes) {
       bytes = safebytes;
     }
@@ -523,36 +529,40 @@ struct CudaAllocatorImpl {
       return false;
     }
     // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 1024 * 4));
-    bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 512));
+    // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 512));
 
-    CUmemGenericAllocationHandle handle;
-    CUmemAllocationProp prop;
-    std::memset(&prop, 0, sizeof(prop));
-    prop.location.id = deviceIndex;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    // CUmemGenericAllocationHandle handle;
+    // CUmemAllocationProp prop;
+    // std::memset(&prop, 0, sizeof(prop));
+    // prop.location.id = deviceIndex;
+    // prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    // prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
 
-    constexpr size_t alignment = (size_t)1024 * 1024 * 128;
-    bytes = (bytes + alignment - 1) / alignment * alignment;
+    // constexpr size_t alignment = (size_t)1024 * 1024 * 128;
+    // bytes = (bytes + alignment - 1) / alignment * alignment;
 
-    CHECK_CU(cuMemCreate(&handle, bytes, &prop, 0));
+    // CHECK_CU(cuMemCreate(&handle, bytes, &prop, 0));
 
-    cuMemHandles.emplace_back(bytes, handle);
+    // cuMemHandles.emplace_back(bytes, handle);
 
-    uintptr_t address = nextMapBase;
-    nextMapBase += bytes;
+    // uintptr_t address = nextMapBase;
+    // nextMapBase += bytes;
 
-    memlog.info("mem map %#x %#x\n", address, bytes);
+    // memlog.info("mem map %#x %#x\n", address, bytes);
 
-    CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
+    // CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
 
-    std::array<CUmemAccessDesc, 1> desc;
-    std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-    desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    desc[0].location.id = deviceIndex;
-    CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
+    // std::array<CUmemAccessDesc, 1> desc;
+    // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+    // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    // desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    // desc[0].location.id = deviceIndex;
+    // CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
+
+    CUdeviceptr ptr;
+    CHECK_CU(cuMemAlloc(&ptr, bytes));
+    uintptr_t address = ptr;
 
     memlog.info("Moodist successfully mapped %d bytes at %#x\n", bytes, address);
 
@@ -897,6 +907,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     CUstream stream = c10::cuda::getCurrentCUDAStream();
     memlog.debug("trying to allocate %d bytes on stream %#x\n", alignedbytes, (uintptr_t)stream);
     uintptr_t cudaPtr = impl.allocate(alignedbytes, stream);
+    deviceStats.allocated_bytes[0].increase(alignedbytes);
     deviceStats.active_bytes[0].increase(alignedbytes);
     Function<void()> f = [this, cudaPtr, alignedbytes, stream] {
       std::lock_guard l(mutex);
@@ -915,6 +926,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       } else {
         impl.deallocate<false>(cudaPtr, alignedbytes, std::array<CUstream, 1>{stream});
       }
+      deviceStats.allocated_bytes[0].decrease(alignedbytes);
       deviceStats.active_bytes[0].decrease(alignedbytes);
     };
     auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
@@ -975,10 +987,12 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   }
   virtual void resetAccumulatedStats(c10::DeviceIndex device) override {
     // throw std::runtime_error("moodist CUDAAllocator::resetAccumulatedStats: not implemented");
+    deviceStats.allocated_bytes[0].reset_accumulated();
     deviceStats.active_bytes[0].reset_accumulated();
   }
   virtual void resetPeakStats(c10::DeviceIndex device) override {
     // throw std::runtime_error("moodist CUDAAllocator::resetPeakStats: not implemented");
+    deviceStats.allocated_bytes[0].reset_peak();
     deviceStats.active_bytes[0].reset_peak();
   }
   virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot() override {
@@ -1044,30 +1058,30 @@ CUDAAllocator* cudaAllocator = nullptr;
 
 namespace allocator {
 
-bool owns(uintptr_t address) {
-  if (!cudaAllocator) {
-    return false;
-  }
-  uintptr_t base = cudaAllocator->impl.reservedBase.load(std::memory_order_relaxed);
-  size_t size = cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
-  return address >= base && address < base + size;
-}
-uintptr_t offset(uintptr_t address) {
-  CHECK(cudaAllocator);
-  return address - cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
-}
+// bool owns(uintptr_t address) {
+//   if (!cudaAllocator) {
+//     return false;
+//   }
+//   uintptr_t base = cudaAllocator->impl.reservedBase.load(std::memory_order_relaxed);
+//   size_t size = cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
+//   return address >= base && address < base + size;
+// }
+// uintptr_t offset(uintptr_t address) {
+//   CHECK(cudaAllocator);
+//   return address - cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
+// }
 
-Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles() {
-  CHECK(cudaAllocator);
-  std::lock_guard l(cudaAllocator->mutex);
-  return cudaAllocator->impl.cuMemHandles;
-}
+// Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles() {
+//   CHECK(cudaAllocator);
+//   std::lock_guard l(cudaAllocator->mutex);
+//   return cudaAllocator->impl.cuMemHandles;
+// }
 
-std::pair<uintptr_t, size_t> reserved() {
-  CHECK(cudaAllocator);
-  std::lock_guard l(cudaAllocator->mutex);
-  return {cudaAllocator->impl.reservedBase, cudaAllocator->impl.reservedSize};
-}
+// std::pair<uintptr_t, size_t> reserved() {
+//   CHECK(cudaAllocator);
+//   std::lock_guard l(cudaAllocator->mutex);
+//   return {cudaAllocator->impl.reservedBase, cudaAllocator->impl.reservedSize};
+// }
 
 } // namespace allocator
 
