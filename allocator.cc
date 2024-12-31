@@ -141,63 +141,64 @@ void add_span(Vector<Span>& spans, uintptr_t begin, uintptr_t end) {
   // }
 }
 
-struct MemoryEvent {
-  IntrusiveListLink<MemoryEvent> link;
-  size_t refcount = 0;
-  CUevent event = nullptr;
-};
+// struct MemoryEvent {
+//   IntrusiveListLink<MemoryEvent> link;
+//   size_t refcount = 0;
+//   CUevent event = nullptr;
+// };
 
-struct MemoryEventHandle {
-  MemoryEvent* e = nullptr;
-  Vector<MemoryEvent*>* container = nullptr;
-  MemoryEventHandle() = default;
-  MemoryEventHandle(MemoryEvent* e, Vector<MemoryEvent*>* container) : e(e), container(container) {
-    ++e->refcount;
-  }
-  ~MemoryEventHandle() {
-    decref();
-  }
-  MemoryEventHandle(MemoryEventHandle&& n) {
-    *this = std::move(n);
-  }
-  MemoryEventHandle(const MemoryEventHandle& n) {
-    *this = n;
-  }
-  MemoryEventHandle& operator=(const MemoryEventHandle& n) {
-    if (e) {
-      decref();
-    }
-    e = n.e;
-    container = n.container;
-    if (e) {
-      ++e->refcount;
-    }
-    return *this;
-  }
-  MemoryEventHandle& operator=(MemoryEventHandle&& n) {
-    std::swap(e, n.e);
-    std::swap(container, n.container);
-    return *this;
-  }
-  void decref() {
-    if (e && --e->refcount == 0) {
-      container->push_back(e);
-      e = nullptr;
-      container = nullptr;
-    }
-  }
-  MemoryEvent* operator->() {
-    return e;
-  }
-  MemoryEvent& operator*() {
-    return *e;
-  }
-};
+// struct MemoryEventHandle {
+//   MemoryEvent* e = nullptr;
+//   Vector<MemoryEvent*>* container = nullptr;
+//   MemoryEventHandle() = default;
+//   MemoryEventHandle(MemoryEvent* e, Vector<MemoryEvent*>* container) : e(e), container(container) {
+//     ++e->refcount;
+//   }
+//   ~MemoryEventHandle() {
+//     decref();
+//   }
+//   MemoryEventHandle(MemoryEventHandle&& n) {
+//     *this = std::move(n);
+//   }
+//   MemoryEventHandle(const MemoryEventHandle& n) {
+//     *this = n;
+//   }
+//   MemoryEventHandle& operator=(const MemoryEventHandle& n) {
+//     if (e) {
+//       decref();
+//     }
+//     e = n.e;
+//     container = n.container;
+//     if (e) {
+//       ++e->refcount;
+//     }
+//     return *this;
+//   }
+//   MemoryEventHandle& operator=(MemoryEventHandle&& n) {
+//     std::swap(e, n.e);
+//     std::swap(container, n.container);
+//     return *this;
+//   }
+//   void decref() {
+//     if (e && --e->refcount == 0) {
+//       container->push_back(e);
+//       e = nullptr;
+//       container = nullptr;
+//     }
+//   }
+//   MemoryEvent* operator->() {
+//     return e;
+//   }
+//   MemoryEvent& operator*() {
+//     return *e;
+//   }
+// };
 
 struct EventRegion {
   IntrusiveListLink<EventRegion> link;
   Span span;
-  MemoryEventHandle event;
+  Event event;
+  CUstream eventStream = nullptr;
 };
 
 template<typename RegionContainer>
@@ -214,7 +215,10 @@ struct RegionSizeCompare {
   using is_transparent = std::true_type;
   template<typename RegionSize>
   bool operator()(const RegionSize& a, const RegionSize& b) const {
-    return a.bytes < b.bytes;
+    if (a.bytes != b.bytes) {
+      return a.bytes < b.bytes;
+    }
+    return a.regionIterator->span.begin < b.regionIterator->span.begin;
   }
   template<typename RegionSize>
   bool operator()(const RegionSize& a, size_t b) const {
@@ -352,7 +356,6 @@ struct FreeList {
       list.pop_back();
       return Handle(this, ptr);
     }
-    // memlog.info("allocate new %s\n", typeid(T).name());
     return Handle(this, allocator.allocate());
   }
 };
@@ -360,8 +363,8 @@ struct FreeList {
 struct CudaAllocatorImpl {
   CudaAllocatorImpl() {}
 
-  PoolAllocator<MemoryEvent> memoryEventAllocator;
-  Vector<MemoryEvent*> memoryEventFreelist;
+  // PoolAllocator<MemoryEvent> memoryEventAllocator;
+  // Vector<MemoryEvent*> memoryEventFreelist;
 
   Vector<Span> mappedRegions;
 
@@ -378,7 +381,7 @@ struct CudaAllocatorImpl {
   // std::atomic_uintptr_t reservedBase = 0;
   // size_t nextMapBase = 0;
 
-  // int deviceIndex = -1;
+  int deviceIndex = -1;
 
   // Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
 
@@ -387,10 +390,22 @@ struct CudaAllocatorImpl {
   Vector<std::tuple<uintptr_t, size_t, FreeList<Vector<CUstream>>::Handle>> pendingDeallocations;
 
   HashMap<CUstream, std::unique_ptr<Regions>> streamFreeMemory;
+  HashMap<CUstream, std::unique_ptr<Regions>>::iterator nextStreamFreeMemory = streamFreeMemory.end();
 
   HashMap<CUstream, bool> tmpDeallocateStreamMap;
   Vector<FreeList<EventRegion>::Handle> tmpDeallocateEventRegions;
   Vector<EventRegion*> tmpEventRegions;
+
+  Regions& getStreamFree(CUstream stream) {
+    auto i = streamFreeMemory.find(stream);
+    if (i != streamFreeMemory.end()) {
+      return *i->second;
+    }
+    auto& ptr = streamFreeMemory[stream];
+    ptr = std::make_unique<Regions>();
+    nextStreamFreeMemory = streamFreeMemory.begin();
+    return *ptr;
+  }
 
   void updateSize(Regions& regions, RegionMap::iterator i) {
     auto sizeNode = regions.sizes.extract(i->sizeIterator);
@@ -518,13 +533,21 @@ struct CudaAllocatorImpl {
     size_t free = 0;
     size_t total = 0;
     CHECK_CU(cuMemGetInfo(&free, &total));
-    memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free, total);
+    if (deviceIndex == -1) {
+      deviceIndex = c10::cuda::current_device();
+      CHECK(deviceIndex != -1);
+    }
+    CHECK(c10::cuda::current_device() == deviceIndex);
 
-    size_t bytes = free;
-    size_t safebytes = free - 1024 * 1024 * 1024;
+    size_t bytes = minbytes;
+    constexpr size_t buffer = 1024 * 1024 * 1024;
+    size_t safebytes = free > buffer ? free - buffer : 0;
     if (safebytes >= minbytes) {
       bytes = safebytes;
     }
+    memlog.info(
+        "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
+        bytes, free, total);
     if (bytes < minbytes) {
       return false;
     }
@@ -561,7 +584,23 @@ struct CudaAllocatorImpl {
     // CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
 
     CUdeviceptr ptr;
-    CHECK_CU(cuMemAlloc(&ptr, bytes));
+    auto err = cuMemAlloc(&ptr, bytes);
+    while (err != CUDA_SUCCESS) {
+      bytes /= 2;
+      if (bytes < minbytes) {
+        bytes = minbytes;
+      }
+      err = cuMemAlloc(&ptr, bytes);
+      if (bytes <= minbytes) {
+        break;
+      }
+    }
+    if (err != CUDA_SUCCESS) {
+      const char* str = "unknown cuda error";
+      cuGetErrorString(err, &str);
+      memlog.error("CUDA Allocator failed to map %d bytes; %s\n", bytes, str);
+      return false;
+    }
     uintptr_t address = ptr;
 
     memlog.info("Moodist successfully mapped %d bytes at %#x\n", bytes, address);
@@ -569,9 +608,10 @@ struct CudaAllocatorImpl {
     add_span(mappedRegions, address, address + bytes);
 
     auto h = freeListEventRegions.pop();
-    h->event = getMemoryEvent();
+    h->event = Event::create();
     h->span = Span{address, address + bytes};
-    CHECK_CU(cuEventRecord(h->event->event, c10::cuda::getCurrentCUDAStream()));
+    h->eventStream = c10::cuda::getCurrentCUDAStream();
+    CHECK_CU(cuEventRecord(h->event, c10::cuda::getCurrentCUDAStream()));
     insertRegion(freeMemory, Span{address, address + bytes}, std::array<EventRegion*, 1>{&*h});
     h.release();
 
@@ -579,7 +619,7 @@ struct CudaAllocatorImpl {
   }
 
   uintptr_t allocateFrom(Regions& regions, size_t bytes, CUstream stream) {
-    checkMap(freeMemory.map, freeMemory.sizes);
+    checkMap(regions.map, regions.sizes);
     auto it = regions.sizes.lower_bound(bytes);
     if (it != regions.sizes.end()) {
       CHECK(it->bytes >= bytes);
@@ -591,15 +631,17 @@ struct CudaAllocatorImpl {
         if (i->span.begin >= ptrEnd) {
           break;
         }
-        memlog.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)i->event->event, i->span.begin, i->span.end);
+        //        memlog.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)(CUevent)i->event, i->span.begin,
+        //        i->span.end);
 
-        CHECK_CU(cuStreamWaitEvent(stream, i->event->event, CU_EVENT_WAIT_DEFAULT));
+        if (i->eventStream != stream) {
+          CHECK_CU(cuStreamWaitEvent(stream, i->event, CU_EVENT_WAIT_DEFAULT));
+        }
 
         if (i->span.end > ptrEnd) {
           i->span.begin = ptrEnd;
           ++i;
         } else {
-          i->event = {};
           freeListEventRegions.push(&*i);
           i = r->events.erase(i);
         }
@@ -613,13 +655,13 @@ struct CudaAllocatorImpl {
         updateSize(regions, r);
       }
 
-      memlog.debug("span %#x %#x\n", r->span.begin, r->span.end);
-      for (auto& v : r->events) {
-        memlog.debug("event %#x %#x\n", v.span.begin, v.span.end);
-      }
+      // memlog.debug("span %#x %#x\n", r->span.begin, r->span.end);
+      // for (auto& v : r->events) {
+      //   memlog.debug("event %#x %#x\n", v.span.begin, v.span.end);
+      // }
 
       checkMap(regions.map, regions.sizes);
-      memlog.debug("ok, returning %#x\n", ptr);
+      // memlog.debug("ok, returning %#x\n", ptr);
       return ptr;
     }
     return 0;
@@ -636,9 +678,8 @@ struct CudaAllocatorImpl {
     }
     CHECK(bytes > 0);
 
-    auto& streamFree = streamFreeMemory[stream];
-    if (streamFree) {
-      uintptr_t r = allocateFrom(*streamFree, bytes, stream);
+    {
+      uintptr_t r = allocateFrom(getStreamFree(stream), bytes, stream);
       if (r) {
         return r;
       }
@@ -657,11 +698,51 @@ struct CudaAllocatorImpl {
       memlog.verbose(
           "Memory exhausted during allocation of %s. Free memory:\n%s\n", this->bytes(bytes), debugFreeMemory());
     }
+    for (size_t i = 0; i != streamFreeMemory.size(); ++i) {
+      CHECK(nextStreamFreeMemory != streamFreeMemory.end());
+      uintptr_t r = allocateFrom(*nextStreamFreeMemory->second, bytes, stream);
+      ++nextStreamFreeMemory;
+      if (nextStreamFreeMemory == streamFreeMemory.end()) {
+        nextStreamFreeMemory = streamFreeMemory.begin();
+      }
+      if (r) {
+        return r;
+      }
+    }
+    // log.error("WAAA emergency free from stream memory!\n");
+    if (freeStreamMemory(bytes)) {
+      return allocate(bytes, stream);
+    }
     if (mapMoreMemory(bytes)) {
       return allocate(bytes, stream);
     }
     // memlog.verbose("Prefetcher free memory:\n%s\n", debugFreeMemory());
-    throw std::runtime_error(fmt::sprintf("Prefetcher failed to allocate %d bytes", bytes));
+
+    size_t nMapped = 0;
+    size_t nFree = 0;
+    size_t largestChunk = 0;
+    size_t nMappedRegions = 0;
+    for (auto& v : mappedRegions) {
+      nMapped += v.end - v.begin;
+      ++nMappedRegions;
+    }
+    auto count = [&](Regions& regions) {
+      for (auto& v : regions.sizes) {
+        nFree += v.bytes;
+        largestChunk = std::max(largestChunk, v.bytes);
+      }
+    };
+    count(freeMemory);
+    for (auto& v : streamFreeMemory) {
+      count(*v.second);
+    }
+    size_t nAllocated = nMapped - nFree;
+
+    throw std::runtime_error(fmt::sprintf(
+        "Moodist CUDA Allocator failed to allocate %s. We have mapped %s (in %d regions), of which %s are "
+        "currently allocated, and %s are free. The largest free chunk is %s",
+        this->bytes(bytes), this->bytes(nMapped), nMappedRegions, this->bytes(nAllocated), this->bytes(nFree),
+        this->bytes(largestChunk)));
   }
 
   // void deallocateImpl(uintptr_t cudaPtr, size_t alignedbytes, Vector<CUstream>& streams) {
@@ -689,40 +770,41 @@ struct CudaAllocatorImpl {
     tmpDeallocateEventRegions.clear();
     for (auto& v : tmpDeallocateStreamMap) {
       CUstream stream = v.first;
-      MemoryEventHandle me;
+      auto h = freeListEventRegions.pop();
       if (allowErrors) {
-        me = getMemoryEvent();
-        CHECK_CU(cuEventRecord(me->event, stream));
-        memlog.debug(
-            "recorded event (0) for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream, (uintptr_t)me->event);
-      } else {
-        if (memoryEventFreelist.empty()) {
-          // memlog.info("memoryEventFreelist is empty!\n");
-          failed = true;
-          break;
+        if (!h->event) {
+          h->event = Event::create();
         }
-        me = getMemoryEvent();
-        if (cuEventRecord(me->event, stream) != CUDA_SUCCESS) {
+        h->eventStream = stream;
+        CHECK_CU(cuEventRecord(h->event, stream));
+        // memlog.debug(
+        //     "recorded event (0) for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
+        //     (uintptr_t)(CUevent)h->event);
+      } else {
+        if (!h->event) {
+          h->event = Event::tryCreate();
+          if (!h->event) {
+            failed = true;
+            break;
+          }
+        }
+        h->eventStream = stream;
+        if (cuEventRecord(h->event, stream) != CUDA_SUCCESS) {
           memlog.info("failed to record event!\n");
           failed = true;
           break;
         }
-        memlog.debug(
-            "recorded event for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream, (uintptr_t)me->event);
+        // memlog.debug(
+        //     "recorded event for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
+        //     (uintptr_t)(CUevent)h->event);
       }
-      auto h = freeListEventRegions.pop();
-      h->event = std::move(me);
       h->span = span;
       tmpDeallocateEventRegions.push_back(std::move(h));
     }
     if (!failed) {
       if (tmpDeallocateEventRegions.size() == 1) {
         CUstream stream = tmpDeallocateStreamMap.begin()->first;
-        auto& streamFree = streamFreeMemory[stream];
-        if (!streamFree) {
-          streamFree = std::make_unique<Regions>();
-        }
-        insertRegion(*streamFree, span, tmpDeallocateEventRegions);
+        insertRegion(getStreamFree(stream), span, tmpDeallocateEventRegions);
       } else {
         insertRegion(freeMemory, Span{cudaPtr, cudaPtr + alignedbytes}, tmpDeallocateEventRegions);
         // insertRegion(pendingFreeMemory, Span{cudaPtr, cudaPtr + alignedbytes}, tmpDeallocateEventRegions);
@@ -740,6 +822,36 @@ struct CudaAllocatorImpl {
       pendingDeallocations.emplace_back(cudaPtr, alignedbytes, std::move(streams));
       checkMap(freeMemory.map, freeMemory.sizes);
     }
+  }
+
+  bool freeStreamMemory(size_t reqbytes) {
+    checkMap(freeMemory.map, freeMemory.sizes);
+    for (auto& v : streamFreeMemory) {
+      Regions& region = *v.second;
+      for (auto i = region.map.begin(); i != region.map.end();) {
+        Span span = i->span;
+        auto events = std::move(i->events);
+        freeRegionSizeNodes.push_back(region.sizes.extract(i->sizeIterator));
+        i->sizeIterator = {};
+        auto ni = std::next(i);
+        freeRegionNodes.push_back(region.map.extract(i));
+        i = ni;
+        tmpEventRegions.clear();
+        for (auto& v : events) {
+          tmpEventRegions.push_back(&v);
+        }
+        insertRegion(freeMemory, span, tmpEventRegions);
+
+        size_t n = span.end - span.begin;
+        if (n >= reqbytes) {
+          checkMap(freeMemory.map, freeMemory.sizes);
+          return true;
+        }
+        reqbytes -= n;
+      }
+    }
+    checkMap(freeMemory.map, freeMemory.sizes);
+    return false;
   }
 
   void freePending() {
@@ -827,21 +939,21 @@ struct CudaAllocatorImpl {
     return s;
   }
 
-  MemoryEventHandle getMemoryEvent() {
-    if (memoryEventFreelist.empty()) {
-      memlog.debug("allocate new memory events!\n");
-      for (size_t i = 0; i != 0x1000; ++i) {
-        MemoryEvent* me = memoryEventAllocator.allocate();
-        CHECK_CU(cuEventCreate(&me->event, CU_EVENT_DISABLE_TIMING));
-        memoryEventFreelist.push_back(me);
-      }
-    }
-    MemoryEvent* me = memoryEventFreelist.back();
-    memoryEventFreelist.pop_back();
-    CHECK(me->event != nullptr);
-    CHECK(me->refcount == 0);
-    return MemoryEventHandle(me, &memoryEventFreelist);
-  }
+  // MemoryEventHandle getMemoryEvent() {
+  //   if (memoryEventFreelist.empty()) {
+  //     memlog.debug("allocate new memory events!\n");
+  //     for (size_t i = 0; i != 0x1000; ++i) {
+  //       MemoryEvent* me = memoryEventAllocator.allocate();
+  //       CHECK_CU(cuEventCreate(&me->event, CU_EVENT_DISABLE_TIMING));
+  //       memoryEventFreelist.push_back(me);
+  //     }
+  //   }
+  //   MemoryEvent* me = memoryEventFreelist.back();
+  //   memoryEventFreelist.pop_back();
+  //   CHECK(me->event != nullptr);
+  //   CHECK(me->refcount == 0);
+  //   return MemoryEventHandle(me, &memoryEventFreelist);
+  // }
 };
 
 // CudaAllocatorImpl& cudaAllocImpl = *new CudaAllocatorImpl();
@@ -902,7 +1014,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       }
     }
 
-    constexpr size_t alignment = 0x1000;
+    constexpr size_t alignment = 0x80;
     size_t alignedbytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
     CUstream stream = c10::cuda::getCurrentCUDAStream();
     memlog.debug("trying to allocate %d bytes on stream %#x\n", alignedbytes, (uintptr_t)stream);
