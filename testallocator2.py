@@ -42,12 +42,12 @@ for i in range(4):
     with torch.cuda.stream(s0):
         for _ in range(32):
             f()
-    with torch.cuda.stream(s1):
-        for _ in range(32):
-            f()
-    with torch.cuda.stream(s2):
-        for _ in range(32):
-            f()
+    # with torch.cuda.stream(s1):
+    #     for _ in range(32):
+    #         f()
+    # with torch.cuda.stream(s2):
+    #     for _ in range(32):
+    #         f()
 
     torch.cuda.synchronize()
     print(time.time() - start)

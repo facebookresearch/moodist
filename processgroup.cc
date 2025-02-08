@@ -51,33 +51,6 @@ std::vector<ProcessGroupImpl*>& activeProcessGroups = *new std::vector<ProcessGr
 std::once_flag freeMemoryCallbackOnceFlag;
 void registerFreeMemoryCallback();
 
-std::once_flag globalInitFlag;
-void globalInit() {
-  const char* logLevel = std::getenv("MOODIST_LOG_LEVEL");
-  if (logLevel) {
-    std::string s = logLevel;
-    for (auto& c : s) {
-      c = std::toupper(c);
-    }
-    if (s == "NONE") {
-      currentLogLevel = LOG_NONE;
-    } else if (s == "ERROR") {
-      currentLogLevel = LOG_ERROR;
-    } else if (s == "INFO") {
-      currentLogLevel = LOG_INFO;
-    } else if (s == "VERBOSE") {
-      currentLogLevel = LOG_VERBOSE;
-    } else if (s == "DEBUG") {
-      currentLogLevel = LOG_DEBUG;
-    } else {
-      currentLogLevel = (LogLevel)std::atoi(logLevel);
-    }
-    if (currentLogLevel < LOG_ERROR) {
-      currentLogLevel = LOG_ERROR;
-    }
-  }
-}
-
 // Work objects can outlive ProcessGroupImpl and hold a pointer to WorkStream.
 // A proper solution would be to hold a shared_ptr to WorkStreams in Work.
 // Instead, we intentionally leak WorkStreams objects through a circular std::shared_ptr.
@@ -135,7 +108,7 @@ struct ProcessGroupImpl {
   std::shared_ptr<Group> group;
 
   ThreadUnsafe threadUnsafe;
-  uint32_t nextStepValue = 1;
+  uint32_t nextStepValue = 0x1000;
   uint32_t nextConcurrencyIndex = 0;
 
   HashMap<CUstream, std::shared_ptr<WorkStreams>> workStreams;
@@ -149,7 +122,7 @@ struct ProcessGroupImpl {
 
     scheduler.setMaxThreads(1);
 
-    std::call_once(globalInitFlag, &globalInit);
+    log.init();
 
     group = std::make_shared<Group>(rank, size);
 
@@ -239,7 +212,7 @@ struct ProcessGroupImpl {
     CHECK_CU(cuCtxPushCurrent(group->cuContext));
     CHECK_CU(cuCtxSynchronize());
     std::memset(group->mySharedMem, 0, group->mySharedMemSize);
-    nextStepValue = 1 + 0x1000;
+    nextStepValue = 0x1000;
     for (auto& a : group->buffersToReset) {
       auto& buffer = a->buffer;
       if (buffer.hostAllocated || buffer.numaAllocated) {
@@ -1643,6 +1616,74 @@ struct ProcessGroupImpl {
 
     fatal("cuda gather is not yet supported :(");
   }
+
+  TensorDataPtr getTensorData(const torch::Tensor& tensor) {
+    TensorDataPtr td = TensorDataPtr::make();
+
+    td->dtype = (int)tensor.dtype().toScalarType();
+    const auto& shape = tensor.sizes();
+    td->shape.resize(shape.size());
+    for (size_t i = 0; i != td->shape.size(); ++i) {
+      td->shape[i] = shape[i];
+    }
+
+    uintptr_t tensorAddress = (uintptr_t)(const void*)tensor.data_ptr();
+
+    if (tensorAddress == 0) {
+      throw std::runtime_error("getTensorData: got a null tensor");
+    }
+
+    td->dataPtr = tensorAddress;
+    td->dataBytes = td->itemsize() * td->numel();
+
+    if (tensor.is_cpu()) {
+      if (cpu_allocator::owns(tensorAddress)) {
+        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)tensor.storage().data());
+        CHECK(handle != nullptr);
+        td->buffer = std::move(handle);
+      } else {
+        td->buffer = AllocatedCpuBufferSharedPtr::make();
+        *td->buffer = group->allocateCpu(td->dataBytes);
+        td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
+        std::memcpy((void*)td->data(), (void*)tensorAddress, td->bytes());
+
+        CHECK(cpu_allocator::owns(td->data()));
+      }
+    } else {
+      td->isCuda = true;
+    }
+
+    return td;
+  }
+
+  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    auto future = FutureImplSharedPtr::make();
+
+    StreamData& sd = group->getStreamData(nullptr);
+    QueueEntryCat* e = group->cpuThread->freelistCat.pop();
+    e->task = taskCat;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->locals.resize(locals.size());
+    for (size_t i = 0; i != locals.size(); ++i) {
+      e->locals[i] = {locals[i].first, getTensorData(locals[i].second)};
+    }
+    e->future = future;
+    group->cpuThread->enqueue(e);
+
+    Future r;
+    r.impl = std::move(future);
+    return r;
+  }
 };
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
@@ -1882,4 +1923,72 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
     throw std::runtime_error("cpu reduce is not currently supported :(");
   }
 }
+
+// c10::intrusive_ptr<Work> ProcessGroup::scatter(
+//     std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
+//     const c10d::ScatterOptions& opts) {
+//     CHECK(outputTensors.size() == 1);
+//   if (getRank() == opts.rootRank) {
+//     CHECK(inputTensors.size() == getSize());
+
+//     for (size_t i = 0; i != inputTensors.size(); ++i) {
+
+//     }
+//     outputTensors[0].copy_(inputTensors[getRank()][0]);
+//   } else {
+//   }
+
+//   auto& input = inputTensors[0];
+//   auto& output = outputTensors[0];
+//   int64_t inputNumel = input.numel();
+//   TORCH_CHECK(inputNumel > 0);
+//   bool isCuda = tensor.is_cuda();
+//   CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
+//   WorkStream* w = nullptr;
+//   if (isCuda) {
+//     w = impl->getWorkStream(stream);
+//     CHECK_CU(cuEventRecord(w->event, stream));
+//     CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
+//     stream = w->stream;
+//   }
+//   auto t = tensor.view({(int64_t)impl->size, -1});
+//   auto o = t[impl->rank];
+//   impl->reduce_scatter(o, t, opts.reduceOp, stream);
+//   impl->all_gather(t, o, stream);
+//   if (w) {
+//     CHECK(stream == w->stream);
+//     tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
+//     CHECK_CU(cuEventRecord(w->event, w->stream));
+//   }
+
+//   return c10::make_intrusive<WorkImpl>(tensors, w);
+// }
+
+std::shared_ptr<Queue> ProcessGroup::makeQueue(int location) {
+  return moodist::makeQueue(impl->group, location);
+}
+
+std::shared_ptr<Queue> ProcessGroup::makeQueue(std::vector<int> location) {
+  return moodist::makeQueue(impl->group, location);
+}
+
+Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
+  return impl->cat(locals);
+}
+
+Future::Future() {}
+Future::~Future() {}
+void Future::wait() {
+  while (impl->done == 0) {
+    futexWait(&impl->done, 0, std::chrono::seconds(1));
+  }
+}
+torch::Tensor Future::result() {
+  wait();
+  if (impl->result == nullptr) {
+    throw std::runtime_error("result has already been called on this Future - it cannot be called twice");
+  }
+  return makeTensor(std::move(impl->result));
+}
+
 } // namespace moodist

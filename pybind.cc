@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <c10/cuda/CUDAStream.h>
 #include <pybind11/chrono.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
@@ -16,6 +17,48 @@
 namespace moodist {
 bool profilingEnabled = false;
 void enableCudaAllocator();
+void enableCpuAllocator();
+void cpuAllocatorDebug();
+
+namespace {
+SpinMutex registerMutex;
+HashMap<uintptr_t, size_t> registered;
+
+void ensureRegistered(uintptr_t address) {
+  auto region = cpu_allocator::regionAt(address);
+  if (region.first) {
+    std::lock_guard l(registerMutex);
+    auto& s = registered[region.first];
+    if (s != region.second) {
+      CHECK(region.second > s);
+      CHECK_CU(cuMemHostRegister((void*)(region.first + s), (region.second - s), 0));
+      s = region.second;
+    }
+  }
+}
+
+void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
+  CHECK(dst.is_contiguous());
+  CHECK(src.is_contiguous());
+  size_t srcbytes = src.itemsize() * src.numel();
+  size_t dstbytes = dst.itemsize() * src.numel();
+  if (srcbytes != dstbytes) {
+    throw std::runtime_error(fmt::sprintf("cuda_copy: dst is %d bytes, but src is %d bytes", dstbytes, srcbytes));
+  }
+  uintptr_t dstAddress = (uintptr_t)(void*)dst.mutable_data_ptr();
+  uintptr_t srcAddress = (uintptr_t)(const void*)src.const_data_ptr();
+  if (dst.is_cpu()) {
+    ensureRegistered(dstAddress);
+  }
+  if (src.is_cpu()) {
+    ensureRegistered(srcAddress);
+  }
+  CUstream stream = c10::cuda::getCurrentCUDAStream();
+  CHECK_CU(cuMemcpyAsync(dstAddress, srcAddress, dstbytes, stream));
+}
+
+} // namespace
+
 } // namespace moodist
 
 namespace py = pybind11;
@@ -27,10 +70,39 @@ PYBIND11_MODULE(_C, m) {
       m, "MoodistProcessGroup", R"d(
     A moodist process group :D
   )d")
-      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>());
+      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "Queue", py::overload_cast<int>(&MoodistProcessGroup::makeQueue), py::arg("location"),
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "Queue", py::overload_cast<std::vector<int>>(&MoodistProcessGroup::makeQueue), py::arg("location"),
+          py::call_guard<py::gil_scoped_release>())
+      .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>());
+
+  py::class_<moodist::Future>(m, "Future")
+      .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())
+      .def("result", &moodist::Future::result, py::call_guard<py::gil_scoped_release>());
+
   m.def("enable_profiling", [](bool b) {
     printf("enable profiling -> %d\n", b);
     moodist::profilingEnabled = b;
   });
   m.def("enable_cuda_allocator", &moodist::enableCudaAllocator);
+  m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
+  m.def("cpu_allocator_debug", &moodist::cpuAllocatorDebug);
+
+  m.def("cuda_copy", &moodist::cudaCopy, py::call_guard<py::gil_scoped_release>());
+
+  py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
+      .def(
+          "put", &moodist::Queue::put, py::arg("tensor"), py::arg("transaction"),
+          py::call_guard<py::gil_scoped_release>())
+      .def("get", &moodist::Queue::get, py::arg("block"), py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
+      .def("qsize", &moodist::Queue::qsize, py::call_guard<py::gil_scoped_release>())
+      .def("wait", &moodist::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
+      .def("transaction_begin", &moodist::Queue::transactionBegin, py::call_guard<py::gil_scoped_release>())
+      .def("transaction_cancel", &moodist::Queue::transactionCancel, py::call_guard<py::gil_scoped_release>())
+      .def("transaction_commit", &moodist::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>());
+  py::class_<moodist::QueueWork>(m, "QueueWork")
+      .def("wait", &moodist::QueueWork::wait, py::call_guard<py::gil_scoped_release>());
 }

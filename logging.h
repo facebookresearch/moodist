@@ -46,6 +46,33 @@ template<typename... Args>
   fflush(ftarget);
 }
 
+inline std::once_flag loggingInitFlag;
+inline void loggingInit() {
+  const char* logLevel = std::getenv("MOODIST_LOG_LEVEL");
+  if (logLevel) {
+    std::string s = logLevel;
+    for (auto& c : s) {
+      c = std::toupper(c);
+    }
+    if (s == "NONE") {
+      currentLogLevel = LOG_NONE;
+    } else if (s == "ERROR") {
+      currentLogLevel = LOG_ERROR;
+    } else if (s == "INFO") {
+      currentLogLevel = LOG_INFO;
+    } else if (s == "VERBOSE") {
+      currentLogLevel = LOG_VERBOSE;
+    } else if (s == "DEBUG") {
+      currentLogLevel = LOG_DEBUG;
+    } else {
+      currentLogLevel = (LogLevel)std::atoi(logLevel);
+    }
+    if (currentLogLevel < LOG_ERROR) {
+      currentLogLevel = LOG_ERROR;
+    }
+  }
+}
+
 inline struct Log {
   template<typename... Args>
   void error(const char* fmt, Args&&... args) {
@@ -71,6 +98,10 @@ inline struct Log {
       [[unlikely]];
       logat(LOG_DEBUG, fmt, std::forward<Args>(args)...);
     }
+  }
+
+  void init() {
+    std::call_once(loggingInitFlag, &loggingInit);
   }
 } log;
 

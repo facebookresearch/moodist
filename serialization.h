@@ -9,8 +9,8 @@
 
 #include "buffer.h"
 #include "hash_map.h"
-#include "vector.h"
 #include "simple_vector.h"
+#include "vector.h"
 
 #include <cstddef>
 #include <cstring>
@@ -214,9 +214,7 @@ struct Serializer {
     return (std::byte*)((uintptr_t)dst + len);
   }
   std::byte* write(OpWrite, std::byte* dst, const void* src, size_t len) {
-    if (src) {
-      std::memcpy(dst, src, len);
-    }
+    std::memcpy(dst, src, len);
     return dst + len;
   }
   template<typename Op, typename T, std::enable_if_t<std::is_trivial_v<T>>* = nullptr>

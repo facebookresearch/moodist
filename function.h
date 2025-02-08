@@ -67,7 +67,7 @@ struct TemplatedStorage : Storage {
     }
   }
   static void push(TemplatedStorage* storage) {
-    FreeList<TemplatedStorage>::push(storage, std::max((size_t)65536 / sizeof(TemplatedStorage), (size_t)64));
+    FreeList<TemplatedStorage>::push(storage, std::min(std::max((size_t)16384 / sizeof(TemplatedStorage), (size_t)8), (size_t)1024));
   }
 };
 

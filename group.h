@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "hash_map.h"
+#include "logging.h"
 #include "simple_vector.h"
 #include "vector.h"
 #include <ATen/core/ATen_fwd.h>
@@ -39,13 +40,18 @@ struct alignas(64) CpuAddresses {
   size_t bytes;
 };
 
-struct alignas(128) DynamicAddresses {
+struct DynamicAddressesNoKeys {
   uint32_t stepValue;
   uint32_t opType;
   uintptr_t gatherAddress;
   size_t gatherBytes;
+};
+
+struct DynamicAddressesBase : DynamicAddressesNoKeys {
   std::array<uint32_t, maxDevices> gatherKey;
 };
+
+struct alignas(128) DynamicAddresses : DynamicAddressesBase {};
 static_assert(sizeof(DynamicAddresses) <= 128);
 
 struct alignas(64) CpuDynamicAddresses {
@@ -107,7 +113,7 @@ struct Group {
   std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
-  std::unique_ptr<CpuThread> cpuThread;
+  CpuThread* cpuThread = nullptr;
 
   AllocatedArray cpuOutBuffer;
   AllocatedArray cpuInBuffer;
@@ -223,11 +229,14 @@ struct Group {
   std::atomic_size_t bytesHost = 0;
 
   void reportBytes() {
+    if (currentLogLevel < LOG_VERBOSE) {
+      return;
+    }
     size_t m = bytesManaged;
     size_t d = bytesDevice;
     size_t h = bytesHost;
     double div = 1024 * 1042 * 1024;
-    log.info(
+    log.verbose(
         "Bytes managed: %d (%gG)\nBytes device: %d (%gG)\nBytes host: %d (%gG)\n", m, m / div, d, d / div, h, h / div);
   }
 
@@ -244,6 +253,11 @@ struct Group {
     cachedTrees[index] = std::move(p);
     return r;
   }
+
+  std::mutex cudaUint32Mutex;
+  std::vector<AllocatedBuffer> cudaUint32List;
+  size_t cudaUint32Offset = 0;
+  uintptr_t getNextCudaUint32();
 };
 
 template<typename T, size_t poolSize = 0x1000>

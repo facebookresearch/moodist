@@ -1,6 +1,7 @@
 #pragma once
 
 #include "async.h"
+#include "cpu_allocator.h"
 #include "logging.h"
 
 #include "fmt/printf.h"
@@ -154,20 +155,26 @@ struct AllocatedCpuBuffer {
   size_t bytes = 0;
 
   AllocatedCpuBuffer() = default;
+  AllocatedCpuBuffer(const AllocatedBuffer&) = delete;
   AllocatedCpuBuffer(AllocatedCpuBuffer&& n) noexcept {
     *this = std::move(n);
   }
-
+  AllocatedCpuBuffer& operator=(const AllocatedCpuBuffer&) = delete;
   AllocatedCpuBuffer& operator=(AllocatedCpuBuffer&& n) noexcept {
     std::swap(cpuPointer, n.cpuPointer);
     std::swap(bytes, n.bytes);
     return *this;
   }
 
-  ~AllocatedCpuBuffer() {
+  void clear() {
     if (cpuPointer) {
-      numa_free(cpuPointer, bytes);
+      cpu_allocator::moo_free(cpuPointer);
+      cpuPointer = nullptr;
     }
+  }
+
+  ~AllocatedCpuBuffer() {
+    clear();
   }
 };
 
@@ -364,5 +371,219 @@ struct Stream {
     return r;
   }
 };
+
+template<typename T, size_t maxThreadLocalEntries = 0x40>
+struct FLPtr {
+  struct Storage {
+    Storage* next;
+    T object;
+
+    template<typename... Args>
+    Storage(Args&&... args) : object(std::forward<Args>(args)...) {}
+
+    void clear() {
+      object.clear();
+    }
+  };
+  Storage* ptr = nullptr;
+  FLPtr(std::nullptr_t) {}
+  FLPtr() = default;
+  ~FLPtr() {
+    if (ptr) {
+      ptr->clear();
+      FreeList<Storage>::push(ptr, maxThreadLocalEntries);
+      ptr = nullptr;
+    }
+  }
+  FLPtr(const FLPtr&) = delete;
+  FLPtr& operator=(const FLPtr&) = delete;
+  FLPtr(FLPtr&& n) {
+    ptr = std::exchange(n.ptr, nullptr);
+  }
+  static FLPtr make() {
+    Storage* ptr = FreeList<Storage>::pop();
+    if (!ptr) [[unlikely]] {
+      ptr = new (cpu_allocator::moo_alloc(sizeof(Storage))) Storage();
+      ptr->clear();
+    }
+    FLPtr r;
+    r.ptr = ptr;
+    return r;
+  }
+  FLPtr& operator=(FLPtr&& n) {
+    std::swap(ptr, n.ptr);
+    return *this;
+  }
+  operator T&() const {
+    return ptr->object;
+  }
+  T& operator*() const {
+    return ptr->object;
+  }
+  T* operator->() const {
+    return &ptr->object;
+  }
+
+  bool operator!=(std::nullptr_t) const {
+    return ptr != nullptr;
+  }
+  bool operator==(std::nullptr_t) const {
+    return ptr == nullptr;
+  }
+};
+
+template<typename T, size_t maxThreadLocalEntries = 0x100>
+struct FLSharedPtr {
+  struct Storage {
+    Storage* next;
+    std::atomic_size_t refcount = 0;
+    T object;
+
+    template<typename... Args>
+    Storage(Args&&... args) : object(std::forward<Args>(args)...) {}
+
+    void clear() {
+      object.clear();
+    }
+  };
+  Storage* ptr = nullptr;
+  FLSharedPtr(std::nullptr_t) {}
+  FLSharedPtr() = default;
+  ~FLSharedPtr() {
+    if (ptr && --ptr->refcount == 0) {
+      ptr->clear();
+      FreeList<Storage>::push(ptr, maxThreadLocalEntries);
+      ptr = nullptr;
+    }
+  }
+  FLSharedPtr(const FLSharedPtr& n) {
+    ptr = n.ptr;
+    if (ptr) {
+      ++ptr->refcount;
+    }
+  }
+  FLSharedPtr& operator=(const FLSharedPtr& n) {
+    ptr = n.ptr;
+    if (ptr) {
+      ++ptr->refcount;
+    }
+    return *this;
+  }
+  FLSharedPtr(FLSharedPtr&& n) {
+    ptr = std::exchange(n.ptr, nullptr);
+  }
+  static FLSharedPtr make() {
+    Storage* ptr = FreeList<Storage>::pop();
+    if (!ptr) [[unlikely]] {
+      ptr = new (cpu_allocator::moo_alloc(sizeof(Storage))) Storage();
+      ptr->clear();
+    }
+    CHECK(ptr->refcount == 0);
+    ptr->refcount = 1;
+    FLSharedPtr r;
+    r.ptr = ptr;
+    return r;
+  }
+  FLSharedPtr& operator=(FLSharedPtr&& n) {
+    std::swap(ptr, n.ptr);
+    return *this;
+  }
+  operator T&() const {
+    return ptr->object;
+  }
+  T& operator*() const {
+    return ptr->object;
+  }
+  T* operator->() const {
+    return &ptr->object;
+  }
+
+  bool operator!=(std::nullptr_t) const {
+    return ptr != nullptr;
+  }
+  bool operator==(std::nullptr_t) const {
+    return ptr == nullptr;
+  }
+};
+
+using AllocatedCpuBufferSharedPtr = FLSharedPtr<AllocatedCpuBuffer>;
+
+struct TensorData {
+  AllocatedCpuBufferSharedPtr buffer;
+  uintptr_t dataPtr;
+  size_t dataBytes;
+  int dtype;
+  std::vector<int64_t> shape;
+  bool isCuda;
+
+  void clear() {
+    buffer = {};
+    dtype = -1;
+    shape.clear();
+    dataPtr = 0;
+    dataBytes = 0;
+    isCuda = false;
+  }
+
+  uintptr_t data() {
+    return dataPtr;
+  }
+  size_t bytes() {
+    return dataBytes;
+  }
+  size_t itemsize() {
+    return torch::elementSize(((torch::ScalarType)dtype));
+  }
+  size_t numel() {
+    size_t r = 1;
+    for (int64_t n : shape) {
+      r *= n;
+    }
+    return r;
+  }
+};
+
+using TensorDataPtr = FLPtr<TensorData>;
+using TensorDataSharedPtr = FLSharedPtr<TensorData>;
+
+namespace cpu_allocator {
+AllocatedCpuBufferSharedPtr getCpuBuffer(uintptr_t address);
+void refCpuBuffer(AllocatedCpuBufferSharedPtr ptr);
+void derefCpuBuffer(uintptr_t address);
+} // namespace cpu_allocator
+
+inline torch::Tensor makeTensor(TensorDataPtr ptr) {
+  torch::Device device(torch::kCPU);
+
+  CHECK(ptr != nullptr);
+
+  CHECK(!ptr->isCuda);
+
+  cpu_allocator::refCpuBuffer(ptr->buffer);
+
+  TensorData* td = &*ptr;
+
+  CHECK(td->data() != 0);
+
+  Function<void()> f = [ptr = std::move(ptr)]() mutable { cpu_allocator::derefCpuBuffer(ptr->data()); };
+  auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
+  auto data = torch::DataPtr((void*)td->data(), (void*)f.release(), deleter, device);
+
+  torch::Storage storage(torch::Storage::use_byte_size_t(), td->bytes(), std::move(data), nullptr, false);
+  return torch::empty({0}, torch::TensorOptions((torch::ScalarType)td->dtype).device(device))
+      .set_(std::move(storage), 0, td->shape);
+}
+
+struct FutureImpl {
+  TensorDataPtr result;
+  std::atomic_uint32_t done = 0;
+  // WorkCudaDonePtr cudaDone = nullptr;
+  void clear() {
+    result = nullptr;
+    done = 0;
+  }
+};
+
+using FutureImplSharedPtr = FLSharedPtr<FutureImpl>;
 
 } // namespace moodist

@@ -1,4 +1,7 @@
 
+#include "common.h"
+#include "queue.h"
+
 #include <torch/torch.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -10,6 +13,17 @@
 namespace moodist {
 
 struct ProcessGroupImpl;
+
+struct FutureImpl;
+struct Future {
+  FutureImplSharedPtr impl;
+  Future();
+  ~Future();
+  Future(const Future&) = delete;
+  Future(Future&&) = default;
+  void wait();
+  torch::Tensor result();
+};
 
 using Work = c10d::Work;
 
@@ -98,6 +112,11 @@ public:
   c10::intrusive_ptr<Work> recvAnysource(std::vector<at::Tensor>& tensors, int tag) override {
     TORCH_CHECK(false, "recvAnysource not supported");
   }
+
+  std::shared_ptr<Queue> makeQueue(int location);
+  std::shared_ptr<Queue> makeQueue(std::vector<int> location);
+
+  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
 };
 
 } // namespace moodist

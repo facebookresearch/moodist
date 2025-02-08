@@ -3,6 +3,8 @@
 #include "async.h"
 #include "clock.h"
 #include "common.h"
+#include "cpu_allocator.h"
+#include "fmt/printf.h"
 #include "freelist.h"
 #include "group.h"
 #include "hash_map.h"
@@ -10,11 +12,11 @@
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
 #include "parameters.h"
+#include "queue.h"
 #include "reduce_scatter.h"
+#include "serialization.h"
 #include "setup_comms.h"
 #include "simple_vector.h"
-
-#include "fmt/printf.h"
 #include "synchronization.h"
 
 #include <atomic>
@@ -24,6 +26,7 @@
 #include <memory>
 #include <numa.h>
 #include <random>
+#include <torch/types.h>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -60,6 +63,7 @@ struct Device {
   ibv_cq* cq;
   size_t currentCqEntries = 0;
   bool efa;
+  size_t numCqEvents = 0;
 };
 
 struct Callback {
@@ -187,28 +191,56 @@ struct CpuReductions {
   }
 };
 
+std::atomic_int nextThreadId;
+thread_local int currentThreadId = ++nextThreadId;
+
+template<typename T>
+struct MTList {
+  std::atomic_size_t n = 0;
+  SpinMutex mutex;
+  std::vector<T> list;
+
+  template<typename U>
+  void push(U&& u) {
+    std::lock_guard l(mutex);
+    list.push_back(std::forward<U>(u));
+    ++n;
+  }
+  void clear() {
+    std::lock_guard l(mutex);
+    list.clear();
+    n = 0;
+  }
+};
+
+template<typename T>
+struct MTHandle {
+  std::optional<T> obj;
+  MTList<T>* list;
+  MTHandle() = default;
+  MTHandle(T&& n, MTList<T>& list) : obj(std::move(n)), list(&list) {}
+  MTHandle(MTHandle&& n) = default;
+  ~MTHandle() {
+    if (list) {
+      list->push(*std::move(obj));
+    }
+  }
+};
+
 struct TemporaryBufferHandle {
   AllocatedCpuBuffer buffer;
   MemoryRegistration* mr = nullptr;
-  Vector<TemporaryBufferHandle>* container = nullptr;
   TemporaryBufferHandle() = default;
-  TemporaryBufferHandle(AllocatedCpuBuffer buffer, MemoryRegistration* mr, Vector<TemporaryBufferHandle>* container)
-      : buffer(std::move(buffer)), mr(mr), container(container) {}
+  TemporaryBufferHandle(AllocatedCpuBuffer buffer, MemoryRegistration* mr) : buffer(std::move(buffer)), mr(mr) {}
   TemporaryBufferHandle(TemporaryBufferHandle&& n) {
     *this = std::move(n);
   }
   TemporaryBufferHandle& operator=(TemporaryBufferHandle&& n) {
     std::swap(buffer, n.buffer);
     std::swap(mr, n.mr);
-    std::swap(container, n.container);
     return *this;
   }
-  ~TemporaryBufferHandle() {
-    if (container) {
-      auto* container = std::exchange(this->container, nullptr);
-      container->push_back(std::move(*this));
-    }
-  }
+  ~TemporaryBufferHandle() {}
   AllocatedCpuBuffer& operator*() {
     return buffer;
   }
@@ -253,6 +285,7 @@ struct CpuThreadImpl {
     CHECK(devices.size() <= maxDevices);
   }
   ~CpuThreadImpl() {
+    destroyReceives();
     dead = true;
   }
 
@@ -261,10 +294,13 @@ struct CpuThreadImpl {
 
   static constexpr size_t maxWr = IbCommon::maxWr;
   static constexpr size_t maxCqEntries = IbCommon::maxCqEntries;
+  static constexpr size_t maxSrqEntries = IbCommon::maxSrqEntries;
 
   SetupComms* setupComms = &*group->setupComms;
   SimpleVector<Device> devices = initDevices();
   IntrusiveList<Device, &Device::link> activeDevices;
+
+  MTList<TemporaryBufferHandle> returnedTemporaryBufferHandles;
 
   size_t bytesWritten = 0;
   size_t bytesRead = 0;
@@ -293,7 +329,8 @@ struct CpuThreadImpl {
   std::vector<RemoteAddressAndKey> remoteCudaStepValuesDeviceChunks = distributeAddressAndKeys(
       group->cudaStepValuesDeviceChunksBuffer.buffer.cudaPointer, cudaStepValuesDeviceChunksMr);
 
-  AllocatedArray internalInStepValueBuffer = group->allocateArrayHost(sizeof(uint32_t) * size, Group::maxConcurrency);
+  AllocatedArray internalInStepValueBuffer =
+      group->allocateArrayHost(sizeof(uint32_t) * 2 * size, Group::maxConcurrency);
   MemoryRegistration* internalInStepValueBufferMr =
       regMr((uintptr_t)internalInStepValueBuffer.buffer.cpuPointer, internalInStepValueBuffer.buffer.bytes);
   std::vector<RemoteAddressAndKey> remoteInternalInStepValueBuffer =
@@ -417,62 +454,14 @@ struct CpuThreadImpl {
     return cpuStepValuesDeviceChunks[stepValueDeviceChunkIndex(concurrencyIndex, index, device, chunk)];
   }
 
-  Vector<TemporaryBufferHandle> vmreadBuffers;
-  Vector<TemporaryBufferHandle> sendRecvBuffers;
-  Vector<TemporaryBufferHandle> allGatherInputBuffers;
-  Vector<TemporaryBufferHandle> allGatherOutputBuffers;
-  Vector<TemporaryBufferHandle> broadcastBuffers;
-
-  TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes, Vector<TemporaryBufferHandle>& container) {
-    for (size_t i = container.size(); i;) {
-      --i;
-      auto& v = container[i];
-      if (v->bytes >= bytes) {
-        auto h = std::move(v);
-        container.erase(container.begin() + i);
-        h.container = &container;
-        return h;
-      }
-    }
+  TemporaryBufferHandle allocateTemporaryBuffer(size_t bytes) {
+    // CHECK(bytes != 0);
     auto buffer = group->allocateCpu(bytes);
-    auto* mr = regMr((uintptr_t)buffer.cpuPointer, buffer.bytes);
-    return TemporaryBufferHandle(std::move(buffer), mr, &container);
-    //  todo: this isn't good enough, for now never free memory.
-    //        the problem is we need to de-register when we free memory,
-    //        as we don't have a buffer id like with cuda memory,
-    //        but it's tricky because of the extra regs we do due to
-    //        efa 2gb bug. this code could just iterate over all regs
-    //        and free the ones in the region when we reallocate,
-    //        but for now let's just do the above (never free).
-    // if (container.empty()) {
-    //   auto buffer = group->allocateCpu(bytes);
-    //   auto* mr = regMr((uintptr_t)buffer.cpuPointer, buffer.bytes);
-    //   return TemporaryBufferHandle(std::move(buffer), mr, &container);
-    // }
-    // auto handle = std::move(container.back());
-    // container.pop_back();
-    // if (handle->bytes < bytes) {
-    //   CHECK(false);
-    //   auto i = mrMap.find((uintptr_t)handle->cpuPointer);
-    //   if (i != mrMap.end()) {
-    //     mrMap.erase(i);
-    //   }
-    //   for (size_t i = 0; i != devices.size(); ++i) {
-    //     if (handle.mr->mrs[i]) {
-    //       for (auto& v : localMrs) {
-    //         if (&*v == handle.mr->mrs[i]) {
-    //           localMrs.erase(localMrs.begin() + (&v - localMrs.data()));
-    //           break;
-    //         }
-    //       }
-    //       //ibv_dereg_mr(handle.mr->mrs[i]);
-    //     }
-    //   }
-    //   handle.buffer = group->allocateCpu(bytes);
-    //   handle.mr = regMr((uintptr_t)handle->cpuPointer, handle->bytes);
-    // }
-    // handle.container = &container;
-    // return std::move(handle);
+    // auto region = cpu_allocator::regionAt(buffer.cpuPointer);
+    // CHECK(region.first != 0);
+    // auto* mr = regMr(region.first, region.second);
+    auto* mr = regMr((uintptr_t)buffer.cpuPointer, bytes);
+    return TemporaryBufferHandle(std::move(buffer), mr);
   }
 
   SimpleVector<Device> initDevices() {
@@ -510,6 +499,7 @@ struct CpuThreadImpl {
         if (wc.status) {
           fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode, wc.wr_id);
         } else {
+          CHECK(dev.currentCqEntries != 0);
           --dev.currentCqEntries;
           if (dev.currentCqEntries == 0) {
             activeDevices.erase(dev);
@@ -531,7 +521,7 @@ struct CpuThreadImpl {
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback = nullptr) {
     CHECK(i >= 0 && i < size);
-    CHECK(i != rank);
+    // CHECK(i != rank);
     auto post = [&]() {
       ibv_sge sge;
       sge.addr = (uintptr_t)localAddress;
@@ -568,7 +558,11 @@ struct CpuThreadImpl {
       qp->wr_id = (uint64_t)(void*)callback;
       qp->wr_flags = IBV_SEND_SIGNALED;
       ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-      ibv_wr_set_sge_list(qp, 1, &sge);
+      if (bytes <= 32) {
+        ibv_wr_set_inline_data(qp, localAddress, bytes);
+      } else {
+        ibv_wr_set_sge_list(qp, 1, &sge);
+      }
 
       if (efa) {
         ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
@@ -603,7 +597,7 @@ struct CpuThreadImpl {
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback = nullptr) {
     CHECK(i >= 0 && i < size);
-    CHECK(i != rank);
+    // CHECK(i != rank);
     auto post = [&]() {
       ibv_sge sge;
       sge.addr = (uintptr_t)localAddress;
@@ -708,6 +702,9 @@ struct CpuThreadImpl {
     ibv_wr_start(qp);
     qp->wr_id = (uint64_t)(void*)&concurrencyLiveControlTransfers[concurrencyIndex] | 1;
     qp->wr_flags = IBV_SEND_SIGNALED;
+    // if (bytes <= 32) {
+    //   qp->wr_flags |= IBV_SEND_INLINE;
+    // }
     ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
     ibv_wr_set_sge_list(qp, 1, &sge);
 
@@ -720,13 +717,245 @@ struct CpuThreadImpl {
     }
   }
 
+  void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback = nullptr) {
+    CHECK(i >= 0 && i < size);
+    // CHECK(i != rank);
+    ibv_sge sge;
+    sge.addr = (uintptr_t)localAddress;
+    sge.length = bytes;
+    sge.lkey = lkey;
+
+    bytesWritten += bytes;
+
+    if (callback) {
+      ++callback->refcount;
+    }
+
+    while (dev.currentCqEntries == maxCqEntries) {
+      poll();
+    }
+    ++dev.currentCqEntries;
+    if (dev.currentCqEntries == 1) {
+      activeDevices.push_back(dev);
+    }
+
+    // log.info(
+    //     "%d: post send %d bytes (%p lkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress, lkey, &dev -
+    //     devices.data(), i);
+
+    ibv_qp_ex* qp = dev.ib->qpex;
+    bool efa = qp != nullptr;
+    if (!efa) {
+      qp = dev.ib->qpexs[i];
+      CHECK(qp != nullptr);
+    }
+
+    ibv_wr_start(qp);
+    qp->wr_id = (uint64_t)(void*)callback;
+    qp->wr_flags = IBV_SEND_SIGNALED;
+    // ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
+    ibv_wr_send(qp);
+    ibv_wr_set_sge_list(qp, 1, &sge);
+
+    if (efa) {
+      ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
+    }
+    int error = ibv_wr_complete(qp);
+    if (error) {
+      fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
+    }
+  }
+
+  void postRecv(Device& dev, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback = nullptr) {
+    ibv_sge sge;
+    sge.addr = (uintptr_t)localAddress;
+    sge.length = bytes;
+    sge.lkey = lkey;
+
+    bytesWritten += bytes;
+
+    if (callback) {
+      ++callback->refcount;
+    }
+
+    // while (dev.currentCqEntries == maxCqEntries) {
+    //   poll();
+    // }
+    // ++dev.currentCqEntries;
+    // if (dev.currentCqEntries == 1) {
+    //   activeDevices.push_back(dev);
+    // }
+
+    // log.info("%d: post recv %d bytes (%p lkey %#x) (dev %d)\n", rank, bytes, localAddress, lkey, &dev -
+    // devices.data());
+
+    CHECK(dev.ib->sharedReceiveQueue != nullptr);
+
+    ibv_recv_wr wr;
+    wr.wr_id = (uint64_t)(void*)callback;
+    wr.next = nullptr;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    ibv_recv_wr* badWr = nullptr;
+    int error = ibv_post_srq_recv(dev.ib->sharedReceiveQueue, &wr, &badWr);
+    if (error) {
+      fatal("ibv_post_srq_recv failed with error %d: %s\n", error, std::strerror(error));
+    }
+  }
+
+  void readDataDistributed(
+      size_t i, void* localAddress, const std::array<uint32_t, maxDevices>& lkeys, void* remoteAddress,
+      const std::array<uint32_t, maxDevices>& rkeys, size_t bytes, Callback* callback = nullptr) {
+    size_t numDevices = std::min((bytes + 262143) / 262144, std::max((size_t)4, group->numTrueIbDevs));
+    size_t numChunks = numDevices;
+    size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    CHECK(devices.size() >= numDevices);
+    for (size_t di = 0; di != devices.size(); ++di) {
+      auto& dev = devices[di];
+      size_t offset = chunkSize * di;
+      size_t n = std::min(bytes - offset, chunkSize);
+      readData(
+          dev, i, (void*)((uintptr_t)localAddress + offset), lkeys[di], (void*)((uintptr_t)remoteAddress + offset),
+          rkeys[di], n, callback);
+      if (offset + n == bytes) {
+        break;
+      }
+    }
+  }
+
+  bool receivesInitialized = false;
+
+  void onRecv(std::string_view view) {
+    try {
+      uint32_t type;
+      view = deserializeBufferPart(view, type);
+      switch (type) {
+      case opTypeQueuePut:
+        onRecvQueuePut(view);
+        break;
+      case opTypeQueueReadFinished:
+        onRecvQueueReadFinished(view);
+        break;
+      case opTypeQueueGet:
+        onRecvQueueGet(view);
+        break;
+      case opTypeQueueTransaction:
+        onRecvQueueTransaction(view);
+        break;
+      default:
+        fatal("Received unknown message type %#x", type);
+      }
+    } catch (const std::exception& e) {
+      fatal("onRecv exception: %s", e.what());
+    }
+  }
+
+  void postRecv(Device& dev, TemporaryBufferHandle buffer) {
+    size_t di = &dev - devices.data();
+    void* pointer = buffer->cpuPointer;
+    size_t bytes = buffer->bytes;
+    uint32_t lkey = buffer.mr->mrs[di]->lkey;
+    postRecv(dev, pointer, lkey, bytes, makeCallback([this, &dev, buffer = std::move(buffer)]() mutable {
+               onRecv(std::string_view((const char*)buffer->cpuPointer, buffer->bytes));
+               postRecv(dev, std::move(buffer));
+             }));
+    // fixme? on shutdown, work requests are not completed, so their callbacks are leaked.
+    //        do we care?
+  }
+
+  void initReceives() {
+    if (receivesInitialized) {
+      return;
+    }
+    receivesInitialized = true;
+
+    for (size_t di = 0; di != devices.size(); ++di) {
+      auto& dev = devices[di];
+      for (size_t i = 0; i != maxSrqEntries; ++i) {
+        postRecv(dev, allocateTemporaryBuffer(4096));
+      }
+
+      CHECK(dev.ib->recvChannel != nullptr);
+      ib_poll::add(dev.ib->recvChannel->fd, [this, &dev, channel = (ibv_comp_channel*)dev.ib->recvChannel] {
+        CHECK(!dead);
+
+        void* ctx;
+        ibv_cq* cq = nullptr;
+        if (ibv_get_cq_event(channel, &cq, &ctx)) {
+          perror("ibv_get_cq_event");
+          CHECK(false);
+        }
+        CHECK(cq == dev.ib->recvCq);
+        ++dev.numCqEvents;
+
+        CHECK(ibv_req_notify_cq(cq, 0) == 0);
+
+        while (true) {
+          std::array<ibv_wc, 4> wcs;
+          int n = ibv_poll_cq(cq, wcs.size(), wcs.data());
+          CHECK(n >= 0);
+          for (size_t i = 0; i != n; ++i) {
+            ibv_wc& wc = wcs[i];
+            if (wc.status) {
+              fatal(
+                  "rank %d Work completion with status %d (opcode %d, id %#x) (recv)\n", rank, wc.status, wc.opcode,
+                  wc.wr_id);
+            } else {
+              Callback* callback = (Callback*)(void*)wc.wr_id;
+              callback->decref();
+            }
+          }
+          if (n < wcs.size()) {
+            break;
+          }
+        }
+      });
+
+      CHECK(ibv_req_notify_cq(dev.ib->recvCq, 0) == 0);
+    }
+  }
+
+  void destroyReceives() {
+    if (!receivesInitialized) {
+      return;
+    }
+    for (size_t di = 0; di != devices.size(); ++di) {
+      auto& dev = devices[di];
+      CHECK(dev.ib->recvChannel != nullptr);
+      ib_poll::remove(dev.ib->recvChannel->fd);
+
+      ibv_ack_cq_events(dev.ib->recvCq, dev.numCqEvents);
+    }
+  }
+
   MemoryRegistration* regMr(uintptr_t address, size_t bytes) {
+    auto region = cpu_allocator::regionAt(address);
+    if (region.first) {
+      uintptr_t inputBegin = address;
+      uintptr_t inputEnd = address + bytes;
+      CHECK(address + bytes <= region.first + region.second);
+      size_t regionEnd = region.first + region.second;
+      uintptr_t alignment = 1024 * 1024 * 1024;
+      uintptr_t roundedDown = address / alignment * alignment;
+      size_t originalEnd = address + bytes;
+      address = std::max(roundedDown, region.first);
+      bytes = originalEnd - address;
+      size_t roundedUp = (bytes + alignment - 1) / alignment * alignment;
+      if (address + roundedUp <= regionEnd) {
+        bytes = roundedUp;
+      } else {
+        bytes = regionEnd - address;
+      }
+      CHECK(address <= inputBegin && address + bytes >= inputEnd);
+    }
     auto i = mrMap.find(address);
     if (i != mrMap.end()) {
-      CHECK(i->second->bytes >= bytes);
-      return &i->second->mr;
+      if (i->second->bytes >= bytes) {
+        return &i->second->mr;
+      }
     }
     auto ptr = std::make_unique<CpuMapping>();
+    ptr->bytes = bytes;
     ptr->mr.mrs.fill(nullptr);
     CHECK(devices.size() <= ptr->mr.mrs.size());
     for (size_t i = 0; i != devices.size(); ++i) {
@@ -739,6 +968,7 @@ struct CpuThreadImpl {
       if (ptr->mr.mrs[i]) {
         continue;
       }
+      auto start = std::chrono::steady_clock::now();
       ibv_mr* mr = ibv_reg_mr(
           devices[i].ib->protectionDomain, (void*)address, bytes,
           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
@@ -749,7 +979,9 @@ struct CpuThreadImpl {
       }
       ptr->mr.mrs[i] = mr;
       localMrs.push_back(mr);
-      log.debug("new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x)\n", bytes, address, mr->lkey, mr->rkey);
+      log.debug(
+          "new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x) (registration took %gs)\n", bytes, address,
+          mr->lkey, mr->rkey, seconds(std::chrono::steady_clock::now() - start));
     }
     MemoryRegistration* r = &ptr->mr;
     mrMap[address] = &*ptr;
@@ -1049,14 +1281,18 @@ struct CpuThreadImpl {
     }                                                                                                                  \
     WAIT_CONTROL                                                                                                       \
   }
+// #define YIELD                                                                                                          \
+//   if (self.numActiveWorks != 1 || self.cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {                    \
+//     this->state = &&CAT(s, __LINE__);                                                                                  \
+//     return;                                                                                                            \
+//     CAT(s, __LINE__) :;                                                                                                \
+//   } else {                                                                                                             \
+//     self.poll();                                                                                                       \
+//   }
 #define YIELD                                                                                                          \
-  if (self.numActiveWorks != 1 || self.cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {                    \
-    this->state = &&CAT(s, __LINE__);                                                                                  \
-    return;                                                                                                            \
-    CAT(s, __LINE__) :;                                                                                                \
-  } else {                                                                                                             \
-    self.poll();                                                                                                       \
-  }
+  this->state = &&CAT(s, __LINE__);                                                                                    \
+  return;                                                                                                              \
+  CAT(s, __LINE__) :;
 #define DONE                                                                                                           \
   {                                                                                                                    \
     this->done = true;                                                                                                 \
@@ -1166,6 +1402,13 @@ struct CpuThreadImpl {
         cpuOutMr->mrs[di]->rkey, sizeof(uint32_t));
   }
 
+  void writeCuda(uintptr_t targetAddress, uint32_t value) {
+    size_t di = 0;
+    auto& dev = devices[di];
+    auto* mr = regMrCuda(targetAddress, 4);
+    writeData(dev, rank, (void*)&value, 0, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t));
+  }
+
   struct WorkBarrier : Work {
     QueueEntryBarrier& params;
     size_t i;
@@ -1244,14 +1487,36 @@ struct CpuThreadImpl {
             concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
-                    sizeof(uint32_t) * (size * concurrencyIndex + rank)),
+                    sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
             self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
       }
       for (i = 0; i != size; ++i) {
         if (i == self.rank) {
           continue;
         }
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + i) != stepValue) {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue) {
+          YIELD
+        }
+      }
+      WAIT_CONTROL;
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        size_t di = (rank + i) % self.devices.size();
+        auto& dev = self.devices[di];
+        self.writeControl(
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            self.outStepValuesStorageMr->mrs[di]->lkey,
+            (void*)(self.remoteInternalInStepValueBuffer[i].address +
+                    sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
+            self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue) {
           YIELD
         }
       }
@@ -2098,8 +2363,8 @@ struct CpuThreadImpl {
         // check if a previous registration for this address corresponds to the same
         // allocation/physical-address as the current one, like we can for cuda with buffer ids.
         // Thus, we use a staging buffer.
-        inputBuffer = self.allocateTemporaryBuffer(params.bytes, self.allGatherInputBuffers);
-        outputBuffer = self.allocateTemporaryBuffer(params.pitch * size, self.allGatherOutputBuffers);
+        inputBuffer = self.allocateTemporaryBuffer(params.bytes);
+        outputBuffer = self.allocateTemporaryBuffer(params.pitch * size);
 
         DynamicAddresses* outDyns = &self.outDyn(concurrencyIndex, 0);
 
@@ -2297,7 +2562,7 @@ struct CpuThreadImpl {
 
     uintptr_t vmread(int pid, uintptr_t src, size_t bytes) {
       if (temporaryBuffer->bytes < bytes) {
-        temporaryBuffer = self.allocateTemporaryBuffer(bytes, self.vmreadBuffers);
+        temporaryBuffer = self.allocateTemporaryBuffer(bytes);
       }
       iovec local;
       local.iov_base = temporaryBuffer->cpuPointer;
@@ -2318,8 +2583,8 @@ struct CpuThreadImpl {
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
       {
-        recvBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size(), self.sendRecvBuffers);
-        sendBuffer = self.allocateTemporaryBuffer(params.pitch * sendRanks.size(), self.sendRecvBuffers);
+        recvBuffer = self.allocateTemporaryBuffer(params.pitch * recvRanks.size());
+        sendBuffer = self.allocateTemporaryBuffer(params.pitch * sendRanks.size());
         uintptr_t recvAddress = (uintptr_t)recvBuffer->cpuPointer;
 
         if (!recvRanks.empty()) {
@@ -2939,7 +3204,7 @@ struct CpuThreadImpl {
 
           CHECK(proxyDestination == nullptr);
 
-          temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+          temporaryBuffer = self.allocateTemporaryBuffer(params.bytes);
 
           DynamicAddresses* outDyns = &self.outDyn(concurrencyIndex, 0);
 
@@ -2959,7 +3224,7 @@ struct CpuThreadImpl {
           // log.info("I will receive the broadcast data indirectly from peer rank %d!", proxyDestination->proxy);
         }
       } else if (rank == params.sourceRank) {
-        temporaryBuffer = self.allocateTemporaryBuffer(params.bytes, self.broadcastBuffers);
+        temporaryBuffer = self.allocateTemporaryBuffer(params.bytes);
         std::memcpy(temporaryBuffer->cpuPointer, (void*)params.tensorAddress, params.bytes);
         CHECK(proxyInfo == nullptr);
         CHECK(proxyDestination == nullptr);
@@ -3135,7 +3400,7 @@ struct CpuThreadImpl {
         for (auto& v : params.outputList) {
           outputSize += (v.bytes + 63) / 64u * 64u;
         }
-        outputBuffer = self.allocateTemporaryBuffer(outputSize, self.allGatherOutputBuffers);
+        outputBuffer = self.allocateTemporaryBuffer(outputSize);
 
         DynamicAddresses* outDyns = &self.outDyn(concurrencyIndex, 0);
 
@@ -3159,7 +3424,7 @@ struct CpuThreadImpl {
 
       } else {
         CHECK(params.outputList.empty());
-        inputBuffer = self.allocateTemporaryBuffer(params.bytes, self.allGatherInputBuffers);
+        inputBuffer = self.allocateTemporaryBuffer(params.bytes);
         std::memcpy(inputBuffer->cpuPointer, (void*)params.inputAddress, params.bytes);
       }
 
@@ -3240,10 +3505,704 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkCreateQueue : Work {
+    QueueEntryCreateQueue& params;
+    size_t i;
+    uint32_t stepValue;
+
+    WorkCreateQueue(CpuThreadImpl& self, QueueEntryCreateQueue& params) : Work(self, params), params(params) {}
+
+    void step() {
+      ENTER
+
+      self.initReceives();
+
+      stepValue = (self.nextInternalStepValue[concurrencyIndex] ^= 1);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      if (rank == params.location) {
+        // auto* mr = self.regMr(params.address, params.bytes);
+        DynamicAddresses& out = self.outDyn(concurrencyIndex, 0);
+        out.opType = opTypeCreateQueue;
+        out.gatherAddress = params.address;
+        out.gatherBytes = params.bytes;
+        out.stepValue = stepValue;
+        out.gatherKey[0] = params.location;
+        for (i = 0; i != size; ++i) {
+          if (i == self.rank) {
+            continue;
+          }
+          self.writeDyn(concurrencyIndex, i, 0, rank);
+          size_t di = (rank + i) % self.devices.size();
+          auto& dev = self.devices[di];
+          self.writeControl(
+              concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+              self.outStepValuesStorageMr->mrs[di]->lkey,
+              (void*)(self.remoteInternalInStepValueBuffer[i].address +
+                      sizeof(uint32_t) * (size * concurrencyIndex + 2 * rank)),
+              self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
+        }
+      } else {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * params.location) != stepValue) {
+          YIELD
+        }
+        WAIT_DYN(opTypeCreateQueue, params.location);
+        if (params.location != dyn.gatherKey[0]) {
+          fatal(
+              "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location %d",
+              rank, params.location, params.location, dyn.gatherKey[0]);
+        }
+        *params.outAddress = dyn.gatherAddress;
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        size_t di = (rank + i) % self.devices.size();
+        auto& dev = self.devices[di];
+        self.writeControl(
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            self.outStepValuesStorageMr->mrs[di]->lkey,
+            (void*)(self.remoteInternalInStepValueBuffer[i].address +
+                    sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
+            self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue) {
+          YIELD
+        }
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        size_t di = (rank + i) % self.devices.size();
+        auto& dev = self.devices[di];
+        self.writeControl(
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            self.outStepValuesStorageMr->mrs[di]->lkey,
+            (void*)(self.remoteInternalInStepValueBuffer[i].address +
+                    sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
+            self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
+      }
+      for (i = 0; i != size; ++i) {
+        if (i == self.rank) {
+          continue;
+        }
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue) {
+          YIELD
+        }
+      }
+      WAIT_CONTROL
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+      self.cpuThread->freelistCreateQueue.push(&params);
+      self.allocatorCreateQueue.deallocate(this);
+      DONE
+    }
+  };
+
+  void onRecvQueuePut(std::string_view view) {
+    uint32_t source;
+    uintptr_t queueAddress;
+    uintptr_t tensorAddress;
+    size_t bytes;
+    uint32_t remoteOpKey;
+    std::array<uint32_t, maxDevices> rkeys;
+    int dtype;
+    uint8_t shapeSize;
+    std::array<int64_t, 256> shapeArr;
+    uint32_t getKey;
+    uint32_t transactionKey;
+    // log.info("view is %#x %d\n", (uintptr_t)view.data(), view.size());
+    {
+      Deserializer d(view);
+      Deserialize x(d);
+      x(source, queueAddress, tensorAddress, bytes);
+      x(remoteOpKey, getKey, transactionKey);
+      for (size_t i = 0; i != maxDevices; ++i) {
+        x(rkeys[i]);
+      }
+      x(dtype);
+      x(shapeSize);
+      for (size_t i = 0; i != shapeSize; ++i) {
+        x(shapeArr[i]);
+      }
+    }
+
+    // log.info("recv queue put %#x\n", remoteOpKey);
+
+    CHECK(remoteOpKey != 0);
+
+    QueueEntryQueueRead* e = cpuThread->freelistQueueRead.pop();
+    e->task = taskQueueRead;
+    e->source = source;
+    e->remoteAddress = tensorAddress;
+    e->remoteOpKey = remoteOpKey;
+    e->rkeys = rkeys;
+    e->bytes = bytes;
+    e->queueAddress = queueAddress;
+    e->localOpKey = queuePrepare(queueAddress, source, getKey, transactionKey);
+    e->tensorShape.resize(shapeSize);
+    for (size_t i = 0; i != shapeSize; ++i) {
+      e->tensorShape[i] = shapeArr[i];
+    }
+    e->tensorDtype = dtype;
+    e->getKey = getKey;
+    e->transactionKey = transactionKey;
+    group->cpuThread->enqueue(e);
+  }
+
+  struct QueuePutInfo {
+    uintptr_t tensorAddress;
+    size_t bytes;
+    std::array<uint32_t, maxDevices> gatherKey;
+    int tensorDtype;
+  };
+
+  HashMap<uint32_t, Function<void(uintptr_t*, uint32_t*)>> queuePutCallbacks;
+
+  void executeQueuePut(QueueEntryQueuePut& params) {
+
+    uintptr_t tensorAddress = (uintptr_t)params.tensor->data();
+    size_t bytes = params.tensor->bytes();
+    MemoryRegistration* tensorMr;
+
+    CHECK(params.putKey != 0);
+
+    if (params.tensor->isCuda) {
+      tensorMr = regMrCuda(tensorAddress, bytes);
+
+      queuePutCallbacks[params.putKey] = std::move(params.callback);
+    } else {
+      auto region = cpu_allocator::regionAt(tensorAddress);
+
+      // log.info("executeQueuePut: tensorAddresss is %#x, owns %d\n", tensorAddress,
+      // cpu_allocator::owns(tensorAddress));
+
+      if (region.first) {
+        CHECK(region.first <= tensorAddress && region.first + region.second >= tensorAddress + bytes);
+        // tensorMr = regMr(region.first, region.second);
+        tensorMr = regMr(tensorAddress, bytes);
+
+        queuePutCallbacks[params.putKey] = std::move(params.callback);
+      } else {
+        fatal("unreachable; queue put called with an unknown cpu address %#x", tensorAddress);
+        CHECK(false);
+        // auto tensorBuffer = allocateTemporaryBuffer(bytes, queueBuffers);
+        // std::memcpy(tensorBuffer->cpuPointer, (void*)tensorAddress, bytes);
+
+        // tensorAddress = (uintptr_t)tensorBuffer->cpuPointer;
+        // tensorMr = tensorBuffer.mr;
+
+        // auto callback = [callback = std::move(params.callback), tensorBuffer = std::move(tensorBuffer)] { callback();
+        // };
+
+        // queuePutCallbacks[key] = std::move(callback);
+      }
+    }
+    CHECK(params.tensor->shape.size() < 256);
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t i = params.location;
+    void* cpuPointer = buffer->cpuPointer;
+    size_t serializedBytes =
+        serializeToUnchecked(cpuPointer, SerializeFunction([&](auto& x) {
+                               x(opTypeQueuePut, (uint32_t)rank, params.remoteAddress, tensorAddress, bytes);
+                               x(params.putKey, params.remoteGetKey, params.transactionKey);
+                               for (size_t i = 0; i != maxDevices; ++i) {
+                                 x(tensorMr->mrs[i]->rkey);
+                               }
+                               x(params.tensor->dtype);
+                               x((uint8_t)params.tensor->shape.size());
+                               for (int64_t v : params.tensor->shape) {
+                                 x(v);
+                               }
+                             }));
+    CHECK(serializedBytes <= 4096);
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    uint32_t lkey = buffer.mr->mrs[di]->lkey;
+    postSend(dev, i, cpuPointer, lkey, serializedBytes, makeCallback([this, buffer = std::move(buffer)] {}));
+    cpuThread->freelistQueuePut.push(&params);
+  }
+
+  void onRecvQueueReadFinished(std::string_view view) {
+    QueueEntryQueueReadFinished* e = cpuThread->freelistQueueReadFinished.pop();
+    e->task = taskQueueReadFinished;
+    deserializeBufferPart(view, e->key);
+    group->cpuThread->enqueue(e);
+  }
+
+  void executeQueueReadFinished(QueueEntryQueueReadFinished& params) {
+    auto i = queuePutCallbacks.find(params.key);
+    if (i == queuePutCallbacks.end()) {
+      fatal("Queue put callback key %#x not found", params.key);
+    }
+    uintptr_t cudaDoneAddress = 0;
+    uint32_t cudaDoneValue;
+    std::move(i->second)(&cudaDoneAddress, &cudaDoneValue);
+    if (cudaDoneAddress) {
+      writeCuda(cudaDoneAddress, cudaDoneValue);
+    }
+    queuePutCallbacks.erase(i);
+    cpuThread->freelistQueueReadFinished.push(&params);
+  }
+
+  void sendBuffer(size_t i, TemporaryBufferHandle buffer, size_t bytes) {
+    CHECK(bytes <= buffer->bytes);
+    void* cpuPointer = buffer->cpuPointer;
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    uint32_t lkey = buffer.mr->mrs[di]->lkey;
+    postSend(dev, i, cpuPointer, lkey, bytes, makeCallback([this, buffer = std::move(buffer)] {}));
+  }
+
+  void sendQueueReadFinished(uint32_t source, uint32_t remoteOpKey) {
+    CHECK(remoteOpKey != 0);
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, opTypeQueueReadFinished, remoteOpKey);
+    sendBuffer(source, std::move(buffer), bytes);
+  }
+
+  void executeQueueRead(QueueEntryQueueRead& params) {
+    size_t bytes = params.bytes;
+
+    // log.info("execute queue read! %d bytes! %#x %#x\n", bytes, params.localOpKey, params.remoteOpKey);
+
+    CHECK(params.remoteOpKey != 0);
+
+    auto buffer = allocateTemporaryBuffer(bytes);
+
+    void* cpuPointer = buffer->cpuPointer;
+    std::array<uint32_t, maxDevices> lkeys;
+    for (size_t i = 0; i != maxDevices; ++i) {
+      lkeys[i] = buffer.mr->mrs[i]->lkey;
+    }
+
+    uintptr_t localAddress = (uintptr_t)buffer->cpuPointer;
+
+    // torch::Device device = torch::Device(torch::kCPU);
+
+    // Function<void()> f =
+    //     [buffer = MTHandle<TemporaryBufferHandle>(std::move(buffer), returnedTemporaryBufferHandles)]() mutable {};
+    // auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
+    // auto data = torch::DataPtr((void*)cpuPointer, (void*)f.release(), deleter, device);
+
+    // torch::Storage storage(torch::Storage::use_byte_size_t(), bytes, std::move(data), nullptr, false);
+    // torch::Tensor tensor = torch::empty({0},
+    // torch::TensorOptions((torch::ScalarType)params.tensorDtype).device(device))
+    //                            .set_(std::move(storage), 0, params.tensorShape);
+
+    auto tensor = TensorDataPtr::make();
+    tensor->buffer = AllocatedCpuBufferSharedPtr::make();
+    *tensor->buffer = std::move(buffer.buffer);
+    tensor->dataPtr = (uintptr_t)tensor->buffer->cpuPointer;
+    tensor->dataBytes = tensor->buffer->bytes;
+    tensor->dtype = params.tensorDtype;
+    tensor->shape = params.tensorShape;
+
+    auto callback = makeCallback([this, &params, tensor = std::move(tensor)]() mutable {
+      // log.info("queue read finished! %#x\n", params.localOpKey);
+      queueFinish(
+          group, params.queueAddress, params.source, params.localOpKey, std::move(tensor), params.getKey,
+          params.transactionKey);
+      sendQueueReadFinished(params.source, params.remoteOpKey);
+
+      cpuThread->freelistQueueRead.push(&params);
+    });
+
+    readDataDistributed(
+        params.source, (void*)localAddress, lkeys, (void*)params.remoteAddress, params.rkeys, bytes, callback);
+
+    // size_t numDevices = std::min((bytes + 262143) / 262144, std::max((size_t)4, group->numTrueIbDevs));
+    // size_t numChunks = numDevices;
+    // size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    // CHECK(devices.size() >= numDevices);
+    // for (size_t di = 0; di != devices.size(); ++di) {
+    //   auto& dev = devices[di];
+    //   size_t offset = chunkSize * di;
+    //   size_t n = std::min(bytes - offset, chunkSize);
+    //   readData(
+    //       dev, params.source, (void*)(localAddress + offset), lkeys[di], (void*)(params.remoteAddress + offset),
+    //       params.rkeys[di], n, callback);
+    //   if (offset + n == bytes) {
+    //     break;
+    //   }
+    // }
+  }
+
+  void onRecvQueueGet(std::string_view view) {
+    uint32_t source;
+    uint8_t op;
+    uintptr_t queueAddress;
+    uintptr_t remoteQueueAddress;
+    uint32_t key;
+    deserializeBufferPart(view, source, op, queueAddress, remoteQueueAddress, key);
+    switch (op) {
+    case QueueEntryQueueGet::opStart:
+      queueRemoteGetStart(group, queueAddress, source, remoteQueueAddress, key);
+      break;
+    case QueueEntryQueueGet::opStop:
+      queueRemoteGetStop(group, queueAddress, source, remoteQueueAddress, key);
+      break;
+    case QueueEntryQueueGet::opStopAck:
+      queueRemoteGetStopAck(group, queueAddress, source, remoteQueueAddress, key);
+      break;
+    default:
+      CHECK(false);
+    }
+  }
+
+  void executeQueueGet(QueueEntryQueueGet& params) {
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t bytes = serializeToUnchecked(
+        buffer->cpuPointer, opTypeQueueGet, (uint32_t)rank, params.op, params.remoteQueueAddress,
+        params.localQueueAddress, params.key);
+    sendBuffer(params.location, std::move(buffer), bytes);
+    cpuThread->freelistQueueGet.push(&params);
+  }
+
+  void onRecvQueueTransaction(std::string_view view) {
+    uint32_t source;
+    uintptr_t queueAddress;
+    uint8_t op;
+    uint32_t key;
+    deserializeBufferPart(view, source, queueAddress, op, key);
+    // log.info("%#x %#x %#x %#x\n", source, queueAddress, op, key);
+    CHECK(queueAddress != 0);
+    switch (op) {
+    case transactionOpCommit:
+      queueTransactionCommit(group, queueAddress, source, key);
+      break;
+    case transactionOpCancel:
+      queueTransactionCancel(group, queueAddress, source, key);
+      break;
+    default:
+      CHECK(false);
+    }
+  }
+
+  void executeQueueTransaction(QueueEntryQueueTransaction& params) {
+    CHECK(params.remoteAddress != 0);
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t bytes = serializeToUnchecked(
+        buffer->cpuPointer, opTypeQueueTransaction, (uint32_t)rank, params.remoteAddress, params.op,
+        params.transactionKey);
+    sendBuffer(params.location, std::move(buffer), bytes);
+    cpuThread->freelistQueueTransaction.push(&params);
+  }
+
+  struct WorkCat : Work {
+    QueueEntryCat& params;
+    size_t i;
+    size_t o;
+
+    TemporaryBufferHandle listBuffer;
+
+    struct CatTensor {
+      uint32_t index;
+      uint8_t dtype;
+      uintptr_t address;
+      size_t bytes;
+      std::array<uint32_t, maxDevices> rkey;
+      union {
+        uint32_t ndim;
+        uint32_t nelem;
+      };
+    };
+    static_assert(std::is_trivial_v<CatTensor>);
+
+    Vector<TemporaryBufferHandle> remoteLists;
+    Vector<uint8_t> remoteListReady;
+    Vector<std::pair<size_t, const CatTensor*>> sorted;
+    size_t numReceivedParts = 0;
+    size_t nextPartIndex = 0;
+    size_t currentOffset = 0;
+    size_t nLiveReads = 0;
+    size_t nReadsDone = 0;
+
+    TemporaryBufferHandle resultBuffer;
+
+    TensorDataPtr resultTensor;
+
+    WorkCat(CpuThreadImpl& self, QueueEntryCat& params) : Work(self, params), params(params) {}
+
+    void allocateResult() {
+      size_t total = 0;
+      for (auto& v : sorted) {
+        total += v.second->bytes;
+      }
+
+      resultBuffer = self.allocateTemporaryBuffer(total);
+    }
+
+    bool progress() {
+      if (nextPartIndex == sorted.size()) {
+        return true;
+      }
+      if (sorted[nextPartIndex].second == nullptr) {
+        return false;
+      }
+      if (nLiveReads >= 128) {
+        return false;
+      }
+      size_t index = nextPartIndex;
+      ++nextPartIndex;
+      size_t i = sorted[index].first;
+      const CatTensor* t = sorted[index].second;
+      CHECK(t->index == index);
+
+      void* dst = (void*)((uintptr_t)resultBuffer->cpuPointer + currentOffset);
+      void* src = (void*)t->address;
+
+      currentOffset += t->bytes;
+
+      std::array<uint32_t, maxDevices> lkeys;
+      for (size_t i = 0; i != maxDevices; ++i) {
+        lkeys[i] = resultBuffer.mr->mrs[i]->lkey;
+      }
+      ++nLiveReads;
+      self.readDataDistributed(i, dst, lkeys, src, t->rkey, t->bytes, self.makeCallback([this, index] {
+        --nLiveReads;
+        ++nReadsDone;
+      }));
+      return false;
+    }
+
+    void step() {
+      ENTER
+
+      // self.initReceives();
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        size_t n = params.locals.size();
+        size_t nbytes = sizeof(CatTensor) * n;
+        for (auto& v : params.locals) {
+          nbytes += 8 * v.second->shape.size();
+        }
+        listBuffer = self.allocateTemporaryBuffer(nbytes);
+        CatTensor* list = (CatTensor*)listBuffer->cpuPointer;
+        for (size_t i = 0; i != n; ++i) {
+          auto& [index, tensor] = params.locals[i];
+          auto& v = list[i];
+          v.index = index;
+          v.address = tensor->data();
+          v.bytes = tensor->bytes();
+          v.dtype = tensor->dtype;
+          v.ndim = tensor->shape.size();
+          auto* mr = tensor->isCuda ? self.regMrCuda(v.address, v.bytes) : self.regMr(v.address, v.bytes);
+          for (size_t i = 0; i != maxDevices; ++i) {
+            v.rkey[i] = mr->mrs[i]->rkey;
+          }
+        }
+        char* shapeptr = (char*)(list + n);
+        for (auto& v : params.locals) {
+          auto& tensor = v.second;
+          CHECK(tensor->shape.size() != 0);
+          static_assert(sizeof(tensor->shape[0]) == 8);
+          size_t n = 8 * tensor->shape.size();
+          std::memcpy(shapeptr, tensor->shape.data(), n);
+          shapeptr += n;
+        }
+        CHECK(shapeptr == (const char*)listBuffer->cpuPointer + nbytes);
+
+        resultTensor = TensorDataPtr::make();
+      }
+
+      for (size_t o = 0; o != size; ++o) {
+        size_t i = self.rank + o;
+        if (i >= size) {
+          i -= size;
+        }
+        CHECK(i >= 0 && i < size);
+        DynamicAddresses& out = self.outDyn(concurrencyIndex, i);
+        out.opType = opTypeCat;
+        out.gatherAddress = (uintptr_t)listBuffer->cpuPointer;
+        out.gatherBytes = listBuffer->bytes;
+        out.stepValue = stepValue;
+        for (size_t i = 0; i != maxDevices; ++i) {
+          out.gatherKey[i] = listBuffer.mr->mrs[i]->rkey;
+        }
+        self.writeDyn(concurrencyIndex, i, i, rank);
+      }
+
+      CHECK(remoteLists.empty());
+      remoteLists.resize(size);
+      remoteListReady.resize(size);
+      sorted.clear();
+
+      for (o = 0; o != size; ++o) {
+        i = self.rank - o;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+
+        while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+          YIELD
+        }
+        DynamicAddresses& dyn = self.inDyn(concurrencyIndex, i);
+        size_t bytes = std::exchange(dyn.gatherBytes, 0);
+        CHECK_DYN(dyn, opTypeCat, stepValue, 0);
+
+        if (bytes == 0) {
+          remoteListReady[i] = 1;
+        } else {
+          auto& targetBuffer = remoteLists[i];
+          targetBuffer = self.allocateTemporaryBuffer(bytes);
+
+          size_t di = o % self.devices.size();
+          auto& dev = self.devices[di];
+          self.readData(
+              dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
+              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] { remoteListReady[i] = 1; }));
+        }
+      }
+
+      for (o = 0; o != size; ++o) {
+        i = self.rank - o;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+
+        while (remoteListReady[i] == 0) {
+          YIELD
+        }
+        const CatTensor* rl = (CatTensor*)remoteLists[i]->cpuPointer;
+        size_t remainingBytes = remoteLists[i]->bytes;
+        while (remainingBytes) {
+          if (sorted.size() <= rl->index) {
+            sorted.resize(rl->index + 1);
+          }
+          if (sorted[rl->index].second) {
+            fatal("cat: got a duplicate tensor for index %d", rl->index);
+          }
+          sorted[rl->index] = {i, rl};
+
+          if (resultTensor->dtype == -1) {
+            resultTensor->dtype = rl->dtype;
+          } else {
+            if (rl->dtype != resultTensor->dtype) {
+              fatal("cat: got mismatching dtypes");
+            }
+          }
+
+          remainingBytes -= sizeof(CatTensor);
+          remainingBytes -= 8 * rl->ndim;
+
+          CHECK((ssize_t)remainingBytes >= 0);
+
+          ++numReceivedParts;
+          ++rl;
+        }
+        const int64_t* shapeptr = (const int64_t*)rl;
+        const int64_t* endptr = (const int64_t*)((const char*)remoteLists[i]->cpuPointer + remoteLists[i]->bytes);
+        for (const CatTensor* t = (CatTensor*)remoteLists[i]->cpuPointer; t != rl; ++t) {
+          size_t ndim = t->ndim;
+          CHECK(shapeptr + ndim <= endptr);
+          if (resultTensor->shape.empty()) {
+            if (ndim == 0) {
+              fatal("cat: got ndim == 0 tensor");
+            }
+            resultTensor->shape.resize(ndim);
+            for (size_t i = 0; i != ndim; ++i) {
+              resultTensor->shape[i] = shapeptr[i];
+            }
+          } else {
+            if (ndim != resultTensor->shape.size()) {
+              fatal(
+                  "cat: expected all tensors to have the same number of dimensions, but got %d and %d",
+                  resultTensor->shape.size(), ndim);
+            }
+            resultTensor->shape[0] += shapeptr[0];
+            for (size_t i = 0; i != ndim; ++i) {
+              if (i == 0) {
+                continue;
+              }
+              if (resultTensor->shape[i] != shapeptr[i]) {
+                fatal(
+                    "cat: expected all tensors to have same shape except in cat dimension (0), but got %d and %d in "
+                    "dimension %d",
+                    resultTensor->shape[i], shapeptr[i], i);
+              }
+            }
+          }
+          shapeptr += ndim;
+        }
+      }
+
+      if (numReceivedParts != sorted.size()) {
+        std::string s;
+        for (size_t i = 0; i != sorted.size(); ++i) {
+          if (sorted[i].second == nullptr) {
+            if (s.empty()) {
+              s += ", ";
+            }
+            s += std::to_string(i);
+          }
+        }
+        fatal("cat operation missing parts: [%s]");
+      }
+
+      allocateResult();
+
+      while (!progress()) {
+        YIELD
+      }
+
+      while (nReadsDone != sorted.size()) {
+        YIELD
+      }
+
+      for (i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        self.writeStepValue(concurrencyIndex, i, 0, rank);
+      }
+
+      for (i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        while (self.inStepValue(concurrencyIndex, i) < stepValue) {
+          YIELD
+        }
+      }
+
+      resultTensor->buffer = AllocatedCpuBufferSharedPtr::make();
+      *resultTensor->buffer = std::move(resultBuffer.buffer);
+      resultTensor->dataPtr = (uintptr_t)resultTensor->buffer->cpuPointer;
+      resultTensor->dataBytes = resultTensor->buffer->bytes;
+
+      CHECK(resultTensor->itemsize() * resultTensor->numel() == resultTensor->dataBytes);
+
+      params.future->result = std::move(resultTensor);
+
+      params.future->done = 1;
+      futexWakeAll(&params.future->done);
+
+      remoteLists.clear();
+      listBuffer = {};
+
+      self.cpuThread->freelistCat.push(&params);
+      self.allocatorCat.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
     IntrusiveList<WorkBase, &WorkBase::freeLink> free;
+    size_t nAllocated = 0;
     template<typename... Args>
     T* allocate(Args&&... args) {
       if (!free.empty()) {
@@ -3253,6 +4212,8 @@ struct CpuThreadImpl {
         new (r) T(std::forward<Args>(args)...);
         return r;
       }
+      ++nAllocated;
+      log.debug("Work %s -> %d\n", typeid(T).name(), nAllocated);
       return allocator.allocate(std::forward<Args>(args)...);
     }
     void deallocate(T* ptr) {
@@ -3269,6 +4230,9 @@ struct CpuThreadImpl {
   WorkAllocator<WorkGatherCpu> allocatorGatherCpu;
   WorkAllocator<WorkBroadcastRingCpu> allocatorBroadcastRingCpu;
   WorkAllocator<WorkReduceTree> allocatorReduce;
+  WorkAllocator<WorkCreateQueue> allocatorCreateQueue;
+  // WorkAllocator<WorkQueuePut> allocatorQueuePut;
+  WorkAllocator<WorkCat> allocatorCat;
 
   size_t numActiveWorks = 0;
 
@@ -3303,6 +4267,9 @@ struct CpuThreadImpl {
 
       bool terminate = false;
       while (!terminate) {
+        if (returnedTemporaryBufferHandles.n.load(std::memory_order_relaxed) != 0) {
+          returnedTemporaryBufferHandles.clear();
+        }
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
           if (activeWorks.empty() && activeDevices.empty()) {
             {
@@ -3331,31 +4298,63 @@ struct CpuThreadImpl {
 
             CHECK(queueEntry.stepValue < (1ul << 31));
 
-            if (queueEntry.task == taskBarrier) {
+            switch (queueEntry.task) {
+            case taskBarrier:
               enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
-            } else if (queueEntry.task == taskAllGather) {
-              QueueEntryAllGather& e = (QueueEntryAllGather&)queueEntry;
+              break;
+            case taskAllGather:
               enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
-            } else if (queueEntry.task == taskReduceScatter) {
+              break;
+            case taskReduceScatter:
               enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
-            } else if (queueEntry.task == taskTerminate) {
+              break;
+            case taskTerminate:
               terminate = true;
               cpuThread->freelistTerminate.push(&queueEntry);
-            } else if (queueEntry.task == taskBroadcast) {
+              break;
+            case taskBroadcast:
               enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
-            } else if (queueEntry.task == taskAllGatherCpu) {
+              break;
+            case taskAllGatherCpu:
               enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
-            } else if (queueEntry.task == taskReduceScatterCpu) {
+              break;
+            case taskReduceScatterCpu:
               enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
-            } else if (queueEntry.task == taskGatherCpu) {
+              break;
+            case taskGatherCpu:
               enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
-            } else if (queueEntry.task == taskBroadcastCpu) {
+              break;
+            case taskBroadcastCpu:
               enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
-            } else if (queueEntry.task == taskInternalBarrier) {
+              break;
+            case taskInternalBarrier:
               enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
-            } else if (queueEntry.task == taskReduce) {
+              break;
+            case taskReduce:
               enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
-            } else {
+              break;
+            case taskCreateQueue:
+              enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
+              break;
+            case taskQueuePut:
+              executeQueuePut((QueueEntryQueuePut&)queueEntry);
+              break;
+            case taskQueueRead:
+              executeQueueRead((QueueEntryQueueRead&)queueEntry);
+              break;
+            case taskQueueReadFinished:
+              executeQueueReadFinished((QueueEntryQueueReadFinished&)queueEntry);
+              break;
+            case taskQueueGet:
+              executeQueueGet((QueueEntryQueueGet&)queueEntry);
+              break;
+            case taskQueueTransaction:
+              executeQueueTransaction((QueueEntryQueueTransaction&)queueEntry);
+              break;
+            case taskCat:
+              enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
+              break;
+            default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
             }
           }

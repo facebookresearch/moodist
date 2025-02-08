@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "common.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -133,6 +135,7 @@ struct SimpleVector {
         --i;
         i->~T();
       }
+      CHECK(false);
     } else if (n > msize) {
       T* newbeginptr = Allocator().allocate(n);
       move(newbeginptr, beginptr, beginptr + msize);

@@ -5,7 +5,7 @@ project(moodist)
 project(moodist LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wfatal-errors -ftemplate-backtrace-limit=0 -Bsymbolic -ffast-math -mavx -mavx2 -msse -msse2 -msse3 -msse4.1 -mpopcnt -mcx16")
+    "${CMAKE_CXX_FLAGS} -Wfatal-errors -Wno-unused-result -ftemplate-backtrace-limit=0 -Bsymbolic -ffast-math -mlzcnt -mavx -mavx2 -msse -msse2 -msse3 -msse4.1 -mpopcnt -mcx16")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
@@ -29,7 +29,7 @@ if(ABI_VERSION)
   message(STATUS "using -fabi-version=${ABI_VERSION}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fabi-version=${ABI_VERSION}")
 else()
-  message(STATUS "using no abi version")
+  message(STATUS "not using -fabi-version")
 endif()
 
 find_package(CUDAToolkit)
@@ -70,6 +70,8 @@ pybind11_add_module(_C
   reduce_scatter.cc
   model.cc
   allocator.cc
+  queue.cc
+  cpu_allocator.cc
 )
 target_link_libraries(
   _C

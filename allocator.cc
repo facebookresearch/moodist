@@ -377,13 +377,13 @@ struct CudaAllocatorImpl {
   // std::set<Region, RegionCompare> pendingFreeMemory;
 
   // size_t nBytesMapped = 0;
-  // std::atomic_size_t reservedSize = 0;
-  // std::atomic_uintptr_t reservedBase = 0;
-  // size_t nextMapBase = 0;
+  std::atomic_size_t reservedSize = 0;
+  std::atomic_uintptr_t reservedBase = 0;
+  size_t nextMapBase = 0;
 
   int deviceIndex = -1;
 
-  // Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
+  Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
 
   FreeList<Vector<CUstream>> freeListStreams;
   FreeList<EventRegion> freeListEventRegions;
@@ -539,8 +539,8 @@ struct CudaAllocatorImpl {
     }
     CHECK(c10::cuda::current_device() == deviceIndex);
 
-    size_t bytes = minbytes;
-    constexpr size_t buffer = 1024 * 1024 * 1024;
+    size_t bytes = free;
+    constexpr size_t buffer = (size_t)1024 * 1024 * 1024 * 4;
     size_t safebytes = free > buffer ? free - buffer : 0;
     if (safebytes >= minbytes) {
       bytes = safebytes;
@@ -551,7 +551,7 @@ struct CudaAllocatorImpl {
     if (bytes < minbytes) {
       return false;
     }
-    // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 1024 * 4));
+    // // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 1024 * 4));
     // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 512));
 
     // CUmemGenericAllocationHandle handle;
@@ -561,6 +561,7 @@ struct CudaAllocatorImpl {
     // prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     // prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    // prop.allocFlags.gpuDirectRDMACapable = 1;
 
     // constexpr size_t alignment = (size_t)1024 * 1024 * 128;
     // bytes = (bytes + alignment - 1) / alignment * alignment;
@@ -576,17 +577,27 @@ struct CudaAllocatorImpl {
 
     // CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
 
-    // std::array<CUmemAccessDesc, 1> desc;
-    // std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-    // desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    // desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    // desc[0].location.id = deviceIndex;
-    // CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
+    // int ndevices = 0;
+    // CHECK_CU(cuDeviceGetCount(&ndevices));
+
+    // log.info("device count is %d\n", ndevices);
+
+    // //CHECK(false);
+
+    // for (size_t i = 0; i != ndevices; ++i) {
+    //   std::array<CUmemAccessDesc, 1> desc;
+    //   std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
+    //   desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    //   desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    //   desc[0].location.id = i;
+    //   CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
+    //   log.info("access ok for device %d\n", i);
+    // }
 
     CUdeviceptr ptr;
     auto err = cuMemAlloc(&ptr, bytes);
     while (err != CUDA_SUCCESS) {
-      bytes /= 2;
+      bytes -= 1024 * 1024;
       if (bytes < minbytes) {
         bytes = minbytes;
       }
@@ -1170,30 +1181,30 @@ CUDAAllocator* cudaAllocator = nullptr;
 
 namespace allocator {
 
-// bool owns(uintptr_t address) {
-//   if (!cudaAllocator) {
-//     return false;
-//   }
-//   uintptr_t base = cudaAllocator->impl.reservedBase.load(std::memory_order_relaxed);
-//   size_t size = cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
-//   return address >= base && address < base + size;
-// }
-// uintptr_t offset(uintptr_t address) {
-//   CHECK(cudaAllocator);
-//   return address - cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
-// }
+bool owns(uintptr_t address) {
+  if (!cudaAllocator) {
+    return false;
+  }
+  uintptr_t base = cudaAllocator->impl.reservedBase.load(std::memory_order_relaxed);
+  size_t size = cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
+  return address >= base && address < base + size;
+}
+uintptr_t offset(uintptr_t address) {
+  CHECK(cudaAllocator);
+  return address - cudaAllocator->impl.reservedSize.load(std::memory_order_relaxed);
+}
 
-// Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles() {
-//   CHECK(cudaAllocator);
-//   std::lock_guard l(cudaAllocator->mutex);
-//   return cudaAllocator->impl.cuMemHandles;
-// }
+Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles() {
+  CHECK(cudaAllocator);
+  std::lock_guard l(cudaAllocator->mutex);
+  return cudaAllocator->impl.cuMemHandles;
+}
 
-// std::pair<uintptr_t, size_t> reserved() {
-//   CHECK(cudaAllocator);
-//   std::lock_guard l(cudaAllocator->mutex);
-//   return {cudaAllocator->impl.reservedBase, cudaAllocator->impl.reservedSize};
-// }
+std::pair<uintptr_t, size_t> reserved() {
+  CHECK(cudaAllocator);
+  std::lock_guard l(cudaAllocator->mutex);
+  return {cudaAllocator->impl.reservedBase, cudaAllocator->impl.reservedSize};
+}
 
 } // namespace allocator
 

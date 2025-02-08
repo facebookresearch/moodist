@@ -4,13 +4,15 @@
 
 #include "providers/efa/efadv.h"
 
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/fcntl.h>
+
 namespace moodist {
 
 IbCommon::IbCommon(Group* group) : group(group) {}
 
-IbCommon::~IbCommon() {
-  log.debug("~IbCommon %p (group size %d)\n", (void*)this, group->size);
-}
+IbCommon::~IbCommon() {}
 
 void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
@@ -19,6 +21,28 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   log.debug("Init IB\n");
 
   IbAddress loopbackAddress;
+
+  recvChannel = ibv_create_comp_channel(context);
+  if (!recvChannel) {
+    perror("ibv_create_comp_channel");
+    CHECK(false);
+  }
+
+  recvCq = ibv_create_cq(context, maxSrqEntries, nullptr, recvChannel, 0);
+  if (!recvCq) {
+    perror("ibv_create_cq");
+    CHECK(false);
+  }
+
+  ibv_srq_init_attr srqAttrs;
+  std::memset(&srqAttrs, 0, sizeof(srqAttrs));
+  srqAttrs.attr.max_sge = 1;
+  srqAttrs.attr.max_wr = maxSrqEntries;
+  sharedReceiveQueue = ibv_create_srq(protectionDomain, &srqAttrs);
+  if (!sharedReceiveQueue) {
+    perror("ibv_create_srq");
+    CHECK(false);
+  }
 
   for (size_t i = 0; i != size; ++i) {
     if (i == rank && false) {
@@ -29,12 +53,12 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       std::memset(&initAttributes, 0, sizeof(initAttributes));
       initAttributes.qp_type = IBV_QPT_RC;
       initAttributes.send_cq = cq;
-      initAttributes.recv_cq = cq;
+      initAttributes.recv_cq = recvCq;
       initAttributes.cap.max_send_wr = maxWr;
       initAttributes.cap.max_send_sge = 1;
       initAttributes.cap.max_recv_wr = 1;
       initAttributes.cap.max_recv_sge = 1;
-      initAttributes.srq = nullptr;
+      initAttributes.srq = sharedReceiveQueue;
       initAttributes.sq_sig_all = 0;
       initAttributes.cap.max_inline_data = 32;
       initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
@@ -280,5 +304,99 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   }
   log.debug("connected, yey!\n");
 }
+
+namespace ib_poll {
+
+struct PollThread {
+  std::once_flag flag;
+  std::thread thread;
+  int epollFd = -1;
+  int eventFd = -1;
+  std::atomic_uint32_t removeCount = 0;
+
+  void entry() {
+    std::array<epoll_event, 1024> events;
+
+    eventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (eventFd > 0) {
+      add(eventFd, [this]() {
+        char buf[8];
+        read(eventFd, buf, 8);
+      });
+    }
+
+    while (true) {
+      uint32_t rc = removeCount.load(std::memory_order_relaxed);
+      int n = epoll_wait(epollFd, events.data(), events.size(), 250);
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::system_error(errno, std::generic_category(), "epoll_wait");
+      }
+      for (int i = 0; i != n; ++i) {
+        Function<void()> f((FunctionPointer)events[i].data.ptr);
+        f();
+        f.release();
+      }
+
+      if (n < events.size() && rc) {
+        removeCount -= rc;
+        futexWakeAll(&removeCount);
+      }
+    }
+
+    remove(eventFd);
+    eventFd = -1;
+
+    close(epollFd);
+  }
+
+  void add(int fd, Function<void()> callback) {
+    std::call_once(flag, [&] {
+      epollFd = epoll_create1(EPOLL_CLOEXEC);
+      if (epollFd == -1) {
+        throw std::system_error(errno, std::generic_category(), "epoll_create1");
+      }
+      thread = std::thread([&] {
+        async::setCurrentThreadName("moo/ib epoll");
+        entry();
+      });
+    });
+
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    epoll_event e;
+    e.data.ptr = callback.release();
+    e.events = EPOLLIN | EPOLLOUT | EPOLLET;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &e)) {
+      throw std::system_error(errno, std::generic_category(), "epoll_ctl");
+    }
+  }
+  void remove(int fd) {
+    epoll_event e;
+    epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, &e);
+
+    ++removeCount;
+    uint32_t rc = removeCount;
+    while (rc != 0) {
+      uint64_t buf = 1;
+      write(eventFd, &buf, 8);
+      futexWait(&removeCount, rc, std::chrono::seconds(1));
+      rc = removeCount;
+    }
+  }
+};
+PollThread* pollThread = new PollThread();
+
+void add(int fd, Function<void()> callback) {
+  pollThread->add(fd, std::move(callback));
+}
+
+void remove(int fd) {
+  pollThread->remove(fd);
+}
+
+} // namespace ib_poll
 
 } // namespace moodist

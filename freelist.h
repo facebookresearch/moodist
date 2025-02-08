@@ -55,7 +55,7 @@ struct FreeList {
     auto& tls = FreeListTlsStorage<T>::get();
     if (tls.size == maxThreadLocalEntries) {
       [[unlikely]];
-      moveToGlobal(tls, maxThreadLocalEntries / 8u);
+      moveToGlobal(tls, maxThreadLocalEntries / 4u);
     }
     [[likely]];
     ++tls.size;

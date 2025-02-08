@@ -20,13 +20,18 @@ if "LOCAL_RANK" not in os.environ:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    #os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    
+    os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
 
-else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+#else:
+    #os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
 os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
+import moodist
+
+moodist.enable_cuda_allocator()
 
 def f(n):
     import torch
@@ -49,6 +54,8 @@ def f(n):
     import socket
 
     print("hostname: %s\n" % (socket.gethostname()))
+    
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     dist.init_process_group(
         backend=n,

@@ -33,7 +33,7 @@ void ReduceScatter::init() {
     }
     s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
   }
-  log.info("rank %d: reduce scatter ring sends are [%s]\n", rank, s);
+  log.debug("rank %d: reduce scatter ring sends are [%s]\n", rank, s);
   s.clear();
   for (auto& v : ringRecvs) {
     if (!s.empty()) {
@@ -41,7 +41,7 @@ void ReduceScatter::init() {
     }
     s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
   }
-  log.info("rank %d: reduce scatter ring recvs are [%s]\n", rank, s);
+  log.debug("rank %d: reduce scatter ring recvs are [%s]\n", rank, s);
 
   // CHECK(recvRanks.size() == sendRanks.size());
   // auto allSendRanks = group->setupComms->allgather(sendRanks);

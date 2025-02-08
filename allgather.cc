@@ -218,7 +218,7 @@ void AllGather::init() {
         // if (abs(destinationNode - sourceNode, nodeRanks.size()) == 1) {
         if (destinationNode == (sourceNode + nodeRanks.size() - 1) % nodeRanks.size()) {
           neighbors.push_back(path[1]);
-          log.info("%d is a neighbor\n", path[1]);
+          log.debug("%d is a neighbor\n", path[1]);
         }
       } else if (path[1] == rank) {
         size_t source = path[0];
@@ -258,7 +258,7 @@ void AllGather::init() {
       }
       s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
     }
-    log.info("rank %d: all gather ring sends are [%s]\n", rank, s);
+    log.debug("rank %d: all gather ring sends are [%s]\n", rank, s);
     s.clear();
     for (auto& v : ringRecvs) {
       if (!s.empty()) {
@@ -266,7 +266,9 @@ void AllGather::init() {
       }
       s += fmt::sprintf("(%d %d)", std::get<0>(v), std::get<1>(v));
     }
-    log.info("rank %d: all gather ring recvs are [%s]\n", rank, s);
+    log.debug("rank %d: all gather ring recvs are [%s]\n", rank, s);
+
+    
     // for (auto& x : ringRecvs) {
     //   CHECK(std::get<2>(x) == (size_t)-1);
     // }

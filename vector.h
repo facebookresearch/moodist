@@ -99,11 +99,9 @@ struct Vector {
     return endptr;
   }
   T& operator[](size_t index) {
-    CHECK(index < msize);
     return beginptr[index];
   }
   const T& operator[](size_t index) const {
-    CHECK(index < msize);
     return beginptr[index];
   }
   void clear() {
@@ -278,9 +276,10 @@ struct Vector {
     CHECK(msize > 0);
     erase(beginptr, beginptr + 1);
   }
-  T* insert(T* at, const T& value) {
+  template<typename V>
+  T* insert(T* at, V&& value) {
     if (at == endptr) {
-      push_back(value);
+      push_back(std::forward<V>(value));
       return &back();
     }
     if (endptr == storageend) {
@@ -292,9 +291,9 @@ struct Vector {
       expand();
       at = beginptr + index;
     }
-    new (endptr) T(std::move(endptr[-1]));
+    new (endptr) T();
     move(at + 1, at, endptr);
-    *at = value;
+    *at = std::forward<V>(value);
     ++endptr;
     ++msize;
     return at;

@@ -119,12 +119,18 @@ struct IbCommon {
 
   static constexpr size_t maxWr = 1024;
   static constexpr size_t maxCqEntries = 1024;
+  static constexpr size_t maxSrqEntries = 256;
 
   IbvSharedPtr<ibv_context, ibv_close_device> context;
   IbvSharedPtr<ibv_pd, ibv_dealloc_pd> protectionDomain;
   IbvCq cq;
   IbvQp qp;
   ibv_qp_ex* qpex = nullptr;
+
+  IbvPtr<ibv_srq, ibv_destroy_srq> sharedReceiveQueue;
+  IbvPtr<ibv_comp_channel, ibv_destroy_comp_channel> recvChannel;
+  IbvCq recvCq;
+
   std::vector<IbvAh> ahs;
   std::vector<IbAddress> remoteAddresses;
 
@@ -138,5 +144,10 @@ struct IbCommon {
   IbCommon(Group* group);
   ~IbCommon();
 };
+
+namespace ib_poll {
+void add(int fd, Function<void()> callback);
+void remove(int fd);
+}
 
 } // namespace moodist

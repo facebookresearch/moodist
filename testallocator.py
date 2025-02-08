@@ -1,4 +1,5 @@
 import torch
+import torch.distributed
 import moodist
 import time
 import os
@@ -84,6 +85,8 @@ def f(x):
 # for _ in range(100):
 #     f(torch.randn((16, 4096), device="cuda"))
 
+torch.distributed.init_process_group()
+
 for i in range(4):
     # if i == 10:
     #     moodist.enable_cuda_allocator()
@@ -97,7 +100,9 @@ for i in range(4):
             inp = torch.randn((bs, 4096), device="cuda", requires_grad=True)
             x = x + f(inp).sum()
         x.sum().backward()
-        grad_sum += inp.grad.sum()
+        lsum = inp.grad.sum()
+        torch.distributed.all_reduce(lsum)
+        grad_sum += lsum
 
     torch.cuda.synchronize()
     print(time.time() - start)

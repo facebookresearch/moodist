@@ -60,14 +60,17 @@ static std::string readBootId() {
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
-  cpuThread = std::make_unique<CpuThread>(this);
+  cpuThread = new CpuThread(this);
   kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
 
 Group::~Group() {
-  cpuThread.reset();
+  // cpuThread needs to remain valid until it has been destructed,
+  // so cannot use unique_ptr
+  delete cpuThread;
+  cpuThread = nullptr;
 }
 
 void Group::init() {
@@ -167,6 +170,15 @@ void Group::init() {
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
   // CHECK(numa_run_on_node(allocationNode) == 0);
+  // {
+  //   auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
+  //   if (bitmask) {
+  //     numa_bitmask_clearall(bitmask);
+  //     numa_bitmask_setbit(bitmask, allocationNode);
+  //     numa_bind(bitmask);
+  //     numa_bitmask_free(bitmask);
+  //   }
+  // }
 
   std::vector<LocalDevice> localDevices;
 
@@ -629,7 +641,6 @@ void Group::init() {
     // but we don't want to change the current numa allocation policy.
     // thus we create a temporary thread to do it.
     std::thread tmp([&] {
-      log.error("begin shared memory %d\n", allocationNode);
       if (allocationNode != -1) {
         auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
         if (bitmask) {
@@ -640,7 +651,6 @@ void Group::init() {
         }
       }
       ipcMapper->init();
-      log.error("end shared memory\n");
     });
     tmp.join();
   }
@@ -814,6 +824,7 @@ void* numaAllocate(size_t bytes, int node) {
     log.error("ERROR: Failed to allocate %d bytes of host memory on NUMA node %d\n", bytes, node);
     throw std::bad_alloc();
   }
+  CHECK(((uintptr_t)r & 63) == 0);
   return r;
 }
 
@@ -939,14 +950,9 @@ AllocatedBuffer Group::allocateDeviceMapped(size_t bytes) {
 }
 
 AllocatedCpuBuffer Group::allocateCpu(size_t bytes) {
-  if (bytes < 4096) {
-    bytes = 4096;
-  }
   AllocatedCpuBuffer r;
   r.bytes = bytes;
-  r.cpuPointer = numaAllocate(bytes, allocationNode);
-  std::memset(r.cpuPointer, 0, bytes);
-  log.verbose("allocated CPU memory (%p) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.bytes, allocationNode);
+  r.cpuPointer = cpu_allocator::moo_alloc(bytes);
   return r;
 }
 
@@ -1030,6 +1036,17 @@ StreamData::~StreamData() = default;
 
 void Group::createStreamData(std::unique_ptr<StreamData>& ptr) {
   ptr = std::make_unique<StreamData>();
+}
+
+uintptr_t Group::getNextCudaUint32() {
+  std::lock_guard l(cudaUint32Mutex);
+  if (cudaUint32List.empty() || cudaUint32Offset == cudaUint32List.back().bytes) {
+    cudaUint32List.push_back(allocateDevice(0x1000));
+    cudaUint32Offset = 0;
+  }
+  size_t o = cudaUint32Offset;
+  cudaUint32Offset += 4;
+  return cudaUint32List.back().cudaPointer + o;
 }
 
 } // namespace moodist
