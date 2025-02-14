@@ -30,6 +30,7 @@ constexpr uint8_t taskQueueReadFinished = 14;
 constexpr uint8_t taskQueueGet = 15;
 constexpr uint8_t taskQueueTransaction = 16;
 constexpr uint8_t taskCat = 17;
+constexpr uint8_t taskCopy = 18;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -237,6 +238,12 @@ struct QueueEntryCat : QueueEntry {
   FutureImplSharedPtr future;
 };
 
+struct QueueEntryCopy : QueueEntry {
+  TensorDataPtr destination;
+  TensorDataPtr source;
+  FutureImplSharedPtr future;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -291,6 +298,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryQueueGet> freelistQueueGet;
   QueueEntryFreeList<QueueEntryQueueTransaction> freelistQueueTransaction;
   QueueEntryFreeList<QueueEntryCat> freelistCat;
+  QueueEntryFreeList<QueueEntryCopy> freelistCopy;
 
   CpuThread(Group*);
   ~CpuThread();

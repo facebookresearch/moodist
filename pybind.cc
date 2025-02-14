@@ -12,6 +12,7 @@
 #include <pybind11/pytypes.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include "common.h"
 #include "processgroup.h"
 
 namespace moodist {
@@ -31,7 +32,12 @@ void ensureRegistered(uintptr_t address) {
     auto& s = registered[region.first];
     if (s != region.second) {
       CHECK(region.second > s);
-      CHECK_CU(cuMemHostRegister((void*)(region.first + s), (region.second - s), 0));
+      if (s != 0) {
+        CHECK_CU(cuCtxSynchronize());
+        CHECK_CU(cuMemHostUnregister((void*)region.first));
+      }
+      CHECK_CU(cuMemHostRegister(
+          (void*)region.first, region.second, CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_PORTABLE));
       s = region.second;
     }
   }
@@ -54,7 +60,12 @@ void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
     ensureRegistered(srcAddress);
   }
   CUstream stream = c10::cuda::getCurrentCUDAStream();
-  CHECK_CU(cuMemcpyAsync(dstAddress, srcAddress, dstbytes, stream));
+  try {
+    CHECK_CU(cuMemcpyAsync(dstAddress, srcAddress, dstbytes, stream));
+  } catch (...) {
+    log.error("failed to copy %#x %#x %d\n", dstAddress, srcAddress, dstbytes);
+    throw;
+  }
 }
 
 } // namespace
@@ -77,7 +88,8 @@ PYBIND11_MODULE(_C, m) {
       .def(
           "Queue", py::overload_cast<std::vector<int>>(&MoodistProcessGroup::makeQueue), py::arg("location"),
           py::call_guard<py::gil_scoped_release>())
-      .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>());
+      .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
+      .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>());
 
   py::class_<moodist::Future>(m, "Future")
       .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())

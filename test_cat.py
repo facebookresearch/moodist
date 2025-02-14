@@ -19,7 +19,7 @@ group = torch.distributed.new_group()
 rank = group.rank()
 size = group.size()
 
-if True:
+if False:
 
     if rank == 0:
         a = torch.randn(4, 2, 1)
@@ -42,29 +42,39 @@ if True:
 else:
 
     torch.manual_seed(42 + rank)
-    locals = [(rank, torch.randn(1024 * 1024 * 8))]
+    #locals = [(rank, torch.randn(1024 * 1024 * 8))]
+    locals = [(rank, torch.randn(random.randrange(1024 * 1024))) for _ in range(100)]
 
-    c = []
-    for i in range(size):
-        torch.manual_seed(42 + i)
-        t = torch.randn(1024 * 1024 * 8)
-        c.append(t)
-    c = torch.cat(c)
+    # c = []
+    # for i in range(size):
+    #     torch.manual_seed(42 + i)
+    #     t = torch.randn(1024 * 1024 * 8)
+    #     c.append(t)
+    # c = torch.cat(c)
 
-    for i in range(100):
-        result = group.cat(locals).result()
-        #assert torch.equal(result, c)
+    # for i in range(100):
+    #     result = group.cat(locals[i]).result()
+    #     #assert torch.equal(result, c)
     
     print("rank %d warmup done" % rank)
 
-    start = time.monotonic()
-    for i in range(100):
-        result = group.cat(locals).result()
-        #assert torch.equal(result, c)
+    for _ in range(8):
+        start = time.monotonic()
+        ops = []
+        for i in range(100):
+            #result = group.cat(locals).result()
+            ops.append(group.cat([locals[i]]))
+            #assert torch.equal(result, c)
+        
+        total_bytes = 0
+        for op in ops:
+            op.wait()
+            tensor = op.result()
+            total_bytes += tensor.itemsize * tensor.numel()
+        
+        t = time.monotonic() - start
+        g = total_bytes * 100 / 1024 / 1024 / 1024
 
-    t = time.monotonic() - start
-    g = result.itemsize * result.numel() * 100 / 1024 / 1024 / 1024
-
-    print("rank %d took %gs, %gG/s" % (rank, t, g / t))
+        print("rank %d took %gs, %gG/s" % (rank, t, g / t))
 
 torch.distributed.barrier()

@@ -100,8 +100,6 @@ struct Group {
   CUcontext cuContext = nullptr;
   CUdevice cuDevice;
 
-  HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
-
   static constexpr size_t maxConcurrency = moodist::maxConcurrency;
   static constexpr size_t maxDevices = moodist::maxDevices;
   static constexpr size_t maxChunks = moodist::maxChunks;
@@ -170,7 +168,8 @@ struct Group {
   AllocatedArray cudaStepValuesBuffer;
   AllocatedArray cudaStepValuesDeviceChunksBuffer;
 
-  bool supportsMulticast = false;
+  HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
+  std::array<std::unique_ptr<StreamData>, maxConcurrency> cpuStreamData;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
@@ -218,6 +217,14 @@ struct Group {
   void createStreamData(std::unique_ptr<StreamData>& ptr);
   StreamData& getStreamData(CUstream stream) {
     auto& ptr = streamData[stream];
+    if (!ptr) {
+      createStreamData(ptr);
+    }
+    return *ptr;
+  }
+
+  StreamData& getCpuStreamData(uint32_t concurrencyIndex) {
+    auto& ptr = cpuStreamData[concurrencyIndex];
     if (!ptr) {
       createStreamData(ptr);
     }

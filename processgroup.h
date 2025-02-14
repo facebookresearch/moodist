@@ -117,6 +117,7 @@ public:
   std::shared_ptr<Queue> makeQueue(std::vector<int> location);
 
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
+  Future copy(torch::Tensor& destination, const torch::Tensor& source);
 };
 
 } // namespace moodist

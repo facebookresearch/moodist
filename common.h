@@ -449,6 +449,11 @@ struct FLSharedPtr {
   Storage* ptr = nullptr;
   FLSharedPtr(std::nullptr_t) {}
   FLSharedPtr() = default;
+  FLSharedPtr(Storage* ptr) : ptr(ptr) {
+    if (ptr) {
+      CHECK(ptr->refcount != 0);
+    }
+  }
   ~FLSharedPtr() {
     if (ptr && --ptr->refcount == 0) {
       ptr->clear();
@@ -503,6 +508,10 @@ struct FLSharedPtr {
   }
   bool operator==(std::nullptr_t) const {
     return ptr == nullptr;
+  }
+
+  Storage* release() {
+    return std::exchange(ptr, nullptr);
   }
 };
 

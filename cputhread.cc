@@ -47,6 +47,7 @@ struct MemoryRegistration {
 
 struct CudaMapping {
   uint64_t bufferId;
+  uintptr_t address;
   size_t bytes;
   MemoryRegistration mr;
 };
@@ -1015,17 +1016,24 @@ struct CpuThreadImpl {
     unsigned long long bufferId = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
     CHECK(bufferId != -1);
-    auto i = mrMapCuda.find(address);
+    auto i = mrMapCuda.find(bufferId);
     if (i != mrMapCuda.end()) {
-      if (i->second->bufferId == bufferId && i->second->bytes >= bytes) {
-        return &i->second->mr;
-      }
+      CHECK(i->second->address <= address && i->second->address + i->second->bytes >= address + bytes);
+      return &i->second->mr;
     }
     unsigned long long bufferId2 = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + bytes - 1));
     CHECK(bufferId == bufferId2);
+
+    CUdeviceptr base = 0;
+    size_t size = 0;
+    CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
+    address = base;
+    bytes = size;
+
     auto ptr = std::make_unique<CudaMapping>();
     ptr->bufferId = bufferId;
+    ptr->address = address;
     ptr->bytes = bytes;
     ptr->mr.mrs.fill(nullptr);
     CHECK(devices.size() <= ptr->mr.mrs.size());
@@ -1056,7 +1064,7 @@ struct CpuThreadImpl {
     // ptr can be destructed here, but r is a plain pointer
     // fixme: return some kind of handle instead?
     MemoryRegistration* r = &ptr->mr;
-    mrMapCuda[address] = &*ptr;
+    mrMapCuda[bufferId] = &*ptr;
     cudaMappings.push_back(std::move(ptr));
     return r;
   }
@@ -3924,6 +3932,7 @@ struct CpuThreadImpl {
     size_t currentOffset = 0;
     size_t nLiveReads = 0;
     size_t nReadsDone = 0;
+    Vector<size_t> readOrder;
 
     TemporaryBufferHandle resultBuffer;
 
@@ -3938,19 +3947,28 @@ struct CpuThreadImpl {
       }
 
       resultBuffer = self.allocateTemporaryBuffer(total);
+
+      size_t n = sorted.size();
+      readOrder.resize(n);
+      for (size_t i = 0; i != n; ++i) {
+        readOrder[i] = i;
+      }
+      std::shuffle(readOrder.begin(), readOrder.end(), getRng());
+
+      // log.info("CAT %#x/%d allocated %d bytes\n", stepValue, concurrencyIndex, resultBuffer->bytes);
     }
 
     bool progress() {
       if (nextPartIndex == sorted.size()) {
         return true;
       }
-      if (sorted[nextPartIndex].second == nullptr) {
-        return false;
-      }
       if (nLiveReads >= 128) {
         return false;
       }
-      size_t index = nextPartIndex;
+      size_t index = readOrder[nextPartIndex];
+      if (sorted[index].second == nullptr) {
+        return false;
+      }
       ++nextPartIndex;
       size_t i = sorted[index].first;
       const CatTensor* t = sorted[index].second;
@@ -3975,6 +3993,8 @@ struct CpuThreadImpl {
 
     void step() {
       ENTER
+
+      // log.info("CAT %#x/%d enter\n", stepValue, concurrencyIndex);
 
       // self.initReceives();
 
@@ -4142,13 +4162,13 @@ struct CpuThreadImpl {
         std::string s;
         for (size_t i = 0; i != sorted.size(); ++i) {
           if (sorted[i].second == nullptr) {
-            if (s.empty()) {
+            if (!s.empty()) {
               s += ", ";
             }
             s += std::to_string(i);
           }
         }
-        fatal("cat operation missing parts: [%s]");
+        fatal("cat operation missing parts: [%s]", s);
       }
 
       allocateResult();
@@ -4192,11 +4212,41 @@ struct CpuThreadImpl {
       remoteLists.clear();
       listBuffer = {};
 
+      params.locals.clear();
+
+      // log.info("CAT %#x/%d done\n", stepValue, concurrencyIndex);
+
       self.cpuThread->freelistCat.push(&params);
       self.allocatorCat.deallocate(this);
       DONE
     }
   };
+
+  void executeCopy(QueueEntryCopy& params) {
+
+    auto* destinationMr = params.destination->isCuda
+                              ? regMrCuda(params.destination->data(), params.destination->bytes())
+                              : regMr(params.destination->data(), params.destination->bytes());
+    auto* sourceMr = params.source->isCuda ? regMrCuda(params.source->data(), params.source->bytes())
+                                           : regMr(params.source->data(), params.source->bytes());
+
+    std::array<uint32_t, maxDevices> lkeys;
+    for (size_t i = 0; i != maxDevices; ++i) {
+      lkeys[i] = destinationMr->mrs[i]->lkey;
+    }
+
+    std::array<uint32_t, maxDevices> rkeys;
+    for (size_t i = 0; i != maxDevices; ++i) {
+      rkeys[i] = sourceMr->mrs[i]->lkey;
+    }
+
+    readDataDistributed(
+        rank, (void*)params.destination->data(), lkeys, (void*)params.source->data(), rkeys,
+        params.destination->bytes(), makeCallback([&params] {
+          params.future->done = 1;
+          futexWakeAll(&params.future->done);
+        }));
+  }
 
   template<typename T>
   struct WorkAllocator {
@@ -4353,6 +4403,9 @@ struct CpuThreadImpl {
               break;
             case taskCat:
               enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
+              break;
+            case taskCopy:
+              executeCopy((QueueEntryCopy&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

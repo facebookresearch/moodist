@@ -1617,7 +1617,7 @@ struct ProcessGroupImpl {
     fatal("cuda gather is not yet supported :(");
   }
 
-  TensorDataPtr getTensorData(const torch::Tensor& tensor) {
+  TensorDataPtr getTensorData(const torch::Tensor& tensor, bool allowCopy = true) {
     TensorDataPtr td = TensorDataPtr::make();
 
     td->dtype = (int)tensor.dtype().toScalarType();
@@ -1642,6 +1642,9 @@ struct ProcessGroupImpl {
         CHECK(handle != nullptr);
         td->buffer = std::move(handle);
       } else {
+        if (!allowCopy) {
+          throw std::runtime_error("Found CPU tensor that we do not own");
+        }
         td->buffer = AllocatedCpuBufferSharedPtr::make();
         *td->buffer = group->allocateCpu(td->dataBytes);
         td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
@@ -1667,7 +1670,7 @@ struct ProcessGroupImpl {
 
     auto future = FutureImplSharedPtr::make();
 
-    StreamData& sd = group->getStreamData(nullptr);
+    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
     QueueEntryCat* e = group->cpuThread->freelistCat.pop();
     e->task = taskCat;
     e->stepValue = stepValue;
@@ -1677,6 +1680,43 @@ struct ProcessGroupImpl {
     for (size_t i = 0; i != locals.size(); ++i) {
       e->locals[i] = {locals[i].first, getTensorData(locals[i].second)};
     }
+    e->future = future;
+    group->cpuThread->enqueue(e);
+
+    Future r;
+    r.impl = std::move(future);
+    return r;
+  }
+
+  Future copy(torch::Tensor& destination, const torch::Tensor& source) {
+    std::unique_lock l(threadUnsafe);
+
+    if (!destination.is_contiguous() || !source.is_contiguous()) {
+      throw std::runtime_error("copy: both source and destination must be contigiuous");
+    }
+
+    auto destinationData = getTensorData(destination, false);
+    auto sourceData = getTensorData(source, false);
+
+    if (destinationData->bytes() != sourceData->bytes()) {
+      throw std::runtime_error(fmt::sprintf(
+          "copy: destination is %d bytes while source is %d bytes\n", destinationData->bytes(), sourceData->bytes()));
+    }
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    auto future = FutureImplSharedPtr::make();
+
+    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+    QueueEntryCopy* e = group->cpuThread->freelistCopy.pop();
+    e->task = taskCopy;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->destination = std::move(destinationData);
+    e->source = std::move(sourceData);
     e->future = future;
     group->cpuThread->enqueue(e);
 
@@ -1974,6 +2014,10 @@ std::shared_ptr<Queue> ProcessGroup::makeQueue(std::vector<int> location) {
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
   return impl->cat(locals);
+}
+
+Future ProcessGroup::copy(torch::Tensor& destination, const torch::Tensor& source) {
+  return impl->copy(destination, source);
 }
 
 Future::Future() {}
