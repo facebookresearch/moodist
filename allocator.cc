@@ -1080,8 +1080,15 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual bool initialized() override {
     throw std::runtime_error("moodist CUDAAllocator::initialized: not implemented");
   }
+  virtual double getMemoryFraction(c10::DeviceIndex) {
+    return 1.0;
+  }
   virtual void setMemoryFraction(double fraction, c10::DeviceIndex device) override {
     throw std::runtime_error("moodist CUDAAllocator::setMemoryFraction: not implemented");
+  }
+  virtual void enable(bool) {}
+  virtual bool isEnabled() const {
+    return true;
   }
   virtual void emptyCache() override {
     // throw std::runtime_error("moodist CUDAAllocator::emptyCache: not implemented");
