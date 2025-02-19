@@ -745,6 +745,8 @@ struct ProcessGroupImpl {
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
 
+    bool workaroundMean = false;
+
     Dtype dindex;
     switch (dtype.toScalarType()) {
     case torch::Dtype::Float:
@@ -778,7 +780,8 @@ struct ProcessGroupImpl {
       opindex = Reduction::max;
       break;
     case c10d::ReduceOp::AVG:
-      opindex = Reduction::avg;
+      opindex = Reduction::sum;
+      workaroundMean = true;
       break;
     default:
       throw std::runtime_error(
@@ -811,6 +814,9 @@ struct ProcessGroupImpl {
       l.unlock();
       while (cpuDone == 0) {
         futexWait(&cpuDone, 0, std::chrono::seconds(10));
+      }
+      if (workaroundMean) {
+        output *= 1.0f / size;
       }
       return;
     }
@@ -958,6 +964,11 @@ struct ProcessGroupImpl {
 
     if (outputAddress != (uintptr_t)output.data_ptr()) {
       CHECK_CU(cuMemcpyDtoDAsync((uintptr_t)output.data_ptr(), outputAddress, bytes, stream));
+    }
+
+    if (workaroundMean) {
+      c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+      output *= 1.0f / size;
     }
 
     trace("post");

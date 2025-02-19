@@ -191,6 +191,7 @@ std::string Kernels::emitReduceFunctionSeq(
     } else if (op == "rmax") {
       return replace("max($args)", "$args", fmt::to_string(fmt::join(names, ", ")));
     } else if (op == "ravg") {
+      fatal("fixme: avg is broken");
       std::string s;
       for (auto& v : names) {
         if (!s.empty()) {
