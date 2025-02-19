@@ -89,7 +89,9 @@ PYBIND11_MODULE(_C, m) {
           "Queue", py::overload_cast<std::vector<int>>(&MoodistProcessGroup::makeQueue), py::arg("location"),
           py::call_guard<py::gil_scoped_release>())
       .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
-      .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>());
+      .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>())
+      .def("_set_group_name", &MoodistProcessGroup::setGroupName)
+      .def_property_readonly("group_name", &MoodistProcessGroup::getGroupName);
 
   py::class_<moodist::Future>(m, "Future")
       .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())
