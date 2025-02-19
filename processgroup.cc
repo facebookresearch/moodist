@@ -1015,6 +1015,8 @@ struct ProcessGroupImpl {
   std::array<AllocatedBuffer, 4> reduceBufferArr;
   size_t reduceCounter = 0;
 
+  std::vector<std::shared_ptr<Queue>> queues;
+
   void peerWriteDyn(
       uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, uintptr_t gatherAddress,
       size_t bytes) {
@@ -1792,7 +1794,6 @@ struct WorkImpl : c10d::Work {
   }
 
   virtual c10::intrusive_ptr<c10::ivalue::Future> getFuture() override {
-    CHECK(false);
     std::vector<torch::Tensor> result;
     if (var.index() == 0) {
       result = {std::get<0>(var)};
@@ -1975,45 +1976,31 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
   }
 }
 
-// c10::intrusive_ptr<Work> ProcessGroup::scatter(
-//     std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
-//     const c10d::ScatterOptions& opts) {
-//     CHECK(outputTensors.size() == 1);
-//   if (getRank() == opts.rootRank) {
-//     CHECK(inputTensors.size() == getSize());
+c10::intrusive_ptr<Work> ProcessGroup::scatter(
+    std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
+    const c10d::ScatterOptions& opts) {
+  CHECK(outputTensors.size() == 1);
+  auto& outputs = outputTensors[0];
+  if (impl->queues.empty()) {
+    for (size_t i = 0; i != getSize(); ++i) {
+      impl->queues.push_back(makeQueue(i));
+    }
+  }
+  if (getRank() == opts.rootRank) {
+    CHECK(inputTensors.size() == 1)
+    auto& inputs = inputTensors[0];
+    CHECK(inputs.size() == getSize());
+    for (size_t i = 0; i != inputs.size(); ++i) {
+      auto t = inputs[i].cpu();
+      impl->queues[i]->put(t, 0);
+    }
+    // outputTensors[0].copy_(inputs[getRank()]);
+  }
+  auto t = *impl->queues.at(getRank())->get();
+  outputTensors[0].copy_(t);
 
-//     for (size_t i = 0; i != inputTensors.size(); ++i) {
-
-//     }
-//     outputTensors[0].copy_(inputTensors[getRank()][0]);
-//   } else {
-//   }
-
-//   auto& input = inputTensors[0];
-//   auto& output = outputTensors[0];
-//   int64_t inputNumel = input.numel();
-//   TORCH_CHECK(inputNumel > 0);
-//   bool isCuda = tensor.is_cuda();
-//   CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
-//   WorkStream* w = nullptr;
-//   if (isCuda) {
-//     w = impl->getWorkStream(stream);
-//     CHECK_CU(cuEventRecord(w->event, stream));
-//     CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
-//     stream = w->stream;
-//   }
-//   auto t = tensor.view({(int64_t)impl->size, -1});
-//   auto o = t[impl->rank];
-//   impl->reduce_scatter(o, t, opts.reduceOp, stream);
-//   impl->all_gather(t, o, stream);
-//   if (w) {
-//     CHECK(stream == w->stream);
-//     tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
-//     CHECK_CU(cuEventRecord(w->event, w->stream));
-//   }
-
-//   return c10::make_intrusive<WorkImpl>(tensors, w);
-// }
+  return c10::make_intrusive<WorkImpl>(torch::Tensor());
+}
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location) {
   return moodist::makeQueue(impl->group, location);

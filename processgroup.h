@@ -105,9 +105,7 @@ public:
 
   c10::intrusive_ptr<Work> scatter(
       std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
-      const c10d::ScatterOptions& opts = c10d::ScatterOptions()) override {
-    TORCH_CHECK(false, "scatter not supported");
-  }
+      const c10d::ScatterOptions& opts = c10d::ScatterOptions()) override;
 
   c10::intrusive_ptr<Work> recvAnysource(std::vector<at::Tensor>& tensors, int tag) override {
     TORCH_CHECK(false, "recvAnysource not supported");
