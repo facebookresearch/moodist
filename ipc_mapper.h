@@ -161,6 +161,7 @@ struct IpcMapper {
   void
   requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
     CHECK(length > 0);
+    CHECK(address != 0);
 
     // if (allocator::owns(address)) {
     //   std::unique_lock l(mutex);
@@ -184,19 +185,6 @@ struct IpcMapper {
     unsigned long long bufferId2 = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + length - 1));
     CHECK(bufferId == bufferId2);
-    std::unique_lock l(mutex);
-    auto& addressMap = peerIpcAddressMap[peerIndex];
-    auto i = addressMap.find(address);
-    if (i != addressMap.end()) {
-      if (i->second.second == bufferId) {
-        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address, i->second.first);
-        callback(i->second.first);
-        return;
-      }
-      addressMap.erase(i);
-      log.debug("requestAddress: bufferId changed for %#x bytes at %#x\n", length, address);
-    }
-
     CUdeviceptr base = 0;
     size_t size = 0;
     try {
@@ -205,6 +193,20 @@ struct IpcMapper {
       log.error("requestAddress: %#x bytes at %#x (buffer id %d), error %s\n", length, address, bufferId, e.what());
       throw;
     }
+    std::unique_lock l(mutex);
+    auto& addressMap = peerIpcAddressMap[peerIndex];
+    auto i = addressMap.find(base);
+    if (i != addressMap.end()) {
+      if (i->second.second == bufferId) {
+        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address, i->second.first);
+        size_t offset = address - base;
+        callback(i->second.first + offset);
+        return;
+      }
+      addressMap.erase(i);
+      log.debug("requestAddress: bufferId changed for %#x bytes at %#x\n", length, address);
+    }
+
     CHECK(size >= length);
     log.debug(
         "requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length, address,
@@ -222,7 +224,7 @@ struct IpcMapper {
       CHECK(mapped.size == size);
       CHECK(mapped.bufferId == bufferId);
       CHECK(mapped.unmappable == unmappable);
-      addressMap[address] = {baseAddress + offset, bufferId};
+      addressMap[base] = {baseAddress, bufferId};
       l.unlock();
       callback(baseAddress + offset);
     } else {
@@ -281,7 +283,7 @@ struct IpcMapper {
               log.debug(
                   "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, e.address,
                   mappedAddress + e.offset, e.offset);
-              peerIpcAddressMap[peerIndex][e.address] = {mappedAddress + e.offset, bufferId};
+              peerIpcAddressMap[peerIndex][e.address] = {mappedAddress, bufferId};
               std::move(e.callback)(mappedAddress + e.offset);
             }
             peerMapCallbacks[peerIndex].erase(it);
