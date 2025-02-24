@@ -100,93 +100,6 @@ struct PairHash {
   }
 };
 
-struct CacheContainer : std::enable_shared_from_this<CacheContainer> {
-  SpinMutex mutex;
-  std::atomic_size_t refcount = 0;
-
-  size_t nextIdentifier = 1;
-
-  Vector<Event> freeEvents;
-
-  struct Data {
-    AllocatedCpuBuffer cpu;
-    size_t identifier = 0;
-    allocator::FreeCallbackHandle freeHandle;
-    Event event;
-  };
-
-  HashMap<std::pair<uintptr_t, size_t>, std::unique_ptr<Data>, PairHash> data;
-
-  void discard() {
-    std::lock_guard l(mutex);
-    for (auto& v : data) {
-      v.second->event.synchronize();
-      freeEvents.push_back(std::move(v.second->event));
-    }
-    data.clear();
-  }
-
-  Data* lookup(uintptr_t inputAddress, size_t bytes) {
-    std::lock_guard l(mutex);
-    auto i = data.find(std::make_pair(inputAddress, bytes));
-    if (i == data.end()) {
-      return nullptr;
-    }
-    return &*i->second;
-  }
-
-  void load(Data* data, uintptr_t outputAddress, CUstream stream) {
-    data->event.wait(stream);
-    cudaCopy(outputAddress, (uintptr_t)data->cpu.cpuPointer, data->cpu.bytes, stream);
-    data->event.record(stream);
-  }
-
-  void store(
-      uintptr_t inputBaseAddress, uintptr_t inputAddress, size_t inputBytes, uintptr_t outputAddress,
-      size_t outputBytes, CUstream stream) {
-    std::lock_guard l(mutex);
-    auto& dptr = data[std::make_pair(inputAddress, inputBytes)];
-    CHECK(dptr == nullptr);
-    dptr = std::make_unique<Data>();
-    auto& d = *dptr;
-    d.cpu = allocate(outputBytes);
-    d.identifier = nextIdentifier;
-    ++nextIdentifier;
-
-    if (freeEvents.empty()) {
-      d.event = Event::create();
-    } else {
-      d.event = std::move(freeEvents.back());
-      freeEvents.pop_back();
-    }
-
-    cudaCopy((uintptr_t)d.cpu.cpuPointer, outputAddress, outputBytes, stream);
-    d.event.record(stream);
-
-    // log.info("cache stored %d bytes with id %d\n", d.cpu.bytes, d.identifier);
-
-    CHECK(allocator::owns(inputBaseAddress));
-    d.freeHandle =
-        allocator::addFreeCallback(inputBaseAddress, [this, self = shared_from_this(), &d, inputAddress, inputBytes] {
-          // log.error("waa free callback was called!\n");
-          std::lock_guard l(mutex);
-          d.freeHandle.release();
-          d.event.synchronize();
-          freeEvents.push_back(std::move(d.event));
-          auto i = data.find(std::make_pair(inputAddress, inputBytes));
-          CHECK(i != data.end());
-          data.erase(i);
-        });
-  }
-
-  AllocatedCpuBuffer allocate(size_t bytes) {
-    AllocatedCpuBuffer r;
-    r.bytes = bytes;
-    r.cpuPointer = cpu_allocator::moo_alloc(bytes);
-    return r;
-  }
-};
-
 struct ThreadUnsafe {
   SpinMutex mutex;
   void lock() {
@@ -217,8 +130,6 @@ struct ProcessGroupImpl {
   std::array<Event, maxConcurrency> concurrencyEvents;
 
   WorkStream copyWorkStream;
-
-  std::shared_ptr<CacheContainer> allgatherCache;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -799,55 +710,6 @@ struct ProcessGroupImpl {
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
 
-    bool cacheResults = false;
-
-    if (allgatherCache) {
-      if (allgatherCache->refcount == 0) {
-        allgatherCache = nullptr;
-      } else {
-        if (!isCuda) {
-          throw std::runtime_error("All-gather cache is only supported with cuda tensors!");
-        }
-        if (!allocator::owns(inputAddress) || !allocator::owns(outputAddress)) {
-          throw std::runtime_error("All-gather cache is enabled, but tensors are not owned by moodist. Moodist "
-                                   "cuda allocator must be enabled for caching");
-        }
-        auto* data = allgatherCache->lookup(inputAddress, bytes);
-        if (data) {
-          StreamData& sd = group->getStreamData(nullptr);
-          std::atomic_uint32_t cpuDone = 0;
-
-          QueueEntryCached* e = group->cpuThread->freelistCached.pop();
-          e->task = taskCached;
-          e->stepValue = stepValue;
-          e->concurrencyIndex = concurrencyIndex;
-          e->sd = &sd;
-          e->identifier = data->identifier;
-          e->inputBytes = bytes;
-          e->outputBytes = outputBytes;
-          group->cpuThread->enqueue(e);
-
-          auto& localIpcRanks = getLocalIpcRanks();
-          size_t n = localIpcRanks.size() + 1;
-          size_t chunkSize = (outputBytes + n - 1) / n;
-          size_t offset = chunkSize * myLocalRank;
-          chunkSize = myLocalRank == localIpcRanks.size() ? outputBytes - offset : chunkSize;
-
-          CHECK(data->cpu.bytes == chunkSize);
-
-          allgatherCache->load(data, outputAddress + offset, stream);
-
-          local_all_gather_impl(
-              concurrencyIndex, stepValue, outputAddress + offset, chunkSize, outputAddress, outputBytes, stream,
-              localIpcRanks, myLocalRank);
-
-          return;
-        }
-
-        cacheResults = true;
-      }
-    }
-
     if (!isCuda) {
       StreamData& sd = group->getStreamData(nullptr);
       std::atomic_uint32_t cpuDone = 0;
@@ -1036,19 +898,6 @@ struct ProcessGroupImpl {
       copyArgs.WidthInBytes = bytes;
       copyArgs.Height = size;
       CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-    }
-
-    if (cacheResults) {
-      auto& localIpcRanks = getLocalIpcRanks();
-      size_t n = localIpcRanks.size() + 1;
-      size_t chunkSize = (outputBytes + n - 1) / n;
-      size_t offset = chunkSize * myLocalRank;
-      // log.info("%d: n %d, chunkSize %d, offset %d, outputBytes %d\n", rank, n, chunkSize, offset, outputBytes);
-      chunkSize = myLocalRank == localIpcRanks.size() ? outputBytes - offset : chunkSize;
-      // log.info("%d: myLocalRank %d, my chunk size %d\n", rank, myLocalRank, chunkSize);
-      allgatherCache->store(
-          (uintptr_t)input.storage().data(), (uintptr_t)input.data_ptr(), bytes, outputAddress + offset, chunkSize,
-          stream);
     }
 
     trace("post");
@@ -2468,50 +2317,6 @@ torch::Tensor Future::result() {
     throw std::runtime_error("result has already been called on this Future - it cannot be called twice");
   }
   return makeTensor(std::move(impl->result));
-}
-
-struct CacheImpl {
-  SpinMutex mutex;
-  std::vector<std::shared_ptr<CacheContainer>> containers;
-  ~CacheImpl() {
-    for (auto& v : containers) {
-      if (--v->refcount == 0) {
-        v->discard();
-      }
-    }
-  }
-  void discard() {
-    std::lock_guard l(mutex);
-    for (auto& v : containers) {
-      v->discard();
-    }
-  }
-  void add(ProcessGroupImpl* group, std::string opname) {
-    std::lock_guard l(mutex);
-    if (opname == "allgather" || opname == "all_gather") {
-      std::lock_guard l(group->threadUnsafe);
-      if (!group->allgatherCache) {
-        group->allgatherCache = std::make_shared<CacheContainer>();
-      }
-      ++group->allgatherCache->refcount;
-      containers.push_back(group->allgatherCache);
-    } else {
-      throw std::runtime_error(fmt::sprintf("cache: unsupported op name '%s'", opname));
-    }
-  }
-};
-
-Cache::Cache() {
-  impl = std::make_unique<CacheImpl>();
-}
-Cache::~Cache() {
-  impl.reset();
-}
-void Cache::discard() {
-  impl->discard();
-}
-void Cache::add(ProcessGroupImpl* group, std::string opname) {
-  impl->add(group, opname);
 }
 
 } // namespace moodist

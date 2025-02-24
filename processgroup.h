@@ -26,15 +26,6 @@ struct Future {
   torch::Tensor result();
 };
 
-struct CacheImpl;
-struct Cache {
-  std::unique_ptr<CacheImpl> impl;
-  Cache();
-  ~Cache();
-  void discard();
-  void add(ProcessGroupImpl* group, std::string opname);
-};
-
 using Work = c10d::Work;
 
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {

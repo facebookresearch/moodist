@@ -24,27 +24,6 @@ void enableCudaAllocator();
 void enableCpuAllocator();
 void cpuAllocatorDebug();
 
-namespace {
-
-std::shared_ptr<Cache> cache(c10d::ProcessGroup& pg, std::string opname) {
-  auto r = std::make_shared<Cache>();
-  auto* p = dynamic_cast<moodist::ProcessGroup*>(&pg);
-  if (p) {
-    r->add(&*p->impl, opname);
-  } else {
-    const auto& backend = pg.getDefaultBackend();
-    auto* p = dynamic_cast<moodist::Backend*>(&*backend);
-    if (p) {
-      r->add(&*p->pg.impl, opname);
-    } else {
-      throw std::runtime_error("cache: the specified group is not a moodist process group");
-    }
-  }
-  return r;
-}
-
-} // namespace
-
 } // namespace moodist
 
 namespace {
@@ -93,8 +72,6 @@ PYBIND11_MODULE(_C, m) {
       .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())
       .def("result", &moodist::Future::result, py::call_guard<py::gil_scoped_release>());
 
-  py::class_<moodist::Cache, std::shared_ptr<moodist::Cache>>(m, "Cache").def("discard", &moodist::Cache::discard);
-
   m.def("enable_profiling", [](bool b) {
     printf("enable profiling -> %d\n", b);
     moodist::profilingEnabled = b;
@@ -104,8 +81,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("cpu_allocator_debug", &moodist::cpuAllocatorDebug);
 
   m.def("cuda_copy", &cudaCopy, py::call_guard<py::gil_scoped_release>());
-
-  m.def("cache", &moodist::cache, py::call_guard<py::gil_scoped_release>());
 
   py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
       .def(
