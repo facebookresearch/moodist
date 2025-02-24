@@ -31,6 +31,8 @@ constexpr uint8_t taskQueueGet = 15;
 constexpr uint8_t taskQueueTransaction = 16;
 constexpr uint8_t taskCat = 17;
 constexpr uint8_t taskCopy = 18;
+constexpr uint8_t taskCached = 19;
+constexpr uint8_t taskReduceScatterBroadcast = 20;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -55,8 +57,10 @@ OPTYPE(ReduceScatterCpu);
 OPTYPE(BroadcastRingCpu);
 OPTYPE(GatherCpu);
 
+OPTYPE(AllGatherLocalCuda);
 OPTYPE(AllGatherRingCuda);
 OPTYPE(ReduceScatterRingCuda);
+OPTYPE(ReduceScatterBroadcastCuda);
 OPTYPE(BroadcastCuda);
 OPTYPE(ReduceCuda);
 
@@ -70,6 +74,7 @@ OPTYPE(QueueGet);
 OPTYPE(QueueTransaction);
 
 OPTYPE(Cat);
+OPTYPE(Cached);
 
 template<typename DynamicAddresses>
 inline void badOp(
@@ -123,6 +128,9 @@ struct QueueEntryReduceScatter : QueueEntry {
   size_t numDevices = 0;
   size_t numChunks = 0;
   size_t numParallel = 0;
+
+  uintptr_t recvAddress = 0;
+  uintptr_t sendAddress = 0;
 };
 
 struct QueueEntryBroadcast : QueueEntry {
@@ -244,6 +252,13 @@ struct QueueEntryCopy : QueueEntry {
   FutureImplSharedPtr future;
 };
 
+struct QueueEntryCached : QueueEntry {
+  int op = -1;
+  int identifier = -1;
+  size_t inputBytes;
+  size_t outputBytes;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -299,6 +314,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryQueueTransaction> freelistQueueTransaction;
   QueueEntryFreeList<QueueEntryCat> freelistCat;
   QueueEntryFreeList<QueueEntryCopy> freelistCopy;
+  QueueEntryFreeList<QueueEntryCached> freelistCached;
 
   CpuThread(Group*);
   ~CpuThread();

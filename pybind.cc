@@ -10,9 +10,12 @@
 #include <pybind11/chrono.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/utils/pybind.h>
 
+#include "backend.h"
 #include "common.h"
+#include "cuda_copy.h"
 #include "processgroup.h"
 
 namespace moodist {
@@ -22,27 +25,29 @@ void enableCpuAllocator();
 void cpuAllocatorDebug();
 
 namespace {
-SpinMutex registerMutex;
-HashMap<uintptr_t, size_t> registered;
 
-void ensureRegistered(uintptr_t address) {
-  auto region = cpu_allocator::regionAt(address);
-  if (region.first) {
-    std::lock_guard l(registerMutex);
-    auto& s = registered[region.first];
-    if (s != region.second) {
-      CHECK(region.second > s);
-      if (s != 0) {
-        CHECK_CU(cuCtxSynchronize());
-        CHECK_CU(cuMemHostUnregister((void*)region.first));
-      }
-      CHECK_CU(cuMemHostRegister(
-          (void*)region.first, region.second, CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_PORTABLE));
-      s = region.second;
+std::shared_ptr<Cache> cache(c10d::ProcessGroup& pg, std::string opname) {
+  auto r = std::make_shared<Cache>();
+  auto* p = dynamic_cast<moodist::ProcessGroup*>(&pg);
+  if (p) {
+    r->add(&*p->impl, opname);
+  } else {
+    const auto& backend = pg.getDefaultBackend();
+    auto* p = dynamic_cast<moodist::Backend*>(&*backend);
+    if (p) {
+      r->add(&*p->pg.impl, opname);
+    } else {
+      throw std::runtime_error("cache: the specified group is not a moodist process group");
     }
   }
+  return r;
 }
 
+} // namespace
+
+} // namespace moodist
+
+namespace {
 void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
   CHECK(dst.is_contiguous());
   CHECK(src.is_contiguous());
@@ -53,28 +58,14 @@ void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
   }
   uintptr_t dstAddress = (uintptr_t)(void*)dst.mutable_data_ptr();
   uintptr_t srcAddress = (uintptr_t)(const void*)src.const_data_ptr();
-  if (dst.is_cpu()) {
-    ensureRegistered(dstAddress);
-  }
-  if (src.is_cpu()) {
-    ensureRegistered(srcAddress);
-  }
-  CUstream stream = c10::cuda::getCurrentCUDAStream();
-  try {
-    CHECK_CU(cuMemcpyAsync(dstAddress, srcAddress, dstbytes, stream));
-  } catch (...) {
-    log.error("failed to copy %#x %#x %d\n", dstAddress, srcAddress, dstbytes);
-    throw;
-  }
+  moodist::cudaCopy(dstAddress, srcAddress, srcbytes, c10::cuda::getCurrentCUDAStream());
 }
-
 } // namespace
-
-} // namespace moodist
 
 namespace py = pybind11;
 
 using MoodistProcessGroup = moodist::ProcessGroup;
+using MoodistBackend = moodist::Backend;
 
 PYBIND11_MODULE(_C, m) {
   py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>, c10d::ProcessGroup>(
@@ -93,9 +84,16 @@ PYBIND11_MODULE(_C, m) {
       .def("_set_group_name", &MoodistProcessGroup::setGroupName)
       .def_property_readonly("group_name", &MoodistProcessGroup::getGroupName);
 
+  py::class_<MoodistBackend, c10::intrusive_ptr<MoodistBackend>, c10d::Backend>(m, "MoodistBackend", R"d(
+    A moodist process group :D
+  )d")
+      .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>());
+
   py::class_<moodist::Future>(m, "Future")
       .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())
       .def("result", &moodist::Future::result, py::call_guard<py::gil_scoped_release>());
+
+  py::class_<moodist::Cache, std::shared_ptr<moodist::Cache>>(m, "Cache").def("discard", &moodist::Cache::discard);
 
   m.def("enable_profiling", [](bool b) {
     printf("enable profiling -> %d\n", b);
@@ -105,7 +103,9 @@ PYBIND11_MODULE(_C, m) {
   m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
   m.def("cpu_allocator_debug", &moodist::cpuAllocatorDebug);
 
-  m.def("cuda_copy", &moodist::cudaCopy, py::call_guard<py::gil_scoped_release>());
+  m.def("cuda_copy", &cudaCopy, py::call_guard<py::gil_scoped_release>());
+
+  m.def("cache", &moodist::cache, py::call_guard<py::gil_scoped_release>());
 
   py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
       .def(

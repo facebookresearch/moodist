@@ -20,12 +20,15 @@ if "LOCAL_RANK" not in os.environ:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
 
-else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+    os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
 
-os.environ["NCCL_PROTO"] = "LL128"
+# else:
+#     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+
+# os.environ["NCCL_PROTO"] = "LL128"
+
 
 def f(n):
     import torch
@@ -38,11 +41,16 @@ def f(n):
         # sys.path.append("/private/home/vegardmella/moolib/py")
         import moodist
 
+        moodist.enable_cuda_allocator()
+        moodist.enable_cpu_allocator()
+
         # moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
 
     # print(torch.randn(1).cuda())
+
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     dist.init_process_group(
         backend=n,
@@ -69,19 +77,20 @@ def f(n):
 
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
     # data = torch.randn(1024 * 1024 * 100 // size).cuda()
-    #data = torch.randn(1024 * 1024 * 40).cuda() + 1
-    #data = torch.randn(589824 * 8 * size).cuda() + 1
-    #data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
-    data = torch.randn(32768 * size).cuda() + 1
+    # data = torch.randn(1024 * 1024 * 40).cuda() + 1
+    # data = torch.randn(589824 * 8 * size).cuda() + 1
+    # data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
+    # data = torch.randn(32768 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
-    #data = torch.randn((442416 - 4) * size).cuda() + 1
-    #data = torch.randn(527040 * size).cuda() + 1
-    #data = torch.randn(589824 * size).cuda() + 1
-    #data = torch.randn(294912 * size).cuda() + 1
-    #data = torch.randn(524288 * size).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
-    #data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
+    data = torch.randn(8192 * 7168).cuda() + 1
+    # data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
+    # data = torch.randn((442416 - 4) * size).cuda() + 1
+    # data = torch.randn(527040 * size).cuda() + 1
+    # data = torch.randn(589824 * size).cuda() + 1
+    # data = torch.randn(294912 * size).cuda() + 1
+    # data = torch.randn(524288 * size).cuda() + 1
+    # data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
+    # data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
     # data *= 0
     # data += 2 ** rank
     # data = torch.randn(1024 * 1024 * 800).cuda() + 1
@@ -95,7 +104,7 @@ def f(n):
     result0 = torch.zeros(data.numel() // size).cuda()
     # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
-    #dtype = torch.bfloat16
+    # dtype = torch.bfloat16
     dtype = torch.float
 
     data = data.to(dtype)
@@ -104,7 +113,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data)
 
-    check = False
+    check = True
 
     if check:
         all_inputs = []
@@ -124,13 +133,13 @@ def f(n):
 
     torch.manual_seed(420 + rank)
 
-    #print("result0 is at %#x" % result0.data_ptr())
+    # print("result0 is at %#x" % result0.data_ptr())
 
-    #x = torch.randn(1024 * 1024).cuda()
-    #y = torch.zeros(x.numel() * size).cuda()
+    # x = torch.randn(1024 * 1024).cuda()
+    # y = torch.zeros(x.numel() * size).cuda()
 
     for _ in range(1000):
-        #print("rank %d warmup %d" % (rank, _))
+        # print("rank %d warmup %d" % (rank, _))
         # dist.all_gather(result, tmp)
         result0 -= 1
         if _ % 3 == 0:
@@ -139,8 +148,8 @@ def f(n):
         #     dist.all_gather_into_tensor(y, x)
         tmp.copy_(data)
         # dist.all_gather(result, tmp)
-        #print("result0 numel is ", result0.numel())
-        #print("tmp numel is ", tmp.numel())
+        # print("result0 numel is ", result0.numel())
+        # print("tmp numel is ", tmp.numel())
         dist.reduce_scatter_tensor(result0, tmp)
         tmp.zero_()
         result = [result0]
@@ -178,7 +187,7 @@ def f(n):
                 print("%d: result %d sum %f" % (rank, i, result[i].sum()))
                 raise RuntimeError("%d: wrong result for index %d" % (rank, i))
         # torch.cuda.synchronize()
-        #print("rank %d warmup %d done" % (rank, _))
+        # print("rank %d warmup %d done" % (rank, _))
     tmp.copy_(data)
 
     print("rank %d warmup done" % (rank))
@@ -261,7 +270,7 @@ def f(n):
         for i in range(loopcount):
             with torch.cuda.stream(stream1):
                 dist.reduce_scatter_tensor(result0, tmp)
-            #with torch.cuda.stream(stream2):
+            # with torch.cuda.stream(stream2):
             #    x1(y)
             #    x2(y)
 
@@ -349,12 +358,17 @@ ngpus = 1
 
 fds = []
 for i in range(ngpus):
-    fds.append(os.open("out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i), os.O_WRONLY|os.O_CREAT|os.O_TRUNC))
+    fds.append(
+        os.open(
+            "out-%s.txt" % str(int(os.environ["SLURM_PROCID"]) * ngpus + i),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        )
+    )
 
 # for n in ("moolib", "nccl", "moolib", "nccl", "moolib", "nccl", "moolib", "nccl"):
 for n in ("moodist", "nccl"):
-#for n in ("nccl", "moodist"):
-#for n in ("moodist", ):
+    # for n in ("nccl", "moodist"):
+    # for n in ("moodist", ):
     os.environ["MASTER_PORT"] = str(master_port)
     master_port += 1
     pids = []

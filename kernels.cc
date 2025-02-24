@@ -543,6 +543,13 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
   blockSize = 256;
   size_t blocksPerSm = 1;
 
+  if (group->ipcRanks.size() == group->size - 1) {
+    gridSize = 32;
+  }
+  if (group->ipcRanks.size() == 0) {
+    gridSize = 4;
+  }
+
   source = replace(
       source, "$copyCode",
       emitCopySeq({"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex"));

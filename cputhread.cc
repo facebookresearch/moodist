@@ -1,7 +1,6 @@
 #include "cputhread.h"
 #include "allgather.h"
 #include "async.h"
-#include "clock.h"
 #include "common.h"
 #include "cpu_allocator.h"
 #include "fmt/printf.h"
@@ -11,7 +10,6 @@
 #include "ib_common.h"
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
-#include "parameters.h"
 #include "queue.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
@@ -27,7 +25,6 @@
 #include <numa.h>
 #include <random>
 #include <torch/types.h>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -1911,11 +1908,14 @@ struct CpuThreadImpl {
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
       {
-        recvAddress = params.sd->recvBuffer.cudaPointer;
-        CHECK(params.sd->recvBuffer.bytes >= params.pitch * ringRecvs.size());
+        // recvAddress = params.sd->recvBuffer.cudaPointer;
+        // CHECK(params.sd->recvBuffer.bytes >= params.pitch * ringRecvs.size());
 
-        uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
-        CHECK(params.sd->sendBuffer.bytes >= params.pitch * ringSends.size());
+        // uintptr_t sendAddress = params.sd->sendBuffer.cudaPointer;
+        // CHECK(params.sd->sendBuffer.bytes >= params.pitch * ringSends.size());
+
+        recvAddress = params.recvAddress;
+        uintptr_t sendAddress = params.sendAddress;
 
         CHECK(sendAddress && recvAddress);
 
@@ -2049,6 +2049,186 @@ struct CpuThreadImpl {
 
       self.cpuThread->freelistReduceScatter.push(&params);
       self.allocatorReduceScatterRingRead.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkReduceScatterBroadcast : Work {
+    QueueEntryReduceScatter& params;
+    MemoryRegistration* recvMr;
+    uintptr_t recvAddress;
+
+    const ReduceScatter& reduceScatter = *self.group->reduceScatter;
+    const Vector<size_t>& recvRanks = reduceScatter.recvRanks;
+    const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
+
+    size_t index;
+    size_t sendIndex;
+    size_t sendDoneIndex;
+    size_t i;
+    size_t liveReads = 0;
+
+    std::array<uint32_t, maxDevices> recvLkeys;
+
+    WorkReduceScatterBroadcast(CpuThreadImpl& self, QueueEntryReduceScatter& params)
+        : Work(self, params), params(params) {
+      // log.info(
+      //     "%d: reduce-scatter broadcast recv ranks [%s], send ranks [%s]\n", rank,
+      //     fmt::to_string(fmt::join(recvRanks, ", ")), fmt::to_string(fmt::join(sendRanks, ", ")));
+    }
+
+    void advanceSend() {
+      CHECK(sendIndex != sendRanks.size());
+      CHECK(sendDoneIndex <= sendIndex);
+
+      if (sendIndex >= sendDoneIndex + 1) {
+        if (self.inStepValueDeviceChunk(concurrencyIndex, sendRanks[sendDoneIndex], 0, 0) != stepValue) {
+          return;
+        }
+        ++sendDoneIndex;
+      }
+
+      self.writeDyn(concurrencyIndex, sendRanks[sendIndex], sendRanks[sendIndex], rank, 1);
+      ++sendIndex;
+    }
+
+    void step() {
+      ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        recvAddress = params.recvAddress;
+        uintptr_t sendAddress = params.sendAddress;
+
+        recvMr = nullptr;
+        MemoryRegistration* sendMr = nullptr;
+
+        if (recvAddress) {
+          recvMr = self.regMrCuda(recvAddress, params.pitch * recvRanks.size());
+
+          for (size_t i = 0; i != maxDevices; ++i) {
+            recvLkeys[i] = recvMr->mrs[i]->lkey;
+          }
+        }
+        if (sendAddress) {
+          sendMr = self.regMrCuda(sendAddress, params.pitch * sendRanks.size());
+        } else {
+          CHECK(sendRanks.size() == size - 1);
+          sendMr = self.regMrCuda(params.inputAddress, params.pitch * size);
+        }
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        for (index = 0; index != sendRanks.size(); ++index) {
+          i = sendRanks[index];
+          outDyns[i].gatherAddress =
+              sendAddress ? sendAddress + params.pitch * index : params.inputAddress + params.pitch * i;
+          outDyns[i].gatherBytes = params.bytes;
+          outDyns[i].stepValue = stepValue;
+          outDyns[i].opType = opTypeReduceScatterBroadcastCuda;
+          CHECK(sendMr != nullptr);
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = sendMr->mrs[di]->rkey;
+          }
+        }
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      // for (size_t i : sendRanks) {
+      //   self.writeDyn(concurrencyIndex, i, i, rank, 1);
+      // }
+
+      sendIndex = 0;
+      sendDoneIndex = 0;
+
+      for (index = 0; index != recvRanks.size();) {
+        i = recvRanks[index];
+
+        if (sendIndex != sendRanks.size()) {
+          advanceSend();
+        }
+
+        if (liveReads >= 1) {
+          YIELD
+          continue;
+        }
+
+        if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+          YIELD
+          continue;
+        }
+
+        WAIT_DYN(opTypeReduceScatterBroadcastCuda, i);
+
+        ++liveReads;
+        self.readDataDistributed(
+            i, (void*)(recvAddress + params.pitch * index), recvLkeys, (void*)(dyn.gatherAddress + 0), dyn.gatherKey,
+            params.bytes, self.makeCallback([this, i = i] {
+              --liveReads;
+
+              self.writeStepValueDeviceChunk(concurrencyIndex, i, 0, rank, 0, 0);
+            }));
+
+        ++index;
+      }
+
+      while (sendIndex != sendRanks.size()) {
+        advanceSend();
+      }
+
+      while (liveReads) {
+        YIELD
+      }
+
+      self.trace("wait for remote reads");
+      for (index = 0; index != sendRanks.size(); ++index) {
+        i = sendRanks[index];
+        while (self.inStepValueDeviceChunk(concurrencyIndex, i, 0, 0) != stepValue) {
+          YIELD
+        }
+      }
+
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      // cpuOut[0] = stepValue;
+      self.writeCpuOut(concurrencyIndex, 0, 0);
+
+      self.trace("kernel-exit");
+
+      // {
+      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
+      //   if (rank == 0) {
+      //     if (params.paramsData) {
+      //       params.paramsData->addTiming(params.paramsIndex, t);
+      //     }
+      //     std::lock_guard l(stats.mutex);
+      //     stats.values.push_back(
+      //         {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+      //          (float)numChunks, (float)numParallel, t});
+      //   }
+      // }
+
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
+
+      self.cpuThread->freelistReduceScatter.push(&params);
+      self.allocatorReduceScatterBroadcast.deallocate(this);
       DONE
     }
   };
@@ -4248,6 +4428,128 @@ struct CpuThreadImpl {
         }));
   }
 
+  struct WorkCached : Work {
+    QueueEntryCached& params;
+    size_t i;
+
+    WorkCached(CpuThreadImpl& self, QueueEntryCached& params) : Work(self, params), params(params) {}
+
+    struct Info {
+      int op = -1;
+      int identifier = -1;
+      size_t inputBytes;
+      size_t outputBytes;
+    };
+
+    TemporaryBufferHandle infoBuffer;
+    TemporaryBufferHandle remoteInfoBuffer;
+    bool readDone = false;
+
+    void step() {
+      ENTER
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        infoBuffer = self.allocateTemporaryBuffer(sizeof(Info));
+        Info i;
+        i.op = params.op;
+        i.identifier = params.identifier;
+        i.inputBytes = params.inputBytes;
+        i.outputBytes = params.outputBytes;
+        std::memcpy(infoBuffer->cpuPointer, &i, sizeof(Info));
+      }
+
+      if (size > 1) {
+        size_t i = self.rank + 1;
+        if (i >= size) {
+          i -= size;
+        }
+        CHECK(i >= 0 && i < size);
+        DynamicAddresses& out = self.outDyn(concurrencyIndex, i);
+        out.opType = opTypeCached;
+        out.gatherAddress = (uintptr_t)infoBuffer->cpuPointer;
+        out.gatherBytes = infoBuffer->bytes;
+        out.stepValue = stepValue;
+        for (size_t i = 0; i != maxDevices; ++i) {
+          out.gatherKey[i] = infoBuffer.mr->mrs[i]->rkey;
+        }
+        self.writeDyn(concurrencyIndex, i, i, rank);
+      }
+
+      if (size > 1) {
+        i = self.rank - 1;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+
+        while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+          YIELD
+        }
+        DynamicAddresses& dyn = self.inDyn(concurrencyIndex, i);
+        CHECK_DYN(dyn, opTypeCached, stepValue, sizeof(Info));
+
+        remoteInfoBuffer = self.allocateTemporaryBuffer(sizeof(Info));
+
+        size_t di = 1 % self.devices.size();
+        auto& dev = self.devices[di];
+        self.readData(
+            dev, i, remoteInfoBuffer->cpuPointer, remoteInfoBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
+            dyn.gatherKey[di], sizeof(Info), self.makeCallback([this, i = this->i] { readDone = true; }));
+      }
+
+      if (size > 1) {
+        i = self.rank - 1;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+
+        while (!readDone) {
+          YIELD
+        }
+        Info ri;
+        std::memcpy(&ri, remoteInfoBuffer->cpuPointer, sizeof(Info));
+
+        if (ri.op != params.op || ri.identifier != params.identifier || ri.inputBytes != params.inputBytes ||
+            ri.outputBytes != params.outputBytes) {
+          // fixme: this op could be synchronous, and errors raised as exceptions
+          fatal(
+              "Mismatched cached operation detected.\nLocal parameters: op %d, identifier %d, input bytes %d, output "
+              "bytes %d\nRemote parameters: op %d, identifier %d, input bytes %d, output bytes %d\n",
+              params.op, params.identifier, params.inputBytes, params.outputBytes, ri.op, ri.identifier, ri.inputBytes,
+              ri.outputBytes);
+        }
+      }
+
+      for (i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        self.writeStepValue(concurrencyIndex, i, 0, rank);
+      }
+
+      for (i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        while (self.inStepValue(concurrencyIndex, i) < stepValue) {
+          YIELD
+        }
+      }
+
+      // log.info("Cached op  ok!\n");
+
+      infoBuffer = {};
+      remoteInfoBuffer = {};
+
+      self.cpuThread->freelistCached.push(&params);
+      self.allocatorCached.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -4283,6 +4585,8 @@ struct CpuThreadImpl {
   WorkAllocator<WorkCreateQueue> allocatorCreateQueue;
   // WorkAllocator<WorkQueuePut> allocatorQueuePut;
   WorkAllocator<WorkCat> allocatorCat;
+  WorkAllocator<WorkCached> allocatorCached;
+  WorkAllocator<WorkReduceScatterBroadcast> allocatorReduceScatterBroadcast;
 
   size_t numActiveWorks = 0;
 
@@ -4406,6 +4710,12 @@ struct CpuThreadImpl {
               break;
             case taskCopy:
               executeCopy((QueueEntryCopy&)queueEntry);
+              break;
+            case taskCached:
+              enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
+              break;
+            case taskReduceScatterBroadcast:
+              enqueue(allocatorReduceScatterBroadcast, (QueueEntryReduceScatter&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

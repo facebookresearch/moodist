@@ -20,18 +20,19 @@ if "LOCAL_RANK" not in os.environ:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
 
-    #os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-    
+    # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+
     os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
 
-#else:
-    #os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+# else:
+# os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
 os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
-import moodist
+# import moodist
 
-moodist.enable_cuda_allocator()
+# moodist.enable_cuda_allocator()
+
 
 def f(n):
     import torch
@@ -42,7 +43,7 @@ def f(n):
 
         sys.path.append("/home/vegardmella/moodist/py")
         import moodist
-        
+
         moodist.enable_cuda_allocator()
 
         # moodist.enable_profiling(True)
@@ -54,7 +55,7 @@ def f(n):
     import socket
 
     print("hostname: %s\n" % (socket.gethostname()))
-    
+
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     dist.init_process_group(
@@ -108,11 +109,13 @@ def f(n):
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
         # data = torch.randn(32768).cuda() + 1
-        #data = torch.randn(36864).cuda() + 1
-        #data = torch.randn(1048576 // 16).cuda() + 1
         # data = torch.randn(36864).cuda() + 1
-        #data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
-        data = torch.randn(1024 * 1024 * 20).cuda() + 1
+        # data = torch.randn(1048576 // 16).cuda() + 1
+        # data = torch.randn(36864).cuda() + 1
+        # data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
+        # data = torch.randn(1024 * 1024 * 20).cuda() + 1
+        # data = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
+        data = torch.randn(1024 * 7168 // 2).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         # data = torch.randn(442416).cuda() + 1
@@ -173,17 +176,21 @@ def f(n):
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
+        group = dist.new_group()
+        #cache = moodist.cache(group, "all_gather")
+
         for _ in range(1000):
             # print("rank %d warmup %d" % (rank, _))
             # dist.all_gather(result, tmp)
             result = [torch.zeros_like(data) for _ in range(size)]
+            result0 *= 0
             result0 -= 1
             if _ % 3 == 0:
                 tmp = torch.zeros_like(tmp)
             tmp.copy_(data)
             ostream = torch.cuda.current_stream()
             # dist.all_gather(result, tmp)
-            dist._all_gather_base(result0, tmp)
+            dist._all_gather_base(result0, data if _ % 3 != 0 else tmp, group=group)
             # with torch.cuda.stream(stream1):
             #     stream1.wait_stream(ostream)
             #     dist._all_gather_base(result0, tmp)
@@ -230,6 +237,7 @@ def f(n):
             torch.cuda.synchronize()
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
+        tmp = data
 
         # print("rank %d warmup done" % (rank))
 
@@ -388,7 +396,7 @@ def f(n):
                     e = torch.cuda.Event()
                     e.record()
                     events2.append(e)
-        elif 1 == 12:
+        elif 1 == 11:
             loopcount = 2000
             freeevents = [
                 torch.cuda.Event(),
@@ -424,8 +432,17 @@ def f(n):
             # moodist.enable_profiling(True)
             loopcount = 10000
             for _ in range(loopcount):
+                dist.all_gather_into_tensor(result0, tmp, group=group)
+                # torch.cuda.synchronize()
+            # moodist.enable_profiling(False)
+
+            dist.all_gather_into_tensor(result0, tmp, group=group)
+        elif 1 == 1:
+            # moodist.enable_profiling(True)
+            loopcount = 10000
+            for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp)
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
             # moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp)
@@ -523,7 +540,7 @@ def f(n):
         items = 1024 * 1024 * 20 * size
         # items = 1024 * 1024 * 50
         # items = 1024 * 1024 * 40
-        #items = (1024 * 512 - 1024 * 8) * size
+        # items = (1024 * 512 - 1024 * 8) * size
         # items = 294912 * size
         sum = 0
         # dtype = torch.bfloat16

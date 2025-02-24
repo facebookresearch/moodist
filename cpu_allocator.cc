@@ -484,7 +484,7 @@ extern "C" void allocate_memory(size_t index) {
       "mapped %d bytes at %#x (total %d bytes, %dG)\n", bytes, (uintptr_t)rv, mmappedBytes,
       mmappedBytes / 1024 / 1024 / 1024);
 
-  //madvise(rv, bytes, MADV_HUGEPAGE);
+  // madvise(rv, bytes, MADV_HUGEPAGE);
 
   auto start = std::chrono::steady_clock::now();
   mlock(rv, bytes);
@@ -827,6 +827,9 @@ std::pair<uintptr_t, size_t> regionAtIterate(uintptr_t address) {
   return {0, 0};
 }
 std::pair<uintptr_t, size_t> regionAt(uintptr_t address) {
+  if (allMappedRegions.size() <= 8) {
+    return regionAtIterate(address);
+  }
   auto i = std::lower_bound(allMappedRegions.begin(), allMappedRegions.end(), address, [](const Span& a, uintptr_t b) {
     return a.begin > b;
   });
@@ -836,7 +839,7 @@ std::pair<uintptr_t, size_t> regionAt(uintptr_t address) {
       r = {i->begin, i->end - i->begin};
     }
   }
-  CHECK(r == regionAtIterate(address));
+  // CHECK(r == regionAtIterate(address));
   return r;
 }
 bool owns(uintptr_t address) {

@@ -2,11 +2,13 @@
 import torch.distributed
 from ._C import (
     MoodistProcessGroup,
+    MoodistBackend,
     enable_profiling,
     enable_cuda_allocator,
     enable_cpu_allocator,
     cpu_allocator_debug,
     cuda_copy,
+    cache,
 )
 
 from datetime import timedelta
@@ -118,7 +120,7 @@ class LocalQueue:
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    return MoodistProcessGroup(store, rank, size)
+    return MoodistBackend(store, rank, size)
 
 
 torch.distributed.Backend.register_backend(
@@ -127,6 +129,7 @@ torch.distributed.Backend.register_backend(
 
 __all__ = [
     "MoodistProcessGroup",
+    "MoodistBackend",
     "enable_profiling",
     "enable_cuda_allocator",
     "enable_cpu_allocator",
@@ -134,4 +137,5 @@ __all__ = [
     "create_moodist_backend",
     "Empty",
     "cuda_copy",
+    "cache",
 ]

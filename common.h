@@ -63,7 +63,7 @@ inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
 #define CHECK(x)                                                                                                       \
   {                                                                                                                    \
     if (!(x)) [[unlikely]]                                                                                             \
-      fatal("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x);                                                      \
+      moodist::fatal("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x);                                             \
   }
 
 inline std::string removePciPathPrefix(std::string path) {
@@ -82,6 +82,7 @@ struct AllocatedBuffer {
   bool hostAllocated = false;
   bool numaAllocated = false;
   bool handleAllocated = false;
+  std::optional<torch::DataPtr> dataPtr;
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
@@ -94,6 +95,7 @@ struct AllocatedBuffer {
     std::swap(bytes, n.bytes);
     std::swap(hostAllocated, n.hostAllocated);
     std::swap(numaAllocated, n.numaAllocated);
+    std::swap(dataPtr, n.dataPtr);
     return *this;
   }
 
@@ -117,7 +119,9 @@ struct AllocatedBuffer {
         cuMemRelease(handle);
       }
     } else {
-      if (cudaPointer) {
+      if (dataPtr) {
+        dataPtr.reset();
+      } else if (cudaPointer) {
         log.verbose("free %d bytes of cuda memory at %#x\n", bytes, cudaPointer);
         cuMemFree(cudaPointer);
       }
@@ -333,6 +337,10 @@ struct Event {
   void wait(CUstream stream) {
     CHECK_CU(cuStreamWaitEvent(stream, event, CU_EVENT_WAIT_DEFAULT));
   }
+
+  void synchronize() {
+    CHECK_CU(cuEventSynchronize(event));
+  }
 };
 
 struct Stream {
@@ -367,6 +375,7 @@ struct Stream {
   static Stream create() {
     Stream r;
     CHECK_CU(cuStreamCreate(&r.stream, CU_STREAM_NON_BLOCKING));
+    // CHECK_CU(cuStreamCreateWithPriority(&r.stream, CU_STREAM_NON_BLOCKING, 100));
     r.owning = true;
     return r;
   }

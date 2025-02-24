@@ -4,6 +4,7 @@ import moodist
 import time
 import os
 
+moodist.enable_cpu_allocator()
 moodist.enable_cuda_allocator()
 
 lin1 = torch.nn.Linear(4096, 8192).cuda()
@@ -38,6 +39,13 @@ def f(x):
             x3 = x2.sum()
             # torch.cuda.synchronize()
             x4 = x2.sum()
+            #x5 = [x4.clone() for _ in range(16)]
+            # for _ in range(128):
+            #     x5 = x4.clone()
+            for i in range(16):
+                x5 = x4 * x4 * x4 * x4 * x4 * x4
+            del x4
+            del x5
             # print(x3)
             e0.record()
         y = x.clone()
@@ -85,9 +93,9 @@ def f(x):
 # for _ in range(100):
 #     f(torch.randn((16, 4096), device="cuda"))
 
-torch.distributed.init_process_group()
+torch.distributed.init_process_group(backend="moodist")
 
-for i in range(4):
+for i in range(40):
     # if i == 10:
     #     moodist.enable_cuda_allocator()
     start = time.time()
