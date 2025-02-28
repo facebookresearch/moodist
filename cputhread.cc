@@ -70,10 +70,17 @@ struct Callback {
   size_t refcount = 0;
   Callback* next = nullptr;
 
+  size_t* counter = nullptr;
+  size_t i = -1;
+
   void decref() {
     CHECK(refcount >= 1);
     if (--refcount == 0) {
-      std::move(onComplete)();
+      if (onComplete) {
+        std::move(onComplete)();
+      } else if (counter) {
+        --*counter;
+      }
       FreeList<Callback>::push(this, 0x1000);
     }
   }
@@ -303,6 +310,10 @@ struct CpuThreadImpl {
   size_t bytesWritten = 0;
   size_t bytesRead = 0;
 
+  bool errorState = false;
+  bool cqErrored = false;
+  std::chrono::steady_clock::time_point errorTime;
+
   std::vector<IbvMr> localMrs;
 
   std::vector<std::unique_ptr<CudaMapping>> cudaMappings;
@@ -321,6 +332,19 @@ struct CpuThreadImpl {
 
   // uint32_t* cudaStepValues = group->cudaStepValues;
   // uint32_t* cudaStepValuesDeviceChunks = group->cudaStepValuesDeviceChunks;
+
+  struct RankInfo {
+    std::array<char, 64> hostname;
+    int pid;
+    int device;
+    size_t heartbeatValue;
+    bool exited;
+  };
+
+  AllocatedArray rankInfo = group->allocateArrayHost(sizeof(RankInfo), size);
+  MemoryRegistration* rankInfoMr = regMr((uintptr_t)rankInfo.buffer.cpuPointer, rankInfo.buffer.bytes);
+  std::vector<RemoteAddressAndKey> remoteRankInfo =
+      distributeAddressAndKeys((uintptr_t)rankInfo.buffer.cpuPointer, rankInfoMr);
 
   MemoryRegistration* cudaStepValuesDeviceChunksMr = regMrCuda(
       group->cudaStepValuesDeviceChunksBuffer.buffer.cudaPointer, group->cudaStepValuesDeviceChunksBuffer.buffer.bytes);
@@ -482,6 +506,8 @@ struct CpuThreadImpl {
     }
     CHECK(callback->refcount == 0);
     callback->onComplete = std::move(f);
+    callback->counter = nullptr;
+    callback->i = -1;
     return CallbackWrapper(callback);
   }
 
@@ -495,21 +521,27 @@ struct CpuThreadImpl {
       for (size_t i = 0; i != n; ++i) {
         ibv_wc& wc = wcs[i];
         if (wc.status) {
-          fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode, wc.wr_id);
+          // fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode,
+          // wc.wr_id);
+          cqErrored = true;
+          Callback* callback = (Callback*)(void*)wc.wr_id;
+          log.error(
+              "%s: Error communicating with %s: Work completion with status %d. The process group is now in an error "
+              "state, and Moodist will shortly forcefully terminate the process.\n",
+              groupName(), rankName(callback->i), wc.status);
+          if (!errorState) {
+            errorState = true;
+            errorTime = std::chrono::steady_clock::now();
+          }
         } else {
           CHECK(dev.currentCqEntries != 0);
           --dev.currentCqEntries;
           if (dev.currentCqEntries == 0) {
             activeDevices.erase(dev);
           }
-          if (wc.wr_id) {
-            if (wc.wr_id & 1) {
-              --*(size_t*)(wc.wr_id & ~(uintptr_t)1);
-            } else {
-              Callback* callback = (Callback*)(void*)wc.wr_id;
-              callback->decref();
-            }
-          }
+          CHECK(wc.wr_id != 0);
+          Callback* callback = (Callback*)(void*)wc.wr_id;
+          callback->decref();
         }
       }
     }
@@ -519,7 +551,12 @@ struct CpuThreadImpl {
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback = nullptr) {
     CHECK(i >= 0 && i < size);
-    // CHECK(i != rank);
+
+    if (!callback) {
+      callback = makeCallback(nullptr);
+    }
+    callback->i = i;
+
     auto post = [&]() {
       ibv_sge sge;
       sge.addr = (uintptr_t)localAddress;
@@ -528,9 +565,7 @@ struct CpuThreadImpl {
 
       bytesWritten += bytes;
 
-      if (callback) {
-        ++callback->refcount;
-      }
+      ++callback->refcount;
 
       while (dev.currentCqEntries == maxCqEntries) {
         poll();
@@ -595,7 +630,12 @@ struct CpuThreadImpl {
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback = nullptr) {
     CHECK(i >= 0 && i < size);
-    // CHECK(i != rank);
+
+    if (!callback) {
+      callback = makeCallback(nullptr);
+    }
+    callback->i = i;
+
     auto post = [&]() {
       ibv_sge sge;
       sge.addr = (uintptr_t)localAddress;
@@ -604,9 +644,7 @@ struct CpuThreadImpl {
 
       bytesRead += bytes;
 
-      if (callback) {
-        ++callback->refcount;
-      }
+      ++callback->refcount;
 
       while (dev.currentCqEntries == maxCqEntries) {
         poll();
@@ -667,7 +705,13 @@ struct CpuThreadImpl {
       size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
       uint32_t rkey, size_t bytes) {
     CHECK(i >= 0 && i < size);
-    // CHECK(i != rank);
+
+    auto callback = makeCallback(nullptr);
+    callback->i = i;
+
+    callback->counter = &concurrencyLiveControlTransfers[concurrencyIndex];
+    ++callback->refcount;
+
     ibv_sge sge;
     sge.addr = (uintptr_t)localAddress;
     sge.length = bytes;
@@ -698,13 +742,14 @@ struct CpuThreadImpl {
     }
 
     ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)&concurrencyLiveControlTransfers[concurrencyIndex] | 1;
+    qp->wr_id = (uint64_t)(void*)(Callback*)callback;
     qp->wr_flags = IBV_SEND_SIGNALED;
-    // if (bytes <= 32) {
-    //   qp->wr_flags |= IBV_SEND_INLINE;
-    // }
     ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-    ibv_wr_set_sge_list(qp, 1, &sge);
+    if (bytes <= 32) {
+      ibv_wr_set_inline_data(qp, localAddress, bytes);
+    } else {
+      ibv_wr_set_sge_list(qp, 1, &sge);
+    }
 
     if (efa) {
       ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
@@ -717,7 +762,12 @@ struct CpuThreadImpl {
 
   void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback = nullptr) {
     CHECK(i >= 0 && i < size);
-    // CHECK(i != rank);
+
+    if (!callback) {
+      callback = makeCallback(nullptr);
+    }
+    callback->i = i;
+
     ibv_sge sge;
     sge.addr = (uintptr_t)localAddress;
     sge.length = bytes;
@@ -725,9 +775,7 @@ struct CpuThreadImpl {
 
     bytesWritten += bytes;
 
-    if (callback) {
-      ++callback->refcount;
-    }
+    ++callback->refcount;
 
     while (dev.currentCqEntries == maxCqEntries) {
       poll();
@@ -1134,8 +1182,11 @@ struct CpuThreadImpl {
           offset += n;
         }
       }
-      while (remaining) {
+      while (remaining && !errorState) {
         poll();
+      }
+      if (errorState) {
+        break;
       }
       setupComms->allgather(0);
       for (size_t i = 0; i != size; ++i) {
@@ -1175,8 +1226,11 @@ struct CpuThreadImpl {
           offset += n;
         }
       }
-      while (remaining) {
+      while (remaining && !errorState) {
         poll();
+      }
+      if (errorState) {
+        break;
       }
       setupComms->allgather(0);
 
@@ -2268,7 +2322,7 @@ struct CpuThreadImpl {
     //   std::chrono::steady_clock::duration prevDuration{};
     // };
     // std::array<DataTime, 4> times;
-    std::chrono::steady_clock::time_point startTime;
+    // std::chrono::steady_clock::time_point startTime;
 
     size_t readIndex = 0;
     size_t chunkIndex = 0;
@@ -2416,7 +2470,7 @@ struct CpuThreadImpl {
 
       tryRead(0);
 
-      startTime = std::chrono::steady_clock::now();
+      // startTime = std::chrono::steady_clock::now();
 
       self.trace("read loop");
       // log.info("enter read loop\n");
@@ -4599,8 +4653,145 @@ struct CpuThreadImpl {
 
   size_t numActiveWorks = 0;
 
+  size_t localHeartbeatValue = 1;
+  struct HeartbeatState {
+    size_t value = 0;
+    std::optional<std::chrono::steady_clock::time_point> activeWrite;
+    std::optional<std::chrono::steady_clock::time_point> valueChangeTime;
+
+    bool hasReportedExit = false;
+  };
+  std::vector<HeartbeatState> heartbeatStates{size};
+
+  std::chrono::steady_clock::duration heartbeatInterval = std::chrono::seconds(30);
+
+  void heartbeat(std::chrono::steady_clock::time_point now) {
+    ++localHeartbeatValue;
+
+    CHECK(heartbeatStates.size() == size);
+
+    for (size_t i = 0; i != size; ++i) {
+      auto& state = heartbeatStates[i];
+      if (rankInfo.at<RankInfo>(i).exited) {
+        if (!state.hasReportedExit) {
+          state.hasReportedExit = true;
+          log.error("%s: %s has exited\n", groupName(), rankName(i));
+        }
+      }
+      if (cqErrored) {
+        continue;
+      }
+      size_t currentValue = rankInfo.at<RankInfo>(i).heartbeatValue;
+      if (!state.valueChangeTime || currentValue != state.value) {
+        state.valueChangeTime = now;
+        state.value = currentValue;
+      } else {
+        if (now - *state.valueChangeTime >= heartbeatInterval * 3) {
+          float s = seconds(now - *state.valueChangeTime);
+          log.error("%s: Heartbeat timeout: %s has not responded in %g seconds\n", groupName(), rankName(i), s);
+
+          if (now - *state.valueChangeTime >= heartbeatInterval * 6) {
+            if (!errorState) {
+              errorState = true;
+              errorTime = std::chrono::steady_clock::now();
+            }
+          }
+        }
+      }
+      if (state.activeWrite) {
+        log.error(
+            "%s: Heartbeat to %s has not completed after %g seconds\n", groupName(), rankName(i),
+            seconds(now - *state.activeWrite));
+
+        if (now - *state.activeWrite >= heartbeatInterval * 6) {
+          if (!errorState) {
+            errorState = true;
+            errorTime = std::chrono::steady_clock::now();
+          }
+        }
+        continue;
+      }
+      state.activeWrite = now;
+      size_t di = localHeartbeatValue % devices.size();
+      auto& dev = devices[di];
+      writeData(
+          dev, i, &localHeartbeatValue, 0,
+          (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, heartbeatValue)),
+          remoteRankInfo[i].keys[di], sizeof(uint32_t), makeCallback([&state] { state.activeWrite.reset(); }));
+    }
+
+    if (errorState && now - errorTime >= std::chrono::seconds(60)) {
+      fatal("Moodist is terminating the process due to the aforementioned errors\n");
+    }
+  }
+
+  void sendRankInfo() {
+    auto buffer = group->allocateCpu(sizeof(RankInfo));
+    RankInfo* local = (RankInfo*)buffer.cpuPointer;
+    ::gethostname(local->hostname.data(), local->hostname.size());
+    local->pid = ::getpid();
+    local->device = group->deviceIndex;
+    local->heartbeatValue = 1;
+
+    auto* mr = regMr((uintptr_t)local, sizeof(RankInfo));
+
+    size_t activeWrites = 0;
+
+    for (size_t i = 0; i != size; ++i) {
+      size_t di = 0;
+      auto& dev = devices[di];
+      ++activeWrites;
+      writeData(
+          dev, i, local, mr->mrs[di]->lkey, (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank),
+          remoteRankInfo[i].keys[di], sizeof(RankInfo), makeCallback([&] { --activeWrites; }));
+    }
+
+    while (activeWrites && !errorState) {
+      poll();
+    }
+    auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i != size; ++i) {
+      while (rankInfo.at<RankInfo>(i).heartbeatValue == 0 &&
+             std::chrono::steady_clock::now() - start < std::chrono::seconds(30) && !errorState) {
+        poll();
+      }
+    }
+  }
+
+  void sendExited() {
+    auto start = std::chrono::steady_clock::now();
+    auto counter = std::make_shared<size_t>(0);
+    bool exitValue = true;
+    for (size_t i = 0; i != size; ++i) {
+      size_t di = 0;
+      auto& dev = devices[di];
+      writeData(
+          dev, i, &exitValue, 0,
+          (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, exited)),
+          remoteRankInfo[i].keys[di], sizeof(bool), makeCallback([counter] { --*counter; }));
+    }
+    while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+      poll();
+    }
+  }
+
+  std::string groupName() {
+    return fmt::sprintf("(group of size %d, rank %d)", size, rank);
+  }
+
+  std::string rankName(size_t i) {
+    const RankInfo& ri = rankInfo.at<RankInfo>(i);
+    std::string hostname(ri.hostname.data(), strnlen(ri.hostname.data(), ri.hostname.size()));
+    if (hostname.empty()) {
+      hostname = "<unknown>";
+    }
+    return fmt::sprintf("(rank %d, hostname %s, pid %d, device %d)", i, hostname, ri.pid, ri.device);
+  }
+
   void entry() {
     try {
+
+      sendRankInfo();
 
       runTests();
 
@@ -4628,8 +4819,15 @@ struct CpuThreadImpl {
         concurrency[work->concurrencyIndex].push_back(*work);
       };
 
+      std::chrono::steady_clock::time_point prevHeartbeatTime = std::chrono::steady_clock::now();
+
       bool terminate = false;
       while (!terminate) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - prevHeartbeatTime >= heartbeatInterval) {
+          prevHeartbeatTime = now;
+          heartbeat(now);
+        }
         if (returnedTemporaryBufferHandles.n.load(std::memory_order_relaxed) != 0) {
           returnedTemporaryBufferHandles.clear();
         }
@@ -4771,6 +4969,7 @@ struct CpuThreadImpl {
         }
       }
 
+      sendExited();
     } catch (const std::exception& e) {
       fatal("CPU thread error: %s\n", e.what());
     }
@@ -4779,6 +4978,10 @@ struct CpuThreadImpl {
 
 CpuThread::CpuThread(Group* group) : group(group) {}
 CpuThread::~CpuThread() {
+  kill();
+}
+
+void CpuThread::kill() {
   if (thread.joinable()) {
     QueueEntry* e = freelistTerminate.pop();
     e->task = taskTerminate;

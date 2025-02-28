@@ -319,6 +319,7 @@ struct CpuThread {
 
   CpuThread(Group*);
   ~CpuThread();
+  void kill();
 
   void start();
   void enqueue(QueueEntry* e) {

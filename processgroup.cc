@@ -44,10 +44,13 @@ void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
 }
 
+void globalsDtor();
+
 struct GlobalsDestroyed {
   bool value = false;
   ~GlobalsDestroyed() {
     value = true;
+    globalsDtor();
   }
 } globalsDestroyed;
 
@@ -2263,6 +2266,19 @@ struct ProcessGroupImpl {
     return r;
   }
 };
+
+void globalsDtor() {
+  std::vector<ProcessGroupImpl*> pgs;
+  {
+    std::lock_guard l(activeProcessGroupsMutex);
+    pgs = activeProcessGroups;
+  }
+  for (auto* pg : pgs) {
+    if (pg->group && pg->group->cpuThread) {
+      pg->group->cpuThread->kill();
+    }
+  }
+}
 
 struct FreeMemoryCallback : at::FreeMemoryCallback {
   virtual bool Execute() {
