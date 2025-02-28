@@ -119,7 +119,7 @@ class LocalQueue:
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    return MoodistBackend(store, rank, size)
+    return MoodistProcessGroup(store, rank, size)
 
 
 torch.distributed.Backend.register_backend(

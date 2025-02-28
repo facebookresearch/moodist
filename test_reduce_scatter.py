@@ -82,12 +82,12 @@ def f(n):
     # data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
     # data = torch.randn(32768 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    data = torch.randn(8192 * 7168).cuda() + 1
+    #data = torch.randn(2 * 8192 * 7168).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     # data = torch.randn((442416 - 4) * size).cuda() + 1
     # data = torch.randn(527040 * size).cuda() + 1
     # data = torch.randn(589824 * size).cuda() + 1
-    # data = torch.randn(294912 * size).cuda() + 1
+    data = torch.randn(294912 * size).cuda() + 1
     # data = torch.randn(524288 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
@@ -104,7 +104,7 @@ def f(n):
     result0 = torch.zeros(data.numel() // size).cuda()
     # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
-    # dtype = torch.bfloat16
+    #dtype = torch.bfloat16
     dtype = torch.float
 
     data = data.to(dtype)
@@ -282,7 +282,7 @@ def f(n):
             dist.reduce_scatter_tensor(result0, tmp)
             torch.cuda.synchronize()
     elif 1 == 1:
-        loopcount = 1000
+        loopcount = 10000
         freeevents = [
             torch.cuda.Event(),
             torch.cuda.Event(),
@@ -354,7 +354,7 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
-ngpus = 1
+ngpus = 2
 
 fds = []
 for i in range(ngpus):

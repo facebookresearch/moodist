@@ -17,10 +17,12 @@ using Work = c10d::Work;
 
 class TORCH_API Backend final : public c10d::Backend {
 public:
-  ProcessGroup pg;
+  std::unique_ptr<ProcessGroup> pgptr;
+  ProcessGroup& pg;
 
   Backend(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
-      : c10d::Backend(rank, size), pg(store, rank, size) {}
+      : c10d::Backend(rank, size), pgptr(std::make_unique<ProcessGroup>(store, rank, size)), pg(*pgptr) {}
+  Backend(ProcessGroup& pg) : c10d::Backend(pg.getRank(), pg.getSize()), pg(pg) {}
   ~Backend() {}
 
   const std::string getBackendName() const override {

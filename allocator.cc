@@ -861,7 +861,7 @@ struct CudaAllocatorImpl {
       tmpDeallocateEventRegions.push_back(std::move(h));
     }
     if (!failed) {
-      if (tmpDeallocateEventRegions.size() == 1) {
+      if (tmpDeallocateEventRegions.size() == 1 || true) {
         CUstream stream = tmpDeallocateStreamMap.begin()->first;
         insertRegion(getStreamFree(stream), span, tmpDeallocateEventRegions);
       } else {
@@ -1107,22 +1107,13 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       }
     }
 
-    constexpr size_t alignment = 0x20;
+    constexpr size_t alignment = 0x100;
     size_t alignedbytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
 
-    size_t index = __builtin_ia32_lzcnt_u64(
-        (std::max(alignedbytes, (size_t)1) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) *
-            alignof(std::max_align_t) -
-        1);
-    size_t nbytes = std::max(1ul << (64 - index), alignof(std::max_align_t));
-    CHECK(nbytes >= alignedbytes);
-    // if (nbytes >= 16384 && nbytes - nbytes / 8 >= alignedbytes) {
-    //   nbytes = nbytes - nbytes / 8;
-    // }
-    // if (nbytes >= 4096 && nbytes - nbytes / 4 >= alignedbytes) {
-    //   nbytes = nbytes - nbytes / 4;
-    // }
-    alignedbytes = nbytes;
+    // size_t index = __builtin_ia32_lzcnt_u64(alignedbytes);
+    // alignedbytes = ((alignedbytes >> (61 - index)) + 1) << (61 - index);
+
+    // alignedbytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
 
     CUstream stream = c10::cuda::getCurrentCUDAStream();
     memlog.debug("trying to allocate %d bytes on stream %#x\n", alignedbytes, (uintptr_t)stream);
@@ -1236,7 +1227,8 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     deviceStats.active_bytes[0].reset_peak();
   }
   virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot() override {
-    throw std::runtime_error("moodist CUDAAllocator::snapshot: not implemented");
+    //throw std::runtime_error("moodist CUDAAllocator::snapshot: not implemented");
+    return {};
   }
   virtual void beginAllocateToPool(
       c10::DeviceIndex device, c10::cuda::MempoolId_t mempool_id, std::function<bool(cudaStream_t)> filter) override {
@@ -1257,7 +1249,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual void recordHistory(
       bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder, size_t alloc_trace_max_entries,
       c10::cuda::CUDACachingAllocator::RecordContext when) override {
-    throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
+    // throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
   }
   virtual void attachOutOfMemoryObserver(c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) override {
     throw std::runtime_error("moodist CUDAAllocator::attachOutOfMemoryObserver: not implemented");

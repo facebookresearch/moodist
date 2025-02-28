@@ -57,6 +57,7 @@ OPTYPE(ReduceScatterCpu);
 OPTYPE(BroadcastRingCpu);
 OPTYPE(GatherCpu);
 
+OPTYPE(AllGatherKernelLessCuda);
 OPTYPE(AllGatherLocalCuda);
 OPTYPE(AllGatherRingCuda);
 OPTYPE(ReduceScatterRingCuda);

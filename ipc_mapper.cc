@@ -542,7 +542,7 @@ struct IpcMapperImpl : IpcMapper {
       event = (CUevent)popEventQueue(peerIndex);
     } else {
       ++numIpcEvents[peerIndex];
-      log.info("%d: Create new ipc event for peer %d!\n", group->rank, peerIndex);
+      log.debug("%d: Create new ipc event for peer %d!\n", group->rank, peerIndex);
       CHECK_CU(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS));
     }
     CHECK_CU(cuEventRecord(event, stream));

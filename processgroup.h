@@ -31,20 +31,12 @@ using Work = c10d::Work;
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
   std::unique_ptr<ProcessGroupImpl> impl;
-  std::string groupName = "<moodist-process-group-name-not-set>";
 
   ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
   ~ProcessGroup();
 
   const std::string getBackendName() const override {
     return "moodist";
-  }
-
-  const std::string& getGroupName() const {
-    return groupName;
-  }
-  void setGroupName(const std::string& name) {
-    groupName = name;
   }
 
   c10::intrusive_ptr<Work>

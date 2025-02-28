@@ -1958,6 +1958,7 @@ struct CpuThreadImpl {
           bool done = false;
           do {
             if (reduceIndex != ringSends.size()) {
+
               if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
                 // log.info("send reduce source %d chunk %d\n", ringSends[reduceIndex].first, reduceChunkIndex);
                 CHECK(ringSends[reduceIndex].first != rank);
@@ -2070,6 +2071,8 @@ struct CpuThreadImpl {
 
     std::array<uint32_t, maxDevices> recvLkeys;
 
+    bool isNoLocal = self.group->peerIndices.empty();
+
     WorkReduceScatterBroadcast(CpuThreadImpl& self, QueueEntryReduceScatter& params)
         : Work(self, params), params(params) {
       // log.info(
@@ -2086,6 +2089,12 @@ struct CpuThreadImpl {
           return;
         }
         ++sendDoneIndex;
+      }
+
+      if (!isNoLocal) {
+        if (cpuIn[16 + sendIndex] < stepValue) {
+          return;
+        }
       }
 
       self.writeDyn(concurrencyIndex, sendRanks[sendIndex], sendRanks[sendIndex], rank, 1);
