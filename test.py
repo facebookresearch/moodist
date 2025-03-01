@@ -115,13 +115,14 @@ def f(n):
         # data = torch.randn(1024 * 512 - 1024 * 8).cuda() + 1
         # data = torch.randn(1024 * 1024 * 20).cuda() + 1
         # data = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
-        #data = torch.randn(1024 * 7168 // 2).cuda() + 1
+        # data = torch.randn(1024 * 7168 // 2).cuda() + 1
         # data = torch.randn(27264000 // 2).cuda() + 1
         # data = torch.randn(13107200 - 1).cuda() + 1
         # data = torch.randn(4194304 - 0).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
         data = torch.randn(442416 - 1).cuda() + 1
+        # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1
         # data = torch.randn(589824).cuda() + 1
         # data = torch.randn(294912).cuda() + 1

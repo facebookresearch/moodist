@@ -716,7 +716,7 @@ struct ProcessGroupImpl {
     for (size_t peerIndex : peerIndices) {
       size_t i = 0;
       auto& recvs = recvsPerPeer[peerIndex];
-      log.info("peer %d recvs is %s\n", peerIndex, fmt::to_string(fmt::join(recvs, ", ")));
+      // log.info("peer %d recvs is %s\n", peerIndex, fmt::to_string(fmt::join(recvs, ", ")));
       auto nextseq = [&]() {
         CHECK(i != recvs.size());
         size_t beginSource = recvs[i];
@@ -733,7 +733,7 @@ struct ProcessGroupImpl {
         }
         CHECK(len >= 1);
         size_t endSource = beginSource + len;
-        log.info("nextseq -> %d %d\n", beginSource, endSource);
+        // log.info("nextseq -> %d %d\n", beginSource, endSource);
         CHECK(endSource >= beginSource);
         return std::make_pair(beginSource, endSource);
       };
@@ -760,6 +760,7 @@ struct ProcessGroupImpl {
             }
           }
           ++numSeqs;
+          prevSeq = seq;
         }
 
         if (pitch == 0) {
@@ -775,9 +776,9 @@ struct ProcessGroupImpl {
 
         (*allGather2dCopies)[peerIndex].push_back(c);
 
-        log.info(
-            "%d: copy from peer %d, %d seqs of length %d with pitch %d and offset %d\n", rank, peerIndex, numSeqs,
-            seqLen, pitch, c.offset);
+        // log.info(
+        //     "%d: copy from peer %d, %d seqs of length %d with pitch %d and offset %d\n", rank, peerIndex, numSeqs,
+        //     seqLen, pitch, c.offset);
 
         CHECK(numSeqs >= 1 && numSeqs < size);
         CHECK(seqLen >= 1 && seqLen < size);
