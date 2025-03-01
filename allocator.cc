@@ -712,7 +712,7 @@ struct CudaAllocatorImpl {
   uintptr_t allocate(size_t bytes, CUstream stream) {
     memlog.debug("allocate %d\n", bytes);
     if (!pendingDeallocations.empty()) {
-      memlog.info("waa %d pending deallocations\n", pendingDeallocations.size());
+      // memlog.info("waa %d pending deallocations\n", pendingDeallocations.size());
       auto tmp = std::move(pendingDeallocations);
       for (auto& v : tmp) {
         deallocate<true>(std::get<0>(v), std::get<1>(v), *std::get<2>(v));
@@ -945,7 +945,7 @@ struct CudaAllocatorImpl {
       }
       insertRegion(freeMemory, span, tmpEventRegions);
 
-      memlog.info("free %d bytes of pending\n", span.end - span.begin);
+      // memlog.info("free %d bytes of pending\n", span.end - span.begin);
 
       retval = true;
     }
@@ -957,8 +957,8 @@ struct CudaAllocatorImpl {
   }
 
   bool freePending(Regions& pendingFreeMemory) {
-    memlog.info("free pending\n");
-    // CHECK(pendingFreeMemoryEvents.size() >= pendingFreeMemory.size());
+    // memlog.info("free pending\n");
+    //  CHECK(pendingFreeMemoryEvents.size() >= pendingFreeMemory.size());
     checkMap(pendingFreeMemory.map, pendingFreeMemory.sizes);
     checkMap(freeMemory.map, freeMemory.sizes);
     for (auto i = pendingFreeMemory.sizes.begin(); i != pendingFreeMemory.sizes.end();) {
@@ -1227,7 +1227,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     deviceStats.active_bytes[0].reset_peak();
   }
   virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot() override {
-    //throw std::runtime_error("moodist CUDAAllocator::snapshot: not implemented");
+    // throw std::runtime_error("moodist CUDAAllocator::snapshot: not implemented");
     return {};
   }
   virtual void beginAllocateToPool(

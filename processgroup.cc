@@ -134,7 +134,19 @@ struct ProcessGroupImpl {
 
   std::array<Event, maxConcurrency> concurrencyEvents;
 
-  WorkStream copyWorkStream;
+  Event localEvent;
+  std::optional<Stream> peerMemcpyStream;
+  std::optional<Stream> peerIncomingMemcpyStream;
+  // std::optional<Stream> reduceStream;
+
+  HashMap<CUstream, Stream> copyStream;
+
+  std::array<std::optional<Stream>, maxChunks> peerMemcpyStreamPerChunk;
+
+  std::array<std::optional<Stream>, 4> reduceStreamArr;
+  size_t reduceCounter = 0;
+
+  std::vector<std::shared_ptr<Queue>> queues;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -156,6 +168,16 @@ struct ProcessGroupImpl {
     for (auto& v : concurrencyEvents) {
       v = Event::create();
     }
+
+    localEvent = Event::create();
+  }
+
+  Stream getCopyStream(CUstream stream) {
+    auto& ref = copyStream[stream];
+    if (!ref) {
+      ref = Stream::create();
+    }
+    return Stream::reference(ref);
   }
 
   WorkStreams* getWorkStreams(CUstream stream) {
@@ -622,14 +644,7 @@ struct ProcessGroupImpl {
           peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllGatherLocalCuda, stepValue, outputBytes);
     }
 
-    if (!localEvent) {
-      localEvent = Event::create();
-    }
-    if (!copyStream) {
-      copyStream = Stream::create();
-    }
-
-    localEvent->record(stream);
+    localEvent.record(stream);
 
     size_t n = ipcRanks.size() + 1;
     size_t chunkSize = (outputBytes + n - 1) / n;
@@ -674,11 +689,12 @@ struct ProcessGroupImpl {
       CHECK(inputBytes == nbytes);
 
       if (outputAddress + offset != inputAddress) {
-        localEvent->wait(*copyStream);
-        CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, *copyStream));
-        localEvent->record(*copyStream);
+        auto copyStream = getCopyStream(stream);
+        localEvent.wait(copyStream);
+        CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, copyStream));
+        localEvent.record(copyStream);
 
-        localEvent->wait(stream);
+        localEvent.wait(stream);
       }
     }
   }
@@ -965,20 +981,21 @@ struct ProcessGroupImpl {
     bool isLocalOnly = allGather.recvRanks.empty();
     bool isNoLocal = !isLocalOnly && peerIndices.empty();
 
-    size_t localThreshold = 50 * 1024 * 1024;
-    if (peerIndices.size() <= 4) {
-      localThreshold /= 2;
-    }
-    if (peerIndices.size() <= 2) {
-      localThreshold /= 2;
-    }
+    if (isLocalOnly) {
+      size_t localThreshold = 50 * 1024 * 1024;
+      if (peerIndices.size() <= 4) {
+        localThreshold /= 2;
+      }
+      if (peerIndices.size() <= 2) {
+        localThreshold /= 2;
+      }
 
-    if (isLocalOnly &&
-        (bytes >= localThreshold || bytes % 16 != 0 || outputAddress % 16 != 0 || inputAddress % 16 != 0)) {
-      local_all_gather_impl(
-          concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, ipcRanks, rank);
+      if (bytes >= localThreshold || bytes % 16 != 0 || outputAddress % 16 != 0 || inputAddress % 16 != 0) {
+        local_all_gather_impl(
+            concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, ipcRanks, rank);
 
-      return;
+        return;
+      }
     }
 
     AllocatedBuffer alignedBuffer;
@@ -1094,12 +1111,7 @@ struct ProcessGroupImpl {
       // memWrite(getPeerOpsMutex(), 0);
       // memFlush(stream);
     } else if (isNoLocal) {
-      if (!copyWorkStream.stream) {
-        CHECK_CU(cuStreamCreate(&copyWorkStream.stream, CU_STREAM_NON_BLOCKING));
-        // CHECK_CU(cuStreamCreateWithPriority(&copyWorkStream.stream, CU_STREAM_NON_BLOCKING, 100));
-        CHECK_CU(cuEventCreate(&copyWorkStream.event, CU_EVENT_DISABLE_TIMING));
-      }
-      CHECK_CU(cuEventRecord(copyWorkStream.event, stream));
+      localEvent.record(stream);
 
       if (kernelLess) {
         memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
@@ -1111,10 +1123,11 @@ struct ProcessGroupImpl {
       }
 
       if (outputAddress + pitch * rank != inputAddress) {
-        CHECK_CU(cuStreamWaitEvent(copyWorkStream.stream, copyWorkStream.event, CU_EVENT_WAIT_DEFAULT));
-        CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, copyWorkStream.stream));
-        CHECK_CU(cuEventRecord(copyWorkStream.event, copyWorkStream.stream));
-        CHECK_CU(cuStreamWaitEvent(stream, copyWorkStream.event, CU_EVENT_WAIT_DEFAULT));
+        auto copyStream = getCopyStream(stream);
+        localEvent.wait(copyStream);
+        CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, copyStream));
+        localEvent.record(copyStream);
+        localEvent.wait(stream);
       }
     } else {
       CHECK(chunkSize != 0);
@@ -1527,22 +1540,6 @@ struct ProcessGroupImpl {
     memops.clear();
   }
 
-  std::optional<Event> localEvent;
-  std::optional<Stream> peerMemcpyStream;
-  std::optional<Stream> peerIncomingMemcpyStream;
-  // std::optional<Stream> reduceStream;
-
-  std::optional<Stream> copyStream;
-
-  std::array<std::optional<Stream>, maxChunks> peerMemcpyStreamPerChunk;
-
-  // AllocatedBuffer reduceBuffer;
-  std::array<std::optional<Stream>, 4> reduceStreamArr;
-  // std::array<AllocatedBuffer, 4> reduceBufferArr;
-  size_t reduceCounter = 0;
-
-  std::vector<std::shared_ptr<Queue>> queues;
-
   void peerWriteDyn(
       uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, uintptr_t gatherAddress,
       size_t bytes) {
@@ -1572,15 +1569,6 @@ struct ProcessGroupImpl {
          std::make_pair(concurrencyIndex, stepValue)));
 
     return dyn.gatherAddress;
-  }
-
-  void writeStepValue(uint32_t concurrencyIndex, size_t peerIndex, uint32_t i, uint32_t stepValue) {
-    group->getPeerVar(peerIndex, group->atomicStepValue)[size * concurrencyIndex + i] = stepValue;
-  }
-  void waitStepValue(uint32_t concurrencyIndex, uint32_t i, uint32_t stepValue) {
-    while (group->atomicStepValue[size * concurrencyIndex + i].load() < stepValue) {
-      _mm_pause();
-    }
   }
 
   void broadcast(const torch::Tensor& tensor, uint32_t sourceRank, CUstream stream) {
@@ -1739,11 +1727,11 @@ struct ProcessGroupImpl {
           copyStream = Stream::create();
         }
 
-        localEvent->record(stream);
-        localEvent->wait(*copyStream);
+        localEvent.record(stream);
+        localEvent.wait(*copyStream);
         CHECK_CU(cuMemcpyDtoDAsync(tensorAddress + offset, peerAddress + offset, currentChunkSize, *copyStream));
-        localEvent->record(*copyStream);
-        localEvent->wait(stream);
+        localEvent.record(*copyStream);
+        localEvent.wait(stream);
 
         if (ipcRanks[next] != localSourceRank) {
           ipcMapper->streamRecord(next, stream);
@@ -1944,13 +1932,13 @@ struct ProcessGroupImpl {
         ipcMapper->streamRecord(peerIndex, stream);
         ipcMapper->streamWait(peerIndex, stream);
       } else {
-        localEvent->record(*peerIncomingMemcpyStream);
-        localEvent->wait(stream);
+        localEvent.record(*peerIncomingMemcpyStream);
+        localEvent.wait(stream);
         ipcMapper->streamRecord(peerIndex, stream);
 
         ipcMapper->streamWait(peerIndex, stream);
-        localEvent->record(stream);
-        localEvent->wait(*peerIncomingMemcpyStream);
+        localEvent.record(stream);
+        localEvent.wait(*peerIncomingMemcpyStream);
       }
 
     } else {
@@ -1978,8 +1966,8 @@ struct ProcessGroupImpl {
 
       if (false) {
 
-        localEvent->record(stream);
-        localEvent->wait(*reduceStream);
+        localEvent.record(stream);
+        localEvent.wait(*reduceStream);
 
         for (size_t peerIndex : peerIndices) {
           ipcMapper->streamWait(peerIndex, *reduceStream);
@@ -1996,11 +1984,11 @@ struct ProcessGroupImpl {
 
       } else {
 
-        localEvent->record(*reduceStream);
-        localEvent->wait(*peerMemcpyStream);
+        localEvent.record(*reduceStream);
+        localEvent.wait(*peerMemcpyStream);
 
-        localEvent->record(stream);
-        localEvent->wait(*reduceStream);
+        localEvent.record(stream);
+        localEvent.wait(*reduceStream);
 
         for (size_t peerIndex : peerIndices) {
           ipcMapper->streamWait(peerIndex, *peerMemcpyStream);
@@ -2015,8 +2003,8 @@ struct ProcessGroupImpl {
         CHECK_CU(cuMemcpyDtoDAsync(
             reduceBuffer.cudaPointer + bytes * peerIndices.size(), tensorAddress, bytes, *reduceStream));
 
-        localEvent->record(*peerMemcpyStream);
-        localEvent->wait(*reduceStream);
+        localEvent.record(*peerMemcpyStream);
+        localEvent.wait(*reduceStream);
       }
 
       torch::Tensor buffer = torch::from_blob(
@@ -2048,8 +2036,8 @@ struct ProcessGroupImpl {
         torch::sum_out(tensor, buffer, 0);
       }
 
-      localEvent->record(*reduceStream);
-      localEvent->wait(stream);
+      localEvent.record(*reduceStream);
+      localEvent.wait(stream);
 
       if (networked) {
         size_t offset = 0;
