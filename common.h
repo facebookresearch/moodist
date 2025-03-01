@@ -25,13 +25,18 @@ namespace moodist {
 
 extern async::Scheduler& scheduler;
 
+struct CudaError : std::runtime_error {
+  CUresult error;
+  CudaError(CUresult error, const std::string& message) : error(error), std::runtime_error(message) {}
+};
+
 inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
   throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));
 }
 inline void throwCu(CUresult error, const char* file, int line) {
   const char* str = "unknown cuda error";
   cuGetErrorString(error, &str);
-  throw std::runtime_error(fmt::sprintf("%s:%d: cuda error %d: %s", file, line, error, str));
+  throw CudaError(error, fmt::sprintf("%s:%d: cuda error %d: %s", file, line, error, str));
 }
 inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
   const char* str = "unknown nvml error";

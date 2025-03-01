@@ -4971,7 +4971,12 @@ struct CpuThreadImpl {
 
       sendExited();
     } catch (const std::exception& e) {
-      fatal("CPU thread error: %s\n", e.what());
+      const CudaError* ce = dynamic_cast<const CudaError*>(&e);
+      if (ce && ce->error == CUDA_ERROR_DEINITIALIZED) {
+        log.verbose("CPU thread got a CUDA deinitialized error.\n");
+      } else {
+        fatal("CPU thread error: %s\n", e.what());
+      }
     }
   }
 };
