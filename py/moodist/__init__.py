@@ -15,7 +15,7 @@ from datetime import timedelta
 import pickle
 from queue import Empty
 
-__version__ = "0.1.4"
+__version__ = "0.2.0"
 
 
 class TransactionContextManager:

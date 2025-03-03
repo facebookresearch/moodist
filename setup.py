@@ -59,7 +59,7 @@ def main():
 
     setuptools.setup(
         name="moodist",
-        version="0.1.2",
+        version="0.2.0",
         description=("moodist"),
         long_description="",
         long_description_content_type="text/markdown",
