@@ -2711,57 +2711,64 @@ c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensor
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
-  TORCH_CHECK(tensors.size() == 1);
-  auto& tensor = tensors[0];
-  int64_t numel = tensor.numel();
-  TORCH_CHECK(numel > 0);
-  bool isCuda = tensor.is_cuda();
-  CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
   WorkStream* w = nullptr;
-  if (isCuda) {
-    w = impl->getWorkStream(stream);
-    CHECK_CU(cuEventRecord(w->event, stream));
-    CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
-    stream = w->stream;
-  }
-  if (numel % impl->size == 0) {
-    auto t = tensor.view({(int64_t)impl->size, -1});
-    auto o = t[impl->rank];
-    impl->reduce_scatter(o, t, opts.reduceOp, stream);
-    impl->all_gather(t, o, stream);
-  } else {
-    int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
-    size_t bytes = numel * tensor.itemsize();
-    std::optional<c10::cuda::CUDAStreamGuard> sg;
+  for (auto& tensor : tensors) {
+    int64_t numel = tensor.numel();
+    TORCH_CHECK(numel > 0);
+    bool isCuda = tensor.is_cuda();
+    CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
     if (isCuda) {
-      sg.emplace(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+      if (!w) {
+        w = impl->getWorkStream(stream);
+      }
+      CHECK_CU(cuEventRecord(w->event, stream));
+      CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
+      stream = w->stream;
     }
-    torch::Tensor temporary =
-        torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
-    if (tensor.device().is_cuda()) {
-      CHECK_CU(cuMemcpyAsync((uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, stream));
+    if (numel % impl->size == 0) {
+      auto t = tensor.view({(int64_t)impl->size, -1});
+      auto o = t[impl->rank];
+      impl->reduce_scatter(o, t, opts.reduceOp, stream);
+      impl->all_gather(t, o, stream);
     } else {
-      std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
-    }
+      int64_t newsize = (numel + impl->size - 1) / impl->size * impl->size;
+      size_t bytes = numel * tensor.itemsize();
+      std::optional<c10::cuda::CUDAStreamGuard> sg;
+      if (isCuda) {
+        sg.emplace(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+      }
+      torch::Tensor temporary =
+          torch::empty({newsize}, torch::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+      if (tensor.device().is_cuda()) {
+        CHECK_CU(cuMemcpyAsync((uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, stream));
+      } else {
+        std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
+      }
 
-    auto t = temporary.view({(int64_t)impl->size, -1});
-    auto o = t[impl->rank];
-    impl->reduce_scatter(o, t, opts.reduceOp, stream);
-    impl->all_gather(t, o, stream);
+      auto t = temporary.view({(int64_t)impl->size, -1});
+      auto o = t[impl->rank];
+      impl->reduce_scatter(o, t, opts.reduceOp, stream);
+      impl->all_gather(t, o, stream);
 
-    if (tensor.device().is_cuda()) {
-      CHECK_CU(cuMemcpyAsync((uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, stream));
-    } else {
-      std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
+      if (tensor.device().is_cuda()) {
+        CHECK_CU(cuMemcpyAsync((uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, stream));
+      } else {
+        std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
+      }
     }
-  }
-  if (w) {
-    CHECK(stream == w->stream);
-    // tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
-    CHECK_CU(cuEventRecord(w->event, w->stream));
+    if (w) {
+      CHECK(stream == w->stream);
+      // tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
+      CHECK_CU(cuEventRecord(w->event, w->stream));
+    }
   }
 
   return c10::make_intrusive<WorkImpl>(tensors, std::nullopt, w);
+}
+
+c10::intrusive_ptr<Work>
+ProcessGroup::allreduce_coalesced(std::vector<at::Tensor>& tensors, const c10d::AllreduceCoalescedOptions& opts) {
+  return allreduce(tensors, opts);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::gather(

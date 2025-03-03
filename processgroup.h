@@ -47,9 +47,7 @@ public:
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
-      const c10d::AllreduceCoalescedOptions& opts = c10d::AllreduceCoalescedOptions()) override {
-    TORCH_CHECK(false, "allreduce_coalesced not supported");
-  }
+      const c10d::AllreduceCoalescedOptions& opts = c10d::AllreduceCoalescedOptions()) override;
 
   c10::intrusive_ptr<Work>
   reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts = c10d::ReduceOptions()) override;
