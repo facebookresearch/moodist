@@ -207,6 +207,20 @@ void AllGather::init() {
   }
 
   {
+    auto allSendRanks = setupComms->allgather(sendRanks);
+    for (size_t i : recvRanks) {
+      auto& s = allSendRanks[i];
+      auto it = std::find(s.begin(), s.end(), rank);
+      CHECK(it != s.end());
+      if (std::next(it) == s.end()) {
+        recvRanksNext.push_back(-1);
+      } else {
+        recvRanksNext.push_back(*std::next(it));
+      }
+    }
+  }
+
+  {
     std::vector<size_t> neighbors;
     for (auto& path : paths) {
       if (path.size() != 2) {
@@ -268,7 +282,6 @@ void AllGather::init() {
     }
     log.debug("rank %d: all gather ring recvs are [%s]\n", rank, s);
 
-    
     // for (auto& x : ringRecvs) {
     //   CHECK(std::get<2>(x) == (size_t)-1);
     // }

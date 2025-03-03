@@ -58,6 +58,8 @@ struct ProcessGroupImpl;
 std::mutex& activeProcessGroupsMutex = *new std::mutex();
 std::vector<ProcessGroupImpl*>& activeProcessGroups = *new std::vector<ProcessGroupImpl*>();
 
+std::atomic_bool globalPreferKernelLess = false;
+
 std::once_flag freeMemoryCallbackOnceFlag;
 void registerFreeMemoryCallback();
 
@@ -147,6 +149,8 @@ struct ProcessGroupImpl {
   size_t reduceCounter = 0;
 
   std::vector<std::shared_ptr<Queue>> queues;
+
+  bool preferKernelLess = globalPreferKernelLess;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
@@ -803,6 +807,263 @@ struct ProcessGroupImpl {
     }
   }
 
+  // struct WorkCudaDone {
+  //   uintptr_t address;
+  //   AllocatedBuffer buffer;
+  //   void clear() {}
+  // };
+
+  // using WorkCudaDonePtr = FLPtr<WorkCudaDone>;
+
+  // void kernelLess_all_gather_impl(
+  //     uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress, size_t inputBytes, uintptr_t
+  //     outputAddress, size_t outputBytes, CUstream stream, const std::array<uintptr_t, 8>& peerMappedInputAddresses,
+  //     const std::array<uintptr_t, 8>& peerMappedOutputAddresses, size_t chunkSize) {
+
+  //   if (!allGather2dCopies) {
+  //     calculateAllGather2dCopies();
+  //   }
+
+  //   const auto& peerIndices = group->peerIndices;
+  //   // const auto& ipcRanks = group->ipcRanks;
+
+  //   IpcMapper* ipcMapper = &*group->ipcMapper;
+
+  //   memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
+  //   memFlush(stream);
+
+  //   {
+  //     size_t offset = inputBytes * rank;
+  //     size_t nbytes = inputBytes;
+  //     CHECK(inputBytes == nbytes);
+
+  //     if (outputAddress + offset != inputAddress) {
+  //       CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, stream));
+  //     }
+  //   }
+
+  //   std::array<uintptr_t, 8> peerAddresses;
+
+  //   for (size_t peerIndex : peerIndices) {
+  //     peerWriteDyn(
+  //         concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue,
+  //         peerMappedOutputAddresses[peerIndex], outputBytes);
+  //   }
+  //   for (size_t peerIndex : peerIndices) {
+  //     peerAddresses[peerIndex] =
+  //         peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue, outputBytes);
+  //   }
+
+  //   auto flag1 = WorkCudaDonePtr::make();
+  //   if (!flag1->address) {
+  //     flag1->buffer = group->allocateDevice(0x100);
+  //     flag1->address = flag1->buffer.cudaPointer;
+  //     // flag1->address = group->getNextCudaUint32();
+  //   }
+
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamRecord(peerIndex, stream);
+  //   // }
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamWait(peerIndex, stream);
+  //   // }
+
+  //   // memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+  //   // memFlush(stream);
+
+  //   // return;
+
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   uintptr_t peerAddr = 0;
+  //   //   // ipcMapper->requestAddress(peerIndex, flag1->address, 4, &peerAddr);
+  //   //   // ipcMapper->wait();
+  //   //   ipcMapper->push(peerIndex, peerAddr);
+  //   // }
+  //   // memWrite(flag1->address, stepValue);
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->pop<uintptr_t>(peerIndex);
+  //   //   //memWaitGeq(ipcMapper->pop<uintptr_t>(peerIndex), stepValue);
+  //   // }
+  //   // memFlush(stream);
+
+  //   // // for (size_t peerIndex : peerIndices) {
+  //   // //   ipcMapper->streamRecord(peerIndex, stream);
+  //   // // }
+  //   // // for (size_t peerIndex : peerIndices) {
+  //   // //   ipcMapper->streamWait(peerIndex, stream);
+  //   // // }
+
+  //   Stream altStream = getCopyStream(stream);
+  //   // size_t copyCounter = 0;
+
+  //   std::array<CUstream, 4> streams;
+  //   streams[0] = altStream;
+  //   for (size_t i = 1; i != streams.size(); ++i) {
+  //     streams[i] = getCopyStream(streams[i - 1]);
+  //   }
+
+  //   for (auto& v : streams) {
+  //     localEvent.record(stream);
+  //     localEvent.wait(v);
+  //   }
+
+  //   // localEvent.record(altStream);
+  //   // localEvent.wait(stream);
+
+  //   // return;
+
+  //   size_t totalBytes = 0;
+
+  //   for (size_t chunkIndex = 0;; ++chunkIndex) {
+  //     size_t currentChunkSize = std::min(chunkSize, inputBytes - chunkSize * chunkIndex);
+  //     bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == inputBytes;
+  //     size_t chunkOffset = chunkSize * chunkIndex;
+
+  //     if (currentChunkSize == 0) {
+  //       break;
+  //     }
+
+  //     CHECK(chunkIndex < maxChunks);
+
+  //     // CUstream cstream = chunkIndex % 2 == 0 ? stream : altStream;
+  //     CUstream cstream = streams[chunkIndex % streams.size()];
+
+  //     for (size_t source : group->allGather->recvRanks) {
+  //       memWaitGeq(
+  //           group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + source),
+  //           stepValue);
+  //     }
+  //     memFlush(cstream);
+
+  //     // for (size_t peerIndex : peerIndices) {
+  //     //   ipcMapper->streamRecord(peerIndex, stream);
+  //     // }
+  //     // for (size_t peerIndex : peerIndices) {
+  //     //   ipcMapper->streamWait(peerIndex, stream);
+  //     // }
+
+  //     auto copy = [&](size_t peerIndex) {
+  //       CHECK(allGather2dCopies.has_value());
+  //       for (auto& c : (*allGather2dCopies)[peerIndex]) {
+  //         // memWaitEq(getPeerOpsMutex(), 0);
+  //         // memFlush(stream);
+
+  //         // CUDA_MEMCPY2D copyArgs = {0};
+  //         // copyArgs.srcDevice = peerAddresses[peerIndex] + inputBytes * c.offset;
+  //         // copyArgs.srcPitch = inputBytes * c.pitch;
+  //         // copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+  //         // copyArgs.dstDevice = outputAddress + inputBytes * c.offset;
+  //         // copyArgs.dstPitch = inputBytes * c.pitch;
+  //         // copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+  //         // copyArgs.WidthInBytes = inputBytes * c.length;
+  //         // copyArgs.Height = c.num;
+  //         // CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
+
+  //         // CUstream cstream = copyCounter % 2 == 0 ? stream : altStream;
+  //         // CUstream cstream = stream;
+  //         //++copyCounter;
+
+  //         for (size_t i = 0; i != c.length; ++i) {
+  //           CUDA_MEMCPY2D copyArgs = {0};
+  //           copyArgs.srcDevice = peerAddresses[peerIndex] + inputBytes * c.offset + chunkOffset + inputBytes * i;
+  //           copyArgs.srcPitch = inputBytes * c.pitch;
+  //           copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+  //           copyArgs.dstDevice = outputAddress + inputBytes * c.offset + chunkOffset + inputBytes * i;
+  //           copyArgs.dstPitch = inputBytes * c.pitch;
+  //           copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+  //           copyArgs.WidthInBytes = currentChunkSize;
+  //           copyArgs.Height = c.num;
+  //           CHECK_CU(cuMemcpy2DAsync(&copyArgs, cstream));
+
+  //           totalBytes += currentChunkSize * c.num;
+  //           break;
+  //         }
+  //       }
+  //     };
+
+  //     if (false) {
+  //       for (size_t peerIndex : peerIndices) {
+  //         ipcMapper->streamRecord(peerIndex, stream);
+  //       }
+  //       for (size_t peerIndex : peerIndices) {
+  //         ipcMapper->streamWait(peerIndex, stream);
+  //       }
+  //       for (size_t peerIndex : peerIndices) {
+  //         copy(peerIndex);
+  //         ipcMapper->streamRecord(peerIndex, stream);
+  //       }
+  //       for (size_t peerIndex : peerIndices) {
+  //         ipcMapper->streamWait(peerIndex, stream);
+  //       }
+  //     } else if (false) {
+  //       for (size_t peerIndex : peerIndices) {
+  //         size_t incomingPeerIndex = peerIndices.size() - 1 - peerIndex;
+
+  //         // memWaitEq(getPeerOpsMutex(), 0);
+  //         // // memWrite(getPeerOpsMutex(), 1);
+  //         // memFlush(stream);
+
+  //         ipcMapper->streamRecord(incomingPeerIndex, stream);
+  //         ipcMapper->streamWait(peerIndex, stream);
+
+  //         copy(peerIndex);
+
+  //         // memWrite(getPeerOpsMutex(), 0);
+  //         // memFlush(stream);
+
+  //         ipcMapper->streamRecord(peerIndex, stream);
+  //         ipcMapper->streamWait(incomingPeerIndex, stream);
+  //       }
+  //     } else {
+  //       for (size_t peerIndex : peerIndices) {
+  //         copy(peerIndex);
+  //       }
+  //     }
+
+  //     if (isLastChunk) {
+  //       break;
+  //     }
+  //   }
+
+  //   memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+  //   memFlush(stream);
+
+  //   for (auto& v : streams) {
+  //     localEvent.record(v);
+  //     localEvent.wait(stream);
+  //   }
+
+  //   log.info("bytes copied: %d\n", totalBytes);
+
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamRecord(peerIndex, stream);
+  //   // }
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamWait(peerIndex, stream);
+  //   // }
+
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamRecord(peerIndex, stream);
+  //   // }
+  //   // for (size_t peerIndex : peerIndices) {
+  //   //   ipcMapper->streamWait(peerIndex, stream);
+  //   // }
+
+  //   // {
+  //   //   size_t offset = inputBytes * myLocalRank;
+  //   //   size_t nbytes = inputBytes;
+  //   //   CHECK(inputBytes == nbytes);
+
+  //   //   if (outputAddress + offset != inputAddress) {
+  //   //     localEvent->wait(*copyStream);
+  //   //     CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, *copyStream));
+  //   //     localEvent->record(*copyStream);
+
+  //   //     localEvent->wait(stream);
+  //   //   }
+  //   // }
+  // }
+
   void kernelLess_all_gather_impl(
       uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress, size_t inputBytes, uintptr_t outputAddress,
       size_t outputBytes, CUstream stream, const std::array<uintptr_t, 8>& peerMappedInputAddresses,
@@ -813,7 +1074,6 @@ struct ProcessGroupImpl {
     }
 
     const auto& peerIndices = group->peerIndices;
-    // const auto& ipcRanks = group->ipcRanks;
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
 
@@ -848,8 +1108,6 @@ struct ProcessGroupImpl {
     auto copy = [&](size_t peerIndex) {
       CHECK(allGather2dCopies.has_value());
       for (auto& c : (*allGather2dCopies)[peerIndex]) {
-        // memWaitEq(getPeerOpsMutex(), 0);
-        // memFlush(stream);
         CUDA_MEMCPY2D copyArgs = {0};
         copyArgs.srcDevice = peerAddresses[peerIndex] + inputBytes * c.offset;
         copyArgs.srcPitch = inputBytes * c.pitch;
@@ -863,7 +1121,7 @@ struct ProcessGroupImpl {
       }
     };
 
-    if (false) {
+    if (true) {
       for (size_t peerIndex : peerIndices) {
         ipcMapper->streamRecord(peerIndex, stream);
       }
@@ -881,36 +1139,15 @@ struct ProcessGroupImpl {
       for (size_t peerIndex : peerIndices) {
         size_t incomingPeerIndex = peerIndices.size() - 1 - peerIndex;
 
-        // memWaitEq(getPeerOpsMutex(), 0);
-        // // memWrite(getPeerOpsMutex(), 1);
-        // memFlush(stream);
-
         ipcMapper->streamRecord(incomingPeerIndex, stream);
         ipcMapper->streamWait(peerIndex, stream);
 
         copy(peerIndex);
 
-        // memWrite(getPeerOpsMutex(), 0);
-        // memFlush(stream);
-
         ipcMapper->streamRecord(peerIndex, stream);
         ipcMapper->streamWait(incomingPeerIndex, stream);
       }
     }
-
-    // {
-    //   size_t offset = inputBytes * myLocalRank;
-    //   size_t nbytes = inputBytes;
-    //   CHECK(inputBytes == nbytes);
-
-    //   if (outputAddress + offset != inputAddress) {
-    //     localEvent->wait(*copyStream);
-    //     CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, *copyStream));
-    //     localEvent->record(*copyStream);
-
-    //     localEvent->wait(stream);
-    //   }
-    // }
   }
 
   void all_gather(at::Tensor& output, const at::Tensor& input, CUstream stream) {
@@ -1001,7 +1238,7 @@ struct ProcessGroupImpl {
     AllocatedBuffer alignedBuffer;
     AllocatedBuffer alignedBuffer2;
 
-    bool kernelLess = !isLocalOnly;
+    bool kernelLess = !isLocalOnly && (isNoLocal || preferKernelLess);
 
     if (!isNoLocal && !kernelLess) {
       if (bytes % 16 != 0 || outputAddress % 16 != 0) {
@@ -1044,6 +1281,7 @@ struct ProcessGroupImpl {
 
     if (!isLocalOnly) {
       QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
+      // e->task = kernelLess ? taskAllGatherBroadcast : taskAllGather;
       e->task = taskAllGather;
       e->stepValue = stepValue;
       e->concurrencyIndex = concurrencyIndex;
@@ -1069,6 +1307,9 @@ struct ProcessGroupImpl {
 
     if (kernelLess && !isNoLocal) {
       CHECK(pitch == bytes);
+      // kernelLess_all_gather_impl(
+      //     concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,
+      //     peerOutputAddresses, chunkSize);
       kernelLess_all_gather_impl(
           concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,
           peerOutputAddresses);
@@ -1300,7 +1541,7 @@ struct ProcessGroupImpl {
     bool isLocalOnly = reduceScatter.recvRanks.empty();
     bool isNoLocal = peerIndices.empty();
 
-    bool kernelLess = isNoLocal;
+    bool kernelLess = isNoLocal && preferKernelLess;
 
     if (!kernelLess) {
       if (bytes % 16 != 0 || inputAddress % 16 != 0) {
@@ -2629,6 +2870,10 @@ torch::Tensor Future::result() {
     throw std::runtime_error("result has already been called on this Future - it cannot be called twice");
   }
   return makeTensor(std::move(impl->result));
+}
+
+void setPreferKernelLess(bool value) {
+  globalPreferKernelLess = value;
 }
 
 } // namespace moodist

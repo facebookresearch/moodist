@@ -8,6 +8,7 @@ from ._C import (
     enable_cpu_allocator,
     cpu_allocator_debug,
     cuda_copy,
+    set_prefer_kernel_less,
 )
 
 from datetime import timedelta
@@ -136,4 +137,5 @@ __all__ = [
     "create_moodist_backend",
     "Empty",
     "cuda_copy",
+    "set_prefer_kernel_less",
 ]

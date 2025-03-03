@@ -266,6 +266,14 @@ struct Vector {
     CHECK(msize > 0);
     return endptr[-1];
   }
+  const T& front() const {
+    CHECK(msize > 0);
+    return *beginptr;
+  }
+  const T& back() const {
+    CHECK(msize > 0);
+    return endptr[-1];
+  }
   void pop_back() {
     CHECK(msize > 0);
     --endptr;

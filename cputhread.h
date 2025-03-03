@@ -33,6 +33,7 @@ constexpr uint8_t taskCat = 17;
 constexpr uint8_t taskCopy = 18;
 constexpr uint8_t taskCached = 19;
 constexpr uint8_t taskReduceScatterBroadcast = 20;
+constexpr uint8_t taskAllGatherBroadcast = 21;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -60,6 +61,7 @@ OPTYPE(GatherCpu);
 OPTYPE(AllGatherKernelLessCuda);
 OPTYPE(AllGatherLocalCuda);
 OPTYPE(AllGatherRingCuda);
+OPTYPE(AllGatherBroadcastCuda);
 OPTYPE(ReduceScatterRingCuda);
 OPTYPE(ReduceScatterBroadcastCuda);
 OPTYPE(BroadcastCuda);

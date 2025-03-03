@@ -46,6 +46,8 @@ def f(n):
 
         moodist.enable_cuda_allocator()
 
+        moodist.set_prefer_kernel_less(False)
+
         # moodist.enable_profiling(True)
     if n == "tccl":
         import tccl
@@ -59,7 +61,7 @@ def f(n):
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     dist.init_process_group(
-        backend=n,
+        backend=n
     )
 
     # group1 = dist.new_group()
@@ -70,7 +72,7 @@ def f(n):
 
     print("%d: world size is %d\n" % (rank, size))
 
-    dist.barrier()
+    dist.barrier(device_ids=[torch.cuda.current_device()])
     torch.cuda.synchronize()
     dist.barrier()
     torch.cuda.synchronize()
@@ -121,7 +123,7 @@ def f(n):
         # data = torch.randn(4194304 - 0).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
-        data = torch.randn(442416 - 1).cuda() + 1
+        data = torch.randn(442416 - 0).cuda() + 1
         # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1
         # data = torch.randn(589824).cuda() + 1
@@ -204,7 +206,7 @@ def f(n):
             tmp.zero_()
             result = result0.chunk(size)
             # dist._all_gather_base(result, tmp)
-            if True:
+            if False:
                 for i, v in zip(range(size), correct_result):
                     if not torch.allclose(result[i], v, 1e-3, 1e-2):
                         print(
@@ -242,6 +244,17 @@ def f(n):
             # print("rank %d warmup %d done" % (rank, _))
         tmp.copy_(data)
         tmp = data
+
+        if True:
+            start = time.time()
+            loopcount = 1000
+            for _ in range(loopcount):
+                dist.all_gather_into_tensor(result0, tmp, group=group)
+            dist.all_gather_into_tensor(result0, tmp, group=group)
+
+            torch.cuda.synchronize()
+
+            print("loop1 took %g" % (time.time() - start))
 
         # print("rank %d warmup done" % (rank))
 
@@ -512,6 +525,7 @@ def f(n):
         #     # #print("rank %d result %d: %s" % (rank, _, s))
         #     # print("rank %d result %d: %s (should be %f)" % (rank, _, s, data.sum()))
 
+        print("cpu time: %g" % (time.time() - start))
         torch.cuda.synchronize()
         t = time.time() - start
         print("rank %d all done!" % rank)

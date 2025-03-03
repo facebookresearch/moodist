@@ -57,7 +57,7 @@ find_package(Python COMPONENTS Interpreter Development REQUIRED)
 pybind11_add_module(_C
   processgroup.cc
   group.cc
-  setup_comms.cc  
+  setup_comms.cc
   connection.cc
   socket.cc
   async.cc

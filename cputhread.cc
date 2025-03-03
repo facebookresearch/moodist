@@ -511,6 +511,16 @@ struct CpuThreadImpl {
     return CallbackWrapper(callback);
   }
 
+  void setErrorState() {
+    if (errorState) {
+      return;
+    }
+    errorState = true;
+    errorTime = std::chrono::steady_clock::now();
+    log.error(
+        "The process group is now in an error state, and Moodist will shortly forcefully terminate the process.\n");
+  }
+
   void poll() {
     for (auto i = activeDevices.begin(); i != activeDevices.end();) {
       Device& dev = *i;
@@ -526,13 +536,9 @@ struct CpuThreadImpl {
           cqErrored = true;
           Callback* callback = (Callback*)(void*)wc.wr_id;
           log.error(
-              "%s: Error communicating with %s: Work completion with status %d. The process group is now in an error "
-              "state, and Moodist will shortly forcefully terminate the process.\n",
-              groupName(), rankName(callback->i), wc.status);
-          if (!errorState) {
-            errorState = true;
-            errorTime = std::chrono::steady_clock::now();
-          }
+              "%s: Error communicating with %s: Work completion with status %d (%s).\n", groupName(),
+              rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
+          setErrorState();
         } else {
           CHECK(dev.currentCqEntries != 0);
           --dev.currentCqEntries;
@@ -2292,6 +2298,251 @@ struct CpuThreadImpl {
 
       self.cpuThread->freelistReduceScatter.push(&params);
       self.allocatorReduceScatterBroadcast.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkAllGatherBroadcast : Work {
+    QueueEntryAllGather& params;
+    MemoryRegistration* outputMr;
+    uintptr_t outputAddress;
+
+    const AllGather& allGather = *self.group->allGather;
+    const Vector<size_t>& recvRanks = allGather.recvRanks;
+    const Vector<size_t>& sendRanks = allGather.sendRanks;
+
+    const Vector<size_t>& recvRanksNext = allGather.recvRanksNext;
+
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    const size_t numParallel = params.numParallel;
+
+    size_t index;
+
+    size_t i;
+    size_t liveReads = 0;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+
+    size_t readIndex = 0;
+    size_t chunkIndex = 0;
+
+    WorkAllGatherBroadcast(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {
+      // log.info(
+      //     "%d: all-gather broadcast recv ranks [%s], send ranks [%s]\n", rank,
+      //     fmt::to_string(fmt::join(recvRanks, ", ")), fmt::to_string(fmt::join(sendRanks, ", ")));
+      // log.info("recv-ranks-next [%s]\n", fmt::to_string(fmt::join(recvRanksNext, ", ")));
+    }
+
+    void tryRead(size_t di) {
+      size_t index = readIndex;
+      size_t chunkIndex = this->chunkIndex;
+      size_t source = recvRanks[index];
+
+      size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+      size_t n = currentChunkSize;
+      bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+      size_t readOffset = chunkSize * chunkIndex;
+      if (n != 0) {
+        // if (index != 0) {
+        //   if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
+        //     return;
+        //   }
+        // }
+
+        uintptr_t dstAddr = params.outputAddress + params.pitch * source;
+
+        ++liveReads;
+        ++deviceLiveReads[di];
+        const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, source);
+        uintptr_t srcAddr = dyn.gatherAddress;
+        auto key = dyn.gatherKey;
+
+        auto& dev = self.devices[di];
+        self.readData(
+            dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
+            n, self.makeCallback([this, di, source, index, chunkIndex]() {
+              --liveReads;
+              --deviceLiveReads[di];
+              self.writeStepValueDeviceChunk(concurrencyIndex, source, 0, rank, 0, chunkIndex);
+              // if (recvRanksNext[index] != -1) {
+              //   self.writeStepValueDeviceChunk(concurrencyIndex, recvRanksNext[index], 0, source, 0, chunkIndex);
+              // }
+
+              self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
+            }));
+      }
+
+      if (true) {
+        if (readIndex == recvRanks.size() - 1) {
+          ++this->chunkIndex;
+          if (isLastChunk) {
+            ++readIndex;
+          } else {
+            readIndex = 0;
+          }
+        } else {
+          ++readIndex;
+        }
+      } else {
+        if (isLastChunk) {
+          this->chunkIndex = 0;
+          ++readIndex;
+        } else {
+          ++this->chunkIndex;
+          CHECK(this->chunkIndex < numChunks);
+        }
+      }
+    }
+
+    void step() {
+      ENTER
+
+      self.trace("ring %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+
+      {
+        uintptr_t inputAddress = params.inputAddress;
+        MemoryRegistration* inputMr = self.regMrCuda(inputAddress, params.bytes);
+
+        outputAddress = params.outputAddress;
+        outputMr = self.regMrCuda(outputAddress, params.bytes * size);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        for (index = 0; index != sendRanks.size(); ++index) {
+          i = sendRanks[index];
+          outDyns[i].gatherAddress = inputAddress;
+          outDyns[i].gatherBytes = params.bytes;
+          outDyns[i].stepValue = stepValue;
+          outDyns[i].opType = opTypeAllGatherBroadcastCuda;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = inputMr->mrs[di]->rkey;
+          }
+
+          // self.writeDyn(concurrencyIndex, i, i, rank, 1);
+        }
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace("kernel-entry");
+
+      // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      for (size_t i : sendRanks) {
+        self.writeDyn(concurrencyIndex, i, i, rank, 1);
+      }
+
+      CHECK(!recvRanks.empty());
+      CHECK(recvRanksNext.size() == recvRanks.size());
+
+      while (true) {
+        {
+          bool done = false;
+          do {
+            if (readIndex == recvRanks.size()) {
+              if (liveReads) {
+                continue;
+              }
+              done = true;
+              continue;
+            }
+
+            if (chunkIndex == 0) {
+              size_t i = recvRanks[readIndex];
+              if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+                continue;
+              }
+              const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, i);
+              CHECK_DYN(dyn, opTypeAllGatherBroadcastCuda, stepValue, params.bytes);
+            }
+
+            size_t bestDevice = 0;
+            size_t bestLiveReads = numParallel;
+            for (size_t di = 0; di != numDevices; ++di) {
+              if (deviceLiveReads[di] < bestLiveReads) {
+                bestLiveReads = deviceLiveReads[di];
+                bestDevice = di;
+              }
+            }
+            if (bestLiveReads >= numParallel) {
+              continue;
+            }
+            size_t di = bestDevice;
+
+            tryRead(di);
+          } while (false);
+          if (done) {
+            break;
+          }
+        }
+        YIELD
+      }
+
+      CHECK(liveReads == 0);
+      CHECK(readIndex == recvRanks.size());
+
+      self.trace("wait for remote reads");
+
+      for (index = 0; index != sendRanks.size(); ++index) {
+        if (params.bytes == 0) {
+          break;
+        }
+        for (chunkIndex = 0;; ++chunkIndex) {
+          while (self.inStepValueDeviceChunk(concurrencyIndex, sendRanks[index], 0, chunkIndex) != stepValue) {
+            YIELD
+          }
+          size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+          bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+          if (isLastChunk) {
+            break;
+          }
+        }
+      }
+
+      // self.writeStepValueDeviceChunk(concurrencyIndex, recvRanks.back(), 0, recvRanks.back(), 0, 0);
+
+      // self.trace("wait for remote reads");
+      // while (self.inStepValueDeviceChunk(concurrencyIndex, rank, 0, 0) != stepValue) {
+      //   YIELD
+      // }
+
+      // log.info("wait for exit kernel %d\n", stepValue);
+
+      // cpuOut[0] = stepValue;
+      self.writeCpuOut(concurrencyIndex, 0, 0);
+
+      self.trace("kernel-exit");
+
+      // {
+      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
+      //   if (rank == 0) {
+      //     if (params.paramsData) {
+      //       params.paramsData->addTiming(params.paramsIndex, t);
+      //     }
+      //     std::lock_guard l(stats.mutex);
+      //     stats.values.push_back(
+      //         {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
+      //          (float)numChunks, (float)numParallel, t});
+      //   }
+      // }
+
+      while (cpuIn[0] < stepValue + 1) {
+        YIELD
+      }
+
+      // log.info("exit kernel %d ok\n", stepValue);
+
+      self.trace("");
+
+      self.cpuThread->freelistAllGather.push(&params);
+      self.allocatorAllGatherBroadcast.deallocate(this);
       DONE
     }
   };
@@ -4650,6 +4901,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkCat> allocatorCat;
   WorkAllocator<WorkCached> allocatorCached;
   WorkAllocator<WorkReduceScatterBroadcast> allocatorReduceScatterBroadcast;
+  WorkAllocator<WorkAllGatherBroadcast> allocatorAllGatherBroadcast;
 
   size_t numActiveWorks = 0;
 
@@ -4691,10 +4943,7 @@ struct CpuThreadImpl {
           log.error("%s: Heartbeat timeout: %s has not responded in %g seconds\n", groupName(), rankName(i), s);
 
           if (now - *state.valueChangeTime >= heartbeatInterval * 6) {
-            if (!errorState) {
-              errorState = true;
-              errorTime = std::chrono::steady_clock::now();
-            }
+            setErrorState();
           }
         }
       }
@@ -4704,10 +4953,7 @@ struct CpuThreadImpl {
             seconds(now - *state.activeWrite));
 
         if (now - *state.activeWrite >= heartbeatInterval * 6) {
-          if (!errorState) {
-            errorState = true;
-            errorTime = std::chrono::steady_clock::now();
-          }
+          setErrorState();
         }
         continue;
       }
@@ -4923,6 +5169,9 @@ struct CpuThreadImpl {
               break;
             case taskReduceScatterBroadcast:
               enqueue(allocatorReduceScatterBroadcast, (QueueEntryReduceScatter&)queueEntry);
+              break;
+            case taskAllGatherBroadcast:
+              enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

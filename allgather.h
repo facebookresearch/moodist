@@ -38,6 +38,8 @@ struct AllGather : CollectiveBase {
   HashMap<size_t, size_t> ringSendsBySource;
   HashMap<size_t, size_t> ringRecvsBySource;
 
+  Vector<size_t> recvRanksNext;
+
   AllGather(Group* group);
   ~AllGather();
   void init();

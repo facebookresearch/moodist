@@ -23,6 +23,7 @@ bool profilingEnabled = false;
 void enableCudaAllocator();
 void enableCpuAllocator();
 void cpuAllocatorDebug();
+void setPreferKernelLess(bool);
 
 } // namespace moodist
 
@@ -77,6 +78,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("enable_cuda_allocator", &moodist::enableCudaAllocator);
   m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
   m.def("cpu_allocator_debug", &moodist::cpuAllocatorDebug);
+
+  m.def("set_prefer_kernel_less", &moodist::setPreferKernelLess);
 
   m.def("cuda_copy", &cudaCopy, py::call_guard<py::gil_scoped_release>());
 
