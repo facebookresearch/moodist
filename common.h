@@ -10,18 +10,21 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
-#include <cuda_runtime_api.h>
-#include <numa.h>
 #include <nvml.h>
 #include <nvrtc.h>
 #include <torch/cuda.h>
 #include <torch/types.h>
 
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <utility>
 
 namespace moodist {
+
+void* numa_alloc_onnode(size_t bytes, int node);
+void* numa_alloc_local(size_t bytes);
+void numa_free(void* ptr, size_t bytes);
 
 extern async::Scheduler& scheduler;
 

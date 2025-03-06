@@ -133,8 +133,6 @@ struct SetupCommsImpl : SetupComms {
       return;
     }
     std::lock_guard l(mutex);
-    // fmt::printf("Connecting to: %s\n", address);
-    // std::fflush(stdout);
     auto connection = context.connect(address);
     auto buffer =
         serializeToBuffer(signature, myId, (uint32_t)rank, ~(uint32_t)0, (uint32_t)0, std::string_view("connect"), key);
@@ -145,8 +143,6 @@ struct SetupCommsImpl : SetupComms {
       if (!e) {
         onRead(std::move(data), connection);
       } else {
-        // fmt::fprintf(stderr, "Socket read error: %s\n", e->what());
-        // std::fflush(stderr);
         connection->close();
       }
     });

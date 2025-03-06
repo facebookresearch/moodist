@@ -10,12 +10,11 @@ from ._C import (
     cuda_copy,
     set_prefer_kernel_less,
 )
+from .version import __version__
 
 from datetime import timedelta
 import pickle
 from queue import Empty
-
-__version__ = "0.2.1"
 
 
 class TransactionContextManager:

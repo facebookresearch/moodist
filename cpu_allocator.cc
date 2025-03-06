@@ -5,8 +5,6 @@
 #include "vector.h"
 
 #include <c10/cuda/CUDAFunctions.h>
-#include <numa.h>
-#include <numaif.h>
 #include <sys/mman.h>
 #include <type_traits>
 
@@ -14,99 +12,18 @@ namespace moodist {
 
 namespace {
 
-// int getNode(int deviceIndex) {
-
-//   CUcontext cuContext = nullptr;
-//   CUdevice cuDevice;
-//   cuCtxGetCurrent(&cuContext);
-//   if (!cuContext) {
-//     CHECK_CU(cuInit(0));
-
-//     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
-//     CHECK_CU(cuDevicePrimaryCtxRetain(&cuContext, cuDevice));
-//     CHECK_CU(cuCtxSetCurrent(cuContext));
-//   } else {
-//     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
-//   }
-
-//   CHECK_NVML(nvmlInit_v2());
-
-//   std::array<char, 0x400> cudaPciBus;
-//   CHECK_CU(cuDeviceGetPCIBusId(cudaPciBus.data(), cudaPciBus.size(), cuDevice));
-//   cudaPciBus[0x3ff] = 0;
-//   auto getDevicePath = [](std::string pciBus) {
-//     std::string s = fmt::sprintf("/sys/bus/pci/devices/%s", pciBus);
-//     for (auto& v : s) {
-//       if (v >= 'A' && v <= 'Z') {
-//         v += 0x20;
-//       }
-//     }
-//     char* path = realpath(s.c_str(), nullptr);
-//     if (path) {
-//       s = path;
-//       free(path);
-//     }
-//     return removePciPathPrefix(s);
-//   };
-//   std::string cudaPath = getDevicePath(cudaPciBus.data());
-
-//   nvmlDevice_t nvmlDevice;
-//   CHECK_NVML(nvmlDeviceGetHandleByPciBusId_v2(cudaPciBus.data(), &nvmlDevice));
-
-//   std::vector<std::string> allCudaPaths;
-
-//   bool localCudaDeviceFound = false;
-//   size_t localAllCudaPathsIndex = 0;
-//   unsigned int deviceCount = 0;
-//   CHECK_NVML(nvmlDeviceGetCount(&deviceCount));
-//   for (unsigned int i = 0; i != deviceCount; ++i) {
-//     nvmlDevice_t device;
-//     CHECK_NVML(nvmlDeviceGetHandleByIndex_v2(i, &device));
-//     nvmlPciInfo_t pciInfo;
-//     CHECK_NVML(nvmlDeviceGetPciInfo_v3(device, &pciInfo));
-//     std::string path = getDevicePath(pciInfo.busIdLegacy);
-//     allCudaPaths.push_back(path);
-//     if (path == cudaPath) {
-//       localCudaDeviceFound = true;
-//       localAllCudaPathsIndex = i;
-//     }
-//   }
-//   if (!localCudaDeviceFound) {
-//     throw std::runtime_error("The current CUDA device could not be found using NVML!");
-//   }
-
-//   unsigned long nodeSet = 0;
-//   CHECK_NVML(nvmlDeviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
-
-//   int allocationNode = -1;
-
-//   for (unsigned int i = 0; i != 64; ++i) {
-//     if (nodeSet & (1ull << i)) {
-//       allocationNode = i;
-//       break;
-//     }
-//   }
-
-//   return allocationNode;
-// }
-
-// int allocationNode = -1;
-
 void* nalloc(size_t bytes) {
-  // CHECK(allocationNode != -1);
-  // void* r = numa_alloc_onnode(bytes, allocationNode);
-  // if (!r) {
-  //   log.error("ERROR: Failed to allocate %d bytes of host memory on NUMA node %d\n", bytes, allocationNode);
-  //   throw std::bad_alloc();
-  // }
-  void* r = numa_alloc_local(bytes);
-  CHECK(r != nullptr);
+  void* r = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (!r) {
+    log.error("ERROR: Failed to allocate %d bytes of memory\n", bytes);
+    throw std::bad_alloc();
+  }
   CHECK(((uintptr_t)r & 63) == 0);
   return r;
 }
 
 void nfree(void* ptr, size_t bytes) {
-  numa_free(ptr, bytes);
+  munmap(ptr, bytes);
 }
 
 template<typename T>
@@ -632,7 +549,7 @@ size_t currentLiveAllocations = 0;
   freeRegions.push_front(*r);
 }
 
-[[gnu::always_inline]] void free_internal(Thread* thread, Region* r, void* p) {
+[[gnu::always_inline]] inline void free_internal(Thread* thread, Region* r, void* p) {
   CHECK(r->allocated >= 1);
   --r->allocated;
   if (!r->freelist) {

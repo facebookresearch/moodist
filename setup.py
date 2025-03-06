@@ -17,7 +17,7 @@ from setuptools.command import build_ext
 from distutils import spawn
 
 
-class CMakeBuild(build_ext.build_ext):
+class Build(build_ext.build_ext):
     def run(self):  # Necessary for pip install -e.
         for ext in self.extensions:
             self.build_extension(ext)
@@ -28,17 +28,20 @@ class CMakeBuild(build_ext.build_ext):
 
         os.makedirs(self.build_temp, exist_ok=True)
 
-        build_type = "Debug" if self.debug else "RelWithDebInfo"
+        global moodist_version
 
-        generator = "Ninja" if spawn.find_executable("ninja") else "Unix Makefiles"
+        with open(output_path / "version.py", "w") as f:
+            f.write('__version__ = "%s"\n' % moodist_version)
 
         cmake_cmd = [
             "cmake",
             str(source_path),
-            "-G%s" % generator,
-            "-DCMAKE_BUILD_TYPE=%s" % build_type,
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=%s" % output_path,
         ]
+
+        if "bdist_wheel" in sys.argv:
+            cmake_cmd.append("-DIS_BUILDING_WHEEL=1")
 
         build_cmd = ["cmake", "--build", ".", "--parallel"]
 
@@ -57,9 +60,22 @@ class CMakeBuild(build_ext.build_ext):
 
 def main():
 
+    import torch
+
+    torch_version = torch.__version__
+    if "+" in torch_version:
+        torch_version = torch_version[: torch_version.index("+")]
+
+    extra_version = ""
+    if "bdist_wheel" not in sys.argv:
+        extra_version = ".dev"
+
+    global moodist_version
+    moodist_version = "0.2.3-alpha+torch.%s%s" % (torch_version, extra_version)
+
     setuptools.setup(
         name="moodist",
-        version="0.2.1",
+        version=moodist_version,
         description=("moodist"),
         long_description="",
         long_description_content_type="text/markdown",
@@ -75,8 +91,8 @@ def main():
         packages=["moodist"],
         package_dir={"": "py"},
         ext_modules=[setuptools.Extension("moodist._C", sources=[])],
-        install_requires=["torch>=1.6.0"],
-        cmdclass={"build_ext": CMakeBuild},
+        install_requires=["torch~=%s" % torch_version],
+        cmdclass={"build_ext": Build},
         zip_safe=False,
     )
 

@@ -11,9 +11,9 @@
 
 #include <algorithm>
 #include <cstring>
-
-#include <numa.h>
 #include <type_traits>
+
+#include <sys/mman.h>
 
 namespace moodist {
 
@@ -155,8 +155,6 @@ void Group::init() {
     throw std::runtime_error("The current CUDA device could not be found using NVML!");
   }
 
-  CHECK(numa_available() >= 0);
-
   unsigned long nodeSet = 0;
   CHECK_NVML(nvmlDeviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
 
@@ -168,17 +166,6 @@ void Group::init() {
   }
 
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
-
-  // CHECK(numa_run_on_node(allocationNode) == 0);
-  // {
-  //   auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
-  //   if (bitmask) {
-  //     numa_bitmask_clearall(bitmask);
-  //     numa_bitmask_setbit(bitmask, allocationNode);
-  //     numa_bind(bitmask);
-  //     numa_bitmask_free(bitmask);
-  //   }
-  // }
 
   std::vector<LocalDevice> localDevices;
 
@@ -636,24 +623,7 @@ void Group::init() {
     peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
   }
 
-  {
-    // we want shared memory (allocated with memfd_create) to be allocated on allocationNode,
-    // but we don't want to change the current numa allocation policy.
-    // thus we create a temporary thread to do it.
-    std::thread tmp([&] {
-      if (allocationNode != -1) {
-        auto* bitmask = numa_bitmask_alloc(allocationNode + 1);
-        if (bitmask) {
-          numa_bitmask_clearall(bitmask);
-          numa_bitmask_setbit(bitmask, allocationNode);
-          numa_bind(bitmask);
-          numa_bitmask_free(bitmask);
-        }
-      }
-      ipcMapper->init();
-    });
-    tmp.join();
-  }
+  ipcMapper->init();
 
   mySharedMem = ipcMapper->getMySharedMem(0, 0);
   peerSharedMem.fill(nullptr);
@@ -1047,6 +1017,24 @@ uintptr_t Group::getNextCudaUint32() {
   size_t o = cudaUint32Offset;
   cudaUint32Offset += 4;
   return cudaUint32List.back().cudaPointer + o;
+}
+
+void* numa_alloc_onnode(size_t bytes, int node) {
+  void* r = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (node >= 0) {
+    constexpr int mode_bind = 2;
+    unsigned long mask = (unsigned long)1 << node;
+    if (syscall(SYS_mbind, (uintptr_t)r, bytes, mode_bind, (uintptr_t)&mask, 64, 0)) {
+      log.debug("mbind error: %d\n", errno);
+    }
+  }
+  return r;
+}
+void* numa_alloc_local(size_t bytes) {
+  return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+void numa_free(void* ptr, size_t bytes) {
+  munmap(ptr, bytes);
 }
 
 } // namespace moodist

@@ -291,7 +291,7 @@ struct ProcessGroupImpl {
 
   std::string currentTraceName = "";
   std::chrono::system_clock::time_point currentTraceBegin = beginning;
-  int threadId = gettid();
+  int threadId = syscall(SYS_gettid);
 
   void trace(std::string name) {
     // if (opCount < 1000 || opCount >= 1200) {

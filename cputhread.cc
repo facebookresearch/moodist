@@ -22,8 +22,8 @@
 #include <cstring>
 #include <libibverbs/verbs.h>
 #include <memory>
-#include <numa.h>
 #include <random>
+#include <sys/syscall.h>
 #include <torch/types.h>
 #include <type_traits>
 #include <utility>
@@ -1247,7 +1247,7 @@ struct CpuThreadImpl {
 
   std::string currentTraceName = "";
   std::chrono::system_clock::time_point currentTraceBegin = beginning;
-  int threadId = gettid();
+  int threadId = syscall(SYS_gettid);
 
   template<typename... Args>
   void trace(const char* fmt, Args&&... args) {
@@ -5236,7 +5236,7 @@ void CpuThread::kill() {
 void CpuThread::start() {
   thread = std::thread([this] {
     async::setCurrentThreadName("moodist-cputhread");
-    CHECK(numa_run_on_node(group->allocationNode) == 0);
+    // CHECK(numa_run_on_node(group->allocationNode) == 0);
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
     CpuThreadImpl impl(this);
     impl.entry();
