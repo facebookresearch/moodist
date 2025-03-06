@@ -555,12 +555,9 @@ struct CpuThreadImpl {
 
   void writeData(
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback = nullptr) {
+      Callback* callback) {
     CHECK(i >= 0 && i < size);
 
-    if (!callback) {
-      callback = makeCallback(nullptr);
-    }
     callback->i = i;
 
     auto post = [&]() {
@@ -634,12 +631,9 @@ struct CpuThreadImpl {
 
   void readData(
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback = nullptr) {
+      Callback* callback) {
     CHECK(i >= 0 && i < size);
 
-    if (!callback) {
-      callback = makeCallback(nullptr);
-    }
     callback->i = i;
 
     auto post = [&]() {
@@ -766,12 +760,9 @@ struct CpuThreadImpl {
     }
   }
 
-  void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback = nullptr) {
+  void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
     CHECK(i >= 0 && i < size);
 
-    if (!callback) {
-      callback = makeCallback(nullptr);
-    }
     callback->i = i;
 
     ibv_sge sge;
@@ -818,7 +809,7 @@ struct CpuThreadImpl {
     }
   }
 
-  void postRecv(Device& dev, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback = nullptr) {
+  void postRecv(Device& dev, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
     ibv_sge sge;
     sge.addr = (uintptr_t)localAddress;
     sge.length = bytes;
@@ -826,9 +817,7 @@ struct CpuThreadImpl {
 
     bytesWritten += bytes;
 
-    if (callback) {
-      ++callback->refcount;
-    }
+    ++callback->refcount;
 
     // while (dev.currentCqEntries == maxCqEntries) {
     //   poll();
@@ -1471,7 +1460,8 @@ struct CpuThreadImpl {
     size_t di = 0;
     auto& dev = devices[di];
     auto* mr = regMrCuda(targetAddress, 4);
-    writeData(dev, rank, (void*)&value, 0, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t));
+    writeData(
+        dev, rank, (void*)&value, 0, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t), makeCallback(nullptr));
   }
 
   struct WorkBarrier : Work {
