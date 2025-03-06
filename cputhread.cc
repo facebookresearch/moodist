@@ -4423,10 +4423,9 @@ struct CpuThreadImpl {
     Vector<std::pair<size_t, const CatTensor*>> sorted;
     size_t numReceivedParts = 0;
     size_t nextPartIndex = 0;
-    size_t currentOffset = 0;
     size_t nLiveReads = 0;
     size_t nReadsDone = 0;
-    Vector<size_t> readOrder;
+    Vector<std::pair<size_t, size_t>> readOrder;
 
     TemporaryBufferHandle resultBuffer;
 
@@ -4436,18 +4435,17 @@ struct CpuThreadImpl {
 
     void allocateResult() {
       size_t total = 0;
-      for (auto& v : sorted) {
-        total += v.second->bytes;
-      }
-
-      resultBuffer = self.allocateTemporaryBuffer(total);
 
       size_t n = sorted.size();
       readOrder.resize(n);
       for (size_t i = 0; i != n; ++i) {
-        readOrder[i] = i;
+        readOrder[i] = {i, total};
+        total += sorted[i].second->bytes;
       }
+
       std::shuffle(readOrder.begin(), readOrder.end(), getRng());
+
+      resultBuffer = self.allocateTemporaryBuffer(total);
 
       // log.info("CAT %#x/%d allocated %d bytes\n", stepValue, concurrencyIndex, resultBuffer->bytes);
     }
@@ -4459,19 +4457,15 @@ struct CpuThreadImpl {
       if (nLiveReads >= 128) {
         return false;
       }
-      size_t index = readOrder[nextPartIndex];
-      if (sorted[index].second == nullptr) {
-        return false;
-      }
+      auto [index, offset] = readOrder[nextPartIndex];
+      CHECK(sorted[index].second != nullptr);
       ++nextPartIndex;
       size_t i = sorted[index].first;
       const CatTensor* t = sorted[index].second;
       CHECK(t->index == index);
 
-      void* dst = (void*)((uintptr_t)resultBuffer->cpuPointer + currentOffset);
+      void* dst = (void*)((uintptr_t)resultBuffer->cpuPointer + offset);
       void* src = (void*)t->address;
-
-      currentOffset += t->bytes;
 
       std::array<uint32_t, maxDevices> lkeys;
       for (size_t i = 0; i != maxDevices; ++i) {
