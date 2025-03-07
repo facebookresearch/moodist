@@ -68,6 +68,7 @@ pybind11_add_module(_C
   allocator.cc
   queue.cc
   cpu_allocator.cc
+  numa.cc
 )
 if (TARGET CUDA::nvrtc_static AND TARGET CUDA::nvrtc_builtins_static AND TARGET CUDA::nvml_static)
   target_link_libraries(_C PRIVATE CUDA::nvrtc_static CUDA::nvrtc_builtins_static CUDA::nvml_static)

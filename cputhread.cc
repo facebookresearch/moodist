@@ -5236,7 +5236,7 @@ void CpuThread::kill() {
 void CpuThread::start() {
   thread = std::thread([this] {
     async::setCurrentThreadName("moodist-cputhread");
-    // CHECK(numa_run_on_node(group->allocationNode) == 0);
+    numa_run_on_node(group->allocationNode);
     CHECK_CU(cuCtxSetCurrent(group->cuContext));
     CpuThreadImpl impl(this);
     impl.entry();

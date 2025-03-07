@@ -13,8 +13,6 @@
 #include <cstring>
 #include <type_traits>
 
-#include <sys/mman.h>
-
 namespace moodist {
 
 struct LocalDevice {
@@ -1017,24 +1015,6 @@ uintptr_t Group::getNextCudaUint32() {
   size_t o = cudaUint32Offset;
   cudaUint32Offset += 4;
   return cudaUint32List.back().cudaPointer + o;
-}
-
-void* numa_alloc_onnode(size_t bytes, int node) {
-  void* r = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (node >= 0) {
-    constexpr int mode_bind = 2;
-    unsigned long mask = (unsigned long)1 << node;
-    if (syscall(SYS_mbind, (uintptr_t)r, bytes, mode_bind, (uintptr_t)&mask, 64, 0)) {
-      log.debug("mbind error: %d\n", errno);
-    }
-  }
-  return r;
-}
-void* numa_alloc_local(size_t bytes) {
-  return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-}
-void numa_free(void* ptr, size_t bytes) {
-  munmap(ptr, bytes);
 }
 
 } // namespace moodist

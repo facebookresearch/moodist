@@ -25,6 +25,7 @@ namespace moodist {
 void* numa_alloc_onnode(size_t bytes, int node);
 void* numa_alloc_local(size_t bytes);
 void numa_free(void* ptr, size_t bytes);
+int numa_run_on_node(int node);
 
 extern async::Scheduler& scheduler;
 
