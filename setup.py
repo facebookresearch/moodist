@@ -71,7 +71,11 @@ def main():
         extra_version = ".dev"
 
     global moodist_version
-    moodist_version = "0.2.3-alpha+torch.%s%s" % (torch_version, extra_version)
+    moodist_version = "%s+torch.%s%s" % (
+        open("version.txt").read().strip(),
+        torch_version,
+        extra_version,
+    )
 
     setuptools.setup(
         name="moodist",
