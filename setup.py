@@ -68,13 +68,13 @@ def main():
 
     extra_version = ""
     if "bdist_wheel" not in sys.argv:
-        extra_version = ".dev"
+        extra_version = "-dev"
 
     global moodist_version
-    moodist_version = "%s+torch.%s%s" % (
+    moodist_version = "%s%s+torch.%s" % (
         open("version.txt").read().strip(),
-        torch_version,
         extra_version,
+        torch_version,
     )
 
     setuptools.setup(
