@@ -16,6 +16,10 @@ from datetime import timedelta
 import pickle
 from queue import Empty
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    class MoodistProcessGroup(torch.distributed.ProcessGroup): ...
 
 class TransactionContextManager:
     def __init__(self, queue):
@@ -77,43 +81,6 @@ class Queue:
 
     def transaction(self):
         return TransactionContextManager(self)
-
-
-class LocalQueue:
-    def __init__(self, process_group):
-        self.queues = [
-            Queue(process_group, location=i) for i in range(process_group.size())
-        ]
-        self.rank = process_group.rank()
-
-    def put_tensor(self, tensor, location=None):
-        return self.queues[self.rank if location is None else location].put_tensor(
-            tensor
-        )
-
-    def get_tensor(self, location=None, block=True, timeout=None):
-        return self.queues[self.rank if location is None else location].get_tensor(
-            block, timeout
-        )
-
-    def put_object(self, object, location=None):
-        return self.queues[self.rank if location is None else location].put_object(
-            object
-        )
-
-    def get_object(self, location=None, block=True, timeout=None):
-        return self.queues[self.rank if location is None else location].get_object(
-            block, timeout
-        )
-
-    def qsize(self, location=None):
-        return self.queues[self.rank if location is None else location].qsize()
-
-    def empty(self, location=None):
-        return self.queues[self.rank if location is None else location].empty()
-
-    def wait(self, location=None, timeout=None):
-        return self.queues[self.rank if location is None else location].wait(timeout)
 
 
 def create_moodist_backend(
