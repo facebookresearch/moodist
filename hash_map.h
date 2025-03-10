@@ -93,16 +93,24 @@ public:
     }
 
     iterator& operator++() noexcept {
+      assert(map != nullptr);
+      assert(ki < map->ksize);
+      assert(isNone(vi) || vi < map->ksize);
       if (isNone(vi)) {
         do {
           if (ki == map->ksize - 1) {
-            ki = none;
+            ki = map->secondary[0].index;
             vi = 0;
-            v = &map->secondary[vi].value;
-            if (!isNone(map->secondary[vi].index)) {
-              return *this;
+            while (isNone(ki)) {
+              if (vi == map->ksize - 1) {
+                v = nullptr;
+                return *this;
+              }
+              ++vi;
+              ki = map->secondary[vi].index;
             }
-            return ++*this;
+            v = &map->secondary[vi].value;
+            return *this;
           } else {
             ++ki;
             v = &map->primary[ki].value;
@@ -115,8 +123,8 @@ public:
             return *this;
           }
           ++vi;
-          v = &map->secondary[vi].value;
         } while (isNone(map->secondary[vi].index));
+        v = &map->secondary[vi].value;
       }
       return *this;
     }
@@ -221,6 +229,7 @@ public:
     assert(ki < ksize);
     assert(isNone(i.vi) || vi < ksize);
     assert(msize > 0);
+    assert(i.map == this);
     --msize;
     auto* primary = this->primary;
     auto* secondary = this->secondary;
@@ -510,8 +519,8 @@ public:
   }
 };
 
+} // namespace moodist
+
 #pragma pop_macro("assert")
 #pragma pop_macro("likely")
 #pragma pop_macro("unlikely")
-
-} // namespace moodist
