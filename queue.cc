@@ -4,7 +4,6 @@
 #include "cputhread.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
-#include "serialization.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 
@@ -12,7 +11,6 @@
 #include <c10/cuda/CUDAStream.h>
 #include <mutex>
 #include <pybind11/pybind11.h>
-#include <signal.h>
 
 namespace moodist {
 
@@ -908,9 +906,10 @@ void queueRemoteGetStop(
   std::lock_guard l(qs->mutex);
   auto i = qs->waitMap.find(key64(source, key));
   if (i != qs->waitMap.end()) {
+    Waiting* w = i->second;
     qs->waitList.erase(*i->second);
     qs->waitMap.erase(i);
-
+    freeWaiting(w);
     QueueEntryQueueGet* e = group->cpuThread->freelistQueueGet.pop();
     e->task = taskQueueGet;
     e->location = source;
