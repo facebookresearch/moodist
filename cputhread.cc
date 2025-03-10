@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <libibverbs/verbs.h>
 #include <memory>
@@ -1522,7 +1523,8 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      stepValue = (self.nextInternalStepValue[concurrencyIndex] ^= 1);
+      stepValue = self.nextInternalStepValue[concurrencyIndex] + 1;
+      self.nextInternalStepValue[concurrencyIndex] += 4;
 
       {
         DynamicAddresses& out = self.outDyn(concurrencyIndex, 0);
@@ -1532,6 +1534,8 @@ struct CpuThreadImpl {
         out.stepValue = stepValue;
       }
       self.outStepValue(concurrencyIndex, 0) = stepValue;
+      self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+      self.outStepValue(concurrencyIndex, 2) = stepValue + 2;
       for (i = 0; i != size; ++i) {
         if (i == self.rank) {
           continue;
@@ -1539,7 +1543,7 @@ struct CpuThreadImpl {
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
         self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
@@ -1549,7 +1553,7 @@ struct CpuThreadImpl {
         if (i == self.rank) {
           continue;
         }
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue) {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue + 1) {
           YIELD
         }
       }
@@ -1561,7 +1565,7 @@ struct CpuThreadImpl {
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
         self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
@@ -1571,7 +1575,7 @@ struct CpuThreadImpl {
         if (i == self.rank) {
           continue;
         }
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue) {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue + 2) {
           YIELD
         }
       }
@@ -4009,12 +4013,14 @@ struct CpuThreadImpl {
 
       self.initReceives();
 
-      stepValue = (self.nextInternalStepValue[concurrencyIndex] ^= 1);
+      stepValue = self.nextInternalStepValue[concurrencyIndex] + 1;
+      self.nextInternalStepValue[concurrencyIndex] += 4;
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
+      self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+      self.outStepValue(concurrencyIndex, 2) = stepValue + 2;
 
       if (rank == params.location) {
-        // auto* mr = self.regMr(params.address, params.bytes);
         DynamicAddresses& out = self.outDyn(concurrencyIndex, 0);
         out.opType = opTypeCreateQueue;
         out.gatherAddress = params.address;
@@ -4025,21 +4031,10 @@ struct CpuThreadImpl {
           if (i == self.rank) {
             continue;
           }
-          self.writeDyn(concurrencyIndex, i, 0, rank);
-          size_t di = (rank + i) % self.devices.size();
-          auto& dev = self.devices[di];
-          self.writeControl(
-              concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
-              self.outStepValuesStorageMr->mrs[di]->lkey,
-              (void*)(self.remoteInternalInStepValueBuffer[i].address +
-                      sizeof(uint32_t) * (size * concurrencyIndex + 2 * rank)),
-              self.remoteInternalInStepValueBuffer[i].keys[di], sizeof(uint32_t));
+          self.writeDyn(concurrencyIndex, i, 0, 0);
         }
       } else {
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * params.location) != stepValue) {
-          YIELD
-        }
-        WAIT_DYN(opTypeCreateQueue, params.location);
+        WAIT_DYN(opTypeCreateQueue, 0);
         if (params.location != dyn.gatherKey[0]) {
           fatal(
               "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location %d",
@@ -4054,7 +4049,7 @@ struct CpuThreadImpl {
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
         self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
@@ -4064,7 +4059,7 @@ struct CpuThreadImpl {
         if (i == self.rank) {
           continue;
         }
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue) {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i) != stepValue + 1) {
           YIELD
         }
       }
@@ -4075,7 +4070,7 @@ struct CpuThreadImpl {
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
         self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 0),
+            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
@@ -4085,7 +4080,7 @@ struct CpuThreadImpl {
         if (i == self.rank) {
           continue;
         }
-        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue) {
+        while (*(&self.internalInStepValueBuffer.at<uint32_t>(concurrencyIndex) + 2 * i + 1) != stepValue + 2) {
           YIELD
         }
       }
