@@ -33,15 +33,18 @@ template<typename... Args>
     std::swap(ftarget, fother);
   }
   fflush(fother);
-  time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  auto* tm = std::localtime(&now);
+  auto now = std::chrono::system_clock::now();
+  time_t tt = std::chrono::system_clock::to_time_t(now);
+  struct tm tm;
+  localtime_r(&tt, &tm);
   char buf[0x40];
-  std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", tm);
+  std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", &tm);
   auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
+  int microseconds = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() % 1000000;
   if (!s.empty() && s.back() == '\n') {
-    fmt::fprintf(ftarget, "%s moodist: %s", buf, s);
+    fmt::fprintf(ftarget, "%s.%.06d moodist: %s", buf, microseconds, s);
   } else {
-    fmt::fprintf(ftarget, "%s moodist: %s\n", buf, s);
+    fmt::fprintf(ftarget, "%s.%.06d moodist: %s\n", buf, microseconds, s);
   }
   fflush(ftarget);
 }
