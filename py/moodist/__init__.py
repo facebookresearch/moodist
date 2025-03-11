@@ -19,7 +19,9 @@ from queue import Empty
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+
     class MoodistProcessGroup(torch.distributed.ProcessGroup): ...
+
 
 class TransactionContextManager:
     def __init__(self, queue):
@@ -36,10 +38,10 @@ class TransactionContextManager:
             self.queue.impl.transaction_commit(self.id)
 
     def put_tensor(self, tensor):
-        return self.queue.put_tensor(tensor, self.id)
+        return self.queue.put_tensor(tensor, transaction=self.id)
 
     def put_object(self, object):
-        return self.queue.put_object(object, self.id)
+        return self.queue.put_object(object, transaction=self.id)
 
 
 class Queue:
@@ -51,21 +53,29 @@ class Queue:
             )
         self.impl = process_group.Queue(location=location)
 
-    def put_tensor(self, tensor, transaction=0):
+    def put_tensor(self, tensor, *, transaction=0):
         return self.impl.put(tensor, transaction)
 
-    def get_tensor(self, block=True, timeout=None):
-        r = self.impl.get(block=block, timeout=timeout)
+    def get_tensor(self, block=True, timeout=None, return_size=False):
+        r, size = self.impl.get(block=block, timeout=timeout)
         if r is None:
             raise Empty
-        return r
+        if return_size:
+            return r, size
+        else:
+            return r
 
-    def put_object(self, object, transaction=0):
+    def put_object(self, object, *, transaction=0):
         return self.impl.put(
             torch.frombuffer(pickle.dumps(object), dtype=torch.uint8), transaction
         )
 
-    def get_object(self, block=True, timeout=None):
+    def get_object(self, block=True, timeout=None, return_size=False):
+        if return_size:
+            tensor, size = self.get_tensor(
+                block=block, timeout=timeout, return_size=True
+            )
+            return pickle.loads(tensor.numpy().tobytes()), size
         return pickle.loads(
             self.get_tensor(block=block, timeout=timeout).numpy().tobytes()
         )

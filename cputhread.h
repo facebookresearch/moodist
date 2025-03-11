@@ -34,6 +34,7 @@ constexpr uint8_t taskCopy = 18;
 constexpr uint8_t taskCached = 19;
 constexpr uint8_t taskReduceScatterBroadcast = 20;
 constexpr uint8_t taskAllGatherBroadcast = 21;
+constexpr uint8_t taskCallback = 22;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -207,6 +208,7 @@ struct QueueEntryQueuePut : QueueEntry {
   uint32_t putKey = 0;
   uint32_t remoteGetKey = 0;
   uint32_t transactionKey = 0;
+  size_t queueSize = -1;
   TensorData* tensor;
 };
 
@@ -230,6 +232,7 @@ struct QueueEntryQueueRead : QueueEntry {
   int tensorDtype = -1;
   uint32_t getKey = 0;
   uint32_t transactionKey = 0;
+  size_t queueSize = -1;
   std::vector<int64_t> tensorShape;
 };
 
@@ -260,6 +263,10 @@ struct QueueEntryCached : QueueEntry {
   int identifier = -1;
   size_t inputBytes;
   size_t outputBytes;
+};
+
+struct QueueEntryCallback : QueueEntry {
+  Function<void()> callback;
 };
 
 template<typename T>
@@ -318,6 +325,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCat> freelistCat;
   QueueEntryFreeList<QueueEntryCopy> freelistCopy;
   QueueEntryFreeList<QueueEntryCached> freelistCached;
+  QueueEntryFreeList<QueueEntryCallback> freelistCallback;
 
   CpuThread(Group*);
   ~CpuThread();

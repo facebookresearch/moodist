@@ -4105,12 +4105,15 @@ struct CpuThreadImpl {
     std::array<int64_t, 256> shapeArr;
     uint32_t getKey;
     uint32_t transactionKey;
+    size_t queueSize;
+    bool inlined;
     // log.info("view is %#x %d\n", (uintptr_t)view.data(), view.size());
+    const char* inlineData = nullptr;
     {
       Deserializer d(view);
       Deserialize x(d);
       x(source, queueAddress, tensorAddress, bytes);
-      x(remoteOpKey, getKey, transactionKey);
+      x(remoteOpKey, getKey, transactionKey, queueSize);
       for (size_t i = 0; i != maxDevices; ++i) {
         x(rkeys[i]);
       }
@@ -4119,6 +4122,35 @@ struct CpuThreadImpl {
       for (size_t i = 0; i != shapeSize; ++i) {
         x(shapeArr[i]);
       }
+      x(inlined);
+      if (inlined) {
+        inlineData = x.consume(bytes);
+      }
+    }
+
+    if (inlineData) {
+      auto buffer = allocateTemporaryBuffer(bytes);
+
+      uintptr_t localAddress = (uintptr_t)buffer->cpuPointer;
+
+      std::memcpy((void*)localAddress, inlineData, bytes);
+
+      auto tensor = TensorDataPtr::make();
+      tensor->buffer = AllocatedCpuBufferSharedPtr::make();
+      *tensor->buffer = std::move(buffer.buffer);
+      tensor->dataPtr = (uintptr_t)tensor->buffer->cpuPointer;
+      tensor->dataBytes = tensor->buffer->bytes;
+      tensor->dtype = dtype;
+      tensor->shape.resize(shapeSize);
+      for (size_t i = 0; i != shapeSize; ++i) {
+        tensor->shape[i] = shapeArr[i];
+      }
+
+      queueFinish(
+          group, queueAddress, source, queuePrepare(queueAddress, source, getKey, transactionKey), std::move(tensor),
+          getKey, transactionKey, queueSize);
+      enqueueCallback([this, source, remoteOpKey] { sendQueueReadFinished(source, remoteOpKey); });
+      return;
     }
 
     // log.info("recv queue put %#x\n", remoteOpKey);
@@ -4141,6 +4173,7 @@ struct CpuThreadImpl {
     e->tensorDtype = dtype;
     e->getKey = getKey;
     e->transactionKey = transactionKey;
+    e->queueSize = queueSize;
     group->cpuThread->enqueue(e);
   }
 
@@ -4161,35 +4194,23 @@ struct CpuThreadImpl {
 
     CHECK(params.putKey != 0);
 
-    if (params.tensor->isCuda) {
+    bool isCuda = params.tensor->isCuda;
+
+    if (isCuda) {
       tensorMr = regMrCuda(tensorAddress, bytes);
 
       queuePutCallbacks[params.putKey] = std::move(params.callback);
     } else {
       auto region = cpu_allocator::regionAt(tensorAddress);
 
-      // log.info("executeQueuePut: tensorAddresss is %#x, owns %d\n", tensorAddress,
-      // cpu_allocator::owns(tensorAddress));
-
       if (region.first) {
         CHECK(region.first <= tensorAddress && region.first + region.second >= tensorAddress + bytes);
-        // tensorMr = regMr(region.first, region.second);
         tensorMr = regMr(tensorAddress, bytes);
 
         queuePutCallbacks[params.putKey] = std::move(params.callback);
       } else {
         fatal("unreachable; queue put called with an unknown cpu address %#x", tensorAddress);
         CHECK(false);
-        // auto tensorBuffer = allocateTemporaryBuffer(bytes, queueBuffers);
-        // std::memcpy(tensorBuffer->cpuPointer, (void*)tensorAddress, bytes);
-
-        // tensorAddress = (uintptr_t)tensorBuffer->cpuPointer;
-        // tensorMr = tensorBuffer.mr;
-
-        // auto callback = [callback = std::move(params.callback), tensorBuffer = std::move(tensorBuffer)] { callback();
-        // };
-
-        // queuePutCallbacks[key] = std::move(callback);
       }
     }
     CHECK(params.tensor->shape.size() < 256);
@@ -4199,7 +4220,7 @@ struct CpuThreadImpl {
     size_t serializedBytes =
         serializeToUnchecked(cpuPointer, SerializeFunction([&](auto& x) {
                                x(opTypeQueuePut, (uint32_t)rank, params.remoteAddress, tensorAddress, bytes);
-                               x(params.putKey, params.remoteGetKey, params.transactionKey);
+                               x(params.putKey, params.remoteGetKey, params.transactionKey, params.queueSize);
                                for (size_t i = 0; i != maxDevices; ++i) {
                                  x(tensorMr->mrs[i]->rkey);
                                }
@@ -4208,7 +4229,16 @@ struct CpuThreadImpl {
                                for (int64_t v : params.tensor->shape) {
                                  x(v);
                                }
+                               x(false);
                              }));
+    if (!isCuda) {
+      if (serializedBytes + bytes <= buffer->bytes) {
+        bool inlineFlag = true;
+        std::memcpy((char*)cpuPointer + serializedBytes - 1, &inlineFlag, sizeof(bool));
+        std::memcpy((char*)cpuPointer + serializedBytes, (void*)tensorAddress, bytes);
+        serializedBytes += bytes;
+      }
+    }
     CHECK(serializedBytes <= 4096);
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
@@ -4258,7 +4288,9 @@ struct CpuThreadImpl {
   void executeQueueRead(QueueEntryQueueRead& params) {
     size_t bytes = params.bytes;
 
-    // log.info("execute queue read! %d bytes! %#x %#x\n", bytes, params.localOpKey, params.remoteOpKey);
+    // log.info(
+    //     "execute queue read! %d bytes! %#x %#x  queue size %d\n", bytes, params.localOpKey, params.remoteOpKey,
+    //     params.queueSize);
 
     CHECK(params.remoteOpKey != 0);
 
@@ -4272,18 +4304,6 @@ struct CpuThreadImpl {
 
     uintptr_t localAddress = (uintptr_t)buffer->cpuPointer;
 
-    // torch::Device device = torch::Device(torch::kCPU);
-
-    // Function<void()> f =
-    //     [buffer = MTHandle<TemporaryBufferHandle>(std::move(buffer), returnedTemporaryBufferHandles)]() mutable {};
-    // auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
-    // auto data = torch::DataPtr((void*)cpuPointer, (void*)f.release(), deleter, device);
-
-    // torch::Storage storage(torch::Storage::use_byte_size_t(), bytes, std::move(data), nullptr, false);
-    // torch::Tensor tensor = torch::empty({0},
-    // torch::TensorOptions((torch::ScalarType)params.tensorDtype).device(device))
-    //                            .set_(std::move(storage), 0, params.tensorShape);
-
     auto tensor = TensorDataPtr::make();
     tensor->buffer = AllocatedCpuBufferSharedPtr::make();
     *tensor->buffer = std::move(buffer.buffer);
@@ -4296,7 +4316,7 @@ struct CpuThreadImpl {
       // log.info("queue read finished! %#x\n", params.localOpKey);
       queueFinish(
           group, params.queueAddress, params.source, params.localOpKey, std::move(tensor), params.getKey,
-          params.transactionKey);
+          params.transactionKey, params.queueSize);
       sendQueueReadFinished(params.source, params.remoteOpKey);
 
       cpuThread->freelistQueueRead.push(&params);
@@ -4304,22 +4324,6 @@ struct CpuThreadImpl {
 
     readDataDistributed(
         params.source, (void*)localAddress, lkeys, (void*)params.remoteAddress, params.rkeys, bytes, callback);
-
-    // size_t numDevices = std::min((bytes + 262143) / 262144, std::max((size_t)4, group->numTrueIbDevs));
-    // size_t numChunks = numDevices;
-    // size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
-    // CHECK(devices.size() >= numDevices);
-    // for (size_t di = 0; di != devices.size(); ++di) {
-    //   auto& dev = devices[di];
-    //   size_t offset = chunkSize * di;
-    //   size_t n = std::min(bytes - offset, chunkSize);
-    //   readData(
-    //       dev, params.source, (void*)(localAddress + offset), lkeys[di], (void*)(params.remoteAddress + offset),
-    //       params.rkeys[di], n, callback);
-    //   if (offset + n == bytes) {
-    //     break;
-    //   }
-    // }
   }
 
   void onRecvQueueGet(std::string_view view) {
@@ -4843,6 +4847,18 @@ struct CpuThreadImpl {
     }
   };
 
+  void enqueueCallback(Function<void()> callback) {
+    QueueEntryCallback* e = cpuThread->freelistCallback.pop();
+    e->task = taskCallback;
+    e->callback = std::move(callback);
+    cpuThread->enqueue(e);
+  }
+
+  void executeCallback(QueueEntryCallback& params) {
+    std::move(params.callback)();
+    cpuThread->freelistCallback.push(&params);
+  }
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -5151,6 +5167,9 @@ struct CpuThreadImpl {
               break;
             case taskAllGatherBroadcast:
               enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
+              break;
+            case taskCallback:
+              executeCallback((QueueEntryCallback&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

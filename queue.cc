@@ -99,6 +99,7 @@ struct RemoteGetResult {
   std::atomic_uint32_t done = 0;
   std::atomic_uint32_t safe = 0;
   TensorDataPtr data;
+  size_t queueSize = -1;
 };
 
 struct QueuedPut {
@@ -222,7 +223,7 @@ std::atomic_uint32_t nextPutKey = getRng()();
 template<typename Tensor>
 void sendPut(
     Group* group, int location, uintptr_t remoteAddress, Tensor tensor, std::shared_ptr<QueueWorkImpl> work,
-    uint32_t remoteGetKey, uint32_t transactionKey) {
+    uint32_t remoteGetKey, uint32_t transactionKey, size_t queueSize = -1) {
   size_t numel = tensor->numel();
   size_t bytes = numel * tensor->itemsize();
 
@@ -246,6 +247,7 @@ void sendPut(
   e->putKey = key;
   e->remoteGetKey = remoteGetKey;
   e->transactionKey = transactionKey;
+  e->queueSize = queueSize;
   if (work) {
     e->callback = [work = std::move(work),
                    tensor = std::move(tensor)](uintptr_t* cudaDoneAddress, uint32_t* cudaDoneValue) {
@@ -267,9 +269,10 @@ void sendPut(
 }
 
 template<typename Tensor>
-void sendPutRemote(Group* group, int location, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey) {
+void sendPutRemote(
+    Group* group, int location, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey, size_t queueSize) {
   CHECK(location != group->rank);
-  sendPut(group, location, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0);
+  sendPut(group, location, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0, queueSize);
 }
 
 std::atomic_uint32_t nextRemoteGetKey = getRng()();
@@ -398,7 +401,7 @@ struct QueueImpl {
     qs->multicastRemoteAddresses = multicastRemoteAddresses;
   }
 
-  std::optional<torch::Tensor> get(bool block, std::optional<float> timeout) {
+  std::pair<std::optional<torch::Tensor>, size_t> get(bool block, std::optional<float> timeout) {
     // fixme: this needs to be refactored such that -
     //        local get is fairly queued alongside remote gets
     //        multi-threaded gets (local & remote) on the same object are also fairly queued
@@ -444,21 +447,35 @@ struct QueueImpl {
       }
 
       CHECK((result.data != nullptr) == hasData);
+      CHECK(result.queueSize != -1);
 
       if (result.data != nullptr) {
-        return makeTensor(std::move(result.data));
+        return {makeTensor(std::move(result.data)), result.queueSize};
       }
-      return {};
+      return {std::nullopt, result.queueSize};
+    }
+
+    if (isMulticast && !isMulticastLocal) {
+      throw std::runtime_error(fmt::sprintf(
+          "Rank %d cannot call get on this multicast Queue since it was not specified as a location on "
+          "construction",
+          group->rank));
+    }
+
+    {
+      std::lock_guard l(qs->mutex);
+      size_t queueSize = qs->size.load();
+      CHECK(qs->vector.size() == queueSize);
+      if (queueSize) {
+        TensorDataPtr r = std::move(qs->vector.front());
+        qs->vector.pop_front();
+        --qs->size;
+        return {makeTensor(std::move(r)), queueSize};
+      }
     }
 
     TimeoutHelper timeouthelper(&qs->size, block, timeout);
     while (true) {
-      if (isMulticast && !isMulticastLocal) {
-        throw std::runtime_error(fmt::sprintf(
-            "Rank %d cannot call get on this multicast Queue since it was not specified as a location on "
-            "construction",
-            group->rank));
-      }
       timeouthelper.wait();
       std::lock_guard l(qs->mutex);
       CHECK(qs->size == qs->vector.size());
@@ -466,10 +483,10 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return makeTensor(std::move(r));
+        return {makeTensor(std::move(r)), 0};
       }
       if (timeouthelper.expired()) {
-        return {};
+        return {std::nullopt, 0};
       }
     }
   }
@@ -680,7 +697,7 @@ Queue::~Queue() {
   delete (QueueImpl*)impl;
 }
 
-std::optional<torch::Tensor> Queue::get(bool block, std::optional<float> timeout) {
+std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::optional<float> timeout) {
   return ((QueueImpl*)impl)->get(block, timeout);
 }
 QueueWork Queue::put(torch::Tensor value, uint32_t transactionKey) {
@@ -764,7 +781,7 @@ void qsAdd(Group* group, QueueStorage* qs, Tensor&& tensor) {
     size_t n = qs->multicastLocations.size();
     for (size_t i = 0; i != n; ++i) {
       if (qs->multicastLocations[i] != group->rank) {
-        sendPutRemote(group, qs->multicastLocations[i], qs->multicastRemoteAddresses[i], shared, 0);
+        sendPutRemote(group, qs->multicastLocations[i], qs->multicastRemoteAddresses[i], shared, 0, -1);
       }
     }
   }
@@ -786,7 +803,7 @@ void transferQueuedItems(Group* group, QueueStorage* qs, IncomingSource* ptr, st
     TensorDataPtr r = std::move(qs->vector.front());
     qs->vector.pop_front();
     --qs->size;
-    sendPutRemote(group, w->source, w->remoteQueueAddress, std::move(r), w->key);
+    sendPutRemote(group, w->source, w->remoteQueueAddress, std::move(r), w->key, 0);
     freeWaiting(w);
   }
   l.unlock();
@@ -795,7 +812,7 @@ void transferQueuedItems(Group* group, QueueStorage* qs, IncomingSource* ptr, st
 
 void queueFinish(
     Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor, uint32_t getKey,
-    uint32_t transactionKey) {
+    uint32_t transactionKey, size_t queueSize) {
   CHECK(tensor != nullptr);
   auto* qs = (QueueStorage*)queueAddress;
   std::unique_lock l(qs->mutex);
@@ -807,6 +824,7 @@ void queueFinish(
     qs->activeOutgoingRemoteGets.erase(i);
     l.unlock();
     r->data = std::move(tensor);
+    r->queueSize = queueSize;
     r->done = 1;
     futexWakeAll(&i->second->done);
     r->safe = 1;
@@ -887,9 +905,11 @@ void queueRemoteGetStart(
     // log.info("data is available!\n");
     TensorDataPtr r = std::move(qs->vector.front());
     // log.info("data: %s\n", hexstr(r.data_ptr(), r.itemsize() * r.numel()));
+    size_t queueSize = qs->size;
+    CHECK(queueSize == qs->vector.size());
     qs->vector.pop_front();
     --qs->size;
-    sendPutRemote(group, source, remoteQueueAddress, std::move(r), key);
+    sendPutRemote(group, source, remoteQueueAddress, std::move(r), key, queueSize);
   } else {
     // log.info("adding to wait list \n");
     Waiting* w = allocWaiting(source, key, remoteQueueAddress);
@@ -933,6 +953,8 @@ void queueRemoteGetStopAck(
     auto* ptr = i->second;
     qs->activeOutgoingRemoteGets.erase(i);
     l.unlock();
+    ptr->data = nullptr;
+    ptr->queueSize = 0;
     ptr->done = 1;
     futexWakeAll(&ptr->done);
     ptr->safe = 1;

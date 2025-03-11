@@ -20,15 +20,16 @@ queue = moodist.Queue(group, location=0)
 rank = group.rank()
 
 for iteration in range(4):
-    if True:
+    if rank == 0:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         handles = []
         for i in range(160):
-            t = torch.randn((128, 1 + i, 2 + i), device="cuda")
+            t = torch.randn((128, 1 + i, 2 + i), device="cpu")
             # def ff():
             #     print("waa finalizer called")
             # weakref.finalize(t, ff)
+            print(" put ", i, t.shape)
             handles.append(queue.put_tensor(t))
             # t.zero_()
             # print("post-put qsize %d" % queue.qsize())
@@ -38,16 +39,18 @@ for iteration in range(4):
             h.wait()
         print("wait took %gs" % (time.time() - start))
 
-    if rank == 0:
+    if rank == 1:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
         # queue.put(torch.randn((1, 2)))
 
         for i in range(160):
-            t = torch.randn((128, 1 + i, 2 + i), device="cuda").cpu()
+            t = torch.randn((128, 1 + i, 2 + i), device="cpu").cpu()
             # print("queue size is %d" % queue.qsize())
             item = queue.get_tensor()
+            
+            print(" got ", i, item.shape)
 
             # print(t - item)
             assert torch.allclose(t, item)

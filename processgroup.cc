@@ -2821,7 +2821,7 @@ c10::intrusive_ptr<Work> ProcessGroup::scatter(
     }
     // outputTensors[0].copy_(inputs[getRank()]);
   }
-  auto t = *impl->queues.at(getRank())->get();
+  auto t = *impl->queues.at(getRank())->get().first;
   outputTensors[0].copy_(t);
 
   impl->barrier();

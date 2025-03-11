@@ -27,7 +27,7 @@ struct Queue {
   Queue(Queue&) = delete;
   Queue& operator=(Queue) = delete;
   ~Queue();
-  std::optional<torch::Tensor> get(bool block = true, std::optional<float> timeout = {});
+  std::pair<std::optional<torch::Tensor>, size_t> get(bool block = true, std::optional<float> timeout = {});
   QueueWork put(torch::Tensor value, uint32_t transactionKey);
   size_t qsize() const;
   bool wait(std::optional<float> timeout) const;
@@ -43,7 +43,7 @@ std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, std::vector<int> locati
 uint32_t queuePrepare(uintptr_t queueAddress, uint32_t source, uint32_t getKey, uint32_t transactionKey);
 void queueFinish(
     Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor, uint32_t getKey,
-    uint32_t transactionKey);
+    uint32_t transactionKey, size_t queueSize);
 
 void queueRemoteGetStart(
     Group* group, uintptr_t queueAddress, uint32_t source, uintptr_t remoteQueueAddress, uint32_t key);
