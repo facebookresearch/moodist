@@ -64,7 +64,6 @@ pybind11_add_module(_C
   allgather.cc
   kernels.cc
   reduce_scatter.cc
-  model.cc
   allocator.cc
   queue.cc
   cpu_allocator.cc

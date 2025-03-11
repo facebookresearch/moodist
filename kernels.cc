@@ -410,7 +410,7 @@ __device__ uint32_t reduce_n$nsources<$typename, $op>(uint32_t dynamicBlockIndex
 }
 
 void Kernels::compile(int flags, std::string compileType, std::string compileReduction) {
-  auto start = Clock::now();
+  auto start = std::chrono::steady_clock::now();
   CUdevice& cuDevice = group->cuDevice;
   CUcontext& cuContext = group->cuContext;
 
@@ -969,7 +969,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
 
   // CHECK_CU(cuLinkDestroy(linkState));
 
-  log.info("compile took %gs", seconds(Clock::now() - start));
+  log.info("compile took %gs", seconds(std::chrono::steady_clock::now() - start));
 }
 
 } // namespace moodist

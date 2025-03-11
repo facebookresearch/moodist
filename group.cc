@@ -1,6 +1,5 @@
 #include "group.h"
 #include "allgather.h"
-#include "clock.h"
 #include "common.h"
 #include "cputhread.h"
 #include "ib_common.h"
@@ -73,7 +72,7 @@ Group::~Group() {
 
 void Group::init() {
 
-  auto start = Clock::now();
+  auto start = std::chrono::steady_clock::now();
 
   deviceIndex = c10::cuda::current_device();
   pid = ::getpid();
@@ -528,8 +527,8 @@ void Group::init() {
   CHECK(peerIndices.size() <= 8);
 
   if (rank == 0) {
-    log.debug("initial connection setup took %g ms\n", seconds(Clock::now() - start) * 1000);
-    start = Clock::now();
+    log.debug("initial connection setup took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+    start = std::chrono::steady_clock::now();
   }
 
   std::sort(ipcRanks.begin(), ipcRanks.end());
@@ -573,8 +572,8 @@ void Group::init() {
   // }
 
   if (rank == 0) {
-    log.debug("ipc ranks sync took %g ms\n", seconds(Clock::now() - start) * 1000);
-    start = Clock::now();
+    log.debug("ipc ranks sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+    start = std::chrono::steady_clock::now();
   }
 
   peerIpcAccess.resize(size);
@@ -604,8 +603,8 @@ void Group::init() {
   // }
 
   if (rank == 0) {
-    log.debug("final connection setup and sync took %g ms\n", seconds(Clock::now() - start) * 1000);
-    start = Clock::now();
+    log.debug("final connection setup and sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+    start = std::chrono::steady_clock::now();
   }
 
   for (auto& v : peerMyRemoteIndex) {

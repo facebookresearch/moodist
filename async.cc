@@ -6,7 +6,6 @@
  */
 
 #include "async.h"
-#include "clock.h"
 #include "synchronization.h"
 #include "vector.h"
 
@@ -17,7 +16,6 @@
 #include <mutex>
 #include <random>
 #include <thread>
-#include <vector>
 
 #include <sched.h>
 

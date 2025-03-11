@@ -213,23 +213,6 @@ struct IpcMapperImpl : IpcMapper {
 
                 CHECK_CU(cuIpcCloseMemHandle(v.requestUnmapAddress));
                 v.response = 1;
-
-                // auto ptr = std::make_shared<std::atomic_bool>(false);
-                // unmapScheduler.run([address = v.requestUnmapAddress, ptr]() {
-                //   CHECK_CU(cuIpcCloseMemHandle(address));
-                //   *ptr = true;
-                // });
-                // v.response = 0;
-                // auto start = Clock::now();
-                // while (Clock::now() - start < std::chrono::milliseconds(10)) {
-                //   if (*ptr) {
-                //     v.response = 1;
-                //     break;
-                //   }
-                // }
-                // if (v.response == 0) {
-                //   log.error("Timed out waiting for unmap\n");
-                // }
               }
             } else if (v.kind == requestMapAddress) {
               log.debug(

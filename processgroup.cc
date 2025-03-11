@@ -1,10 +1,8 @@
 
 #include "processgroup.h"
 #include "allgather.h"
-#include "allocator.h"
 #include "async.h"
 #include "backend.h"
-#include "clock.h"
 #include "common.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
@@ -30,7 +28,6 @@
 #include <stdexcept>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/types.h>
-#include <variant>
 
 #include <cublas.h>
 
@@ -351,7 +348,7 @@ struct ProcessGroupImpl {
 
     log.verbose("%d/%d: init\n", rank, size);
 
-    auto start = Clock::now();
+    auto start = std::chrono::steady_clock::now();
 
     std::unique_lock l(threadUnsafe);
 
@@ -415,7 +412,7 @@ struct ProcessGroupImpl {
 
     group->init();
 
-    log.verbose("init took %gs\n", seconds(Clock::now() - start));
+    log.verbose("init took %gs\n", seconds(std::chrono::steady_clock::now() - start));
   }
 
   std::vector<std::string> decodeAddress(std::string str) {

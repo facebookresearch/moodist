@@ -7,14 +7,12 @@
 
 #pragma once
 
-#include "clock.h"
-
 #include <atomic>
 #include <climits>
+#include <cstdio>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
-#include <cstdio>
 
 #include <linux/futex.h>
 #include <semaphore.h>
@@ -98,7 +96,7 @@ public:
       printf("BAD MUTEX MAGIC\n");
       std::abort();
     }
-    auto start = Clock::now();
+    auto start = std::chrono::steady_clock::now();
     do {
       while (locked_.load(std::memory_order_acquire)) {
         _mm_pause();
@@ -106,14 +104,14 @@ public:
           printf("BAD MUTEX MAGIC\n");
           std::abort();
         }
-        if (Clock::now() - start >= std::chrono::milliseconds(100)) {
+        if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(100)) {
           int* p = owner.load();
           printf(
               "deadlock detected in thread %d! held by thread %d (my return address %p, owner return address %p, "
               "&mutexThreadIdCounter is %p)\n",
               mutexThreadId, p ? *p : -1, __builtin_return_address(0), ownerAddress.load(),
               (void*)&mutexThreadIdCounter);
-          start = Clock::now();
+          start = std::chrono::steady_clock::now();
         }
       }
     } while (locked_.exchange(true, std::memory_order_acq_rel));
@@ -299,7 +297,7 @@ public:
   }
   template<typename Clock, typename Duration>
   void wait_until(const std::chrono::time_point<Clock, Duration>& timePoint) noexcept {
-    wait_for(timePoint - Clock::now());
+    wait_for(timePoint - std::chrono::steady_clock::now());
   }
 
   Semaphore(const Semaphore&) = delete;

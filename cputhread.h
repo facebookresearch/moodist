@@ -2,13 +2,10 @@
 
 #include "group.h"
 #include "intrusive_list.h"
-#include "parameters_data.h"
 #include "simple_vector.h"
 #include "synchronization.h"
-#include "vector.h"
 
 #include <forward_list>
-#include <memory>
 
 namespace moodist {
 

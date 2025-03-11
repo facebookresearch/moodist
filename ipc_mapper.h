@@ -7,7 +7,6 @@
 #include <optional>
 #include <type_traits>
 
-// #include "allocator.h"
 #include "group.h"
 
 namespace moodist {
@@ -37,11 +36,6 @@ struct IpcMapper {
   std::array<HashMap<CUevent, uintptr_t>, 8> peerIpcEventMap;
 
   std::array<HashMap<CUipcMemHandle, bool, IpcMemHash, IpcMemEqual>, 8> peerQueuedUnmaps;
-
-  // std::array<std::string, 8> peerMemoryId{};
-  // std::array<allocator::PeerMemory, 8> peerMemory{};
-  // std::array<uintptr_t, 8> peerMemoryBase{};
-  // std::array<uintptr_t, 8> peerMemorySize{};
 
   std::atomic_bool hasException = false;
   std::optional<std::exception_ptr> exception;
@@ -146,12 +140,13 @@ struct IpcMapper {
       l.lock();
     }
     l.unlock();
-    auto start = Clock::now();
+    auto start = std::chrono::steady_clock::now();
     while (waitCount.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      if (Clock::now() - start >= std::chrono::seconds(60)) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - start >= std::chrono::seconds(60)) {
         log.error("Timeout waiting for ipc unmap!\n");
-        start = Clock::now();
+        break;
       }
     }
     l.lock();
@@ -162,22 +157,6 @@ struct IpcMapper {
   requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
     CHECK(length > 0);
     CHECK(address != 0);
-
-    // if (allocator::owns(address)) {
-    //   std::unique_lock l(mutex);
-    //   uintptr_t offset = allocator::offset(address);
-    //   if (offset + length <= peerMemorySize[peerIndex]) {
-    //     callback(peerMemoryBase[peerIndex] + offset);
-    //     return;
-    //   }
-    //   if (!peerMemory[peerIndex]) {
-    //     peerMemory[peerIndex] = allocator::getPeerMemory(peerMemoryId[peerIndex]);
-    //     peerMemoryBase[peerIndex] = peerMemory[peerIndex].remoteBaseAddress();
-    //   }
-    //   peerMemory[peerIndex].remoteExtend(offset + length);
-    //   callback(peerMemoryBase[peerIndex] + offset);
-    //   return;
-    // }
 
     unsigned long long bufferId = -1;
     CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));

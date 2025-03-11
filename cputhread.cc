@@ -25,11 +25,10 @@
 #include <memory>
 #include <random>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <torch/types.h>
 #include <type_traits>
 #include <utility>
-
-#include <sys/uio.h>
 
 namespace moodist {
 
@@ -4813,7 +4812,7 @@ struct CpuThreadImpl {
             ri.outputBytes != params.outputBytes) {
           // fixme: this op could be synchronous, and errors raised as exceptions
           fatal(
-              "Mismatched cached operation detected.\nLocal parameters: op %d, identifier %d, input bytes %d, output "
+              "Mismatched cached operation detected.\nLocal s: op %d, identifier %d, input bytes %d, output "
               "bytes %d\nRemote parameters: op %d, identifier %d, input bytes %d, output bytes %d\n",
               params.op, params.identifier, params.inputBytes, params.outputBytes, ri.op, ri.identifier, ri.inputBytes,
               ri.outputBytes);
