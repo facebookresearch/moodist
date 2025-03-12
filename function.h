@@ -39,6 +39,7 @@ struct Storage {
   };
   void* callPtr = nullptr;
   const OpsBase* ops = nullptr;
+  Storage() {}
   template<typename F, typename R, typename... Args>
   F& as() {
     return (F&)((TemplatedStorage<F, R, Args...>*)this)->f;
@@ -67,7 +68,8 @@ struct TemplatedStorage : Storage {
     }
   }
   static void push(TemplatedStorage* storage) {
-    FreeList<TemplatedStorage>::push(storage, std::min(std::max((size_t)16384 / sizeof(TemplatedStorage), (size_t)8), (size_t)1024));
+    FreeList<TemplatedStorage>::push(
+        storage, std::min(std::max((size_t)16384 / sizeof(TemplatedStorage), (size_t)8), (size_t)1024));
   }
 };
 

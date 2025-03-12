@@ -150,7 +150,7 @@ struct ProcessGroupImpl {
   bool preferKernelLess = globalPreferKernelLess;
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
-    TORCH_CHECK(rank >= 0 && size > 0 && rank < size);
+    CHECK(rank >= 0 && size > 0 && rank < size);
 
     scheduler.setMaxThreads(1);
 
@@ -403,7 +403,7 @@ struct ProcessGroupImpl {
       log.debug("%d: waiting for greeting from %d\n", rank, i);
       std::fflush(stdout);
       std::string greeting = group->setupComms->recvFrom<std::string>(i);
-      TORCH_CHECK(greeting == fmt::sprintf("hello %d %s", rank, key));
+      CHECK(greeting == fmt::sprintf("hello %d %s", rank, key));
       log.debug("greeting ok!\n");
       std::fflush(stdout);
     }
@@ -1153,16 +1153,16 @@ struct ProcessGroupImpl {
 
     size_t size = this->size;
 
-    TORCH_CHECK(input.is_contiguous());
-    TORCH_CHECK(output.is_contiguous());
+    CHECK(input.is_contiguous());
+    CHECK(output.is_contiguous());
 
     bool isCuda = input.is_cuda();
 
     if (isCuda) {
-      TORCH_CHECK(input.is_cuda());
-      TORCH_CHECK(input.device().index() == group->deviceIndex);
-      TORCH_CHECK(output.is_cuda());
-      TORCH_CHECK(output.device().index() == group->deviceIndex);
+      CHECK(input.is_cuda());
+      CHECK(input.device().index() == group->deviceIndex);
+      CHECK(output.is_cuda());
+      CHECK(output.device().index() == group->deviceIndex);
     }
 
     size_t bytes = input.numel() * input.itemsize();
@@ -1171,8 +1171,8 @@ struct ProcessGroupImpl {
 
     // log.info("group size %d doing all-gather of size %d bytes\n", size, bytes);
 
-    TORCH_CHECK(bytes > 0);
-    TORCH_CHECK(output.numel() * output.itemsize() == outputBytes);
+    CHECK(bytes > 0);
+    CHECK(output.numel() * output.itemsize() == outputBytes);
 
     uint32_t stepValue = getNextStepValue();
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -1421,20 +1421,20 @@ struct ProcessGroupImpl {
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
-    TORCH_CHECK(input.is_contiguous());
-    TORCH_CHECK(output.is_contiguous());
+    CHECK(input.is_contiguous());
+    CHECK(output.is_contiguous());
 
     bool isCuda = input.is_cuda();
 
     if (isCuda) {
-      TORCH_CHECK(input.is_cuda());
-      TORCH_CHECK(input.device().index() == group->deviceIndex);
-      TORCH_CHECK(output.is_cuda());
-      TORCH_CHECK(output.device().index() == group->deviceIndex);
+      CHECK(input.is_cuda());
+      CHECK(input.device().index() == group->deviceIndex);
+      CHECK(output.is_cuda());
+      CHECK(output.device().index() == group->deviceIndex);
     }
 
     auto dtype = output.dtype();
-    TORCH_CHECK(input.dtype() == dtype);
+    CHECK(input.dtype() == dtype);
 
     size_t numel = output.numel();
     size_t bytes = numel * output.itemsize();
@@ -1443,8 +1443,8 @@ struct ProcessGroupImpl {
 
     // log.info("group size %d doing reduce-scatter of size %d bytes\n", size, bytes);
 
-    TORCH_CHECK(bytes > 0);
-    TORCH_CHECK(input.numel() * input.itemsize() == inputBytes);
+    CHECK(bytes > 0);
+    CHECK(input.numel() * input.itemsize() == inputBytes);
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
@@ -1820,11 +1820,11 @@ struct ProcessGroupImpl {
 
     bool isCuda = tensor.is_cuda();
 
-    TORCH_CHECK(tensor.is_contiguous());
-    TORCH_CHECK(sourceRank < size);
+    CHECK(tensor.is_contiguous());
+    CHECK(sourceRank < size);
 
     if (isCuda) {
-      TORCH_CHECK(tensor.device().index() == group->deviceIndex);
+      CHECK(tensor.device().index() == group->deviceIndex);
     }
 
     size_t numel = tensor.numel();
@@ -2021,11 +2021,11 @@ struct ProcessGroupImpl {
 
     bool isCuda = tensor.is_cuda();
 
-    TORCH_CHECK(tensor.is_contiguous());
-    TORCH_CHECK(destinationRank < size);
+    CHECK(tensor.is_contiguous());
+    CHECK(destinationRank < size);
 
     if (isCuda) {
-      TORCH_CHECK(tensor.device().index() == group->deviceIndex);
+      CHECK(tensor.device().index() == group->deviceIndex);
     }
 
     size_t numel = tensor.numel();
@@ -2324,33 +2324,33 @@ struct ProcessGroupImpl {
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     CHECK(stepValue < 0x80000000);
 
-    TORCH_CHECK(destinationRank < size);
+    CHECK(destinationRank < size);
     if (destinationRank == rank) {
-      TORCH_CHECK(outputList.size() == size);
+      CHECK(outputList.size() == size);
     } else {
-      TORCH_CHECK(outputList.empty());
+      CHECK(outputList.empty());
     }
 
-    TORCH_CHECK(input.is_contiguous());
+    CHECK(input.is_contiguous());
     for (auto& output : outputList) {
-      TORCH_CHECK(output.is_contiguous());
+      CHECK(output.is_contiguous());
     }
 
     bool isCuda = input.is_cuda();
 
     if (isCuda) {
-      TORCH_CHECK(input.is_cuda());
-      TORCH_CHECK(input.device().index() == group->deviceIndex);
+      CHECK(input.is_cuda());
+      CHECK(input.device().index() == group->deviceIndex);
       for (auto& output : outputList) {
-        TORCH_CHECK(output.is_cuda());
-        TORCH_CHECK(output.device().index() == group->deviceIndex);
+        CHECK(output.is_cuda());
+        CHECK(output.device().index() == group->deviceIndex);
       }
     }
 
     size_t bytes = input.numel() * input.itemsize();
     size_t outputBytes = bytes * size;
 
-    TORCH_CHECK(bytes > 0);
+    CHECK(bytes > 0);
 
     uintptr_t inputAddress = (uintptr_t)input.data_ptr();
 
@@ -2600,13 +2600,13 @@ struct WorkImpl : c10d::Work {
 c10::intrusive_ptr<Work> ProcessGroup::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
-  TORCH_CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
+  CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
   const auto& input = inputTensors[0];
   int64_t numel = input.numel();
   size_t bytes = numel * input.itemsize();
   const auto& outputList = outputTensors[0];
   for (auto& v : outputList) {
-    TORCH_CHECK(v.numel() == numel);
+    CHECK(v.numel() == numel);
   }
   bool isCuda = input.is_cuda();
   CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
@@ -2690,7 +2690,7 @@ c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions& opts)
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
-  TORCH_CHECK(tensors.size() == 1);
+  CHECK(tensors.size() == 1);
   auto& tensor = tensors[0];
   bool isCuda = tensor.is_cuda();
   if (isCuda) {
@@ -2711,7 +2711,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   WorkStream* w = nullptr;
   for (auto& tensor : tensors) {
     int64_t numel = tensor.numel();
-    TORCH_CHECK(numel > 0);
+    CHECK(numel > 0);
     bool isCuda = tensor.is_cuda();
     CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
     if (isCuda) {
@@ -2771,15 +2771,15 @@ ProcessGroup::allreduce_coalesced(std::vector<at::Tensor>& tensors, const c10d::
 c10::intrusive_ptr<Work> ProcessGroup::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
     const c10d::GatherOptions& opts) {
-  TORCH_CHECK(outputTensors.size() <= 1);
-  TORCH_CHECK(inputTensors.size() == 1);
+  CHECK(outputTensors.size() <= 1);
+  CHECK(inputTensors.size() == 1);
   impl->gather(outputTensors.empty() ? std::vector<at::Tensor>() : outputTensors[0], inputTensors[0], opts.rootRank);
   return c10::make_intrusive<WorkImpl>(
       outputTensors.empty() ? std::vector<at::Tensor>() : outputTensors[0], inputTensors);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
-  TORCH_CHECK(tensors.size() == 1);
+  CHECK(tensors.size() == 1);
   auto& tensor = tensors[0];
   if (impl->size == 1) {
     return c10::make_intrusive<WorkImpl>(tensor, std::nullopt);

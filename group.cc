@@ -294,7 +294,7 @@ void Group::init() {
       localRanksByBootId.push_back(i);
     }
   }
-  TORCH_CHECK(std::find(localRanksByBootId.begin(), localRanksByBootId.end(), rank) != localRanksByBootId.end());
+  CHECK(std::find(localRanksByBootId.begin(), localRanksByBootId.end(), rank) != localRanksByBootId.end());
 
   log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
 
@@ -305,7 +305,7 @@ void Group::init() {
       break;
     }
   }
-  TORCH_CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
+  CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
 
   std::unordered_map<size_t, int> localNvlink;
 
@@ -563,8 +563,8 @@ void Group::init() {
   }
 
   // rankIbDevNames = setupComms->allgather(std::string(bestCtx->device->name));
-  // TORCH_CHECK(rankIbDevNames.size() == size);
-  // TORCH_CHECK(rankIbDevNames.at(rank) == bestCtx->device->name);
+  // CHECK(rankIbDevNames.size() == size);
+  // CHECK(rankIbDevNames.at(rank) == bestCtx->device->name);
   // if (rank == 0) {
   //   for (size_t i = 0; i != size; ++i) {
   //     fmt::printf("rank %d is using device %s\n", i, rankIbDevNames[i]);

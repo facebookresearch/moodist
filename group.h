@@ -194,8 +194,8 @@ struct Group {
         return i;
       }
     }
-    TORCH_CHECK(false, "getPeerIndex failed");
-    return (size_t)-1;
+    throw std::runtime_error("Moodist could not find a peer rank which should be on the same node but isn't. This "
+                             "could indicate that the local machine topology is not supported by Moodist.");
   }
 
   AllocatedBuffer allocateManaged(size_t bytes);

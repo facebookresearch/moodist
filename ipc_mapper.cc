@@ -263,7 +263,7 @@ struct IpcMapperImpl : IpcMapper {
   void enqueue(size_t peerIndex, Function<void(uintptr_t)> callback, F&& f) {
     size_t slotIndex = 0;
     SharedStruct* nshared = peershared.at(peerIndex);
-    TORCH_CHECK(nshared != nullptr);
+    CHECK(nshared != nullptr);
     while (true) {
       if (hasException) {
         std::lock_guard l(mutex);
@@ -454,12 +454,12 @@ struct IpcMapperImpl : IpcMapper {
   }
 
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size) {
-    TORCH_CHECK(offset + size <= memsize);
+    CHECK(offset + size <= memsize);
     return (void*)((uintptr_t)(void*)(peershared[peerIndex] + 1) + offset);
   }
 
   void* getMySharedMem(size_t offset, size_t size) {
-    TORCH_CHECK(offset + size <= memsize);
+    CHECK(offset + size <= memsize);
     return (void*)((uintptr_t)(void*)(shared + 1) + offset);
   }
 

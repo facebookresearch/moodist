@@ -40,13 +40,12 @@ struct IbvPtr {
     return *this;
   }
   ~IbvPtr() {
-    if (value) {
+    if (value) [[unlikely]] {
       int error = destroy(value);
-      if (error) {
-        fmt::fprintf(
-            stderr, "Failed to destroy ibv instance of type %s: error %d: %s\n", typeid(T).name(), error,
-            std::strerror(error));
-        fflush(stderr);
+      if (error) [[unlikely]] {
+        NOINLINE_COLD(log.error(
+            "Failed to destroy ibv instance of type %s: error %d: %s\n", typeid(T).name(), error,
+            std::strerror(error)););
       }
     }
   }
@@ -148,6 +147,6 @@ struct IbCommon {
 namespace ib_poll {
 void add(int fd, Function<void()> callback);
 void remove(int fd);
-}
+} // namespace ib_poll
 
 } // namespace moodist

@@ -3,9 +3,9 @@ cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(moodist)
 
 project(moodist LANGUAGES C CXX)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_C_STANDARD 17)
-set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3")
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_C_STANDARD 23)
+set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3 -mtls-dialect=gnu2")
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -ftemplate-backtrace-limit=0 ${COMPILE_FLAGS}")
 set(CMAKE_C_FLAGS

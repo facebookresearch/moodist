@@ -63,7 +63,7 @@ public:
   c10::intrusive_ptr<Work> allgather_coalesced(
       std::vector<std::vector<at::Tensor>>& outputTensorLists, std::vector<at::Tensor>& inputTensors,
       const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
-    TORCH_CHECK(false, "allgather_coalesced not supported");
+    throw std::runtime_error("allgather_coalesced not supported");
   }
   virtual c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(
       std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
@@ -72,7 +72,7 @@ public:
   c10::intrusive_ptr<Work> reduce_scatter(
       std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
-    TORCH_CHECK(false, "reduce_scatter not supported");
+    throw std::runtime_error("reduce_scatter not supported");
   }
 
   c10::intrusive_ptr<Work> _reduce_scatter_base(
@@ -88,7 +88,7 @@ public:
   c10::intrusive_ptr<Work> alltoall_base(
       at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
       std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
-    TORCH_CHECK(false, "alltoall_base not supported");
+    throw std::runtime_error("alltoall_base not supported");
   }
 
   c10::intrusive_ptr<Work> alltoall(
@@ -96,11 +96,11 @@ public:
       const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
 
   c10::intrusive_ptr<Work> send(std::vector<at::Tensor>& tensors, int dstRank, int tag) override {
-    TORCH_CHECK(false, "send not supported");
+    throw std::runtime_error("send not supported");
   }
 
   c10::intrusive_ptr<Work> recv(std::vector<at::Tensor>& tensors, int srcRank, int tag) override {
-    TORCH_CHECK(false, "recv not supported");
+    throw std::runtime_error("recv not supported");
   }
 
   c10::intrusive_ptr<Work> gather(
@@ -112,7 +112,7 @@ public:
       const c10d::ScatterOptions& opts = c10d::ScatterOptions()) override;
 
   c10::intrusive_ptr<Work> recvAnysource(std::vector<at::Tensor>& tensors, int tag) override {
-    TORCH_CHECK(false, "recvAnysource not supported");
+    throw std::runtime_error("recvAnysource not supported");
   }
 
   std::shared_ptr<Queue> makeQueue(int location);

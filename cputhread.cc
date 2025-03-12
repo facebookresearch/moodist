@@ -10,6 +10,7 @@
 #include "ib_common.h"
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
+#include "logging.h"
 #include "queue.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
@@ -530,15 +531,17 @@ struct CpuThreadImpl {
       CHECK(n >= 0);
       for (size_t i = 0; i != n; ++i) {
         ibv_wc& wc = wcs[i];
-        if (wc.status) {
-          // fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode,
-          // wc.wr_id);
-          cqErrored = true;
-          Callback* callback = (Callback*)(void*)wc.wr_id;
-          log.error(
-              "%s: Error communicating with %s: Work completion with status %d (%s).\n", groupName(),
-              rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
-          setErrorState();
+        if (wc.status) [[unlikely]] {
+          NOINLINE_COLD({
+            // fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode,
+            // wc.wr_id);
+            cqErrored = true;
+            Callback* callback = (Callback*)(void*)wc.wr_id;
+            log.error(
+                "%s: Error communicating with %s: Work completion with status %d (%s).\n", groupName(),
+                rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
+            setErrorState();
+          });
         } else {
           CHECK(dev.currentCqEntries != 0);
           --dev.currentCqEntries;
@@ -605,7 +608,7 @@ struct CpuThreadImpl {
       }
       int error = ibv_wr_complete(qp);
       if (error) {
-        fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
+        throwErrno(error, "ibv_wr_complete");
       }
     };
 
@@ -819,14 +822,6 @@ struct CpuThreadImpl {
 
     ++callback->refcount;
 
-    // while (dev.currentCqEntries == maxCqEntries) {
-    //   poll();
-    // }
-    // ++dev.currentCqEntries;
-    // if (dev.currentCqEntries == 1) {
-    //   activeDevices.push_back(dev);
-    // }
-
     // log.info("%d: post recv %d bytes (%p lkey %#x) (dev %d)\n", rank, bytes, localAddress, lkey, &dev -
     // devices.data());
 
@@ -1015,8 +1010,7 @@ struct CpuThreadImpl {
           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
       if (!mr) {
         perror("ibv_reg_mr");
-        log.error("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
-        TORCH_CHECK(false);
+        fatal("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
       }
       ptr->mr.mrs[i] = mr;
       localMrs.push_back(mr);
@@ -1092,8 +1086,7 @@ struct CpuThreadImpl {
           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
       if (!mr) {
         perror("ibv_reg_mr");
-        log.error("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
-        TORCH_CHECK(false);
+        fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
       }
       ptr->mr.mrs[i] = mr;
       localMrs.push_back(mr);

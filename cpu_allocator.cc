@@ -110,13 +110,6 @@ struct IntrusiveList {
   }
 
   iterator erase(iterator at) noexcept {
-    bool found = false;
-    for (auto& v : *this) {
-      if (&v == &*at) {
-        found = true;
-      }
-    }
-    CHECK(found);
     T* nextItem = next(&*at);
     T* prevItem = prev(&*at);
     if (nextItem) {
@@ -173,7 +166,6 @@ constexpr size_t alignment = 1024 * 1024 * 2;
 
 struct Thread;
 struct Region {
-  Thread* thread;
   std::pair<Region*, Region*> link;
   size_t index;
   size_t allocated;
@@ -182,21 +174,9 @@ struct Region {
   uintptr_t end;
 };
 struct Thread {
-  std::atomic_size_t nFrees = 0;
-  SpinMutex mutex;
-  void* queuedFrees = nullptr;
-  bool running = true;
   size_t numFullyAllocatedRegions = 0;
   IntrusiveList<Region> activeRegions[64];
 };
-
-Thread singleThread;
-
-IntrusiveList<Region> freeRegions;
-
-Thread* currentThread() {
-  return &singleThread;
-}
 
 struct Span {
   uintptr_t begin;
@@ -220,6 +200,10 @@ struct Indestructible {
 struct Globals {
   SpinMutex mutex;
 
+  Thread singleThread;
+
+  IntrusiveList<Region> freeRegions;
+
   Vector<Span, basic::Allocator<Span>> spans;
   Vector<Span, basic::Allocator<Span>> allMappedRegions;
 
@@ -230,6 +214,9 @@ Indestructible<Globals> globals;
 
 Vector<Span, basic::Allocator<Span>>& spans = globals->spans;
 Vector<Span, basic::Allocator<Span>>& allMappedRegions = globals->allMappedRegions;
+
+Thread& singleThread = globals->singleThread;
+IntrusiveList<Region>& freeRegions = globals->freeRegions;
 
 constexpr size_t regionSize =
     (sizeof(Region) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) * alignof(std::max_align_t);
@@ -277,8 +264,7 @@ void initRegion(Region* r, size_t index, size_t nbytes) {
   r->freearea = (uintptr_t)r + std::max(regionSize, std::min((size_t)4096, nbytes));
   r->freelist = nullptr;
   r->index = index;
-  r->thread = currentThread();
-  r->thread->activeRegions[index].push_front(*r);
+  singleThread.activeRegions[index].push_front(*r);
 
   size_t n = 0;
   while (r->freearea + nbytes <= r->end) {
@@ -321,14 +307,9 @@ uint64_t rng() {
 size_t mmappedBytes;
 
 extern "C" void allocate_memory(size_t index) {
-  // printf("allocate memory %d (%#llx)! -> %p\n", (int)n, 1ull << (64 - n), r);
-  // printf("base is %p\n", base);
-
   CHECK(index != 0);
 
   size_t nbytes = std::max(1ul << (64 - index), alignof(std::max_align_t));
-
-  // log.debug("allocate_memory(%ld) nbytes %d\n", index, nbytes);
 
   size_t minbytes = regionSize + nbytes;
   size_t alignedminbytes = std::max(alignment, (minbytes + alignment - 1) / alignment * alignment);
@@ -338,21 +319,13 @@ extern "C" void allocate_memory(size_t index) {
       CHECK(v.begin % alignment == 0);
       Region* r = (Region*)v.begin;
       if (v.end - v.begin <= alignedminbytes) {
-        // printf("grab entire span! %ld\n", v.end - v.begin);
         r->end = v.end;
         spans.erase(spans.begin() + (&v - spans.data()));
-        // printf("%d spans:\n", spans.size());
-        // for (auto& v : spans) {
-        //   printf("[%#lx, %#lx)\n", v.begin, v.end);
-        // }
       } else {
-        // printf("grab alignedminbytes %ld\n", alignedminbytes);
         v.begin += alignedminbytes;
         CHECK(v.begin < v.end);
         r->end = v.begin;
       }
-
-      // log.debug("new region %d at %p\n", index, (void*)r);
 
       initRegion(r, index, nbytes);
       return;
@@ -361,9 +334,6 @@ extern "C" void allocate_memory(size_t index) {
 
   size_t bytes = std::max(alignment, (size_t)(alignment + regionSize + nbytes * (nbytes < alignment ? 8 : 2)));
   bytes = std::max(bytes, (mmappedBytes / 4 + alignment - 1) / alignment * alignment);
-  // if (nbytes >= 1024 * 1024 * 256) {
-  //   bytes = nbytes + alignof(std::max_align_t);
-  // }
   bytes = (bytes + alignment - 1) / alignment * alignment;
   void* rv = nullptr;
 
@@ -385,7 +355,7 @@ extern "C" void allocate_memory(size_t index) {
   }
 
   if (!rv || rv == MAP_FAILED) {
-    printf("fallback allocation of %ld bytes\n", bytes);
+    log.error("fallback allocation of %ld bytes\n", bytes);
     rv = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (!rv || rv == MAP_FAILED) {
       throw std::system_error(errno, std::generic_category(), "mmap");
@@ -401,35 +371,10 @@ extern "C" void allocate_memory(size_t index) {
       "mapped %d bytes at %#x (total %d bytes, %dG)\n", bytes, (uintptr_t)rv, mmappedBytes,
       mmappedBytes / 1024 / 1024 / 1024);
 
-  // madvise(rv, bytes, MADV_HUGEPAGE);
-
   auto start = std::chrono::steady_clock::now();
   mlock(rv, bytes);
 
   log.error("locked in %gs\n", seconds(std::chrono::steady_clock::now() - start));
-
-  // numa_tonode_memory(rv, bytes, allocationNode);
-  // start = std::chrono::steady_clock::now();
-
-  // {
-  //   int deviceIndex = c10::cuda::current_device();
-  //   CUcontext cuContext;
-  //   CUdevice cuDevice;
-  //   cuCtxGetCurrent(&cuContext);
-  //   if (!cuContext) {
-  //     CHECK_CU(cuInit(0));
-
-  //     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
-  //     CHECK_CU(cuDevicePrimaryCtxRetain(&cuContext, cuDevice));
-  //     CHECK_CU(cuCtxSetCurrent(cuContext));
-  //   } else {
-  //     CHECK_CU(cuDeviceGet(&cuDevice, deviceIndex));
-  //   }
-
-  //   CHECK_CU(cuMemHostRegister(rv, bytes, CU_MEMHOSTREGISTER_DEVICEMAP));
-  // }
-
-  // log.error("registered in %gs\n", seconds(std::chrono::steady_clock::now() - start));
 
   CHECK(bytes > 0);
 
@@ -442,7 +387,7 @@ extern "C" void allocate_memory(size_t index) {
 [[gnu::noinline]] void* moo_alloc_slow(size_t bytes, size_t index) {
   bytes = (bytes + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) * alignof(std::max_align_t);
   size_t nbytes = std::max(1ul << (64 - index), (size_t)alignof(std::max_align_t));
-  CHECK(currentThread()->activeRegions[index].empty());
+  CHECK(singleThread.activeRegions[index].empty());
   if (!freeRegions.empty()) {
     size_t abytes = std::max(alignment, (size_t)(alignment + regionSize + nbytes * (nbytes < alignment ? 8 : 2)));
     for (auto& v : freeRegions) {
@@ -450,18 +395,15 @@ extern "C" void allocate_memory(size_t index) {
       size_t size = r->end - ((uintptr_t)r + regionSize);
       if (size >= nbytes && size <= abytes * 2) {
         freeRegions.erase(v);
-        CHECK(v.thread == nullptr);
         if (r->index != index) {
           add_span(spans, (uintptr_t)&v, v.end);
           allocate_memory(index);
         } else {
-          r->thread = currentThread();
-          r->thread->activeRegions[index].push_front(*r);
+          singleThread.activeRegions[index].push_front(*r);
         }
         return moo_alloc(bytes);
       }
     }
-    // printf("reset spans!\n");
     for (auto& v : freeRegions) {
       add_span(spans, (uintptr_t)&v, v.end);
     }
@@ -471,36 +413,17 @@ extern "C" void allocate_memory(size_t index) {
   return moo_alloc(bytes);
 }
 
-[[gnu::noinline]] void* moo_alloc_deferred_frees(Thread* thread, size_t bytes) {
-  std::unique_lock l(thread->mutex);
-  void* q = std::exchange(thread->queuedFrees, nullptr);
-  thread->nFrees = 0;
-  l.unlock();
-  while (q) {
-    void* n;
-    std::memcpy(&n, q, sizeof(void*));
-    moo_free(q);
-    q = n;
-  }
-  return moo_alloc(bytes);
-}
-
 size_t currentLiveAllocations = 0;
 
 [[gnu::noinline]] void* moo_alloc(size_t bytes) {
-  Thread* thread = currentThread();
-  if (thread->nFrees.load(std::memory_order_relaxed)) [[unlikely]] {
-    CHECK(false);
-    return moo_alloc_deferred_frees(thread, bytes);
-  }
   size_t index = __builtin_ia32_lzcnt_u64(
       (std::max(bytes, (size_t)1) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) *
           alignof(std::max_align_t) -
       1);
   CHECK(index && index < 64);
+  Thread* thread = &singleThread;
   if (!thread->activeRegions[index].empty()) [[likely]] {
     Region* r = &thread->activeRegions[index].front();
-    CHECK(r->thread == thread);
     CHECK(r->index == index);
     ++r->allocated;
     void* rv = r->freelist;
@@ -523,20 +446,17 @@ size_t currentLiveAllocations = 0;
     } else {
       __builtin_prefetch(r->freelist);
     }
-    // printf("fast-alloc %p from region %d at %p\n", rv, r->index, r);
     CHECK((uintptr_t)rv / alignment * alignment == (uintptr_t)r);
     CHECK(index);
     CHECK(r->index == index);
     ++currentLiveAllocations;
     return rv;
   }
-  // printf("moo_alloc(%ld) -> index %ld\n", bytes, index);
   return moo_alloc_slow(bytes, index);
 }
 
 [[gnu::noinline]] void free_internal_free_region(Thread* thread, Region* r) {
   CHECK(r->freelist != nullptr);
-  // log.debug("thread %p give up region %p index %ld\n", (void*)thread, (void*)r, r->index);
   bool found = false;
   for (auto& v : thread->activeRegions[r->index]) {
     if (&v == r) {
@@ -545,7 +465,6 @@ size_t currentLiveAllocations = 0;
   }
   CHECK(found);
   thread->activeRegions[r->index].erase(*r);
-  r->thread = nullptr;
   freeRegions.push_front(*r);
 }
 
@@ -564,42 +483,12 @@ size_t currentLiveAllocations = 0;
   }
 }
 
-[[gnu::noinline]] void moo_free_other_thread(Region* r, void* p) {
-  Thread* thread = r->thread;
-  std::unique_lock l(thread->mutex);
-  if (thread->running) [[likely]] {
-    std::memcpy(p, &r->thread->queuedFrees, sizeof(void*));
-    thread->queuedFrees = p;
-    ++thread->nFrees;
-  } else {
-    free_internal(thread, r, p);
-    if (thread->numFullyAllocatedRegions == 0) {
-      bool empty = true;
-      for (auto& v : thread->activeRegions) {
-        if (!v.empty()) {
-          empty = false;
-          break;
-        }
-      }
-      if (empty) {
-        l.unlock();
-        munmap(thread, sizeof(Thread));
-      }
-    }
-  }
-}
-
 [[gnu::noinline]] void moo_free(void* p) {
-  Thread* thread = currentThread();
+  Thread* thread = &singleThread;
   uintptr_t a = (uintptr_t)p / alignment * alignment;
   Region* r = (Region*)a;
-  if (r->thread == thread) [[likely]] {
-    --currentLiveAllocations;
-    free_internal(thread, r, p);
-  } else {
-    CHECK(false);
-    return moo_free_other_thread(r, p);
-  }
+  --currentLiveAllocations;
+  free_internal(thread, r, p);
 }
 
 size_t moo_alloc_size(void* p) {
@@ -620,35 +509,6 @@ struct CpuAllocator : torch::Allocator {
 
     std::lock_guard l(globals->mutex);
 
-    // if (deviceIndex == -1) {
-    //   log.init();
-    //   deviceIndex = c10::cuda::current_device();
-    //   CHECK(deviceIndex != -1);
-
-    //   if (numa_available() == -1) {
-    //     throw std::runtime_error("Moodist CPU Allocator cannot be used since NUMA is not available.");
-    //   }
-
-    //   allocationNode = getNode(c10::cuda::current_device());
-    //   if (allocationNode == -1) {
-    //     throw std::runtime_error(fmt::sprintf(
-    //         "Moodist CPU Allocator failed to find a NUMA node associated with device index %d.", deviceIndex));
-    //   }
-    //   long long free = 0;
-    //   long long total = numa_node_size(allocationNode, &free);
-    //   log.verbose(
-    //       "CPU Allocator: CUDA device is %d, allocating CPU memory on NUMA node %d. "
-    //       "Node has %d total and %d free bytes of memory.",
-    //       deviceIndex, allocationNode, total, free);
-    // }
-    // int currentDeviceIndex = c10::cuda::current_device();
-    // if (deviceIndex != currentDeviceIndex) {
-    //   throw std::runtime_error(fmt::sprintf(
-    //       "Moodist CPU Allocator was initialized with CUDA device %d, but the current CUDA device is %d. "
-    //       "Please set the CUDA device before allocating any tensors, and do not change it.",
-    //       deviceIndex, currentDeviceIndex));
-    // }
-
     void* ptr = moo_alloc(bytes);
 
     handle->cpuPointer = ptr;
@@ -666,9 +526,6 @@ struct CpuAllocator : torch::Allocator {
       globals->sharedHandles.erase(i);
       l.unlock();
     };
-
-    // void* ptr = moo_alloc(bytes);
-    // Function<void()> f = [this, ptr] { moo_free(ptr); };
 
     auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
     torch::Device device(torch::kCPU);
@@ -705,7 +562,7 @@ void enableCpuAllocator() {
 }
 
 void cpuAllocatorDebug() {
-  auto* thread = currentThread();
+  auto* thread = &singleThread;
   for (size_t i = 0; i != 64; ++i) {
     size_t n = std::distance(thread->activeRegions[i].begin(), thread->activeRegions[i].end());
     if (n == 0) {

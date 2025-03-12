@@ -1,9 +1,9 @@
 #pragma once
 
 #include "common.h"
-#include "vector.h"
 
 #include <atomic>
+#include <type_traits>
 
 namespace moodist {
 
@@ -38,7 +38,7 @@ struct alignas(std::max_align_t) Buffer {
     std::free((std::byte*)buffer);
   }
 };
-static_assert(std::is_trivial_v<Buffer>);
+static_assert(std::is_trivially_copyable_v<Buffer>);
 
 struct BufferHandle {
   Buffer* buffer = nullptr;

@@ -25,10 +25,8 @@ void enableCpuAllocator();
 void cpuAllocatorDebug();
 void setPreferKernelLess(bool);
 
-} // namespace moodist
-
 namespace {
-void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
+void cudaCopyTensor(torch::Tensor& dst, const torch::Tensor& src) {
   CHECK(dst.is_contiguous());
   CHECK(src.is_contiguous());
   size_t srcbytes = src.itemsize() * src.numel();
@@ -38,9 +36,11 @@ void cudaCopy(torch::Tensor& dst, const torch::Tensor& src) {
   }
   uintptr_t dstAddress = (uintptr_t)(void*)dst.mutable_data_ptr();
   uintptr_t srcAddress = (uintptr_t)(const void*)src.const_data_ptr();
-  moodist::cudaCopy(dstAddress, srcAddress, srcbytes, c10::cuda::getCurrentCUDAStream());
+  cudaCopy(dstAddress, srcAddress, srcbytes, c10::cuda::getCurrentCUDAStream());
 }
 } // namespace
+
+} // namespace moodist
 
 namespace py = pybind11;
 
@@ -81,7 +81,7 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("set_prefer_kernel_less", &moodist::setPreferKernelLess);
 
-  m.def("cuda_copy", &cudaCopy, py::call_guard<py::gil_scoped_release>());
+  m.def("cuda_copy", &moodist::cudaCopyTensor, py::call_guard<py::gil_scoped_release>());
 
   py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
       .def(

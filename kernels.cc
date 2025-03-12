@@ -22,7 +22,7 @@ Kernels::~Kernels() {
 std::string Kernels::emitCopySeq(
     std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
     size_t blockSize, std::string threadIndex, std::string blockIndex) {
-  TORCH_CHECK(sources.size() == destinations.size());
+  CHECK(sources.size() == destinations.size());
   auto genCopy = [&](std::string type, int typesize, int unroll) {
     std::string nbytes;
     std::string condi;
@@ -278,7 +278,7 @@ std::string Kernels::emitReduceFunctionSeq(
         fatal("unhandled reduce type %s for datatype %s", sourcetype, datatype);
       };
   auto generate = [&](std::string datatype, int datatypesize, int unroll) {
-    TORCH_CHECK(datatypesize % sourcetypesize == 0);
+    CHECK(datatypesize % sourcetypesize == 0);
     std::string nbytes;
     std::string condi;
     std::string s;

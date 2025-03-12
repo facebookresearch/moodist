@@ -34,47 +34,61 @@ struct CudaError : std::runtime_error {
   CudaError(CUresult error, const std::string& message) : error(error), std::runtime_error(message) {}
 };
 
-inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
+[[noreturn]] [[gnu::cold]] inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
   throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));
 }
-inline void throwCu(CUresult error, const char* file, int line) {
+[[noreturn]] [[gnu::cold]] inline void throwCu(CUresult error, const char* file, int line) {
   const char* str = "unknown cuda error";
   cuGetErrorString(error, &str);
   throw CudaError(error, fmt::sprintf("%s:%d: cuda error %d: %s", file, line, error, str));
 }
-inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
+[[noreturn]] [[gnu::cold]] inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
   const char* str = "unknown nvml error";
   str = nvmlErrorString(error);
   throw std::runtime_error(fmt::sprintf("%s:%d: nvml error %d: %s", file, line, error, str));
 }
 
+[[noreturn]] [[gnu::cold]] inline void throwCheckFail(const char* file, int line, const char* text) {
+  std::string str = fmt::sprintf("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, text);
+  log.error("%s", str);
+  throw std::runtime_error(str);
+}
+
+[[noreturn]] [[gnu::cold]] inline void throwErrno(int e, const char* text) {
+  log.error("%s: error %d: %s", text, e, std::strerror(e));
+  throw std::system_error(e, std::generic_category(), text);
+}
+
+#define NORETURN(x) [&] [[noreturn]] [[gnu::cold]] [[gnu::noinline]] () { x }();
+#define NOINLINE(x) [&] [[gnu::noinline]] () { x }();
+#define NOINLINE_COLD(x) [&] [[gnu::noinline]] [[gnu::cold]] () { x }();
+
 #define CHECK_NVRTC(x)                                                                                                 \
   {                                                                                                                    \
     nvrtcResult error__ = (x);                                                                                         \
     if (error__ != NVRTC_SUCCESS) [[unlikely]]                                                                         \
-      throwNvrtc(error__, __FILE__, __LINE__);                                                                         \
+      NORETURN(throwNvrtc(error__, __FILE__, __LINE__);)                                                               \
   }
 #define CHECK_CU(x)                                                                                                    \
   {                                                                                                                    \
     CUresult error__ = (x);                                                                                            \
     if (error__ != CUDA_SUCCESS) [[unlikely]]                                                                          \
-      throwCu(error__, __FILE__, __LINE__);                                                                            \
+      NORETURN(throwCu(error__, __FILE__, __LINE__);)                                                                  \
   }
 
 #define CHECK_NVML(x)                                                                                                  \
   {                                                                                                                    \
     nvmlReturn_t error__ = (x);                                                                                        \
     if (error__ != NVML_SUCCESS) [[unlikely]]                                                                          \
-      throwNvml(error__, __FILE__, __LINE__);                                                                          \
+      NORETURN(throwNvml(error__, __FILE__, __LINE__);)                                                                \
   }
 
 #undef CHECK
 #define CHECK(x)                                                                                                       \
   {                                                                                                                    \
     if (!(x)) [[unlikely]]                                                                                             \
-      moodist::fatal("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, #x);                                             \
+      NORETURN(throwCheckFail(__FILE__, __LINE__, #x);)                                                                \
   }
-
 inline std::string removePciPathPrefix(std::string path) {
   std::string_view prefix = "/sys/devices/";
   if (path.find(prefix) == 0) {
@@ -612,5 +626,4 @@ struct FutureImpl {
 };
 
 using FutureImplSharedPtr = FLSharedPtr<FutureImpl>;
-
 } // namespace moodist

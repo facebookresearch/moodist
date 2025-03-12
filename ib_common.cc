@@ -24,14 +24,12 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
   recvChannel = ibv_create_comp_channel(context);
   if (!recvChannel) {
-    perror("ibv_create_comp_channel");
-    CHECK(false);
+    throwErrno(errno, "ibv_create_comp_channel");
   }
 
   recvCq = ibv_create_cq(context, maxSrqEntries, nullptr, recvChannel, 0);
   if (!recvCq) {
-    perror("ibv_create_cq");
-    CHECK(false);
+    throwErrno(errno, "ibv_create_cq");
   }
 
   ibv_srq_init_attr srqAttrs;
@@ -40,8 +38,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   srqAttrs.attr.max_wr = maxSrqEntries;
   sharedReceiveQueue = ibv_create_srq(protectionDomain, &srqAttrs);
   if (!sharedReceiveQueue) {
-    perror("ibv_create_srq");
-    CHECK(false);
+    throwErrno(errno, "ibv_create_srq");
   }
 
   for (size_t i = 0; i != size; ++i) {
@@ -67,16 +64,14 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
       IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
       if (!qp) {
-        perror("ibv_create_qp_ex");
-        TORCH_CHECK(false);
+        throwErrno(errno, "ibv_create_qp_ex");
       }
       ibv_qp_attr attr;
       memset(&attr, 0, sizeof(attr));
       attr.qp_state = IBV_QPS_RESET;
       int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
       if (error) {
-        log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-        TORCH_CHECK(false);
+        throwErrno(errno, "ibv_modify_qp");
       }
 
       memset(&attr, 0, sizeof(attr));
@@ -86,8 +81,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
       error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
       if (error) {
-        log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-        TORCH_CHECK(false);
+        throwErrno(errno, "ibv_modify_qp");
       }
 
       IbAddress address;
@@ -96,8 +90,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       address.mtuIndex = portAttributes.active_mtu;
       error = ibv_query_gid(context, portNum, 0, &address.gid);
       if (error) {
-        perror("ibv_query_gid");
-        CHECK(false);
+        throwErrno(errno, "ibv_query_gid");
       }
 
       if (i != rank) {
@@ -123,7 +116,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     ibv_qp_attr attr;
     ibv_qp_init_attr initAttr;
     int error = ibv_query_qp(qp, &attr, IBV_QP_STATE, &initAttr);
-    TORCH_CHECK(attr.qp_state == IBV_QPS_INIT);
+    CHECK(attr.qp_state == IBV_QPS_INIT);
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     std::memset(&attr.ah_attr, 0, sizeof(attr.ah_attr));
@@ -140,8 +133,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
             IBV_QP_MIN_RNR_TIMER);
     if (error) {
-      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      CHECK(false);
+      throwErrno(errno, "ibv_modify_qp");
     }
 
     std::memset(&attr, 0, sizeof(attr));
@@ -163,8 +155,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC |
             IBV_QP_ACCESS_FLAGS);
     if (error) {
-      log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-      CHECK(false);
+      throwErrno(errno, "ibv_modify_qp");
     }
 
     // fmt::printf("connected, yey!\n");
@@ -180,15 +171,13 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   if (!protectionDomain) {
     protectionDomain = ibv_alloc_pd(context);
     if (!protectionDomain) {
-      perror("ibv_alloc_pd");
-      CHECK(false);
+      throwErrno(errno, "ibv_alloc_pd");
     }
   }
 
   cq = ibv_create_cq(context, maxCqEntries, nullptr, nullptr, 0);
   if (!cq) {
-    perror("ibv_create_cq");
-    CHECK(false);
+    throwErrno(errno, "ibv_create_cq");
   }
 
   return init2Ib(portNum, portAttributes);
@@ -285,13 +274,13 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   //   ibv_qp_attr attr;
   //   ibv_qp_init_attr initAttr;
   //   int error = ibv_query_qp(qp, &attr, IBV_QP_STATE, &initAttr);
-  //   TORCH_CHECK(attr.qp_state == IBV_QPS_INIT);
+  //   CHECK(attr.qp_state == IBV_QPS_INIT);
   //   std::memset(&attr, 0, sizeof(attr));
   //   attr.qp_state = IBV_QPS_RTR;
   //   error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
   //   if (error) {
   //     log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //     TORCH_CHECK(false);
+  //     CHECK(false);
   //   }
 
   //   std::memset(&attr, 0, sizeof(attr));
@@ -301,7 +290,7 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   //   error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RNR_RETRY);
   //   if (error) {
   //     log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //     TORCH_CHECK(false);
+  //     CHECK(false);
   //   }
   // }
   // log.debug("connected, yey!\n");
@@ -334,7 +323,7 @@ struct PollThread {
         if (errno == EINTR) {
           continue;
         }
-        throw std::system_error(errno, std::generic_category(), "epoll_wait");
+        throwErrno(errno, "epoll_wait");
       }
       for (int i = 0; i != n; ++i) {
         Function<void()> f((FunctionPointer)events[i].data.ptr);
@@ -358,7 +347,7 @@ struct PollThread {
     std::call_once(flag, [&] {
       epollFd = epoll_create1(EPOLL_CLOEXEC);
       if (epollFd == -1) {
-        throw std::system_error(errno, std::generic_category(), "epoll_create1");
+        throwErrno(errno, "epoll_create1");
       }
       thread = std::thread([&] {
         async::setCurrentThreadName("moo/ib epoll");
@@ -372,7 +361,7 @@ struct PollThread {
     e.data.ptr = callback.release();
     e.events = EPOLLIN | EPOLLOUT | EPOLLET;
     if (epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &e)) {
-      throw std::system_error(errno, std::generic_category(), "epoll_ctl");
+      throwErrno(errno, "epoll_ctl");
     }
   }
   void remove(int fd) {
