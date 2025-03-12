@@ -3,7 +3,7 @@
 #include "common.h"
 #include "hash_map.h"
 
-#define RDMA_STATIC_PROVIDERS all
+#define RDMA_STATIC_PROVIDERS mlx5
 #include "libibverbs/verbs.h"
 
 namespace moodist {

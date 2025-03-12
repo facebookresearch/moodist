@@ -2,13 +2,18 @@ cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 
 project(moodist)
 
-project(moodist LANGUAGES CXX)
+project(moodist LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD 17)
+set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3")
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wfatal-errors -Wno-unused-result -ftemplate-backtrace-limit=0 -Bsymbolic -march=x86-64-v3")
+    "${CMAKE_CXX_FLAGS} -ftemplate-backtrace-limit=0 ${COMPILE_FLAGS}")
+set(CMAKE_C_FLAGS
+    "${CMAKE_C_FLAGS} ${COMPILE_FLAGS}")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_SKIP_RPATH TRUE)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
@@ -43,12 +48,39 @@ message(STATUS "CUDADEVRT is ${CUDADEVRT}")
 find_package(Threads REQUIRED)
 
 add_subdirectory(pybind11)
-add_subdirectory(fmt EXCLUDE_FROM_ALL)
 
 set(ENABLE_STATIC ON CACHE BOOL "")
 set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
-set(RDMA_STATIC_PROVIDERS "all" CACHE STRING "")
+set(NO_PYVERBS ON CACHE BOOL "")
+set(NO_MAN_PAGES ON CACHE BOOL "")
+set(NO_COMPAT_SYMS ON CACHE BOOL "")
+set(HAVE_FUNC_ATTRIBUTE_SYMVER "0" CACHE STRING "" FORCE)
 add_subdirectory(rdma-core EXCLUDE_FROM_ALL)
+
+set(ibverbs_sources
+  cmd.c cmd_ah.c cmd_counters.c cmd_cq.c cmd_device.c cmd_dm.c cmd_fallback.c cmd_flow.c
+  cmd_flow_action.c cmd_ioctl.c cmd_mr.c cmd_mw.c cmd_pd.c cmd_qp.c cmd_rwq_ind.c cmd_srq.c
+  cmd_wq.c cmd_xrcd.c device.c enum_strs.c ibdev_nl.c init.c marshall.c memory.c
+  static_driver.c sysfs.c verbs.c dummy_ops.c neigh.c
+)
+list(TRANSFORM ibverbs_sources PREPEND rdma-core/libibverbs/)
+set(util_sources
+  bitmap.c cl_map.c interval_set.c node_name_map.c open_cdev.c rdma_nl.c util.c
+)
+list(TRANSFORM util_sources PREPEND rdma-core/util/)
+set(mlx5_sources
+  buf.c cq.c dbrec.c dr_action.c dr_arg.c dr_buddy.c dr_crc32.c dr_dbg.c
+  dr_devx.c dr_domain.c dr_icm_pool.c dr_matcher.c dr_ptrn.c dr_rule.c dr_send.c dr_ste.c
+  dr_ste_v0.c dr_ste_v1.c dr_ste_v2.c dr_ste_v3.c dr_table.c dr_vports.c mlx5.c mlx5_vfio.c
+  qp.c srq.c verbs.c
+)
+list(TRANSFORM mlx5_sources PREPEND rdma-core/providers/mlx5/)
+
+set(rdma_sources
+  ${ibverbs_sources}
+  ${util_sources}
+  ${mlx5_sources}
+)
 
 pybind11_add_module(_C
   processgroup.cc
@@ -68,6 +100,8 @@ pybind11_add_module(_C
   queue.cc
   cpu_allocator.cc
   numa.cc
+  fmt/src/format.cc
+  ${rdma_sources}
 )
 if (TARGET CUDA::nvrtc_static AND TARGET CUDA::nvrtc_builtins_static AND TARGET CUDA::nvml_static)
   target_link_libraries(_C PRIVATE CUDA::nvrtc_static CUDA::nvrtc_builtins_static CUDA::nvml_static)
@@ -83,8 +117,8 @@ target_link_libraries(_C PRIVATE
   CUDA::cuda_driver
   ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
-  fmt
   anl
+  kern-abi
 )
 target_include_directories(_C SYSTEM PRIVATE
   rdma-core
@@ -92,9 +126,12 @@ target_include_directories(_C SYSTEM PRIVATE
   ${TorchPath}/include
   ${TorchPath}/include/torch/csrc/api/include
   ${CUDAToolkit_INCLUDE_DIRS}
+  fmt/include
 )
 target_compile_options(_C PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 
-target_link_libraries(_C PUBLIC ibverbs-static bnxt_re cxgb4 efa-static erdma hns irdma mana-static mlx4-static mlx5-static mthca ocrdma qedr vmw_pvrdma hfi1verbs ipathverbs rxe siw ibverbs-static)
-
 target_compile_definitions(_C PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
+
+target_compile_definitions(_C PRIVATE _STATIC_LIBRARY_BUILD_)
+
+set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
