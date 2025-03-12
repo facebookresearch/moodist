@@ -158,6 +158,7 @@ struct hns_roce_device {
 	int				page_size;
 	const struct hns_roce_u_hw	*u_hw;
 	int				hw_version;
+	uint8_t                         congest_cap;
 };
 
 struct hns_roce_buf {
@@ -172,6 +173,7 @@ struct hns_roce_buf {
 enum hns_roce_db_type {
 	HNS_ROCE_QP_TYPE_DB,
 	HNS_ROCE_CQ_TYPE_DB,
+	HNS_ROCE_SRQ_TYPE_DB,
 	HNS_ROCE_DB_TYPE_NUM
 };
 
@@ -181,12 +183,22 @@ enum hns_roce_pktype {
 	HNS_ROCE_PKTYPE_ROCE_V2_IPV4,
 };
 
+enum hns_roce_tc_map_mode {
+	HNS_ROCE_TC_MAP_MODE_PRIO,
+	HNS_ROCE_TC_MAP_MODE_DSCP,
+};
+
 struct hns_roce_db_page {
 	struct hns_roce_db_page	*prev, *next;
 	struct hns_roce_buf	buf;
 	unsigned int		num_db;
 	unsigned int		use_cnt;
 	unsigned long		*bitmap;
+};
+
+struct hns_roce_spinlock {
+	pthread_spinlock_t lock;
+	int need_lock;
 };
 
 struct hns_roce_context {
@@ -223,15 +235,27 @@ struct hns_roce_context {
 	unsigned int			max_inline_data;
 };
 
+struct hns_roce_td {
+	struct ibv_td ibv_td;
+	atomic_int refcount;
+};
+
 struct hns_roce_pd {
 	struct ibv_pd			ibv_pd;
 	unsigned int			pdn;
+	atomic_int			refcount;
+	struct hns_roce_pd		*protection_domain;
+};
+
+struct hns_roce_pad {
+	struct hns_roce_pd pd;
+	struct hns_roce_td *td;
 };
 
 struct hns_roce_cq {
 	struct verbs_cq			verbs_cq;
 	struct hns_roce_buf		buf;
-	pthread_spinlock_t		lock;
+	struct hns_roce_spinlock	hr_lock;
 	unsigned int			cqn;
 	unsigned int			cq_depth;
 	unsigned int			cons_index;
@@ -241,6 +265,7 @@ struct hns_roce_cq {
 	unsigned long			flags;
 	unsigned int			cqe_size;
 	struct hns_roce_v2_cqe		*cqe;
+	struct ibv_pd			*parent_domain;
 };
 
 struct hns_roce_idx_que {
@@ -266,21 +291,21 @@ struct hns_roce_srq {
 	struct verbs_srq		verbs_srq;
 	struct hns_roce_idx_que		idx_que;
 	struct hns_roce_buf		wqe_buf;
-	struct hns_roce_rinl_buf	srq_rinl_buf;
-	pthread_spinlock_t		lock;
+	struct hns_roce_spinlock        hr_lock;
 	unsigned long			*wrid;
 	unsigned int			srqn;
 	unsigned int			wqe_cnt;
 	unsigned int			max_gs;
 	unsigned int			rsv_sge;
 	unsigned int			wqe_shift;
-	unsigned int			*db;
+	unsigned int			*rdb;
+	unsigned int			cap_flags;
 	unsigned short			counter;
 };
 
 struct hns_roce_wq {
 	unsigned long			*wrid;
-	pthread_spinlock_t		lock;
+	struct hns_roce_spinlock	hr_lock;
 	unsigned int			wqe_cnt;
 	int				max_post;
 	unsigned int			head;
@@ -321,6 +346,8 @@ struct hns_roce_qp {
 	unsigned int			next_sge;
 	int				port_num;
 	uint8_t				sl;
+	uint8_t				tc_mode;
+	uint8_t				priority;
 	unsigned int			qkey;
 	enum ibv_mtu			path_mtu;
 
@@ -396,9 +423,33 @@ static inline struct hns_roce_context *to_hr_ctx(struct ibv_context *ibv_ctx)
 	return container_of(ibv_ctx, struct hns_roce_context, ibv_ctx.context);
 }
 
+static inline struct hns_roce_td *to_hr_td(struct ibv_td *ibv_td)
+{
+	return container_of(ibv_td, struct hns_roce_td, ibv_td);
+}
+
+/* to_hr_pd always returns the real hns_roce_pd obj. */
 static inline struct hns_roce_pd *to_hr_pd(struct ibv_pd *ibv_pd)
 {
-	return container_of(ibv_pd, struct hns_roce_pd, ibv_pd);
+	struct hns_roce_pd *pd =
+		container_of(ibv_pd, struct hns_roce_pd, ibv_pd);
+
+	if (pd->protection_domain)
+		return pd->protection_domain;
+
+	return pd;
+}
+
+static inline struct hns_roce_pad *to_hr_pad(struct ibv_pd *ibv_pd)
+{
+	struct hns_roce_pad *pad = ibv_pd ?
+		container_of(ibv_pd, struct hns_roce_pad, pd.ibv_pd) : NULL;
+
+	if (pad && pad->pd.protection_domain)
+		return pad;
+
+	/* Otherwise ibv_pd isn't a parent_domain */
+	return NULL;
 }
 
 static inline struct hns_roce_cq *to_hr_cq(struct ibv_cq *ibv_cq)
@@ -421,14 +472,35 @@ static inline struct hns_roce_ah *to_hr_ah(struct ibv_ah *ibv_ah)
 	return container_of(ibv_ah, struct hns_roce_ah, ibv_ah);
 }
 
+static inline int hns_roce_spin_lock(struct hns_roce_spinlock *hr_lock)
+{
+	if (hr_lock->need_lock)
+		return pthread_spin_lock(&hr_lock->lock);
+
+	return 0;
+}
+
+static inline int hns_roce_spin_unlock(struct hns_roce_spinlock *hr_lock)
+{
+	if (hr_lock->need_lock)
+		return pthread_spin_unlock(&hr_lock->lock);
+
+	return 0;
+}
+
 int hns_roce_u_query_device(struct ibv_context *context,
 			    const struct ibv_query_device_ex_input *input,
 			    struct ibv_device_attr_ex *attr, size_t attr_size);
 int hns_roce_u_query_port(struct ibv_context *context, uint8_t port,
 			  struct ibv_port_attr *attr);
 
+struct ibv_td *hns_roce_u_alloc_td(struct ibv_context *context,
+				   struct ibv_td_init_attr *attr);
+int hns_roce_u_dealloc_td(struct ibv_td *ibv_td);
+struct ibv_pd *hns_roce_u_alloc_pad(struct ibv_context *context,
+				    struct ibv_parent_domain_init_attr *attr);
 struct ibv_pd *hns_roce_u_alloc_pd(struct ibv_context *context);
-int hns_roce_u_free_pd(struct ibv_pd *pd);
+int hns_roce_u_dealloc_pd(struct ibv_pd *pd);
 
 struct ibv_mr *hns_roce_u_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 				 uint64_t hca_va, int access);
@@ -487,10 +559,13 @@ int hns_roce_u_close_xrcd(struct ibv_xrcd *ibv_xrcd);
 int hns_roce_alloc_buf(struct hns_roce_buf *buf, unsigned int size,
 		       int page_size);
 void hns_roce_free_buf(struct hns_roce_buf *buf);
+void hns_roce_qp_spinlock_destroy(struct hns_roce_qp *qp);
 
 void hns_roce_free_qp_buf(struct hns_roce_qp *qp, struct hns_roce_context *ctx);
 
 void hns_roce_init_qp_indices(struct hns_roce_qp *qp);
+
+bool is_hns_dev(struct ibv_device *device);
 
 extern const struct hns_roce_u_hw hns_roce_u_hw_v2;
 

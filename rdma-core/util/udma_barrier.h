@@ -93,7 +93,7 @@
 #elif defined(__sparc_v9__)
 #define udma_to_device_barrier() asm volatile("membar #StoreStore" ::: "memory")
 #elif defined(__aarch64__)
-#define udma_to_device_barrier() asm volatile("dsb st" ::: "memory");
+#define udma_to_device_barrier() asm volatile("dmb oshst" ::: "memory")
 #elif defined(__sparc__) || defined(__s390x__)
 #define udma_to_device_barrier() asm volatile("" ::: "memory")
 #elif defined(__loongarch__)
@@ -101,7 +101,7 @@
 #elif defined(__riscv)
 #define udma_to_device_barrier() asm volatile("fence ow,ow" ::: "memory")
 #elif defined(__mips__)
-#define udma_to_device_barrier() asm volatile("sync 0" ::: "memory")
+#define udma_to_device_barrier() asm volatile("sync" ::: "memory")
 #else
 #error No architecture specific memory barrier defines found!
 #endif
@@ -131,7 +131,7 @@
 #elif defined(__sparc_v9__)
 #define udma_from_device_barrier() asm volatile("membar #LoadLoad" ::: "memory")
 #elif defined(__aarch64__)
-#define udma_from_device_barrier() asm volatile("dsb ld" ::: "memory");
+#define udma_from_device_barrier() asm volatile("dmb oshld" ::: "memory")
 #elif defined(__sparc__) || defined(__s390x__)
 #define udma_from_device_barrier() asm volatile("" ::: "memory")
 #elif defined(__loongarch__)
@@ -139,7 +139,7 @@
 #elif defined(__riscv)
 #define udma_from_device_barrier() asm volatile("fence ir,ir" ::: "memory")
 #elif defined(__mips__)
-#define udma_from_device_barrier() asm volatile("sync 0" ::: "memory")
+#define udma_from_device_barrier() asm volatile("sync" ::: "memory")
 #else
 #error No architecture specific memory barrier defines found!
 #endif
@@ -212,7 +212,7 @@
 #include "s390_mmio_insn.h"
 #define mmio_flush_writes() s390_pciwb()
 #elif defined(__mips__)
-#define mmio_flush_writes() asm volatile("sync 0" ::: "memory")
+#define mmio_flush_writes() asm volatile("sync" ::: "memory")
 #else
 #error No architecture specific memory barrier defines found!
 #endif

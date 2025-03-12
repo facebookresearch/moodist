@@ -1,5 +1,5 @@
 Name: rdma-core
-Version: 49.0
+Version: 57.0
 Release: 1%{?dist}
 Summary: RDMA core userspace libraries and daemons
 
@@ -158,6 +158,8 @@ Provides: liberdma = %{version}-%{release}
 Obsoletes: liberdma < %{version}-%{release}
 Provides: libhfi1 = %{version}-%{release}
 Obsoletes: libhfi1 < %{version}-%{release}
+Provides: libhns = %{version}-%{release}
+Obsoletes: libhns < %{version}-%{release}
 Provides: libipathverbs = %{version}-%{release}
 Obsoletes: libipathverbs < %{version}-%{release}
 Provides: libirdma = %{version}-%{release}
@@ -188,7 +190,7 @@ Device-specific plug-in ibverbs userspace drivers are included:
 - libefa: Amazon Elastic Fabric Adapter
 - liberdma: Alibaba Elastic RDMA (iWarp) Adapter
 - libhfi1: Intel Omni-Path HFI
-- libhns: HiSilicon Hip06 SoC
+- libhns: HiSilicon Hip08+ SoC
 - libipathverbs: QLogic InfiniPath HCA
 - libirdma: Intel Ethernet Connection RDMA
 - libmana: Microsoft Azure Network Adapter
@@ -361,6 +363,18 @@ if [ -x /sbin/udevadm ]; then
 /sbin/udevadm trigger --subsystem-match=net --action=change || true
 /sbin/udevadm trigger --subsystem-match=infiniband_mad --action=change || true
 fi
+%systemd_post rdma-load-modules@rdma.service
+%systemd_post rdma-load-modules@infiniband.service
+%systemd_post rdma-load-modules@roce.service
+
+%preun -n rdma-core
+%systemd_preun rdma-load-modules@rdma.service
+%systemd_preun rdma-load-modules@infiniband.service
+%systemd_preun rdma-load-modules@roce.service
+%postun -n rdma-core
+%systemd_postun_with_restart rdma-load-modules@rdma.service
+%systemd_postun_with_restart rdma-load-modules@infiniband.service
+%systemd_postun_with_restart rdma-load-modules@roce.service
 
 %post -n infiniband-diags -p /sbin/ldconfig
 %postun -n infiniband-diags -p /sbin/ldconfig
@@ -448,6 +462,7 @@ fi
 %{_libdir}/lib*.so
 %{_libdir}/pkgconfig/*.pc
 %{_mandir}/man3/efadv*
+%{_mandir}/man3/hnsdv*
 %{_mandir}/man3/ibv_*
 %{_mandir}/man3/rdma*
 %{_mandir}/man3/umad*
@@ -457,6 +472,7 @@ fi
 %{_mandir}/man3/mlx5dv*
 %{_mandir}/man3/mlx4dv*
 %{_mandir}/man7/efadv*
+%{_mandir}/man7/hnsdv*
 %{_mandir}/man7/manadv*
 %{_mandir}/man7/mlx5dv*
 %{_mandir}/man7/mlx4dv*
@@ -575,6 +591,7 @@ fi
 %dir %{_sysconfdir}/libibverbs.d
 %dir %{_libdir}/libibverbs
 %{_libdir}/libefa.so.*
+%{_libdir}/libhns.so.*
 %{_libdir}/libibverbs*.so.*
 %{_libdir}/libibverbs/*.so
 %{_libdir}/libmana.so.*

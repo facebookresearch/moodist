@@ -102,6 +102,7 @@ static const struct verbs_context_ops irdma_uctx_ops = {
 	.query_qp = irdma_uquery_qp,
 	.reg_dmabuf_mr = irdma_ureg_mr_dmabuf,
 	.reg_mr = irdma_ureg_mr,
+	.rereg_mr = irdma_urereg_mr,
 	.req_notify_cq = irdma_uarm_cq,
 	.resize_cq = irdma_uresize_cq,
 	.free_context = irdma_ufree_context,
@@ -156,11 +157,12 @@ static struct verbs_context *irdma_ualloc_context(struct ibv_device *ibdev,
 	cmd.userspace_ver = user_ver;
 	if (ibv_cmd_get_context(&iwvctx->ibv_ctx,
 				(struct ibv_get_context *)&cmd, sizeof(cmd),
-				&resp.ibv_resp, sizeof(resp))) {
+				NULL, &resp.ibv_resp, sizeof(resp))) {
 		cmd.userspace_ver = 4;
 		if (ibv_cmd_get_context(&iwvctx->ibv_ctx,
-					(struct ibv_get_context *)&cmd, sizeof(cmd),
-					&resp.ibv_resp, sizeof(resp)))
+					(struct ibv_get_context *)&cmd,
+					sizeof(cmd), NULL, &resp.ibv_resp,
+					sizeof(resp)))
 			goto err_free;
 		user_ver = cmd.userspace_ver;
 	}

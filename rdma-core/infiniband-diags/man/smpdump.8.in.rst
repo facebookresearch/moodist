@@ -55,10 +55,10 @@ Port Selection flags
 Debugging flags
 ---------------
 
-.. include:: common/opt_d.rst
+.. include:: common/opt_debug.rst
 .. include:: common/opt_e.rst
 .. include:: common/opt_h.rst
-.. include:: common/opt_v.rst
+.. include:: common/opt_verbose.rst
 .. include:: common/opt_V.rst
 
 
@@ -81,12 +81,14 @@ EXAMPLES
 Direct Routed Examples
 
 ::
+
         smpdump -D 0,1,2,3,5 16 # NODE DESC
         smpdump -D 0,1,2 0x15 2 # PORT INFO, port 2
 
 LID Routed Examples
 
 ::
+
         smpdump 3 0x15 2        # PORT INFO, lid 3 port 2
         smpdump 0xa0 0x11       # NODE INFO, lid 0xa0
 

@@ -54,7 +54,7 @@ static int calculate_fifo_occupancy(struct bnxt_re_context *cntx)
 	struct bnxt_re_dev *rdev = cntx->rdev;
 	uint32_t read_val, fifo_occup;
 	uint64_t fifo_reg_off;
-	uint64_t *dbr_map;
+	uint32_t *dbr_map;
 
 	fifo_reg_off =  pacing_data->grc_reg_offset & ~(BNXT_RE_PAGE_MASK(rdev->pg_size));
 	dbr_map = cntx->bar_map + fifo_reg_off;
@@ -106,71 +106,119 @@ static void bnxt_re_ring_db(struct bnxt_re_dpi *dpi,
 }
 
 static void bnxt_re_init_db_hdr(struct bnxt_re_db_hdr *hdr, uint32_t indx,
-				uint32_t qid, uint32_t typ)
+				uint32_t qid, uint32_t toggle, uint32_t typ)
 {
-	hdr->indx = htole32(indx & BNXT_RE_DB_INDX_MASK);
+	hdr->indx = htole32(indx | toggle << BNXT_RE_DB_TOGGLE_SHIFT);
 	hdr->typ_qid = htole32(qid & BNXT_RE_DB_QID_MASK);
 	hdr->typ_qid |= htole32(((typ & BNXT_RE_DB_TYP_MASK) <<
-				  BNXT_RE_DB_TYP_SHIFT));
+				 BNXT_RE_DB_TYP_SHIFT) | (0x1UL << BNXT_RE_DB_VALID_SHIFT));
 }
 
 void bnxt_re_ring_rq_db(struct bnxt_re_qp *qp)
 {
 	struct bnxt_re_db_hdr hdr;
+	uint32_t epoch;
 	uint32_t tail;
 
 	bnxt_re_do_pacing(qp->cntx, &qp->rand);
 	tail = *qp->jrqq->hwque->dbtail;
-	bnxt_re_init_db_hdr(&hdr, tail, qp->qpid, BNXT_RE_QUE_TYPE_RQ);
+	epoch = (qp->jrqq->hwque->flags &  BNXT_RE_FLAG_EPOCH_TAIL_MASK) <<
+		BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+	bnxt_re_init_db_hdr(&hdr, tail | epoch,
+			    qp->qpid, 0, BNXT_RE_QUE_TYPE_RQ);
 	bnxt_re_ring_db(qp->udpi, &hdr);
 }
 
 void bnxt_re_ring_sq_db(struct bnxt_re_qp *qp)
 {
 	struct bnxt_re_db_hdr hdr;
+	uint32_t epoch;
 	uint32_t tail;
 
 	bnxt_re_do_pacing(qp->cntx, &qp->rand);
 	tail = *qp->jsqq->hwque->dbtail;
-	bnxt_re_init_db_hdr(&hdr, tail, qp->qpid, BNXT_RE_QUE_TYPE_SQ);
+	epoch = (qp->jsqq->hwque->flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) <<
+		BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+	bnxt_re_init_db_hdr(&hdr, tail | epoch, qp->qpid, 0, BNXT_RE_QUE_TYPE_SQ);
 	bnxt_re_ring_db(qp->udpi, &hdr);
 }
 
 void bnxt_re_ring_srq_db(struct bnxt_re_srq *srq)
 {
 	struct bnxt_re_db_hdr hdr;
+	uint32_t epoch;
 
 	bnxt_re_do_pacing(srq->cntx, &srq->rand);
-	bnxt_re_init_db_hdr(&hdr, srq->srqq->tail, srq->srqid,
-			    BNXT_RE_QUE_TYPE_SRQ);
+	epoch = (srq->srqq->flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) <<
+		BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+	bnxt_re_init_db_hdr(&hdr, srq->srqq->tail | epoch, srq->srqid, 0, BNXT_RE_QUE_TYPE_SRQ);
 	bnxt_re_ring_db(srq->udpi, &hdr);
 }
 
 void bnxt_re_ring_srq_arm(struct bnxt_re_srq *srq)
 {
+	uint32_t *pgptr, toggle = 0;
 	struct bnxt_re_db_hdr hdr;
 
+	pgptr = (uint32_t *)srq->toggle_map;
+	if (pgptr)
+		toggle = *pgptr;
 	bnxt_re_do_pacing(srq->cntx, &srq->rand);
-	bnxt_re_init_db_hdr(&hdr, srq->cap.srq_limit, srq->srqid,
+	bnxt_re_init_db_hdr(&hdr, srq->cap.srq_limit, srq->srqid, toggle,
 			    BNXT_RE_QUE_TYPE_SRQ_ARM);
 	bnxt_re_ring_db(srq->udpi, &hdr);
+}
+
+/*
+ * During CQ resize, it is expected that the epoch needs to be maintained when
+ * switching from the old CQ to the new resized CQ.
+ *
+ * On the first CQ DB excecuted on the new CQ, we need to check if the index we
+ * are writing is less than the last index written for the old CQ. If that is
+ * the case, we need to flip the epoch so the ASIC does not get confused and
+ * think the CQ DB is out of order and therefore drop the DB (note the logic
+ * in the ASIC that checks CQ DB ordering is not aware of the CQ resize).
+ */
+static void bnxt_re_cq_resize_check(struct bnxt_re_queue *cqq)
+{
+	if (unlikely(cqq->cq_resized)) {
+		if (cqq->head < cqq->old_head)
+			cqq->flags ^= 1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT;
+
+		cqq->cq_resized = false;
+	}
 }
 
 void bnxt_re_ring_cq_db(struct bnxt_re_cq *cq)
 {
 	struct bnxt_re_db_hdr hdr;
+	uint32_t epoch;
 
 	bnxt_re_do_pacing(cq->cntx, &cq->rand);
-	bnxt_re_init_db_hdr(&hdr, cq->cqq.head, cq->cqid, BNXT_RE_QUE_TYPE_CQ);
+	bnxt_re_cq_resize_check(cq->cqq);
+	epoch = (cq->cqq->flags & BNXT_RE_FLAG_EPOCH_HEAD_MASK) << BNXT_RE_DB_EPOCH_HEAD_SHIFT;
+	bnxt_re_init_db_hdr(&hdr, cq->cqq->head | epoch, cq->cqid, 0, BNXT_RE_QUE_TYPE_CQ);
 	bnxt_re_ring_db(cq->udpi, &hdr);
 }
 
 void bnxt_re_ring_cq_arm_db(struct bnxt_re_cq *cq, uint8_t aflag)
 {
+	uint32_t epoch, toggle = 0;
 	struct bnxt_re_db_hdr hdr;
+	uint32_t *pgptr;
+
+	if (aflag == BNXT_RE_QUE_TYPE_CQ_CUT_ACK) {
+		toggle = cq->resize_tog;
+	} else {
+		pgptr = (uint32_t *)cq->toggle_map;
+		if (pgptr)
+			toggle = *pgptr;
+	}
 
 	bnxt_re_do_pacing(cq->cntx, &cq->rand);
-	bnxt_re_init_db_hdr(&hdr, cq->cqq.head, cq->cqid, aflag);
+	bnxt_re_cq_resize_check(cq->cqq);
+	epoch = (cq->cqq->flags & BNXT_RE_FLAG_EPOCH_HEAD_MASK) <<  BNXT_RE_DB_EPOCH_HEAD_SHIFT;
+	bnxt_re_init_db_hdr(&hdr, cq->cqq->head | epoch, cq->cqid, toggle, aflag);
 	bnxt_re_ring_db(cq->udpi, &hdr);
 }
 

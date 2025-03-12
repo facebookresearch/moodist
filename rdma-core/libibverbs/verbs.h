@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <string.h>
 #include <linux/types.h>
+#include <linux/if_ether.h>
 #include <sys/types.h>
 #include <infiniband/verbs_api.h>
 
@@ -1116,6 +1117,8 @@ enum ibv_wr_opcode {
 	IBV_WR_ATOMIC_WRITE = 15,
 };
 
+const char *ibv_wr_opcode_str(enum ibv_wr_opcode opcode);
+
 enum ibv_send_flags {
 	IBV_SEND_FENCE		= 1 << 0,
 	IBV_SEND_SIGNALED	= 1 << 1,
@@ -1143,6 +1146,11 @@ struct ibv_sge {
 	uint64_t		addr;
 	uint32_t		length;
 	uint32_t		lkey;
+};
+
+struct ibv_fd_arr {
+	int *arr;
+	uint32_t count;
 };
 
 struct ibv_send_wr {
@@ -1734,9 +1742,10 @@ enum ibv_flow_spec_type {
 	IBV_FLOW_SPEC_ACTION_COUNT	= 0x1003,
 };
 
+#define ETHERNET_LL_SIZE ETH_ALEN
 struct ibv_flow_eth_filter {
-	uint8_t		dst_mac[6];
-	uint8_t		src_mac[6];
+	uint8_t		dst_mac[ETHERNET_LL_SIZE];
+	uint8_t		src_mac[ETHERNET_LL_SIZE];
 	uint16_t	ether_type;
 	/*
 	 * same layout as 802.1q: prio 3, cfi 1, vlan id 12
@@ -2564,9 +2573,9 @@ static inline int ibv_close_xrcd(struct ibv_xrcd *xrcd)
  * ibv_reg_mr_iova2 - Register memory region with a virtual offset address
  *
  * This version will be called if ibv_reg_mr or ibv_reg_mr_iova were called
- * with at least one potential access flag from the IBV_OPTIONAL_ACCESS_RANGE
- * flags range The optional access flags will be masked if running over kernel
- * that does not support passing them.
+ * with at least one optional access flag from the IBV_ACCESS_OPTIONAL_RANGE
+ * bits flag range. The optional access flags will be masked if running over
+ * kernel that does not support passing them.
  */
 struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 				uint64_t iova, unsigned int access);
@@ -2616,7 +2625,7 @@ __ibv_reg_mr_iova(struct ibv_pd *pd, void *addr, size_t length, uint64_t iova,
 				  ((access) & IBV_ACCESS_OPTIONAL_RANGE) == 0))
 
 /**
- * ibv_reg_dmabuf_mr - Register a dambuf-based memory region
+ * ibv_reg_dmabuf_mr - Register a dmabuf-based memory region
  */
 struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
 				 uint64_t iova, int fd, int access);
@@ -3480,7 +3489,6 @@ const char *ibv_port_state_str(enum ibv_port_state port_state);
  */
 const char *ibv_event_type_str(enum ibv_event_type event);
 
-#define ETHERNET_LL_SIZE 6
 int ibv_resolve_eth_l2_from_gid(struct ibv_context *context,
 				struct ibv_ah_attr *attr,
 				uint8_t eth_mac[ETHERNET_LL_SIZE],

@@ -311,7 +311,7 @@ static void remove_cma_dev(struct cma_device *cma_dev)
 
 static int dev_cmp(const void *a, const void *b)
 {
-	return (int)(*(char *const *)a - *(char *const *)b);
+	return (*(uintptr_t *)a > *(uintptr_t *)b) - (*(uintptr_t *)a < *(uintptr_t *)b);
 }
 
 static int sync_devices_list(void)
@@ -1951,8 +1951,14 @@ int rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param)
 		return (ret >= 0) ? ERR(ENODATA) : -1;
 	}
 
-	if (ucma_is_ud_qp(id->qp_type))
+	if (ucma_is_ud_qp(id->qp_type)) {
+		if (id_priv->sync && id_priv->id.event) {
+			rdma_ack_cm_event(id_priv->id.event);
+			id_priv->id.event = NULL;
+		}
+
 		return 0;
+	}
 
 	return ucma_complete(id);
 }
@@ -2246,17 +2252,30 @@ int rdma_ack_cm_event(struct rdma_cm_event *event)
 
 static void ucma_process_addr_resolved(struct cma_event *evt)
 {
+	struct rdma_cm_id *id = &evt->id_priv->id;
+
 	if (af_ib_support) {
-		evt->event.status = ucma_query_addr(&evt->id_priv->id);
+		evt->event.status = ucma_query_addr(id);
+		if (!evt->event.status && !id->verbs)
+			goto err_dev;
+
 		if (!evt->event.status &&
-		    evt->id_priv->id.verbs->device->transport_type == IBV_TRANSPORT_IB)
-			evt->event.status = ucma_query_gid(&evt->id_priv->id);
+		    id->verbs->device->transport_type == IBV_TRANSPORT_IB) {
+			evt->event.status = ucma_query_gid(id);
+		}
 	} else {
-		evt->event.status = ucma_query_route(&evt->id_priv->id);
+		evt->event.status = ucma_query_route(id);
+		if (!evt->event.status && !id->verbs)
+			goto err_dev;
 	}
 
 	if (evt->event.status)
 		evt->event.event = RDMA_CM_EVENT_ADDR_ERROR;
+	return;
+
+err_dev:
+	evt->event.status = ERR(ENODEV);
+	evt->event.event = RDMA_CM_EVENT_ADDR_ERROR;
 }
 
 static void ucma_process_route_resolved(struct cma_event *evt)

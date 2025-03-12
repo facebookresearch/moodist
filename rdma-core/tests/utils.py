@@ -407,6 +407,8 @@ def get_send_elements(agr_obj, is_server, opcode=e.IBV_WR_SEND):
     :param is_server: Indicates whether this is server or client side
     :return: send wr and its SGE
     """
+    if hasattr(agr_obj, 'use_mixed_mr') and agr_obj.use_mixed_mr:
+        return get_send_elements_mixed_mr(agr_obj, is_server, opcode)
     if opcode == e.IBV_WR_ATOMIC_WRITE:
         atomic_wr = agr_obj.msg_size * (b's' if is_server else b'c')
         return None, atomic_wr
@@ -422,9 +424,30 @@ def get_send_elements(agr_obj, is_server, opcode=e.IBV_WR_SEND):
         send_wr.set_wr_rdma(int(agr_obj.rkey), int(agr_obj.raddr))
     return send_wr, sge
 
+
+def get_send_elements_mixed_mr(agr_obj, is_server, opcode=e.IBV_WR_SEND):
+    """
+    Creates 2 SGEs and a single Send WR for agr_obj's QP type. There are 2 messages,
+    one for each MR. The content of the message is either 's' for server side or 'c'
+    for client side.
+    :param agr_obj: Aggregation object which contains all resources necessary
+    :param is_server: Indicates whether this is server or client side
+    :param opcode: send WR opcode
+    :return: send wr and its SG list
+    """
+    msg = (agr_obj.msg_size) * ('s' if is_server else 'c')
+    agr_obj.mr.write(msg, agr_obj.msg_size)
+    agr_obj.non_odp_mr.write(msg, agr_obj.msg_size)
+    sge1 = SGE(agr_obj.mr.buf, agr_obj.msg_size, agr_obj.mr.lkey)
+    sge2 = SGE(agr_obj.non_odp_mr.buf, agr_obj.msg_size, agr_obj.non_odp_mr.lkey)
+    send_wr = SendWR(opcode=opcode, num_sge=2, sg=[sge1, sge2])
+    return send_wr, [sge1, sge2]
+
+
 def get_recv_wr(agr_obj):
     """
-    Creates a single SGE Recv WR for agr_obj's QP type.
+    Creates a single SGE Recv WR for agr_obj's QP type. In case of mixed MRs,
+    creates 2 SGEs accordingly.
     :param agr_obj: Aggregation object which contains all resources necessary
     :return: recv wr
     """
@@ -433,8 +456,11 @@ def get_recv_wr(agr_obj):
     mr = agr_obj.mr
     length = agr_obj.msg_size + GRH_SIZE if qp_type == e.IBV_QPT_UD \
              else agr_obj.msg_size
-    recv_sge = SGE(mr.buf, length, mr.lkey)
-    return RecvWR(sg=[recv_sge], num_sge=1)
+    recv_sgl = [SGE(mr.buf, length, mr.lkey)]
+    if hasattr(agr_obj, 'use_mixed_mr') and agr_obj.use_mixed_mr:
+        sec_mr = agr_obj.non_odp_mr
+        recv_sgl.append(SGE(sec_mr.buf,length,sec_mr.lkey))
+    return RecvWR(sg=recv_sgl, num_sge=len(recv_sgl))
 
 
 def get_global_ah(agr_obj, gid_index, port):
@@ -631,11 +657,14 @@ def poll_cq_ex(cqex, count=1, data=None, sgid=None):
     :param cq: CQEX to poll from
     :param count: How many completions to poll
     :param data: In case of a work request with immediate, the immediate data
-                 to be compared after poll
+                 to be compared after poll, either a list of immediate data or
+                 one value
     :param sgid: In case of EFA receive completion, the sgid to be compared
                  after poll
-    :return: None
+    :return: WR id order received
     """
+    wr_id_order = []
+    iters = count
     try:
         start_poll_t = time.perf_counter()
         poll_attr = PollCqAttr()
@@ -644,12 +673,14 @@ def poll_cq_ex(cqex, count=1, data=None, sgid=None):
             ret = cqex.start_poll(poll_attr)
         if ret != 0:
             raise PyverbsRDMAErrno('Failed to poll CQ')
+        wr_id_order.append(cqex.wr_id)
         count -= 1
         if cqex.status != e.IBV_WC_SUCCESS:
             raise PyverbsRDMAErrno('Completion status is {s}'.
                                    format(s=cqex.status))
         if data:
-            assert data == socket.ntohl(cqex.read_imm_data())
+            imm_data = data if not isinstance(data, list) else data[iters - count - 1]
+            assert imm_data == socket.ntohl(cqex.read_imm_data())
 
         if isinstance(cqex, EfaCQ):
             if sgid is not None and cqex.read_opcode() == e.IBV_WC_RECV:
@@ -661,21 +692,23 @@ def poll_cq_ex(cqex, count=1, data=None, sgid=None):
                 ret = cqex.poll_next()
             if ret != 0:
                 raise PyverbsRDMAErrno('Failed to poll CQ')
-            count -= 1
             if cqex.status != e.IBV_WC_SUCCESS:
                 raise PyverbsRDMAErrno('Completion status is {s}'.
                                        format(s=cqex.status))
+            count -= 1
+            wr_id_order.append(cqex.wr_id)
             if data:
-                assert data == socket.ntohl(cqex.read_imm_data())
+                imm_data = data if not isinstance(data, list) else data[iters - count - 1]
+                assert imm_data == socket.ntohl(cqex.read_imm_data())
 
             if isinstance(cqex, EfaCQ):
                 if sgid is not None and cqex.read_opcode() == e.IBV_WC_RECV:
                     assert sgid.gid == cqex.read_sgid().gid
-            count -= 1
         if count > 0:
             raise PyverbsError(f'Got timeout on polling ({count} CQEs remaining)')
     finally:
         cqex.end_poll()
+    return wr_id_order
 
 
 def validate(received_str, is_server, msg_size):
@@ -709,6 +742,51 @@ def send(agr_obj, send_object, send_op=None, new_send=False, qp_idx=0, ah=None, 
     if new_send:
         return post_send_ex(agr_obj, send_object, send_op, qp_idx, ah, **kwargs)
     return post_send(agr_obj, send_object, qp_idx, ah, is_imm)
+
+
+def traffic_poll_at_once(test, msg_size, iterations=10, opcode=e.IBV_WR_SEND):
+    """
+    Execute traffic between two peers iterations times:
+    - Create receive resources and then post recv
+    - Create send resources and then post send
+    - Poll client and server all cqes at once
+    - Compare received buffer with the expected one and validate
+    :param test: Test object with client and server.
+    :param msg_size: Size of a packet.
+    :param iterations: Number of packets to send/recv.
+    :param opcode: Send opcode. Currently it supports SEND and
+                   RDMA_WRITE_WITH_IMM opcodes only.
+    """
+    imm_data_exp = []
+
+    for i in range(iterations):
+        recv_sge = SGE(test.server.mr.buf + (msg_size * i), msg_size, test.server.mr.lkey)
+        recv_wr = RecvWR(sg=[recv_sge], num_sge=1, wr_id=i)
+        test.server.mr.write(str(iterations - i - 1) * msg_size, msg_size, i * msg_size)
+        test.server.qp.post_recv(recv_wr)
+
+    for i in range(iterations):
+        send_sge = SGE(test.client.mr.buf + (msg_size * i), msg_size, test.client.mr.lkey)
+        send_wr = SendWR(opcode=opcode, num_sge=1, sg=[send_sge], wr_id=i)
+        if opcode == e.IBV_WR_RDMA_WRITE_WITH_IMM:
+            send_wr.imm_data = socket.htonl(i + iterations)
+            imm_data_exp.append(i + iterations)
+            send_wr.set_wr_rdma(int(test.client.rkey), int(test.client.raddr + i * msg_size))
+        test.client.mr.write(str(i % 10) * msg_size, msg_size, i * msg_size)
+        test.client.qp.post_send(send_wr)
+
+    send_id_order = poll_cq_ex(test.client.cq, iterations)
+    recv_id_order = poll_cq_ex(test.server.cq, iterations, data=imm_data_exp)
+    # With opcodes that don't consume Recv WQEs (e.g. WRITE and WRITE_WITH_IMM) the buffer
+    # scattering offsets are defined by the sender.
+    recv_id_order = send_id_order if opcode == e.IBV_WR_RDMA_WRITE_WITH_IMM else recv_id_order
+
+    for i, j in zip(recv_id_order, send_id_order):
+        exp_buff = bytearray((str(j % 10) * msg_size), 'utf-8')
+        recv_buff = test.server.mr.read(msg_size, i * msg_size)
+        if recv_buff != exp_buff:
+            raise PyverbsRDMAError(f'Data validation failed: expected {exp_buff},'
+                                   f' received {recv_buff}')
 
 
 def traffic(client, server, iters, gid_idx, port, is_cq_ex=False, send_op=e.IBV_WR_SEND,
@@ -764,8 +842,9 @@ def traffic(client, server, iters, gid_idx, port, is_cq_ex=False, send_op=e.IBV_
             poll(client.cq)
             poll(server.cq, data=imm_data)
             post_recv(server, s_recv_wr, qp_idx=qp_idx)
-            msg_received = server.mr.read(server.msg_size, read_offset)
-            validate(msg_received, True, server.msg_size)
+            msg_received_list = get_msg_received(server, read_offset)
+            for msg in msg_received_list:
+                validate(msg, True, server.msg_size)
             s_send_wr, s_sg = get_send_elements(server, True, send_op)
             if server.use_mr_prefetch:
                 flags = e._IBV_ADVISE_MR_FLAG_FLUSH
@@ -779,8 +858,16 @@ def traffic(client, server, iters, gid_idx, port, is_cq_ex=False, send_op=e.IBV_
             poll(server.cq)
             poll(client.cq, data=imm_data)
             post_recv(client, c_recv_wr, qp_idx=qp_idx)
-            msg_received = client.mr.read(client.msg_size, read_offset)
-            validate(msg_received, False, client.msg_size)
+            msg_received_list = get_msg_received(client,read_offset)
+            for msg in msg_received_list:
+                validate(msg, False, server.msg_size)
+
+
+def get_msg_received(agr_obj, read_offset):
+    msg_received_list = [agr_obj.mr.read(agr_obj.msg_size, read_offset)]
+    if hasattr(agr_obj, 'use_mixed_mr') and agr_obj.use_mixed_mr:
+        msg_received_list.append(agr_obj.non_odp_mr.read(agr_obj.msg_size, read_offset))
+    return msg_received_list
 
 
 def gen_ethernet_header(dst_mac=PacketConsts.DST_MAC, src_mac=PacketConsts.SRC_MAC,
@@ -1343,9 +1430,20 @@ def xrc_traffic(client, server, is_cq_ex=False, send_op=None, force_page_faults=
 def requires_odp(qp_type, required_odp_caps):
     def outer(func):
         def inner(instance):
-            odp_supported(instance.ctx, qp_type, required_odp_caps)
+            ctx = getattr(instance, 'ctx', d.Context(name=instance.dev_name))
+            odp_supported(ctx, qp_type, required_odp_caps)
             if getattr(instance, 'is_implicit', False):
                 odp_implicit_supported(instance.ctx)
+            return func(instance)
+        return inner
+    return outer
+
+
+def requires_root():
+    def outer(func):
+        def inner(instance):
+            if not is_root():
+                raise unittest.SkipTest('Must be run by root')
             return func(instance)
         return inner
     return outer
@@ -1402,6 +1500,30 @@ def odp_implicit_supported(ctx):
     has_odp_implicit = odp_caps.general_caps & e.IBV_ODP_SUPPORT_IMPLICIT
     if has_odp_implicit == 0:
         raise unittest.SkipTest('ODP implicit is not supported')
+
+
+def odp_v2_supported(ctx):
+    """
+    ODPv2 check
+    :return: True/False if ODPv2 supported
+    """
+    from tests.mlx5_prm_structs import QueryHcaCapIn, QueryOdpCapOut, DevxOps, QueryHcaCapMod
+    query_cap_in = QueryHcaCapIn(op_mod=DevxOps.MLX5_CMD_OP_QUERY_ODP_CAP << 1 | \
+                                        QueryHcaCapMod.CURRENT)
+    cmd_res = ctx.devx_general_cmd(query_cap_in, len(QueryOdpCapOut()))
+    query_cap_out = QueryOdpCapOut(cmd_res)
+    if query_cap_out.status:
+        raise PyverbsRDMAError(f'QUERY_HCA_CAP has failed with status ({query_cap_out.status}) '
+                               f'and syndrome ({query_cap_out.syndrome})')
+    return query_cap_out.capability.mem_page_fault == 1
+
+
+def requires_odpv2(func):
+    def inner(instance):
+        if not odp_v2_supported(instance.ctx):
+            raise unittest.SkipTest('ODPv2 is not supported')
+        return func(instance)
+    return inner
 
 
 def get_pci_name(dev_name):
@@ -1667,3 +1789,11 @@ def high_rate_send(agr_obj, packet, rate_limit, timeout=2):
     # Calculate the rate
     rate = agr_obj.msg_size * iterations / timeout / 1000000
     assert rate > rate_limit, 'Traffic rate is smaller than minimal rate for the test'
+
+
+def get_pkey_from_kernel(device, port=1, index=0):
+    path = f'/sys/class/infiniband/{device}/ports/{port}/pkeys/{index}'
+    output = subprocess.check_output(['cat', path], universal_newlines=True)
+    pkey_hex = output.strip()
+    pkey_decimal = int(pkey_hex, 16)
+    return pkey_decimal

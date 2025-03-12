@@ -100,10 +100,10 @@ Debugging flags
 ---------------
 
 .. include:: common/opt_h.rst
-.. include:: common/opt_d.rst
+.. include:: common/opt_debug.rst
 .. include:: common/opt_e.rst
 .. include:: common/opt_K.rst
-.. include:: common/opt_v.rst
+.. include:: common/opt_verbose.rst
 .. include:: common/opt_V.rst
 
 FILES
@@ -115,6 +115,7 @@ EXAMPLES
 ========
 
 ::
+
         ibportstate -C qib0 -P 1 3 1 disable     # by CA name, CA Port Number, lid, physical port number
         ibportstate -C qib0 -P 1 3 1 enable      # by CA name, CA Port Number, lid, physical port number
         ibportstate -D 0 1                       # (query) by direct route

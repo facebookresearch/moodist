@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause */
 /*
- * Copyright 2019-2022 Amazon.com, Inc. or its affiliates. All rights reserved.
+ * Copyright 2019-2025 Amazon.com, Inc. or its affiliates. All rights reserved.
  */
 
 #ifndef __EFA_H__
@@ -70,6 +70,7 @@ struct efa_cq {
 	uint8_t *buf;
 	size_t buf_size;
 	uint32_t *db;
+	uint8_t *db_mmap_addr;
 	uint16_t cc; /* Consumer Counter */
 	uint8_t cmd_sn;
 	uint16_t num_sub_cqs;
@@ -78,6 +79,7 @@ struct efa_cq {
 	pthread_spinlock_t lock;
 	struct efa_wq *cur_wq;
 	struct efa_io_cdesc_common *cur_cqe;
+	struct ibv_device *dev;
 	struct efa_sub_cq sub_cq_arr[];
 };
 
@@ -136,6 +138,7 @@ struct efa_qp {
 	int page_size;
 	int sq_sig_all;
 	int wr_session_err;
+	struct ibv_device *dev;
 };
 
 struct efa_mr {

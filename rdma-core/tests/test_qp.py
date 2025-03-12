@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
 # Copyright (c) 2019 Mellanox Technologies, Inc. All rights reserved. See COPYING file
 # Copyright (c) 2020 Kamal Heib <kamalheib1@gmail.com>, All rights reserved.  See COPYING file
-# Copyright 2020-2022 Amazon.com, Inc. or its affiliates. All rights reserved.
+# Copyright 2020-2023 Amazon.com, Inc. or its affiliates. All rights reserved.
 
 """
 Test module for pyverbs' qp module.
@@ -12,8 +12,8 @@ import errno
 import os
 
 from pyverbs.pyverbs_error import PyverbsRDMAError
-from pyverbs.qp import QPInitAttr, QPAttr, QP
-from tests.base import PyverbsAPITestCase
+from pyverbs.qp import QPAttr, QP
+from tests.base import PyverbsAPITestCase, RDMATestCase, RCResources
 import pyverbs.utils as pu
 import pyverbs.device as d
 import pyverbs.enums as e
@@ -316,7 +316,12 @@ class QPTest(PyverbsAPITestCase):
                 qia.qp_type = e.IBV_QPT_UD
                 qp = self.create_qp(pd, qia, False, True, self.ib_port)
                 is_data_in_order = qp.query_data_in_order(e.IBV_WR_SEND)
-                self.assertIn(is_data_in_order, [0, 1], 'Data in order result is not valid')
+                self.assertIn(is_data_in_order, [0, 1], 'Data in order result with flags=0 is not valid')
+                is_data_in_order = qp.query_data_in_order(e.IBV_WR_SEND,e.IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS)
+                valid_results = [0,
+                                e.IBV_QUERY_QP_DATA_IN_ORDER_ALIGNED_128_BYTES,
+                                e.IBV_QUERY_QP_DATA_IN_ORDER_WHOLE_MSG | e.IBV_QUERY_QP_DATA_IN_ORDER_ALIGNED_128_BYTES]
+                self.assertIn(is_data_in_order, valid_results, 'Data in order result with flags=1 is not valid')
 
     @u.skip_unsupported
     def test_modify_ud_qp(self):
@@ -359,6 +364,29 @@ class QPTest(PyverbsAPITestCase):
                 qa.qp_state = e.IBV_QPS_RESET
                 qp.modify(qa, e.IBV_QP_STATE)
                 assert qp.qp_state == e.IBV_QPS_RESET, 'Extended QP, QP state is not as expected'
+
+
+class RCQPTest(RDMATestCase):
+    """
+    Test various functionalities of the RC QP class.
+    """
+    def test_modify_rc_qp_rd_atomic(self):
+        """
+        This test verifies that the values of rd_atomic fields are
+        at least the requested value.
+        """
+        self.max_rd_atomic = 12
+        self.max_dest_rd_atomic = 12
+
+        self.create_players(RCResources, max_rd_atomic=self.max_rd_atomic,
+                            max_dest_rd_atomic=self.max_dest_rd_atomic)
+
+        qp_attr, _ = self.server.qp.query(e.IBV_QP_MAX_QP_RD_ATOMIC | e.IBV_QP_MAX_DEST_RD_ATOMIC)
+
+        self.assertGreaterEqual(qp_attr.max_rd_atomic, self.max_rd_atomic,
+                                'Max RD Atomic value is less than requested.')
+        self.assertGreaterEqual(qp_attr.max_dest_rd_atomic, self.max_dest_rd_atomic,
+                                'Max Dest RD Atomic is less than requested.')
 
 
 def get_qp_init_attr_ex(cq, pd, attr, attr_ex, qpt):

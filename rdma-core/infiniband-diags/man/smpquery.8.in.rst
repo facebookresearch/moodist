@@ -81,10 +81,10 @@ Port Selection flags
 Debugging flags
 ---------------
 
-.. include:: common/opt_d.rst
+.. include:: common/opt_debug.rst
 .. include:: common/opt_e.rst
 .. include:: common/opt_h.rst
-.. include:: common/opt_v.rst
+.. include:: common/opt_verbose.rst
 .. include:: common/opt_V.rst
 
 
@@ -110,6 +110,7 @@ EXAMPLES
 ========
 
 ::
+
         smpquery portinfo 3 1                     # portinfo by lid, with port modifier
         smpquery -G switchinfo 0x2C9000100D051 1  # switchinfo by guid
         smpquery -D nodeinfo 0                    # nodeinfo by direct route

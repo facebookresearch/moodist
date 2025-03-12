@@ -111,7 +111,7 @@ static void print_port(ibnd_node_t *node, ibnd_port_t *port,
 	char width_msg[256];
 	char speed_msg[256];
 	char ext_port_str[256];
-	int iwidth, ispeed, fdr10, espeed, istate, iphystate, cap_mask;
+	int iwidth, ispeed, fdr10, espeed, istate, iphystate;
 	int n = 0;
 	uint8_t *info = NULL;
 	int rc;
@@ -132,12 +132,7 @@ static void print_port(ibnd_node_t *node, ibnd_port_t *port,
 		info = (uint8_t *)&port->info;
 
 	if (info) {
-		cap_mask = mad_get_field(info, 0, IB_PORT_CAPMASK_F);
-		if (cap_mask & be32toh(IB_PORT_CAP_HAS_EXT_SPEEDS))
-			espeed = mad_get_field(port->info, 0,
-					       IB_PORT_LINK_SPEED_EXT_ACTIVE_F);
-		else
-			espeed = 0;
+		espeed = ibnd_get_agg_linkspeedext(info, port->info);
 	} else {
 		ispeed = 0;
 		iwidth = 0;
@@ -169,8 +164,7 @@ static void print_port(ibnd_node_t *node, ibnd_port_t *port,
 				mad_dump_val(IB_PORT_LINK_SPEED_ACTIVE_F, speed,
 					     64, &ispeed);
 		} else
-			mad_dump_val(IB_PORT_LINK_SPEED_EXT_ACTIVE_F, speed,
-				     64, &espeed);
+			ibnd_dump_agg_linkspeedext(speed, 64, espeed);
 
 		n = snprintf(link_str, 256, "(%3s %18s %6s/%8s)",
 		     mad_dump_val(IB_PORT_LINK_WIDTH_ACTIVE_F, width, 64,
@@ -599,6 +593,7 @@ int main(int argc, char **argv)
 	ibnd_fabric_t *fabric = NULL;
 	ibnd_fabric_t *diff_fabric = NULL;
 	struct ibmad_port *ibmad_port;
+	struct ibmad_ports_pair *ibmad_ports;
 	ib_portid_t port_id = { 0 };
 	uint8_t ni[IB_SMP_DATA_SIZE] = { 0 };
 	int mgmt_classes[3] =
@@ -646,7 +641,14 @@ int main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	ibmad_port = mad_rpc_open_port(ibd_ca, ibd_ca_port, mgmt_classes, 3);
+	ibmad_ports = mad_rpc_open_port2(ibd_ca, ibd_ca_port, mgmt_classes, 3, 1);
+	if (!ibmad_ports) {
+		fprintf(stderr, "Failed to open %s port %d\n", ibd_ca,
+			ibd_ca_port);
+		exit(1);
+	}
+
+	ibmad_port = ibmad_ports->smi.port;
 	if (!ibmad_port) {
 		fprintf(stderr, "Failed to open %s port %d\n", ibd_ca,
 			ibd_ca_port);
@@ -666,7 +668,7 @@ int main(int argc, char **argv)
 	node_name_map = open_node_name_map(node_name_map_file);
 
 	if (dr_path && load_cache_file) {
-		mad_rpc_close_port(ibmad_port);
+		mad_rpc_close_port2(ibmad_ports);
 		fprintf(stderr, "Cannot specify cache and direct route path\n");
 		exit(1);
 	}
@@ -674,14 +676,14 @@ int main(int argc, char **argv)
 	if (dr_path) {
 		/* only scan part of the fabric */
 		if ((resolved =
-		     resolve_portid_str(ibd_ca, ibd_ca_port, &port_id, dr_path,
-					IB_DEST_DRPATH, NULL, ibmad_port)) < 0)
+		     resolve_portid_str(ibmad_ports->gsi.ca_name, ibd_ca_port, &port_id, dr_path,
+					IB_DEST_DRPATH, NULL, ibmad_ports->gsi.port)) < 0)
 			IBWARN("Failed to resolve %s; attempting full scan",
 			       dr_path);
 	} else if (node_label.guid_str) {
 		if ((resolved = resolve_portid_str(
-			     ibd_ca, ibd_ca_port, &port_id, node_label.guid_str,
-			     IB_DEST_GUID, NULL, ibmad_port)) < 0)
+			     ibmad_ports->gsi.ca_name, ibd_ca_port, &port_id, node_label.guid_str,
+			     IB_DEST_GUID, NULL, ibmad_ports->gsi.port)) < 0)
 			IBWARN("Failed to resolve %s; attempting full scan\n",
 			       node_label.guid_str);
 	}
@@ -689,12 +691,12 @@ int main(int argc, char **argv)
 	if (!all && dr_path) {
 		if (!smp_query_via(ni, &port_id, IB_ATTR_NODE_INFO, 0,
 				   ibd_timeout, ibmad_port)){
-			mad_rpc_close_port(ibmad_port);
+			mad_rpc_close_port2(ibmad_ports);
 			fprintf(stderr, "Failed to get local Node Info\n");
 			exit(1);
 		}
 	}
-	mad_rpc_close_port(ibmad_port);
+	mad_rpc_close_port2(ibmad_ports);
 
 	if (diff_cache_file &&
 	    !(diff_fabric = ibnd_load_fabric(diff_cache_file, 0)))

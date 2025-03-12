@@ -25,9 +25,6 @@ DECLARE_DRV_CMD(mana_alloc_ucontext, IB_USER_VERBS_CMD_GET_CONTEXT, empty,
 
 DECLARE_DRV_CMD(mana_alloc_pd, IB_USER_VERBS_CMD_ALLOC_PD, empty, empty);
 
-DECLARE_DRV_CMD(mana_create_cq, IB_USER_VERBS_CMD_CREATE_CQ, mana_ib_create_cq,
-		empty);
-
 static const struct verbs_match_ent hca_table[] = {
 	VERBS_DRIVER_ID(RDMA_DRIVER_MANA),
 	{},
@@ -36,6 +33,18 @@ static const struct verbs_match_ent hca_table[] = {
 struct mana_context *to_mctx(struct ibv_context *ibctx)
 {
 	return container_of(ibctx, struct mana_context, ibv_ctx.context);
+}
+
+void *mana_alloc_mem(uint32_t size)
+{
+	void *buf;
+
+	buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (buf == MAP_FAILED)
+		return NULL;
+	return buf;
 }
 
 int mana_query_device_ex(struct ibv_context *context,
@@ -104,7 +113,7 @@ mana_alloc_parent_domain(struct ibv_context *context,
 		verbs_err(
 			verbs_get_ctx(context),
 			"This driver supports IBV_PARENT_DOMAIN_INIT_ATTR_PD_CONTEXT only\n");
-		errno = EINVAL;
+		errno = EOPNOTSUPP;
 		return NULL;
 	}
 
@@ -149,6 +158,29 @@ int mana_dealloc_pd(struct ibv_pd *ibpd)
 	return 0;
 }
 
+struct ibv_mr *mana_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+				  size_t length, uint64_t iova, int fd,
+				  int access)
+{
+	struct verbs_mr *vmr;
+	int ret;
+
+	vmr = calloc(1, sizeof(*vmr));
+	if (!vmr)
+		return NULL;
+
+	ret = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, vmr, NULL);
+	if (ret) {
+		verbs_err(verbs_get_ctx(pd->context),
+			  "Failed to register dma-buf MR\n");
+		errno = ret;
+		free(vmr);
+		return NULL;
+	}
+
+	return &vmr->ibv_mr;
+}
+
 struct ibv_mr *mana_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 			   uint64_t hca_va, int access)
 {
@@ -189,137 +221,45 @@ int mana_dereg_mr(struct verbs_mr *vmr)
 	return 0;
 }
 
-struct ibv_cq *mana_create_cq(struct ibv_context *context, int cqe,
-			      struct ibv_comp_channel *channel, int comp_vector)
-{
-	struct mana_context *ctx = to_mctx(context);
-	struct mana_cq *cq;
-	struct mana_create_cq cmd = {};
-	struct mana_create_cq_resp resp = {};
-	struct mana_ib_create_cq *cmd_drv;
-	int cq_size;
-	int ret;
-
-	if (cqe > MAX_SEND_BUFFERS_PER_QUEUE) {
-		verbs_err(verbs_get_ctx(context), "CQE %d exceeding limit\n",
-			  cqe);
-		errno = EINVAL;
-		return NULL;
-	}
-
-	if (!ctx->extern_alloc.alloc || !ctx->extern_alloc.free) {
-		/*
-		 * This version of driver doesn't support allocating buffers
-		 * in rdma-core.
-		 */
-		verbs_err(verbs_get_ctx(context),
-			  "Allocating core buffers for CQ is not supported\n");
-		errno = EINVAL;
-		return NULL;
-	}
-
-	cq = calloc(1, sizeof(*cq));
-	if (!cq)
-		return NULL;
-
-	cq_size = cqe * COMP_ENTRY_SIZE;
-	cq_size = roundup_pow_of_two(cq_size);
-	cq_size = align(cq_size, MANA_PAGE_SIZE);
-
-	cq->buf = ctx->extern_alloc.alloc(cq_size, ctx->extern_alloc.data);
-	if (!cq->buf) {
-		errno = ENOMEM;
-		goto free_cq;
-	}
-	cq->cqe = cqe;
-
-	cmd_drv = &cmd.drv_payload;
-	cmd_drv->buf_addr = (uintptr_t)cq->buf;
-
-	ret = ibv_cmd_create_cq(context, cq->cqe, channel, comp_vector,
-				&cq->ibcq, &cmd.ibv_cmd, sizeof(cmd),
-				&resp.ibv_resp, sizeof(resp));
-
-	if (ret) {
-		verbs_err(verbs_get_ctx(context), "Failed to Create CQ\n");
-		ctx->extern_alloc.free(cq->buf, ctx->extern_alloc.data);
-		errno = ret;
-		goto free_cq;
-	}
-
-	return &cq->ibcq;
-
-free_cq:
-	free(cq);
-	return NULL;
-}
-
-int mana_destroy_cq(struct ibv_cq *ibcq)
-{
-	int ret;
-	struct mana_cq *cq = container_of(ibcq, struct mana_cq, ibcq);
-	struct mana_context *ctx = to_mctx(ibcq->context);
-
-	if (!ctx->extern_alloc.free) {
-		/*
-		 * This version of driver doesn't support allocating buffers
-		 * in rdma-core. It's not possible to reach the code here.
-		 */
-		verbs_err(verbs_get_ctx(ibcq->context),
-			  "Invalid external context in destroy CQ\n");
-		return -EINVAL;
-	}
-
-	ret = ibv_cmd_destroy_cq(ibcq);
-	if (ret) {
-		verbs_err(verbs_get_ctx(ibcq->context),
-			  "Failed to Destroy CQ\n");
-		return ret;
-	}
-
-	ctx->extern_alloc.free(cq->buf, ctx->extern_alloc.data);
-	free(cq);
-
-	return ret;
-}
-
-static int mana_poll_cq(struct ibv_cq *ibcq, int nwc, struct ibv_wc *wc)
-{
-	/* This version of driver supports RAW QP only.
-	 * Polling CQ is done directly in the application.
-	 */
-	return EOPNOTSUPP;
-}
-
-static int mana_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
-			  struct ibv_recv_wr **bad)
-{
-	/* This version of driver supports RAW QP only.
-	 * Posting WR is done directly in the application.
-	 */
-	return EOPNOTSUPP;
-}
-
-static int mana_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
-			  struct ibv_send_wr **bad)
-{
-	/* This version of driver supports RAW QP only.
-	 * Posting WR is done directly in the application.
-	 */
-	return EOPNOTSUPP;
-}
-
 static void mana_free_context(struct ibv_context *ibctx)
 {
 	struct mana_context *context = to_mctx(ibctx);
+	int i;
+
+	for (i = 0; i < MANA_QP_TABLE_SIZE; ++i) {
+		if (context->qp_stable[i].refcnt)
+			free(context->qp_stable[i].table);
+		if (context->qp_rtable[i].refcnt)
+			free(context->qp_rtable[i].table);
+	}
+	pthread_mutex_destroy(&context->qp_table_mutex);
 
 	munmap(context->db_page, DOORBELL_PAGE_SIZE);
 	verbs_uninit_context(&context->ibv_ctx);
 	free(context);
 }
 
+static void mana_async_event(struct ibv_context *context,
+			     struct ibv_async_event *event)
+{
+	struct ibv_qp *ibvqp;
+
+	switch (event->event_type) {
+	case IBV_EVENT_QP_FATAL:
+	case IBV_EVENT_QP_REQ_ERR:
+	case IBV_EVENT_QP_ACCESS_ERR:
+	case IBV_EVENT_PATH_MIG_ERR:
+		ibvqp = event->element.qp;
+		mana_qp_move_flush_err(ibvqp);
+		break;
+	default:
+		break;
+	}
+}
+
 static const struct verbs_context_ops mana_ctx_ops = {
 	.alloc_pd = mana_alloc_pd,
+	.async_event = mana_async_event,
 	.alloc_parent_domain = mana_alloc_parent_domain,
 	.create_cq = mana_create_cq,
 	.create_qp = mana_create_qp,
@@ -340,7 +280,9 @@ static const struct verbs_context_ops mana_ctx_ops = {
 	.post_send = mana_post_send,
 	.query_device_ex = mana_query_device_ex,
 	.query_port = mana_query_port,
+	.reg_dmabuf_mr = mana_reg_dmabuf_mr,
 	.reg_mr = mana_reg_mr,
+	.req_notify_cq = mana_arm_cq,
 };
 
 static struct verbs_device *mana_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
@@ -365,7 +307,7 @@ static void mana_uninit_device(struct verbs_device *verbs_device)
 static struct verbs_context *mana_alloc_context(struct ibv_device *ibdev,
 						int cmd_fd, void *private_data)
 {
-	int ret;
+	int ret, i;
 	struct mana_context *context;
 	struct mana_alloc_ucontext_resp resp;
 	struct ibv_get_context cmd;
@@ -376,7 +318,7 @@ static struct verbs_context *mana_alloc_context(struct ibv_device *ibdev,
 		return NULL;
 
 	ret = ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd),
-				  &resp.ibv_resp, sizeof(resp));
+				  NULL, &resp.ibv_resp, sizeof(resp));
 	if (ret) {
 		verbs_err(&context->ibv_ctx, "Failed to get ucontext\n");
 		errno = ret;
@@ -384,6 +326,12 @@ static struct verbs_context *mana_alloc_context(struct ibv_device *ibdev,
 	}
 
 	verbs_set_ops(&context->ibv_ctx, &mana_ctx_ops);
+
+	pthread_mutex_init(&context->qp_table_mutex, NULL);
+	for (i = 0; i < MANA_QP_TABLE_SIZE; ++i) {
+		context->qp_stable[i].refcnt = 0;
+		context->qp_rtable[i].refcnt = 0;
+	}
 
 	context->db_page = mmap(NULL, DOORBELL_PAGE_SIZE, PROT_WRITE,
 				MAP_SHARED, context->ibv_ctx.context.cmd_fd, 0);

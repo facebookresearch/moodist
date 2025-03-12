@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
 # Copyright (c) 2018, Mellanox Technologies. All rights reserved. See COPYING file
 
-include 'libibverbs_enums.pxd'
+#cython: language_level=3
+
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
 from posix.time cimport timespec
+from pyverbs.libibverbs_enums cimport *
+
 
 cdef extern from 'infiniband/verbs.h':
 
@@ -187,6 +190,7 @@ cdef extern from 'infiniband/verbs.h':
         unsigned char           link_layer
         unsigned char           flags
         unsigned short          port_cap_flags2
+        unsigned int            active_speed_ex
 
     cdef struct ibv_comp_channel:
         ibv_context     *context
@@ -349,6 +353,10 @@ cdef extern from 'infiniband/verbs.h':
 
     cdef union qp_type:
         xrc             xrc
+
+    cdef struct ibv_fd_arr:
+        int        *arr
+        uint32_t    count
 
     cdef struct ibv_send_wr:
         unsigned long   wr_id
@@ -652,6 +660,7 @@ cdef extern from 'infiniband/verbs.h':
                       int index, ibv_gid *gid)
     int ibv_query_pkey(ibv_context *context, unsigned int port_num,
                        int index, uint16_t *pkey)
+    int ibv_get_pkey_index(ibv_context *context, unsigned int port_num, uint16_t pkey)
     ibv_pd *ibv_alloc_pd(ibv_context *context)
     int ibv_dealloc_pd(ibv_pd *pd)
     ibv_mr *ibv_reg_mr(ibv_pd *pd, void *addr, size_t length, int access)

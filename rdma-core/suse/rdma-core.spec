@@ -1,7 +1,7 @@
 #
 # spec file for package rdma-core
 #
-# Copyright (c) 2022 SUSE LLC
+# Copyright (c) 2025 SUSE LLC
 #
 # All modifications and additions to the file contributed by third parties
 # remain the property of their copyright owners, unless otherwise agreed
@@ -28,13 +28,14 @@
 
 %define         git_ver %{nil}
 Name:           rdma-core
-Version:        49.0
+Version:        57.0
 Release:        0
 Summary:        RDMA core userspace libraries and daemons
 License:        BSD-2-Clause OR GPL-2.0-only
 Group:          Productivity/Networking/Other
 
 %define efa_so_major    1
+%define hns_so_major    1
 %define verbs_so_major  1
 %define rdmacm_so_major 1
 %define umad_so_major   3
@@ -45,6 +46,7 @@ Group:          Productivity/Networking/Other
 %define mad_major       5
 
 %define  efa_lname    libefa%{efa_so_major}
+%define  hns_lname    libhns%{hns_so_major}
 %define  verbs_lname  libibverbs%{verbs_so_major}
 %define  rdmacm_lname librdmacm%{rdmacm_so_major}
 %define  umad_lname   libibumad%{umad_so_major}
@@ -159,6 +161,7 @@ Requires:       %{umad_lname} = %{version}-%{release}
 Requires:       %{verbs_lname} = %{version}-%{release}
 %if 0%{?dma_coherent}
 Requires:       %{efa_lname} = %{version}-%{release}
+Requires:       %{hns_lname} = %{version}-%{release}
 Requires:       %{mana_lname} = %{version}-%{release}
 Requires:       %{mlx4_lname} = %{version}-%{release}
 Requires:       %{mlx5_lname} = %{version}-%{release}
@@ -200,6 +203,7 @@ Requires:       %{name}%{?_isa} = %{version}-%{release}
 Obsoletes:      libcxgb4-rdmav2 < %{version}-%{release}
 Obsoletes:      libefa-rdmav2 < %{version}-%{release}
 Obsoletes:      libhfi1verbs-rdmav2 < %{version}-%{release}
+Obsoletes:      libhns-rdmav2 < %{version}-%{release}
 Obsoletes:      libipathverbs-rdmav2 < %{version}-%{release}
 Obsoletes:      libmana-rdmav2 < %{version}-%{release}
 Obsoletes:      libmlx4-rdmav2 < %{version}-%{release}
@@ -209,6 +213,7 @@ Obsoletes:      libocrdma-rdmav2 < %{version}-%{release}
 Obsoletes:      librxe-rdmav2 < %{version}-%{release}
 %if 0%{?dma_coherent}
 Requires:       %{efa_lname} = %{version}-%{release}
+Requires:       %{hns_lname} = %{version}-%{release}
 Requires:       %{mana_lname} = %{version}-%{release}
 Requires:       %{mlx4_lname} = %{version}-%{release}
 Requires:       %{mlx5_lname} = %{version}-%{release}
@@ -228,7 +233,7 @@ Device-specific plug-in ibverbs userspace drivers are included:
 - libcxgb4: Chelsio T4 iWARP HCA
 - libefa: Amazon Elastic Fabric Adapter
 - libhfi1: Intel Omni-Path HFI
-- libhns: HiSilicon Hip06 SoC
+- libhns: HiSilicon Hip08+ SoC
 - libipathverbs: QLogic InfiniPath HCA
 - libirdma: Intel Ethernet Connection RDMA
 - libmana: Microsoft Azure Network Adapter
@@ -255,6 +260,13 @@ Group:          System/Libraries
 
 %description -n %efa_lname
 This package contains the efa runtime library.
+
+%package -n %hns_lname
+Summary:        HNS runtime library
+Group:          System/Libraries
+
+%description -n %hns_lname
+This package contains the hns runtime library.
 
 %package -n %mana_lname
 Summary:        MANA runtime library
@@ -496,7 +508,9 @@ cd build
 LD_LIBRARY_PATH=./lib bin/ib_acme -D . -O
 install -D -m0644 ibacm_opts.cfg %{buildroot}%{_sysconfdir}/rdma/
 
+%if 0%{?suse_version} < 1600
 for service in rdma rdma-ndd ibacm iwpmd srp_daemon; do ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rc${service}; done
+%endif
 
 # Delete the package's init.d scripts
 rm -rf %{buildroot}/%{_initddir}/
@@ -507,6 +521,9 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 
 %post -n %efa_lname -p /sbin/ldconfig
 %postun -n %efa_lname -p /sbin/ldconfig
+
+%post -n %hns_lname -p /sbin/ldconfig
+%postun -n %hns_lname -p /sbin/ldconfig
 
 %post -n %mana_lname -p /sbin/ldconfig
 %postun -n %mana_lname -p /sbin/ldconfig
@@ -647,7 +664,9 @@ done
 %{_libexecdir}/mlx4-setup.sh
 %{_libexecdir}/truescale-serdes.cmds
 %license COPYING.*
+%if 0%{?suse_version} < 1600
 %{_sbindir}/rcrdma
+%endif
 
 %files devel
 %doc %{_docdir}/%{name}-%{version}/MAINTAINERS
@@ -668,10 +687,12 @@ done
 %{_mandir}/man7/rdma_cm.*
 %if 0%{?dma_coherent}
 %{_mandir}/man3/efadv*
+%{_mandir}/man3/hnsdv*
 %{_mandir}/man3/manadv*
 %{_mandir}/man3/mlx5dv*
 %{_mandir}/man3/mlx4dv*
 %{_mandir}/man7/efadv*
+%{_mandir}/man7/hnsdv*
 %{_mandir}/man7/manadv*
 %{_mandir}/man7/mlx5dv*
 %{_mandir}/man7/mlx4dv*
@@ -700,6 +721,10 @@ done
 %files -n %efa_lname
 %{_libdir}/libefa*.so.*
 
+%files -n %hns_lname
+%defattr(-,root,root)
+%{_libdir}/libhns*.so.*
+
 %files -n %mana_lname
 %{_libdir}/libmana*.so.*
 
@@ -726,7 +751,9 @@ done
 %{_unitdir}/ibacm.socket
 %dir %{_libdir}/ibacm
 %{_libdir}/ibacm/*
+%if 0%{?suse_version} < 1600
 %{_sbindir}/rcibacm
+%endif
 %doc %{_docdir}/%{name}-%{version}/ibacm.md
 
 %files -n infiniband-diags
@@ -799,7 +826,9 @@ done
 %dir %{_sysconfdir}/rdma
 %dir %{_sysconfdir}/rdma/modules
 %{_sbindir}/iwpmd
+%if 0%{?suse_version} < 1600
 %{_sbindir}/rciwpmd
+%endif
 %{_unitdir}/iwpmd.service
 %config(noreplace) %{_sysconfdir}/rdma/modules/iwpmd.conf
 %config(noreplace) %{_sysconfdir}/iwpmd.conf
@@ -860,7 +889,9 @@ done
 %{_sbindir}/ibsrpdm
 %{_sbindir}/srp_daemon
 %{_sbindir}/run_srp_daemon
+%if 0%{?suse_version} < 1600
 %{_sbindir}/rcsrp_daemon
+%endif
 %{_mandir}/man5/srp_daemon.service.5*
 %{_mandir}/man5/srp_daemon_port@.service.5*
 %{_mandir}/man8/ibsrpdm.8*
@@ -869,7 +900,9 @@ done
 
 %files -n rdma-ndd
 %{_sbindir}/rdma-ndd
+%if 0%{?suse_version} < 1600
 %{_sbindir}/rcrdma-ndd
+%endif
 %{_unitdir}/rdma-ndd.service
 %{_mandir}/man8/rdma-ndd.8*
 %{_udevrulesdir}/60-rdma-ndd.rules

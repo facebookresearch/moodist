@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved
  */
@@ -14,7 +14,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <string.h>
+#include <libgen.h>
 #include <sys/param.h>
 #include <linux/vfio.h>
 #include <sys/eventfd.h>
@@ -1040,12 +1040,15 @@ static int mlx5_vfio_get_iommu_info(struct mlx5_vfio_context *ctx)
 		goto end;
 
 	if (info->argsz > sizeof(*info)) {
-		info = realloc(info, info->argsz);
-		if (!info) {
+		struct vfio_iommu_type1_info *tmp;
+
+		tmp = realloc(info, info->argsz);
+		if (!tmp) {
 			errno = ENOMEM;
 			ret = -1;
 			goto end;
 		}
+		info = tmp;
 
 		ret = ioctl(ctx->container_fd, VFIO_IOMMU_GET_INFO, info);
 		if (ret)

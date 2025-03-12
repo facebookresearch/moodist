@@ -83,6 +83,7 @@ const struct verbs_match_ent mlx5_hca_table[] = {
 	HCA(MELLANOX, 0x101f),	/* ConnectX-6 LX */
 	HCA(MELLANOX, 0x1021),  /* ConnectX-7 */
 	HCA(MELLANOX, 0x1023),  /* ConnectX-8 */
+	HCA(MELLANOX, 0x1025),  /* ConnectX-9 */
 	HCA(MELLANOX, 0xa2d2),	/* BlueField integrated ConnectX-5 network controller */
 	HCA(MELLANOX, 0xa2d3),	/* BlueField integrated ConnectX-5 network controller VF */
 	HCA(MELLANOX, 0xa2d6),  /* BlueField-2 integrated ConnectX-6 Dx network controller */
@@ -739,13 +740,15 @@ static int single_threaded_app(void)
 static int mlx5_cmd_get_context(struct mlx5_context *context,
 				struct mlx5_alloc_ucontext *req,
 				size_t req_len,
+				struct ibv_fd_arr *fds,
 				struct mlx5_alloc_ucontext_resp *resp,
 				size_t resp_len)
 {
 	struct verbs_context *verbs_ctx = &context->ibv_ctx;
 
 	if (!ibv_cmd_get_context(verbs_ctx, &req->ibv_cmd,
-				 req_len, &resp->ibv_resp, resp_len))
+				 req_len, fds, &resp->ibv_resp,
+				 resp_len))
 		return 0;
 
 	/* The ibv_cmd_get_context fails in older kernels when passing
@@ -769,13 +772,13 @@ static int mlx5_cmd_get_context(struct mlx5_context *context,
 	 */
 	if (!ibv_cmd_get_context(verbs_ctx, &req->ibv_cmd,
 				 offsetof(struct mlx5_alloc_ucontext, lib_caps),
-				 &resp->ibv_resp, resp_len))
+				 fds, &resp->ibv_resp, resp_len))
 		return 0;
 
 	return ibv_cmd_get_context(verbs_ctx, &req->ibv_cmd,
 				   offsetof(struct mlx5_alloc_ucontext,
 					    max_cqe_version),
-				   &resp->ibv_resp, resp_len);
+				   fds, &resp->ibv_resp, resp_len);
 }
 
 static int mlx5_map_internal_clock(struct mlx5_device *mdev,
@@ -971,6 +974,20 @@ static int _mlx5dv_query_device(struct ibv_context *ctx_in,
 		comp_mask_out |= MLX5DV_CONTEXT_MASK_MAX_DC_RD_ATOM;
 	}
 
+	if (attrs_out->comp_mask & MLX5DV_CONTEXT_MASK_REG_C0) {
+		if (mctx->reg_c0.mask) {
+			attrs_out->reg_c0 = mctx->reg_c0;
+			comp_mask_out |= MLX5DV_CONTEXT_MASK_REG_C0;
+		}
+	}
+
+	if (attrs_out->comp_mask & MLX5DV_CONTEXT_MASK_OOO_RECV_WRS) {
+		if (mctx->vendor_cap_flags & MLX5_VENDOR_CAP_FLAGS_OOO_DP) {
+			attrs_out->ooo_recv_wrs_caps = mctx->ooo_recv_wrs_caps;
+			comp_mask_out |= MLX5DV_CONTEXT_MASK_OOO_RECV_WRS;
+		}
+	}
+
 	attrs_out->comp_mask = comp_mask_out;
 
 	return 0;
@@ -1130,6 +1147,14 @@ static int mlx5dv_get_pd(struct ibv_pd *pd_in,
 
 	pd_out->comp_mask = 0;
 	pd_out->pdn = mpd->pdn;
+
+	return 0;
+}
+
+static int mlx5dv_get_devx(struct mlx5dv_devx_obj *devx_in,
+			   struct mlx5dv_devx *devx_out)
+{
+	devx_out->handle = devx_in->handle;
 
 	return 0;
 }
@@ -2068,6 +2093,8 @@ static int _mlx5dv_init_obj(struct mlx5dv_obj *obj, uint64_t obj_type)
 		ret = mlx5dv_get_av(obj->ah.in, obj->ah.out);
 	if (!ret && (obj_type & MLX5DV_OBJ_PD))
 		ret = mlx5dv_get_pd(obj->pd.in, obj->pd.out);
+	if (!ret && (obj_type & MLX5DV_OBJ_DEVX))
+		ret = mlx5dv_get_devx(obj->devx.in, obj->devx.out);
 
 	return ret;
 }
@@ -2089,6 +2116,8 @@ get_context_from_obj(struct mlx5dv_obj *obj, uint64_t obj_type)
 		return obj->ah.in->context;
 	if (obj_type & MLX5DV_OBJ_PD)
 		return obj->pd.in->context;
+	if (obj_type & MLX5DV_OBJ_DEVX)
+		return obj->devx.in->context;
 
 	return NULL;
 }
@@ -2585,6 +2614,7 @@ static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 	struct mlx5_alloc_ucontext_resp resp = {};
 	struct mlx5dv_context_attr      *ctx_attr = private_data;
 	bool				always_devx = false;
+	struct ibv_fd_arr               *fds = NULL;
 	int ret;
 
 	context = mlx5_init_context(ibdev, cmd_fd);
@@ -2592,8 +2622,12 @@ static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 		return NULL;
 
 	if (ctx_attr && ctx_attr->comp_mask) {
-		errno = EINVAL;
-		goto err;
+		if (!check_comp_mask(ctx_attr->comp_mask,
+				     MLX5DV_CONTEXT_ATTR_MASK_FD_ARRAY)) {
+			errno = EINVAL;
+			goto err;
+		}
+		fds = ctx_attr->fds;
 	}
 
 	req.total_num_bfregs = context->tot_uuars;
@@ -2615,7 +2649,7 @@ static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 	}
 
 retry_open:
-	if (mlx5_cmd_get_context(context, &req, sizeof(req), &resp,
+	if (mlx5_cmd_get_context(context, &req, sizeof(req), fds, &resp,
 				 sizeof(resp))) {
 		if (always_devx) {
 			req.flags &= ~MLX5_IB_ALLOC_UCTX_DEVX;

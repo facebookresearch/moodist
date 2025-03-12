@@ -141,9 +141,9 @@ static struct verbs_context *mlx4_alloc_context(struct ibv_device *ibdev,
 {
 	struct mlx4_context	       *context;
 	struct ibv_get_context		cmd;
-	struct mlx4_alloc_ucontext_resp resp;
+	struct mlx4_alloc_ucontext_resp resp = {};
 	int				i;
-	struct mlx4_alloc_ucontext_v3_resp resp_v3;
+	struct mlx4_alloc_ucontext_v3_resp resp_v3 = {};
 	__u16				bf_reg_size;
 	struct mlx4_device              *dev = to_mdev(ibdev);
 	struct verbs_context		*verbs_ctx;
@@ -157,7 +157,8 @@ static struct verbs_context *mlx4_alloc_context(struct ibv_device *ibdev,
 
 	if (dev->abi_version <= MLX4_UVERBS_NO_DEV_CAPS_ABI_VERSION) {
 		if (ibv_cmd_get_context(verbs_ctx, &cmd, sizeof(cmd),
-					&resp_v3.ibv_resp, sizeof(resp_v3)))
+					NULL, &resp_v3.ibv_resp,
+					sizeof(resp_v3)))
 			goto failed;
 
 		context->num_qps  = resp_v3.qp_tab_size;
@@ -165,7 +166,7 @@ static struct verbs_context *mlx4_alloc_context(struct ibv_device *ibdev,
 		context->cqe_size = sizeof (struct mlx4_cqe);
 	} else  {
 		if (ibv_cmd_get_context(verbs_ctx, &cmd, sizeof(cmd),
-					&resp.ibv_resp, sizeof(resp)))
+					NULL, &resp.ibv_resp, sizeof(resp)))
 			goto failed;
 
 		context->num_qps  = resp.qp_tab_size;

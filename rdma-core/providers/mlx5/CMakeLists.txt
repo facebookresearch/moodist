@@ -10,8 +10,13 @@ if (MLX5_MW_DEBUG)
   add_definitions("-DMW_DEBUG")
 endif()
 
+if (ENABLE_LTTNG AND LTTNGUST_FOUND)
+  set(TRACE_FILE mlx5_trace.c)
+endif()
+
 rdma_shared_provider(mlx5 libmlx5.map
-  1 1.24.${PACKAGE_VERSION}
+  1 1.25.${PACKAGE_VERSION}
+  ${TRACE_FILE}
   buf.c
   cq.c
   dbrec.c
@@ -28,6 +33,7 @@ rdma_shared_provider(mlx5 libmlx5.map
   dr_ste_v0.c
   dr_ste_v1.c
   dr_ste_v2.c
+  dr_ste_v3.c
   dr_table.c
   dr_send.c
   dr_vports.c
@@ -47,3 +53,8 @@ publish_headers(infiniband
 )
 
 rdma_pkg_config("mlx5" "libibverbs" "${CMAKE_THREAD_LIBS_INIT}")
+
+if (ENABLE_LTTNG AND LTTNGUST_FOUND)
+	target_include_directories(mlx5 PUBLIC ".")
+	target_link_libraries(mlx5 LINK_PRIVATE LTTng::UST)
+endif()

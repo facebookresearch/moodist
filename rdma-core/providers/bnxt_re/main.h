@@ -62,6 +62,9 @@
 #define CHIP_NUM_57508		0x1750
 #define CHIP_NUM_57504		0x1751
 #define CHIP_NUM_57502		0x1752
+#define CHIP_NUM_58818          0xd818
+#define CHIP_NUM_57608          0x1760
+
 #define BNXT_RE_MAX_DO_PACING	0xFFFF
 #define BNXT_NSEC_PER_SEC	1000000000UL
 #define BNXT_RE_PAGE_MASK(pg_size) (~((__u64)(pg_size) - 1))
@@ -70,7 +73,8 @@ struct bnxt_re_chip_ctx {
 	__u16 chip_num;
 	__u8 chip_rev;
 	__u8 chip_metal;
-	__u8 gen_p5;
+	__u8 gen_p5_p7;
+	__u8 gen_p7;
 };
 
 struct bnxt_re_dpi {
@@ -89,15 +93,22 @@ struct bnxt_re_cq {
 	struct ibv_cq ibvcq;
 	uint32_t cqid;
 	struct bnxt_re_context *cntx;
-	struct bnxt_re_queue cqq;
-	struct bnxt_re_queue resize_cqq;
+	struct bnxt_re_queue *cqq;
 	struct bnxt_re_dpi *udpi;
+	struct bnxt_re_mem *mem;
+	struct bnxt_re_mem *resize_mem;
 	struct list_head sfhead;
 	struct list_head rfhead;
 	struct list_head prev_cq_head;
 	uint32_t cqe_size;
 	uint8_t  phase;
 	struct xorshift32_state rand;
+	uint32_t mem_handle;
+	void *toggle_map;
+	uint32_t toggle_size;
+	uint8_t resize_tog;
+	bool deffered_db_sup;
+	uint32_t hw_cqes;
 };
 
 struct bnxt_re_push_buffer {
@@ -146,6 +157,7 @@ struct bnxt_re_qpcap {
 	uint32_t max_rsge;
 	uint32_t max_inline;
 	uint8_t	sqsig;
+	uint8_t is_atomic_cap;
 };
 
 struct bnxt_re_srq {
@@ -156,21 +168,45 @@ struct bnxt_re_srq {
 	struct bnxt_re_wrid *srwrid;
 	struct bnxt_re_dpi *udpi;
 	struct xorshift32_state rand;
+	struct bnxt_re_mem *mem;
 	uint32_t srqid;
 	int start_idx;
 	int last_idx;
 	bool arm_req;
+	uint32_t mem_handle;
+	uint32_t toggle_size;
+	void *toggle_map;
 };
 
 struct bnxt_re_joint_queue {
+	struct bnxt_re_context *cntx;
 	struct bnxt_re_queue *hwque;
 	struct bnxt_re_wrid *swque;
 	uint32_t start_idx;
 	uint32_t last_idx;
 };
 
+/* WR API post send data */
+struct bnxt_re_wr_send_qp {
+	struct bnxt_re_bsqe     *cur_hdr;
+	struct bnxt_re_send     *cur_sqe;
+	uint32_t                cur_wqe_cnt;
+	uint32_t                cur_slot_cnt;
+	uint32_t                cur_swq_idx;
+	uint8_t                 cur_opcode;
+	bool                    cur_push_wqe;
+	unsigned int            cur_push_size;
+	int                     error;
+};
+
+#define STATIC_WQE_NUM_SLOTS	8
+#define SEND_SGE_MIN_SLOTS	3
+#define MSG_LEN_ADJ_TO_BYTES	15
+#define SLOTS_RSH_TO_NUM_WQE	4
+
 struct bnxt_re_qp {
-	struct ibv_qp ibvqp;
+	struct verbs_qp vqp;
+	struct ibv_qp *ibvqp;
 	struct bnxt_re_chip_ctx *cctx;
 	struct bnxt_re_context *cntx;
 	struct xorshift32_state rand;
@@ -187,6 +223,7 @@ struct bnxt_re_qp {
 	uint32_t tbl_indx;
 	uint32_t sq_psn;
 	uint32_t pending_db;
+	void *pbuf;
 	uint64_t wqe_cnt;
 	uint16_t mtu;
 	uint16_t qpst;
@@ -194,7 +231,8 @@ struct bnxt_re_qp {
 	uint8_t push_st_en;
 	uint16_t max_push_sz;
 	uint8_t qptyp;
-	/* irdord? */
+	struct bnxt_re_mem *mem;
+	struct bnxt_re_wr_send_qp wr_sq;
 };
 
 struct bnxt_re_mr {
@@ -249,6 +287,8 @@ struct bnxt_re_mmap_info {
 	__u32 dpi;
 	__u64 alloc_offset;
 	__u32 alloc_size;
+	__u32 pg_offset;
+	__u32 res_id;
 };
 
 /* DB ring functions used internally*/
@@ -277,6 +317,9 @@ int bnxt_re_alloc_page(struct ibv_context *ibvctx,
 		       struct bnxt_re_mmap_info *minfo,
 		       uint32_t *page_handle);
 int bnxt_re_notify_drv(struct ibv_context *ibvctx);
+int bnxt_re_get_toggle_mem(struct ibv_context *ibvctx,
+			   struct bnxt_re_mmap_info *minfo,
+			   uint32_t *page_handle);
 
 /* pointer conversion functions*/
 static inline struct bnxt_re_dev *to_bnxt_re_dev(struct ibv_device *ibvdev)
@@ -302,7 +345,9 @@ static inline struct bnxt_re_cq *to_bnxt_re_cq(struct ibv_cq *ibvcq)
 
 static inline struct bnxt_re_qp *to_bnxt_re_qp(struct ibv_qp *ibvqp)
 {
-	return container_of(ibvqp, struct bnxt_re_qp, ibvqp);
+	struct verbs_qp *vqp = (struct verbs_qp *)ibvqp;
+
+	return container_of(vqp, struct bnxt_re_qp, vqp);
 }
 
 static inline struct bnxt_re_srq *to_bnxt_re_srq(struct ibv_srq *ibvsrq)
@@ -514,7 +559,7 @@ static inline uint8_t bnxt_re_is_cqe_valid(struct bnxt_re_cq *cq,
 
 static inline void bnxt_re_change_cq_phase(struct bnxt_re_cq *cq)
 {
-	if (!cq->cqq.head)
+	if (!cq->cqq->head)
 		cq->phase = (~cq->phase & BNXT_RE_BCQE_PH_MASK);
 }
 
@@ -538,6 +583,12 @@ static inline void bnxt_re_jqq_mod_last(struct bnxt_re_joint_queue *jqq,
 	jqq->last_idx = jqq->swque[idx].next_idx;
 }
 
+static inline uint32_t bnxt_re_init_depth(uint32_t ent, uint64_t cmask)
+{
+	return cmask & BNXT_RE_COMP_MASK_UCNTX_POW2_DISABLED ?
+		ent : roundup_pow_of_two(ent);
+}
+
 /* Helper function to copy to push buffers */
 static inline void bnxt_re_copy_data_to_pb(struct bnxt_re_push_buffer *pbuf,
 					   uint8_t offset, uint32_t idx)
@@ -547,7 +598,7 @@ static inline void bnxt_re_copy_data_to_pb(struct bnxt_re_push_buffer *pbuf,
 	int indx;
 
 	for (indx = 0; indx < idx; indx++) {
-		dst = (uintptr_t *)(pbuf->pbuf + 2 * (indx + offset));
+		dst = (uintptr_t *)(pbuf->pbuf) + 2 * indx + offset;
 		src = (uintptr_t *)(pbuf->wqe[indx]);
 		mmio_write64(dst, *src);
 
@@ -590,4 +641,6 @@ static inline void bnxt_re_sub_sec_busy_wait(uint32_t nsec)
 			break;
 	}
 }
+
+#define BNXT_RE_MSN_TBL_EN(a) ((a)->comp_mask & BNXT_RE_COMP_MASK_UCNTX_MSN_TABLE_ENABLED)
 #endif

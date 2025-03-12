@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
 # Copyright (c) 2019 Mellanox Technologies, Inc. All rights reserved. See COPYING file
 
-include 'mlx5dv_enums.pxd'
+#cython: language_level=3
 
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, uintptr_t
 from posix.types cimport off_t
 from libcpp cimport bool
 cimport libc.stdio as s
 
+from pyverbs.providers.mlx5.mlx5_enums cimport *
 cimport pyverbs.libibverbs as v
 
 
@@ -16,6 +17,7 @@ cdef extern from 'infiniband/mlx5dv.h':
     cdef struct mlx5dv_context_attr:
         unsigned int    flags
         unsigned long   comp_mask
+        v.ibv_fd_arr    *fds
 
     cdef struct mlx5dv_cqe_comp_caps:
         unsigned int    max_num
@@ -43,6 +45,13 @@ cdef extern from 'infiniband/mlx5dv.h':
         uint8_t log_max_num_deks
         uint32_t flags
 
+    cdef struct mlx5dv_ooo_recv_wrs_caps:
+        uint32_t max_rc
+        uint32_t max_xrc
+        uint32_t max_dct
+        uint32_t max_ud
+        uint32_t max_uc
+
     cdef struct mlx5dv_context:
         unsigned char           version
         unsigned long           flags
@@ -61,6 +70,7 @@ cdef extern from 'infiniband/mlx5dv.h':
         size_t                  max_wr_memcpy_length
         uint64_t                max_dc_rd_atom
         uint64_t                max_dc_init_rd_atom
+        mlx5dv_ooo_recv_wrs_caps ooo_recv_wrs_caps
 
 
     cdef struct mlx5dv_dci_streams:
@@ -470,6 +480,9 @@ cdef extern from 'infiniband/mlx5dv.h':
                                                                  void *data,
                                                                  unsigned char reformat_type,
                                                                  unsigned char ft_type)
+    v.ibv_mr *mlx5dv_reg_dmabuf_mr(v.ibv_pd *pd, uint64_t offset, size_t length, uint64_t iova,
+                                   int fd, int access, int mlx5_access)
+    int mlx5dv_get_data_direct_sysfs_path(v.ibv_context *context, char *buf, size_t buf_len)
 
     # Direct rules verbs
     mlx5dv_dr_domain *mlx5dv_dr_domain_create(v.ibv_context *ctx, mlx5dv_dr_domain_type type)

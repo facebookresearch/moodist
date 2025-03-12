@@ -228,6 +228,12 @@ cdef class Context(PyverbsCM):
             raise PyverbsRDMAError(f'Failed to query pkey {index} of port {port_num}')
         return pkey
 
+    def get_pkey_index(self, unsigned int port_num, int pkey):
+        idx = v.ibv_get_pkey_index(self.context, port_num, pkey)
+        if idx == -1:
+            raise PyverbsRDMAError(f'Failed to get pkey index of pkey = {pkey} of port {port_num}')
+        return idx
+
     def query_gid(self, unsigned int port_num, int index):
         gid = GID()
         rc = v.ibv_query_gid(self.context, port_num, index, &gid.gid)
@@ -913,6 +919,9 @@ cdef class PortAttr(PyverbsObject):
     @property
     def port_cap_flags2(self):
         return self.attr.port_cap_flags2
+    @property
+    def active_speed_ex(self):
+        return self.attr.active_speed_ex
 
     def __str__(self):
         print_format = '{:<24}: {:<20}\n'
@@ -935,7 +944,7 @@ cdef class PortAttr(PyverbsObject):
             print_format.format('Subnet timeout', self.attr.subnet_timeout) +\
             print_format.format('Init type reply', self.attr.init_type_reply) +\
             print_format.format('Active width', width_to_str(self.attr.active_width)) +\
-            print_format.format('Active speed', speed_to_str(self.attr.active_speed)) +\
+            print_format.format('Active speed', speed_to_str(self.attr.active_speed, self.attr.active_speed_ex)) +\
             print_format.format('Phys state', phys_state_to_str(self.attr.phys_state)) +\
             print_format.format('Flags', self.attr.flags)
 
@@ -1160,19 +1169,20 @@ def phys_state_to_str(phys):
 
 
 def width_to_str(width):
-    l = {1: '1X', 2: '4X', 4: '8X', 16: '2X'}
+    l = {1: '1X', 2: '4X', 4: '8X', 8: '12X', 16: '2X'}
     try:
         return '{s} ({n})'.format(s=l[width], n=width)
     except KeyError:
         return 'Invalid width'
 
 
-def speed_to_str(speed):
+def speed_to_str(active_speed, active_speed_ex):
+    real_speed = active_speed if not active_speed_ex else active_speed_ex
     l = {0: '0.0 Gbps', 1: '2.5 Gbps', 2: '5.0 Gbps', 4: '5.0 Gbps',
          8: '10.0 Gbps', 16: '14.0 Gbps', 32: '25.0 Gbps', 64: '50.0 Gbps',
-         128: '100.0 Gbps'}
+         128: '100.0 Gbps', 256: '200.0 Gbps'}
     try:
-        return '{s} ({n})'.format(s=l[speed], n=speed)
+        return '{s} ({n})'.format(s=l[real_speed], n=real_speed)
     except KeyError:
         return 'Invalid speed'
 
@@ -1255,3 +1265,38 @@ def translate_event_type(event_type):
         return types[event_type]
     except KeyError:
         return f'Unknown event_type ({event_type})'
+
+
+cdef class FdArr(PyverbsObject):
+    """
+    Represent ibv_fd_arr struct. This class is used a pointer to the file descriptor array
+    """
+    def __init__(self, arr=[], count=0):
+        super().__init__()
+        cdef int *dst
+        self.attr.arr = <int*>malloc(count * sizeof(int))
+        if self.attr.arr == NULL:
+            raise PyverbsRDMAErrno('Failed to malloc FD list')
+        dst = self.attr.arr
+        for i in range(count):
+            dst[i]= arr[i]
+        self.attr.count = count
+
+    def __dealloc__(self):
+        self.close()
+
+    cpdef close(self):
+        free(self.attr.arr)
+
+    def __str__(self):
+        print_format = '{:20}: {:<20}\n'
+        return print_format.format('Number of fd in arr', self.attr.count) +\
+               print_format.format('FDs in arr', [self.attr.arr[i] for i in range(self.attr.count)])
+
+    @property
+    def arr(self):
+        return [self.attr.arr[i] for i in range(self.attr.count)]
+
+    @property
+    def count(self):
+        return self.attr.count

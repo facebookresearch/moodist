@@ -34,7 +34,6 @@
 #include <endian.h>
 #include <getopt.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -140,6 +139,7 @@ struct rping_cb {
 
 	enum test_state state;		/* used for cond/signalling */
 	sem_t sem;
+	sem_t accept_ready;		/* Ready for another conn req */
 
 	struct sockaddr_storage sin;
 	struct sockaddr_storage ssource;
@@ -185,6 +185,7 @@ static int rping_cma_event_handler(struct rdma_cm_id *cma_id,
 		break;
 
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
+		sem_wait(&cb->accept_ready);
 		cb->state = CONNECT_REQUEST;
 		cb->child_cm_id = cma_id;
 		DEBUG_LOG("child cma %p\n", cb->child_cm_id);
@@ -960,6 +961,8 @@ static int rping_run_persistent_server(struct rping_cb *listening_cb)
 		if (!cb)
 			return -1;
 
+		sem_post(&listening_cb->accept_ready);
+
 		ret = pthread_create(&cb->persistent_server_thread, &attr, rping_persistent_server_thread, cb);
 		if (ret) {
 			perror("pthread_create");
@@ -1253,9 +1256,9 @@ static int get_addr(char *dst, struct sockaddr *addr)
 static void usage(const char *name)
 {
 	printf("%s -s [-vVd] [-S size] [-C count] [-a addr] [-p port]\n", 
-	       basename(name));
+	       name);
 	printf("%s -c [-vVd] [-S size] [-C count] [-I addr] -a addr [-p port]\n", 
-	       basename(name));
+	       name);
 	printf("\t-c\t\tclient side\n");
 	printf("\t-I\t\tSource address to bind to for client.\n");
 	printf("\t-s\t\tserver side.  To bind to any address with IPv6 use -a ::0\n");
@@ -1288,6 +1291,7 @@ int main(int argc, char *argv[])
 	cb->sin.ss_family = PF_INET;
 	cb->port = htobe16(7174);
 	sem_init(&cb->sem, 0, 0);
+	sem_init(&cb->accept_ready, 0, 1);
 
 	opterr = 0;
 	while ((op = getopt(argc, argv, "a:I:Pp:C:S:t:scvVdq")) != -1) {
@@ -1362,7 +1366,7 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
-	cb->cm_channel = create_first_event_channel();
+	cb->cm_channel = create_event_channel();
 	if (!cb->cm_channel) {
 		ret = errno;
 		goto out;

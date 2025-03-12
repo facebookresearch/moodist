@@ -55,10 +55,10 @@ Port Selection flags
 Debugging flags
 ---------------
 
-.. include:: common/opt_d.rst
+.. include:: common/opt_debug.rst
 .. include:: common/opt_e.rst
 .. include:: common/opt_h.rst
-.. include:: common/opt_v.rst
+.. include:: common/opt_verbose.rst
 .. include:: common/opt_V.rst
 
 
@@ -83,6 +83,7 @@ EXAMPLES
 Unicast examples
 
 ::
+
         ibroute 4               # dump all lids with valid out ports of switch with lid 4
         ibroute -a 4            # same, but dump all lids, even with invalid out ports
         ibroute -n 4            # simple dump format - no destination resolution
@@ -94,6 +95,7 @@ Unicast examples
 Multicast examples
 
 ::
+
         ibroute -M 4                # dump all non empty mlids of switch with lid 4
         ibroute -M 4 0xc010 0xc020  # same, but with range
         ibroute -M -n 4             # simple dump format

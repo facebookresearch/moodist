@@ -41,15 +41,39 @@
 #define __MEMORY_H__
 
 #include <pthread.h>
+#include "main.h"
+
+struct bnxt_re_mem {
+	void *va_head;
+	void *va_tail;
+	uint32_t head;
+	uint32_t tail;
+	uint32_t size;
+	uint32_t pad;
+};
+
+#define BNXT_RE_QATTR_SQ_INDX	0
+#define BNXT_RE_QATTR_RQ_INDX	1
+struct bnxt_re_qattr {
+	uint32_t esize;
+	uint32_t slots;
+	uint32_t nwr;
+	uint32_t sz_ring;
+	uint32_t sz_shad;
+	uint32_t sw_nwr;
+};
 
 struct bnxt_re_queue {
 	void *va;
+	uint32_t flags;
 	uint32_t *dbtail;
 	uint32_t bytes; /* for munmap */
 	uint32_t depth; /* no. of entries */
 	uint32_t head;
 	uint32_t tail;
 	uint32_t stride;
+	void *pad; /* to hold the padding area */
+	uint32_t pad_stride_log2;
 	/* Represents the difference between the real queue depth allocated in
 	 * HW and the user requested queue depth and is used to correctly flag
 	 * queue full condition based on user supplied queue depth.
@@ -61,10 +85,18 @@ struct bnxt_re_queue {
 	uint32_t esize;
 	uint32_t max_slots;
 	pthread_spinlock_t qlock;
+	uint32_t msn;
+	uint32_t msn_tbl_sz;
+	/*
+	 * This flag is set when CQ is resized. It will be cleared after the
+	 * first CQE is received on the newly resized CQ
+	 */
+	bool cq_resized;
+
+	/* this tracks the 'head' index on the old CQ before resizing */
+	uint32_t old_head;
 };
 
-int bnxt_re_alloc_aligned(struct bnxt_re_queue *que, uint32_t pg_size);
-void bnxt_re_free_aligned(struct bnxt_re_queue *que);
 
 /* Basic queue operation */
 static inline void *bnxt_re_get_hwqe(struct bnxt_re_queue *que, uint32_t idx)
@@ -101,15 +133,26 @@ static inline uint32_t bnxt_re_is_que_empty(struct bnxt_re_queue *que)
 static inline void bnxt_re_incr_tail(struct bnxt_re_queue *que, uint8_t cnt)
 {
 	que->tail += cnt;
-	if (que->tail >= que->depth)
+	if (que->tail >= que->depth) {
 		que->tail %= que->depth;
+		/* Rolled over, Toggle Tail bit in epoch flags */
+		que->flags ^= 1UL << BNXT_RE_FLAG_EPOCH_TAIL_SHIFT;
+	}
 }
 
 static inline void bnxt_re_incr_head(struct bnxt_re_queue *que, uint8_t cnt)
 {
 	que->head += cnt;
-	if (que->head >= que->depth)
+	if (que->head >= que->depth) {
 		que->head %= que->depth;
+		/* Rolled over, Toggle HEAD bit in epoch flags */
+		que->flags ^= 1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT;
+	}
 }
+
+void bnxt_re_free_mem(struct bnxt_re_mem *mem);
+void *bnxt_re_alloc_mem(size_t size, uint32_t pg_size);
+void *bnxt_re_get_obj(struct bnxt_re_mem *mem, size_t req);
+void *bnxt_re_get_ring(struct bnxt_re_mem *mem, size_t req);
 
 #endif

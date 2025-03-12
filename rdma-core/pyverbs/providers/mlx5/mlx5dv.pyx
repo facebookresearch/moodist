@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
 # Copyright (c) 2019 Mellanox Technologies, Inc. All rights reserved. See COPYING file
 
-from libc.stdint cimport uintptr_t, uint8_t, uint16_t, uint32_t
+from libc.stdint cimport uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.string cimport memcpy, memset
-from libc.stdlib cimport calloc, free
+from libc.stdlib cimport calloc, free ,malloc
 from posix.mman cimport munmap
 import logging
 import weakref
@@ -14,7 +14,7 @@ from pyverbs.providers.mlx5.mlx5dv_crypto cimport Mlx5CryptoLoginAttr, Mlx5Crypt
 from pyverbs.pyverbs_error import PyverbsUserError, PyverbsRDMAError, PyverbsError
 from pyverbs.providers.mlx5.dr_action cimport DrActionFlowCounter, DrActionDestTir
 from pyverbs.providers.mlx5.mlx5dv_sched cimport Mlx5dvSchedLeaf
-cimport pyverbs.providers.mlx5.mlx5dv_enums as dve
+cimport pyverbs.providers.mlx5.mlx5_enums as dve
 cimport pyverbs.providers.mlx5.libmlx5 as dv
 from pyverbs.mem_alloc import posix_memalign
 from pyverbs.qp cimport QPInitAttrEx, QPEx
@@ -24,7 +24,7 @@ from pyverbs.wr cimport copy_sg_array
 cimport pyverbs.libibverbs_enums as e
 from pyverbs.cq cimport CqInitAttrEx
 cimport pyverbs.libibverbs as v
-from pyverbs.device cimport DM
+from pyverbs.device cimport DM, FdArr
 from pyverbs.addr cimport AH
 from pyverbs.pd cimport PD
 
@@ -130,10 +130,13 @@ cdef class Mlx5DVContextAttr(PyverbsObject):
     Represent mlx5dv_context_attr struct. This class is used to open an mlx5
     device.
     """
-    def __init__(self, flags=0, comp_mask=0):
+    def __init__(self, flags=0, comp_mask=0, FdArr fds=None):
         super().__init__()
         self.attr.flags = flags
         self.attr.comp_mask = comp_mask
+        if fds is not None:
+            self.attr.fds = &fds.attr
+        self.fds = fds
 
     def __str__(self):
         print_format = '{:20}: {:<20}\n'
@@ -313,7 +316,8 @@ cdef class Mlx5Context(Context):
                 dve.MLX5DV_CONTEXT_MASK_DCI_STREAMS |\
                 dve.MLX5DV_CONTEXT_MASK_WR_MEMCPY_LENGTH |\
                 dve.MLX5DV_CONTEXT_MASK_CRYPTO_OFFLOAD |\
-                dve.MLX5DV_CONTEXT_MASK_MAX_DC_RD_ATOM
+                dve.MLX5DV_CONTEXT_MASK_MAX_DC_RD_ATOM |\
+                dve.MLX5DV_CONTEXT_MASK_OOO_RECV_WRS
         else:
             dv_attr.comp_mask = comp_mask
         rc = dv.mlx5dv_query_device(self.context, &dv_attr.dv)
@@ -445,6 +449,18 @@ cdef class Mlx5Context(Context):
             raise PyverbsRDMAError('Failed to query EQN', rc)
         return eqn
 
+    def get_data_direct_sysfs_path(self, length=512):
+        cdef char *buffer = <char *> calloc(1, length)
+        if buffer == NULL:
+            raise MemoryError('Failed to allocate memory')
+        rc = dv.mlx5dv_get_data_direct_sysfs_path(self.context, buffer, length)
+        if rc:
+            free(buffer)
+            raise PyverbsRDMAError('Get data direct sysfs path failed.', rc)
+        buffer_str = str(buffer.decode())
+        free(buffer)
+        return buffer_str
+
     cdef add_ref(self, obj):
         try:
             Context.add_ref(self, obj)
@@ -542,6 +558,10 @@ cdef class Mlx5DVContext(PyverbsObject):
     @property
     def max_dc_init_rd_atom(self):
         return self.dv.max_dc_init_rd_atom
+
+    @property
+    def ooo_recv_wrs_caps(self):
+        return self.dv.ooo_recv_wrs_caps
 
     def __str__(self):
         print_format = '{:20}: {:<20}\n'
@@ -1427,24 +1447,46 @@ cdef class Mlx5DmOpAddr(PyverbsCM):
     def unmap(self, length):
         munmap(self.addr, length)
 
+    @staticmethod
+    cdef void _cpy(void *dst, void *src, int length):
+        """
+        Copy data (bytes) from src to dst. To ensure atomicity, copy in a single
+        write operation.
+        :param dst: The address to copy from.
+        :param src: The address to copy to.
+        :param length: Length in bytes. (supports: power of two. up to 8 bytes)
+        """
+        if length == 1:
+            (<uint8_t *> dst)[0] = (<uint8_t *> src)[0]
+        elif length == 2:
+            (<uint16_t *> dst)[0] = (<uint16_t *> src)[0]
+        elif length == 4:
+            (<uint32_t *> dst)[0] = (<uint32_t *> src)[0]
+        elif length == 8:
+            (<uint64_t *> dst)[0] = (<uint64_t *> src)[0]
+        elif length == 16:
+            raise PyverbsUserError('Currently PyVerbs does not support 16 bytes Memic Atomic operations')
+        else:
+            raise PyverbsUserError(f'Memic Atomic operations do not support with length: {length}')
+
     def write(self, data):
         """
-        Writes data (bytes) to the DM operation address using memcpy.
+        Writes data (bytes) to the DM operation address.
         :param data: Bytes of data
         """
-        memcpy(<char *>self.addr, <char *>data, len(data))
+        length = len(data)
+        Mlx5DmOpAddr._cpy(<void *> self.addr, <void *><char *> data, length)
+
 
     def read(self, length):
         """
-        Reads 'length' bytes from the DM operation address using memcpy.
+        Reads 'length' bytes from the DM operation address.
         :param length: Data length to read (in bytes)
         :return: Read data in bytes
         """
-        cdef char *data = <char*> calloc(length, sizeof(char))
-        if data == NULL:
-            raise PyverbsError('Failed to allocate memory')
-        memcpy(<char *>data, <char *>self.addr, length)
-        res = data[:length]
+        cdef void *data = calloc(length, sizeof(char))
+        Mlx5DmOpAddr._cpy(data, <void *>self.addr, length)
+        res = (<char *> data)[:length]
         free(data)
         return res
 
@@ -1491,7 +1533,7 @@ cdef class WqeCtrlSeg(WqeSeg):
         using mlx5dv_set_ctrl_seg, segment values are accessed
         through the getters/setters.
         """
-        self.segment = calloc(sizeof(dv.mlx5_wqe_ctrl_seg), 1)
+        self.segment = calloc(1, sizeof(dv.mlx5_wqe_ctrl_seg))
         self.set_ctrl_seg(pi, opcode, opmod, qp_num, fm_ce_se, ds, signature, imm)
 
     def __str__(self):
@@ -1562,7 +1604,7 @@ cdef class WqeDataSeg(WqeSeg):
         Create a dv.mlx5_wqe_data_seg by allocating it and using
         dv.mlx5dv_set_data_seg with the values received in init
         """
-        self.segment = calloc(sizeof(dv.mlx5_wqe_data_seg), 1)
+        self.segment = calloc(1, sizeof(dv.mlx5_wqe_data_seg))
         self.set_data_seg(length, lkey, addr)
 
     @staticmethod
@@ -1624,7 +1666,7 @@ cdef class Wqe(PyverbsCM):
             self.is_user_addr = False
             allocation_size = sum(map(lambda x: x.sizeof() if isinstance(x, WqeSeg) else len(x),
                                       self.segments))
-            self.addr = calloc(allocation_size, 1)
+            self.addr = calloc(1, allocation_size)
         addr = <uintptr_t>self.addr
         for seg in self.segments:
             if isinstance(seg, WqeSeg):

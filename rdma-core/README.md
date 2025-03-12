@@ -19,7 +19,7 @@ is included:
  - erdma.ko
  - iw_cxgb4.ko
  - hfi1.ko
- - hns-roce.ko
+ - hns-roce-hw-v2.ko
  - irdma.ko
  - ib_qib.ko
  - mana_ib.ko
@@ -143,4 +143,4 @@ See [Contributing to rdma-core](Documentation/contributing.md).
 # Stable branches
 
 Stable versions are released regularly with backported fixes (see Documentation/stable.md)
-The current minimum version still maintained is 'v28.X'
+The current minimum version still maintained is 'v33.X'

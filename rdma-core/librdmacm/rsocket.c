@@ -917,8 +917,12 @@ static int rs_create_ep(struct rsocket *rs)
 	int i, ret;
 
 	rs_set_qp_size(rs);
-	if (rs->cm_id->verbs->device->transport_type == IBV_TRANSPORT_IWARP)
+	if (rs->cm_id->verbs->device->transport_type == IBV_TRANSPORT_IWARP) {
 		rs->opts |= RS_OPT_MSG_SEND;
+
+		if (rs->sq_inline < RS_MSG_SIZE)
+			rs->sq_inline = RS_MSG_SIZE;
+	}
 	ret = rs_create_cq(rs, rs->cm_id);
 	if (ret)
 		return ret;
@@ -2358,7 +2362,7 @@ static int rs_poll_all(struct rsocket *rs)
  * We use hardware flow control to prevent over running the remote
  * receive queue.  However, data transfers still require space in
  * the remote rmsg queue, or we risk losing notification that data
- * has been transfered.
+ * has been transferred.
  *
  * Be careful with race conditions in the check below.  The target SGL
  * may be updated by a remote RDMA write.
@@ -4674,8 +4678,11 @@ static void *cm_svc_run(void *arg)
 			fds[i].revents = 0;
 
 		poll(fds, svc->cnt + 1, -1);
-		if (fds[0].revents)
+		if (fds[0].revents) {
 			cm_svc_process_sock(svc);
+			/* svc->contexts may have been reallocated, so need to assign again */
+			fds = svc->contexts;
+		}
 
 		for (i = 1; i <= svc->cnt; i++) {
 			if (!fds[i].revents)

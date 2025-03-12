@@ -87,6 +87,8 @@ enum mlx5dv_context_comp_mask {
 	MLX5DV_CONTEXT_MASK_WR_MEMCPY_LENGTH	= 1 << 12,
 	MLX5DV_CONTEXT_MASK_CRYPTO_OFFLOAD	= 1 << 13,
 	MLX5DV_CONTEXT_MASK_MAX_DC_RD_ATOM	= 1 << 14,
+	MLX5DV_CONTEXT_MASK_REG_C0		= 1 << 15,
+	MLX5DV_CONTEXT_MASK_OOO_RECV_WRS	= 1 << 16,
 };
 
 struct mlx5dv_cqe_comp_caps {
@@ -212,6 +214,14 @@ struct mlx5dv_crypto_caps {
 	uint32_t flags; /* use enum mlx5dv_crypto_caps_flags */
 };
 
+struct mlx5dv_ooo_recv_wrs_caps {
+	uint32_t max_rc;
+	uint32_t max_xrc;
+	uint32_t max_dct;
+	uint32_t max_ud;
+	uint32_t max_uc;
+};
+
 /*
  * Direct verbs device-specific attributes
  */
@@ -235,6 +245,8 @@ struct mlx5dv_context {
 	struct mlx5dv_crypto_caps crypto_caps;
 	uint64_t max_dc_rd_atom;
 	uint64_t max_dc_init_rd_atom;
+	struct mlx5dv_reg reg_c0;
+	struct mlx5dv_ooo_recv_wrs_caps ooo_recv_wrs_caps;
 };
 
 enum mlx5dv_context_flags {
@@ -281,6 +293,7 @@ enum mlx5dv_qp_create_flags {
 	MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE = 1 << 4,
 	MLX5DV_QP_CREATE_PACKET_BASED_CREDIT_MODE = 1 << 5,
 	MLX5DV_QP_CREATE_SIG_PIPELINING = 1 << 6,
+	MLX5DV_QP_CREATE_OOO_DP = 1 << 7,
 };
 
 enum mlx5dv_mkey_init_attr_flags {
@@ -723,6 +736,7 @@ struct mlx5dv_flow_match_parameters {
 
 enum mlx5dv_flow_matcher_attr_mask {
 	MLX5DV_FLOW_MATCHER_MASK_FT_TYPE = 1 << 0,
+	MLX5DV_FLOW_MATCHER_MASK_IB_PORT = 1 << 1,
 };
 
 struct mlx5dv_flow_matcher_attr {
@@ -733,6 +747,7 @@ struct mlx5dv_flow_matcher_attr {
 	struct mlx5dv_flow_match_parameters *match_mask;
 	uint64_t comp_mask; /* use mlx5dv_flow_matcher_attr_mask */
 	enum mlx5dv_flow_table_type ft_type;
+	uint32_t ib_port;
 };
 
 struct mlx5dv_flow_matcher;
@@ -917,6 +932,12 @@ struct ibv_dm *mlx5dv_alloc_dm(struct ibv_context *context,
 
 void *mlx5dv_dm_map_op_addr(struct ibv_dm *dm, uint8_t op);
 
+struct ibv_mr *mlx5dv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+				    size_t length, uint64_t iova, int fd,
+				    int access, int mlx5_access);
+int mlx5dv_get_data_direct_sysfs_path(struct ibv_context *context, char *buf,
+				      size_t buf_len);
+
 struct mlx5_wqe_av;
 
 struct mlx5dv_ah {
@@ -927,6 +948,10 @@ struct mlx5dv_ah {
 struct mlx5dv_pd {
 	uint32_t		pdn;
 	uint64_t		comp_mask;
+};
+
+struct mlx5dv_devx {
+	uint32_t handle;
 };
 
 struct mlx5dv_obj {
@@ -958,6 +983,10 @@ struct mlx5dv_obj {
 		struct ibv_pd		*in;
 		struct mlx5dv_pd	*out;
 	} pd;
+	struct {
+		struct mlx5dv_devx_obj *in;
+		struct mlx5dv_devx *out;
+	} devx;
 };
 
 enum mlx5dv_obj_type {
@@ -968,6 +997,7 @@ enum mlx5dv_obj_type {
 	MLX5DV_OBJ_DM	= 1 << 4,
 	MLX5DV_OBJ_AH	= 1 << 5,
 	MLX5DV_OBJ_PD	= 1 << 6,
+	MLX5DV_OBJ_DEVX	= 1 << 7,
 };
 
 enum mlx5dv_wq_init_attr_mask {
@@ -1009,8 +1039,8 @@ struct ibv_wq *mlx5dv_create_wq(struct ibv_context *context,
 				struct mlx5dv_wq_init_attr *mlx5_wq_attr);
 /*
  * This function will initialize mlx5dv_xxx structs based on supplied type.
- * The information for initialization is taken from ibv_xx structs supplied
- * as part of input.
+ * The information for initialization is taken from either ibv_xx or
+ * mlx5dv_xxx structs supplied as part of input.
  *
  * Request information of CQ marks its owned by DV for all consumer index
  * related actions.
@@ -1277,7 +1307,7 @@ struct mlx5_wqe_av {
 	uint8_t		fl_mlid;
 	__be16		rlid;
 	uint8_t		reserved0[4];
-	uint8_t		rmac[6];
+	uint8_t		rmac[ETHERNET_LL_SIZE];
 	uint8_t		tclass;
 	uint8_t		hop_limit;
 	__be32		grh_gid_fl;
@@ -1524,7 +1554,7 @@ void mlx5dv_set_dgram_seg(struct mlx5_wqe_datagram_seg *seg,
 	seg->av.stat_rate_sl	= stat_rate_sl;
 	seg->av.fl_mlid		= fl_mlid;
 	seg->av.rlid		= htobe16(rlid);
-	memcpy(seg->av.rmac, rmac, 6);
+	memcpy(seg->av.rmac, rmac, ETHERNET_LL_SIZE);
 	seg->av.tclass		= tclass;
 	seg->av.hop_limit	= hop_limit;
 	seg->av.grh_gid_fl	= htobe32(grh_gid_fi);
@@ -1685,9 +1715,14 @@ enum mlx5dv_context_attr_flags {
 	MLX5DV_CONTEXT_FLAGS_DEVX = 1 << 0,
 };
 
+enum mlx5dv_context_attr_comp_mask {
+	MLX5DV_CONTEXT_ATTR_MASK_FD_ARRAY = 1 << 0,
+};
+
 struct mlx5dv_context_attr {
 	uint32_t flags; /* Use enum mlx5dv_context_attr_flags */
-	uint64_t comp_mask;
+	uint64_t comp_mask; /* Use enum mlx5dv_context_attr_comp_mask */
+	struct ibv_fd_arr *fds;
 };
 
 bool mlx5dv_is_supported(struct ibv_device *device);

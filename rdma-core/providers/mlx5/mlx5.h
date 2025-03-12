@@ -39,6 +39,7 @@
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <util/compiler.h>
+#include <limits.h>
 
 #include <infiniband/driver.h>
 #include <util/udma_barrier.h>
@@ -221,6 +222,7 @@ enum mlx5_vendor_cap_flags {
 	MLX5_VENDOR_CAP_FLAGS_CQE_128B_PAD	= 1 << 4,
 	MLX5_VENDOR_CAP_FLAGS_PACKET_BASED_CREDIT_MODE	= 1 << 5,
 	MLX5_VENDOR_CAP_FLAGS_SCAT2CQE_DCT = 1 << 6,
+	MLX5_VENDOR_CAP_FLAGS_OOO_DP = 1 << 7,
 };
 
 enum {
@@ -362,7 +364,7 @@ struct mlx5_context {
 	int				stall_cycles;
 	struct mlx5_bf		       *bfs;
 	FILE			       *dbg_fp;
-	char				hostname[40];
+	char				hostname[HOST_NAME_MAX + 1];
 	struct mlx5_spinlock            hugetlb_lock;
 	struct list_head                hugetlb_list;
 	int				cqe_version;
@@ -422,6 +424,8 @@ struct mlx5_context {
 	pthread_mutex_t			crypto_login_mutex;
 	uint64_t			max_dc_rd_atom;
 	uint64_t			max_dc_init_rd_atom;
+	struct mlx5dv_reg		reg_c0;
+	struct mlx5dv_ooo_recv_wrs_caps ooo_recv_wrs_caps;
 };
 
 struct mlx5_hugetlb_mem {
@@ -651,6 +655,7 @@ struct mlx5_mr {
 enum mlx5_qp_flags {
 	MLX5_QP_FLAGS_USE_UNDERLAY = 0x01,
 	MLX5_QP_FLAGS_DRAIN_SIGERR = 0x02,
+	MLX5_QP_FLAGS_OOO_DP = 1 << 2,
 };
 
 struct mlx5_qp {
@@ -1621,6 +1626,10 @@ struct mlx5_dv_context_ops {
 						 const void *in, size_t inlen,
 						 void *out, size_t outlen);
 	int (*devx_destroy_eq)(struct mlx5dv_devx_eq *eq);
+	struct ibv_mr *(*reg_dmabuf_mr)(struct ibv_pd *pd, uint64_t offset,
+					size_t length, uint64_t iova, int fd,
+					int access, int mlx5_access);
+	int (*get_data_direct_sysfs_path)(struct ibv_context *context, char *buf, size_t buf_len);
 };
 
 struct mlx5_dv_context_ops *mlx5_get_dv_ops(struct ibv_context *context);

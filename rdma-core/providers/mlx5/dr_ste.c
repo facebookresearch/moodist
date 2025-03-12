@@ -604,7 +604,7 @@ void dr_ste_set_actions_tx(struct dr_ste_ctx *ste_ctx,
 			   struct dr_ste_actions_attr *attr,
 			   uint32_t *added_stes)
 {
-	ste_ctx->set_actions_tx(action_type_set, ste_ctx->actions_caps,
+	ste_ctx->set_actions_tx(ste_ctx, action_type_set, ste_ctx->actions_caps,
 				hw_ste_arr, attr, added_stes);
 }
 
@@ -614,7 +614,7 @@ void dr_ste_set_actions_rx(struct dr_ste_ctx *ste_ctx,
 			   struct dr_ste_actions_attr *attr,
 			   uint32_t *added_stes)
 {
-	ste_ctx->set_actions_rx(action_type_set, ste_ctx->actions_caps,
+	ste_ctx->set_actions_rx(ste_ctx, action_type_set, ste_ctx->actions_caps,
 				hw_ste_arr, attr, added_stes);
 }
 
@@ -730,6 +730,42 @@ void dr_ste_free_modify_hdr(struct mlx5dv_dr_action *action)
 		return action->rewrite.dmn->ste_ctx->dealloc_modify_hdr_chunk(action);
 
 	return dr_dealloc_modify_hdr_chunk(action);
+}
+
+int dr_ste_alloc_encap(struct mlx5dv_dr_action *action)
+{
+	struct mlx5dv_dr_domain *dmn = action->reformat.dmn;
+	uint32_t dynamic_chunck_size;
+	int ret;
+
+	dynamic_chunck_size = ilog32((action->reformat.reformat_size - 1) /
+				     DR_SW_ENCAP_ENTRY_SIZE);
+	action->reformat.chunk = dr_icm_alloc_chunk(dmn->encap_icm_pool,
+						    dynamic_chunck_size);
+	if (!action->reformat.chunk)
+		return errno;
+
+	action->reformat.index = (dr_icm_pool_get_chunk_icm_addr(action->reformat.chunk) -
+				  dmn->info.caps.indirect_encap_icm_base) /
+				  DR_SW_ENCAP_ENTRY_SIZE;
+
+	ret = dr_send_postsend_action(dmn, action);
+	if (ret)
+		goto postsend_err;
+
+	return 0;
+
+postsend_err:
+	dr_icm_free_chunk(action->reformat.chunk);
+	action->reformat.chunk = NULL;
+	action->reformat.index = 0;
+
+	return ret;
+}
+
+void dr_ste_free_encap(struct mlx5dv_dr_action *action)
+{
+	dr_icm_free_chunk(action->reformat.chunk);
 }
 
 static int dr_ste_build_pre_check_spec(struct mlx5dv_dr_domain *dmn,
@@ -1729,6 +1765,8 @@ struct dr_ste_ctx *dr_ste_get_ctx(uint8_t version)
 		return dr_ste_get_ctx_v1();
 	else if (version == MLX5_HW_CONNECTX_7)
 		return dr_ste_get_ctx_v2();
+	else if (version == MLX5_HW_CONNECTX_8)
+		return dr_ste_get_ctx_v3();
 
 	errno = EOPNOTSUPP;
 

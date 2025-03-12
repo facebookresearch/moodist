@@ -30,14 +30,17 @@ rdma_python_test(tests
   test_mlx5_devx.py
   test_mlx5_dm_ops.py
   test_mlx5_dma_memcpy.py
+  test_mlx5_dmabuf.py
   test_mlx5_dr.py
   test_mlx5_flow.py
   test_mlx5_huge_page.py
   test_mlx5_lag_affinity.py
   test_mlx5_mkey.py
+  test_mlx5_ooo_qp.py
   test_mlx5_pp.py
   test_mlx5_query_port.py
   test_mlx5_raw_wqe.py
+  test_mlx5_rdma_ctrl.py
   test_mlx5_rdmacm.py
   test_mlx5_sched.py
   test_mlx5_timestamp.py
@@ -55,6 +58,7 @@ rdma_python_test(tests
   test_relaxed_ordering.py
   test_rss_traffic.py
   test_shared_pd.py
+  test_srq.py
   test_tag_matching.py
   utils.py
   )

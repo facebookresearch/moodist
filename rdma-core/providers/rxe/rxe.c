@@ -55,6 +55,7 @@
 #include "rxe_queue.h"
 #include "rxe-abi.h"
 #include "rxe.h"
+#include "rxe_trace.h"
 
 static void rxe_free_context(struct ibv_context *ibctx);
 
@@ -161,11 +162,6 @@ static int rxe_dealloc_mw(struct ibv_mw *ibmw)
 	return 0;
 }
 
-static int next_rkey(int rkey)
-{
-	return (rkey & 0xffffff00) | ((rkey + 1) & 0x000000ff);
-}
-
 static int rxe_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr_list,
 			 struct ibv_send_wr **bad_wr);
 
@@ -190,7 +186,7 @@ static int rxe_bind_mw(struct ibv_qp *ibqp, struct ibv_mw *ibmw,
 	ibwr.send_flags = mw_bind->send_flags;
 	ibwr.bind_mw.bind_info = mw_bind->bind_info;
 	ibwr.bind_mw.mw = ibmw;
-	ibwr.bind_mw.rkey = next_rkey(ibmw->rkey);
+	ibwr.bind_mw.rkey = ibv_inc_rkey(ibmw->rkey);
 
 	ret = rxe_post_send(ibqp, &ibwr, &bad_wr);
 	if (ret)
@@ -265,15 +261,17 @@ static int cq_next_poll(struct ibv_cq_ex *current)
 {
 	struct rxe_cq *cq = container_of(current, struct rxe_cq, vcq.cq_ex);
 
-	advance_cq_cur_index(cq);
+	struct rxe_queue_buf *q = cq->queue;
+	uint32_t next_index = (cq->cur_index + 1) & q->index_mask;
 
-	if (check_cq_queue_empty(cq)) {
+	if (next_index == load_producer_index(q)) {
 		store_consumer_index(cq->queue, cq->cur_index);
 		pthread_spin_unlock(&cq->lock);
 		errno = ENOENT;
 		return errno;
 	}
 
+	cq->cur_index = next_index;
 	cq->wc = addr_from_index(cq->queue, cq->cur_index);
 	cq->vcq.cq_ex.status = cq->wc->status;
 	cq->vcq.cq_ex.wr_id = cq->wc->wr_id;
@@ -667,7 +665,7 @@ static int rxe_modify_srq(struct ibv_srq *ibsrq,
 
 	cmd.mmap_info_addr = (__u64)(uintptr_t) &mi;
 	rc = ibv_cmd_modify_srq(ibsrq, attr, attr_mask,
-				&cmd.ibv_cmd, sizeof(cmd));
+				&cmd.ibv_cmd, sizeof(cmd.ibv_cmd));
 	if (rc)
 		goto out;
 
@@ -1619,6 +1617,11 @@ static int post_one_send(struct rxe_qp *qp, struct rxe_wq *sq,
 		return ENOMEM;
 
 	advance_producer(sq->queue);
+	rdma_tracepoint(rdma_core_rxe, post_send,
+			qp->vqp.qp.context->device->name,
+			qp->vqp.qp.qp_num,
+			(char *)ibv_wr_opcode_str(ibwr->opcode),
+			length);
 
 	return 0;
 }
@@ -1867,7 +1870,7 @@ static struct verbs_context *rxe_alloc_context(struct ibv_device *ibdev,
 		return NULL;
 
 	if (ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd),
-				&resp, sizeof(resp)))
+				NULL, &resp, sizeof(resp)))
 		goto out;
 
 	verbs_set_ops(&context->ibv_ctx, &rxe_ctx_ops);

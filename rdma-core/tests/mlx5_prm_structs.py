@@ -36,6 +36,7 @@ class DevxOps:
     MLX5_QPC_PM_STATE_MIGRATED = 0x3
     MLX5_CMD_OP_QUERY_HCA_CAP = 0x100
     MLX5_CMD_OP_QUERY_QOS_CAP = 0xc
+    MLX5_CMD_OP_QUERY_ODP_CAP = 0x2
     MLX5_CMD_OP_ALLOC_FLOW_COUNTER = 0x939
     MLX5_CMD_OP_DEALLOC_FLOW_COUNTER = 0x93a
     MLX5_CMD_OP_QUERY_FLOW_COUNTER = 0x93b
@@ -45,6 +46,11 @@ class DevxOps:
     MLX5_CMD_OP_ACCESS_REGISTER_PAOS = 0x5006
     MLX5_CMD_OP_ACCESS_REG = 0x805
     MLX5_CMD_OP_CREATE_MKEY = 0x200
+    MLX5_CMD_OP_CREATE_GENERAL_OBJECT = 0xa00
+
+
+class DevxGeneralObjTypes:
+    MLX5_OBJ_TYPE_RDMA_CTRL = 0x0053
 
 
 class ActionType:
@@ -53,8 +59,14 @@ class ActionType:
     COPY_ACTION = 0x3
 
 
+class PRMPacket(Packet):
+
+    def extract_padding(self, p):
+        return "", p
+
+
 # Common
-class SwPas(Packet):
+class SwPas(PRMPacket):
     fields_desc = [
         IntField('pa_h', 0),
         BitField('pa_l', 0, 20),
@@ -63,7 +75,7 @@ class SwPas(Packet):
 
 
 # PD
-class AllocPdIn(Packet):
+class AllocPdIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_ALLOC_PD),
         ShortField('uid', 0),
@@ -73,7 +85,7 @@ class AllocPdIn(Packet):
     ]
 
 
-class AllocPdOut(Packet):
+class AllocPdOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -85,7 +97,7 @@ class AllocPdOut(Packet):
 
 
 # CQ
-class CmdInputFieldSelectResizeCq(Packet):
+class CmdInputFieldSelectResizeCq(PRMPacket):
     fields_desc = [
         BitField('reserved1', 0, 28),
         BitField('umem', 0, 1),
@@ -95,7 +107,7 @@ class CmdInputFieldSelectResizeCq(Packet):
     ]
 
 
-class CmdInputFieldSelectModifyCqFields(Packet):
+class CmdInputFieldSelectModifyCqFields(PRMPacket):
     fields_desc = [
         BitField('reserved_0', 0, 26),
         BitField('status', 0, 1),
@@ -107,7 +119,7 @@ class CmdInputFieldSelectModifyCqFields(Packet):
     ]
 
 
-class SwCqc(Packet):
+class SwCqc(PRMPacket):
     fields_desc = [
         BitField('status', 0, 4),
         BitField('as_notify', 0, 1),
@@ -158,7 +170,7 @@ class SwCqc(Packet):
     ]
 
 
-class CreateCqIn(Packet):
+class CreateCqIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_CREATE_CQ),
         ShortField('uid', 0),
@@ -177,7 +189,7 @@ class CreateCqIn(Packet):
     ]
 
 
-class CreateCqOut(Packet):
+class CreateCqOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -189,7 +201,7 @@ class CreateCqOut(Packet):
 
 
 # QP
-class SwAds(Packet):
+class SwAds(PRMPacket):
     fields_desc = [
         BitField('fl', 0, 1),
         BitField('free_ar', 0, 1),
@@ -227,7 +239,7 @@ class SwAds(Packet):
     ]
 
 
-class SwQpc(Packet):
+class SwQpc(PRMPacket):
     fields_desc = [
         BitField('state', 0, 4),
         BitField('lag_tx_port_affinity', 0, 4),
@@ -353,7 +365,7 @@ class SwQpc(Packet):
     ]
 
 
-class CreateQpIn(Packet):
+class CreateQpIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_CREATE_QP),
         ShortField('uid', 0),
@@ -377,7 +389,7 @@ class CreateQpIn(Packet):
     ]
 
 
-class CreateQpOut(Packet):
+class CreateQpOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -388,7 +400,7 @@ class CreateQpOut(Packet):
     ]
 
 
-class ModifyQpIn(Packet):
+class ModifyQpIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', 0),
         ShortField('uid', 0),
@@ -404,7 +416,7 @@ class ModifyQpIn(Packet):
     ]
 
 
-class ModifyQpOut(Packet):
+class ModifyQpOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -413,7 +425,7 @@ class ModifyQpOut(Packet):
     ]
 
 
-class QueryQpIn(Packet):
+class QueryQpIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_QUERY_QP),
         ShortField('uid', 0),
@@ -425,7 +437,7 @@ class QueryQpIn(Packet):
     ]
 
 
-class QueryQpOut(Packet):
+class QueryQpOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -442,7 +454,7 @@ class QueryQpOut(Packet):
 
 
 # EQ
-class SwEqc(Packet):
+class SwEqc(PRMPacket):
     fields_desc = [
         BitField('status', 0, 4),
         BitField('reserved1', 0, 9),
@@ -473,7 +485,7 @@ class SwEqc(Packet):
     ]
 
 
-class CreateEqIn(Packet):
+class CreateEqIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_CREATE_EQ),
         ShortField('uid', 0),
@@ -492,7 +504,7 @@ class CreateEqIn(Packet):
     ]
 
 
-class CreateEqOut(Packet):
+class CreateEqOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -503,7 +515,7 @@ class CreateEqOut(Packet):
     ]
 
 
-class IbSmp(Packet):
+class IbSmp(PRMPacket):
     fields_desc = [
         ByteField('base_version', 0),
         ByteField('mgmt_class', 0),
@@ -527,7 +539,7 @@ class IbSmp(Packet):
     ]
 
 
-class MadIfcIn(Packet):
+class MadIfcIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_MAD_IFC),
         ShortField('uid', 0),
@@ -543,7 +555,7 @@ class MadIfcIn(Packet):
     ]
 
 
-class MadIfcOut(Packet):
+class MadIfcOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -553,7 +565,7 @@ class MadIfcOut(Packet):
     ]
 
 
-class PaosReg(Packet):
+class PaosReg(PRMPacket):
     fields_desc = [
         ByteField('swid', 0),
         ByteField('local_port', 0),
@@ -571,7 +583,7 @@ class PaosReg(Packet):
     ]
 
 
-class AccessPaosRegisterIn(Packet):
+class AccessPaosRegisterIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_ACCESS_REG),
         ShortField('uid', 0),
@@ -584,7 +596,7 @@ class AccessPaosRegisterIn(Packet):
     ]
 
 
-class AccessPaosRegisterOut(Packet):
+class AccessPaosRegisterOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -601,7 +613,7 @@ class EventType:
     PORT_STATE_CHANGE = 0X9
 
 
-class AffiliatedEventHeader(Packet):
+class AffiliatedEventHeader(PRMPacket):
     fields_desc = [
         ShortField('reserved1', 0),
         ShortField('obj_type', 0),
@@ -609,7 +621,7 @@ class AffiliatedEventHeader(Packet):
     ]
 
 
-class CompEvent(Packet):
+class CompEvent(PRMPacket):
     fields_desc = [
         StrFixedLenField('reserved1', None, length=24),
         ByteField('reserved2', 0),
@@ -617,7 +629,7 @@ class CompEvent(Packet):
     ]
 
 
-class CqError(Packet):
+class CqError(PRMPacket):
     fields_desc = [
         ByteField('reserved1', 0),
         BitField('cqn', 0, 24),
@@ -628,7 +640,7 @@ class CqError(Packet):
     ]
 
 
-class PortStateChangeEvent(Packet):
+class PortStateChangeEvent(PRMPacket):
     fields_desc = [
         StrFixedLenField('reserved1', None, length=8),
         BitField('port_num', 0, 4),
@@ -637,7 +649,7 @@ class PortStateChangeEvent(Packet):
     ]
 
 
-class SwEqe(Packet):
+class SwEqe(PRMPacket):
     fields_desc = [
         ByteField('reserved1', 0),
         ByteField('event_type', 0),
@@ -663,7 +675,7 @@ class SwEqe(Packet):
 
 
 # Query HCA VPORT Context
-class QueryHcaVportContextIn(Packet):
+class QueryHcaVportContextIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_QUERY_HCA_VPORT_CONTEXT),
         ShortField('uid', 0),
@@ -677,7 +689,7 @@ class QueryHcaVportContextIn(Packet):
     ]
 
 
-class HcaVportContext(Packet):
+class HcaVportContext(PRMPacket):
     fields_desc = [
         IntField('field_select', 0),
         StrFixedLenField('reserved1', None, length=28),
@@ -717,7 +729,7 @@ class HcaVportContext(Packet):
     ]
 
 
-class QueryHcaVportContextOut(Packet):
+class QueryHcaVportContextOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -728,7 +740,7 @@ class QueryHcaVportContextOut(Packet):
 
 
 # Query HCA VPORT GID
-class QueryHcaVportGidIn(Packet):
+class QueryHcaVportGidIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_QUERY_HCA_VPORT_GID),
         ShortField('uid', 0),
@@ -743,14 +755,14 @@ class QueryHcaVportGidIn(Packet):
     ]
 
 
-class IbGidCmd(Packet):
+class IbGidCmd(PRMPacket):
     fields_desc = [
         LongField('prefix', 0),
         LongField('guid', 0),
     ]
 
 
-class QueryHcaVportGidOut(Packet):
+class QueryHcaVportGidOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -779,7 +791,7 @@ class SendDbrMode:
 
 
 # Query HCA CAP
-class QueryHcaCapIn(Packet):
+class QueryHcaCapIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_QUERY_HCA_CAP),
         ShortField('uid', 0),
@@ -792,7 +804,7 @@ class QueryHcaCapIn(Packet):
     ]
 
 
-class CmdHcaCap(Packet):
+class CmdHcaCap(PRMPacket):
     fields_desc = [
         BitField('access_other_hca_roce', 0, 1),
         BitField('reserved1', 0, 30),
@@ -1292,7 +1304,7 @@ class CmdHcaCap(Packet):
     ]
 
 
-class QueryCmdHcaCapOut(Packet):
+class QueryCmdHcaCapOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1302,7 +1314,7 @@ class QueryCmdHcaCapOut(Packet):
     ]
 
 
-class FlowTableEntryMatchSetMisc(Packet):
+class FlowTableEntryMatchSetMisc(PRMPacket):
     fields_desc = [
         BitField('gre_c_present', 0, 1),
         BitField('bth_a', 0, 1),
@@ -1350,7 +1362,7 @@ class FlowTableEntryMatchSetMisc(Packet):
     ]
 
 
-class FlowTableEntryMatchSetMisc2(Packet):
+class FlowTableEntryMatchSetMisc2(PRMPacket):
     fields_desc = [
         BitField('outer_first_mpls_label', 0, 20),
         BitField('outer_first_mpls_exp', 0, 3),
@@ -1382,7 +1394,7 @@ class FlowTableEntryMatchSetMisc2(Packet):
     ]
 
 
-class FlowTableEntryMatchSetMisc3(Packet):
+class FlowTableEntryMatchSetMisc3(PRMPacket):
     fields_desc = [
         IntField('inner_tcp_seq_num', 0),
         IntField('outer_tcp_seq_num', 0),
@@ -1412,7 +1424,7 @@ class FlowTableEntryMatchSetMisc3(Packet):
     ]
 
 
-class FlowTableEntryMatchSetLyr24(Packet):
+class FlowTableEntryMatchSetLyr24(PRMPacket):
     fields_desc = [
         MACField('smac', '00:00:00:00:00:00'),
         ShortField('ethertype', 0),
@@ -1461,21 +1473,21 @@ class FlowTableEntryMatchSetLyr24(Packet):
     ]
 
 
-class ProgSampleField(Packet):
+class ProgSampleField(PRMPacket):
     fields_desc = [
         IntField('prog_sample_field_value', 0),
         IntField('prog_sample_field_id', 0),
     ]
 
 
-class FlowTableEntryMatchSetMisc4(Packet):
+class FlowTableEntryMatchSetMisc4(PRMPacket):
     fields_desc = [
         PacketListField('prog_sample_field', [ProgSampleField() for x in range(4)], ProgSampleField, count_from=lambda pkt:4),
         StrFixedLenField('reserved1', None, length=32),
     ]
 
 
-class FlowTableEntryMatchSetMisc5(Packet):
+class FlowTableEntryMatchSetMisc5(PRMPacket):
     fields_desc = [
         IntField('macsec_tag_0', 0),
         IntField('macsec_tag_1', 0),
@@ -1489,7 +1501,7 @@ class FlowTableEntryMatchSetMisc5(Packet):
     ]
 
 
-class FlowTableEntryMatchParam(Packet):
+class FlowTableEntryMatchParam(PRMPacket):
     fields_desc = [
         PacketField('outer_headers', FlowTableEntryMatchSetLyr24(), FlowTableEntryMatchSetLyr24),
         PacketField('misc_parameters', FlowTableEntryMatchSetMisc(), FlowTableEntryMatchSetMisc),
@@ -1504,7 +1516,7 @@ class FlowTableEntryMatchParam(Packet):
     ]
 
 
-class SetActionIn(Packet):
+class SetActionIn(PRMPacket):
     fields_desc = [
         BitField('action_type', ActionType.SET_ACTION, 4),
         BitField('field', 0, 12),
@@ -1516,7 +1528,7 @@ class SetActionIn(Packet):
     ]
 
 
-class CopyActionIn(Packet):
+class CopyActionIn(PRMPacket):
     fields_desc = [
         BitField('action_type', ActionType.COPY_ACTION, 4),
         BitField('src_field', 0, 12),
@@ -1532,7 +1544,7 @@ class CopyActionIn(Packet):
     ]
 
 
-class AllocFlowCounterIn(Packet):
+class AllocFlowCounterIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_ALLOC_FLOW_COUNTER),
         ShortField('uid', 0),
@@ -1544,7 +1556,7 @@ class AllocFlowCounterIn(Packet):
     ]
 
 
-class AllocFlowCounterOut(Packet):
+class AllocFlowCounterOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1554,7 +1566,7 @@ class AllocFlowCounterOut(Packet):
     ]
 
 
-class DeallocFlowCounterIn(Packet):
+class DeallocFlowCounterIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_DEALLOC_FLOW_COUNTER),
         ShortField('uid', 0),
@@ -1565,7 +1577,7 @@ class DeallocFlowCounterIn(Packet):
     ]
 
 
-class DeallocFlowCounterOut(Packet):
+class DeallocFlowCounterOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1574,7 +1586,7 @@ class DeallocFlowCounterOut(Packet):
     ]
 
 
-class QueryFlowCounterIn(Packet):
+class QueryFlowCounterIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_QUERY_FLOW_COUNTER),
         ShortField('uid', 0),
@@ -1590,14 +1602,14 @@ class QueryFlowCounterIn(Packet):
     ]
 
 
-class TrafficCounter(Packet):
+class TrafficCounter(PRMPacket):
     fields_desc = [
         LongField('packets', 0),
         LongField('octets', 0),
     ]
 
 
-class QueryFlowCounterOut(Packet):
+class QueryFlowCounterOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1607,7 +1619,7 @@ class QueryFlowCounterOut(Packet):
     ]
 
 
-class RxHashFieldSelect(Packet):
+class RxHashFieldSelect(PRMPacket):
     fields_desc = [
         BitField('l3_prot_type', 0, 1),
         BitField('l4_prot_type', 0, 1),
@@ -1615,7 +1627,7 @@ class RxHashFieldSelect(Packet):
     ]
 
 
-class Tirc(Packet):
+class Tirc(PRMPacket):
     fields_desc = [
         StrFixedLenField('reserved1', None, length=4),
         BitField('disp_type', 0, 4),
@@ -1653,7 +1665,7 @@ class Tirc(Packet):
     ]
 
 
-class CreateTirIn(Packet):
+class CreateTirIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_CREATE_TIR),
         ShortField('uid', 0),
@@ -1664,7 +1676,7 @@ class CreateTirIn(Packet):
     ]
 
 
-class CreateTirOut(Packet):
+class CreateTirOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('icm_address_63_40', 0, 24),
@@ -1675,7 +1687,7 @@ class CreateTirOut(Packet):
     ]
 
 
-class SwMkc(Packet):
+class SwMkc(PRMPacket):
     fields_desc = [
         BitField('reserved1', 0, 1),
         BitField('free', 0, 1),
@@ -1727,7 +1739,7 @@ class SwMkc(Packet):
     ]
 
 
-class CreateMkeyIn(Packet):
+class CreateMkeyIn(PRMPacket):
     fields_desc = [
         ShortField('opcode', DevxOps.MLX5_CMD_OP_CREATE_MKEY),
         ShortField('uid', 0),
@@ -1750,7 +1762,7 @@ class CreateMkeyIn(Packet):
     ]
 
 
-class CreateMkeyOut(Packet):
+class CreateMkeyOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1761,7 +1773,7 @@ class CreateMkeyOut(Packet):
     ]
 
 
-class MigrationTagVersion0(Packet):
+class MigrationTagVersion0(PRMPacket):
     fields_desc = [
         ShortField('reserved1', 0),
         ShortField('device_id', 0),
@@ -1772,7 +1784,7 @@ class MigrationTagVersion0(Packet):
     ]
 
 
-class CmdHcaCap2(Packet):
+class CmdHcaCap2(PRMPacket):
     fields_desc = [
         StrFixedLenField('reserved1', None, length=16),
         BitField('migratable', 0, 1),
@@ -1871,7 +1883,7 @@ class CmdHcaCap2(Packet):
     ]
 
 
-class QueryCmdHcaCap2Out(Packet):
+class QueryCmdHcaCap2Out(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1881,7 +1893,7 @@ class QueryCmdHcaCap2Out(Packet):
     ]
 
 
-class FlowMeterParams(Packet):
+class FlowMeterParams(PRMPacket):
     fields_desc = [
         BitField('valid', 0, 1),
         BitField('bucket_overflow', 0, 1),
@@ -1906,7 +1918,7 @@ class FlowMeterParams(Packet):
     ]
 
 
-class QosCaps(Packet):
+class QosCaps(PRMPacket):
     fields_desc = [
         BitField('packet_pacing', 0, 1),
         BitField('esw_scheduling', 0, 1),
@@ -1960,7 +1972,7 @@ class QosCaps(Packet):
     ]
 
 
-class QueryQosCapOut(Packet):
+class QueryQosCapOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -1970,7 +1982,66 @@ class QueryQosCapOut(Packet):
     ]
 
 
-class FlowTableFieldsSupported2(Packet):
+class OdpPerTransportServiceCap(PRMPacket):
+    fields_desc = [
+        BitField('send', 0, 1),
+        BitField('receive', 0, 1),
+        BitField('write', 0, 1),
+        BitField('read', 0, 1),
+        BitField('atomic', 0, 1),
+        BitField('rmp', 0, 1),
+        BitField('tag_matching', 0, 1),
+        BitField('reserved1', 0, 25),
+    ]
+
+
+class OdpSchemeCap(PRMPacket):
+    fields_desc = [
+        StrFixedLenField('reserved1', None, length=8),
+        BitField('sig', 0, 1),
+        BitField('cross_vhca_mkey', 0, 1),
+        BitField('klm_null_mkey', 0, 1),
+        BitField('dpa_process_win', 0, 1),
+        BitField('reserved2', 0, 3),
+        BitField('mmo_wqe', 0, 1),
+        BitField('local_mmo_wqe', 0, 1),
+        BitField('aso_wqe', 0, 1),
+        BitField('umr_wqe', 0, 1),
+        BitField('get_psv_wqe', 0, 1),
+        BitField('rget_psv_wqe', 0, 1),
+        BitField('reserved3', 0, 19),
+        StrFixedLenField('reserved4', None, length=4),
+        PacketField('rc_odp_caps', OdpPerTransportServiceCap(), OdpPerTransportServiceCap),
+        PacketField('uc_odp_caps', OdpPerTransportServiceCap(), OdpPerTransportServiceCap),
+        PacketField('ud_odp_caps', OdpPerTransportServiceCap(), OdpPerTransportServiceCap),
+        PacketField('xrc_odp_caps', OdpPerTransportServiceCap(), OdpPerTransportServiceCap),
+        PacketField('dc_odp_caps', OdpPerTransportServiceCap(), OdpPerTransportServiceCap),
+        StrFixedLenField('reserved5', None, length=28),
+    ]
+
+
+class OdpCap(PRMPacket):
+    fields_desc = [
+        PacketField('transport_page_fault_scheme_cap', OdpSchemeCap(), OdpSchemeCap),
+        PacketField('memory_page_fault_scheme_cap', OdpSchemeCap(), OdpSchemeCap),
+        StrFixedLenField('reserved1', None, length=64),
+        BitField('mem_page_fault', 0, 1),
+        BitField('reserved2', 0, 31),
+        StrFixedLenField('reserved3', None, length=60),
+    ]
+
+
+class QueryOdpCapOut(PRMPacket):
+    fields_desc = [
+        ByteField('status', 0),
+        BitField('reserved1', 0, 24),
+        IntField('syndrome', 0),
+        StrFixedLenField('reserved2', None, length=8),
+        PadField(PacketField('capability', OdpCap(), OdpCap), 4096, padwith=b"\x00"),
+    ]
+
+
+class FlowTableFieldsSupported2(PRMPacket):
     fields_desc = [
         BitField('reserved1', 0, 10),
         BitField('lag_rx_port_affinity', 0, 1),
@@ -1999,7 +2070,7 @@ class FlowTableFieldsSupported2(Packet):
     ]
 
 
-class FlowTableFieldsSupported(Packet):
+class FlowTableFieldsSupported(PRMPacket):
     fields_desc = [
         BitField('outer_dmac', 0, 1),
         BitField('outer_smac', 0, 1),
@@ -2131,7 +2202,7 @@ class FlowTableFieldsSupported(Packet):
     ]
 
 
-class HeaderModifyCapProperties(Packet):
+class HeaderModifyCapProperties(PRMPacket):
     fields_desc = [
         PacketField('set_action_field_support', FlowTableFieldsSupported(),
                     FlowTableFieldsSupported),
@@ -2149,7 +2220,7 @@ class HeaderModifyCapProperties(Packet):
     ]
 
 
-class FlowTablePropLayout(Packet):
+class FlowTablePropLayout(PRMPacket):
     fields_desc = [
         BitField('ft_support', 0, 1),
         BitField('flow_tag', 0, 1),
@@ -2227,7 +2298,7 @@ class FlowTablePropLayout(Packet):
     ]
 
 
-class FlowTableNicCap(Packet):
+class FlowTableNicCap(PRMPacket):
     fields_desc = [
         BitField('nic_rx_multi_path_tirs', 0, 1),
         BitField('nic_rx_multi_path_tirs_fts', 0, 1),
@@ -2294,7 +2365,7 @@ class FlowTableNicCap(Packet):
     ]
 
 
-class QueryCmdHcaNicFlowTableCapOut(Packet):
+class QueryCmdHcaNicFlowTableCapOut(PRMPacket):
     fields_desc = [
         ByteField('status', 0),
         BitField('reserved1', 0, 24),
@@ -2302,4 +2373,59 @@ class QueryCmdHcaNicFlowTableCapOut(Packet):
         StrFixedLenField('reserved2', None, length=8),
         PadField(PacketField('capability', FlowTableNicCap(), FlowTableNicCap), 2048,
                  padwith=b"\x00"),
+    ]
+
+
+class RdmaCtrlObj(PRMPacket):
+    fields_desc = [
+        LongField('modify_field_select', 0),
+        StrFixedLenField('reserved1', None, length=6),
+        ShortField('other_vhca_id', 0),
+    ]
+
+
+class GeneralObjCreateParam(PRMPacket):
+    fields_desc = [
+        BitField('alias_object', 0, 1),
+        BitField('reserved1', 0, 2),
+        BitField('log_obj_range', 0, 5),
+        BitField('reserved2', 0, 24),
+    ]
+
+
+class GeneralObjInCmdHdr(PRMPacket):
+    fields_desc = [
+        ShortField('opcode', 0),
+        ShortField('uid', 0),
+        ShortField('vhca_tunnel_id', 0),
+        ShortField('obj_type', 0),
+        IntField('obj_id', 0),
+        ConditionalField(
+            PadField(PacketField('op_param_create', GeneralObjCreateParam(), GeneralObjCreateParam), 4, padwith=b"\x00"),
+            lambda pkt: pkt.opcode == DevxOps.MLX5_CMD_OP_CREATE_GENERAL_OBJECT)
+    ]
+
+
+class GeneralObjOutCmdHdr(PRMPacket):
+    fields_desc = [
+        ByteField('status', 0),
+        BitField('reserved1', 0, 24),
+        IntField('syndrome', 0),
+        IntField('obj_id', 0),
+        StrFixedLenField('reserved2', None, length=4),
+    ]
+
+
+class CreateGeneralObjIn(PRMPacket):
+    fields_desc = [
+        PacketField('general_obj_in_cmd_hdr', GeneralObjInCmdHdr(), GeneralObjInCmdHdr),
+        ConditionalField(
+            PadField(PacketField('obj_context', RdmaCtrlObj(), RdmaCtrlObj), 488, padwith=b"\x00"),
+            lambda pkt: pkt.general_obj_in_cmd_hdr.obj_type == DevxGeneralObjTypes.MLX5_OBJ_TYPE_RDMA_CTRL),
+    ]
+
+
+class CreateGeneralObjOut(PRMPacket):
+    fields_desc = [
+        PacketField('general_obj_out_cmd_hdr', GeneralObjOutCmdHdr(), GeneralObjOutCmdHdr),
     ]
