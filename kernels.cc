@@ -890,48 +890,50 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
 
   CHECK_NVRTC(nvrtcDestroyProgram(&program));
 
-  auto exists = [&](std::string fn) {
-    struct stat buf;
-    return ::stat(fn.c_str(), &buf) == 0;
-  };
+  if (false) {
+    auto exists = [&](std::string fn) {
+      struct stat buf;
+      return ::stat(fn.c_str(), &buf) == 0;
+    };
 
-  std::string devrtPath = CUDADEVRT_PATH;
-  if (!exists(devrtPath)) {
-    std::string fn = "/usr/local/cuda/lib64/libcudadevrt.a";
-    if (exists(fn)) {
-      devrtPath = fn;
-    }
-  }
-
-  if (!exists(devrtPath)) {
-    std::vector<std::string> modules;
-    dl_iterate_phdr(
-        [](struct dl_phdr_info* info, size_t size, void* data) {
-          Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
-          return 0;
-        },
-        Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
-          modules.push_back(info->dlpi_name);
-        }).release());
-    std::reverse(modules.begin(), modules.end());
-    for (auto path : modules) {
-      auto slash = path.rfind('/');
-      if (slash != std::string::npos) {
-        path.resize(slash);
-      }
-      path += "libcudadevrt.a";
-      if (exists(path)) {
-        devrtPath = path;
-        break;
+    std::string devrtPath = CUDADEVRT_PATH;
+    if (!exists(devrtPath)) {
+      std::string fn = "/usr/local/cuda/lib64/libcudadevrt.a";
+      if (exists(fn)) {
+        devrtPath = fn;
       }
     }
-  }
 
-  if (!exists(devrtPath)) {
-    log.error("Cannot find libcudadevrt.a (at compile time, it was at %s)\n", devrtPath);
-  }
+    if (!exists(devrtPath)) {
+      std::vector<std::string> modules;
+      dl_iterate_phdr(
+          [](struct dl_phdr_info* info, size_t size, void* data) {
+            Function<void(struct dl_phdr_info*)>((FunctionPointer)data)(info);
+            return 0;
+          },
+          Function<void(struct dl_phdr_info*)>([&](struct dl_phdr_info* info) {
+            modules.push_back(info->dlpi_name);
+          }).release());
+      std::reverse(modules.begin(), modules.end());
+      for (auto path : modules) {
+        auto slash = path.rfind('/');
+        if (slash != std::string::npos) {
+          path.resize(slash);
+        }
+        path += "libcudadevrt.a";
+        if (exists(path)) {
+          devrtPath = path;
+          break;
+        }
+      }
+    }
 
-  log.verbose("devrtPath is %s\n", devrtPath);
+    if (!exists(devrtPath)) {
+      log.error("Cannot find libcudadevrt.a (at compile time, it was at %s)\n", devrtPath);
+    }
+
+    log.verbose("devrtPath is %s\n", devrtPath);
+  }
 
   // CUlinkState linkState;
   // CHECK_CU(cuLinkCreate(0, nullptr, nullptr, &linkState));
