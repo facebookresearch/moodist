@@ -49,7 +49,7 @@ struct CudaError : std::runtime_error {
 }
 
 [[noreturn]] [[gnu::cold]] inline void throwCheckFail(const char* file, int line, const char* text) {
-  std::string str = fmt::sprintf("[CHECK FAILED %s:%d] %s\n", __FILE__, __LINE__, text);
+  std::string str = fmt::sprintf("[CHECK FAILED %s:%d] %s\n", file, line, text);
   log.error("%s", str);
   throw std::runtime_error(str);
 }

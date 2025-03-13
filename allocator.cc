@@ -998,6 +998,9 @@ struct CudaAllocatorImpl {
       totalMappedBytes += v.end - v.begin;
       size_t prevEnd = v.begin;
       for (auto& x : freeMemory.map) {
+        if (x.span.begin < v.begin || x.span.begin >= v.end) {
+          continue;
+        }
         auto& v = x.span;
         if (v.begin != prevEnd) {
           s += fmt::sprintf("ALLOCATED %s\n", bytes(v.begin - prevEnd));
