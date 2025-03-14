@@ -196,6 +196,7 @@ struct QueueEntryCreateQueue : QueueEntry {
   size_t location = 0;
   uintptr_t address = 0;
   size_t bytes = 0;
+  bool streaming = false;
 };
 
 struct QueueEntryQueuePut : QueueEntry {
@@ -206,7 +207,8 @@ struct QueueEntryQueuePut : QueueEntry {
   uint32_t remoteGetKey = 0;
   uint32_t transactionKey = 0;
   size_t queueSize = -1;
-  TensorData* tensor;
+  TensorData* tensor = nullptr;
+  bool streaming = false;
 };
 
 struct QueueEntryQueueGet : QueueEntry {

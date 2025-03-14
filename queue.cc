@@ -131,6 +131,8 @@ struct QueueStorage {
 
   std::atomic_size_t putQueueSize = 0;
   Vector<QueuedPut> putQueue;
+
+  bool streaming = false;
 };
 
 void barrier(Group* group) {
@@ -148,7 +150,7 @@ void barrier(Group* group) {
   }
 }
 
-uintptr_t sendCreateQueue(Group* group, int location, uintptr_t address) {
+uintptr_t sendCreateQueue(Group* group, int location, uintptr_t address, bool streaming) {
   uint32_t concurrencyIndex = 0;
   std::atomic_uintptr_t outAddress = 0;
   std::atomic_uint32_t cpuDone = 0;
@@ -161,6 +163,7 @@ uintptr_t sendCreateQueue(Group* group, int location, uintptr_t address) {
   e->outAddress = &outAddress;
   e->location = location;
   e->address = address;
+  e->streaming = streaming;
   group->cpuThread->enqueue(e);
   while (cpuDone == 0) {
     futexWait(&cpuDone, 0, std::chrono::seconds(10));
@@ -168,19 +171,20 @@ uintptr_t sendCreateQueue(Group* group, int location, uintptr_t address) {
   return outAddress;
 }
 
-void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress) {
+void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress, bool streaming) {
   CHECK(location >= 0 && location < group->size);
   // barrier(group);
 
   uintptr_t address = 0;
 
   qs = new QueueStorage();
+  qs->streaming = streaming;
 
   if (location == group->rank) {
-    sendCreateQueue(group, location, (uintptr_t)qs);
+    sendCreateQueue(group, location, (uintptr_t)qs, streaming);
     remoteAddress = (uintptr_t)qs;
   } else {
-    remoteAddress = sendCreateQueue(group, location, 0);
+    remoteAddress = sendCreateQueue(group, location, 0, streaming);
   }
 
   barrier(group);
@@ -196,10 +200,10 @@ void create(
   for (size_t i = 0; i != locations.size(); ++i) {
     int location = locations[i];
     if (location == group->rank) {
-      sendCreateQueue(group, location, (uintptr_t)qs);
+      sendCreateQueue(group, location, (uintptr_t)qs, false);
       remoteAddress[i] = (uintptr_t)qs;
     } else {
-      remoteAddress[i] = sendCreateQueue(group, location, 0);
+      remoteAddress[i] = sendCreateQueue(group, location, 0, false);
     }
   }
 
@@ -222,7 +226,7 @@ std::atomic_uint32_t nextPutKey = getRng()();
 
 template<typename Tensor>
 void sendPut(
-    Group* group, int location, uintptr_t remoteAddress, Tensor tensor, std::shared_ptr<QueueWorkImpl> work,
+    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, std::shared_ptr<QueueWorkImpl> work,
     uint32_t remoteGetKey, uint32_t transactionKey, size_t queueSize = -1) {
   size_t numel = tensor->numel();
   size_t bytes = numel * tensor->itemsize();
@@ -248,6 +252,7 @@ void sendPut(
   e->remoteGetKey = remoteGetKey;
   e->transactionKey = transactionKey;
   e->queueSize = queueSize;
+  e->streaming = streaming;
   if (work) {
     e->callback = [work = std::move(work),
                    tensor = std::move(tensor)](uintptr_t* cudaDoneAddress, uint32_t* cudaDoneValue) {
@@ -270,9 +275,9 @@ void sendPut(
 
 template<typename Tensor>
 void sendPutRemote(
-    Group* group, int location, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey, size_t queueSize) {
+    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey, size_t queueSize) {
   CHECK(location != group->rank);
-  sendPut(group, location, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0, queueSize);
+  sendPut(group, location, streaming, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0, queueSize);
 }
 
 std::atomic_uint32_t nextRemoteGetKey = getRng()();
@@ -363,15 +368,19 @@ struct QueueImpl {
   SimpleVector<int> multicastLocations;
   SimpleVector<uintptr_t> multicastRemoteAddresses;
 
-  QueueImpl(std::shared_ptr<Group> group, int location) : group(group), location(location) {
-    create(&*group, location, qs, remoteAddress);
+  QueueImpl(std::shared_ptr<Group> group, int location, bool streaming) : group(group), location(location) {
+    create(&*group, location, qs, remoteAddress, streaming);
     CHECK(qs != nullptr);
     CHECK(remoteAddress != 0);
+    CHECK(qs->streaming == streaming);
   }
 
-  QueueImpl(std::shared_ptr<Group> group, std::vector<int> locations) : group(group) {
+  QueueImpl(std::shared_ptr<Group> group, std::vector<int> locations, bool streaming) : group(group) {
     if (locations.empty()) {
       throw std::runtime_error("Queue cannot be constructed with an empty location list");
+    }
+    if (streaming) {
+      throw std::runtime_error("Streaming broadcast queues are currently not supported!");
     }
     isMulticast = true;
     location = locations[0];
@@ -557,7 +566,7 @@ struct QueueImpl {
 
         CHECK(qs->putQueueSize == qs->putQueue.size());
       } else {
-        sendPut(&*group, location, remoteAddress, std::move(td), work, 0, transactionKey);
+        sendPut(&*group, location, qs->streaming, remoteAddress, std::move(td), work, 0, transactionKey);
       }
     } else {
       td->isCuda = true;
@@ -595,7 +604,7 @@ struct QueueImpl {
             sendTransaction(&*group, i->location, i->remoteAddress, i->transactionKey, i->transactionOp);
           } else {
             sendPut(
-                &*group, i->location, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0, i->transactionKey);
+                &*group, i->location, qs->streaming, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0, i->transactionKey);
           }
           qs->putQueue.pop_front();
           --qs->putQueueSize;
@@ -726,15 +735,15 @@ Queue::Queue(void* p) {
   CHECK(p == &foo);
 }
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location) {
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location, bool streaming) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location);
+  r->impl = (void*)new QueueImpl(group, location, streaming);
   return r;
 }
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, std::vector<int> location) {
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location);
+  r->impl = (void*)new QueueImpl(group, location, streaming);
   return r;
 }
 
@@ -781,7 +790,7 @@ void qsAdd(Group* group, QueueStorage* qs, Tensor&& tensor) {
     size_t n = qs->multicastLocations.size();
     for (size_t i = 0; i != n; ++i) {
       if (qs->multicastLocations[i] != group->rank) {
-        sendPutRemote(group, qs->multicastLocations[i], qs->multicastRemoteAddresses[i], shared, 0, -1);
+        sendPutRemote(group, qs->multicastLocations[i], qs->streaming, qs->multicastRemoteAddresses[i], shared, 0, -1);
       }
     }
   }
@@ -803,7 +812,7 @@ void transferQueuedItems(Group* group, QueueStorage* qs, IncomingSource* ptr, st
     TensorDataPtr r = std::move(qs->vector.front());
     qs->vector.pop_front();
     --qs->size;
-    sendPutRemote(group, w->source, w->remoteQueueAddress, std::move(r), w->key, 0);
+    sendPutRemote(group, w->source, qs->streaming, w->remoteQueueAddress, std::move(r), w->key, 0);
     freeWaiting(w);
   }
   l.unlock();
@@ -909,7 +918,7 @@ void queueRemoteGetStart(
     CHECK(queueSize == qs->vector.size());
     qs->vector.pop_front();
     --qs->size;
-    sendPutRemote(group, source, remoteQueueAddress, std::move(r), key, queueSize);
+    sendPutRemote(group, source, qs->streaming, remoteQueueAddress, std::move(r), key, queueSize);
   } else {
     // log.info("adding to wait list \n");
     Waiting* w = allocWaiting(source, key, remoteQueueAddress);

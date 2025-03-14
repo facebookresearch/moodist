@@ -272,7 +272,7 @@ struct ProcessGroupImpl {
     CUcontext poppedContext;
     CHECK_CU(cuCtxPopCurrent(&poppedContext));
 
-    log.verbose("Reset step value done, syncing\n");
+    log.info("Reset step value done, syncing\n");
     internalBarrier();
     log.verbose("Reset step value end\n");
   }
@@ -2845,12 +2845,12 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
   return c10::make_intrusive<WorkImpl>(torch::Tensor(), std::nullopt);
 }
 
-std::shared_ptr<Queue> ProcessGroup::makeQueue(int location) {
-  return moodist::makeQueue(impl->group, location);
+std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming) {
+  return moodist::makeQueue(impl->group, location, streaming);
 }
 
-std::shared_ptr<Queue> ProcessGroup::makeQueue(std::vector<int> location) {
-  return moodist::makeQueue(impl->group, location);
+std::shared_ptr<Queue> ProcessGroup::makeQueue(std::vector<int> location, bool streaming) {
+  return moodist::makeQueue(impl->group, location, streaming);
 }
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {

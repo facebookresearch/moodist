@@ -15,7 +15,7 @@ moodist.enable_cpu_allocator()
 
 group = torch.distributed.new_group()
 
-queue = moodist.Queue(group, location=0)
+queue = moodist.Queue(group, location=0, streaming=False)
 
 rank = group.rank()
 
@@ -49,7 +49,7 @@ for iteration in range(4):
             t = torch.randn((128, 1 + i, 2 + i), device="cpu").cpu()
             # print("queue size is %d" % queue.qsize())
             item = queue.get_tensor()
-            
+
             print(" got ", i, item.shape)
 
             # print(t - item)
@@ -60,7 +60,11 @@ for iteration in range(4):
             # print("%d ok" % i)
             del item
 
+    torch.distributed.barrier()
+
     moodist.cpu_allocator_debug()
+
+    torch.distributed.barrier()
 
     # if iteration == 1:
     #     break

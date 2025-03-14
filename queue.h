@@ -37,8 +37,8 @@ struct Queue {
   void transactionCommit(uint32_t id);
 };
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location);
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, std::vector<int> location);
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming);
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming);
 
 uint32_t queuePrepare(uintptr_t queueAddress, uint32_t source, uint32_t getKey, uint32_t transactionKey);
 void queueFinish(

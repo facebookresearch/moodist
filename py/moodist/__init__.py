@@ -45,13 +45,13 @@ class TransactionContextManager:
 
 
 class Queue:
-    def __init__(self, process_group, location):
+    def __init__(self, process_group, location, streaming=False):
         if not hasattr(process_group, "Queue"):
             raise RuntimeError(
                 "moodist.Queue process_group parameter must be a MoodistProcessGroup, but got %s"
                 % str(type(process_group)),
             )
-        self.impl = process_group.Queue(location=location)
+        self.impl = process_group.Queue(location=location, streaming=streaming)
 
     def put_tensor(self, tensor, *, transaction=0):
         return self.impl.put(tensor, transaction)

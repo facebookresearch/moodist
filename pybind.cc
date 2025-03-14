@@ -54,11 +54,11 @@ PYBIND11_MODULE(_C, m) {
   )d")
       .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
       .def(
-          "Queue", py::overload_cast<int>(&MoodistProcessGroup::makeQueue), py::arg("location"),
-          py::call_guard<py::gil_scoped_release>())
+          "Queue", py::overload_cast<int, bool>(&MoodistProcessGroup::makeQueue), py::arg("location"),
+          py::arg("streaming") = false, py::call_guard<py::gil_scoped_release>())
       .def(
-          "Queue", py::overload_cast<std::vector<int>>(&MoodistProcessGroup::makeQueue), py::arg("location"),
-          py::call_guard<py::gil_scoped_release>())
+          "Queue", py::overload_cast<std::vector<int>, bool>(&MoodistProcessGroup::makeQueue), py::arg("location"),
+          py::arg("streaming") = false, py::call_guard<py::gil_scoped_release>())
       .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
       .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>());
 

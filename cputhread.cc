@@ -4018,7 +4018,9 @@ struct CpuThreadImpl {
         out.gatherAddress = params.address;
         out.gatherBytes = params.bytes;
         out.stepValue = stepValue;
+        static_assert(maxDevices >= 2);
         out.gatherKey[0] = params.location;
+        out.gatherKey[1] = params.streaming;
         for (i = 0; i != size; ++i) {
           if (i == self.rank) {
             continue;
@@ -4031,6 +4033,12 @@ struct CpuThreadImpl {
           fatal(
               "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location %d",
               rank, params.location, params.location, dyn.gatherKey[0]);
+        }
+        if (params.streaming != dyn.gatherKey[1]) {
+          fatal(
+              "Queue streaming mismatch. Queue was created on rank %d with streaming %d, but on rank %d with streaming "
+              "%d",
+              rank, params.streaming, params.location, dyn.gatherKey[1]);
         }
         *params.outAddress = dyn.gatherAddress;
       }
@@ -4223,7 +4231,7 @@ struct CpuThreadImpl {
                                }
                                x(false);
                              }));
-    if (!isCuda) {
+    if (!isCuda && !params.streaming) {
       if (serializedBytes + bytes <= buffer->bytes) {
         bool inlineFlag = true;
         std::memcpy((char*)cpuPointer + serializedBytes - 1, &inlineFlag, sizeof(bool));

@@ -115,8 +115,8 @@ public:
     throw std::runtime_error("recvAnysource not supported");
   }
 
-  std::shared_ptr<Queue> makeQueue(int location);
-  std::shared_ptr<Queue> makeQueue(std::vector<int> location);
+  std::shared_ptr<Queue> makeQueue(int location, bool streaming = false);
+  std::shared_ptr<Queue> makeQueue(std::vector<int> location, bool streaming = false);
 
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
