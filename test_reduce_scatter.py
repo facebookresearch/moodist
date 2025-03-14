@@ -43,6 +43,8 @@ def f(n):
 
         moodist.enable_cuda_allocator()
         moodist.enable_cpu_allocator()
+        
+        moodist.set_prefer_kernel_less(True)
 
         # moodist.enable_profiling(True)
     if n == "tccl":
@@ -127,9 +129,6 @@ def f(n):
             # print("%d: input sum %d is %f" % (rank, r, rdata.chunk(size)[rank].sum()))
 
         correct_result = sum(all_inputs).chunk(size)[rank]
-
-        print("sum(all_inputs) shape ", sum(all_inputs).shape)
-        print("correct_result shape ", correct_result.shape)
 
     torch.manual_seed(420 + rank)
 
