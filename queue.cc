@@ -175,6 +175,10 @@ void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddr
   CHECK(location >= 0 && location < group->size);
   // barrier(group);
 
+  if (streaming) {
+    throw std::runtime_error("Queue: streaming is not fully implemented");
+  }
+
   uintptr_t address = 0;
 
   qs = new QueueStorage();
