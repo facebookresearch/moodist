@@ -17,6 +17,7 @@
 
 #include <optional>
 #include <random>
+#include <ranges>
 #include <stdexcept>
 #include <utility>
 
@@ -626,4 +627,12 @@ struct FutureImpl {
 };
 
 using FutureImplSharedPtr = FLSharedPtr<FutureImpl>;
+
+auto range(auto n) {
+  return std::views::iota((decltype(n))0, n);
+}
+auto indices(auto&& c) {
+  return range(c.size());
+}
+
 } // namespace moodist

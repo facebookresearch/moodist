@@ -105,7 +105,7 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = True
+    test_gather = False
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
@@ -555,7 +555,8 @@ def f(n):
 
     else:
         # items = 1024 * 1024 * 64 * size
-        items = 1024 * 1024 * 20 * size
+        #items = 1024 * 1024 * 20 * size
+        items = 1
         # items = 1024 * 1024 * 50
         # items = 1024 * 1024 * 40
         # items = (1024 * 512 - 1024 * 8) * size

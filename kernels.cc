@@ -13,6 +13,9 @@
 
 namespace moodist {
 
+std::string generate_reduce_scatter_direct(
+    const Group* group, std::vector<std::string> generateTypes, std::vector<std::string> generateReductions);
+
 Kernels::~Kernels() {
   for (auto cuModule : cuModules) {
     cuModuleUnload(cuModule);
@@ -554,7 +557,7 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
       source, "$copyCode",
       emitCopySeq({"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex"));
 
-  if (flags & CompileReduceScatter) {
+  if (flags & (CompileReduceScatter | CompileReduceScatterDirect)) {
     auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
     CHECK(i != supportedTypes.end());
     source += emitReduceFunctionSeq(
@@ -746,6 +749,18 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
     fn(cuReduceScatterLocal[t][r],
        replace("reduce_scatter_local_$type_$red", "$type", compileType, "$red", compileReduction));
     fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", compileType, "$red", compileReduction));
+  }
+  if (flags & CompileReduceScatterDirect) {
+    source += generate_reduce_scatter_direct(group, {compileType}, {compileReduction});
+
+    auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
+    auto i2 = std::find(supportedReductions.begin(), supportedReductions.end(), compileReduction);
+    CHECK(i != supportedTypes.end());
+    CHECK(i2 != supportedReductions.end());
+    size_t t = i - supportedTypes.begin();
+    size_t r = i2 - supportedReductions.begin();
+    fn(cuReduceScatterDirect[t][r],
+       replace("reduce_scatter_direct_$type_$red", "$type", compileType, "$red", compileReduction));
   }
 
   fn(cuBroadcast, "broadcast");

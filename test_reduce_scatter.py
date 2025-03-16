@@ -89,7 +89,8 @@ def f(n):
     # data = torch.randn((442416 - 4) * size).cuda() + 1
     # data = torch.randn(527040 * size).cuda() + 1
     # data = torch.randn(589824 * size).cuda() + 1
-    data = torch.randn(294912 * size).cuda() + 1
+    #data = torch.randn(294912 * size).cuda() + 1
+    data = torch.randn(3784800 // 4 * size).cuda() + 1
     # data = torch.randn(524288 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
@@ -353,7 +354,7 @@ if len(sys.argv) < 3:
     f(sys.argv[1])
     sys.exit(0)
 
-ngpus = 2
+ngpus = 8
 
 fds = []
 for i in range(ngpus):

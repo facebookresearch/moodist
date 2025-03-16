@@ -8,6 +8,7 @@ namespace moodist {
 enum CompileFlags {
   CompileAllGather = 1,
   CompileReduceScatter = 2,
+  CompileReduceScatterDirect = 4,
 };
 
 struct Group;
@@ -28,6 +29,7 @@ struct Kernels : CollectiveBase {
 
   std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatterLocal{};
   std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatter{};
+  std::array<std::array<CUfunction, (size_t)Reduction::count>, (size_t)Dtype::count> cuReduceScatterDirect{};
 
   CUfunction cuBroadcast = nullptr;
 

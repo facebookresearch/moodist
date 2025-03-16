@@ -96,6 +96,7 @@ pybind11_add_module(_C
   allgather.cc
   kernels.cc
   reduce_scatter.cc
+  reduce_scatter_direct.cc
   allocator.cc
   queue.cc
   cpu_allocator.cc

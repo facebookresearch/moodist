@@ -29,7 +29,7 @@ constexpr uint8_t taskQueueTransaction = 16;
 constexpr uint8_t taskCat = 17;
 constexpr uint8_t taskCopy = 18;
 constexpr uint8_t taskCached = 19;
-constexpr uint8_t taskReduceScatterBroadcast = 20;
+constexpr uint8_t taskReduceScatterDirect = 20;
 constexpr uint8_t taskAllGatherBroadcast = 21;
 constexpr uint8_t taskCallback = 22;
 
@@ -62,7 +62,7 @@ OPTYPE(AllGatherRingCuda);
 OPTYPE(AllGatherBroadcastCuda);
 OPTYPE(ReduceScatterKernelLessCuda);
 OPTYPE(ReduceScatterRingCuda);
-OPTYPE(ReduceScatterBroadcastCuda);
+OPTYPE(ReduceScatterDirectCuda);
 OPTYPE(BroadcastCuda);
 OPTYPE(ReduceCuda);
 

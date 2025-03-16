@@ -275,32 +275,32 @@ struct CollectiveBase {
     return r;
   }
 
-  std::string cast(std::string type, uintptr_t address) {
+  std::string cast(std::string type, uintptr_t address) const {
     return fmt::sprintf("((%s)%#x)", type, address);
   }
-  std::string cast(std::string type, std::string address) {
+  std::string cast(std::string type, std::string address) const {
     return replace("(($type)($address))", "$type", type, "$address", address);
   }
 
   template<typename offsetT = size_t>
-  std::string concurrencyIndex(uintptr_t base, size_t itembytes, offsetT offset = 0) {
+  std::string concurrencyIndex(uintptr_t base, size_t itembytes, offsetT offset = 0) const {
     return replace(
         "($base + $itembytes * concurrencyIndex + $offset)", "$base", base, "$itembytes", itembytes, "$offset", offset);
   }
   template<typename offsetT = size_t>
-  std::string concurrencyIndex(const AllocatedArray& arr, offsetT offset = 0) {
+  std::string concurrencyIndex(const AllocatedArray& arr, offsetT offset = 0) const {
     return concurrencyIndex(arr.buffer.cudaPointer, arr.itembytes, offset);
   }
   template<typename offsetT = size_t>
-  std::string concurrencyIndex(const PeerArrayRef& arr, offsetT offset = 0) {
+  std::string concurrencyIndex(const PeerArrayRef& arr, offsetT offset = 0) const {
     return concurrencyIndex(arr.base, arr.itembytes, offset);
   }
 
-  size_t getPeerIndex(size_t rank) {
+  size_t getPeerIndex(size_t rank) const {
     return group->getPeerIndex(rank);
   }
 
-  size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
+  size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) const {
     return Group::maxChunks * Group::maxDevices * size * concurrencyIndex + Group::maxChunks * size * device +
            size * chunk + index;
   }

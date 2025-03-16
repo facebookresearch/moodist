@@ -2004,7 +2004,6 @@ struct CpuThreadImpl {
           bool done = false;
           do {
             if (reduceIndex != ringSends.size()) {
-
               if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
                 // log.info("send reduce source %d chunk %d\n", ringSends[reduceIndex].first, reduceChunkIndex);
                 CHECK(ringSends[reduceIndex].first != rank);
@@ -2100,7 +2099,7 @@ struct CpuThreadImpl {
     }
   };
 
-  struct WorkReduceScatterBroadcast : Work {
+  struct WorkReduceScatterDirect : Work {
     QueueEntryReduceScatter& params;
     MemoryRegistration* recvMr;
     uintptr_t recvAddress;
@@ -2108,43 +2107,106 @@ struct CpuThreadImpl {
     const ReduceScatter& reduceScatter = *self.group->reduceScatter;
     const Vector<size_t>& recvRanks = reduceScatter.recvRanks;
     const Vector<size_t>& sendRanks = reduceScatter.sendRanks;
+    const size_t numRecvs = recvRanks.size();
+    const size_t numSends = sendRanks.size();
 
     size_t index;
-    size_t sendIndex;
-    size_t sendDoneIndex;
+    // size_t sendIndex;
+    // size_t sendDoneIndex;
     size_t i;
     size_t liveReads = 0;
 
-    std::array<uint32_t, maxDevices> recvLkeys;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+    size_t readIndex = 0;
+    size_t chunkIndex = 0;
+    size_t reduceIndex = 0;
+    size_t reduceChunkIndex = 0;
 
     bool isNoLocal = self.group->peerIndices.empty();
 
-    WorkReduceScatterBroadcast(CpuThreadImpl& self, QueueEntryReduceScatter& params)
-        : Work(self, params), params(params) {
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    const size_t numParallel = params.numParallel;
+
+    WorkReduceScatterDirect(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params) {
       // log.info(
-      //     "%d: reduce-scatter broadcast recv ranks [%s], send ranks [%s]\n", rank,
+      //     "%d: reduce-scatter direct recv ranks [%s], send ranks [%s]\n", rank,
       //     fmt::to_string(fmt::join(recvRanks, ", ")), fmt::to_string(fmt::join(sendRanks, ", ")));
     }
 
-    void advanceSend() {
-      CHECK(sendIndex != sendRanks.size());
-      CHECK(sendDoneIndex <= sendIndex);
+    // void advanceSend() {
+    //   CHECK(sendIndex != sendRanks.size());
+    //   CHECK(sendDoneIndex <= sendIndex);
 
-      if (sendIndex >= sendDoneIndex + 1) {
-        if (self.inStepValueDeviceChunk(concurrencyIndex, sendRanks[sendDoneIndex], 0, 0) != stepValue) {
+    //   if (sendIndex >= sendDoneIndex + 1) {
+    //     if (self.inStepValueDeviceChunk(concurrencyIndex, sendRanks[sendDoneIndex], 0, 0) != stepValue) {
+    //       return;
+    //     }
+    //     ++sendDoneIndex;
+    //   }
+
+    //   if (!isNoLocal) {
+    //     if (cpuIn[16 + sendIndex] < stepValue) {
+    //       return;
+    //     }
+    //   }
+
+    //   self.writeDyn(concurrencyIndex, sendRanks[sendIndex], sendRanks[sendIndex], rank, 1);
+    //   ++sendIndex;
+    // }
+
+    void tryRead(size_t di) {
+      size_t index = readIndex;
+      size_t chunkIndex = this->chunkIndex;
+      size_t source = recvRanks[index];
+
+      size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+      size_t n = currentChunkSize;
+      bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+      size_t readOffset = chunkSize * chunkIndex;
+      if (n != 0) {
+
+        if (self.inDyn(concurrencyIndex, source).stepValue != stepValue) {
           return;
         }
-        ++sendDoneIndex;
-      }
 
-      if (!isNoLocal) {
-        if (cpuIn[16 + sendIndex] < stepValue) {
+        WAIT_DYN(opTypeReduceScatterDirectCuda, source);
+
+        // if (!isNoLocal) {
+        //   if (cpuIn[16 + size * chunkIndex + index] < stepValue) {
+        //     return;
+        //   }
+        // }
+
+        if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
           return;
         }
+
+        uintptr_t dstAddr = recvAddress + params.pitch * index;
+
+        ++liveReads;
+        ++deviceLiveReads[di];
+        uintptr_t srcAddr = dyn.gatherAddress;
+        auto key = dyn.gatherKey;
+        auto& dev = self.devices[di];
+        self.readData(
+            dev, source, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
+            n, self.makeCallback([this, di, source, chunkIndex]() {
+              --liveReads;
+              --deviceLiveReads[di];
+              // self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
+            }));
       }
 
-      self.writeDyn(concurrencyIndex, sendRanks[sendIndex], sendRanks[sendIndex], rank, 1);
-      ++sendIndex;
+      if (isLastChunk) {
+        this->chunkIndex = 0;
+        ++this->readIndex;
+      } else {
+        ++this->chunkIndex;
+        CHECK(this->chunkIndex < numChunks);
+      }
     }
 
     void step() {
@@ -2153,6 +2215,7 @@ struct CpuThreadImpl {
       self.trace("ring %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
+      self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
 
       {
         recvAddress = params.recvAddress;
@@ -2163,10 +2226,6 @@ struct CpuThreadImpl {
 
         if (recvAddress) {
           recvMr = self.regMrCuda(recvAddress, params.pitch * recvRanks.size());
-
-          for (size_t i = 0; i != maxDevices; ++i) {
-            recvLkeys[i] = recvMr->mrs[i]->lkey;
-          }
         }
         if (sendAddress) {
           sendMr = self.regMrCuda(sendAddress, params.pitch * sendRanks.size());
@@ -2183,7 +2242,7 @@ struct CpuThreadImpl {
               sendAddress ? sendAddress + params.pitch * index : params.inputAddress + params.pitch * i;
           outDyns[i].gatherBytes = params.bytes;
           outDyns[i].stepValue = stepValue;
-          outDyns[i].opType = opTypeReduceScatterBroadcastCuda;
+          outDyns[i].opType = opTypeReduceScatterDirectCuda;
           CHECK(sendMr != nullptr);
           for (size_t di = 0; di != self.devices.size(); ++di) {
             outDyns[i].gatherKey[di] = sendMr->mrs[di]->rkey;
@@ -2195,69 +2254,122 @@ struct CpuThreadImpl {
 
       self.trace("kernel-entry");
 
-      // wait for kernel
+      // // wait for kernel
       while (cpuIn[0] < stepValue) {
         YIELD
       }
 
-      // for (size_t i : sendRanks) {
-      //   self.writeDyn(concurrencyIndex, i, i, rank, 1);
-      // }
-
-      sendIndex = 0;
-      sendDoneIndex = 0;
-
-      for (index = 0; index != recvRanks.size();) {
-        i = recvRanks[index];
-
-        if (sendIndex != sendRanks.size()) {
-          advanceSend();
-        }
-
-        if (liveReads >= 1) {
-          YIELD
-          continue;
-        }
-
-        if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
-          YIELD
-          continue;
-        }
-
-        WAIT_DYN(opTypeReduceScatterBroadcastCuda, i);
-
-        ++liveReads;
-        self.readDataDistributed(
-            i, (void*)(recvAddress + params.pitch * index), recvLkeys, (void*)(dyn.gatherAddress + 0), dyn.gatherKey,
-            params.bytes, self.makeCallback([this, i = i] {
-              --liveReads;
-
-              self.writeStepValueDeviceChunk(concurrencyIndex, i, 0, rank, 0, 0);
-            }));
-
-        ++index;
+      for (size_t i : sendRanks) {
+        self.writeDyn(concurrencyIndex, i, i, rank, 1);
       }
 
-      while (sendIndex != sendRanks.size()) {
-        advanceSend();
+      while (readIndex != numRecvs || reduceIndex != numSends) {
+        if (reduceIndex != numSends) {
+          if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
+            size_t i = sendRanks[reduceIndex];
+            CHECK(i != rank);
+            if (self.inDyn(concurrencyIndex, i).stepValue == stepValue) {
+              self.writeStepValueDeviceChunk(concurrencyIndex, i, 0, rank, 0, reduceChunkIndex);
+              size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * reduceChunkIndex);
+              if (chunkSize * reduceChunkIndex + currentChunkSize == params.bytes) {
+                ++reduceIndex;
+                reduceChunkIndex = 0;
+              } else {
+                ++reduceChunkIndex;
+              }
+            }
+          }
+        }
+        if (readIndex != numRecvs) {
+          size_t bestDevice = 0;
+          size_t bestLiveReads = numParallel;
+          for (size_t di : range(numDevices)) {
+            if (deviceLiveReads[di] < bestLiveReads) {
+              bestLiveReads = deviceLiveReads[di];
+              bestDevice = di;
+            }
+          }
+          if (bestLiveReads < numParallel) {
+            tryRead(bestDevice);
+          }
+        }
+        YIELD
       }
 
       while (liveReads) {
         YIELD
       }
 
+      self.writeCpuOut(concurrencyIndex, 0, 0);
+
+      CHECK(liveReads == 0);
+      CHECK(readIndex == numRecvs);
+      CHECK(reduceIndex == numSends);
+
+      // sendIndex = 0;
+      // sendDoneIndex = 0;
+
+      // for (index = 0; index != recvRanks.size();) {
+      //   i = recvRanks[index];
+
+      //   if (sendIndex != sendRanks.size()) {
+      //     advanceSend();
+      //   }
+
+      //   if (liveReads >= 1) {
+      //     YIELD
+      //     continue;
+      //   }
+
+      //   if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+      //     YIELD
+      //     continue;
+      //   }
+
+      //   WAIT_DYN(opTypeReduceScatterDirectCuda, i);
+
+      //   ++liveReads;
+      //   self.readDataDistributed(
+      //       i, (void*)(recvAddress + params.pitch * index), recvLkeys, (void*)(dyn.gatherAddress + 0), dyn.gatherKey,
+      //       params.bytes, self.makeCallback([this, i = i] {
+      //         --liveReads;
+
+      //         self.writeStepValueDeviceChunk(concurrencyIndex, i, 0, rank, 0, 0);
+      //       }));
+
+      //   ++index;
+      // }
+
+      // while (sendIndex != sendRanks.size()) {
+      //   advanceSend();
+      // }
+
+      // while (liveReads) {
+      //   YIELD
+      // }
+
       self.trace("wait for remote reads");
+      for (size_t i : recvRanks) {
+        self.writeStepValue(concurrencyIndex, i, 0, rank);
+      }
       for (index = 0; index != sendRanks.size(); ++index) {
         i = sendRanks[index];
-        while (self.inStepValueDeviceChunk(concurrencyIndex, i, 0, 0) != stepValue) {
+        while (self.inStepValue(concurrencyIndex, i) != stepValue) {
           YIELD
         }
       }
 
+      // for (index = 0; index != sendRanks.size(); ++index) {
+      //   i = sendRanks[index];
+      //   while (self.inStepValueDeviceChunk(concurrencyIndex, i, 0, 0) != stepValue) {
+      //     YIELD
+      //   }
+      // }
+
       // log.info("wait for exit kernel %d\n", stepValue);
 
       // cpuOut[0] = stepValue;
-      self.writeCpuOut(concurrencyIndex, 0, 0);
+      self.writeCpuOut(concurrencyIndex, 0, 1);
 
       self.trace("kernel-exit");
 
@@ -2274,16 +2386,16 @@ struct CpuThreadImpl {
       //   }
       // }
 
-      while (cpuIn[0] < stepValue + 1) {
-        YIELD
-      }
+      // while (cpuIn[0] < stepValue + 1) {
+      //   YIELD
+      // }
 
       // log.info("exit kernel %d ok\n", stepValue);
 
       self.trace("");
 
       self.cpuThread->freelistReduceScatter.push(&params);
-      self.allocatorReduceScatterBroadcast.deallocate(this);
+      self.allocatorReduceScatterDirect.deallocate(this);
       DONE
     }
   };
@@ -4895,7 +5007,7 @@ struct CpuThreadImpl {
   // WorkAllocator<WorkQueuePut> allocatorQueuePut;
   WorkAllocator<WorkCat> allocatorCat;
   WorkAllocator<WorkCached> allocatorCached;
-  WorkAllocator<WorkReduceScatterBroadcast> allocatorReduceScatterBroadcast;
+  WorkAllocator<WorkReduceScatterDirect> allocatorReduceScatterDirect;
   WorkAllocator<WorkAllGatherBroadcast> allocatorAllGatherBroadcast;
 
   size_t numActiveWorks = 0;
@@ -5162,8 +5274,8 @@ struct CpuThreadImpl {
             case taskCached:
               enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
               break;
-            case taskReduceScatterBroadcast:
-              enqueue(allocatorReduceScatterBroadcast, (QueueEntryReduceScatter&)queueEntry);
+            case taskReduceScatterDirect:
+              enqueue(allocatorReduceScatterDirect, (QueueEntryReduceScatter&)queueEntry);
               break;
             case taskAllGatherBroadcast:
               enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
