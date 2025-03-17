@@ -522,15 +522,32 @@ struct CpuThreadImpl {
         "The process group is now in an error state, and Moodist will shortly forcefully terminate the process.\n");
   }
 
+  struct PollState {
+    IntrusiveList<Device, &Device::link>::iterator i;
+    std::array<ibv_wc, 8> wcs;
+    size_t wcsn = 0;
+    size_t wcsi = 0;
+  };
+  PollState pollState{activeDevices.end()};
+
   void poll() {
-    for (auto i = activeDevices.begin(); i != activeDevices.end();) {
-      Device& dev = *i;
-      ++i;
-      ibv_wc wcs[4];
-      int n = ibv_poll_cq(dev.cq, 4, wcs);
-      CHECK(n >= 0);
-      for (size_t i = 0; i != n; ++i) {
-        ibv_wc& wc = wcs[i];
+    auto& s = pollState;
+
+    if (s.i == activeDevices.end()) {
+      s.i = activeDevices.begin();
+      if (s.i == activeDevices.end()) {
+        return;
+      }
+    }
+
+    size_t n = devices.size();
+    for (size_t t = 0; t != n; ++t) {
+
+      Device& dev = *s.i;
+
+      if (s.wcsi != s.wcsn) {
+        ibv_wc& wc = s.wcs[s.wcsi];
+        ++s.wcsi;
         if (wc.status) [[unlikely]] {
           NOINLINE_COLD({
             // fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode,
@@ -546,11 +563,23 @@ struct CpuThreadImpl {
           CHECK(dev.currentCqEntries != 0);
           --dev.currentCqEntries;
           if (dev.currentCqEntries == 0) {
+            CHECK(s.wcsi == s.wcsn);
+            ++s.i;
             activeDevices.erase(dev);
           }
           CHECK(wc.wr_id != 0);
           Callback* callback = (Callback*)(void*)wc.wr_id;
           callback->decref();
+        }
+        return;
+      }
+
+      s.wcsn = ibv_poll_cq(dev.cq, s.wcs.size(), s.wcs.data());
+      s.wcsi = 0;
+      if (s.wcsn == 0) {
+        ++s.i;
+        if (s.i == activeDevices.end()) {
+          s.i = activeDevices.begin();
         }
       }
     }
@@ -2309,7 +2338,7 @@ struct CpuThreadImpl {
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
       CHECK(liveReads == 0);
-      //CHECK(readIndex == numRecvs);
+      // CHECK(readIndex == numRecvs);
       CHECK(remaining.empty());
       CHECK(reduceIndex == numSends);
 
