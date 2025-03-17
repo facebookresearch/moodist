@@ -114,7 +114,7 @@ def f(n):
     result0 = result0.to(dtype)
     tmp = tmp.to(dtype)
 
-    print("%d: input is (sum %f) " % (rank, data.sum()), data)
+    print("%d: input is (sum %f) " % (rank, data.sum()), data.view(size, -1))
 
     check = True
 

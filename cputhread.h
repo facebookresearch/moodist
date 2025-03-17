@@ -133,6 +133,8 @@ struct QueueEntryReduceScatter : QueueEntry {
 
   uintptr_t recvAddress = 0;
   uintptr_t sendAddress = 0;
+
+  bool isCopy = false;
 };
 
 struct QueueEntryBroadcast : QueueEntry {

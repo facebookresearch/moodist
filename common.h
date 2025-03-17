@@ -628,6 +628,10 @@ struct FutureImpl {
 
 using FutureImplSharedPtr = FLSharedPtr<FutureImpl>;
 
+template<typename T>
+auto range(T begin, T end) {
+  return std::views::iota(begin, end);
+}
 auto range(auto n) {
   return std::views::iota((decltype(n))0, n);
 }

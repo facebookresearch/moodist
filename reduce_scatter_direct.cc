@@ -105,11 +105,10 @@ std::string generate_reduce_scatter_direct(
 
   std::string syncForward;
   std::string syncWait;
-  {
+  if (false) {
     for (size_t peerIndex : peerIndices) {
       syncForward += replace(
-          "*(volatile uint32_t*)($forwardPtr + 4 * n) = stepValue;\n",
-          "$forwardPtr",
+          "*(volatile uint32_t*)($forwardPtr + 4 * n) = stepValue;\n", "$forwardPtr",
           concurrencyIndex(peerCudaProxyReady[peerIndex], sizeof(uint32_t) * size * peerMyRemoteIndex[peerIndex]),
           "$peerIndex", peerIndex);
       syncWait += replace(
@@ -118,6 +117,14 @@ std::string generate_reduce_scatter_direct(
     }
     syncWait += "__syncwarp();\n";
   }
+
+  reduceCode += replace(
+      R"(
+      if (n) {
+        $syncWait
+      }
+    )",
+      "$syncWait", syncWait);
 
   auto forEachChunk = [&](auto&& f) {
     for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
@@ -158,14 +165,6 @@ std::string generate_reduce_scatter_direct(
   forEachChunk([&](size_t chunkIndex) {
     CHECK(prevReduceDst == "" && prevReduceSrc == "");
     dstVisited.clear();
-
-    reduceCode += replace(
-        R"(
-      if (n) {
-        $syncWait
-      }
-    )",
-        "$syncWait", syncWait);
 
     std::string addr = "(T*)(params.sendAddress + params.pitch * n + chunkOffset)";
     reduceAdd(addr, "(const T*)(params.inputAddress + params.pitch * source + chunkOffset)", "currentChunkSize");

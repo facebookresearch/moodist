@@ -2117,8 +2117,8 @@ struct CpuThreadImpl {
     size_t liveReads = 0;
 
     std::array<size_t, maxDevices> deviceLiveReads{};
-    size_t readIndex = 0;
-    size_t chunkIndex = 0;
+    // size_t readIndex = 0;
+    // size_t chunkIndex = 0;
     size_t reduceIndex = 0;
     size_t reduceChunkIndex = 0;
 
@@ -2129,42 +2129,30 @@ struct CpuThreadImpl {
     const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
     const size_t numParallel = params.numParallel;
 
+    Vector<std::pair<size_t, size_t>> remaining;
+
     WorkReduceScatterDirect(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params) {
       // log.info(
       //     "%d: reduce-scatter direct recv ranks [%s], send ranks [%s]\n", rank,
       //     fmt::to_string(fmt::join(recvRanks, ", ")), fmt::to_string(fmt::join(sendRanks, ", ")));
     }
 
-    // void advanceSend() {
-    //   CHECK(sendIndex != sendRanks.size());
-    //   CHECK(sendDoneIndex <= sendIndex);
-
-    //   if (sendIndex >= sendDoneIndex + 1) {
-    //     if (self.inStepValueDeviceChunk(concurrencyIndex, sendRanks[sendDoneIndex], 0, 0) != stepValue) {
-    //       return;
-    //     }
-    //     ++sendDoneIndex;
-    //   }
-
-    //   if (!isNoLocal) {
-    //     if (cpuIn[16 + sendIndex] < stepValue) {
-    //       return;
-    //     }
-    //   }
-
-    //   self.writeDyn(concurrencyIndex, sendRanks[sendIndex], sendRanks[sendIndex], rank, 1);
-    //   ++sendIndex;
-    // }
-
     void tryRead(size_t di) {
-      size_t index = readIndex;
-      size_t chunkIndex = this->chunkIndex;
+      CHECK(!remaining.empty());
+      size_t remainingIndex = random((size_t)0, remaining.size() - 1);
+      size_t index;
+      size_t chunkIndex;
+      std::tie(index, chunkIndex) = remaining[remainingIndex];
+      CHECK(index < numRecvs);
+      CHECK(chunkIndex < numChunks);
+      // size_t index = readIndex;
+      // size_t chunkIndex = this->chunkIndex;
       size_t source = recvRanks[index];
 
       size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
 
       size_t n = currentChunkSize;
-      bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+      // bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
       size_t readOffset = chunkSize * chunkIndex;
       if (n != 0) {
 
@@ -2184,6 +2172,9 @@ struct CpuThreadImpl {
           return;
         }
 
+        std::swap(remaining[remainingIndex], remaining.back());
+        remaining.pop_back();
+
         uintptr_t dstAddr = recvAddress + params.pitch * index;
 
         ++liveReads;
@@ -2200,13 +2191,13 @@ struct CpuThreadImpl {
             }));
       }
 
-      if (isLastChunk) {
-        this->chunkIndex = 0;
-        ++this->readIndex;
-      } else {
-        ++this->chunkIndex;
-        CHECK(this->chunkIndex < numChunks);
-      }
+      // if (isLastChunk) {
+      //   this->chunkIndex = 0;
+      //   ++this->readIndex;
+      // } else {
+      //   ++this->chunkIndex;
+      //   CHECK(this->chunkIndex < numChunks);
+      // }
     }
 
     void step() {
@@ -2216,6 +2207,20 @@ struct CpuThreadImpl {
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+
+      {
+        CHECK(remaining.empty());
+        for (size_t i : indices(recvRanks)) {
+          for (size_t chunkIndex : range(maxChunks)) {
+            size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+            bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+            remaining.emplace_back(i, chunkIndex);
+            if (isLastChunk) {
+              break;
+            }
+          }
+        }
+      }
 
       {
         recvAddress = params.recvAddress;
@@ -2263,9 +2268,10 @@ struct CpuThreadImpl {
         self.writeDyn(concurrencyIndex, i, i, rank, 1);
       }
 
-      while (readIndex != numRecvs || reduceIndex != numSends) {
+      while (!remaining.empty() || reduceIndex != numSends) {
         if (reduceIndex != numSends) {
-          if (cpuIn[16 + size * reduceChunkIndex + reduceIndex] == stepValue) {
+          if ((params.isCopy ? cpuIn[16 + reduceIndex] : cpuIn[16 + size * reduceChunkIndex + reduceIndex]) ==
+              stepValue) {
             size_t i = sendRanks[reduceIndex];
             CHECK(i != rank);
             if (self.inDyn(concurrencyIndex, i).stepValue == stepValue) {
@@ -2280,7 +2286,7 @@ struct CpuThreadImpl {
             }
           }
         }
-        if (readIndex != numRecvs) {
+        if (!remaining.empty()) {
           size_t bestDevice = 0;
           size_t bestLiveReads = numParallel;
           for (size_t di : range(numDevices)) {
@@ -2303,7 +2309,8 @@ struct CpuThreadImpl {
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
       CHECK(liveReads == 0);
-      CHECK(readIndex == numRecvs);
+      //CHECK(readIndex == numRecvs);
+      CHECK(remaining.empty());
       CHECK(reduceIndex == numSends);
 
       // sendIndex = 0;
