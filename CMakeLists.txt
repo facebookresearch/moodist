@@ -27,13 +27,44 @@ message(STATUS "PyTorch is at ${TorchPath}")
 # We're forced to inherit from a class defined in pytorch, whose pybind code is also in pytorch.
 # pybind then requires the abi of our class and the parent class to be the same.
 # (pybind enforces this by a string lookup, where the string is composed of compiler, abi version etc)
-set(ABI_VERSION "11" CACHE STRING "The ABI version that pytorch was built with")
-if(ABI_VERSION)
-  message(STATUS "using -fabi-version=${ABI_VERSION}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fabi-version=${ABI_VERSION}")
-else()
-  message(STATUS "not using -fabi-version")
+set(ABI_VERSION "auto" CACHE STRING "The ABI version that pytorch was built with")
+set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
+
+if (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto")
+  message(STATUS "Auto-detecting pytorch abi")
+  foreach(abi IN ITEMS 16 11 13 19 20 18 17 15 14 12)
+    foreach (cxx IN ITEMS 1 0)
+      set(dir ${CMAKE_CURRENT_BINARY_DIR}/detect_abi_${abi}_${cxx})
+      try_compile(success PROJECT detect_abi SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/detect_abi BINARY_DIR ${dir} CMAKE_FLAGS -DABI_VERSION=${abi} -DUSE_CXX1_ABI=${cxx} -DTorchPath=${TorchPath} OUTPUT_VARIABLE stdout)
+      #message(STATUS "${stdout}")
+      if (success)
+        execute_process(
+          COMMAND python -c "import torch, moodist_detect_abi"
+          WORKING_DIRECTORY ${dir}
+          RESULT_VARIABLE exitcode
+        )
+        #message(STATUS "exitcode for ${dir} is ${exitcode}")
+        if (exitcode EQUAL 0)
+          set(ABI_VERSION ${abi} CACHE STRING "" FORCE)
+          set(USE_CXX1_ABI ${cxx} CACHE STRING "" FORCE)
+          break()
+        endif()
+      endif()
+    endforeach()
+    if (NOT (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto"))
+      break()
+    endif()
+  endforeach()
+
+  if (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto")
+    message(FATAL_ERROR "Failed to auto-detect abi version for pytorch. Set ABI_VERSION and USE_CXX1_ABI to the appropriate values.")
+  endif()
 endif()
+
+message(STATUS "Using -fabi-version=${ABI_VERSION}")
+message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fabi-version=${ABI_VERSION}")
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -122,17 +153,15 @@ target_link_libraries(_C PRIVATE
   kern-abi
 )
 target_include_directories(_C SYSTEM PRIVATE
+  fmt/include
   rdma-core
   ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
   ${TorchPath}/include
   ${TorchPath}/include/torch/csrc/api/include
   ${CUDAToolkit_INCLUDE_DIRS}
-  fmt/include
 )
-target_compile_options(_C PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
-
+target_compile_definitions(_C PRIVATE _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI})
 target_compile_definitions(_C PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
-
 target_compile_definitions(_C PRIVATE _STATIC_LIBRARY_BUILD_)
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
