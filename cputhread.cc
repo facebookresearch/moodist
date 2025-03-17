@@ -5101,7 +5101,7 @@ struct CpuThreadImpl {
         continue;
       }
       state.activeWrite = now;
-      size_t di = localHeartbeatValue % devices.size();
+      size_t di = (localHeartbeatValue + rank + i) % devices.size();
       auto& dev = devices[di];
       writeData(
           dev, i, &localHeartbeatValue, 0,
