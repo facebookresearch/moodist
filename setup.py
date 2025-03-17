@@ -77,6 +77,10 @@ def main():
         torch_version,
     )
 
+    torch_req_version = ".".join(torch_version.split(".")[:2]) + ".*"
+    
+    print("Building for torch==%s" % torch_req_version)
+
     setuptools.setup(
         name="moodist",
         version=moodist_version,
@@ -95,7 +99,7 @@ def main():
         packages=["moodist"],
         package_dir={"": "py"},
         ext_modules=[setuptools.Extension("moodist._C", sources=[])],
-        install_requires=["torch~=%s" % torch_version],
+        install_requires=["torch==%s" % torch_req_version],
         cmdclass={"build_ext": Build},
         zip_safe=False,
     )
