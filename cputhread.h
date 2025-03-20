@@ -32,6 +32,7 @@ constexpr uint8_t taskCached = 19;
 constexpr uint8_t taskReduceScatterDirect = 20;
 constexpr uint8_t taskAllGatherBroadcast = 21;
 constexpr uint8_t taskCallback = 22;
+constexpr uint8_t taskAllGatherDirect = 23;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -60,6 +61,7 @@ OPTYPE(AllGatherKernelLessCuda);
 OPTYPE(AllGatherLocalCuda);
 OPTYPE(AllGatherRingCuda);
 OPTYPE(AllGatherBroadcastCuda);
+OPTYPE(AllGatherDirectCuda);
 OPTYPE(ReduceScatterKernelLessCuda);
 OPTYPE(ReduceScatterRingCuda);
 OPTYPE(ReduceScatterDirectCuda);

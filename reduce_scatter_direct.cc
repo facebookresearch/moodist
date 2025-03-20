@@ -177,6 +177,23 @@ std::string generate_reduce_scatter_direct(
           "currentChunkSize");
     }
     reduceFlush();
+    // reduceCode += replace(
+    //     R"(
+    //     __syncwarp();
+    //     if (threadIdx.x % 32 == 0) {
+    //       int cc = atomicInc(&sendReadyCounter[n][$chunkIndex][concurrencyIndex], $gridSize * $blockSize / 32 - 1);
+    //       if (cc == 0) {
+    //         if (isLastChunk) {
+    //           $syncForward
+    //         }
+    //       }
+    //       if (cc == $gridSize * $blockSize / 32 - 1) {
+    //         $cpuIn[16 + $size * $chunkIndex + n] = stepValue;
+    //       }
+    //     }
+    //     __syncwarp();
+    //   )",
+    //     "$syncForward", syncForward);
     reduceCode += replace(
         R"(
         __syncwarp();
@@ -191,7 +208,7 @@ std::string generate_reduce_scatter_direct(
         __syncwarp();
       )",
         "$syncForward", syncForward);
-    // reduceCode += "dynamicBlockIndex = newDynamicBlockIndex;\n";
+    reduceCode += "dynamicBlockIndex = newDynamicBlockIndex;\n";
   });
 
   reduceCode += "}\n";
@@ -238,7 +255,9 @@ __device__ void reduce_scatter_direct(ReduceScatterParameters params) {
   [[maybe_unused]] const uint32_t concurrencyIndex = params.concurrencyIndex;
   [[maybe_unused]] volatile uint32_t* __restrict__ cpuOut = $cpuOut;
 
-  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x;
+  if (blockIdx.x % 4 != 0) return;
+
+  uint32_t dynamicBlockIndex = $gridSize * (threadIdx.x / 32u) + blockIdx.x / 4;
   uint32_t newDynamicBlockIndex = dynamicBlockIndex;
   uint32_t dynamicBlockCounter = 0;
   uint32_t syncIndex = 0;

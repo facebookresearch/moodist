@@ -1263,62 +1263,73 @@ struct CpuThreadImpl {
     std::chrono::system_clock::time_point end;
     int threadId = -1;
   };
-  std::vector<TraceEvent> traceEvents;
+  Vector<TraceEvent> traceEvents;
 
   std::chrono::system_clock::time_point beginning = std::chrono::system_clock::now();
 
-  std::string currentTraceName = "";
-  std::chrono::system_clock::time_point currentTraceBegin = beginning;
-  int threadId = syscall(SYS_gettid);
+  HashMap<int, std::string> currentTraceName;
+  HashMap<int, std::chrono::system_clock::time_point> currentTraceBegin;
+  int pidForTracing = syscall(SYS_gettid);
 
   template<typename... Args>
-  void trace(const char* fmt, Args&&... args) {
-    return;
+  void trace(int threadId, const char* fmt, Args&&... args) {
     //  fmt::printf("trace enter '%s'\n", name);
     //   if (opCount < 1000 || opCount >= 1200) {
-    if (!profilingEnabled) {
-      if (!traceEvents.empty()) {
-        std::string fn = fmt::sprintf("moodist-trace-cpu-%d.json", rank);
-        FILE* f = fopen(fn.c_str(), "wb");
-        CHECK(f != nullptr);
-        fmt::fprintf(
-            f, R"({"traceEvents": [)"
-               "\n");
-        bool first = true;
-        for (auto& e : traceEvents) {
-          if (!first) {
-            fmt::fprintf(f, ",\n");
-          } else {
-            first = false;
+    if (profilingEnabled || !traceEvents.empty()) {
+      NOINLINE_COLD({
+        if (!profilingEnabled) {
+          if (!traceEvents.empty()) {
+            std::string fn = fmt::sprintf("moodist-trace-cpu-%d.json", rank);
+            FILE* f = fopen(fn.c_str(), "wb");
+            CHECK(f != nullptr);
+            fmt::fprintf(
+                f, R"({"traceEvents": [)"
+                   "\n");
+            bool first = true;
+            for (auto& e : traceEvents) {
+              if (!first) {
+                fmt::fprintf(f, ",\n");
+              } else {
+                first = false;
+              }
+              fmt::fprintf(
+                  f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", e.name,
+                  std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
+                  std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId,
+                  pidForTracing);
+            }
+            fmt::fprintf(f, "]}\n");
+            fclose(f);
+            log.info("Chrome trace dumped to %s\n", fn);
+            traceEvents.clear();
           }
-          fmt::fprintf(
-              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
-              std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
-              std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId);
+          return;
         }
-        fmt::fprintf(f, "]}\n");
-        fclose(f);
-        log.info("Chrome trace dumped to %s\n", fn);
-        traceEvents.clear();
-      }
-      return;
+        auto now = std::chrono::system_clock::now();
+        if (traceEvents.empty() && currentTraceName.empty()) {
+          beginning = now;
+        }
+        std::string name = fmt::sprintf(fmt, std::forward<Args>(args)...);
+        if (currentTraceName[threadId] == name) {
+          return;
+        }
+        if (!currentTraceName[threadId].empty()) {
+          traceEvents.emplace_back();
+          TraceEvent& e = traceEvents.back();
+          e.name = std::move(currentTraceName[threadId]);
+          e.begin = currentTraceBegin[threadId];
+          e.end = now;
+          e.threadId = threadId;
+        }
+        currentTraceBegin[threadId] = now;
+        currentTraceName[threadId] = name;
+      });
     }
-    auto now = std::chrono::system_clock::now();
-    if (traceEvents.empty() && currentTraceName.empty()) {
-      beginning = now;
-    }
-    if (!currentTraceName.empty()) {
-      traceEvents.emplace_back();
-      TraceEvent& e = traceEvents.back();
-      e.name = std::move(currentTraceName);
-      e.begin = currentTraceBegin;
-      e.end = now;
-      e.threadId = threadId;
-    }
-    currentTraceBegin = now;
-    currentTraceName = fmt::sprintf(fmt, std::forward<Args>(args)...);
   }
-  // #define trace(name)
+  // template<typename... Args>
+  // void trace(const char* fmt, Args&&... args) {
+  //   trace(threadId, fmt, std::forward<Args>(args)...);
+  // }
 
   struct WorkBase {
     IntrusiveListLink<WorkBase> freeLink;
@@ -1978,7 +1989,7 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      self.trace("ring %#x", stepValue);
+      self.trace(concurrencyIndex, "reduce-scatter-ring-read %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
@@ -2010,7 +2021,7 @@ struct CpuThreadImpl {
 
       // log.info("wait for enter kernel %d\n", stepValue);
 
-      self.trace("kernel-entry");
+      self.trace(concurrencyIndex, "kernel-entry");
 
       // wait for kernel
       while (cpuIn[0] < stepValue) {
@@ -2022,7 +2033,7 @@ struct CpuThreadImpl {
 
       tryRead(0);
 
-      self.trace("read loop");
+      self.trace(concurrencyIndex, "read loop");
       // log.info("enter read loop\n");
 
       // readBegin = self.bytesRead;
@@ -2089,7 +2100,7 @@ struct CpuThreadImpl {
       //       waitCounter, readCounter);
       // }
       // log.info("wait for remote reads\n");
-      self.trace("wait for remote reads");
+      self.trace(concurrencyIndex, "wait for remote reads");
       while (self.inStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, 0) != stepValue) {
         YIELD
       }
@@ -2099,7 +2110,7 @@ struct CpuThreadImpl {
       // cpuOut[0] = stepValue;
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
-      self.trace("kernel-exit");
+      self.trace(concurrencyIndex, "kernel-exit");
 
       // {
       //   float t = seconds(std::chrono::steady_clock::now() - startTime);
@@ -2120,7 +2131,7 @@ struct CpuThreadImpl {
 
       // log.info("exit kernel %d ok\n", stepValue);
 
-      self.trace("");
+      self.trace(concurrencyIndex, "");
 
       self.cpuThread->freelistReduceScatter.push(&params);
       self.allocatorReduceScatterRingRead.deallocate(this);
@@ -2140,14 +2151,10 @@ struct CpuThreadImpl {
     const size_t numSends = sendRanks.size();
 
     size_t index;
-    // size_t sendIndex;
-    // size_t sendDoneIndex;
     size_t i;
     size_t liveReads = 0;
 
     std::array<size_t, maxDevices> deviceLiveReads{};
-    // size_t readIndex = 0;
-    // size_t chunkIndex = 0;
     size_t reduceIndex = 0;
     size_t reduceChunkIndex = 0;
 
@@ -2159,6 +2166,7 @@ struct CpuThreadImpl {
     const size_t numParallel = params.numParallel;
 
     Vector<std::pair<size_t, size_t>> remaining;
+    Vector<size_t> peerReadCount;
 
     WorkReduceScatterDirect(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params) {
       // log.info(
@@ -2174,81 +2182,65 @@ struct CpuThreadImpl {
       std::tie(index, chunkIndex) = remaining[remainingIndex];
       CHECK(index < numRecvs);
       CHECK(chunkIndex < numChunks);
-      // size_t index = readIndex;
-      // size_t chunkIndex = this->chunkIndex;
       size_t source = recvRanks[index];
+
+      if (self.inDyn(concurrencyIndex, source).stepValue != stepValue) {
+        return;
+      }
+
+      WAIT_DYN(opTypeReduceScatterDirectCuda, source);
+
+      if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
+        return;
+      }
 
       size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
 
       size_t n = currentChunkSize;
-      // bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
       size_t readOffset = chunkSize * chunkIndex;
-      if (n != 0) {
+      CHECK(n != 0);
+      CHECK(readOffset < params.bytes);
 
-        if (self.inDyn(concurrencyIndex, source).stepValue != stepValue) {
-          return;
-        }
+      std::swap(remaining[remainingIndex], remaining.back());
+      remaining.pop_back();
 
-        WAIT_DYN(opTypeReduceScatterDirectCuda, source);
+      uintptr_t dstAddr = recvAddress + params.pitch * index;
 
-        // if (!isNoLocal) {
-        //   if (cpuIn[16 + size * chunkIndex + index] < stepValue) {
-        //     return;
-        //   }
-        // }
-
-        if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
-          return;
-        }
-
-        std::swap(remaining[remainingIndex], remaining.back());
-        remaining.pop_back();
-
-        uintptr_t dstAddr = recvAddress + params.pitch * index;
-
-        ++liveReads;
-        ++deviceLiveReads[di];
-        uintptr_t srcAddr = dyn.gatherAddress;
-        auto key = dyn.gatherKey;
-        auto& dev = self.devices[di];
-        self.readData(
-            dev, source, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
-            n, self.makeCallback([this, di, source, chunkIndex]() {
-              --liveReads;
-              --deviceLiveReads[di];
-              // self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
-            }));
-      }
-
-      // if (isLastChunk) {
-      //   this->chunkIndex = 0;
-      //   ++this->readIndex;
-      // } else {
-      //   ++this->chunkIndex;
-      //   CHECK(this->chunkIndex < numChunks);
-      // }
+      ++liveReads;
+      ++deviceLiveReads[di];
+      uintptr_t srcAddr = dyn.gatherAddress;
+      auto key = dyn.gatherKey;
+      auto& dev = self.devices[di];
+      self.readData(
+          dev, source, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di], n,
+          self.makeCallback([this, di, source, chunkIndex, index]() {
+            --liveReads;
+            --deviceLiveReads[di];
+            if (peerReadCount[index] == numChunks - 1) {
+              self.writeStepValue(concurrencyIndex, source, 0, rank);
+            } else {
+              ++peerReadCount[index];
+            }
+          }));
     }
 
     void step() {
       ENTER
 
-      self.trace("ring %#x", stepValue);
+      self.trace(concurrencyIndex, "reduce-scatter-direct %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
 
       {
         CHECK(remaining.empty());
+        remaining.reserve(numRecvs * numChunks);
         for (size_t i : indices(recvRanks)) {
-          for (size_t chunkIndex : range(maxChunks)) {
-            size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
-            bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
+          for (size_t chunkIndex : range(numChunks)) {
             remaining.emplace_back(i, chunkIndex);
-            if (isLastChunk) {
-              break;
-            }
           }
         }
+        peerReadCount.resize(numRecvs);
       }
 
       {
@@ -2286,7 +2278,7 @@ struct CpuThreadImpl {
 
       // log.info("wait for enter kernel %d\n", stepValue);
 
-      self.trace("kernel-entry");
+      self.trace(concurrencyIndex, "kernel-entry");
 
       // // wait for kernel
       while (cpuIn[0] < stepValue) {
@@ -2296,6 +2288,8 @@ struct CpuThreadImpl {
       for (size_t i : sendRanks) {
         self.writeDyn(concurrencyIndex, i, i, rank, 1);
       }
+
+      self.trace(concurrencyIndex, "read loop");
 
       while (!remaining.empty() || reduceIndex != numSends) {
         if (reduceIndex != numSends) {
@@ -2338,56 +2332,10 @@ struct CpuThreadImpl {
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
       CHECK(liveReads == 0);
-      // CHECK(readIndex == numRecvs);
       CHECK(remaining.empty());
       CHECK(reduceIndex == numSends);
 
-      // sendIndex = 0;
-      // sendDoneIndex = 0;
-
-      // for (index = 0; index != recvRanks.size();) {
-      //   i = recvRanks[index];
-
-      //   if (sendIndex != sendRanks.size()) {
-      //     advanceSend();
-      //   }
-
-      //   if (liveReads >= 1) {
-      //     YIELD
-      //     continue;
-      //   }
-
-      //   if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
-      //     YIELD
-      //     continue;
-      //   }
-
-      //   WAIT_DYN(opTypeReduceScatterDirectCuda, i);
-
-      //   ++liveReads;
-      //   self.readDataDistributed(
-      //       i, (void*)(recvAddress + params.pitch * index), recvLkeys, (void*)(dyn.gatherAddress + 0), dyn.gatherKey,
-      //       params.bytes, self.makeCallback([this, i = i] {
-      //         --liveReads;
-
-      //         self.writeStepValueDeviceChunk(concurrencyIndex, i, 0, rank, 0, 0);
-      //       }));
-
-      //   ++index;
-      // }
-
-      // while (sendIndex != sendRanks.size()) {
-      //   advanceSend();
-      // }
-
-      // while (liveReads) {
-      //   YIELD
-      // }
-
-      self.trace("wait for remote reads");
-      for (size_t i : recvRanks) {
-        self.writeStepValue(concurrencyIndex, i, 0, rank);
-      }
+      self.trace(concurrencyIndex, "wait for remote reads");
       for (index = 0; index != sendRanks.size(); ++index) {
         i = sendRanks[index];
         while (self.inStepValue(concurrencyIndex, i) != stepValue) {
@@ -2395,40 +2343,9 @@ struct CpuThreadImpl {
         }
       }
 
-      // for (index = 0; index != sendRanks.size(); ++index) {
-      //   i = sendRanks[index];
-      //   while (self.inStepValueDeviceChunk(concurrencyIndex, i, 0, 0) != stepValue) {
-      //     YIELD
-      //   }
-      // }
-
-      // log.info("wait for exit kernel %d\n", stepValue);
-
-      // cpuOut[0] = stepValue;
       self.writeCpuOut(concurrencyIndex, 0, 1);
 
-      self.trace("kernel-exit");
-
-      // {
-      //   float t = seconds(std::chrono::steady_clock::now() - startTime);
-      //   if (rank == 0) {
-      //     if (params.paramsData) {
-      //       params.paramsData->addTiming(params.paramsIndex, t);
-      //     }
-      //     std::lock_guard l(stats.mutex);
-      //     stats.values.push_back(
-      //         {(float)size, (float)(1 + self.group->ipcRanks.size()), (float)params.bytes, (float)numDevices,
-      //          (float)numChunks, (float)numParallel, t});
-      //   }
-      // }
-
-      // while (cpuIn[0] < stepValue + 1) {
-      //   YIELD
-      // }
-
-      // log.info("exit kernel %d ok\n", stepValue);
-
-      self.trace("");
+      self.trace(concurrencyIndex, "");
 
       self.cpuThread->freelistReduceScatter.push(&params);
       self.allocatorReduceScatterDirect.deallocate(this);
@@ -2533,7 +2450,7 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      self.trace("ring %#x", stepValue);
+      self.trace(concurrencyIndex, "all-gather-broadcast %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
@@ -2562,7 +2479,7 @@ struct CpuThreadImpl {
 
       // log.info("wait for enter kernel %d\n", stepValue);
 
-      self.trace("kernel-entry");
+      self.trace(concurrencyIndex, "kernel-entry");
 
       // wait for kernel
       while (cpuIn[0] < stepValue) {
@@ -2622,7 +2539,7 @@ struct CpuThreadImpl {
       CHECK(liveReads == 0);
       CHECK(readIndex == recvRanks.size());
 
-      self.trace("wait for remote reads");
+      self.trace(concurrencyIndex, "wait for remote reads");
 
       for (index = 0; index != sendRanks.size(); ++index) {
         if (params.bytes == 0) {
@@ -2652,7 +2569,7 @@ struct CpuThreadImpl {
       // cpuOut[0] = stepValue;
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
-      self.trace("kernel-exit");
+      self.trace(concurrencyIndex, "kernel-exit");
 
       // {
       //   float t = seconds(std::chrono::steady_clock::now() - startTime);
@@ -2673,7 +2590,7 @@ struct CpuThreadImpl {
 
       // log.info("exit kernel %d ok\n", stepValue);
 
-      self.trace("");
+      self.trace(concurrencyIndex, "");
 
       self.cpuThread->freelistAllGather.push(&params);
       self.allocatorAllGatherBroadcast.deallocate(this);
@@ -2683,14 +2600,11 @@ struct CpuThreadImpl {
 
   struct WorkAllGatherRingRead4 : Work {
     QueueEntryAllGather& params;
-    // size_t di;
+
     MemoryRegistration* inputMr;
 
     size_t recvNeighbor;
     size_t sendNeighbor;
-
-    // size_t readBegin;
-    // std::chrono::steady_clock::time_point startTime;
 
     const AllGather& allGather = *self.group->allGather;
     const Vector<std::pair<size_t, size_t>>& ringRecvs = allGather.ringRecvs;
@@ -2700,14 +2614,6 @@ struct CpuThreadImpl {
     const size_t numChunks = params.numChunks;
     const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
     const size_t numParallel = params.numParallel;
-
-    // struct DataTime {
-    //   bool inProgress = false;
-    //   std::chrono::steady_clock::time_point startTime;
-    //   std::chrono::steady_clock::duration prevDuration{};
-    // };
-    // std::array<DataTime, 4> times;
-    // std::chrono::steady_clock::time_point startTime;
 
     size_t readIndex = 0;
     size_t chunkIndex = 0;
@@ -2731,16 +2637,12 @@ struct CpuThreadImpl {
     }
 
     void tryRead(size_t di) {
-      // CHECK(!times[parallelIndex].inProgress);
       size_t index = readIndex;
       size_t chunkIndex = this->chunkIndex;
       size_t source = std::get<0>(ringRecvs[index]);
 
       size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
 
-      // const size_t devChunkSize = currentChunkSize / numDevices / 1024u * 1024u;
-      // size_t offset = devChunkSize * di;
-      // size_t n = di == numDevices - 1 ? currentChunkSize - offset : devChunkSize;
       size_t n = currentChunkSize;
       bool isLastChunk = chunkSize * chunkIndex + currentChunkSize == params.bytes;
       size_t readOffset = chunkSize * chunkIndex;
@@ -2748,54 +2650,37 @@ struct CpuThreadImpl {
         if (source != sendNeighbor) {
           self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, 0, chunkIndex);
         }
-        // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
       } else {
         if (source != recvNeighbor) {
           if (self.inStepValueDeviceChunk(concurrencyIndex, source, 0, chunkIndex) != stepValue) {
+            self.trace(
+                maxConcurrency + maxConcurrency * concurrencyIndex + di, "WAIT di %d source %d chunk %d", di, source,
+                chunkIndex);
             return;
           }
         }
-        // allgather ring read bytes 139985192 numDevices 4, numChunks 32, numParallel 2
-
-        // size_t prevParallelIndex = (parallelIndex + numParallel - 1) % numParallel;
-        // auto now = std::chrono::steady_clock::now();
-        // if (times[prevParallelIndex].inProgress &&
-        //     now - times[prevParallelIndex].startTime < times[prevParallelIndex].prevDuration / 2) {
-        //   // log.info("read wait!\n");
-        //   ++waitCounter;
-        //   continue;
-        // }
-        // times[parallelIndex].startTime = now;
-        // ++parallelCounter;
         uintptr_t dstAddr = params.outputAddress + params.pitch * source;
         auto* srcMr = source == rank ? inputMr : self.outDynsMrVector[size * concurrencyIndex + 0];
+
+        self.trace(
+            maxConcurrency + maxConcurrency * concurrencyIndex + di, "READ di %d source %d chunk %d", di, source,
+            chunkIndex);
 
         ++liveReads;
         ++deviceLiveReads[di];
         const DynamicAddresses& dyn = self.inDyn(concurrencyIndex, source == recvNeighbor ? 1 : 0);
         uintptr_t srcAddr = source == recvNeighbor ? dyn.gatherAddress : dyn.gatherAddress + params.pitch * source;
         auto key = dyn.gatherKey;
-        // times[parallelIndex].inProgress = true;
-        //++readCounter;
         auto& dev = self.devices[di];
         self.readData(
             dev, recvNeighbor, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
             key[di], n, self.makeCallback([this, di, source, chunkIndex /*, parallelIndex*/]() {
-              // auto now = std::chrono::steady_clock::now();
-              // times[parallelIndex].inProgress = false;
-              // times[parallelIndex].prevDuration = now - times[parallelIndex].startTime;
-              // log.info("duration[%d] set to %d\n", parallelIndex, times[parallelIndex].prevDuration.count());
+              self.trace(maxConcurrency + maxConcurrency * concurrencyIndex + di, "");
               --liveReads;
               --deviceLiveReads[di];
               if (source != sendNeighbor) {
                 self.writeStepValueDeviceChunk(concurrencyIndex, sendNeighbor, 0, source, 0, chunkIndex);
               }
-              // self.writeCudaStepValueDeviceChunk(concurrencyIndex, neighbor, 0, source, di, chunkIndex);
-              // if (readIndex != ringRecvs.size()) {
-              //   tryRead(di);
-              // }
-
-              // cpuOut[16 + size * chunkIndex + source] = stepValue;
               self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
             }));
       }
@@ -2812,7 +2697,7 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      self.trace("ring %#x", stepValue);
+      self.trace(concurrencyIndex, "all-gather-ring-read4 %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
@@ -2842,22 +2727,25 @@ struct CpuThreadImpl {
 
       // log.info("wait for enter kernel %d\n", stepValue);
 
-      self.trace("kernel-entry");
+      self.trace(concurrencyIndex, "kernel-entry");
 
       // wait for kernel
       while (cpuIn[0] < stepValue) {
         YIELD
       }
 
+      self.trace(concurrencyIndex, "wait-dyn");
+
       self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0, 2);
       { WAIT_DYN(opTypeAllGatherRingCuda, 0); }
       { WAIT_DYN(opTypeAllGatherRingCuda, 1); }
+
+      self.trace(concurrencyIndex, "read loop");
 
       tryRead(0);
 
       // startTime = std::chrono::steady_clock::now();
 
-      self.trace("read loop");
       // log.info("enter read loop\n");
 
       // readBegin = self.bytesRead;
@@ -2913,7 +2801,7 @@ struct CpuThreadImpl {
       //       waitCounter, readCounter);
       // }
       // log.info("wait for remote reads\n");
-      self.trace("wait for remote reads");
+      self.trace(concurrencyIndex, "wait for remote reads");
       while (self.inStepValueDeviceChunk(concurrencyIndex, rank, 0, 0) != stepValue) {
         YIELD
       }
@@ -2923,7 +2811,7 @@ struct CpuThreadImpl {
       // cpuOut[0] = stepValue;
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
-      self.trace("kernel-exit");
+      self.trace(concurrencyIndex, "kernel-exit");
 
       // {
       //   float t = seconds(std::chrono::steady_clock::now() - startTime);
@@ -2944,10 +2832,196 @@ struct CpuThreadImpl {
 
       // log.info("exit kernel %d ok\n", stepValue);
 
-      self.trace("");
+      self.trace(concurrencyIndex, "");
 
       self.cpuThread->freelistAllGather.push(&params);
       self.allocatorAllGatherRingRead4.deallocate(this);
+      DONE
+    }
+  };
+
+  struct WorkAllGatherDirect : Work {
+    QueueEntryAllGather& params;
+    size_t index;
+    size_t i;
+
+    const AllGather& allGather = *self.group->allGather;
+    const Vector<size_t>& recvRanks = allGather.recvRanks;
+    const Vector<size_t>& sendRanks = allGather.sendRanks;
+    const size_t numRecvs = recvRanks.size();
+    const size_t numSends = sendRanks.size();
+
+    const size_t numDevices = params.numDevices;
+    const size_t numChunks = params.numChunks;
+    const size_t chunkSize = ((params.bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
+    const size_t numParallel = params.numParallel;
+
+    size_t liveReads = 0;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+
+    MemoryRegistration* outputMr = nullptr;
+
+    Vector<std::pair<size_t, size_t>> remaining;
+    Vector<size_t> peerReadCount;
+
+    WorkAllGatherDirect(CpuThreadImpl& self, QueueEntryAllGather& params) : Work(self, params), params(params) {
+      CHECK(recvRanks.size() != 0);
+      CHECK(sendRanks.size() != 0);
+
+      CHECK(numDevices <= self.devices.size());
+      CHECK(numChunks != 0 && numChunks <= maxChunks);
+      CHECK(numParallel != 0);
+      CHECK(chunkSize > 0);
+
+      // log.info(
+      //     "allgather direct bytes %d numDevices %d, numChunks %d, numParallel %d\n", params.bytes, numDevices,
+      //     numChunks, numParallel);
+    }
+
+    void tryRead(size_t di) {
+      CHECK(!remaining.empty());
+      size_t remainingIndex = random((size_t)0, remaining.size() - 1);
+      size_t index;
+      size_t chunkIndex;
+      std::tie(index, chunkIndex) = remaining[remainingIndex];
+      size_t source = recvRanks[index];
+
+      if (self.inDyn(concurrencyIndex, source).stepValue != stepValue) {
+        return;
+      }
+
+      WAIT_DYN(opTypeAllGatherDirectCuda, source);
+
+      size_t currentChunkSize = std::min(chunkSize, params.bytes - chunkSize * chunkIndex);
+
+      size_t n = currentChunkSize;
+      size_t readOffset = chunkSize * chunkIndex;
+      CHECK(n != 0);
+      CHECK(readOffset < params.bytes);
+
+      std::swap(remaining[remainingIndex], remaining.back());
+      remaining.pop_back();
+
+      uintptr_t dstAddr = params.outputAddress + params.pitch * source;
+
+      self.trace(
+          maxConcurrency + maxConcurrency * concurrencyIndex + di, "READ di %d source %d chunk %d", di, source,
+          chunkIndex);
+
+      ++liveReads;
+      ++deviceLiveReads[di];
+      uintptr_t srcAddr = dyn.gatherAddress;
+      auto key = dyn.gatherKey;
+      auto& dev = self.devices[di];
+      // log.info("read di %d source %d chunk %d bytes %d dst %#x src %#x offset %#x\n", di, source, chunkIndex, n,
+      // dstAddr, srcAddr, readOffset);
+      self.readData(
+          dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
+          n, self.makeCallback([this, di, source, chunkIndex, index]() {
+            // log.info("read FINISHED di %d source %d chunk %d\n", di, source, chunkIndex);
+            self.trace(maxConcurrency + maxConcurrency * concurrencyIndex + di, "");
+            --liveReads;
+            --deviceLiveReads[di];
+            // self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
+            if (peerReadCount[index] == numChunks - 1) {
+              self.writeStepValue(concurrencyIndex, source, 0, rank);
+            } else {
+              ++peerReadCount[index];
+            }
+          }));
+    }
+
+    void step() {
+      ENTER
+
+      self.trace(concurrencyIndex, "all-gather-direct %#x", stepValue);
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+      self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+
+      {
+        CHECK(remaining.empty());
+        remaining.reserve(numRecvs * numChunks);
+        for (size_t i : indices(recvRanks)) {
+          for (size_t chunkIndex : range(numChunks)) {
+            remaining.emplace_back(i, chunkIndex);
+          }
+        }
+        peerReadCount.resize(numRecvs);
+      }
+
+      {
+        outputMr = self.regMrCuda(params.outputAddress, params.pitch * size);
+        auto* inputMr = self.regMrCuda(params.inputAddress, params.bytes);
+
+        DynamicAddresses* outDyns = (DynamicAddresses*)self.outDynsBuffer.cpu(concurrencyIndex);
+
+        for (size_t i : sendRanks) {
+          outDyns[i].gatherAddress = params.inputAddress;
+          outDyns[i].gatherBytes = params.bytes;
+          outDyns[i].stepValue = stepValue;
+          outDyns[i].opType = opTypeAllGatherDirectCuda;
+          for (size_t di = 0; di != self.devices.size(); ++di) {
+            outDyns[i].gatherKey[di] = inputMr->mrs[di]->rkey;
+          }
+        }
+      }
+
+      // log.info("wait for enter kernel %d\n", stepValue);
+
+      self.trace(concurrencyIndex, "kernel-entry");
+
+      // // wait for kernel
+      while (cpuIn[0] < stepValue) {
+        YIELD
+      }
+
+      for (size_t i : sendRanks) {
+        self.writeDyn(concurrencyIndex, i, i, rank, 1);
+      }
+
+      self.trace(concurrencyIndex, "read loop");
+
+      while (!remaining.empty()) {
+        {
+          size_t bestDevice = 0;
+          size_t bestLiveReads = numParallel;
+          for (size_t di = 0; di != numDevices; ++di) {
+            if (deviceLiveReads[di] < bestLiveReads) {
+              bestLiveReads = deviceLiveReads[di];
+              bestDevice = di;
+            }
+          }
+          if (bestLiveReads < numParallel) {
+            tryRead(bestDevice);
+          }
+        }
+        YIELD
+      }
+
+      while (liveReads) {
+        YIELD
+      }
+
+      self.writeCpuOut(concurrencyIndex, 1, 0);
+
+      CHECK(liveReads == 0);
+      CHECK(remaining.empty());
+
+      self.trace(concurrencyIndex, "wait for remote reads");
+      for (index = 0; index != sendRanks.size(); ++index) {
+        i = sendRanks[index];
+        while (self.inStepValue(concurrencyIndex, i) != stepValue) {
+          YIELD
+        }
+      }
+
+      self.writeCpuOut(concurrencyIndex, 1, 1);
+
+      self.trace(concurrencyIndex, "");
+
+      self.cpuThread->freelistAllGather.push(&params);
+      self.allocatorAllGatherDirect.deallocate(this);
       DONE
     }
   };
@@ -3430,7 +3504,7 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      self.trace("ring %#x", stepValue);
+      self.trace(concurrencyIndex, "broadcast-reduce-base %#x", stepValue);
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
 
@@ -3472,7 +3546,7 @@ struct CpuThreadImpl {
 
       // log.info("wait for enter kernel %d\n", stepValue);
 
-      self.trace("kernel-entry");
+      self.trace(concurrencyIndex, "kernel-entry");
 
       // wait for kernel
       while (cpuIn[0] < stepValue) {
@@ -3495,7 +3569,7 @@ struct CpuThreadImpl {
         tryRead(0);
       }
 
-      self.trace("read loop");
+      self.trace(concurrencyIndex, "read loop");
 
       while (true) {
         {
@@ -3559,7 +3633,7 @@ struct CpuThreadImpl {
 
       CHECK(nSends <= 1)
       for (i = 0; i != nSends; ++i) {
-        self.trace("wait for remote reads");
+        self.trace(concurrencyIndex, "wait for remote reads");
         while (self.inStepValueDeviceChunk(concurrencyIndex, rank, 0, 0) != stepValue) {
           YIELD
         }
@@ -3570,7 +3644,7 @@ struct CpuThreadImpl {
       // cpuOut[0] = stepValue;
       self.writeCpuOut(concurrencyIndex, 0, 0);
 
-      self.trace("kernel-exit");
+      self.trace(concurrencyIndex, "kernel-exit");
 
       // ?? why did we wait for the kernel here ??
       //    this would prevent a new op from running that could write some data to the kernel
@@ -3584,7 +3658,7 @@ struct CpuThreadImpl {
 
       // log.info("exit kernel %d ok\n", stepValue);
 
-      self.trace("");
+      self.trace(concurrencyIndex, "");
 
       static_assert(std::is_base_of_v<WorkBroadcastReduceBase, Parent>);
 
@@ -5045,6 +5119,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkCached> allocatorCached;
   WorkAllocator<WorkReduceScatterDirect> allocatorReduceScatterDirect;
   WorkAllocator<WorkAllGatherBroadcast> allocatorAllGatherBroadcast;
+  WorkAllocator<WorkAllGatherDirect> allocatorAllGatherDirect;
 
   size_t numActiveWorks = 0;
 
@@ -5318,6 +5393,9 @@ struct CpuThreadImpl {
               break;
             case taskCallback:
               executeCallback((QueueEntryCallback&)queueEntry);
+              break;
+            case taskAllGatherDirect:
+              enqueue(allocatorAllGatherDirect, (QueueEntryAllGather&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

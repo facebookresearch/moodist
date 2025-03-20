@@ -134,6 +134,9 @@ struct Group {
   AllocatedArray cudaCopyDone;
   std::array<PeerArrayRef, 8> peerCudaCopyDone;
 
+  AllocatedArray cudaMemSync;
+  std::array<PeerArrayRef, 8> peerCudaMemSync;
+
   std::vector<AllocatedArray*> buffersToReset;
 
   std::vector<size_t> ipcRanks;

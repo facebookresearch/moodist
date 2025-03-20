@@ -201,7 +201,7 @@ struct Vector {
     msize = n;
   }
   bool empty() const {
-    return beginptr == endptr;
+    return msize == 0;
   }
   size_t capacity() {
     return storageend - beginptr;
@@ -283,6 +283,16 @@ struct Vector {
   void pop_front() {
     CHECK(msize > 0);
     erase(beginptr, beginptr + 1);
+  }
+  T pop_back_value() {
+    T r = std::move(back());
+    pop_back();
+    return r;
+  }
+  T pop_front_value() {
+    T r = std::move(front());
+    pop_front();
+    return r;
   }
   template<typename V>
   T* insert(T* at, V&& value) {

@@ -710,6 +710,9 @@ void Group::init() {
   cudaStepValuesDeviceChunksBuffer =
       allocateArrayDevice(sizeof(uint32_t) * Group::maxChunks * Group::maxDevices * size, Group::maxConcurrency);
 
+  cudaMemSync = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
+  mapPeerAddrs(cudaMemSync, peerCudaMemSync);
+
   // This list MUST contain all buffers that should be reset on step value reset.
   // Any buffers which receive step values from peers should be reset.
   // All such buffers should be allocated in this function.
@@ -725,7 +728,9 @@ void Group::init() {
       &cudaProxyReady,
       &cudaCopyDone,
       &cudaStepValuesBuffer,
-      &cudaStepValuesDeviceChunksBuffer};
+      &cudaStepValuesDeviceChunksBuffer,
+      &cudaMemSync,
+  };
 
   allGather->init();
   reduceScatter->init();

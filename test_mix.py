@@ -40,6 +40,9 @@ class AllGather:
         handle = group._allgather_base(output, input)
         if sync:
             handle.wait()
+        if rng.randrange(0, 8) == 0:
+            handle.wait()
+            input.zero_()
         return (handle, output, data)
 
     def wait(self, x):
@@ -63,9 +66,19 @@ class ReduceScatter:
             if i == group.rank():
                 input = x
         output = torch.randn_like(result)
+        if rng.randrange(0, 8) == 0:
+            tmp = input
+            input = tmp.clone()
+            tmp.zero_()
+        if rng.randrange(0, 8) == 0:
+            tmp = torch.zeros_like(input)
+            tmp.copy_(input)
         handle = group._reduce_scatter_base(output, input)
         if sync:
             handle.wait()
+        if rng.randrange(0, 8) == 0:
+            handle.wait()
+            input.zero_()
         return (handle, output, result)
 
     def wait(self, x):
@@ -132,12 +145,17 @@ def step(rng: random.Random, group: dist.ProcessGroup, op):
             handles.append(op.run(group, data, rng))
     for h in handles:
         op.wait(h)
+        random_data(rng, group.size())
 
 
 def step_sequential(rng: random.Random, group: dist.ProcessGroup, op):
     for i in range(rng.randrange(1, 4)):
         data = random_data(rng, group.size())
         op.wait(op.run(group, data, rng))
+
+    data = [random_data(rng, group.size()) for _ in range(rng.randrange(1, 4))]
+    for d in data:
+        op.wait(op.run(group, d, rng))
 
 
 def step_parallel(rng: random.Random, group: dist.ProcessGroup, op):

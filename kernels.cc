@@ -725,6 +725,8 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   cpuIn[0] = stepValue + 1;
   while (cpuOut[0] < stepValue);
 }
+extern "C" __global__ void dummy_signal() {
+}
   )",
       "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones,
       "$copyDoneAllCode", copyDoneAllCode);
@@ -764,6 +766,7 @@ extern "C" __global__ void broadcast(uint32_t stepValue, uint32_t concurrencyInd
   }
 
   fn(cuBroadcast, "broadcast");
+  fn(cuDummySignal, "dummy_signal");
 
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);

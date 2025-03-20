@@ -43,7 +43,7 @@ def f(n):
 
         moodist.enable_cuda_allocator()
         moodist.enable_cpu_allocator()
-        
+
         moodist.set_prefer_kernel_less(True)
 
         # moodist.enable_profiling(True)
@@ -84,13 +84,14 @@ def f(n):
     # data = torch.randn((1024 * 512 - 1024 * 8) * size).cuda() + 1
     # data = torch.randn(32768 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64).cuda() + 1
-    #data = torch.randn(2 * 8192 * 7168).cuda() + 1
+    # data = torch.randn(2 * 8192 * 7168).cuda() + 1
     # data = torch.randn(1024 * 1024 * 64 * size).cuda() + 1
     # data = torch.randn((442416 - 4) * size).cuda() + 1
     # data = torch.randn(527040 * size).cuda() + 1
     # data = torch.randn(589824 * size).cuda() + 1
-    #data = torch.randn(294912 * size).cuda() + 1
-    data = torch.randn(3784800 // 4 * size).cuda() + 1
+    # data = torch.randn(294912 * size).cuda() + 1
+    #data = torch.randn(3784800 // 4 * size).cuda() + 1
+    data = torch.randn(1892400 // 4 * size).cuda() + 1
     # data = torch.randn(524288 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 2 * size).cuda() + 1
     # data = torch.randn(1024 * 1024 * 256 * size).cuda() + 1
@@ -107,7 +108,7 @@ def f(n):
     result0 = torch.zeros(data.numel() // size).cuda()
     # result0 = torch.zeros(1024 * 1024 * 800 * size, device="cuda")
 
-    #dtype = torch.bfloat16
+    # dtype = torch.bfloat16
     dtype = torch.float
 
     data = data.to(dtype)
@@ -116,7 +117,7 @@ def f(n):
 
     print("%d: input is (sum %f) " % (rank, data.sum()), data.view(size, -1))
 
-    check = True
+    check = False
 
     if check:
         all_inputs = []
@@ -322,13 +323,22 @@ def f(n):
     t = time.time() - start
     if rank == 0:
         print(
-            "time: %g, %g/s  %gG/s"
+            "time: %g, %g/s  %gG/s  (net %gG/s)"
             % (
                 t,
                 loopcount / t,
                 data.numel()
                 // size
                 * data.element_size()
+                / 1024
+                / 1024
+                / 1024
+                * loopcount
+                / t,
+                data.numel()
+                // size
+                * data.element_size()
+                * ((size + 7) // 8 - 1)
                 / 1024
                 / 1024
                 / 1024

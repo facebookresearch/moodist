@@ -46,7 +46,7 @@ def f(n):
 
         moodist.enable_cuda_allocator()
 
-        moodist.set_prefer_kernel_less(False)
+        moodist.set_prefer_kernel_less(True)
 
         # moodist.enable_profiling(True)
     if n == "tccl":
@@ -105,7 +105,7 @@ def f(n):
     # print("data: ", data)
     # data = torch.randn(1024 * 1024 * 10).cuda()
 
-    test_gather = False
+    test_gather = True
 
     if test_gather:
         # data = torch.randn(1024 * 1024 * 100 // size).cuda()
@@ -119,10 +119,10 @@ def f(n):
         # data = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
         # data = torch.randn(1024 * 7168 // 2).cuda() + 1
         # data = torch.randn(27264000 // 2).cuda() + 1
-        data = torch.randn(13107200 - 1).cuda() + 1
+        #data = torch.randn(13107200 - 1).cuda() + 1
         # data = torch.randn(4194304 - 0).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        # data = torch.randn(263520).cuda() + 1
+        data = torch.randn(263520).cuda() + 1
         #data = torch.randn(442416 - 0).cuda() + 1
         # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1

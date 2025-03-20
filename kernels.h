@@ -33,6 +33,8 @@ struct Kernels : CollectiveBase {
 
   CUfunction cuBroadcast = nullptr;
 
+  CUfunction cuDummySignal = nullptr;
+
   std::string emitCopySeq(
       std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
       size_t blockSize, std::string threadIndex, std::string blockIndex);
