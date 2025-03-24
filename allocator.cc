@@ -559,6 +559,9 @@ struct CudaAllocatorImpl {
     if (safebytes >= minbytes) {
       bytes = safebytes;
     }
+    if (mappedRegions.empty() && free / 2 > minbytes) {
+      bytes = free / 2;
+    }
     memlog.info(
         "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
         bytes, free, total);
@@ -1251,7 +1254,12 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   }
   virtual void recordHistory(
       bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder, size_t alloc_trace_max_entries,
-      c10::cuda::CUDACachingAllocator::RecordContext when) override {
+      c10::cuda::CUDACachingAllocator::RecordContext when){
+    // throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
+  }
+  virtual void recordHistory(
+      bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder, size_t alloc_trace_max_entries,
+      c10::cuda::CUDACachingAllocator::RecordContext when, bool){
     // throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
   }
   virtual void attachOutOfMemoryObserver(c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) override {

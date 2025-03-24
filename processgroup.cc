@@ -1682,8 +1682,8 @@ struct ProcessGroupImpl {
         size_t blockSize = group->kernels->blockSize;
 
         CHECK_CU(cuLaunchKernel(
-            group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex], gridSize * 4, 1, 1, blockSize, 1, 1, 0,
-            stream, params.data(), nullptr));
+            group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex], gridSize * 4, 1, 1, blockSize, 1, 1,
+            0, stream, params.data(), nullptr));
 
         for (size_t peerIndex : peerIndices) {
           cudaCopy(
