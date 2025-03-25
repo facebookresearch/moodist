@@ -30,7 +30,7 @@ void cudaCopyTensor(torch::Tensor& dst, const torch::Tensor& src) {
   CHECK(dst.is_contiguous());
   CHECK(src.is_contiguous());
   size_t srcbytes = src.itemsize() * src.numel();
-  size_t dstbytes = dst.itemsize() * src.numel();
+  size_t dstbytes = dst.itemsize() * dst.numel();
   if (srcbytes != dstbytes) {
     throw std::runtime_error(fmt::sprintf("cuda_copy: dst is %d bytes, but src is %d bytes", dstbytes, srcbytes));
   }
