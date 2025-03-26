@@ -4351,17 +4351,17 @@ struct CpuThreadImpl {
     }
 
     if (inlineData) {
-      auto buffer = allocateTemporaryBuffer(bytes);
+      auto buffer = group->allocateCpu(bytes);
 
-      uintptr_t localAddress = (uintptr_t)buffer->cpuPointer;
+      uintptr_t localAddress = (uintptr_t)buffer.cpuPointer;
 
       std::memcpy((void*)localAddress, inlineData, bytes);
 
       auto tensor = TensorDataPtr::make();
       tensor->buffer = AllocatedCpuBufferSharedPtr::make();
-      *tensor->buffer = std::move(buffer.buffer);
-      tensor->dataPtr = (uintptr_t)tensor->buffer->cpuPointer;
-      tensor->dataBytes = tensor->buffer->bytes;
+      *tensor->buffer = std::move(buffer);
+      tensor->dataPtr = (uintptr_t)localAddress;
+      tensor->dataBytes = bytes;
       tensor->dtype = dtype;
       tensor->shape.resize(shapeSize);
       for (size_t i = 0; i != shapeSize; ++i) {
