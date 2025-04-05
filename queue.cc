@@ -132,8 +132,12 @@ struct QueueStorage {
   std::atomic_size_t putQueueSize = 0;
   Vector<QueuedPut> putQueue;
 
+  int location = -1;
   bool streaming = false;
 };
+
+SpinMutex namedQueuesMutex;
+HashMap<std::string, QueueStorage*> namedQueues;
 
 void barrier(Group* group) {
   uint32_t concurrencyIndex = 0;
@@ -150,48 +154,66 @@ void barrier(Group* group) {
   }
 }
 
-uintptr_t sendCreateQueue(Group* group, int location, uintptr_t address, bool streaming) {
+uintptr_t
+sendCreateQueue(Group* group, int location, uintptr_t address, bool streaming, std::optional<std::string> name) {
   uint32_t concurrencyIndex = 0;
   std::atomic_uintptr_t outAddress = 0;
+  std::string outError;
   std::atomic_uint32_t cpuDone = 0;
   QueueEntryCreateQueue* e = group->cpuThread->freelistCreateQueue.pop();
-  e->task = taskCreateQueue;
+  e->task = name ? taskCreateQueueNamed : taskCreateQueue;
   e->stepValue = 0;
   e->sd = &group->getStreamData(nullptr);
   e->concurrencyIndex = concurrencyIndex;
   e->cpuDone = &cpuDone;
   e->outAddress = &outAddress;
+  e->outError = &outError;
   e->location = location;
   e->address = address;
   e->streaming = streaming;
+  e->name = name;
   group->cpuThread->enqueue(e);
   while (cpuDone == 0) {
     futexWait(&cpuDone, 0, std::chrono::seconds(10));
   }
+  if (!outError.empty()) {
+    throw std::runtime_error(outError);
+  }
   return outAddress;
 }
 
-void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress, bool streaming) {
+void create(
+    Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress, bool streaming,
+    std::optional<std::string> name) {
   CHECK(location >= 0 && location < group->size);
-  // barrier(group);
-
   if (streaming) {
     throw std::runtime_error("Queue: streaming is not fully implemented");
   }
 
-  uintptr_t address = 0;
-
-  qs = new QueueStorage();
-  qs->streaming = streaming;
-
-  if (location == group->rank) {
-    sendCreateQueue(group, location, (uintptr_t)qs, streaming);
-    remoteAddress = (uintptr_t)qs;
+  if (name) {
+    remoteAddress = sendCreateQueue(group, location, 0, streaming, name);
+    CHECK(remoteAddress != 0);
+    if (location == group->rank) {
+      qs = (QueueStorage*)remoteAddress;
+    } else {
+      qs = new QueueStorage();
+      qs->location = location;
+      qs->streaming = streaming;
+    }
   } else {
-    remoteAddress = sendCreateQueue(group, location, 0, streaming);
-  }
+    qs = new QueueStorage();
+    qs->location = location;
+    qs->streaming = streaming;
 
-  barrier(group);
+    if (location == group->rank) {
+      sendCreateQueue(group, location, (uintptr_t)qs, streaming, name);
+      remoteAddress = (uintptr_t)qs;
+    } else {
+      remoteAddress = sendCreateQueue(group, location, 0, streaming, name);
+    }
+
+    barrier(group);
+  }
 }
 
 void create(
@@ -204,10 +226,10 @@ void create(
   for (size_t i = 0; i != locations.size(); ++i) {
     int location = locations[i];
     if (location == group->rank) {
-      sendCreateQueue(group, location, (uintptr_t)qs, false);
+      sendCreateQueue(group, location, (uintptr_t)qs, false, std::nullopt);
       remoteAddress[i] = (uintptr_t)qs;
     } else {
-      remoteAddress[i] = sendCreateQueue(group, location, 0, false);
+      remoteAddress[i] = sendCreateQueue(group, location, 0, false, std::nullopt);
     }
   }
 
@@ -230,8 +252,8 @@ std::atomic_uint32_t nextPutKey = getRng()();
 
 template<typename Tensor>
 void sendPut(
-    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, std::shared_ptr<QueueWorkImpl> work,
-    uint32_t remoteGetKey, uint32_t transactionKey, size_t queueSize = -1) {
+    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor,
+    std::shared_ptr<QueueWorkImpl> work, uint32_t remoteGetKey, uint32_t transactionKey, size_t queueSize = -1) {
   size_t numel = tensor->numel();
   size_t bytes = numel * tensor->itemsize();
 
@@ -279,7 +301,8 @@ void sendPut(
 
 template<typename Tensor>
 void sendPutRemote(
-    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey, size_t queueSize) {
+    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey,
+    size_t queueSize) {
   CHECK(location != group->rank);
   sendPut(group, location, streaming, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0, queueSize);
 }
@@ -372,19 +395,26 @@ struct QueueImpl {
   SimpleVector<int> multicastLocations;
   SimpleVector<uintptr_t> multicastRemoteAddresses;
 
-  QueueImpl(std::shared_ptr<Group> group, int location, bool streaming) : group(group), location(location) {
-    create(&*group, location, qs, remoteAddress, streaming);
+  std::optional<std::string> name;
+
+  QueueImpl(std::shared_ptr<Group> group, int location, bool streaming, std::optional<std::string> name)
+      : group(group), location(location), name(name) {
+    create(&*group, location, qs, remoteAddress, streaming, name);
     CHECK(qs != nullptr);
     CHECK(remoteAddress != 0);
     CHECK(qs->streaming == streaming);
   }
 
-  QueueImpl(std::shared_ptr<Group> group, std::vector<int> locations, bool streaming) : group(group) {
+  QueueImpl(std::shared_ptr<Group> group, std::vector<int> locations, bool streaming, std::optional<std::string> name)
+      : group(group) {
     if (locations.empty()) {
       throw std::runtime_error("Queue cannot be constructed with an empty location list");
     }
     if (streaming) {
       throw std::runtime_error("Streaming broadcast queues are currently not supported!");
+    }
+    if (name) {
+      throw std::runtime_error("Named broadcast queues are currently not supported!");
     }
     isMulticast = true;
     location = locations[0];
@@ -608,7 +638,8 @@ struct QueueImpl {
             sendTransaction(&*group, i->location, i->remoteAddress, i->transactionKey, i->transactionOp);
           } else {
             sendPut(
-                &*group, i->location, qs->streaming, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0, i->transactionKey);
+                &*group, i->location, qs->streaming, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0,
+                i->transactionKey);
           }
           qs->putQueue.pop_front();
           --qs->putQueueSize;
@@ -733,21 +764,30 @@ void Queue::transactionCommit(uint32_t id) {
   return ((QueueImpl*)impl)->transactionCommit(id);
 }
 
+std::string Queue::name() const {
+  if (!((QueueImpl*)impl)->name) {
+    throw std::runtime_error("This Queue has no name");
+  }
+  return *((QueueImpl*)impl)->name;
+}
+
 static int foo;
 
 Queue::Queue(void* p) {
   CHECK(p == &foo);
 }
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location, bool streaming) {
+std::shared_ptr<Queue>
+makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::optional<std::string> name) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location, streaming);
+  r->impl = (void*)new QueueImpl(group, location, streaming, name);
   return r;
 }
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming) {
+std::shared_ptr<Queue>
+makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::optional<std::string> name) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location, streaming);
+  r->impl = (void*)new QueueImpl(group, location, streaming, name);
   return r;
 }
 
@@ -1013,6 +1053,22 @@ void queueTransactionCancel(Group* group, uintptr_t queueAddress, uint32_t sourc
   IncomingSource* ptr = &*qs->incoming[source];
   CHECK(ptr != nullptr);
   ptr->transactions.erase(key);
+}
+
+QueueInfo queueGetOrCreate(const std::string& name, int location, bool streaming) {
+  std::lock_guard l(namedQueuesMutex);
+  auto i = namedQueues.find(name);
+  if (i == namedQueues.end()) {
+    QueueStorage* qs = new QueueStorage();
+    qs->location = location;
+    qs->streaming = streaming;
+    i = namedQueues.emplace(name, qs).first;
+  }
+  QueueInfo r;
+  r.address = (uintptr_t)i->second;
+  r.location = i->second->location;
+  r.streaming = i->second->streaming;
+  return r;
 }
 
 } // namespace moodist

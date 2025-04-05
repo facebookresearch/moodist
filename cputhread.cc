@@ -907,6 +907,12 @@ struct CpuThreadImpl {
       case opTypeQueueTransaction:
         onRecvQueueTransaction(view);
         break;
+      case opTypeCreateQueueNamed:
+        onRecvCreateQueueNamed(view);
+        break;
+      case opTypeCreateQueueNamedResult:
+        onRecvCreateQueueNamedResult(view);
+        break;
       default:
         fatal("Received unknown message type %#x", type);
       }
@@ -4225,8 +4231,6 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      self.initReceives();
-
       stepValue = self.nextInternalStepValue[concurrencyIndex] + 1;
       self.nextInternalStepValue[concurrencyIndex] += 4;
 
@@ -5081,6 +5085,66 @@ struct CpuThreadImpl {
     cpuThread->freelistCallback.push(&params);
   }
 
+  uint32_t nextCreateQueueKey = random<uint32_t>();
+  HashMap<uint32_t, QueueEntryCreateQueue*> queueCreateOutgoing;
+
+  void executeCreateQueueNamed(QueueEntryCreateQueue& params) {
+    uint32_t key = nextCreateQueueKey++;
+    CHECK(params.name != std::nullopt);
+    queueCreateOutgoing[key] = &params;
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t bytes = serializeToUnchecked(
+        buffer->cpuPointer, opTypeCreateQueueNamed, (uint32_t)rank, key, *params.name, (uint32_t)params.location,
+        params.streaming);
+    sendBuffer(params.location, std::move(buffer), bytes);
+  }
+
+  void onRecvCreateQueueNamed(std::string_view view) {
+    uint32_t sourceRank;
+    uint32_t key;
+    std::string_view name;
+    uint32_t location;
+    bool streaming;
+    deserializeBufferPart(view, sourceRank, key, name, location, streaming);
+
+    std::string fullName = fmt::sprintf("%s.%s", group->name, name);
+
+    QueueInfo qi = queueGetOrCreate(fullName, location, streaming);
+
+    enqueueCallback([this, qi, key, sourceRank] {
+      auto buffer = allocateTemporaryBuffer(4096);
+      size_t bytes = serializeToUnchecked(
+          buffer->cpuPointer, opTypeCreateQueueNamedResult, key, qi.address, (uint32_t)qi.location, qi.streaming);
+      sendBuffer(sourceRank, std::move(buffer), bytes);
+    });
+  }
+
+  void onRecvCreateQueueNamedResult(std::string_view view) {
+    uint32_t key;
+    uintptr_t address;
+    uint32_t location;
+    bool streaming;
+    deserializeBufferPart(view, key, address, location, streaming);
+    CHECK(queueCreateOutgoing.contains(key));
+    auto& params = *queueCreateOutgoing[key];
+
+    *params.outAddress = address;
+    if (params.location != location || params.streaming != streaming) {
+      std::string err = fmt::sprintf(
+          "Queue creation found mismatched parameters for named queue '%s'. Local: location %d, streaming %d. Remote: "
+          "location %d, streaming %d\n",
+          *params.name, params.location, params.streaming, location, streaming);
+      if (params.outError) {
+        *params.outError = err;
+      } else {
+        fatal("%s", err);
+      }
+    }
+
+    params.cpuDone->store(1);
+    futexWakeAll(params.cpuDone);
+  }
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -5252,12 +5316,16 @@ struct CpuThreadImpl {
     return fmt::sprintf("(rank %d, hostname %s, pid %d, device %d)", i, hostname, ri.pid, ri.device);
   }
 
+  int mainThreadId = currentThreadId;
+
   void entry() {
     try {
 
       sendRankInfo();
 
       runTests();
+
+      initReceives();
 
       cpuThread->ready = true;
 
@@ -5360,6 +5428,9 @@ struct CpuThreadImpl {
               break;
             case taskCreateQueue:
               enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
+              break;
+            case taskCreateQueueNamed:
+              executeCreateQueueNamed((QueueEntryCreateQueue&)queueEntry);
               break;
             case taskQueuePut:
               executeQueuePut((QueueEntryQueuePut&)queueEntry);

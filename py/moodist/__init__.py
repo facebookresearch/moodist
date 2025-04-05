@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+import weakref
 import torch.distributed
 from ._C import (
     MoodistProcessGroup,
@@ -45,13 +46,38 @@ class TransactionContextManager:
 
 
 class Queue:
-    def __init__(self, process_group, location, streaming=False):
+    def __init__(
+        self,
+        process_group: MoodistProcessGroup | str,
+        location,
+        streaming=False,
+        name=None,
+    ):
+        if isinstance(process_group, str):
+            pg_name = process_group
+            process_group = find_process_group(pg_name)
+            assert process_group is not None, (
+                "The Moodist process group by name '%s' could not be found" % pg_name
+            )
         if not hasattr(process_group, "Queue"):
             raise RuntimeError(
                 "moodist.Queue process_group parameter must be a MoodistProcessGroup, but got %s"
                 % str(type(process_group)),
             )
-        self.impl = process_group.Queue(location=location, streaming=streaming)
+        self.impl = process_group.Queue(
+            location=location, streaming=streaming, name=name
+        )
+        self.process_group = process_group
+        self.location = location
+        self.streaming = streaming
+
+    def __reduce__(self):
+        return type(self), (
+            self.process_group.moodist_name(),
+            self.location,
+            self.streaming,
+            self.impl.name(),
+        )
 
     def put_tensor(self, tensor, *, transaction=0):
         return self.impl.put(tensor, transaction)
@@ -93,10 +119,19 @@ class Queue:
         return TransactionContextManager(self)
 
 
+_name_to_group = weakref.WeakValueDictionary()
+
+
+def find_process_group(name: str):
+    return _name_to_group.get(name, None)
+
+
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    return MoodistProcessGroup(store, rank, size)
+    obj = MoodistProcessGroup(store, rank, size)
+    _name_to_group[obj.moodist_name()] = obj
+    return obj
 
 
 torch.distributed.Backend.register_backend(

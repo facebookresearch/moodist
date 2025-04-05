@@ -33,6 +33,7 @@ constexpr uint8_t taskReduceScatterDirect = 20;
 constexpr uint8_t taskAllGatherBroadcast = 21;
 constexpr uint8_t taskCallback = 22;
 constexpr uint8_t taskAllGatherDirect = 23;
+constexpr uint8_t taskCreateQueueNamed = 24;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -76,6 +77,8 @@ OPTYPE(QueuePut);
 OPTYPE(QueueReadFinished);
 OPTYPE(QueueGet);
 OPTYPE(QueueTransaction);
+OPTYPE(CreateQueueNamed);
+OPTYPE(CreateQueueNamedResult);
 
 OPTYPE(Cat);
 OPTYPE(Cached);
@@ -196,12 +199,14 @@ struct QueueEntryBroadcastCpu : QueueEntry {
 
 struct QueueEntryCreateQueue : QueueEntry {
   std::atomic_uintptr_t* outAddress = nullptr;
+  std::string* outError = nullptr;
   std::atomic_uint32_t* cpuDone = nullptr;
 
   size_t location = 0;
   uintptr_t address = 0;
   size_t bytes = 0;
   bool streaming = false;
+  std::optional<std::string> name;
 };
 
 struct QueueEntryQueuePut : QueueEntry {

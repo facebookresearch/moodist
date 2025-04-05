@@ -39,6 +39,8 @@ public:
     return "moodist";
   }
 
+  std::string moodist_name() const;
+
   c10::intrusive_ptr<Work>
   broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;
 
@@ -115,8 +117,10 @@ public:
     throw std::runtime_error("recvAnysource not supported");
   }
 
-  std::shared_ptr<Queue> makeQueue(int location, bool streaming = false);
-  std::shared_ptr<Queue> makeQueue(std::vector<int> location, bool streaming = false);
+  std::shared_ptr<Queue>
+  makeQueue(int location, bool streaming = false, std::optional<std::string> name = std::nullopt);
+  std::shared_ptr<Queue>
+  makeQueue(std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
 
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);

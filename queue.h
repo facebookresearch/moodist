@@ -35,10 +35,13 @@ struct Queue {
   uint32_t transactionBegin();
   void transactionCancel(uint32_t id);
   void transactionCommit(uint32_t id);
+
+  std::string name() const;
 };
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming);
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming);
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming, std::optional<std::string> name);
+std::shared_ptr<Queue>
+makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::optional<std::string> name);
 
 uint32_t queuePrepare(uintptr_t queueAddress, uint32_t source, uint32_t getKey, uint32_t transactionKey);
 void queueFinish(
@@ -54,5 +57,12 @@ void queueRemoteGetStopAck(
 
 void queueTransactionCommit(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key);
 void queueTransactionCancel(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key);
+
+struct QueueInfo {
+  uintptr_t address;
+  int location;
+  bool streaming;
+};
+QueueInfo queueGetOrCreate(const std::string& name, int location, bool streaming);
 
 } // namespace moodist

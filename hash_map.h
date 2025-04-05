@@ -436,6 +436,11 @@ public:
     return findSlowPath(ki, std::forward<KeyT>(key));
   }
 
+  template<typename KeyT>
+  bool contains(KeyT&& key) const noexcept {
+    return find(std::forward<KeyT>(key)) != end();
+  }
+
   void reserve(size_t n) {
     if (n >= std::numeric_limits<size_t>::max() / 2) {
       throw std::range_error("reserve beyond max size");

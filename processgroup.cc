@@ -193,6 +193,8 @@ struct ReusableHandle {
 
 SharedSpinMutex unmapMemoryMutex;
 
+std::atomic_uint64_t nameCounter = 1;
+
 struct ProcessGroupImpl {
   size_t rank = 0;
   size_t size = 0;
@@ -457,7 +459,6 @@ struct ProcessGroupImpl {
     }
 
     log.debug("%d: Waiting for setupComms\n", rank);
-    std::fflush(stdout);
     group->setupComms->waitForConnections();
 
     set(fmt::sprintf("moodist_rank%d_ready", rank), key);
@@ -466,7 +467,6 @@ struct ProcessGroupImpl {
     }
 
     log.debug("%d: Waiting for connections\n", rank);
-    std::fflush(stdout);
     for (size_t i = 0; i != size; ++i) {
       if (i == rank) {
         continue;
@@ -478,14 +478,27 @@ struct ProcessGroupImpl {
         continue;
       }
       log.debug("%d: waiting for greeting from %d\n", rank, i);
-      std::fflush(stdout);
+
       std::string greeting = group->setupComms->recvFrom<std::string>(i);
       CHECK(greeting == fmt::sprintf("hello %d %s", rank, key));
       log.debug("greeting ok!\n");
-      std::fflush(stdout);
     }
     log.debug("got all connections\n");
-    std::fflush(stdout);
+
+    if (rank == 0) {
+      uint64_t n = nameCounter.fetch_add(1);
+      group->name = fmt::sprintf("moopg%d", n);
+      for (size_t i = 0; i != size; ++i) {
+        if (i == rank) {
+          continue;
+        }
+        group->setupComms->sendTo(i, group->name);
+      }
+    } else {
+      group->name = group->setupComms->recvFrom<std::string>(0);
+    }
+
+    log.info("rank %d created group with name '%s'\n", rank, group->name);
 
     group->init();
 
@@ -2913,12 +2926,13 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
   return c10::make_intrusive<WorkImpl>(torch::Tensor(), std::nullopt);
 }
 
-std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming) {
-  return moodist::makeQueue(impl->group, location, streaming);
+std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
+  return moodist::makeQueue(impl->group, location, streaming, name);
 }
 
-std::shared_ptr<Queue> ProcessGroup::makeQueue(std::vector<int> location, bool streaming) {
-  return moodist::makeQueue(impl->group, location, streaming);
+std::shared_ptr<Queue>
+ProcessGroup::makeQueue(std::vector<int> location, bool streaming, std::optional<std::string> name) {
+  return moodist::makeQueue(impl->group, location, streaming, name);
 }
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
@@ -2927,6 +2941,10 @@ Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& local
 
 Future ProcessGroup::copy(torch::Tensor& destination, const torch::Tensor& source) {
   return impl->copy(destination, source);
+}
+
+std::string ProcessGroup::moodist_name() const {
+  return impl->group->name;
 }
 
 Future::Future() {}

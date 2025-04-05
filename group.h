@@ -174,6 +174,8 @@ struct Group {
   HashMap<CUstream, std::unique_ptr<StreamData>> streamData;
   std::array<std::unique_ptr<StreamData>, maxConcurrency> cpuStreamData;
 
+  std::string name;
+
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
     size_t offset = (uintptr_t)(void*)myVar - (uintptr_t)mySharedMem;

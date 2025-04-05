@@ -54,13 +54,17 @@ PYBIND11_MODULE(_C, m) {
   )d")
       .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
       .def(
-          "Queue", py::overload_cast<int, bool>(&MoodistProcessGroup::makeQueue), py::arg("location"),
-          py::arg("streaming") = false, py::call_guard<py::gil_scoped_release>())
+          "Queue", py::overload_cast<int, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
+          py::arg("location"), py::arg("streaming") = false, py::arg("name") = py::none(),
+          py::call_guard<py::gil_scoped_release>())
       .def(
-          "Queue", py::overload_cast<std::vector<int>, bool>(&MoodistProcessGroup::makeQueue), py::arg("location"),
-          py::arg("streaming") = false, py::call_guard<py::gil_scoped_release>())
+          "Queue",
+          py::overload_cast<std::vector<int>, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
+          py::arg("location"), py::arg("streaming") = false, py::arg("name") = py::none(),
+          py::call_guard<py::gil_scoped_release>())
       .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
-      .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>());
+      .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>())
+      .def("moodist_name", &MoodistProcessGroup::moodist_name);
 
   py::class_<MoodistBackend, c10::intrusive_ptr<MoodistBackend>, c10d::Backend>(m, "MoodistBackend", R"d(
     A moodist process group :D
@@ -92,7 +96,8 @@ PYBIND11_MODULE(_C, m) {
       .def("wait", &moodist::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
       .def("transaction_begin", &moodist::Queue::transactionBegin, py::call_guard<py::gil_scoped_release>())
       .def("transaction_cancel", &moodist::Queue::transactionCancel, py::call_guard<py::gil_scoped_release>())
-      .def("transaction_commit", &moodist::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>());
+      .def("transaction_commit", &moodist::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>())
+      .def("name", &moodist::Queue::name);
   py::class_<moodist::QueueWork>(m, "QueueWork")
       .def("wait", &moodist::QueueWork::wait, py::call_guard<py::gil_scoped_release>());
 }
