@@ -68,6 +68,8 @@ OPTYPE(ReduceScatterRingCuda);
 OPTYPE(ReduceScatterDirectCuda);
 OPTYPE(BroadcastCuda);
 OPTYPE(ReduceCuda);
+OPTYPE(AllToAllCuda);
+OPTYPE(LocalSmallAllReduceCuda);
 
 OPTYPE(BroadcastRingCuda);
 OPTYPE(ReduceTreeCuda);

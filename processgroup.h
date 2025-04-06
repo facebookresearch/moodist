@@ -89,9 +89,7 @@ public:
 
   c10::intrusive_ptr<Work> alltoall_base(
       at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
-      std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
-    throw std::runtime_error("alltoall_base not supported");
-  }
+      std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
 
   c10::intrusive_ptr<Work> alltoall(
       std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,

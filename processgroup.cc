@@ -2573,6 +2573,165 @@ struct ProcessGroupImpl {
     r.impl = std::move(future);
     return r;
   }
+
+  void alltoall(at::Tensor& output, const at::Tensor& input, CUstream stream) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    CHECK(input.is_contiguous());
+    CHECK(output.is_contiguous());
+
+    bool isCuda = input.is_cuda();
+
+    if (isCuda) {
+      CHECK(input.is_cuda());
+      CHECK(input.device().index() == group->deviceIndex);
+      CHECK(output.is_cuda());
+      CHECK(output.device().index() == group->deviceIndex);
+    }
+
+    if (size - 1 != group->peerIndices.size()) {
+      throw std::runtime_error("only local alltoall is supported at the moment, sorry :(");
+    }
+
+    size_t totalBytes = input.numel() * input.itemsize();
+    CHECK(totalBytes % size == 0);
+    size_t chunkBytes = totalBytes / size;
+
+    uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+    uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+
+    Group* group = &*this->group;
+
+    std::shared_lock unmapLock(unmapMemoryMutex);
+    sync(stepValue);
+
+    const auto& ipcRanks = group->ipcRanks;
+    const auto& peerIndices = group->peerIndices;
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    std::array<uintptr_t, 8> peerMappedAddresses;
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(i, inputAddress, totalBytes, &peerMappedAddresses[i], true);
+    }
+    ipcMapper->wait();
+
+    std::array<uintptr_t, 8> peerAddresses;
+    for (size_t peerIndex : peerIndices) {
+      peerWriteDyn(
+          concurrencyIndex, peerIndex, opTypeAllToAllCuda, stepValue, peerMappedAddresses[peerIndex], totalBytes);
+    }
+    for (size_t peerIndex : peerIndices) {
+      peerAddresses[peerIndex] = peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllToAllCuda, stepValue, totalBytes);
+    }
+
+    freePendingIpcEvents();
+
+    syncPeers(stream);
+    for (size_t peerIndex : peerIndices) {
+      cudaCopy(
+          outputAddress + chunkBytes * ipcRanks[peerIndex], peerAddresses[peerIndex] + chunkBytes * rank, chunkBytes,
+          stream);
+    }
+    cudaCopy(outputAddress + chunkBytes * rank, inputAddress + chunkBytes * rank, chunkBytes, stream);
+    syncPeers(stream);
+  }
+
+  void local_small_allreduce(at::Tensor& tensor, c10d::ReduceOp reduceOp, CUstream stream) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    CHECK(tensor.is_contiguous());
+
+    bool isCuda = tensor.is_cuda();
+
+    CHECK(isCuda);
+
+    if (size - 1 != group->peerIndices.size()) {
+      throw std::runtime_error("only local alltoall is supported at the moment, sorry :(");
+    }
+
+    size_t numel = tensor.numel();
+    size_t bytes = numel * tensor.itemsize();
+
+    Group* group = &*this->group;
+
+    std::shared_lock unmapLock(unmapMemoryMutex);
+    sync(stepValue);
+
+    const auto& ipcRanks = group->ipcRanks;
+    const auto& peerIndices = group->peerIndices;
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+
+    auto temporary = torch::empty({(int64_t)numel}, at::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+
+    auto local = tensor.flatten();
+
+    cudaCopy((uintptr_t)temporary.data_ptr(), (uintptr_t)local.data_ptr(), bytes, stream);
+
+    uintptr_t address = (uintptr_t)temporary.data_ptr();
+
+    std::array<uintptr_t, 8> peerMappedAddresses;
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(i, address, bytes, &peerMappedAddresses[i], true);
+    }
+    ipcMapper->wait();
+
+    std::array<uintptr_t, 8> peerAddresses;
+    for (size_t peerIndex : peerIndices) {
+      peerWriteDyn(
+          concurrencyIndex, peerIndex, opTypeLocalSmallAllReduceCuda, stepValue, peerMappedAddresses[peerIndex], bytes);
+    }
+    for (size_t peerIndex : peerIndices) {
+      peerAddresses[peerIndex] =
+          peerWaitDyn(concurrencyIndex, peerIndex, opTypeLocalSmallAllReduceCuda, stepValue, bytes);
+    }
+
+    freePendingIpcEvents();
+
+    syncPeers(stream);
+    for (size_t peerIndex : peerIndices) {
+      torch::Tensor peerTensor = torch::from_blob(
+          (void*)peerAddresses[peerIndex], {(int64_t)numel},
+          at::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
+
+      switch (reduceOp) {
+      case c10d::ReduceOp::SUM:
+        local.add_(peerTensor);
+        break;
+      case c10d::ReduceOp::MIN:
+        throw std::runtime_error("fixme local small allreduce min");
+        break;
+      case c10d::ReduceOp::MAX:
+        throw std::runtime_error("fixme local small allreduce max");
+        break;
+      case c10d::ReduceOp::AVG:
+        local.add_(peerTensor);
+        break;
+      default:
+        throw std::runtime_error(
+            fmt::sprintf("moodist: allreduce: Unsupported reduceOp %s", std::string(tensor.dtype().name())));
+      }
+    }
+    if (reduceOp == c10d::ReduceOp::AVG) {
+      local *= 1.0f / size;
+    }
+    syncPeers(stream);
+  }
 };
 
 void globalsDtor() {
@@ -2803,7 +2962,11 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       CHECK_CU(cuStreamWaitEvent(w->stream, w->event, CU_EVENT_WAIT_DEFAULT));
       stream = w->stream;
     }
-    if (numel % impl->size == 0) {
+    // if (numel < 1024 * 1024 && impl->size - 1 == impl->group->peerIndices.size() && isCuda &&
+    //     (opts.reduceOp == c10d::ReduceOp::SUM || opts.reduceOp == c10d::ReduceOp::AVG)) {
+    if (false) {
+      impl->local_small_allreduce(tensor, opts.reduceOp, stream);
+    } else if (numel % impl->size == 0) {
       auto t = tensor.view({(int64_t)impl->size, -1});
       auto o = t[impl->rank];
       impl->reduce_scatter(o, t, opts.reduceOp, stream);
@@ -2839,6 +3002,10 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
       // tensor.record_stream(c10::Stream(c10::Stream::UNSAFE, tensor.device(), (c10::StreamId)w->stream));
       CHECK_CU(cuEventRecord(w->event, w->stream));
     }
+  }
+
+  for (auto& tensor : tensors) {
+    CHECK(tensor.is_cuda() == (w != nullptr));
   }
 
   return c10::make_intrusive<WorkImpl>(tensors, std::nullopt, w);
@@ -2912,18 +3079,50 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
   CHECK(inputTensors.size() == getSize());
   CHECK(outputTensors.size() == getSize());
 
-  for (size_t i = 0; i != getSize(); ++i) {
-    std::vector<at::Tensor> output = {outputTensors[i]};
-    std::vector<std::vector<at::Tensor>> input;
-    if (i == getRank()) {
-      input = {inputTensors};
-    }
-    c10d::ScatterOptions scatteropts;
-    scatteropts.rootRank = i;
-    scatter(output, input, scatteropts);
-  }
+  bool isCuda = outputTensors[0].is_cuda();
+  if (isCuda) {
+    throw std::runtime_error("Moodist: CUDA alltoall is not currently supported");
+  } else {
 
-  return c10::make_intrusive<WorkImpl>(torch::Tensor(), std::nullopt);
+    for (size_t i = 0; i != getSize(); ++i) {
+      std::vector<at::Tensor> output = {outputTensors[i]};
+      std::vector<std::vector<at::Tensor>> input;
+      if (i == getRank()) {
+        input = {inputTensors};
+      }
+      c10d::ScatterOptions scatteropts;
+      scatteropts.rootRank = i;
+      scatter(output, input, scatteropts);
+    }
+
+    return c10::make_intrusive<WorkImpl>(torch::Tensor(), std::nullopt);
+  }
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
+    at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
+    std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts) {
+
+  CHECK(outputSplitSizes.size() == 0);
+  CHECK(inputSplitSizes.size() == 0);
+
+  bool isCuda = outputTensor.is_cuda();
+  if (isCuda) {
+    CHECK(inputTensor.is_cuda());
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
+    WorkStream* w = impl->getWorkStream(stream);
+    Event e = Event::reference(w->event);
+    e.record(stream);
+    e.wait(w->stream);
+    impl->alltoall(outputTensor, inputTensor, w->stream);
+    e.record(w->stream);
+    return c10::make_intrusive<WorkImpl>(outputTensor, inputTensor, w);
+  } else {
+    auto outputs = outputTensor.chunk(getSize());
+    auto inputs = inputTensor.chunk(getSize());
+
+    return alltoall(outputs, inputs);
+  }
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {

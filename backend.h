@@ -42,7 +42,7 @@ public:
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
       const c10d::AllreduceCoalescedOptions& opts = c10d::AllreduceCoalescedOptions()) override {
-    throw std::runtime_error("allreduce_coalesced not supported");
+    return pg.allreduce_coalesced(tensors, opts);
   }
 
   virtual c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(
@@ -71,13 +71,13 @@ public:
   c10::intrusive_ptr<Work> allgather_coalesced(
       std::vector<std::vector<at::Tensor>>& outputTensorLists, std::vector<at::Tensor>& inputTensors,
       const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
-    throw std::runtime_error("allgather_coalesced not supported");
+    return pg.allgather_coalesced(outputTensorLists, inputTensors, opts);
   }
 
   c10::intrusive_ptr<Work> reduce_scatter(
       std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
-    throw std::runtime_error("reduce_scatter not supported");
+    return pg.reduce_scatter(outputTensors, inputTensors, opts);
   }
 
   c10::intrusive_ptr<Work> _reduce_scatter_base(
@@ -99,7 +99,7 @@ public:
   c10::intrusive_ptr<Work> alltoall_base(
       at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
       std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
-    throw std::runtime_error("alltoall_base not supported");
+    return pg.alltoall_base(outputTensor, inputTensor, outputSplitSizes, inputSplitSizes, opts);
   }
 
   c10::intrusive_ptr<Work> alltoall(
@@ -109,11 +109,11 @@ public:
   }
 
   c10::intrusive_ptr<Work> send(std::vector<at::Tensor>& tensors, int dstRank, int tag) override {
-    throw std::runtime_error("send not supported");
+    return pg.send(tensors, dstRank, tag);
   }
 
   c10::intrusive_ptr<Work> recv(std::vector<at::Tensor>& tensors, int srcRank, int tag) override {
-    throw std::runtime_error("recv not supported");
+    return pg.recv(tensors, srcRank, tag);
   }
 
   c10::intrusive_ptr<Work> gather(
@@ -129,7 +129,7 @@ public:
   }
 
   c10::intrusive_ptr<Work> recvAnysource(std::vector<at::Tensor>& tensors, int tag) override {
-    throw std::runtime_error("recvAnysource not supported");
+    return pg.recvAnysource(tensors, tag);
   }
 };
 

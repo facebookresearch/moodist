@@ -86,6 +86,37 @@ class ReduceScatter:
         handle.wait()
         assert torch.allclose(output, data, 1e-3, 1e-2)
 
+class AllToAll:
+    def run(
+        self,
+        group: dist.ProcessGroup,
+        data: torch.Tensor,
+        rng: random.Random,
+        sync=False,
+    ):
+        output = torch.randn_like(data)
+        output.zero_()
+        result = []
+        for i in range(group.size()):
+            x = torch.randn_like(data)
+            result.append(x.chunk(group.size())[group.rank()])
+            if i == group.rank():
+                input = x
+        result = torch.cat(result)
+        handle = group.alltoall_base(output, input, [], [])
+        if sync:
+            handle.wait()
+        if rng.randrange(0, 8) == 0:
+            handle.wait()
+            input.zero_()
+        return (handle, output, result)
+
+    def wait(self, x):
+        handle, output, data = x
+        handle.wait()
+        assert torch.equal(output, data)
+
+
 
 class Mixed:
     def run(
@@ -191,7 +222,7 @@ def entry(backend):
 
     torch.cuda.manual_seed(42)
 
-    ops = [AllGather(), ReduceScatter(), Mixed()]
+    ops = [AllGather(), ReduceScatter(), Mixed(), AllToAll()]
     funcs = [step, step_streams, step_sequential, step_parallel]
 
     for i in range(1000):
