@@ -396,10 +396,10 @@ struct Stream {
     r.owning = false;
     return r;
   }
-  static Stream create() {
+  static Stream create(int priority = 0) {
     Stream r;
-    CHECK_CU(cuStreamCreate(&r.stream, CU_STREAM_NON_BLOCKING));
-    // CHECK_CU(cuStreamCreateWithPriority(&r.stream, CU_STREAM_NON_BLOCKING, -100));
+    // CHECK_CU(cuStreamCreate(&r.stream, CU_STREAM_NON_BLOCKING));
+    CHECK_CU(cuStreamCreateWithPriority(&r.stream, CU_STREAM_NON_BLOCKING, priority));
     r.owning = true;
     return r;
   }

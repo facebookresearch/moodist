@@ -27,7 +27,7 @@ if "LOCAL_RANK" not in os.environ:
 # else:
 # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 
-os.environ["NCCL_PROTO"] = "^LL,^LL128"
+# os.environ["NCCL_PROTO"] = "^LL,^LL128"
 
 # import moodist
 
@@ -60,9 +60,7 @@ def f(n):
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    dist.init_process_group(
-        backend=n
-    )
+    dist.init_process_group(backend=n)
 
     # group1 = dist.new_group()
     # group2 = dist.new_group()
@@ -119,11 +117,12 @@ def f(n):
         # data = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
         # data = torch.randn(1024 * 7168 // 2).cuda() + 1
         # data = torch.randn(27264000 // 2).cuda() + 1
-        #data = torch.randn(13107200 - 1).cuda() + 1
+        # data = torch.randn(13107200 - 1).cuda() + 1
         # data = torch.randn(4194304 - 0).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
-        data = torch.randn(263520).cuda() + 1
-        #data = torch.randn(442416 - 0).cuda() + 1
+        # data = torch.randn(263520).cuda() + 1
+        data = torch.randn(50331648 // 4).cuda() + 1
+        # data = torch.randn(442416 - 0).cuda() + 1
         # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1
         # data = torch.randn(589824).cuda() + 1
@@ -555,7 +554,7 @@ def f(n):
 
     else:
         # items = 1024 * 1024 * 64 * size
-        #items = 1024 * 1024 * 20 * size
+        # items = 1024 * 1024 * 20 * size
         items = 1
         # items = 1024 * 1024 * 50
         # items = 1024 * 1024 * 40

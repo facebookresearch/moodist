@@ -70,6 +70,7 @@ OPTYPE(BroadcastCuda);
 OPTYPE(ReduceCuda);
 OPTYPE(AllToAllCuda);
 OPTYPE(LocalSmallAllReduceCuda);
+OPTYPE(ShareCuda);
 
 OPTYPE(BroadcastRingCuda);
 OPTYPE(ReduceTreeCuda);

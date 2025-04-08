@@ -122,6 +122,8 @@ public:
 
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
+
+  std::vector<torch::Tensor> share(const torch::Tensor& input);
 };
 
 } // namespace moodist

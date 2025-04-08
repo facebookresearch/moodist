@@ -64,7 +64,8 @@ PYBIND11_MODULE(_C, m) {
           py::call_guard<py::gil_scoped_release>())
       .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
       .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>())
-      .def("moodist_name", &MoodistProcessGroup::moodist_name);
+      .def("moodist_name", &MoodistProcessGroup::moodist_name)
+      .def("share", &MoodistProcessGroup::share, py::call_guard<py::gil_scoped_release>());
 
   py::class_<MoodistBackend, c10::intrusive_ptr<MoodistBackend>, c10d::Backend>(m, "MoodistBackend", R"d(
     A moodist process group :D

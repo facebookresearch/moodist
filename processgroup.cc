@@ -228,6 +228,8 @@ struct ProcessGroupImpl {
   Reusable<IpcEvent> ipcEvents;
   Reusable<IpcEvent> pendingIpcEvents;
 
+  int streamPriority = 0;
+
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     CHECK(rank >= 0 && size > 0 && rank < size);
 
@@ -250,12 +252,16 @@ struct ProcessGroupImpl {
     }
 
     localEvent = Event::create();
+
+    if (size - 1 == group->peerIndices.size()) {
+      streamPriority = -10;
+    }
   }
 
   Stream getCopyStream(CUstream stream) {
     auto& ref = copyStream[stream];
     if (!ref) {
-      ref = Stream::create();
+      ref = Stream::create(streamPriority);
     }
     return Stream::reference(ref);
   }
@@ -297,8 +303,8 @@ struct ProcessGroupImpl {
 
       w->owner = workStreams[stream];
       CHECK(&*w->owner == ws);
-      CHECK_CU(cuStreamCreate(&w->stream, CU_STREAM_NON_BLOCKING));
-      // CHECK_CU(cuStreamCreateWithPriority(&w->stream, CU_STREAM_NON_BLOCKING, -100));
+      // CHECK_CU(cuStreamCreate(&w->stream, CU_STREAM_NON_BLOCKING));
+      CHECK_CU(cuStreamCreateWithPriority(&w->stream, CU_STREAM_NON_BLOCKING, streamPriority));
       CHECK_CU(cuEventCreate(&w->event, CU_EVENT_DISABLE_TIMING));
       log.info("New work stream %#x created for stream %#x\n", (uintptr_t)w->stream, (uintptr_t)stream);
     }
@@ -1952,7 +1958,7 @@ struct ProcessGroupImpl {
     CHECK(memops.empty());
 
     if (!peerMemcpyStream) {
-      peerMemcpyStream = Stream::create();
+      peerMemcpyStream = Stream::create(streamPriority);
     }
     if (!localEvent) {
       localEvent = Event::create();
@@ -2043,7 +2049,7 @@ struct ProcessGroupImpl {
 
         auto& copyStream = peerMemcpyStreamPerChunk[chunkIndex];
         if (!copyStream) {
-          copyStream = Stream::create();
+          copyStream = Stream::create(streamPriority);
         }
 
         localEvent.record(stream);
@@ -2150,10 +2156,10 @@ struct ProcessGroupImpl {
     // };
 
     if (!peerMemcpyStream) {
-      peerMemcpyStream = Stream::create();
+      peerMemcpyStream = Stream::create(streamPriority);
     }
     if (!peerIncomingMemcpyStream) {
-      peerIncomingMemcpyStream = Stream::create();
+      peerIncomingMemcpyStream = Stream::create(streamPriority);
     }
     if (!localEvent) {
       localEvent = Event::create();
@@ -2190,7 +2196,7 @@ struct ProcessGroupImpl {
     }
 
     if (!reduceStream) {
-      reduceStream = Stream::create();
+      reduceStream = Stream::create(streamPriority);
     }
 
     if (networked) {
@@ -2226,7 +2232,7 @@ struct ProcessGroupImpl {
     }
 
     if (!peerMemcpyStream) {
-      peerMemcpyStream = Stream::create();
+      peerMemcpyStream = Stream::create(streamPriority);
     }
     if (!localEvent) {
       localEvent = Event::create();
@@ -2732,6 +2738,68 @@ struct ProcessGroupImpl {
     }
     syncPeers(stream);
   }
+
+  std::vector<torch::Tensor> share(const at::Tensor& input, CUstream stream) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    CHECK(input.is_contiguous());
+
+    bool isCuda = input.is_cuda();
+
+    CHECK(isCuda);
+
+    CHECK(size - 1 == group->peerIndices.size());
+
+    size_t bytes = input.numel() * input.itemsize();
+
+    uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+
+    Group* group = &*this->group;
+
+    std::shared_lock unmapLock(unmapMemoryMutex);
+    sync(stepValue);
+
+    const auto& ipcRanks = group->ipcRanks;
+    const auto& peerIndices = group->peerIndices;
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    std::array<uintptr_t, 8> peerMappedAddresses;
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(i, inputAddress, bytes, &peerMappedAddresses[i], true);
+    }
+    ipcMapper->wait();
+
+    std::array<uintptr_t, 8> peerAddresses;
+    for (size_t peerIndex : peerIndices) {
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeShareCuda, stepValue, peerMappedAddresses[peerIndex], bytes);
+    }
+    for (size_t peerIndex : peerIndices) {
+      peerAddresses[peerIndex] = peerWaitDyn(concurrencyIndex, peerIndex, opTypeShareCuda, stepValue, bytes);
+    }
+    freePendingIpcEvents();
+    syncPeers(stream);
+
+    std::vector<torch::Tensor> r;
+    for (size_t i = 0; i != size; ++i) {
+      if (i == rank) {
+        r.push_back(input);
+      } else {
+        size_t peerIndex = group->getPeerIndex(i);
+        r.push_back(torch::from_blob(
+            (void*)peerAddresses[peerIndex], input.sizes(),
+            at::TensorOptions().dtype(input.dtype()).device(input.device())));
+      }
+    }
+
+    return r;
+  }
 };
 
 void globalsDtor() {
@@ -3123,6 +3191,17 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
 
     return alltoall(outputs, inputs);
   }
+}
+
+std::vector<torch::Tensor> ProcessGroup::share(const torch::Tensor& input) {
+  if (!input.is_cuda()) {
+    throw std::runtime_error("Moodist: share is only supported with cuda tensors");
+  }
+  if (impl->size - 1 != impl->group->peerIndices.size()) {
+    throw std::runtime_error(
+        "Moodist: share is only supported on local groups (all ranks on the same node with nvlink connectivity)");
+  }
+  return impl->share(input, c10::cuda::getCurrentCUDAStream());
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
