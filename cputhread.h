@@ -69,6 +69,7 @@ OPTYPE(ReduceScatterDirectCuda);
 OPTYPE(BroadcastCuda);
 OPTYPE(ReduceCuda);
 OPTYPE(AllToAllCuda);
+OPTYPE(AllToAllCuda2);
 OPTYPE(LocalSmallAllReduceCuda);
 OPTYPE(ShareCuda);
 

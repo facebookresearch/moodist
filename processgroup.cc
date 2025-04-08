@@ -2649,6 +2649,89 @@ struct ProcessGroupImpl {
     syncPeers(stream);
   }
 
+  void alltoall(const std::vector<at::Tensor>& outputs, const std::vector<at::Tensor>& inputs, CUstream stream) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    CHECK(inputs.size() == size);
+    CHECK(outputs.size() == size);
+
+    for (auto& v : inputs) {
+      CHECK(v.is_contiguous());
+    }
+    for (auto& v : outputs) {
+      CHECK(v.is_contiguous());
+    }
+
+    // bool isCuda = input.is_cuda();
+
+    // if (isCuda) {
+    //   CHECK(input.is_cuda());
+    //   CHECK(input.device().index() == group->deviceIndex);
+    //   CHECK(output.is_cuda());
+    //   CHECK(output.device().index() == group->deviceIndex);
+    // }
+
+    if (size - 1 != group->peerIndices.size()) {
+      throw std::runtime_error("only local alltoall is supported at the moment, sorry :(");
+    }
+
+    size_t numel = inputs[0].numel();
+    size_t bytes = numel * inputs[0].itemsize();
+
+    for (auto& v : inputs) {
+      CHECK(v.is_cuda())
+      CHECK(v.numel() * v.itemsize() == bytes);
+    }
+    for (auto& v : outputs) {
+      CHECK(v.is_cuda())
+      CHECK(v.numel() * v.itemsize() == bytes);
+    }
+
+    // uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+    // uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+
+    Group* group = &*this->group;
+
+    std::shared_lock unmapLock(unmapMemoryMutex);
+    sync(stepValue);
+
+    const auto& ipcRanks = group->ipcRanks;
+    const auto& peerIndices = group->peerIndices;
+
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    std::array<uintptr_t, 8> peerMappedAddresses;
+    for (size_t i : peerIndices) {
+      ipcMapper->requestAddress(
+          i, (uintptr_t)inputs[ipcRanks[i]].data_ptr(), bytes, &peerMappedAddresses[i], true);
+    }
+    ipcMapper->wait();
+
+    std::array<uintptr_t, 8> peerAddresses;
+    for (size_t peerIndex : peerIndices) {
+      peerWriteDyn(
+          concurrencyIndex, peerIndex, opTypeAllToAllCuda2, stepValue, peerMappedAddresses[peerIndex], bytes);
+    }
+    for (size_t peerIndex : peerIndices) {
+      peerAddresses[peerIndex] = peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllToAllCuda2, stepValue, bytes);
+    }
+
+    freePendingIpcEvents();
+
+    syncPeers(stream);
+    for (size_t peerIndex : peerIndices) {
+      cudaCopy((uintptr_t)outputs[ipcRanks[peerIndex]].data_ptr(), peerAddresses[peerIndex], bytes, stream);
+    }
+    cudaCopy((uintptr_t)outputs[rank].data_ptr(), (uintptr_t)inputs[rank].data_ptr(), bytes, stream);
+    syncPeers(stream);
+  }
+
   void local_small_allreduce(at::Tensor& tensor, c10d::ReduceOp reduceOp, CUstream stream) {
     std::unique_lock l(threadUnsafe);
 
@@ -3149,7 +3232,21 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
 
   bool isCuda = outputTensors[0].is_cuda();
   if (isCuda) {
-    throw std::runtime_error("Moodist: CUDA alltoall is not currently supported");
+    // throw std::runtime_error("Moodist: CUDA alltoall is not currently supported");
+    for (auto& v : inputTensors) {
+      CHECK(v.is_cuda());
+    }
+    for (auto& v : outputTensors) {
+      CHECK(v.is_cuda());
+    }
+    CUstream stream = c10::cuda::getCurrentCUDAStream();
+    WorkStream* w = impl->getWorkStream(stream);
+    Event e = Event::reference(w->event);
+    e.record(stream);
+    e.wait(w->stream);
+    impl->alltoall(outputTensors, inputTensors, w->stream);
+    e.record(w->stream);
+    return c10::make_intrusive<WorkImpl>(outputTensors, inputTensors, w);
   } else {
 
     for (size_t i = 0; i != getSize(); ++i) {
