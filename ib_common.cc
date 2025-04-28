@@ -8,6 +8,8 @@
 #include <sys/eventfd.h>
 #include <sys/fcntl.h>
 
+extern "C" bool is_efa_dev(ibv_device* device);
+
 namespace moodist {
 
 IbCommon::IbCommon(Group* group) : group(group) {}
@@ -41,6 +43,8 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     throwErrno(errno, "ibv_create_srq");
   }
 
+  inlineBytes = 64;
+
   for (size_t i = 0; i != size; ++i) {
     if (i == rank && false) {
       qps.emplace_back();
@@ -57,10 +61,10 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       initAttributes.cap.max_recv_sge = 1;
       initAttributes.srq = sharedReceiveQueue;
       initAttributes.sq_sig_all = 0;
-      initAttributes.cap.max_inline_data = 32;
+      initAttributes.cap.max_inline_data = inlineBytes;
       initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
       initAttributes.pd = protectionDomain;
-      initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ;
+      initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ | IBV_QP_EX_WITH_SEND;
 
       IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
       if (!qp) {
@@ -139,7 +143,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 4979;
-    attr.timeout = 8; // 1ms
+    attr.timeout = 5; // ?ms
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
     // attr.retry_cnt = 2;
@@ -162,6 +166,128 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   }
 }
 
+void IbCommon::init2Efa(int portNum, ibv_port_attr portAttributes) {
+  const size_t rank = group->rank;
+  const size_t size = group->size;
+
+  log.debug("Init EFA\n");
+
+  recvChannel = ibv_create_comp_channel(context);
+  if (!recvChannel) {
+    throwErrno(errno, "ibv_create_comp_channel");
+  }
+
+  recvCq = ibv_create_cq(context, maxSrqEntries, nullptr, recvChannel, 0);
+  if (!recvCq) {
+    throwErrno(errno, "ibv_create_cq");
+  }
+
+  inlineBytes = 0;
+
+  ibv_qp_init_attr_ex initAttributes;
+  std::memset(&initAttributes, 0, sizeof(initAttributes));
+  initAttributes.qp_type = IBV_QPT_DRIVER;
+  initAttributes.send_cq = cq;
+  initAttributes.recv_cq = recvCq;
+  initAttributes.cap.max_send_wr = maxWr;
+  initAttributes.cap.max_send_sge = 1;
+  initAttributes.cap.max_recv_wr = maxSrqEntries;
+  initAttributes.cap.max_recv_sge = 1;
+  initAttributes.srq = nullptr;
+  initAttributes.sq_sig_all = 0;
+  initAttributes.cap.max_inline_data = inlineBytes;
+  initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+  initAttributes.pd = protectionDomain;
+  initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ | IBV_QP_EX_WITH_SEND;
+  efadv_qp_init_attr efaAttr;
+  std::memset(&efaAttr, 0, sizeof(efaAttr));
+  efaAttr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
+  qp = efadv_create_qp_ex(context, &initAttributes, &efaAttr, sizeof(efaAttr));
+  if (!qp) {
+    throwErrno(errno, "efadv_create_qp_ex");
+  }
+  log.debug("Init EFA\n");
+  ibv_qp_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RESET;
+  int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  if (error) {
+    throwErrno(errno, "ibv_modify_qp");
+  }
+
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_INIT;
+  attr.pkey_index = 0;
+  attr.port_num = portNum;
+  attr.qkey = 0x4242;
+  error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY);
+  if (error) {
+    throwErrno(errno, "ibv_modify_qp");
+  }
+
+  IbAddress address;
+  address.lid = portAttributes.lid;
+  address.qpNum = qp->qp_num;
+  address.mtuIndex = portAttributes.active_mtu;
+  error = ibv_query_gid(context, portNum, 0, &address.gid);
+  if (error) {
+    throwErrno(errno, "ibv_query_gid");
+  }
+
+  qpex = ibv_qp_to_qp_ex(qp);
+
+  for (size_t i = 0; i != size; ++i) {
+    if (i != rank) {
+      group->setupComms->sendTo(i, address);
+    }
+  }
+
+  for (size_t i = 0; i != size; ++i) {
+    // if (i == rank) {
+    //   ahs.emplace_back();
+    //   remoteAddresses.emplace_back();
+    //   continue;
+    // }
+    auto remoteAddress = i == rank ? address : group->setupComms->recvFrom<IbAddress>(i);
+
+    ibv_ah_attr ah_attr;
+    std::memset(&ah_attr, 0, sizeof(ah_attr));
+    ah_attr.port_num = portNum;
+    ah_attr.dlid = remoteAddress.lid;
+    ah_attr.is_global = true;
+    std::memcpy(&ah_attr.grh.dgid.raw, &remoteAddress.gid, sizeof(remoteAddress.gid));
+    ahs.push_back(ibv_create_ah(protectionDomain, &ah_attr));
+    if (!ahs.back()) {
+      throwErrno(errno, "ibv_create_ah");
+    }
+
+    remoteAddresses.push_back(remoteAddress);
+  }
+
+  {
+    ibv_qp_attr attr;
+    ibv_qp_init_attr initAttr;
+    int error = ibv_query_qp(qp, &attr, IBV_QP_STATE, &initAttr);
+    CHECK(attr.qp_state == IBV_QPS_INIT);
+    std::memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTR;
+    error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    if (error) {
+      throwErrno(errno, "ibv_modify_qp");
+    }
+
+    std::memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.sq_psn = 4979;
+    attr.rnr_retry = 7;
+    error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RNR_RETRY);
+    if (error) {
+      throwErrno(errno, "ibv_modify_qp");
+    }
+  }
+  log.debug("connected, yey!\n");
+}
+
 void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
   const size_t size = group->size;
@@ -180,120 +306,11 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
     throwErrno(errno, "ibv_create_cq");
   }
 
+  if (is_efa_dev(context->device)) {
+    return init2Efa(portNum, portAttributes);
+  }
+
   return init2Ib(portNum, portAttributes);
-
-  // ibv_qp_init_attr_ex initAttributes;
-  // std::memset(&initAttributes, 0, sizeof(initAttributes));
-  // initAttributes.qp_type = IBV_QPT_DRIVER;
-  // initAttributes.send_cq = cq;
-  // initAttributes.recv_cq = cq;
-  // initAttributes.cap.max_send_wr = maxWr;
-  // initAttributes.cap.max_send_sge = 1;
-  // initAttributes.cap.max_recv_wr = 1;
-  // initAttributes.cap.max_recv_sge = 1;
-  // initAttributes.srq = nullptr;
-  // initAttributes.sq_sig_all = 0;
-  // initAttributes.cap.max_inline_data = 32;
-  // initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
-  // initAttributes.pd = protectionDomain;
-  // initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ;
-  // efadv_qp_init_attr efaAttr;
-  // std::memset(&efaAttr, 0, sizeof(efaAttr));
-  // efaAttr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
-  // qp = efadv_create_qp_ex(context, &initAttributes, &efaAttr, sizeof(efaAttr));
-  // if (!qp) {
-  //   if (errno == EOPNOTSUPP) {
-  //     return init2Ib(portNum, portAttributes);
-  //   }
-  //   perror("efadv_create_qp_ex");
-  //   CHECK(false);
-  // }
-  // log.debug("Init EFA\n");
-  // ibv_qp_attr attr;
-  // memset(&attr, 0, sizeof(attr));
-  // attr.qp_state = IBV_QPS_RESET;
-  // int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-  // if (error) {
-  //   log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //   CHECK(false);
-  // }
-
-  // memset(&attr, 0, sizeof(attr));
-  // attr.qp_state = IBV_QPS_INIT;
-  // attr.pkey_index = 0;
-  // attr.port_num = portNum;
-  // attr.qkey = 0x4242;
-  // error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY);
-  // if (error) {
-  //   log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //   CHECK(false);
-  // }
-
-  // IbAddress address;
-  // address.lid = portAttributes.lid;
-  // address.qpNum = qp->qp_num;
-  // address.mtuIndex = portAttributes.active_mtu;
-  // error = ibv_query_gid(context, portNum, 0, &address.gid);
-  // if (error) {
-  //   perror("ibv_query_gid");
-  //   CHECK(false);
-  // }
-
-  // qpex = ibv_qp_to_qp_ex(qp);
-
-  // for (size_t i = 0; i != size; ++i) {
-  //   if (i != rank) {
-  //     group->setupComms->sendTo(i, address);
-  //   }
-  // }
-
-  // for (size_t i = 0; i != size; ++i) {
-  //   if (i == rank) {
-  //     ahs.emplace_back();
-  //     remoteAddresses.emplace_back();
-  //     continue;
-  //   }
-  //   auto remoteAddress = group->setupComms->recvFrom<IbAddress>(i);
-
-  //   ibv_ah_attr ah_attr;
-  //   std::memset(&ah_attr, 0, sizeof(ah_attr));
-  //   ah_attr.port_num = portNum;
-  //   ah_attr.dlid = remoteAddress.lid;
-  //   ah_attr.is_global = true;
-  //   std::memcpy(&ah_attr.grh.dgid.raw, &remoteAddress.gid, sizeof(remoteAddress.gid));
-  //   ahs.push_back(ibv_create_ah(protectionDomain, &ah_attr));
-  //   if (!ahs.back()) {
-  //     perror("ibv_create_ah");
-  //     CHECK(false);
-  //   }
-
-  //   remoteAddresses.push_back(remoteAddress);
-  // }
-
-  // {
-  //   ibv_qp_attr attr;
-  //   ibv_qp_init_attr initAttr;
-  //   int error = ibv_query_qp(qp, &attr, IBV_QP_STATE, &initAttr);
-  //   CHECK(attr.qp_state == IBV_QPS_INIT);
-  //   std::memset(&attr, 0, sizeof(attr));
-  //   attr.qp_state = IBV_QPS_RTR;
-  //   error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-  //   if (error) {
-  //     log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //     CHECK(false);
-  //   }
-
-  //   std::memset(&attr, 0, sizeof(attr));
-  //   attr.qp_state = IBV_QPS_RTS;
-  //   attr.sq_psn = 4979;
-  //   attr.rnr_retry = 7;
-  //   error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RNR_RETRY);
-  //   if (error) {
-  //     log.error("ibv_modify_qp failed with error %d: %s\n", error, std::strerror(error));
-  //     CHECK(false);
-  //   }
-  // }
-  // log.debug("connected, yey!\n");
 }
 
 namespace ib_poll {

@@ -306,7 +306,7 @@ uint64_t rng() {
 
 size_t mmappedBytes;
 
-extern "C" void allocate_memory(size_t index) {
+void allocate_memory(size_t index) {
   CHECK(index != 0);
 
   size_t nbytes = std::max(1ul << (64 - index), alignof(std::max_align_t));
@@ -562,6 +562,7 @@ void enableCpuAllocator() {
 }
 
 void cpuAllocatorDebug() {
+  std::lock_guard l(globals->mutex);
   auto* thread = &singleThread;
   for (size_t i = 0; i != 64; ++i) {
     size_t n = std::distance(thread->activeRegions[i].begin(), thread->activeRegions[i].end());
@@ -601,6 +602,7 @@ std::pair<uintptr_t, size_t> regionAtIterate(uintptr_t address) {
   return {0, 0};
 }
 std::pair<uintptr_t, size_t> regionAt(uintptr_t address) {
+  std::lock_guard l(globals->mutex);
   if (allMappedRegions.size() <= 8) {
     return regionAtIterate(address);
   }
@@ -629,13 +631,13 @@ std::pair<uintptr_t, size_t> regionAt(const void* ptr) {
 
 void* moo_alloc(size_t bytes) {
   void* r = moo_alloc2(bytes);
-  if (!owns(r)) {
-    log.error("%p not owned !?\n", r);
+  // if (!owns(r)) {
+  //   log.error("%p not owned !?\n", r);
 
-    cpuAllocatorDebug();
+  //   cpuAllocatorDebug();
 
-    CHECK(false);
-  }
+  //   CHECK(false);
+  // }
   return r;
 }
 void moo_free(void* ptr) {

@@ -9,6 +9,7 @@ enum CompileFlags {
   CompileAllGather = 1,
   CompileReduceScatter = 2,
   CompileReduceScatterDirect = 4,
+  CompileAllToAll = 8,
 };
 
 struct Group;
@@ -34,6 +35,8 @@ struct Kernels : CollectiveBase {
   CUfunction cuBroadcast = nullptr;
 
   CUfunction cuDummySignal = nullptr;
+
+  CUfunction cuAllToAll = nullptr;
 
   std::string emitCopySeq(
       std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,

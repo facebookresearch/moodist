@@ -41,7 +41,7 @@ struct Memfd {
     return *this;
   }
 
-  static Memfd create(size_t size) {
+  static Memfd create(size_t size, int node) {
     int fd;
     fd = memfd_create("Memfd", MFD_CLOEXEC);
     if (fd == -1) {
@@ -54,7 +54,11 @@ struct Memfd {
 
     log.debug("memfd create %d\n", fd);
 
-    return map(fd, size);
+    auto r = map(fd, size);
+    if (node >= 0) {
+      numa_move(r.base, r.size, node);
+    }
+    return r;
   }
   static Memfd map(int fd, size_t size) {
     void* base;
@@ -328,9 +332,9 @@ struct IpcMapperImpl : IpcMapper {
     });
   }
 
-  void init() {
+  void init(int node) {
 
-    mymem = Memfd::create(memsize);
+    mymem = Memfd::create(memsize, node);
 
     shared = new (mymem.base) SharedStruct();
 
@@ -550,8 +554,8 @@ struct IpcMapperImpl : IpcMapper {
   }
 };
 
-void IpcMapper::init() {
-  ((IpcMapperImpl*)this)->init();
+void IpcMapper::init(int node) {
+  ((IpcMapperImpl*)this)->init(node);
 }
 
 void IpcMapper::sendRequestAddress(

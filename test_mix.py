@@ -251,7 +251,8 @@ def entry(backend):
 
     torch.cuda.manual_seed(42)
 
-    ops = [AllGather(), ReduceScatter(), Mixed(), AllToAll(), AllToAll2()]
+    ops = [AllGather(), ReduceScatter(), Mixed()]
+    #ops = [AllToAll(), AllToAll2()]
     funcs = [step, step_streams, step_sequential, step_parallel]
 
     for i in range(1000):

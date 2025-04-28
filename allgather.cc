@@ -597,4 +597,62 @@ extern "C" __global__ void $launchBounds allgather(AllGatherParameters params) {
   return source;
 }
 
+const IVector<std::pair<size_t, size_t>>& AllGather::shuffledReads(size_t numRecvs, size_t numChunks) const {
+  std::lock_guard l(shuffledReadsCacheMutex);
+  auto i = shuffledReadsCache.find(std::make_pair(numRecvs, numChunks));
+  if (i != shuffledReadsCache.end()) [[likely]] {
+    return i->second;
+  }
+  return NOINLINE_COLD({
+    CHECK(numRecvs == recvRanks.size());
+    Vector<std::pair<size_t, size_t>> rr;
+    rr.reserve(numRecvs * numChunks);
+    auto sortedRanks = recvRanks;
+    sortedRanks.push_back(rank);
+    std::sort(sortedRanks.begin(), sortedRanks.end());
+    size_t myIndex = std::ranges::find(sortedRanks, rank) - sortedRanks.begin();
+    for (size_t i : sortedRanks) {
+      for (size_t chunkIndex : range(numChunks)) {
+        rr.emplace_back(i, chunkIndex);
+      }
+    }
+    std::minstd_rand rng(131071 + size * 8191 + numRecvs * 49 + numChunks);
+    std::ranges::shuffle(rr, rng);
+    std::ranges::stable_sort(rr, [](auto& a, auto& b) { return a.second < b.second; });
+    IVector<std::pair<size_t, size_t>> r;
+    for (auto& v : rr) {
+      auto i = std::ranges::find(sortedRanks, v.first);
+      CHECK(i != sortedRanks.end());
+      size_t n = (i - sortedRanks.begin() + myIndex) % sortedRanks.size();
+      if (sortedRanks[n] != rank) {
+        auto i = std::ranges::find(recvRanks, sortedRanks[n]);
+        CHECK(i != recvRanks.end());
+        r.emplace_back(i - recvRanks.begin(), v.second);
+      }
+    }
+    std::string s;
+    for (auto& v : r) {
+      if (!s.empty()) {
+        s += ", ";
+      }
+      s += fmt::sprintf("(%d, %d)", v.first, v.second);
+    }
+    log.info("shuffled reads indices %d, %d -> [%s]\n", numRecvs, numChunks, s);
+    rr.clear();
+    for (auto& v : r) {
+      rr.emplace_back(recvRanks.at(v.first), v.second);
+    }
+    s.clear();
+    for (auto& v : rr) {
+      if (!s.empty()) {
+        s += ", ";
+      }
+      s += fmt::sprintf("(%d, %d)", v.first, v.second);
+    }
+    log.info("shuffled reads ranks %d, %d -> [%s]\n", numRecvs, numChunks, s);
+    shuffledReadsCache[std::make_pair(numRecvs, numChunks)] = r;
+    return shuffledReadsCache[std::make_pair(numRecvs, numChunks)];
+  });
+}
+
 } // namespace moodist

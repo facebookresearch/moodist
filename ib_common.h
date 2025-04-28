@@ -116,8 +116,8 @@ struct Group;
 struct IbCommon {
   Group* group;
 
-  static constexpr size_t maxWr = 1024;
-  static constexpr size_t maxCqEntries = 1024;
+  static constexpr size_t maxWr = 2048;
+  static constexpr size_t maxCqEntries = 2048;
   static constexpr size_t maxSrqEntries = 256;
 
   IbvSharedPtr<ibv_context, ibv_close_device> context;
@@ -136,9 +136,12 @@ struct IbCommon {
   std::vector<IbvQp> qps;
   std::vector<ibv_qp_ex*> qpexs;
 
+  size_t inlineBytes = 0;
+
   void init(int portNum, ibv_port_attr portAttributes);
 
   void init2Ib(int portNum, ibv_port_attr portAttributes);
+  void init2Efa(int portNum, ibv_port_attr portAttributes);
 
   IbCommon(Group* group);
   ~IbCommon();

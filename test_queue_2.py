@@ -39,7 +39,8 @@ if rank == 0:
 
 time.sleep(2)
 
-foo = None if rank == 0 else queue.get_object()
+#foo = None if rank == 0 else queue.get_object()
+foo = queue.get_object()
 
 for i in range(size):
     torch.distributed.barrier()

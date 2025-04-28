@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <type_traits>
 
 namespace moodist {
@@ -57,20 +58,20 @@ static std::string readBootId() {
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
-  cpuThread = new CpuThread(this);
   kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
 
 Group::~Group() {
-  // cpuThread needs to remain valid until it has been destructed,
-  // so cannot use unique_ptr
-  delete cpuThread;
-  cpuThread = nullptr;
+  if (cpuThread) {
+    cpuThread->~CpuThread();
+    internalFree(cpuThread);
+    cpuThread = nullptr;
+  }
 }
 
-void Group::init() {
+void Group::init(Function<void()> f) {
 
   auto start = std::chrono::steady_clock::now();
 
@@ -164,588 +165,597 @@ void Group::init() {
 
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
-  std::vector<LocalDevice> localDevices;
+  internalAllocatorNode = allocationNode;
+  cpuThread = new (internalAlloc(sizeof(CpuThread))) CpuThread(this);
 
-  std::vector<LocalDeviceNode> localDeviceNodes;
+  init2 = [&]() {
+    f();
 
-  std::vector<std::vector<LocalDeviceNode>> allDeviceNodes;
-  allDeviceNodes.resize(allCudaPaths.size());
+    std::vector<LocalDevice> localDevices;
 
-  std::string bootId = readBootId();
+    std::vector<LocalDeviceNode> localDeviceNodes;
 
-  ibv_fork_init();
+    std::vector<std::vector<LocalDeviceNode>> allDeviceNodes;
+    allDeviceNodes.resize(allCudaPaths.size());
 
-  ibv_device** list = ibv_get_device_list(nullptr);
-  for (ibv_device** i = list; *i; ++i) {
-    ibv_device* di = *i;
+    std::string bootId = readBootId();
 
-    // fmt::printf("device %s\n", di->name);
-    IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
-    if (ctx) {
-      ibv_device_attr attributes;
-      std::memset(&attributes, 0, sizeof(attributes));
-      if (ibv_query_device(ctx, &attributes) != 0) {
-        continue;
-      }
+    ibv_device** list = ibv_get_device_list(nullptr);
+    for (ibv_device** i = list; *i; ++i) {
+      ibv_device* di = *i;
 
-      log.debug("max_mr_size is %d\n", attributes.max_mr_size);
-      log.debug("max_mr is %d\n", attributes.max_mr);
-
-      int portNum = -1;
-      ibv_port_attr portAttributes;
-      int bestSpeed = -1;
-      for (size_t i = 0; i != attributes.phys_port_cnt; ++i) {
-        ibv_port_attr attributes;
+      // fmt::printf("device %s\n", di->name);
+      IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
+      if (ctx) {
+        ibv_device_attr attributes;
         std::memset(&attributes, 0, sizeof(attributes));
-        if (ibv_query_port(ctx, 1 + i, &attributes) == 0) {
-          if (attributes.state != IBV_PORT_ACTIVE) {
-            continue;
-          }
-          log.debug("got a port with link layer %d\n", attributes.link_layer);
-          log.debug("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
-          int speed = attributes.active_speed;
-          if (attributes.link_layer == IBV_LINK_LAYER_INFINIBAND) {
-            speed += 0x100000;
-          }
-          if (speed > bestSpeed) {
-            bestSpeed = speed;
-            portNum = 1 + i;
-            portAttributes = attributes;
-          }
+        if (ibv_query_device(ctx, &attributes) != 0) {
+          continue;
         }
-        // fmt::printf("queried port %d\n", 1 + i);
-      }
-      if (portNum == -1) {
-        continue;
-      }
 
-      std::string ibPath = fmt::sprintf("%s/device", di->ibdev_path);
-      char* path = realpath(ibPath.c_str(), nullptr);
-      if (path) {
-        ibPath = path;
-        free(path);
-      }
-      ibPath = removePciPathPrefix(ibPath);
-      // fmt::printf("ib path is %s\n", ibPath);
+        log.debug("max_mr_size is %d\n", attributes.max_mr_size);
+        log.debug("max_mr is %d\n", attributes.max_mr);
 
-      auto getScore = [&](std::string cudaPath) {
-        int nmatch = 0;
-        for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
-          if (cudaPath[i] == ibPath[i]) {
-            if (cudaPath[i] == '/') {
-              ++nmatch;
+        int portNum = -1;
+        ibv_port_attr portAttributes;
+        int bestSpeed = -1;
+        for (size_t i = 0; i != attributes.phys_port_cnt; ++i) {
+          ibv_port_attr attributes;
+          std::memset(&attributes, 0, sizeof(attributes));
+          if (ibv_query_port(ctx, 1 + i, &attributes) == 0) {
+            if (attributes.state != IBV_PORT_ACTIVE) {
+              continue;
             }
-          } else {
-            break;
+            log.debug("got a port with link layer %d\n", attributes.link_layer);
+            log.debug("port mtu %d, speed %d\n", attributes.active_mtu, attributes.active_speed);
+            int speed = attributes.active_speed;
+            if (attributes.link_layer == IBV_LINK_LAYER_INFINIBAND) {
+              speed += 0x100000;
+            }
+            if (speed > bestSpeed) {
+              bestSpeed = speed;
+              portNum = 1 + i;
+              portAttributes = attributes;
+            }
           }
+          // fmt::printf("queried port %d\n", 1 + i);
         }
-        return nmatch;
-      };
+        if (portNum == -1) {
+          continue;
+        }
 
-      log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
+        std::string ibPath = fmt::sprintf("%s/device", di->ibdev_path);
+        char* path = realpath(ibPath.c_str(), nullptr);
+        if (path) {
+          ibPath = path;
+          free(path);
+        }
+        ibPath = removePciPathPrefix(ibPath);
+        // fmt::printf("ib path is %s\n", ibPath);
 
-      for (auto& v : localDevices) {
-        CHECK(v.ibPath != ibPath);
-      }
+        auto getScore = [&](std::string cudaPath) {
+          int nmatch = 0;
+          for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
+            if (cudaPath[i] == ibPath[i]) {
+              if (cudaPath[i] == '/') {
+                ++nmatch;
+              }
+            } else {
+              break;
+            }
+          }
+          return nmatch;
+        };
 
-      LocalDevice lc;
-      lc.ctx = std::move(ctx);
-      lc.portNum = portNum;
-      lc.ibPath = ibPath;
-      lc.portAttributes = portAttributes;
-      localDevices.push_back(std::move(lc));
+        log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
 
-      for (auto& v : localDeviceNodes) {
-        CHECK(v.ibPath != ibPath);
-      }
+        for (auto& v : localDevices) {
+          CHECK(v.ibPath != ibPath);
+        }
 
-      std::tuple<int, int, int> score = {getScore(cudaPath), 0, bestSpeed};
-      LocalDeviceNode n;
-      n.ibPath = ibPath;
-      n.score = score;
-      localDeviceNodes.push_back(n);
+        LocalDevice lc;
+        lc.ctx = std::move(ctx);
+        lc.portNum = portNum;
+        lc.ibPath = ibPath;
+        lc.portAttributes = portAttributes;
+        localDevices.push_back(std::move(lc));
 
-      for (size_t i = 0; i != allCudaPaths.size(); ++i) {
-        std::tuple<int, int, int> score = {getScore(allCudaPaths[i]), 0, bestSpeed};
+        for (auto& v : localDeviceNodes) {
+          CHECK(v.ibPath != ibPath);
+        }
+
+        std::tuple<int, int, int> score = {getScore(cudaPath), 0, bestSpeed};
         LocalDeviceNode n;
         n.ibPath = ibPath;
         n.score = score;
-        allDeviceNodes.at(i).push_back(n);
+        localDeviceNodes.push_back(n);
+
+        for (size_t i = 0; i != allCudaPaths.size(); ++i) {
+          std::tuple<int, int, int> score = {getScore(allCudaPaths[i]), 0, bestSpeed};
+          LocalDeviceNode n;
+          n.ibPath = ibPath;
+          n.score = score;
+          allDeviceNodes.at(i).push_back(n);
+        }
       }
     }
-  }
-  ibv_free_device_list(list);
+    ibv_free_device_list(list);
 
-  RankForIbSetup localRankForIbSetup;
-  localRankForIbSetup.bootId = bootId;
-  localRankForIbSetup.ibDevices = localDeviceNodes;
+    RankForIbSetup localRankForIbSetup;
+    localRankForIbSetup.bootId = bootId;
+    localRankForIbSetup.ibDevices = localDeviceNodes;
 
-  std::vector<RankForIbSetup> allRanksDeviceNodes = setupComms->allgather(localRankForIbSetup);
+    std::vector<RankForIbSetup> allRanksDeviceNodes = setupComms->allgather(localRankForIbSetup);
 
-  for (size_t i = 0; i != size; ++i) {
-    if (allRanksDeviceNodes[i].ibDevices.empty()) {
-      throw std::runtime_error(fmt::sprintf("No usable InfiniBand device found for rank %d", i));
+    for (size_t i = 0; i != size; ++i) {
+      if (allRanksDeviceNodes[i].ibDevices.empty()) {
+        throw std::runtime_error(fmt::sprintf("No usable InfiniBand device found for rank %d", i));
+      }
     }
-  }
 
-  std::vector<size_t> localRanksByBootId;
-  for (size_t i = 0; i != size; ++i) {
-    if (allRanksDeviceNodes[i].bootId == bootId) {
-      localRanksByBootId.push_back(i);
+    std::vector<size_t> localRanksByBootId;
+    for (size_t i = 0; i != size; ++i) {
+      if (allRanksDeviceNodes[i].bootId == bootId) {
+        localRanksByBootId.push_back(i);
+      }
     }
-  }
-  CHECK(std::find(localRanksByBootId.begin(), localRanksByBootId.end(), rank) != localRanksByBootId.end());
+    CHECK(std::find(localRanksByBootId.begin(), localRanksByBootId.end(), rank) != localRanksByBootId.end());
 
-  log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
+    log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
 
-  size_t localRankIndex = ~(size_t)0;
-  for (size_t i = 0; i != localRanksByBootId.size(); ++i) {
-    if (localRanksByBootId[i] == rank) {
-      localRankIndex = i;
-      break;
+    size_t localRankIndex = ~(size_t)0;
+    for (size_t i = 0; i != localRanksByBootId.size(); ++i) {
+      if (localRanksByBootId[i] == rank) {
+        localRankIndex = i;
+        break;
+      }
     }
-  }
-  CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
+    CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
 
-  std::unordered_map<size_t, int> localNvlink;
+    std::unordered_map<size_t, int> localNvlink;
 
-  std::vector<std::string> allRanksCudaPciBus = setupComms->allgather(std::string(cudaPciBus.data()));
-  for (size_t i : localRanksByBootId) {
-    if (i == rank) {
-      continue;
-    }
-    if (allRanksDeviceNodes[i].bootId == bootId && allRanksCudaPciBus.at(i) == std::string(cudaPciBus.data())) {
-      throw std::runtime_error(
-          fmt::sprintf("Rank %d and %d share the same CUDA device! (%s)", rank, i, std::string(cudaPciBus.data())));
-    }
-    nvmlDevice_t peerDevice;
-    if (nvmlDeviceGetHandleByPciBusId_v2(allRanksCudaPciBus.at(i).c_str(), &peerDevice) == NVML_SUCCESS) {
-      nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
-      CHECK_NVML(nvmlDeviceGetP2PStatus(nvmlDevice, peerDevice, NVML_P2P_CAPS_INDEX_NVLINK, &status));
-      if (status == NVML_P2P_STATUS_OK) {
-        log.debug("rank %d: connected to local rank %d through nvlink\n", rank, i);
-        localNvlink[i] = 1;
+    std::vector<std::string> allRanksCudaPciBus = setupComms->allgather(std::string(cudaPciBus.data()));
+    for (size_t i : localRanksByBootId) {
+      if (i == rank) {
+        continue;
+      }
+      if (allRanksDeviceNodes[i].bootId == bootId && allRanksCudaPciBus.at(i) == std::string(cudaPciBus.data())) {
+        throw std::runtime_error(
+            fmt::sprintf("Rank %d and %d share the same CUDA device! (%s)", rank, i, std::string(cudaPciBus.data())));
+      }
+      nvmlDevice_t peerDevice;
+      if (nvmlDeviceGetHandleByPciBusId_v2(allRanksCudaPciBus.at(i).c_str(), &peerDevice) == NVML_SUCCESS) {
+        nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
+        CHECK_NVML(nvmlDeviceGetP2PStatus(nvmlDevice, peerDevice, NVML_P2P_CAPS_INDEX_NVLINK, &status));
+        if (status == NVML_P2P_STATUS_OK) {
+          log.debug("rank %d: connected to local rank %d through nvlink\n", rank, i);
+          localNvlink[i] = 1;
+        } else {
+          log.debug("rank %d: connected to local rank %d through NOT nvlink\n", rank, i);
+        }
       } else {
-        log.debug("rank %d: connected to local rank %d through NOT nvlink\n", rank, i);
+        log.error("rank %d: nvml failed to access cuda device for local rank %d\n", rank, i);
       }
-    } else {
-      log.error("rank %d: nvml failed to access cuda device for local rank %d\n", rank, i);
     }
-  }
 
-  std::vector<std::unordered_map<size_t, int>> allRanksNvlink = setupComms->allgather(localNvlink);
+    std::vector<std::unordered_map<size_t, int>> allRanksNvlink = setupComms->allgather(localNvlink);
 
-  std::vector<std::pair<LocalDeviceNode*, LocalDevice*>> useDevices;
+    std::vector<std::pair<LocalDeviceNode*, LocalDevice*>> useDevices;
 
-  {
-    HashMap<std::string, bool> taken;
-    while (true) {
-      std::vector<LocalDeviceNode*> current;
-      HashMap<std::string_view, int> useCount;
-      current.resize(allDeviceNodes.size());
-      std::vector<LocalDeviceNode*> best;
-      std::tuple<int, int, int> bestScore = {0, 0, 0};
-      int solutions = 0;
-      std::function<void(size_t)> visit = [&](size_t index) {
-        if (index == allDeviceNodes.size()) {
-          std::tuple<int, int, int> score = {0, 0, 0};
-          for (LocalDeviceNode* n : current) {
-            auto s = n->score;
-            if (useCount[n->ibPath] > 1) {
-              std::get<2>(s) -= useCount[n->ibPath];
-              if (std::get<2>(s) > 0) {
-                std::get<2>(s) /= useCount[n->ibPath];
+    {
+      HashMap<std::string, bool> taken;
+      while (true) {
+        std::vector<LocalDeviceNode*> current;
+        HashMap<std::string_view, int> useCount;
+        current.resize(allDeviceNodes.size());
+        std::vector<LocalDeviceNode*> best;
+        std::tuple<int, int, int> bestScore = {0, 0, 0};
+        int solutions = 0;
+        std::function<void(size_t)> visit = [&](size_t index) {
+          if (index == allDeviceNodes.size()) {
+            std::tuple<int, int, int> score = {0, 0, 0};
+            for (LocalDeviceNode* n : current) {
+              auto s = n->score;
+              if (useCount[n->ibPath] > 1) {
+                std::get<2>(s) -= useCount[n->ibPath];
+                if (std::get<2>(s) > 0) {
+                  std::get<2>(s) /= useCount[n->ibPath];
+                }
+              }
+              std::get<0>(score) += std::get<0>(s);
+              std::get<1>(score) += std::get<1>(s);
+              std::get<2>(score) += std::get<2>(s);
+              if (best.empty() || score > bestScore) {
+                bestScore = score;
+                best = current;
               }
             }
-            std::get<0>(score) += std::get<0>(s);
-            std::get<1>(score) += std::get<1>(s);
-            std::get<2>(score) += std::get<2>(s);
-            if (best.empty() || score > bestScore) {
-              bestScore = score;
-              best = current;
+            ++solutions;
+            return;
+          }
+          std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
+          for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
+            if (std::get<0>(v.score) && !taken[v.ibPath]) {
+              sorted.emplace_back(v.score, &v);
             }
           }
-          ++solutions;
-          return;
+          if (sorted.empty()) {
+            return;
+          }
+          std::sort(sorted.begin(), sorted.end());
+          std::reverse(sorted.begin(), sorted.end());
+          if (sorted.size() > 4) {
+            sorted.resize(4);
+          }
+          for (auto& v : sorted) {
+            ++useCount[v.second->ibPath];
+            current[index] = v.second;
+            visit(index + 1);
+            --useCount[v.second->ibPath];
+          }
+        };
+        visit(0);
+
+        if (best.empty()) {
+          if (!useDevices.empty()) {
+            break;
+          }
+          throw std::runtime_error(fmt::sprintf(
+              "No usable InfiniBand device found for rank %d (refusing to use devices routed through CPU)", rank));
         }
-        std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
-        for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
-          if (std::get<0>(v.score) && !taken[v.ibPath]) {
-            sorted.emplace_back(v.score, &v);
+
+        for (auto* v : best) {
+          taken[v->ibPath] = true;
+        }
+
+        log.debug("evaluated %d solutions\n", solutions);
+        log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
+
+        for (size_t i = 0; i != best.size(); ++i) {
+          log.debug("best device for %d is %s with score %d\n", i, best[i]->ibPath, std::get<0>(best[i]->score));
+        }
+
+        for (auto& v : localDeviceNodes) {
+          if (v.ibPath == best.at(localAllCudaPathsIndex)->ibPath) {
+            for (auto& v2 : localDevices) {
+              if (v2.ibPath == v.ibPath) {
+                useDevices.emplace_back(&v, &v2);
+              }
+            }
           }
         }
-        if (sorted.empty()) {
-          return;
-        }
-        std::sort(sorted.begin(), sorted.end());
-        std::reverse(sorted.begin(), sorted.end());
-        if (sorted.size() > 4) {
-          sorted.resize(4);
-        }
-        for (auto& v : sorted) {
-          ++useCount[v.second->ibPath];
-          current[index] = v.second;
-          visit(index + 1);
-          --useCount[v.second->ibPath];
-        }
-      };
-      visit(0);
+      }
+    }
 
-      if (best.empty()) {
-        if (!useDevices.empty()) {
-          break;
-        }
+    auto peersDeviceCounts = setupComms->allgather(useDevices.size());
+    for (size_t i = 0; i != size; ++i) {
+      if (peersDeviceCounts[i] != useDevices.size()) {
         throw std::runtime_error(fmt::sprintf(
-            "No usable InfiniBand device found for rank %d (refusing to use devices routed through CPU)", rank));
-      }
-
-      for (auto* v : best) {
-        taken[v->ibPath] = true;
-      }
-
-      log.debug("evaluated %d solutions\n", solutions);
-      log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
-
-      for (size_t i = 0; i != best.size(); ++i) {
-        log.debug("best device for %d is %s with score %d\n", i, best[i]->ibPath, std::get<0>(best[i]->score));
-      }
-
-      for (auto& v : localDeviceNodes) {
-        if (v.ibPath == best.at(localAllCudaPathsIndex)->ibPath) {
-          for (auto& v2 : localDevices) {
-            if (v2.ibPath == v.ibPath) {
-              useDevices.emplace_back(&v, &v2);
-            }
-          }
-        }
+            "Topology mismatch: rank %d has %d ib devices, but rank %d has %d ib devices", rank, useDevices.size(), i,
+            peersDeviceCounts[i]));
       }
     }
-  }
 
-  auto peersDeviceCounts = setupComms->allgather(useDevices.size());
-  for (size_t i = 0; i != size; ++i) {
-    if (peersDeviceCounts[i] != useDevices.size()) {
-      throw std::runtime_error(fmt::sprintf(
-          "Topology mismatch: rank %d has %d ib devices, but rank %d has %d ib devices", rank, useDevices.size(), i,
-          peersDeviceCounts[i]));
-    }
-  }
+    for (auto& [dn, d] : useDevices) {
 
-  for (auto& [dn, d] : useDevices) {
-
-    auto ibCommon = std::make_unique<IbCommon>(this);
-
-    IbvSharedPtr<ibv_context, ibv_close_device>& bestCtx = ibCommon->context;
-    int bestPortNum = 0;
-    ibv_port_attr bestPortAttributes;
-
-    bestCtx = std::move(d->ctx);
-    bestPortNum = d->portNum;
-    bestPortAttributes = d->portAttributes;
-    CHECK(bestCtx != nullptr);
-
-    log.verbose("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
-
-    ibCommon->init(bestPortNum, bestPortAttributes);
-
-    ibDevs.push_back(std::move(ibCommon));
-
-    if (ibDevs.size() == maxDevices) {
-      break;
-    }
-  }
-  numTrueIbDevs = ibDevs.size();
-  while (ibDevs.size() >= 1 && ibDevs.size() + useDevices.size() <= maxDevices) {
-    for (size_t i = 0; i != useDevices.size(); ++i) {
       auto ibCommon = std::make_unique<IbCommon>(this);
-      ibCommon->protectionDomain = ibDevs.at(i)->protectionDomain;
 
       IbvSharedPtr<ibv_context, ibv_close_device>& bestCtx = ibCommon->context;
       int bestPortNum = 0;
       ibv_port_attr bestPortAttributes;
 
-      auto* d = useDevices.at(i).second;
-
-      bestCtx = ibDevs.at(i)->context;
+      bestCtx = std::move(d->ctx);
       bestPortNum = d->portNum;
       bestPortAttributes = d->portAttributes;
       CHECK(bestCtx != nullptr);
 
-      log.verbose(
-          "rank %d using duplicate of device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
+      log.verbose("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
 
       ibCommon->init(bestPortNum, bestPortAttributes);
 
       ibDevs.push_back(std::move(ibCommon));
-    }
-  }
 
-  CHECK(!ibDevs.empty());
-  CHECK(ibDevs.size() <= maxDevices);
-
-  std::vector<std::string> allRanksBootIds = setupComms->allgather(bootId);
-
-  HashMap<std::string, size_t> nodeMap;
-  for (size_t i = 0; i != size; ++i) {
-    std::string& id = allRanksBootIds[i];
-    auto it = nodeMap.find(id);
-    if (it == nodeMap.end()) {
-      nodeMap[id] = nodeRanks.size();
-      nodeRanks.emplace_back();
-    }
-    size_t index = nodeMap[id];
-    size_t localRank = nodeRanks.at(index).size();
-    nodeRanks.at(index).push_back(i);
-    rankToNodeIndex.push_back(index);
-    rankLocalRank.push_back(localRank);
-  }
-
-  AllocatedBuffer testMemory = allocateDevice(0x1000);
-
-  CUipcMemHandle testIpcHandle;
-  CHECK_CU(cuIpcGetMemHandle(&testIpcHandle, testMemory.cudaPointer));
-
-  auto allTestIpcHandles = setupComms->allgather(testIpcHandle);
-
-  ipcAccess.resize(size);
-
-  for (size_t i = 0; i != size; ++i) {
-    if (allRanksBootIds[i] == bootId && i != rank) {
-      CUdeviceptr mapPtr = 0;
-      bool success =
-          cuIpcOpenMemHandle(&mapPtr, allTestIpcHandles[i], CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS) == CUDA_SUCCESS;
-      log.debug("ipc success? %d address %#x\n", success, mapPtr);
-      if (success) {
-        cuIpcCloseMemHandle(mapPtr);
-        ipcAccess[i] = true;
-        ipcRanks.push_back(i);
-        peerIndices.push_back(peerIndices.size());
+      if (ibDevs.size() == maxDevices) {
+        break;
       }
     }
-  }
+    numTrueIbDevs = ibDevs.size();
+    while (ibDevs.size() >= 1 && ibDevs.size() + useDevices.size() <= maxDevices) {
+      // while (ibDevs.size() >= 1 && ibDevs.size() + useDevices.size() <= 2) {
+      for (size_t i = 0; i != useDevices.size(); ++i) {
+        auto ibCommon = std::make_unique<IbCommon>(this);
+        ibCommon->protectionDomain = ibDevs.at(i)->protectionDomain;
 
-  CHECK(peerIndices.size() <= 8);
+        IbvSharedPtr<ibv_context, ibv_close_device>& bestCtx = ibCommon->context;
+        int bestPortNum = 0;
+        ibv_port_attr bestPortAttributes;
 
-  if (rank == 0) {
-    log.debug("initial connection setup took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
-    start = std::chrono::steady_clock::now();
-  }
+        auto* d = useDevices.at(i).second;
 
-  std::sort(ipcRanks.begin(), ipcRanks.end());
-  std::stable_partition(ipcRanks.begin(), ipcRanks.end(), [&](size_t i) { return i > rank; });
+        bestCtx = ibDevs.at(i)->context;
+        bestPortNum = d->portNum;
+        bestPortAttributes = d->portAttributes;
+        CHECK(bestCtx != nullptr);
 
-  std::vector<std::vector<size_t>> peerIpcRanks = setupComms->allgather(ipcRanks);
+        log.verbose(
+            "rank %d using duplicate of device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
 
-  {
+        ibCommon->init(bestPortNum, bestPortAttributes);
 
-    std::vector<size_t> newIpcRanks;
-    for (size_t i : ipcRanks) {
-      bool keep = true;
-      if (localNvlink[i] == 0) {
-        for (size_t n : peerIpcRanks[i]) {
-          if (allRanksNvlink[n][i]) {
-            log.debug(
-                "rank %d: dropping connection to %d as there is no nvlink, but there is an nvlink through rank %d\n",
-                rank, i, n);
-            keep = false;
-            break;
-          }
+        ibDevs.push_back(std::move(ibCommon));
+      }
+    }
+
+    CHECK(!ibDevs.empty());
+    CHECK(ibDevs.size() <= maxDevices);
+
+    std::vector<std::string> allRanksBootIds = setupComms->allgather(bootId);
+
+    HashMap<std::string, size_t> nodeMap;
+    for (size_t i = 0; i != size; ++i) {
+      std::string& id = allRanksBootIds[i];
+      auto it = nodeMap.find(id);
+      if (it == nodeMap.end()) {
+        nodeMap[id] = nodeRanks.size();
+        nodeRanks.emplace_back();
+      }
+      size_t index = nodeMap[id];
+      size_t localRank = nodeRanks.at(index).size();
+      nodeRanks.at(index).push_back(i);
+      rankToNodeIndex.push_back(index);
+      rankLocalRank.push_back(localRank);
+    }
+
+    AllocatedBuffer testMemory = allocateDevice(0x1000);
+
+    CUipcMemHandle testIpcHandle;
+    CHECK_CU(cuIpcGetMemHandle(&testIpcHandle, testMemory.cudaPointer));
+
+    auto allTestIpcHandles = setupComms->allgather(testIpcHandle);
+
+    ipcAccess.resize(size);
+
+    for (size_t i = 0; i != size; ++i) {
+      if (allRanksBootIds[i] == bootId && i != rank) {
+        CUdeviceptr mapPtr = 0;
+        bool success =
+            cuIpcOpenMemHandle(&mapPtr, allTestIpcHandles[i], CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS) == CUDA_SUCCESS;
+        log.debug("ipc success? %d address %#x\n", success, mapPtr);
+        if (success) {
+          cuIpcCloseMemHandle(mapPtr);
+          ipcAccess[i] = true;
+          ipcRanks.push_back(i);
+          peerIndices.push_back(peerIndices.size());
         }
       }
-      if (keep) {
-        newIpcRanks.push_back(i);
+    }
+
+    CHECK(peerIndices.size() <= 8);
+
+    if (rank == 0) {
+      log.debug("initial connection setup took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+      start = std::chrono::steady_clock::now();
+    }
+
+    std::sort(ipcRanks.begin(), ipcRanks.end());
+    std::stable_partition(ipcRanks.begin(), ipcRanks.end(), [&](size_t i) { return i > rank; });
+
+    std::vector<IVector<size_t>> peerIpcRanks = setupComms->allgather(ipcRanks);
+
+    {
+
+      IVector<size_t> newIpcRanks;
+      for (size_t i : ipcRanks) {
+        bool keep = true;
+        if (localNvlink[i] == 0) {
+          for (size_t n : peerIpcRanks[i]) {
+            if (allRanksNvlink[n][i]) {
+              log.debug(
+                  "rank %d: dropping connection to %d as there is no nvlink, but there is an nvlink through rank %d\n",
+                  rank, i, n);
+              keep = false;
+              break;
+            }
+          }
+        }
+        if (keep) {
+          newIpcRanks.push_back(i);
+        }
+      }
+      ipcRanks = newIpcRanks;
+      peerIpcRanks = setupComms->allgather(ipcRanks);
+
+      log.debug("rank %d ipc ranks is %s\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
+    }
+
+    // rankIbDevNames = setupComms->allgather(std::string(bestCtx->device->name));
+    // CHECK(rankIbDevNames.size() == size);
+    // CHECK(rankIbDevNames.at(rank) == bestCtx->device->name);
+    // if (rank == 0) {
+    //   for (size_t i = 0; i != size; ++i) {
+    //     fmt::printf("rank %d is using device %s\n", i, rankIbDevNames[i]);
+    //   }
+    // }
+
+    if (rank == 0) {
+      log.debug("ipc ranks sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+      start = std::chrono::steady_clock::now();
+    }
+
+    peerIpcAccess.resize(size);
+
+    for (size_t i = 0; i != size; ++i) {
+      peerIpcAccess[i].resize(size);
+      for (size_t n : peerIpcRanks[i]) {
+        CHECK(std::find(peerIpcRanks[n].begin(), peerIpcRanks[n].end(), i) != peerIpcRanks[n].end());
+        peerIpcAccess[i][n] = true;
       }
     }
-    ipcRanks = newIpcRanks;
-    peerIpcRanks = setupComms->allgather(ipcRanks);
 
-    log.debug("rank %d ipc ranks is %s\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));
-  }
+    // int localSupportsMulticast = 0;
+    // CHECK_CU(cuDeviceGetAttribute(&localSupportsMulticast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
+    // supportsMulticast = localSupportsMulticast;
+    // for (size_t i : peerIndices) {
+    //   setupComms->sendTo(ipcRanks[i], supportsMulticast);
+    // }
+    // for (size_t i : peerIndices) {
+    //   supportsMulticast &= setupComms->recvFrom<bool>(ipcRanks[i]);
+    // }
 
-  // rankIbDevNames = setupComms->allgather(std::string(bestCtx->device->name));
-  // CHECK(rankIbDevNames.size() == size);
-  // CHECK(rankIbDevNames.at(rank) == bestCtx->device->name);
-  // if (rank == 0) {
-  //   for (size_t i = 0; i != size; ++i) {
-  //     fmt::printf("rank %d is using device %s\n", i, rankIbDevNames[i]);
-  //   }
-  // }
+    // if (supportsMulticast) {
+    //   log.info("Multicast supported by all local devices\n");
+    // } else {
+    //   log.info("Multicast not supported by all local devices\n");
+    // }
 
-  if (rank == 0) {
-    log.debug("ipc ranks sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
-    start = std::chrono::steady_clock::now();
-  }
-
-  peerIpcAccess.resize(size);
-
-  for (size_t i = 0; i != size; ++i) {
-    peerIpcAccess[i].resize(size);
-    for (size_t n : peerIpcRanks[i]) {
-      CHECK(std::find(peerIpcRanks[n].begin(), peerIpcRanks[n].end(), i) != peerIpcRanks[n].end());
-      peerIpcAccess[i][n] = true;
+    if (rank == 0) {
+      log.debug(
+          "final connection setup and sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
+      start = std::chrono::steady_clock::now();
     }
-  }
 
-  // int localSupportsMulticast = 0;
-  // CHECK_CU(cuDeviceGetAttribute(&localSupportsMulticast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
-  // supportsMulticast = localSupportsMulticast;
-  // for (size_t i : peerIndices) {
-  //   setupComms->sendTo(ipcRanks[i], supportsMulticast);
-  // }
-  // for (size_t i : peerIndices) {
-  //   supportsMulticast &= setupComms->recvFrom<bool>(ipcRanks[i]);
-  // }
-
-  // if (supportsMulticast) {
-  //   log.info("Multicast supported by all local devices\n");
-  // } else {
-  //   log.info("Multicast not supported by all local devices\n");
-  // }
-
-  if (rank == 0) {
-    log.debug("final connection setup and sync took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
-    start = std::chrono::steady_clock::now();
-  }
-
-  for (auto& v : peerMyRemoteIndex) {
-    v = (uint32_t)-1;
-  }
-
-  for (size_t i : ipcRanks) {
-    size_t peerIndex = getPeerIndex(i);
-    setupComms->sendTo(i, peerIndex);
-  }
-  for (size_t i : ipcRanks) {
-    auto remoteIndex = setupComms->recvFrom<size_t>(i);
-    peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
-  }
-
-  ipcMapper->init();
-
-  mySharedMem = ipcMapper->getMySharedMem(0, 0);
-  peerSharedMem.fill(nullptr);
-  for (size_t i : peerIndices) {
-    peerSharedMem[i] = ipcMapper->getPeerSharedMem(i, 0, 0);
-  }
-
-  size_t offset = 0;
-  uintptr_t addr = (uintptr_t)mySharedMem;
-  CHECK(addr % 128 == 0);
-  auto get = [&](auto*& ptr, size_t n) {
-    using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
-    if (offset % alignof(T) != 0) {
-      offset += alignof(T) - offset % alignof(T);
+    for (auto& v : peerMyRemoteIndex) {
+      v = (uint32_t)-1;
     }
-    CHECK((addr + offset) % alignof(T) == 0);
-    ptr = (T*)(addr + offset);
-    offset += sizeof(T) * n;
-  };
-  get(localDyns, size * Group::maxConcurrency);
-  get(cpuLocalDyns, size * Group::maxConcurrency);
-  get(localProgress, size * Group::maxConcurrency);
-  get(cpuAddresses, Group::maxConcurrency);
-  get(syncData, 1);
-  get(cpuProxyReady, size * Group::maxConcurrency);
-  get(localProgress2, size * Group::maxConcurrency);
-  get(cpuStepValues, size * Group::maxConcurrency);
-  get(cpuStepValuesDeviceChunks, Group::maxChunks * Group::maxDevices * size * Group::maxConcurrency);
-  get(atomicStepValue, size * Group::maxConcurrency);
 
-  mySharedMemSize = offset;
+    for (size_t i : ipcRanks) {
+      size_t peerIndex = getPeerIndex(i);
+      setupComms->sendTo(i, peerIndex);
+    }
+    for (size_t i : ipcRanks) {
+      auto remoteIndex = setupComms->recvFrom<size_t>(i);
+      peerMyRemoteIndex[getPeerIndex(i)] = remoteIndex;
+    }
 
-  ipcMapper->getMySharedMem(0, offset);
+    ipcMapper->init(allocationNode);
 
-  cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
-  cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
-
-  {
-    unsigned int value = 1;
-    CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
-  }
-
-  auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
-    peerPtrs.fill({});
-    auto& localBuffer = localArray.buffer;
-
-    std::array<uintptr_t, 8> peerMapping;
-
+    mySharedMem = ipcMapper->getMySharedMem(0, 0);
+    peerSharedMem.fill(nullptr);
     for (size_t i : peerIndices) {
-      ipcMapper->requestAddress(
-          i, localBuffer.cudaPointer, localBuffer.bytes, [&, i](uintptr_t address) { peerMapping[i] = address; });
+      peerSharedMem[i] = ipcMapper->getPeerSharedMem(i, 0, 0);
     }
-    ipcMapper->wait();
-    for (size_t i : peerIndices) {
-      setupComms->sendTo(ipcRanks[i], std::tuple(rank, i, peerMapping[i]));
+
+    size_t offset = 0;
+    uintptr_t addr = (uintptr_t)mySharedMem;
+    CHECK(addr % 128 == 0);
+    auto get = [&](auto*& ptr, size_t n) {
+      using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
+      if (offset % alignof(T) != 0) {
+        offset += alignof(T) - offset % alignof(T);
+      }
+      CHECK((addr + offset) % alignof(T) == 0);
+      ptr = (T*)(addr + offset);
+      offset += sizeof(T) * n;
+    };
+    get(localDyns, size * Group::maxConcurrency);
+    get(cpuLocalDyns, size * Group::maxConcurrency);
+    get(localProgress, size * Group::maxConcurrency);
+    get(cpuAddresses, Group::maxConcurrency);
+    get(syncData, 1);
+    get(cpuProxyReady, size * Group::maxConcurrency);
+    get(localProgress2, size * Group::maxConcurrency);
+    get(cpuStepValues, size * Group::maxConcurrency);
+    get(cpuStepValuesDeviceChunks, Group::maxChunks * Group::maxDevices * size * Group::maxConcurrency);
+    get(atomicStepValue, size * Group::maxConcurrency);
+
+    mySharedMemSize = offset;
+
+    ipcMapper->getMySharedMem(0, offset);
+
+    cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+    cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+
+    {
+      unsigned int value = 1;
+      CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
     }
-    for (size_t i : peerIndices) {
-      auto [sourceRank, sourcePeerIndex, address] =
-          setupComms->recvFrom<std::tuple<size_t, size_t, uintptr_t>>(ipcRanks[i]);
-      CHECK(sourceRank == ipcRanks[i]);
-      CHECK(sourcePeerIndex == peerMyRemoteIndex[i]);
-      peerPtrs[i] = {address, localArray.itembytes};
-    }
+
+    auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
+      peerPtrs.fill({});
+      auto& localBuffer = localArray.buffer;
+
+      std::array<uintptr_t, 8> peerMapping;
+
+      for (size_t i : peerIndices) {
+        ipcMapper->requestAddress(
+            i, localBuffer.cudaPointer, localBuffer.bytes, [&, i](uintptr_t address) { peerMapping[i] = address; });
+      }
+      ipcMapper->wait();
+      for (size_t i : peerIndices) {
+        setupComms->sendTo(ipcRanks[i], std::tuple(rank, i, peerMapping[i]));
+      }
+      for (size_t i : peerIndices) {
+        auto [sourceRank, sourcePeerIndex, address] =
+            setupComms->recvFrom<std::tuple<size_t, size_t, uintptr_t>>(ipcRanks[i]);
+        CHECK(sourceRank == ipcRanks[i]);
+        CHECK(sourcePeerIndex == peerMyRemoteIndex[i]);
+        peerPtrs[i] = {address, localArray.itembytes};
+      }
+      setupComms->allgather(0);
+    };
+
+    cudaStepValue = allocateArrayDevice(sizeof(uint64_t) * size, Group::maxConcurrency);
+    mapPeerAddrs(cudaStepValue, peerCudaStepValue);
+
+    cudaPeerAddresses = allocateArrayDevice(sizeof(uintptr_t) * 2 * size, Group::maxConcurrency);
+    mapPeerAddrs(cudaPeerAddresses, peerCudaPeerAddresses);
+
+    cudaCommsDeviceDataSent = allocateArrayDevice(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
+    cpuCommsDeviceDataSent = allocateArrayHost(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
+
+    cudaCommsDeviceDataSent2 = allocateArrayDevice(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
+    cpuCommsDeviceDataSent2 = allocateArrayHost(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
+
+    cudaProxyReady = allocateArrayDevice(
+        sizeof(uint32_t) * std::max(size * maxChunks, size * peerIndices.size()), Group::maxConcurrency);
+    mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
+
+    cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
+    mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
+
+    cudaStepValuesBuffer = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
+    cudaStepValuesDeviceChunksBuffer =
+        allocateArrayDevice(sizeof(uint32_t) * Group::maxChunks * Group::maxDevices * size, Group::maxConcurrency);
+
+    cudaMemSync = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
+    mapPeerAddrs(cudaMemSync, peerCudaMemSync);
+
+    // This list MUST contain all buffers that should be reset on step value reset.
+    // Any buffers which receive step values from peers should be reset.
+    // All such buffers should be allocated in this function.
+    buffersToReset = {
+        &cpuOutBuffer,
+        &cpuInBuffer,
+        &cudaStepValue,
+        &cudaPeerAddresses,
+        &cudaCommsDeviceDataSent,
+        &cpuCommsDeviceDataSent,
+        &cudaCommsDeviceDataSent2,
+        &cpuCommsDeviceDataSent2,
+        &cudaProxyReady,
+        &cudaCopyDone,
+        &cudaStepValuesBuffer,
+        &cudaStepValuesDeviceChunksBuffer,
+        &cudaMemSync,
+    };
+
+    allGather->init();
+    reduceScatter->init();
+
+    log.debug("%d: init ok!\n", rank);
+
+    // synchronize to prevent ipc init race conditions
     setupComms->allgather(0);
+
+    log.debug("%d: init synchronized!\n", rank);
   };
 
-  cudaStepValue = allocateArrayDevice(sizeof(uint64_t) * size, Group::maxConcurrency);
-  mapPeerAddrs(cudaStepValue, peerCudaStepValue);
-
-  cudaPeerAddresses = allocateArrayDevice(sizeof(uintptr_t) * 2 * size, Group::maxConcurrency);
-  mapPeerAddrs(cudaPeerAddresses, peerCudaPeerAddresses);
-
-  cudaCommsDeviceDataSent = allocateArrayDevice(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
-  cpuCommsDeviceDataSent = allocateArrayHost(sizeof(uint32_t) * size * 32, Group::maxConcurrency);
-
-  cudaCommsDeviceDataSent2 = allocateArrayDevice(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
-  cpuCommsDeviceDataSent2 = allocateArrayHost(sizeof(uint32_t) * size * 32 * 32, Group::maxConcurrency);
-
-  cudaProxyReady = allocateArrayDevice(
-      sizeof(uint32_t) * std::max(size * maxChunks, size * peerIndices.size()), Group::maxConcurrency);
-  mapPeerAddrs(cudaProxyReady, peerCudaProxyReady);
-
-  cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
-  mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
-
-  cudaStepValuesBuffer = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
-  cudaStepValuesDeviceChunksBuffer =
-      allocateArrayDevice(sizeof(uint32_t) * Group::maxChunks * Group::maxDevices * size, Group::maxConcurrency);
-
-  cudaMemSync = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
-  mapPeerAddrs(cudaMemSync, peerCudaMemSync);
-
-  // This list MUST contain all buffers that should be reset on step value reset.
-  // Any buffers which receive step values from peers should be reset.
-  // All such buffers should be allocated in this function.
-  buffersToReset = {
-      &cpuOutBuffer,
-      &cpuInBuffer,
-      &cudaStepValue,
-      &cudaPeerAddresses,
-      &cudaCommsDeviceDataSent,
-      &cpuCommsDeviceDataSent,
-      &cudaCommsDeviceDataSent2,
-      &cpuCommsDeviceDataSent2,
-      &cudaProxyReady,
-      &cudaCopyDone,
-      &cudaStepValuesBuffer,
-      &cudaStepValuesDeviceChunksBuffer,
-      &cudaMemSync,
-  };
-
-  allGather->init();
-  reduceScatter->init();
-
-  log.debug("%d: init ok!\n", rank);
-
-  // synchronize to prevent ipc init race conditions
-  setupComms->allgather(0);
-
-  log.debug("%d: init synchronized!\n", rank);
-
-  // cpuThread takes over setupComms from here
   cpuThread->start();
   while (!cpuThread->ready) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (cpuThread->initException) {
+      std::rethrow_exception(cpuThread->initExceptionPtr);
+    }
   }
 }
 

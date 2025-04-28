@@ -124,6 +124,7 @@ public:
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
 
   std::vector<torch::Tensor> share(const torch::Tensor& input);
+  void cudaBarrier();
 };
 
 } // namespace moodist

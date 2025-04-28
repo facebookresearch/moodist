@@ -1,9 +1,11 @@
 #pragma once
 
+#include "allocator.h"
 #include "common.h"
 #include "function.h"
 #include "hash_map.h"
 #include "synchronization.h"
+
 #include <optional>
 #include <type_traits>
 
@@ -61,7 +63,7 @@ struct IpcMapper {
 
   virtual ~IpcMapper() {}
 
-  void init();
+  void init(int node);
 
   void
   sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback);
@@ -159,25 +161,36 @@ struct IpcMapper {
     CHECK(address != 0);
 
     unsigned long long bufferId = -1;
-    CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
-    CHECK(bufferId != -1);
-    unsigned long long bufferId2 = -1;
-    CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + length - 1));
-    CHECK(bufferId == bufferId2);
     CUdeviceptr base = 0;
     size_t size = 0;
-    try {
-      CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
-    } catch (const std::exception& e) {
-      log.error("requestAddress: %#x bytes at %#x (buffer id %d), error %s\n", length, address, bufferId, e.what());
-      throw;
+
+    auto myRegion = allocator::mappedRegion(address);
+
+    if (myRegion.first) {
+      bufferId = myRegion.first;
+      base = myRegion.first;
+      size = myRegion.second;
+    } else {
+      log.error("ipc mapper cuda memory - this should be rare\n");
+      CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
+      CHECK(bufferId != -1);
+      unsigned long long bufferId2 = -1;
+      CHECK_CU(cuPointerGetAttribute(&bufferId2, CU_POINTER_ATTRIBUTE_BUFFER_ID, address + length - 1));
+      CHECK(bufferId == bufferId2);
+      try {
+        CHECK_CU(cuMemGetAddressRange(&base, &size, (CUdeviceptr)address));
+      } catch (const std::exception& e) {
+        log.error("requestAddress: %#x bytes at %#x (buffer id %d), error %s\n", length, address, bufferId, e.what());
+        throw;
+      }
     }
     std::unique_lock l(mutex);
     auto& addressMap = peerIpcAddressMap[peerIndex];
     auto i = addressMap.find(base);
     if (i != addressMap.end()) {
       if (i->second.second == bufferId) {
-        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address, i->second.first);
+        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address,
+        // i->second.first);
         size_t offset = address - base;
         callback(i->second.first + offset);
         return;

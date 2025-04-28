@@ -5,8 +5,6 @@
 #include "logging.h"
 #include "simple_vector.h"
 #include "vector.h"
-#include <ATen/core/ATen_fwd.h>
-#include <torch/types.h>
 
 namespace moodist {
 
@@ -139,9 +137,9 @@ struct Group {
 
   std::vector<AllocatedArray*> buffersToReset;
 
-  std::vector<size_t> ipcRanks;
-  std::vector<size_t> peerIndices;
-  std::vector<uint8_t> ipcAccess;
+  IVector<size_t> ipcRanks;
+  IVector<size_t> peerIndices;
+  IVector<uint8_t> ipcAccess;
   std::vector<std::vector<uint8_t>> peerIpcAccess;
   std::array<size_t, 8> peerMyRemoteIndex;
 
@@ -191,7 +189,8 @@ struct Group {
   Group(size_t rank, size_t size);
   ~Group();
 
-  void init();
+  void init(Function<void()> f);
+  Function<void()> init2;
 
   size_t getPeerIndex(size_t rank) {
     for (size_t i = 0; i != ipcRanks.size(); ++i) {

@@ -23,27 +23,31 @@ struct AllGatherParameters {
 
 struct AllGather : CollectiveBase {
 
-  Vector<size_t> sendRanks;
-  Vector<size_t> recvRanks;
+  IVector<size_t> sendRanks;
+  IVector<size_t> recvRanks;
 
-  Vector<ProxyInfo> proxyInfo;
-  Vector<ProxyDestinationInfo> proxyDestinationInfo;
+  IVector<ProxyInfo> proxyInfo;
+  IVector<ProxyDestinationInfo> proxyDestinationInfo;
 
-  HashMap<size_t, Vector<ProxyInfo*>> proxyInfoBySource;
+  HashMap<size_t, IVector<ProxyInfo*>> proxyInfoBySource;
   HashMap<size_t, ProxyDestinationInfo*> proxyDestinationInfoBySource;
 
-  Vector<std::pair<size_t, size_t>> ringSends;
-  Vector<std::pair<size_t, size_t>> ringRecvs;
+  IVector<std::pair<size_t, size_t>> ringSends;
+  IVector<std::pair<size_t, size_t>> ringRecvs;
 
   HashMap<size_t, size_t> ringSendsBySource;
   HashMap<size_t, size_t> ringRecvsBySource;
 
-  Vector<size_t> recvRanksNext;
+  IVector<size_t> recvRanksNext;
 
   AllGather(Group* group);
   ~AllGather();
   void init();
   std::string generate();
+
+  mutable SpinMutex shuffledReadsCacheMutex;
+  mutable HashMap<std::pair<size_t, size_t>, IVector<std::pair<size_t, size_t>>, PairHash> shuffledReadsCache;
+  const IVector<std::pair<size_t, size_t>>& shuffledReads(size_t numRecvs, size_t numChunks) const;
 };
 
 } // namespace moodist

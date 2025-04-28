@@ -121,19 +121,19 @@ def f(n):
         # data = torch.randn(4194304 - 0).cuda() + 1
         # data = torch.randn(1024 * 1024 * 256).cuda() + 1
         # data = torch.randn(263520).cuda() + 1
-        data = torch.randn(50331648 // 4).cuda() + 1
+        #data = torch.randn(50331648 // 4).cuda() + 1
         # data = torch.randn(442416 - 0).cuda() + 1
         # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1
-        # data = torch.randn(589824).cuda() + 1
+        data = torch.randn(589824).cuda() + 1
         # data = torch.randn(294912).cuda() + 1
         # data = torch.randn(353028).cuda() + 1
         # data = torch.randn(8388608).cuda() + 1
-        # data = torch.randn(262144 - 1024).cuda() + 1
+        #data = torch.randn(262144 - 1024).cuda() + 1
         # data = torch.randn(262144 - 64).cuda() + 1
         # data = torch.randn(682678 // 2).cuda() + 1
         # data = torch.randn(1024 * 1024).cuda() + 1
-        # data = torch.randn(1024).cuda() + 1
+        #data = torch.randn(50331648 // 4).cuda() + 1
         # data = torch.randn(1024 * 1024 * 800).cuda() + 1
         # data = torch.randn(1536024 // 2, device="cuda") + 1
         # data = torch.randn(1024 * 1024 + 123 * 14 + 91).cuda() + 1
@@ -444,13 +444,13 @@ def f(n):
             #     e = torch.cuda.Event()
             #     e.record()
             #     events.append(e)
-        elif 1 == 1:
-            # moodist.enable_profiling(True)
+        elif 1 == 21:
+            moodist.enable_profiling(True)
             loopcount = 10000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp, group=group)
                 # torch.cuda.synchronize()
-            # moodist.enable_profiling(False)
+            moodist.enable_profiling(False)
 
             dist.all_gather_into_tensor(result0, tmp, group=group)
         elif 1 == 1:

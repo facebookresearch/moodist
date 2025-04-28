@@ -26,6 +26,15 @@ void ReduceScatter::init() {
     ringRecvs.back().first = rank;
   }
 
+  sendRemoteRecvIndex.resize(recvRanks.size());
+  auto allRecvRanks = group->setupComms->allgather(recvRanks);
+  for (size_t index : indices(sendRanks)) {
+    auto& c = allRecvRanks.at(sendRanks[index]);
+    auto it = std::ranges::find(c, rank);
+    CHECK(it != c.end());
+    sendRemoteRecvIndex[index] = it - c.begin();
+  }
+
   std::string s;
   for (auto& v : ringSends) {
     if (!s.empty()) {

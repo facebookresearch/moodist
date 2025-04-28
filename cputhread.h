@@ -5,6 +5,7 @@
 #include "simple_vector.h"
 #include "synchronization.h"
 
+#include <exception>
 #include <forward_list>
 
 namespace moodist {
@@ -72,6 +73,7 @@ OPTYPE(AllToAllCuda);
 OPTYPE(AllToAllCuda2);
 OPTYPE(LocalSmallAllReduceCuda);
 OPTYPE(ShareCuda);
+OPTYPE(BarrierCuda);
 
 OPTYPE(BroadcastRingCuda);
 OPTYPE(ReduceTreeCuda);
@@ -285,7 +287,7 @@ struct QueueEntryCallback : QueueEntry {
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
-  std::forward_list<T> all;
+  std::forward_list<T, InternalAllocator<T>> all;
   IntrusiveList<QueueEntry, &QueueEntry::link> free;
   size_t nAllocated = 0;
   T* pop() {
@@ -339,6 +341,9 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCopy> freelistCopy;
   QueueEntryFreeList<QueueEntryCached> freelistCached;
   QueueEntryFreeList<QueueEntryCallback> freelistCallback;
+
+  std::exception_ptr initExceptionPtr;
+  std::atomic_bool initException = false;
 
   CpuThread(Group*);
   ~CpuThread();
