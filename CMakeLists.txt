@@ -107,10 +107,16 @@ set(mlx5_sources
 )
 list(TRANSFORM mlx5_sources PREPEND rdma-core/providers/mlx5/)
 
+set(efa_sources
+  efa.c verbs.c
+)
+list(TRANSFORM efa_sources PREPEND rdma-core/providers/efa/)
+
 set(rdma_sources
   ${ibverbs_sources}
   ${util_sources}
   ${mlx5_sources}
+  ${efa_sources}
 )
 
 pybind11_add_module(_C
@@ -132,6 +138,8 @@ pybind11_add_module(_C
   queue.cc
   cpu_allocator.cc
   numa.cc
+  alltoall.cc
+  internal_allocator.cc
   fmt/src/format.cc
   ${rdma_sources}
 )
