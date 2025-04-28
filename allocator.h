@@ -9,6 +9,7 @@ namespace moodist {
 namespace allocator {
 
 bool owns(uintptr_t address);
+std::pair<uintptr_t, size_t> mappedRegion(uintptr_t address);
 
 void removeFreeCallback(uintptr_t baseAddress, void* handle);
 
