@@ -16,6 +16,8 @@ namespace moodist {
 std::string generate_reduce_scatter_direct(
     const Group* group, std::vector<std::string> generateTypes, std::vector<std::string> generateReductions);
 
+std::string generate_alltoall(const Group* group);
+
 Kernels::~Kernels() {
   for (auto cuModule : cuModules) {
     cuModuleUnload(cuModule);
@@ -153,6 +155,7 @@ std::string Kernels::emitCopySeq(
     v = var;
   }
   std::string copy1;
+  copy1 += genCopy("uint4", 16, 32);
   copy1 += genCopy("uint4", 16, 16);
   copy1 += genCopy("uint4", 16, 8);
   copy1 += genCopy("uint4", 16, 4);
@@ -547,7 +550,7 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
   size_t blocksPerSm = 1;
 
   if (group->ipcRanks.size() == group->size - 1) {
-    gridSize = 32;
+    gridSize = 64;
   }
   if (group->ipcRanks.size() == 0) {
     gridSize = 4;
@@ -763,6 +766,10 @@ extern "C" __global__ void dummy_signal() {
     size_t r = i2 - supportedReductions.begin();
     fn(cuReduceScatterDirect[t][r],
        replace("reduce_scatter_direct_$type_$red", "$type", compileType, "$red", compileReduction));
+  }
+  if (flags & CompileAllToAll) {
+    source += generate_alltoall(group);
+    fn(cuAllToAll, "alltoall");
   }
 
   fn(cuBroadcast, "broadcast");
