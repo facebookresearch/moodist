@@ -7,8 +7,6 @@
 
 #pragma once
 
-#include "common.h"
-
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +14,11 @@
 #include <new>
 #include <stdexcept>
 #include <utility>
+
+#pragma push_macro("assert")
+#undef assert
+// #define assert(x) (bool(x) ? 0 : (printf("assert failure %s:%d\n", __FILE__, __LINE__), std::abort(), 0))
+#define assert(x)
 
 namespace moodist {
 
@@ -176,7 +179,7 @@ struct Vector {
   }
   T* erase(T* at) {
     size_t index = at - beginptr;
-    CHECK(index < msize);
+    assert(index < msize);
     erase(at, at + 1);
     return beginptr + index;
   }
@@ -259,29 +262,29 @@ struct Vector {
     ++msize;
   }
   T& front() {
-    CHECK(msize > 0);
+    assert(msize > 0);
     return *beginptr;
   }
   T& back() {
-    CHECK(msize > 0);
+    assert(msize > 0);
     return endptr[-1];
   }
   const T& front() const {
-    CHECK(msize > 0);
+    assert(msize > 0);
     return *beginptr;
   }
   const T& back() const {
-    CHECK(msize > 0);
+    assert(msize > 0);
     return endptr[-1];
   }
   void pop_back() {
-    CHECK(msize > 0);
+    assert(msize > 0);
     --endptr;
     --msize;
     endptr->~T();
   }
   void pop_front() {
-    CHECK(msize > 0);
+    assert(msize > 0);
     erase(beginptr, beginptr + 1);
   }
   T pop_back_value() {
@@ -319,3 +322,5 @@ struct Vector {
 };
 
 } // namespace moodist
+
+#pragma pop_macro("assert")

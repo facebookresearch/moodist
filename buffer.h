@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "commondefs.h"
 
 #include <atomic>
 #include <type_traits>
@@ -26,7 +27,7 @@ struct alignas(std::max_align_t) Buffer {
   ~Buffer() = delete;
 
   static Buffer* allocate(size_t nbytes) {
-    Buffer* r = (Buffer*)std::malloc(sizeof(Buffer) + nbytes);
+    Buffer* r = (Buffer*)internalAlloc(sizeof(Buffer) + nbytes);
     if (!r) {
       throw std::bad_alloc();
     }
@@ -35,7 +36,7 @@ struct alignas(std::max_align_t) Buffer {
     return r;
   }
   static void deallocate(Buffer* buffer) {
-    std::free((std::byte*)buffer);
+    internalFree((std::byte*)buffer);
   }
 };
 static_assert(std::is_trivially_copyable_v<Buffer>);

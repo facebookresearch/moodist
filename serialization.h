@@ -136,13 +136,13 @@ void serialize(X& x, std::vector<T>& v) {
   serializeVector(x, v);
 }
 
-template<typename X, typename T>
-void serialize(X& x, const Vector<T>& v) {
+template<typename X, typename T, typename A>
+void serialize(X& x, const Vector<T, A>& v) {
   serializeVector(x, v);
 }
 
-template<typename X, typename T>
-void serialize(X& x, Vector<T>& v) {
+template<typename X, typename T, typename A>
+void serialize(X& x, Vector<T, A>& v) {
   serializeVector(x, v);
 }
 

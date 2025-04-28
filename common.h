@@ -1,14 +1,21 @@
 #pragma once
 
+#include "commondefs.h"
+
+#pragma push_macro("CHECK")
+
 #include "async.h"
 #include "cpu_allocator.h"
 #include "logging.h"
+#include "vector.h"
 
 #include "fmt/printf.h"
+
 
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+
 #include <cuda.h>
 #include <nvml.h>
 #include <nvrtc.h>
@@ -21,75 +28,13 @@
 #include <stdexcept>
 #include <utility>
 
-namespace moodist {
+#undef CHECK
+#pragma pop_macro("CHECK")
 
-void* numa_alloc_onnode(size_t bytes, int node);
-void* numa_alloc_local(size_t bytes);
-void numa_free(void* ptr, size_t bytes);
-int numa_run_on_node(int node);
+namespace moodist {
 
 extern async::Scheduler& scheduler;
 
-struct CudaError : std::runtime_error {
-  CUresult error;
-  CudaError(CUresult error, const std::string& message) : error(error), std::runtime_error(message) {}
-};
-
-[[noreturn]] [[gnu::cold]] inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
-  throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));
-}
-[[noreturn]] [[gnu::cold]] inline void throwCu(CUresult error, const char* file, int line) {
-  const char* str = "unknown cuda error";
-  cuGetErrorString(error, &str);
-  throw CudaError(error, fmt::sprintf("%s:%d: cuda error %d: %s", file, line, error, str));
-}
-[[noreturn]] [[gnu::cold]] inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
-  const char* str = "unknown nvml error";
-  str = nvmlErrorString(error);
-  throw std::runtime_error(fmt::sprintf("%s:%d: nvml error %d: %s", file, line, error, str));
-}
-
-[[noreturn]] [[gnu::cold]] inline void throwCheckFail(const char* file, int line, const char* text) {
-  std::string str = fmt::sprintf("[CHECK FAILED %s:%d] %s\n", file, line, text);
-  log.error("%s", str);
-  throw std::runtime_error(str);
-}
-
-[[noreturn]] [[gnu::cold]] inline void throwErrno(int e, const char* text) {
-  log.error("%s: error %d: %s", text, e, std::strerror(e));
-  throw std::system_error(e, std::generic_category(), text);
-}
-
-#define NORETURN(x) [&] [[noreturn]] [[gnu::cold]] [[gnu::noinline]] () { x }();
-#define NOINLINE(x) [&] [[gnu::noinline]] () { x }();
-#define NOINLINE_COLD(x) [&] [[gnu::noinline]] [[gnu::cold]] () { x }();
-
-#define CHECK_NVRTC(x)                                                                                                 \
-  {                                                                                                                    \
-    nvrtcResult error__ = (x);                                                                                         \
-    if (error__ != NVRTC_SUCCESS) [[unlikely]]                                                                         \
-      NORETURN(throwNvrtc(error__, __FILE__, __LINE__);)                                                               \
-  }
-#define CHECK_CU(x)                                                                                                    \
-  {                                                                                                                    \
-    CUresult error__ = (x);                                                                                            \
-    if (error__ != CUDA_SUCCESS) [[unlikely]]                                                                          \
-      NORETURN(throwCu(error__, __FILE__, __LINE__);)                                                                  \
-  }
-
-#define CHECK_NVML(x)                                                                                                  \
-  {                                                                                                                    \
-    nvmlReturn_t error__ = (x);                                                                                        \
-    if (error__ != NVML_SUCCESS) [[unlikely]]                                                                          \
-      NORETURN(throwNvml(error__, __FILE__, __LINE__);)                                                                \
-  }
-
-#undef CHECK
-#define CHECK(x)                                                                                                       \
-  {                                                                                                                    \
-    if (!(x)) [[unlikely]]                                                                                             \
-      NORETURN(throwCheckFail(__FILE__, __LINE__, #x);)                                                                \
-  }
 inline std::string removePciPathPrefix(std::string path) {
   std::string_view prefix = "/sys/devices/";
   if (path.find(prefix) == 0) {
@@ -638,5 +583,33 @@ auto range(auto n) {
 auto indices(auto&& c) {
   return range(c.size());
 }
+
+struct PairHash {
+  template<typename A, typename B>
+  size_t operator()(const std::pair<A, B>& v) const {
+    return std::hash<A>()(v.first) ^ std::hash<B>()(v.second);
+  }
+};
+
+template<class T>
+struct InternalAllocator {
+  typedef T value_type;
+  InternalAllocator() = default;
+  template<class U>
+  constexpr InternalAllocator(const InternalAllocator<U>&) noexcept {}
+  T* allocate(size_t n) {
+    void* r = internalAlloc(sizeof(T) * n);
+    if (!r) {
+      throw std::bad_alloc();
+    }
+    return (T*)r;
+  }
+  void deallocate(T* p, std::size_t n) noexcept {
+    internalFree(p);
+  }
+};
+
+template<typename T>
+using IVector = Vector<T, InternalAllocator<T>>;
 
 } // namespace moodist
