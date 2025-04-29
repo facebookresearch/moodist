@@ -956,13 +956,17 @@ struct ProcessGroupImpl {
       // localEvent.record(stream);
       // localEvent.wait(altStream);
 
-      for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+      CUstream curStream = stream;
 
-        //CUstream curStream = chunkIndex % 2 ? altStream : stream;
-        CUstream curStream = stream;
+      size_t flushIndex = 0;
+      size_t nQueuedChunks = 0;
 
-        size_t chunkOffset = chunkSize * chunkIndex;
-        size_t currentChunkSize = std::min(chunkSize, inputBytes - chunkSize * chunkIndex);
+      auto flushCopies = [&]() {
+        if (nQueuedChunks == 0) {
+          return;
+        }
+        size_t chunkOffset = chunkSize * flushIndex;
+        size_t currentChunkSize = std::min(chunkSize * nQueuedChunks, inputBytes - chunkSize * flushIndex);
 
         auto copy = [&](size_t peerIndex) {
           CHECK(allGather2dCopies.has_value());
@@ -981,14 +985,29 @@ struct ProcessGroupImpl {
           }
         };
 
+        for (size_t peerIndex : peerIndices) {
+          copy(peerIndex);
+        }
+
+        flushIndex += nQueuedChunks;
+        nQueuedChunks = 0;
+      };
+
+      for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
+
+        // CUstream curStream = chunkIndex % 2 ? altStream : stream;
+        //  CUstream curStream = stream;
+
         memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + chunkIndex), stepValue);
         memFlush(curStream);
 
         syncPeers(curStream);
-        for (size_t peerIndex : peerIndices) {
-          copy(peerIndex);
+        ++nQueuedChunks;
+        if (nQueuedChunks >= 1) {
+          flushCopies();
         }
       }
+      flushCopies();
       // localEvent.record(altStream);
       // localEvent.wait(stream);
       syncPeers(stream);
@@ -1287,7 +1306,7 @@ struct ProcessGroupImpl {
     }
 
     if (kernelLess && (!isNoLocal || direct)) {
-      //log.info("direct, %d chunks of %d bytes\n", numChunks, chunkSize);
+      // log.info("direct, %d chunks of %d bytes\n", numChunks, chunkSize);
       CHECK(pitch == bytes);
       // kernelLess_all_gather_impl(
       //     concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,

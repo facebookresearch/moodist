@@ -125,7 +125,7 @@ def f(n):
         # data = torch.randn(442416 - 0).cuda() + 1
         # data = torch.zeros(442416 - 3, dtype=torch.uint8).cuda() + 1
         # data = torch.randn(18874368).cuda() + 1
-        data = torch.randn(589824).cuda() + 1
+        data = torch.randn(5898240).cuda() + 1
         # data = torch.randn(294912).cuda() + 1
         # data = torch.randn(353028).cuda() + 1
         # data = torch.randn(8388608).cuda() + 1
@@ -181,7 +181,8 @@ def f(n):
         tmp2 = tmp.clone()
         result02 = result0.clone()
 
-        group = dist.new_group()
+        #group = dist.new_group()
+        group = None
         # cache = moodist.cache(group, "all_gather")
 
         for _ in range(1000):
@@ -246,7 +247,7 @@ def f(n):
 
         if True:
             start = time.time()
-            loopcount = 1000
+            loopcount = 2000
             for _ in range(loopcount):
                 dist.all_gather_into_tensor(result0, tmp, group=group)
             dist.all_gather_into_tensor(result0, tmp, group=group)
@@ -455,13 +456,13 @@ def f(n):
             dist.all_gather_into_tensor(result0, tmp, group=group)
         elif 1 == 1:
             # moodist.enable_profiling(True)
-            loopcount = 10000
+            loopcount = 2000
             for _ in range(loopcount):
-                dist.all_gather_into_tensor(result0, tmp)
+                dist.all_gather_into_tensor(result0, tmp, group=group)
                 # torch.cuda.synchronize()
             # moodist.enable_profiling(False)
 
-            dist.all_gather_into_tensor(result0, tmp)
+            dist.all_gather_into_tensor(result0, tmp, group=group)
         else:
             # result = [torch.zeros_like(data) for _ in range(size)]
             loopcount = 1000

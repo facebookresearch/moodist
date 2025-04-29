@@ -171,7 +171,6 @@ struct IpcMapper {
       base = myRegion.first;
       size = myRegion.second;
     } else {
-      log.error("ipc mapper cuda memory - this should be rare\n");
       CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
       CHECK(bufferId != -1);
       unsigned long long bufferId2 = -1;

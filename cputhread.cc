@@ -672,6 +672,7 @@ struct CpuThreadImpl {
     if (st.offset >= buf->bytes) {
       st.busy.push_back(std::move(buf));
       st.free.pop_front();
+      st.offset = 0;
     }
     [[assume(bytes <= 64)]];
     std::memcpy((void*)r, address, bytes);
