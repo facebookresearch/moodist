@@ -994,34 +994,101 @@ struct CpuThreadImpl {
     }
   }
 
-  bool receivesInitialized = false;
+  using seq_t = uint32_t;
 
-  void onRecv(std::string_view view) {
+  bool receivesInitialized = false;
+  Vector<seq_t> incomingSeqId;
+  Vector<seq_t> outgoingSeqId;
+  Vector<Vector<std::pair<seq_t, TemporaryBufferHandle>>> incomingSeqQueued;
+
+  struct Header {
+    uint32_t type;
+    uint32_t source;
+    seq_t seqid;
+    template<typename X>
+    void serialize(X& x) {
+      x(type, source, seqid);
+    }
+  };
+
+  Header header(uint32_t op, uint32_t destination) {
+    return Header{op, (uint32_t)rank, outgoingSeqId[destination]++};
+  }
+
+  void onRecv(Device& dev, TemporaryBufferHandle buffer) {
     try {
+      std::string_view view((const char*)buffer->cpuPointer, buffer->bytes);
       uint32_t type;
-      view = deserializeBufferPart(view, type);
-      switch (type) {
-      case opTypeQueuePut:
-        onRecvQueuePut(view);
-        break;
-      case opTypeQueueReadFinished:
-        onRecvQueueReadFinished(view);
-        break;
-      case opTypeQueueGet:
-        onRecvQueueGet(view);
-        break;
-      case opTypeQueueTransaction:
-        onRecvQueueTransaction(view);
-        break;
-      case opTypeCreateQueueNamed:
-        onRecvCreateQueueNamed(view);
-        break;
-      case opTypeCreateQueueNamedResult:
-        onRecvCreateQueueNamedResult(view);
-        break;
-      default:
-        fatal("Received unknown message type %#x", type);
+      uint32_t source;
+      seq_t seqid;
+      view = deserializeBufferPart(view, type, source, seqid);
+      CHECK(source < size);
+      auto& queue = incomingSeqQueued[source];
+      seq_t& expectedSeqId = incomingSeqId[source];
+      if (seqid != expectedSeqId) {
+        uint32_t expectedValue = expectedSeqId;
+        queue.emplace(
+            std::ranges::lower_bound(
+                queue, seqid,
+                [expectedValue](auto& a, auto& b) {
+                  auto p = [expectedValue](auto& v) {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(v)>, seq_t>) {
+                      return seq_t(v - expectedValue);
+                    } else {
+                      return seq_t(v.first - expectedValue);
+                    }
+                  };
+                  return p(a) < p(b);
+                }),
+            seqid, std::move(buffer));
+        enqueueCallback([this, &dev]() { postRecv(dev, allocateTemporaryBuffer(4096)); });
+        return;
       }
+      bool first = true;
+      while (true) {
+        ++expectedSeqId;
+        switch (type) {
+        case opTypeQueuePut:
+          onRecvQueuePut(view, source);
+          break;
+        case opTypeQueueReadFinished:
+          onRecvQueueReadFinished(view);
+          break;
+        case opTypeQueueGet:
+          onRecvQueueGet(view, source);
+          break;
+        case opTypeQueueTransaction:
+          onRecvQueueTransaction(view, source);
+          break;
+        case opTypeCreateQueueNamed:
+          onRecvCreateQueueNamed(view, source);
+          break;
+        case opTypeCreateQueueNamedResult:
+          onRecvCreateQueueNamedResult(view);
+          break;
+        default:
+          fatal("Received unknown message type %#x", type);
+        }
+        if (first) {
+          first = false;
+          postRecv(dev, std::move(buffer));
+        }
+        if (queue.empty()) {
+          break;
+        }
+        auto& x = queue.front();
+        if (x.first != expectedSeqId) {
+          break;
+        }
+        buffer = std::move(x.second);
+        queue.pop_front();
+        uint32_t tmpSource;
+        view = std::string_view((const char*)buffer->cpuPointer, buffer->bytes);
+        view = deserializeBufferPart(view, type, tmpSource, seqid);
+        CHECK(tmpSource == source);
+        CHECK(seqid == expectedSeqId);
+      }
+
     } catch (const std::exception& e) {
       fatal("onRecv exception: %s", e.what());
     }
@@ -1033,8 +1100,7 @@ struct CpuThreadImpl {
     size_t bytes = buffer->bytes;
     uint32_t lkey = buffer.mr->mrs[di]->lkey;
     postRecv(dev, pointer, lkey, bytes, makeCallback([this, &dev, buffer = std::move(buffer)]() mutable {
-               onRecv(std::string_view((const char*)buffer->cpuPointer, buffer->bytes));
-               postRecv(dev, std::move(buffer));
+               onRecv(dev, std::move(buffer));
              }));
     // fixme? on shutdown, work requests are not completed, so their callbacks are leaked.
     //        do we care?
@@ -1045,6 +1111,10 @@ struct CpuThreadImpl {
       return;
     }
     receivesInitialized = true;
+
+    incomingSeqId.resize(size);
+    outgoingSeqId.resize(size);
+    incomingSeqQueued.resize(size);
 
     for (size_t di = 0; di != devices.size(); ++di) {
       auto& dev = devices[di];
@@ -5023,8 +5093,7 @@ struct CpuThreadImpl {
     }
   };
 
-  void onRecvQueuePut(std::string_view view) {
-    uint32_t source;
+  void onRecvQueuePut(std::string_view view, uint32_t source) {
     uintptr_t queueAddress;
     uintptr_t tensorAddress;
     size_t bytes;
@@ -5042,7 +5111,7 @@ struct CpuThreadImpl {
     {
       Deserializer d(view);
       Deserialize x(d);
-      x(source, queueAddress, tensorAddress, bytes);
+      x(queueAddress, tensorAddress, bytes);
       x(remoteOpKey, getKey, transactionKey, queueSize);
       for (size_t i = 0; i != maxDevices; ++i) {
         x(rkeys[i]);
@@ -5149,7 +5218,7 @@ struct CpuThreadImpl {
     void* cpuPointer = buffer->cpuPointer;
     size_t serializedBytes =
         serializeToUnchecked(cpuPointer, SerializeFunction([&](auto& x) {
-                               x(opTypeQueuePut, (uint32_t)rank, params.remoteAddress, tensorAddress, bytes);
+                               x(header(opTypeQueuePut, i), params.remoteAddress, tensorAddress, bytes);
                                x(params.putKey, params.remoteGetKey, params.transactionKey, params.queueSize);
                                for (size_t i = 0; i != maxDevices; ++i) {
                                  x(tensorMr->mrs[i] ? tensorMr->mrs[i]->rkey : 0);
@@ -5169,11 +5238,7 @@ struct CpuThreadImpl {
         serializedBytes += bytes;
       }
     }
-    CHECK(serializedBytes <= 4096);
-    size_t di = (rank + i) % devices.size();
-    auto& dev = devices[di];
-    uint32_t lkey = buffer.mr->mrs[di]->lkey;
-    postSend(dev, i, cpuPointer, lkey, serializedBytes, makeCallback([this, buffer = std::move(buffer)] {}));
+    sendBuffer(i, std::move(buffer), serializedBytes);
     cpuThread->freelistQueuePut.push(&params);
   }
 
@@ -5211,7 +5276,7 @@ struct CpuThreadImpl {
   void sendQueueReadFinished(uint32_t source, uint32_t remoteOpKey) {
     CHECK(remoteOpKey != 0);
     auto buffer = allocateTemporaryBuffer(4096);
-    size_t bytes = serializeToUnchecked(buffer->cpuPointer, opTypeQueueReadFinished, remoteOpKey);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeQueueReadFinished, source), remoteOpKey);
     sendBuffer(source, std::move(buffer), bytes);
   }
 
@@ -5256,13 +5321,12 @@ struct CpuThreadImpl {
         params.source, (void*)localAddress, lkeys, (void*)params.remoteAddress, params.rkeys, bytes, callback);
   }
 
-  void onRecvQueueGet(std::string_view view) {
-    uint32_t source;
+  void onRecvQueueGet(std::string_view view, uint32_t source) {
     uint8_t op;
     uintptr_t queueAddress;
     uintptr_t remoteQueueAddress;
     uint32_t key;
-    deserializeBufferPart(view, source, op, queueAddress, remoteQueueAddress, key);
+    deserializeBufferPart(view, op, queueAddress, remoteQueueAddress, key);
     switch (op) {
     case QueueEntryQueueGet::opStart:
       queueRemoteGetStart(group, queueAddress, source, remoteQueueAddress, key);
@@ -5281,18 +5345,17 @@ struct CpuThreadImpl {
   void executeQueueGet(QueueEntryQueueGet& params) {
     auto buffer = allocateTemporaryBuffer(4096);
     size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, opTypeQueueGet, (uint32_t)rank, params.op, params.remoteQueueAddress,
+        buffer->cpuPointer, header(opTypeQueueGet, params.location), params.op, params.remoteQueueAddress,
         params.localQueueAddress, params.key);
     sendBuffer(params.location, std::move(buffer), bytes);
     cpuThread->freelistQueueGet.push(&params);
   }
 
-  void onRecvQueueTransaction(std::string_view view) {
-    uint32_t source;
+  void onRecvQueueTransaction(std::string_view view, uint32_t source) {
     uintptr_t queueAddress;
     uint8_t op;
     uint32_t key;
-    deserializeBufferPart(view, source, queueAddress, op, key);
+    deserializeBufferPart(view, queueAddress, op, key);
     // log.info("%#x %#x %#x %#x\n", source, queueAddress, op, key);
     CHECK(queueAddress != 0);
     switch (op) {
@@ -5311,7 +5374,7 @@ struct CpuThreadImpl {
     CHECK(params.remoteAddress != 0);
     auto buffer = allocateTemporaryBuffer(4096);
     size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, opTypeQueueTransaction, (uint32_t)rank, params.remoteAddress, params.op,
+        buffer->cpuPointer, header(opTypeQueueTransaction, params.location), params.remoteAddress, params.op,
         params.transactionKey);
     sendBuffer(params.location, std::move(buffer), bytes);
     cpuThread->freelistQueueTransaction.push(&params);
@@ -5798,18 +5861,17 @@ struct CpuThreadImpl {
     queueCreateOutgoing[key] = &params;
     auto buffer = allocateTemporaryBuffer(4096);
     size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, opTypeCreateQueueNamed, (uint32_t)rank, key, *params.name, (uint32_t)params.location,
-        params.streaming);
+        buffer->cpuPointer, header(opTypeCreateQueueNamed, params.location), key, *params.name,
+        (uint32_t)params.location, params.streaming);
     sendBuffer(params.location, std::move(buffer), bytes);
   }
 
-  void onRecvCreateQueueNamed(std::string_view view) {
-    uint32_t sourceRank;
+  void onRecvCreateQueueNamed(std::string_view view, uint32_t sourceRank) {
     uint32_t key;
     std::string_view name;
     uint32_t location;
     bool streaming;
-    deserializeBufferPart(view, sourceRank, key, name, location, streaming);
+    deserializeBufferPart(view, key, name, location, streaming);
 
     std::string fullName = fmt::sprintf("%s.%s", group->name, name);
 
@@ -5818,7 +5880,8 @@ struct CpuThreadImpl {
     enqueueCallback([this, qi, key, sourceRank] {
       auto buffer = allocateTemporaryBuffer(4096);
       size_t bytes = serializeToUnchecked(
-          buffer->cpuPointer, opTypeCreateQueueNamedResult, key, qi.address, (uint32_t)qi.location, qi.streaming);
+          buffer->cpuPointer, header(opTypeCreateQueueNamedResult, sourceRank), key, qi.address, (uint32_t)qi.location,
+          qi.streaming);
       sendBuffer(sourceRank, std::move(buffer), bytes);
     });
   }

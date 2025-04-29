@@ -319,6 +319,29 @@ struct Vector {
     ++msize;
     return at;
   }
+  template<typename... Args>
+  T* emplace(T* at, Args&&... args) {
+    if (at == endptr) {
+      emplace_back(std::forward<Args>(args)...);
+      return &back();
+    }
+    if (endptr == storageend) {
+      if (capacity() != size()) {
+        __builtin_unreachable();
+      }
+      [[unlikely]];
+      size_t index = at - beginptr;
+      expand();
+      at = beginptr + index;
+    }
+    T tmp(std::forward<Args>(args)...);
+    new (endptr) T();
+    move(at + 1, at, endptr);
+    *at = std::move(tmp);
+    ++endptr;
+    ++msize;
+    return at;
+  }
 };
 
 } // namespace moodist
