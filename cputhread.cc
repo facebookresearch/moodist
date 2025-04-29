@@ -679,8 +679,8 @@ struct CpuThreadImpl {
   }
 
   void writeData(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback, bool allowInline = true) {
+      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback, bool allowInline = true) {
     CHECK(i >= 0 && i < size);
 
     callback->i = i;
@@ -717,10 +717,10 @@ struct CpuThreadImpl {
       if (allowInline && bytes <= dev.ib->inlineBytes) {
         ibv_wr_set_inline_data(qp, localAddress, bytes);
       } else {
-        if (lkey == 0) {
+        if (!lkey) {
           std::tie(localAddress, lkey) = temporaryLkey(dev, localAddress, bytes);
         }
-        ibv_wr_set_sge(qp, lkey, (uintptr_t)localAddress, bytes);
+        ibv_wr_set_sge(qp, *lkey, (uintptr_t)localAddress, bytes);
       }
 
       if (efa) {
@@ -1153,7 +1153,6 @@ struct CpuThreadImpl {
         fatal("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
       }
       ptr->mr.mrs[i] = mr;
-      CHECK(mr->lkey != 0);
       localMrs.push_back(mr);
       log.debug(
           "new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x) (registration took %gs)\n", bytes, address,
@@ -1243,7 +1242,6 @@ struct CpuThreadImpl {
         fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
       }
       ptr->mr.mrs[i] = mr;
-      CHECK(mr->lkey != 0);
       localMrs.push_back(mr);
       log.debug(
           "new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
@@ -1620,7 +1618,8 @@ struct CpuThreadImpl {
     auto& dev = devices[di];
     auto* mr = regMrCuda(targetAddress, 4);
     writeData(
-        dev, rank, (void*)&value, 0, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t), makeCallback(nullptr));
+        dev, rank, (void*)&value, std::nullopt, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t),
+        makeCallback(nullptr));
   }
 
   struct WorkBarrier : Work {
@@ -5959,7 +5958,7 @@ struct CpuThreadImpl {
       size_t di = (localHeartbeatValue + rank + i) % devices.size();
       auto& dev = devices[di];
       writeData(
-          dev, i, &localHeartbeatValue, 0,
+          dev, i, &localHeartbeatValue, std::nullopt,
           (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, heartbeatValue)),
           remoteRankInfo[i].keys[di], sizeof(uint32_t), makeCallback([&state] { state.activeWrite.reset(); }));
     }
@@ -6010,7 +6009,7 @@ struct CpuThreadImpl {
       size_t di = 0;
       auto& dev = devices[di];
       writeData(
-          dev, i, &exitValue, 0,
+          dev, i, &exitValue, std::nullopt,
           (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, exited)),
           remoteRankInfo[i].keys[di], sizeof(bool), makeCallback([counter] { --*counter; }));
     }
