@@ -228,6 +228,11 @@ struct ibv_query_device_ex_input {
 	uint32_t		comp_mask;
 };
 
+enum ibv_odp_general_caps {
+	IBV_ODP_SUPPORT = 1 << 0,
+	IBV_ODP_SUPPORT_IMPLICIT = 1 << 1,
+};
+
 enum ibv_odp_transport_cap_bits {
 	IBV_ODP_SUPPORT_SEND     = 1 << 0,
 	IBV_ODP_SUPPORT_RECV     = 1 << 1,
@@ -235,6 +240,8 @@ enum ibv_odp_transport_cap_bits {
 	IBV_ODP_SUPPORT_READ     = 1 << 3,
 	IBV_ODP_SUPPORT_ATOMIC   = 1 << 4,
 	IBV_ODP_SUPPORT_SRQ_RECV = 1 << 5,
+	IBV_ODP_SUPPORT_FLUSH    = 1 << 6,
+	IBV_ODP_SUPPORT_ATOMIC_WRITE = 1 << 7,
 };
 
 struct ibv_odp_caps {
@@ -244,11 +251,6 @@ struct ibv_odp_caps {
 		uint32_t uc_odp_caps;
 		uint32_t ud_odp_caps;
 	} per_transport_caps;
-};
-
-enum ibv_odp_general_caps {
-	IBV_ODP_SUPPORT = 1 << 0,
-	IBV_ODP_SUPPORT_IMPLICIT = 1 << 1,
 };
 
 struct ibv_tso_caps {
@@ -2220,7 +2222,7 @@ static inline struct verbs_context *verbs_get_ctx(struct ibv_context *ctx)
 		return NULL;
 
 	/* open code container_of to not pollute the global namespace */
-	return (struct verbs_context *)(((uint8_t *)ctx) -
+	return (struct verbs_context *)(((uintptr_t)ctx) -
 					offsetof(struct verbs_context,
 						 context));
 }
@@ -2340,13 +2342,13 @@ int ibv_close_device(struct ibv_context *context);
 struct ibv_context *ibv_import_device(int cmd_fd);
 
 /**
- * ibv_import_pd - Import a protetion domain
+ * ibv_import_pd - Import a protection domain
  */
 struct ibv_pd *ibv_import_pd(struct ibv_context *context,
 			     uint32_t pd_handle);
 
 /**
- * ibv_unimport_pd - Unimport a protetion domain
+ * ibv_unimport_pd - Unimport a protection domain
  */
 void ibv_unimport_pd(struct ibv_pd *pd);
 

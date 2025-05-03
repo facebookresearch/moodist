@@ -578,7 +578,7 @@ static struct ibv_srq *rxe_create_srq(struct ibv_pd *ibpd,
 	struct rxe_srq *srq;
 	struct ibv_srq *ibsrq;
 	struct ibv_create_srq cmd;
-	struct urxe_create_srq_resp resp;
+	struct urxe_create_srq_resp resp = {};
 	int ret;
 
 	srq = calloc(1, sizeof(*srq));
@@ -617,7 +617,7 @@ static struct ibv_srq *rxe_create_srq_ex(
 	struct rxe_srq *srq;
 	struct ibv_srq *ibsrq;
 	struct ibv_create_xsrq cmd;
-	struct urxe_create_srq_ex_resp resp;
+	struct urxe_create_srq_ex_resp resp = {};
 	int ret;
 
 	srq = calloc(1, sizeof(*srq));
@@ -665,7 +665,7 @@ static int rxe_modify_srq(struct ibv_srq *ibsrq,
 
 	cmd.mmap_info_addr = (__u64)(uintptr_t) &mi;
 	rc = ibv_cmd_modify_srq(ibsrq, attr, attr_mask,
-				&cmd.ibv_cmd, sizeof(cmd.ibv_cmd));
+				&cmd.ibv_cmd, sizeof(cmd));
 	if (rc)
 		goto out;
 
