@@ -11,7 +11,6 @@
 
 #include "fmt/printf.h"
 
-
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -408,6 +407,9 @@ struct FLPtr {
   bool operator==(std::nullptr_t) const {
     return ptr == nullptr;
   }
+  explicit operator bool() const {
+    return ptr != nullptr;
+  }
 };
 
 template<typename T, size_t maxThreadLocalEntries = 0x100>
@@ -486,6 +488,9 @@ struct FLSharedPtr {
   }
   bool operator==(std::nullptr_t) const {
     return ptr == nullptr;
+  }
+  explicit operator bool() const {
+    return ptr != nullptr;
   }
 
   Storage* release() {

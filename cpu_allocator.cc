@@ -162,7 +162,7 @@ struct Allocator {
 void* moo_alloc(size_t);
 void moo_free(void*);
 
-constexpr size_t alignment = 1024 * 1024 * 2;
+constexpr size_t alignment = 1024 * 1024 * 16;
 
 struct Thread;
 struct Region {
@@ -334,6 +334,7 @@ void allocate_memory(size_t index) {
 
   size_t bytes = std::max(alignment, (size_t)(alignment + regionSize + nbytes * (nbytes < alignment ? 8 : 2)));
   bytes = std::max(bytes, (mmappedBytes / 4 + alignment - 1) / alignment * alignment);
+  bytes = std::max(bytes, (size_t)1024 * 1024 * 1024);
   bytes = (bytes + alignment - 1) / alignment * alignment;
   void* rv = nullptr;
 
@@ -371,10 +372,10 @@ void allocate_memory(size_t index) {
       "mapped %d bytes at %#x (total %d bytes, %dG)\n", bytes, (uintptr_t)rv, mmappedBytes,
       mmappedBytes / 1024 / 1024 / 1024);
 
-  auto start = std::chrono::steady_clock::now();
-  mlock(rv, bytes);
+  // auto start = std::chrono::steady_clock::now();
+  // mlock(rv, bytes);
 
-  log.error("locked in %gs\n", seconds(std::chrono::steady_clock::now() - start));
+  // log.error("locked in %gs\n", seconds(std::chrono::steady_clock::now() - start));
 
   CHECK(bytes > 0);
 

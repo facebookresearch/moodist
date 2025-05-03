@@ -265,6 +265,7 @@ struct QueueEntryQueueTransaction : QueueEntry {
 struct QueueEntryCat : QueueEntry {
   std::vector<std::pair<int, TensorDataPtr>> locals;
   FutureImplSharedPtr future;
+  TensorDataPtr out;
 };
 
 struct QueueEntryCopy : QueueEntry {

@@ -18,6 +18,8 @@ struct ProcessGroupImpl;
 struct FutureImpl;
 struct Future {
   FutureImplSharedPtr impl;
+  std::vector<torch::Tensor> tensors;
+  std::optional<torch::Tensor> out;
   Future();
   ~Future();
   Future(const Future&) = delete;
@@ -120,7 +122,7 @@ public:
   std::shared_ptr<Queue>
   makeQueue(std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
 
-  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals);
+  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out = std::nullopt);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
 
   std::vector<torch::Tensor> share(const torch::Tensor& input);

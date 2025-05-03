@@ -626,8 +626,9 @@ struct CudaAllocatorImpl {
     CUdeviceptr ptr;
     auto err = cuMemAlloc(&ptr, bytes);
     while (err != CUDA_SUCCESS) {
-      bytes -= 1024 * 1024;
-      if (bytes < minbytes) {
+      if (bytes > minbytes + 1024 * 1024) {
+        bytes -= 1024 * 1024;
+      } else {
         bytes = minbytes;
       }
       err = cuMemAlloc(&ptr, bytes);

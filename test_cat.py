@@ -9,6 +9,7 @@ import weakref
 from queue import Empty
 
 moodist.enable_cpu_allocator()
+moodist.enable_cuda_allocator()
 
 torch.cuda.set_device(int(os.getenv("LOCAL_RANK")))
 
@@ -19,16 +20,18 @@ group = torch.distributed.new_group()
 rank = group.rank()
 size = group.size()
 
-if False:
+random.seed(42)
+
+if True:
 
     if rank == 0:
-        a = torch.randn(4, 2, 1)
+        a = torch.randn(3).cuda()
 
         print("a is: %s" % (a,))
 
         locals = [(0, a), (2, a)]
     elif rank == 1:
-        a = torch.randn(16, 2, 1)
+        a = torch.randn(4).cuda()
 
         print("a is: %s" % (a,))
 
@@ -41,40 +44,60 @@ if False:
     print("result is: %s" % (result,))
 else:
 
+    device = "cpu"
     torch.manual_seed(42 + rank)
-    #locals = [(rank, torch.randn(1024 * 1024 * 8))]
-    locals = [(rank, torch.randn(random.randrange(1024 * 1024))) for _ in range(100)]
+    # locals = [(rank, torch.randn(1024 * 1024 * 8))]
+    locals = [
+        (rank, torch.randn(random.randrange(1024 * 1024 * 16), device=device))
+        for _ in range(100)
+    ]
 
-    # c = []
-    # for i in range(size):
-    #     torch.manual_seed(42 + i)
-    #     t = torch.randn(1024 * 1024 * 8)
-    #     c.append(t)
-    # c = torch.cat(c)
+    c = []
+    for i in range(size):
+        torch.manual_seed(42 + i)
+        t = torch.randn(1024 * 1024 * 8, device=device)
+        if i == rank:
+            lc = t.clone()
+        c.append(t)
+    c = torch.cat(c)
 
-    # for i in range(100):
-    #     result = group.cat(locals[i]).result()
-    #     #assert torch.equal(result, c)
-    
+    for i in range(100):
+        # result = group.cat([(rank, lc)]).result()
+        result = group.cat(
+            [(rank, lc)], out=torch.empty(1024 * 1024 * 8 * size, device=device)
+        ).result()
+        assert torch.equal(result, c)
+        result += 1
+
     print("rank %d warmup done" % rank)
 
-    for _ in range(8):
+    for _ in range(50):
         start = time.monotonic()
         ops = []
         for i in range(100):
-            #result = group.cat(locals).result()
+            # result = group.cat(locals).result()
+            # ops.append(
+            #     group.cat(
+            #         [locals[i]], out=torch.empty(locals[i][1].numel() * size, device=device)
+            #     )
+            # )
             ops.append(group.cat([locals[i]]))
-            #assert torch.equal(result, c)
-        
+            # assert torch.equal(result, c)
+
+        xl = []
         total_bytes = 0
         for op in ops:
             op.wait()
             tensor = op.result()
             total_bytes += tensor.itemsize * tensor.numel()
-        
+            
+            xl.append(tensor)
+
         t = time.monotonic() - start
-        g = total_bytes * 100 / 1024 / 1024 / 1024
+        g = total_bytes / 1024 / 1024 / 1024
 
         print("rank %d took %gs, %gG/s" % (rank, t, g / t))
+        
+        del ops
 
 torch.distributed.barrier()

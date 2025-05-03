@@ -62,7 +62,9 @@ PYBIND11_MODULE(_C, m) {
           py::overload_cast<std::vector<int>, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
           py::arg("location"), py::arg("streaming") = false, py::arg("name") = py::none(),
           py::call_guard<py::gil_scoped_release>())
-      .def("cat", &MoodistProcessGroup::cat, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "cat", &MoodistProcessGroup::cat, py::arg("locals"), py::arg("out") = py::none(),
+          py::call_guard<py::gil_scoped_release>())
       .def("copy", &MoodistProcessGroup::copy, py::call_guard<py::gil_scoped_release>())
       .def("moodist_name", &MoodistProcessGroup::moodist_name)
       .def("share", &MoodistProcessGroup::share, py::call_guard<py::gil_scoped_release>())

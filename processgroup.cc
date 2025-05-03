@@ -2633,6 +2633,31 @@ struct ProcessGroupImpl {
   }
 
   TensorDataPtr getTensorData(const torch::Tensor& tensor, bool allowCopy = true) {
+    TensorDataPtr td = getTensorReference(tensor);
+
+    if (!td->isCuda) {
+      if (cpu_allocator::owns(td->dataPtr)) {
+        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)tensor.storage().data());
+        CHECK(handle != nullptr);
+        td->buffer = std::move(handle);
+      } else {
+        if (!allowCopy) {
+          throw std::runtime_error("Found CPU tensor that we do not own");
+        }
+        uintptr_t src = td->data();
+        td->buffer = AllocatedCpuBufferSharedPtr::make();
+        *td->buffer = group->allocateCpu(td->dataBytes);
+        td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
+        std::memcpy((void*)td->data(), (void*)src, td->bytes());
+
+        CHECK(cpu_allocator::owns(td->data()));
+      }
+    }
+
+    return td;
+  }
+
+  TensorDataPtr getTensorReference(const torch::Tensor& tensor) {
     TensorDataPtr td = TensorDataPtr::make();
 
     td->dtype = (int)tensor.dtype().toScalarType();
@@ -2645,36 +2670,18 @@ struct ProcessGroupImpl {
     uintptr_t tensorAddress = (uintptr_t)(const void*)tensor.data_ptr();
 
     if (tensorAddress == 0) {
-      throw std::runtime_error("getTensorData: got a null tensor");
+      throw std::runtime_error("getTensorReference: got a null tensor");
     }
 
     td->dataPtr = tensorAddress;
     td->dataBytes = td->itemsize() * td->numel();
 
-    if (tensor.is_cpu()) {
-      if (cpu_allocator::owns(tensorAddress)) {
-        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)tensor.storage().data());
-        CHECK(handle != nullptr);
-        td->buffer = std::move(handle);
-      } else {
-        if (!allowCopy) {
-          throw std::runtime_error("Found CPU tensor that we do not own");
-        }
-        td->buffer = AllocatedCpuBufferSharedPtr::make();
-        *td->buffer = group->allocateCpu(td->dataBytes);
-        td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
-        std::memcpy((void*)td->data(), (void*)tensorAddress, td->bytes());
-
-        CHECK(cpu_allocator::owns(td->data()));
-      }
-    } else {
-      td->isCuda = true;
-    }
+    td->isCuda = !tensor.is_cpu();
 
     return td;
   }
 
-  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
+  Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out) {
     std::unique_lock l(threadUnsafe);
 
     size_t size = this->size;
@@ -2692,13 +2699,23 @@ struct ProcessGroupImpl {
     e->concurrencyIndex = concurrencyIndex;
     e->sd = &sd;
     e->locals.resize(locals.size());
-    for (size_t i = 0; i != locals.size(); ++i) {
+    for (size_t i : indices(locals)) {
       e->locals[i] = {locals[i].first, getTensorData(locals[i].second)};
     }
     e->future = future;
+    e->out = nullptr;
+    if (out) {
+      e->out = getTensorData(*out, false);
+    }
     group->cpuThread->enqueue(e);
 
     Future r;
+    for (auto& v : locals) {
+      r.tensors.push_back(v.second);
+    }
+    if (out) {
+      r.out = *out;
+    }
     r.impl = std::move(future);
     return r;
   }
@@ -3481,8 +3498,8 @@ ProcessGroup::makeQueue(std::vector<int> location, bool streaming, std::optional
   return moodist::makeQueue(impl->group, location, streaming, name);
 }
 
-Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals) {
-  return impl->cat(locals);
+Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out) {
+  return impl->cat(locals, out);
 }
 
 Future ProcessGroup::copy(torch::Tensor& destination, const torch::Tensor& source) {
@@ -3494,14 +3511,22 @@ std::string ProcessGroup::moodist_name() const {
 }
 
 Future::Future() {}
-Future::~Future() {}
+Future::~Future() {
+  if (impl) {
+    wait();
+  }
+}
 void Future::wait() {
   while (impl->done == 0) {
     futexWait(&impl->done, 0, std::chrono::seconds(1));
   }
+  tensors.clear();
 }
 torch::Tensor Future::result() {
   wait();
+  if (out) {
+    return *out;
+  }
   if (impl->result == nullptr) {
     throw std::runtime_error("result has already been called on this Future - it cannot be called twice");
   }

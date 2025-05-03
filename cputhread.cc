@@ -1182,7 +1182,7 @@ struct CpuThreadImpl {
       uintptr_t inputEnd = address + bytes;
       CHECK(address + bytes <= region.first + region.second);
       size_t regionEnd = region.first + region.second;
-      uintptr_t alignment = 1024 * 1024 * 1024;
+      uintptr_t alignment = 1024ull * 1024 * 1024;
       uintptr_t roundedDown = address / alignment * alignment;
       size_t originalEnd = address + bytes;
       address = std::max(roundedDown, region.first);
@@ -5410,8 +5410,11 @@ struct CpuThreadImpl {
     Vector<std::pair<size_t, size_t>> readOrder;
 
     TemporaryBufferHandle resultBuffer;
+    MemoryRegistration* outMr = nullptr;
 
     TensorDataPtr resultTensor;
+
+    Vector<TemporaryBufferHandle> temporaryBuffers;
 
     WorkCat(CpuThreadImpl& self, QueueEntryCat& params) : Work(self, params), params(params) {}
 
@@ -5427,7 +5430,16 @@ struct CpuThreadImpl {
 
       std::shuffle(readOrder.begin(), readOrder.end(), getRng());
 
-      resultBuffer = self.allocateTemporaryBuffer(total);
+      if (params.out) {
+        outMr = params.out->isCuda ? self.regMrCuda(params.out->data(), params.out->bytes())
+                                   : self.regMr(params.out->data(), params.out->bytes());
+        if (params.out->bytes() != total) {
+          fatal("cat got an out tensor of %d bytes, but the result is %d bytes\n", params.out->bytes(), total);
+        }
+      } else {
+        resultBuffer = self.allocateTemporaryBuffer(total);
+        outMr = resultBuffer.mr;
+      }
 
       // log.info("CAT %#x/%d allocated %d bytes\n", stepValue, concurrencyIndex, resultBuffer->bytes);
     }
@@ -5446,12 +5458,12 @@ struct CpuThreadImpl {
       const CatTensor* t = sorted[index].second;
       CHECK(t->index == index);
 
-      void* dst = (void*)((uintptr_t)resultBuffer->cpuPointer + offset);
+      void* dst = (void*)((params.out ? params.out->data() : (uintptr_t)resultBuffer->cpuPointer) + offset);
       void* src = (void*)t->address;
 
       std::array<uint32_t, maxDevices> lkeys;
       for (size_t i = 0; i != maxDevices; ++i) {
-        lkeys[i] = resultBuffer.mr->mrs[i] ? resultBuffer.mr->mrs[i]->lkey : 0;
+        lkeys[i] = outMr->mrs[i] ? outMr->mrs[i]->lkey : 0;
       }
       ++nLiveReads;
       self.readDataDistributed(i, dst, lkeys, src, t->rkey, t->bytes, self.makeCallback([this, index] {
@@ -5667,14 +5679,16 @@ struct CpuThreadImpl {
         }
       }
 
-      resultTensor->buffer = AllocatedCpuBufferSharedPtr::make();
-      *resultTensor->buffer = std::move(resultBuffer.buffer);
-      resultTensor->dataPtr = (uintptr_t)resultTensor->buffer->cpuPointer;
-      resultTensor->dataBytes = resultTensor->buffer->bytes;
+      if (!params.out) {
+        resultTensor->buffer = AllocatedCpuBufferSharedPtr::make();
+        *resultTensor->buffer = std::move(resultBuffer.buffer);
+        resultTensor->dataPtr = (uintptr_t)resultTensor->buffer->cpuPointer;
+        resultTensor->dataBytes = resultTensor->buffer->bytes;
 
-      CHECK(resultTensor->itemsize() * resultTensor->numel() == resultTensor->dataBytes);
+        CHECK(resultTensor->itemsize() * resultTensor->numel() == resultTensor->dataBytes);
 
-      params.future->result = std::move(resultTensor);
+        params.future->result = std::move(resultTensor);
+      }
 
       params.future->done = 1;
       futexWakeAll(&params.future->done);
@@ -5683,6 +5697,8 @@ struct CpuThreadImpl {
       listBuffer = {};
 
       params.locals.clear();
+
+      temporaryBuffers.clear();
 
       // log.info("CAT %#x/%d done\n", stepValue, concurrencyIndex);
 
