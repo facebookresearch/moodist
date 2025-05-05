@@ -370,7 +370,7 @@ void allocate_memory(size_t index) {
   rv = (void*)(((uintptr_t)rv + alignment - 1) / alignment * alignment);
   bytes = e - (uintptr_t)rv;
 
-  log.error(
+  log.verbose(
       "(internal) mapped %d bytes at %#x (total %d bytes, %dG) on node %d\n", bytes, (uintptr_t)rv, mmappedBytes,
       mmappedBytes / 1024 / 1024 / 1024, internalAllocatorNode);
 

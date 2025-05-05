@@ -100,7 +100,6 @@ void numa_run_on_node(int node) {
 void numa_membind(int node) {
   constexpr int bind = 2;
   uint64_t mask = (uint64_t)1 << node;
-  log.error("mem bind mask %#x\n", mask);
   if (syscall(SYS_set_mempolicy, bind, &mask, 64)) {
     log.error("set_mempolicy error: %d\n", errno);
   }
