@@ -1306,7 +1306,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   }
 
   virtual void enablePeerAccess(c10::DeviceIndex dev, c10::DeviceIndex dev_to_access) override {
-    throw std::runtime_error("moodist CUDAAllocator::enablePeerAccess: not implemented");
+    //throw std::runtime_error("moodist CUDAAllocator::enablePeerAccess: not implemented");
   }
 
   virtual cudaError_t memcpyAsync(
