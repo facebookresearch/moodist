@@ -12,7 +12,7 @@ versions="cp39-cp39 cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
 
 torch_versions="2.5 2.6 2.7"
 
-pre_torch_versions="2.8.*"
+pre_torch_versions=""
 
 orig_path=$PATH
 for ver in $versions; do
