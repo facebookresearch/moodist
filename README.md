@@ -41,6 +41,13 @@ pip install .
 If it throws an error about building wheels and not finding CUDA static libraries, you must use the `python setup.py install` command to build it.
 
 
+
+
 ## Documentation
 
 Wouldn't that be nice?
+
+# License
+
+Moodist is released under an MIT license. See LICENSE for more information.
+
