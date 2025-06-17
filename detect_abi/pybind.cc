@@ -1,3 +1,4 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include <pybind11/chrono.h>
 #include <pybind11/pybind11.h>
