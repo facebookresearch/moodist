@@ -1,11 +1,5 @@
 #!/usr/bin/env python
-#
-#
-# To install: pip install .
-#
-# For debug builds: python setup.py build --debug install
-#
-#
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import os
 import pathlib

@@ -1,3 +1,5 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
 #include "cputhread.h"
 #include "allgather.h"
 #include "allocator.h"

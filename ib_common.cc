@@ -1,3 +1,5 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
 #include "ib_common.h"
 #include "group.h"
 #include "setup_comms.h"

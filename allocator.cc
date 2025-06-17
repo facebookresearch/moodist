@@ -1,3 +1,4 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "allocator.h"
 #include "common.h"

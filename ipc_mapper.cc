@@ -1,3 +1,5 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
 #include "ipc_mapper.h"
 #include "async.h"
 #include "common.h"

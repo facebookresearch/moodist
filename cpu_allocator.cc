@@ -1,3 +1,4 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cpu_allocator.h"
 #include "common.h"

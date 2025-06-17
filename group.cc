@@ -1,3 +1,5 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
 #include "group.h"
 #include "allgather.h"
 #include "common.h"

@@ -1,3 +1,4 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "setup_comms.h"
 #include "buffer.h"
