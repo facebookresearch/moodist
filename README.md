@@ -26,7 +26,7 @@ The following command should install a version of moodist built for your local v
 pip install moodist
 ```
 
-If it cannot find an appropriate version, if you are using a nightly version of pytorch or it otherwise does not work, you can also build pytorch from source:
+If it cannot find an appropriate version, if you are using a nightly version of pytorch or it otherwise does not work, you can also build moodist from source:
 
 `pip install https://github.com/facebookresearch/moodist`
 
@@ -45,7 +45,7 @@ If it throws an error about building wheels and not finding CUDA static librarie
 
 ## Documentation
 
-Wouldn't that be nice?
+Coming soon.
 
 # License
 
