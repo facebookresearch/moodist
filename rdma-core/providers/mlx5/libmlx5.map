@@ -1,0 +1,237 @@
+/* Export symbols should be added below according to
+   Documentation/versioning.md document. */
+MLX5_1.0 {
+	global:
+		mlx5dv_query_device;
+		mlx5dv_init_obj;
+	local: *;
+};
+
+MLX5_1.1 {
+	global:
+		mlx5dv_create_cq;
+} MLX5_1.0;
+
+MLX5_1.2 {
+	global:
+		mlx5dv_init_obj;
+		mlx5dv_set_context_attr;
+} MLX5_1.1;
+
+MLX5_1.3 {
+	global:
+		mlx5dv_create_qp;
+		mlx5dv_create_wq;
+} MLX5_1.2;
+
+MLX5_1.4 {
+	global:
+		mlx5dv_get_clock_info;
+} MLX5_1.3;
+
+MLX5_1.5 {
+	global:
+		mlx5dv_create_flow_action_esp;
+} MLX5_1.4;
+
+MLX5_1.6 {
+        global:
+		mlx5dv_create_flow_matcher;
+		mlx5dv_destroy_flow_matcher;
+		mlx5dv_create_flow;
+} MLX5_1.5;
+
+MLX5_1.7 {
+	global:
+		mlx5dv_create_flow_action_modify_header;
+		mlx5dv_create_flow_action_packet_reformat;
+		mlx5dv_devx_alloc_uar;
+		mlx5dv_devx_free_uar;
+		mlx5dv_devx_general_cmd;
+		mlx5dv_devx_obj_create;
+		mlx5dv_devx_obj_destroy;
+		mlx5dv_devx_obj_modify;
+		mlx5dv_devx_obj_query;
+		mlx5dv_devx_query_eqn;
+		mlx5dv_devx_umem_dereg;
+		mlx5dv_devx_umem_reg;
+		mlx5dv_open_device;
+} MLX5_1.6;
+
+MLX5_1.8 {
+	global:
+		mlx5dv_devx_cq_modify;
+		mlx5dv_devx_cq_query;
+		mlx5dv_devx_ind_tbl_modify;
+		mlx5dv_devx_ind_tbl_query;
+		mlx5dv_devx_qp_modify;
+		mlx5dv_devx_qp_query;
+		mlx5dv_devx_srq_modify;
+		mlx5dv_devx_srq_query;
+		mlx5dv_devx_wq_modify;
+		mlx5dv_devx_wq_query;
+		mlx5dv_is_supported;
+} MLX5_1.7;
+
+MLX5_1.9 {
+	global:
+		mlx5dv_devx_create_cmd_comp;
+		mlx5dv_devx_destroy_cmd_comp;
+		mlx5dv_devx_get_async_cmd_comp;
+		mlx5dv_devx_obj_query_async;
+} MLX5_1.8;
+
+MLX5_1.10 {
+	global:
+		mlx5dv_alloc_dm;
+		mlx5dv_create_mkey;
+		mlx5dv_destroy_mkey;
+		mlx5dv_dr_action_create_dest_table;
+		mlx5dv_dr_action_create_dest_ibv_qp;
+		mlx5dv_dr_action_create_dest_vport;
+		mlx5dv_dr_action_create_flow_counter;
+		mlx5dv_dr_action_create_drop;
+		mlx5dv_dr_action_create_modify_header;
+		mlx5dv_dr_action_create_packet_reformat;
+		mlx5dv_dr_action_create_tag;
+		mlx5dv_dr_action_destroy;
+		mlx5dv_dr_domain_create;
+		mlx5dv_dr_domain_destroy;
+		mlx5dv_dr_domain_sync;
+		mlx5dv_dr_matcher_create;
+		mlx5dv_dr_matcher_destroy;
+		mlx5dv_dr_rule_create;
+		mlx5dv_dr_rule_destroy;
+		mlx5dv_dr_table_create;
+		mlx5dv_dr_table_destroy;
+		mlx5dv_qp_ex_from_ibv_qp_ex;
+} MLX5_1.9;
+
+MLX5_1.11 {
+        global:
+		mlx5dv_devx_create_event_channel;
+		mlx5dv_devx_destroy_event_channel;
+		mlx5dv_devx_get_event;
+		mlx5dv_devx_subscribe_devx_event;
+		mlx5dv_devx_subscribe_devx_event_fd;
+} MLX5_1.10;
+
+MLX5_1.12 {
+	global:
+		mlx5dv_alloc_var;
+		mlx5dv_dr_action_create_flow_meter;
+		mlx5dv_dr_action_modify_flow_meter;
+		mlx5dv_dump_dr_domain;
+		mlx5dv_dump_dr_matcher;
+		mlx5dv_dump_dr_rule;
+		mlx5dv_dump_dr_table;
+		mlx5dv_free_var;
+} MLX5_1.11;
+
+MLX5_1.13 {
+        global:
+		mlx5dv_pp_alloc;
+		mlx5dv_pp_free;
+} MLX5_1.12;
+
+MLX5_1.14 {
+	global:
+		mlx5dv_dr_action_create_default_miss;
+		mlx5dv_dr_domain_set_reclaim_device_memory;
+		mlx5dv_modify_qp_lag_port;
+		mlx5dv_query_qp_lag_port;
+} MLX5_1.13;
+
+MLX5_1.15 {
+	global:
+		mlx5dv_dr_action_create_dest_devx_tir;
+} MLX5_1.14;
+
+MLX5_1.16 {
+	global:
+		mlx5dv_dr_action_create_dest_array;
+		mlx5dv_dr_action_create_flow_sampler;
+} MLX5_1.15;
+
+MLX5_1.17 {
+	global:
+		mlx5dv_dr_action_create_aso;
+		mlx5dv_dr_action_create_pop_vlan;
+		mlx5dv_dr_action_create_push_vlan;
+		mlx5dv_dr_action_modify_aso;
+		mlx5dv_modify_qp_sched_elem;
+		mlx5dv_modify_qp_udp_sport;
+		mlx5dv_sched_leaf_create;
+		mlx5dv_sched_leaf_destroy;
+		mlx5dv_sched_leaf_modify;
+		mlx5dv_sched_node_create;
+		mlx5dv_sched_node_destroy;
+		mlx5dv_sched_node_modify;
+} MLX5_1.16;
+
+MLX5_1.18 {
+	global:
+		mlx5dv_reserved_qpn_alloc;
+		mlx5dv_reserved_qpn_dealloc;
+} MLX5_1.17;
+
+MLX5_1.19 {
+        global:
+		mlx5dv_devx_umem_reg_ex;
+		mlx5dv_dm_map_op_addr;
+		_mlx5dv_query_port;
+} MLX5_1.18;
+
+MLX5_1.20 {
+	global:
+		mlx5dv_dr_domain_allow_duplicate_rules;
+		mlx5dv_map_ah_to_qp;
+		mlx5dv_qp_cancel_posted_send_wrs;
+		_mlx5dv_mkey_check;
+} MLX5_1.19;
+
+MLX5_1.21 {
+	global:
+		mlx5dv_crypto_login;
+		mlx5dv_crypto_login_query_state;
+		mlx5dv_crypto_logout;
+		mlx5dv_dci_stream_id_reset;
+		mlx5dv_dek_create;
+		mlx5dv_dek_destroy;
+		mlx5dv_dek_query;
+		mlx5dv_dr_action_create_dest_ib_port;
+		mlx5dv_dr_matcher_set_layout;
+		mlx5dv_get_vfio_device_list;
+		mlx5dv_vfio_get_events_fd;
+		mlx5dv_vfio_process_events;
+} MLX5_1.20;
+
+MLX5_1.22 {
+	global:
+		mlx5dv_dr_aso_other_domain_link;
+		mlx5dv_dr_aso_other_domain_unlink;
+} MLX5_1.21;
+
+MLX5_1.23 {
+	global:
+		mlx5dv_devx_alloc_msi_vector;
+		mlx5dv_devx_create_eq;
+		mlx5dv_devx_destroy_eq;
+		mlx5dv_devx_free_msi_vector;
+} MLX5_1.22;
+
+MLX5_1.24 {
+	global:
+		mlx5dv_create_steering_anchor;
+		mlx5dv_crypto_login_create;
+		mlx5dv_crypto_login_destroy;
+		mlx5dv_crypto_login_query;
+		mlx5dv_destroy_steering_anchor;
+		mlx5dv_dr_action_create_dest_root_table;
+} MLX5_1.23;
+
+MLX5_1.25 {
+	global:
+		mlx5dv_get_data_direct_sysfs_path;
+		mlx5dv_reg_dmabuf_mr;
+} MLX5_1.24;
