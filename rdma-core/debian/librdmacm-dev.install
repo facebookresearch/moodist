@@ -1,0 +1,11 @@
+usr/include/infiniband/ib.h
+usr/include/rdma/rdma_cma.h
+usr/include/rdma/rdma_cma_abi.h
+usr/include/rdma/rdma_verbs.h
+usr/include/rdma/rsocket.h
+usr/lib/*/librdmacm*.so
+usr/lib/*/librdmacm.a
+usr/lib/*/pkgconfig/librdmacm.pc
+usr/share/man/man3/rdma_*.3
+usr/share/man/man7/rdma_cm.7
+usr/share/man/man7/rsocket.7
