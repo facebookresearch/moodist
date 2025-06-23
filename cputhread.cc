@@ -5191,29 +5191,28 @@ struct CpuThreadImpl {
 
     uintptr_t tensorAddress = (uintptr_t)params.tensor->data();
     size_t bytes = params.tensor->bytes();
-    MemoryRegistration* tensorMr;
+    MemoryRegistration* tensorMr = nullptr;
 
     CHECK(params.putKey != 0);
 
     bool isCuda = params.tensor->isCuda;
 
-    if (isCuda) {
-      tensorMr = regMrCuda(tensorAddress, bytes);
-
-      queuePutCallbacks[params.putKey] = std::move(params.callback);
-    } else {
-      auto region = cpu_allocator::regionAt(tensorAddress);
-
-      if (region.first) {
-        CHECK(region.first <= tensorAddress && region.first + region.second >= tensorAddress + bytes);
-        tensorMr = regMr(tensorAddress, bytes);
-
-        queuePutCallbacks[params.putKey] = std::move(params.callback);
+    if (bytes != 0) {
+      if (isCuda) {
+        tensorMr = regMrCuda(tensorAddress, bytes);
       } else {
-        fatal("unreachable; queue put called with an unknown cpu address %#x", tensorAddress);
-        CHECK(false);
+        auto region = cpu_allocator::regionAt(tensorAddress);
+
+        if (region.first) {
+          CHECK(region.first <= tensorAddress && region.first + region.second >= tensorAddress + bytes);
+          tensorMr = regMr(tensorAddress, bytes);
+        } else {
+          fatal("unreachable; queue put called with an unknown cpu address %#x", tensorAddress);
+          CHECK(false);
+        }
       }
     }
+    queuePutCallbacks[params.putKey] = std::move(params.callback);
     CHECK(params.tensor->shape.size() < 256);
     auto buffer = allocateTemporaryBuffer(4096);
     size_t i = params.location;
@@ -5223,7 +5222,7 @@ struct CpuThreadImpl {
                                x(header(opTypeQueuePut, i), params.remoteAddress, tensorAddress, bytes);
                                x(params.putKey, params.remoteGetKey, params.transactionKey, params.queueSize);
                                for (size_t i = 0; i != maxDevices; ++i) {
-                                 x(tensorMr->mrs[i] ? tensorMr->mrs[i]->rkey : 0);
+                                 x(tensorMr && tensorMr->mrs[i] ? tensorMr->mrs[i]->rkey : 0);
                                }
                                x(params.tensor->dtype);
                                x((uint8_t)params.tensor->shape.size());
@@ -5232,12 +5231,14 @@ struct CpuThreadImpl {
                                }
                                x(false);
                              }));
-    if (!isCuda && !params.streaming) {
+    if ((!isCuda && !params.streaming) || bytes == 0) {
       if (serializedBytes + bytes <= buffer->bytes) {
         bool inlineFlag = true;
         std::memcpy((char*)cpuPointer + serializedBytes - 1, &inlineFlag, sizeof(bool));
         std::memcpy((char*)cpuPointer + serializedBytes, (void*)tensorAddress, bytes);
         serializedBytes += bytes;
+      } else {
+        CHECK(bytes != 0);
       }
     }
     sendBuffer(i, std::move(buffer), serializedBytes);

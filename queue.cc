@@ -564,12 +564,12 @@ struct QueueImpl {
 
     uintptr_t tensorAddress = (uintptr_t)(const void*)value.data_ptr();
 
-    if (tensorAddress == 0) {
-      throw std::runtime_error("Queue.put value is a null tensor");
-    }
-
     td->dataPtr = tensorAddress;
     td->dataBytes = td->itemsize() * td->numel();
+
+    if (tensorAddress == 0 && td->dataBytes != 0) {
+      throw std::runtime_error(fmt::sprintf("Queue.put value is a %d-byte tensor with null address", td->dataBytes));
+    }
 
     if (value.is_cpu()) {
       if (cpu_allocator::owns(tensorAddress)) {
