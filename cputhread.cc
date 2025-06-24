@@ -1257,17 +1257,13 @@ struct CpuThreadImpl {
   }
 
   MemoryRegistration* regMrCuda(uintptr_t address, size_t bytes) {
-    if (bytes == 0) {
-      bytes = 1;
-    }
-
     unsigned long long bufferId = -1;
     CUdeviceptr base = 0;
     size_t size = 0;
 
     auto myRegion = allocator::mappedRegion(address);
 
-    if (myRegion.first) {
+    if (myRegion.first || bytes == 0) {
       bufferId = myRegion.first;
       base = myRegion.first;
       size = myRegion.second;
@@ -1306,6 +1302,9 @@ struct CpuThreadImpl {
       }
       if (ptr->mr.mrs[i]) {
         continue;
+      }
+      if (bytes == 0) {
+        break;
       }
       ibv_mr* mr = ibv_reg_mr(
           devices[i].protectionDomain, (void*)address, bytes,
@@ -5461,18 +5460,22 @@ struct CpuThreadImpl {
       const CatTensor* t = sorted[index].second;
       CHECK(t->index == index);
 
-      void* dst = (void*)((params.out ? params.out->data() : (uintptr_t)resultBuffer->cpuPointer) + offset);
-      void* src = (void*)t->address;
+      if (t->bytes) {
+        void* dst = (void*)((params.out ? params.out->data() : (uintptr_t)resultBuffer->cpuPointer) + offset);
+        void* src = (void*)t->address;
 
-      std::array<uint32_t, maxDevices> lkeys;
-      for (size_t i = 0; i != maxDevices; ++i) {
-        lkeys[i] = outMr->mrs[i] ? outMr->mrs[i]->lkey : 0;
-      }
-      ++nLiveReads;
-      self.readDataDistributed(i, dst, lkeys, src, t->rkey, t->bytes, self.makeCallback([this, index] {
-        --nLiveReads;
+        std::array<uint32_t, maxDevices> lkeys;
+        for (size_t i = 0; i != maxDevices; ++i) {
+          lkeys[i] = outMr->mrs[i] ? outMr->mrs[i]->lkey : 0;
+        }
+        ++nLiveReads;
+        self.readDataDistributed(i, dst, lkeys, src, t->rkey, t->bytes, self.makeCallback([this, index] {
+          --nLiveReads;
+          ++nReadsDone;
+        }));
+      } else {
         ++nReadsDone;
-      }));
+      }
       return false;
     }
 

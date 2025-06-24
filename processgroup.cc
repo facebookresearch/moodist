@@ -2670,14 +2670,14 @@ struct ProcessGroupImpl {
 
     uintptr_t tensorAddress = (uintptr_t)(const void*)tensor.data_ptr();
 
-    if (tensorAddress == 0) {
-      throw std::runtime_error("getTensorReference: got a null tensor");
-    }
-
     td->dataPtr = tensorAddress;
     td->dataBytes = td->itemsize() * td->numel();
 
     td->isCuda = !tensor.is_cpu();
+
+    if (tensorAddress == 0 && td->dataBytes != 0) {
+      throw std::runtime_error(fmt::sprintf("getTensorReference: got a null tensor of %d bytes", td->dataBytes));
+    }
 
     return td;
   }
