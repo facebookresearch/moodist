@@ -72,6 +72,16 @@ struct TemporaryLkeyBuffers {
   Vector<TemporaryBufferHandle> busy;
 };
 
+struct Device;
+struct Callback;
+struct QueuedWr {
+  size_t i;
+  void* localAddress;
+  uint32_t lkey;
+  size_t bytes;
+  Callback* callback;
+};
+struct SmallFunction;
 struct Device {
   IntrusiveListLink<Device> link;
   IbCommon* ib;
@@ -82,6 +92,8 @@ struct Device {
   size_t numCqEvents = 0;
 
   TemporaryLkeyBuffers temporaryLkeyBuffers;
+
+  IVector<Function<void()>> queuedWrs;
 };
 
 struct SmallFunction {
@@ -627,17 +639,22 @@ struct CpuThreadImpl {
           });
         } else {
           CHECK(dev.currentCqEntries != 0);
-          --dev.currentCqEntries;
-          if (dev.currentCqEntries == 0) {
-            CHECK(s.wcsi == s.wcsn);
-            ++s.i;
-            activeDevices.erase(dev);
+          if (!dev.queuedWrs.empty()) {
+            CHECK(dev.currentCqEntries == maxCqEntries);
+            dev.queuedWrs.pop_front_value()();
+          } else {
+            --dev.currentCqEntries;
+            if (dev.currentCqEntries == 0) {
+              CHECK(s.wcsi == s.wcsn);
+              ++s.i;
+              activeDevices.erase(dev);
 
-            if (!dev.temporaryLkeyBuffers.busy.empty()) {
-              for (auto& v : dev.temporaryLkeyBuffers.busy) {
-                dev.temporaryLkeyBuffers.free.push_back(std::move(v));
+              if (!dev.temporaryLkeyBuffers.busy.empty()) {
+                for (auto& v : dev.temporaryLkeyBuffers.busy) {
+                  dev.temporaryLkeyBuffers.free.push_back(std::move(v));
+                }
+                dev.temporaryLkeyBuffers.busy.clear();
               }
-              dev.temporaryLkeyBuffers.busy.clear();
             }
           }
           CHECK(wc.wr_id != 0);
@@ -681,59 +698,74 @@ struct CpuThreadImpl {
     return {(void*)r, lkey};
   }
 
+  void postWriteImpl(
+      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback, bool allowInline) {
+    CHECK(i >= 0 && i < size);
+
+    bytesWritten += bytes;
+
+    ibv_qp_ex* qp = dev.ib->qpex;
+
+    // log.info(
+    //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
+    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+
+    bool efa = qp != nullptr;
+    if (!efa) {
+      qp = dev.ib->qpexs[i];
+      CHECK(qp != nullptr);
+    }
+
+    ibv_wr_start(qp);
+    qp->wr_id = (uint64_t)(void*)callback;
+    qp->wr_flags = IBV_SEND_SIGNALED;
+    ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
+    if (allowInline && bytes <= dev.ib->inlineBytes) {
+      ibv_wr_set_inline_data(qp, localAddress, bytes);
+    } else {
+      if (!lkey) {
+        std::tie(localAddress, lkey) = temporaryLkey(dev, localAddress, bytes);
+      }
+      ibv_wr_set_sge(qp, *lkey, (uintptr_t)localAddress, bytes);
+    }
+
+    if (efa) {
+      ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
+    }
+    int error = ibv_wr_complete(qp);
+    if (error) {
+      throwErrno(error, "ibv_wr_complete");
+    }
+  }
+
+  void postWrite(
+      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback, bool allowInline) {
+    CHECK(i >= 0 && i < size);
+
+    callback->i = i;
+    ++callback->refcount;
+
+    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
+      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline] {
+        postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
+      });
+      return;
+    }
+    ++dev.currentCqEntries;
+    if (dev.currentCqEntries == 1) {
+      activeDevices.push_back(dev);
+    }
+    postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
+  }
+
   void writeData(
       Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
       size_t bytes, Callback* callback, bool allowInline = true) {
     CHECK(i >= 0 && i < size);
 
     callback->i = i;
-
-    auto post = [&]() {
-      bytesWritten += bytes;
-
-      ++callback->refcount;
-
-      while (dev.currentCqEntries == maxCqEntries) {
-        poll();
-      }
-      ++dev.currentCqEntries;
-      if (dev.currentCqEntries == 1) {
-        activeDevices.push_back(dev);
-      }
-
-      ibv_qp_ex* qp = dev.ib->qpex;
-
-      // log.info(
-      //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-      //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
-
-      bool efa = qp != nullptr;
-      if (!efa) {
-        qp = dev.ib->qpexs[i];
-        CHECK(qp != nullptr);
-      }
-
-      ibv_wr_start(qp);
-      qp->wr_id = (uint64_t)(void*)callback;
-      qp->wr_flags = IBV_SEND_SIGNALED;
-      ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-      if (allowInline && bytes <= dev.ib->inlineBytes) {
-        ibv_wr_set_inline_data(qp, localAddress, bytes);
-      } else {
-        if (!lkey) {
-          std::tie(localAddress, lkey) = temporaryLkey(dev, localAddress, bytes);
-        }
-        ibv_wr_set_sge(qp, *lkey, (uintptr_t)localAddress, bytes);
-      }
-
-      if (efa) {
-        ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
-      }
-      int error = ibv_wr_complete(qp);
-      if (error) {
-        throwErrno(error, "ibv_wr_complete");
-      }
-    };
 
     const size_t threshold = 1024ull * 1024 * 896;
     const size_t chunkSize = 1024ull * 1024 * 768;
@@ -744,14 +776,14 @@ struct CpuThreadImpl {
         if (remaining < threshold) {
           bytes = remaining;
         }
-        post();
+        postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
 
         localAddress = (void*)((uintptr_t)localAddress + bytes);
         remoteAddress = (void*)((uintptr_t)remoteAddress + bytes);
         remaining -= bytes;
       }
     } else {
-      post();
+      postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
     }
   }
 
@@ -761,111 +793,18 @@ struct CpuThreadImpl {
     return writeData(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, false);
   }
 
-  void readData(
+  void postReadImpl(
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback) {
     CHECK(i >= 0 && i < size);
 
-    callback->i = i;
-
-    auto post = [&]() {
-      ibv_sge sge;
-      sge.addr = (uintptr_t)localAddress;
-      sge.length = bytes;
-      sge.lkey = lkey;
-
-      bytesRead += bytes;
-
-      ++callback->refcount;
-
-      while (dev.currentCqEntries == maxCqEntries) {
-        poll();
-      }
-      ++dev.currentCqEntries;
-      if (dev.currentCqEntries == 1) {
-        activeDevices.push_back(dev);
-      }
-
-      ibv_qp_ex* qp = dev.ib->qpex;
-
-      // log.info(
-      //     "%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-      //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
-
-      bool efa = qp != nullptr;
-      if (!efa) {
-        qp = dev.ib->qpexs[i];
-        CHECK(qp != nullptr);
-      }
-
-      ibv_wr_start(qp);
-      qp->wr_id = (uint64_t)(void*)callback;
-      qp->wr_flags = IBV_SEND_SIGNALED;
-      ibv_wr_rdma_read(qp, rkey, (uintptr_t)remoteAddress);
-      ibv_wr_set_sge_list(qp, 1, &sge);
-
-      if (efa) {
-        ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
-      }
-      int error = ibv_wr_complete(qp);
-      if (error) {
-        fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
-      }
-    };
-
-    const size_t threshold = 1024ull * 1024 * 896;
-    const size_t chunkSize = 1024ull * 1024 * 768;
-    if (bytes >= threshold) {
-      size_t remaining = bytes;
-      bytes = chunkSize;
-      while (remaining > 0) {
-        if (remaining < threshold) {
-          bytes = remaining;
-        }
-        post();
-
-        localAddress = (void*)((uintptr_t)localAddress + bytes);
-        remoteAddress = (void*)((uintptr_t)remoteAddress + bytes);
-        remaining -= bytes;
-      }
-    } else {
-      post();
-    }
-  }
-
-  void writeControl(
-      size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
-      uint32_t rkey, size_t bytes) {
-    CHECK(i >= 0 && i < size);
-
-    auto callback = makeCallback(nullptr);
-    callback->i = i;
-
-    callback->counter = &concurrencyLiveControlTransfers[concurrencyIndex];
-    ++callback->refcount;
-
-    ibv_sge sge;
-    sge.addr = (uintptr_t)localAddress;
-    sge.length = bytes;
-    sge.lkey = lkey;
-
-    bytesWritten += bytes;
-
-    while (dev.currentCqEntries == maxCqEntries) {
-      poll();
-    }
-    ++dev.currentCqEntries;
-    if (dev.currentCqEntries == 1) {
-      activeDevices.push_back(dev);
-    }
-
-    ++concurrencyLiveControlTransfers[concurrencyIndex];
+    bytesRead += bytes;
 
     ibv_qp_ex* qp = dev.ib->qpex;
 
     // log.info(
-    //     "%d: rdma write control %d bytes (%p -> %p, rkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress,
-    //     remoteAddress, rkey, &dev - devices.data(), i);
+    //     "%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
+    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
 
     bool efa = qp != nullptr;
     if (!efa) {
@@ -874,14 +813,10 @@ struct CpuThreadImpl {
     }
 
     ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)(Callback*)callback;
+    qp->wr_id = (uint64_t)(void*)callback;
     qp->wr_flags = IBV_SEND_SIGNALED;
-    ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-    if (bytes <= dev.ib->inlineBytes) {
-      ibv_wr_set_inline_data(qp, localAddress, bytes);
-    } else {
-      ibv_wr_set_sge_list(qp, 1, &sge);
-    }
+    ibv_wr_rdma_read(qp, rkey, (uintptr_t)remoteAddress);
+    ibv_wr_set_sge(qp, lkey, (uintptr_t)localAddress, bytes);
 
     if (efa) {
       ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
@@ -892,31 +827,87 @@ struct CpuThreadImpl {
     }
   }
 
-  void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
-    CHECK(i >= 0 && i < size);
-
+  void postRead(
+      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      Callback* callback) {
     callback->i = i;
-
-    ibv_sge sge;
-    sge.addr = (uintptr_t)localAddress;
-    sge.length = bytes;
-    sge.lkey = lkey;
-
-    bytesWritten += bytes;
-
     ++callback->refcount;
 
-    while (dev.currentCqEntries == maxCqEntries) {
-      poll();
+    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
+      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
+        postReadImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+      });
+      return;
     }
     ++dev.currentCqEntries;
     if (dev.currentCqEntries == 1) {
       activeDevices.push_back(dev);
     }
 
+    return postReadImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+  }
+
+  void readData(
+      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      Callback* callback) {
+    CHECK(i >= 0 && i < size);
+
+    const size_t threshold = 1024ull * 1024 * 896;
+    const size_t chunkSize = 1024ull * 1024 * 768;
+    if (bytes >= threshold) [[unlikely]] {
+      size_t remaining = bytes;
+      bytes = chunkSize;
+      while (remaining > 0) {
+        if (remaining < threshold) {
+          bytes = remaining;
+        }
+        postRead(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+
+        localAddress = (void*)((uintptr_t)localAddress + bytes);
+        remoteAddress = (void*)((uintptr_t)remoteAddress + bytes);
+        remaining -= bytes;
+      }
+    } else {
+      postRead(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+    }
+  }
+
+  void writeControl(
+      size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
+      uint32_t rkey, size_t bytes) {
+    CHECK(i >= 0 && i < size);
+
+    auto callbackobj = makeCallback(nullptr);
+    Callback* callback = callbackobj;
+    callback->i = i;
+
+    callback->counter = &concurrencyLiveControlTransfers[concurrencyIndex];
+    ++callback->refcount;
+
+    ++concurrencyLiveControlTransfers[concurrencyIndex];
+
+    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
+      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
+        postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+      });
+      return;
+    }
+    ++dev.currentCqEntries;
+    if (dev.currentCqEntries == 1) {
+      activeDevices.push_back(dev);
+    }
+
+    postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+  }
+
+  void postSendImpl(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
+    CHECK(i >= 0 && i < size);
+
+    bytesWritten += bytes;
+
     // log.info(
-    //     "%d: post send %d bytes (%p lkey %#x) (dev %d, i %d)\n", rank, bytes, localAddress, lkey, &dev -
-    //     devices.data(), i);
+    //     "%d: post send %d bytes (%p lkey %#x) (dev %d, i %d, dev.currentCqEntries %d)\n", rank, bytes,
+    //     localAddress, lkey, &dev - devices.data(), i, dev.currentCqEntries);
 
     ibv_qp_ex* qp = dev.ib->qpex;
     bool efa = qp != nullptr;
@@ -928,9 +919,8 @@ struct CpuThreadImpl {
     ibv_wr_start(qp);
     qp->wr_id = (uint64_t)(void*)callback;
     qp->wr_flags = IBV_SEND_SIGNALED;
-    // ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
     ibv_wr_send(qp);
-    ibv_wr_set_sge_list(qp, 1, &sge);
+    ibv_wr_set_sge(qp, lkey, (uintptr_t)localAddress, bytes);
 
     if (efa) {
       ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
@@ -939,6 +929,25 @@ struct CpuThreadImpl {
     if (error) {
       fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
     }
+  }
+
+  void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
+    callback->i = i;
+    ++callback->refcount;
+
+    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
+      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, bytes, callback] {
+        postSendImpl(dev, i, localAddress, lkey, bytes, callback);
+      });
+      return;
+    }
+
+    ++dev.currentCqEntries;
+    if (dev.currentCqEntries == 1) {
+      activeDevices.push_back(dev);
+    }
+
+    postSendImpl(dev, i, localAddress, lkey, bytes, callback);
   }
 
   void postRecv(Device& dev, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
@@ -1849,7 +1858,8 @@ struct CpuThreadImpl {
   //   const size_t nDevices = self.devices.size();
   //   std::array<SendState, 32> sendStates;
 
-  //   WorkReduceScatterRing(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params), params(params)
+  //   WorkReduceScatterRing(CpuThreadImpl& self, QueueEntryReduceScatter& params) : Work(self, params),
+  //   params(params)
   //   {}
 
   //   void callback(
@@ -2848,7 +2858,8 @@ struct CpuThreadImpl {
       }
 
       // log.info(
-      //     "reduce-scatter %#x took %gms\n", stepValue, seconds(std::chrono::steady_clock::now() - startTime) * 1000);
+      //     "reduce-scatter %#x took %gms\n", stepValue, seconds(std::chrono::steady_clock::now() - startTime) *
+      //     1000);
 
       self.cpuThread->freelistReduceScatter.push(&params);
       self.allocatorReduceScatterDirectWrite.deallocate(this);
@@ -5032,12 +5043,14 @@ struct CpuThreadImpl {
         WAIT_DYN(opTypeCreateQueue, 0);
         if (params.location != dyn.gatherKey[0]) {
           fatal(
-              "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location %d",
+              "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location "
+              "%d",
               rank, params.location, params.location, dyn.gatherKey[0]);
         }
         if (params.streaming != dyn.gatherKey[1]) {
           fatal(
-              "Queue streaming mismatch. Queue was created on rank %d with streaming %d, but on rank %d with streaming "
+              "Queue streaming mismatch. Queue was created on rank %d with streaming %d, but on rank %d with "
+              "streaming "
               "%d",
               rank, params.streaming, params.location, dyn.gatherKey[1]);
         }
@@ -5920,7 +5933,8 @@ struct CpuThreadImpl {
     *params.outAddress = address;
     if (params.location != location || params.streaming != streaming) {
       std::string err = fmt::sprintf(
-          "Queue creation found mismatched parameters for named queue '%s'. Local: location %d, streaming %d. Remote: "
+          "Queue creation found mismatched parameters for named queue '%s'. Local: location %d, streaming %d. "
+          "Remote: "
           "location %d, streaming %d\n",
           *params.name, params.location, params.streaming, location, streaming);
       if (params.outError) {
