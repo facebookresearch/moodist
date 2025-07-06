@@ -1233,9 +1233,8 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual bool isEnabled() const {
     return true;
   }
-  virtual void emptyCache() override {
-    // throw std::runtime_error("moodist CUDAAllocator::emptyCache: not implemented");
-  }
+  virtual void emptyCache() {}
+  virtual void emptyCache(at::cuda::MempoolId_t) {}
   virtual void cacheInfo(c10::DeviceIndex dev_id, size_t* largestBlock) override {
     throw std::runtime_error("moodist CUDAAllocator::cacheInfo: not implemented");
   }
@@ -1268,8 +1267,10 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     deviceStats.allocated_bytes[0].reset_peak();
     deviceStats.active_bytes[0].reset_peak();
   }
-  virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot() override {
-    // throw std::runtime_error("moodist CUDAAllocator::snapshot: not implemented");
+  virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot() {
+    return {};
+  }
+  virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot(at::cuda::MempoolId_t) {
     return {};
   }
   virtual void beginAllocateToPool(
@@ -1307,7 +1308,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   }
 
   virtual void enablePeerAccess(c10::DeviceIndex dev, c10::DeviceIndex dev_to_access) override {
-    //throw std::runtime_error("moodist CUDAAllocator::enablePeerAccess: not implemented");
+    // throw std::runtime_error("moodist CUDAAllocator::enablePeerAccess: not implemented");
   }
 
   virtual cudaError_t memcpyAsync(
