@@ -1241,7 +1241,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual void* getBaseAllocation(void* ptr, size_t* size) override {
     throw std::runtime_error("moodist CUDAAllocator::getBaseAllocation: not implemented");
   }
-  virtual void recordStream(const torch::DataPtr& ptr, c10::cuda::CUDAStream stream) override {
+  virtual void recordStream(const torch::DataPtr& ptr, c10::Stream stream) override {
     auto& list = streamUses[(uintptr_t)ptr.get()];
     if (!list) {
       if (!streamListFree.empty()) {
@@ -1251,7 +1251,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
         list = std::make_unique<Vector<CUstream>>();
       }
     }
-    list->push_back(stream);
+    list->push_back(c10::cuda::CUDAStream{stream});
   }
   virtual c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex device) override {
     // throw std::runtime_error("moodist CUDAAllocator::getDeviceStats: not implemented");
