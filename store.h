@@ -1,0 +1,34 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#pragma once
+
+#include <torch/csrc/distributed/c10d/Store.hpp>
+
+namespace moodist {
+
+struct StoreImpl;
+
+class TORCH_API TcpStore final : public c10d::Store {
+public:
+  TcpStore(std::shared_ptr<StoreImpl> impl) : impl(impl) {}
+  TcpStore(
+      std::string hostname, int port, std::string key, int worldSize, int rank,
+      std::chrono::steady_clock::duration timeout);
+
+  std::shared_ptr<StoreImpl> impl;
+
+  virtual c10::intrusive_ptr<Store> clone() {
+    return c10::make_intrusive<TcpStore>(impl);
+  }
+
+  virtual void set(const std::string& key, const std::vector<uint8_t>& value) override;
+  virtual std::vector<uint8_t> get(const std::string& key) override;
+  virtual int64_t add(const std::string& key, int64_t value) override;
+  virtual bool deleteKey(const std::string& key) override;
+  virtual bool check(const std::vector<std::string>& keys) override;
+  virtual int64_t getNumKeys() override;
+  virtual void wait(const std::vector<std::string>& keys) override;
+  virtual void wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) override;
+};
+
+} // namespace moodist

@@ -46,10 +46,6 @@ struct SetupCommsImpl : SetupComms {
           if (error) {
             return;
           }
-          // fmt::fprintf(
-          //     stdout, "Got new connection, local address: %s remote address: %s\n", connection->localAddress(),
-          //     connection->remoteAddress());
-          std::fflush(stdout);
           std::lock_guard l(mutex);
           if (dying) {
             return;

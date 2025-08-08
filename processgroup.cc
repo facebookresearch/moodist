@@ -36,7 +36,7 @@ namespace moodist {
 
 extern bool profilingEnabled;
 
-async::Scheduler& scheduler = *new async::Scheduler();
+async::Scheduler& scheduler = *new async::Scheduler(1);
 
 void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
@@ -235,8 +235,6 @@ struct ProcessGroupImpl {
 
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     CHECK(rank >= 0 && size > 0 && rank < size);
-
-    scheduler.setMaxThreads(1);
 
     log.init();
 

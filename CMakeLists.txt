@@ -32,7 +32,7 @@ set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch
 
 if (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto")
   message(STATUS "Auto-detecting pytorch abi")
-  foreach(abi IN ITEMS 16 11 13 19 20 18 17 15 14 12)
+  foreach(abi IN ITEMS 19 18 16 11 13 20 17 15 14 12)
     foreach (cxx IN ITEMS 1 0)
       set(dir ${CMAKE_CURRENT_BINARY_DIR}/detect_abi_${abi}_${cxx})
       try_compile(success PROJECT detect_abi SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/detect_abi BINARY_DIR ${dir} CMAKE_FLAGS -DABI_VERSION=${abi} -DUSE_CXX1_ABI=${cxx} -DTorchPath=${TorchPath} OUTPUT_VARIABLE stdout)
@@ -140,6 +140,7 @@ pybind11_add_module(_C
   numa.cc
   alltoall.cc
   internal_allocator.cc
+  store.cc
   fmt/src/format.cc
   ${rdma_sources}
 )

@@ -45,11 +45,13 @@ struct Socket {
   Socket& operator=(Socket&& n);
   static Socket Unix();
   static Socket Tcp();
+  static Socket Udp(bool ipv6);
 
   void close();
   bool closed() const;
 
   void listen(std::string_view address);
+  bool bind(int port);
   void accept(Function<void(Error*, Socket)> callback);
   void connect(std::string_view address, Function<void(Error*)> callback);
 
@@ -67,6 +69,13 @@ struct Socket {
   std::string remoteAddress() const;
 
   int nativeFd() const;
+
+  void resolve(std::string_view address, Function<void(void*, size_t)> callback);
+  void resolve(std::string_view address, int port, Function<void(void*, size_t)> callback);
+
+  static std::string ipAndPort(const void* addr, size_t addrlen);
+
+  std::pair<const void*, size_t> recvFromAddr();
 };
 
 struct CachedReader {

@@ -11,6 +11,7 @@ from ._C import (
     cpu_allocator_debug,
     cuda_copy,
     set_prefer_kernel_less,
+    TcpStore,
 )
 from .version import __version__
 
@@ -150,4 +151,5 @@ __all__ = [
     "Empty",
     "cuda_copy",
     "set_prefer_kernel_less",
+    "TcpStore",
 ]

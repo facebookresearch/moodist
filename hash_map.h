@@ -87,7 +87,7 @@ public:
     using iterator_category = std::bidirectional_iterator_tag;
 
     std::pair<Key&, Value&>& operator*() const noexcept {
-      new (&tmp) std::pair<Key&, Value&>(*(Key*)((char*)v - sizeof(Key)), *v);
+      new (&tmp) std::pair<Key&, Value&>(*(Key*)((char*)v - std::max(sizeof(Key), alignof(Value))), *v);
       return (std::pair<Key&, Value&>&)tmp;
     }
     std::pair<Key&, Value&>* operator->() const noexcept {

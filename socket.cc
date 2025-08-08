@@ -4,6 +4,7 @@
 
 #include "async.h"
 #include "function.h"
+#include "hash_map.h"
 #include "vector.h"
 
 #include "fmt/printf.h"
@@ -136,8 +137,13 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   int fd = -1;
   std::atomic_bool closed = false;
   bool readLoopClose = false;
-  std::shared_ptr<ResolveHandle> resolveHandle;
+  uint32_t resolveCounter = 0;
+  HashMap<uint32_t, std::shared_ptr<ResolveHandle>> resolveHandles;
   bool addedInPoll = false;
+  bool isUdp = false;
+
+  sockaddr_storage recvFromAddr;
+  size_t recvFromAddrLen = 0;
 
   alignas(64) std::atomic_int writeTriggerCount = 0;
   SpinMutex writeQueueMutex;
@@ -166,9 +172,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     std::unique_lock l3(writeQueueMutex);
     queuedWrites.clear();
     queuedWriteCallbacks.clear();
-    if (resolveHandle) {
-      resolveHandle = nullptr;
-    }
+    resolveHandles.clear();
     if (fd != -1) {
       ::close(fd);
       fd = -1;
@@ -209,7 +213,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
       if (::listen(fd, 50) == -1) {
         throw std::system_error(errno, std::generic_category(), "listen:");
       }
-    } else if (af == AF_INET) {
+    } else if (af == AF_INET || af == AF_INET6) {
       wl.unlock();
       int port = 0;
       std::tie(address, port) = decodeIpAddress(address);
@@ -265,10 +269,30 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
             }
           });
       wl.lock();
-      resolveHandle = std::move(h);
     } else {
       throw Error("listen: unkown address family\n");
     }
+  }
+
+  bool bind(int port) {
+    bool r = false;
+    if (af == AF_INET) {
+      sockaddr_in sa;
+      std::memset(&sa, 0, sizeof(sa));
+      sa.sin_family = af;
+      sa.sin_port = htons(port);
+      r = ::bind(fd, (sockaddr*)&sa, sizeof(sa)) == 0;
+    } else if (af == AF_INET6) {
+      sockaddr_in6 sa;
+      std::memset(&sa, 0, sizeof(sa));
+      sa.sin6_family = af;
+      sa.sin6_port = htons(port);
+      r = ::bind(fd, (sockaddr*)&sa, sizeof(sa)) == 0;
+    }
+    if (r) {
+      poll::add(shared_from_this());
+    }
+    return r;
   }
 
   void setTcpSockOpts() {
@@ -331,14 +355,17 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
         writeLoop(wl, ql);
       }
     } else {
+      uint32_t resolveKey = resolveCounter++;
+      resolveHandles[resolveKey] = nullptr;
       wl.unlock();
       int port = 0;
       std::tie(address, port) = decodeIpAddress(address);
       auto h = resolveIpAddress(
           address, port, true,
-          [this, me = shared_from_this(), address = std::string(address)](Error* e, addrinfo* aix) {
+          [this, me = shared_from_this(), address = std::string(address), resolveKey](Error* e, addrinfo* aix) {
             std::unique_lock rl(readMutex);
             std::unique_lock wl(writeMutex);
+            resolveHandles.erase(resolveKey);
             if (closed.load(std::memory_order_relaxed)) {
               return;
             }
@@ -368,7 +395,9 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
             }
           });
       wl.lock();
-      resolveHandle = std::move(h);
+      if (resolveHandles.contains(resolveKey)) {
+        resolveHandles[resolveKey] = std::move(h);
+      }
     }
   }
 
@@ -475,6 +504,10 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     msg.msg_iov = (::iovec*)vec;
     msg.msg_iovlen = std::min(veclen, (size_t)IOV_MAX);
     readTriggerCount.store(-0xffff, std::memory_order_relaxed);
+    if (isUdp) {
+      msg.msg_name = &recvFromAddr;
+      msg.msg_namelen = sizeof(recvFromAddr);
+    }
     ssize_t r = ::recvmsg(fd, &msg, 0);
     wantsRead = true;
     if (r == -1) {
@@ -492,7 +525,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
       }
       return 0;
     } else {
-      if (r == 0) {
+      if (r == 0 && !isUdp) {
         wantsRead = false;
         Error e("Connection closed");
         if (onRead) {
@@ -507,6 +540,9 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
           std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
           receivedFds.push_back(fd);
         }
+      }
+      if (isUdp) {
+        recvFromAddrLen = msg.msg_namelen;
       }
       return r;
     }
@@ -554,6 +590,10 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
           }
         }
       }
+    }
+    size_t nbytes = 0;
+    for (size_t i : range(veclen)) {
+      nbytes += vec[i].iov_len;
     }
     writeTriggerCount.store(-0xffff, std::memory_order_relaxed);
     ssize_t r = ::sendmsg(fd, &msg, MSG_NOSIGNAL);
@@ -764,7 +804,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   }
 
   std::vector<std::string> localAddresses() const {
-    if (af == AF_INET) {
+    if (af == AF_INET || af == AF_INET6) {
       std::vector<std::string> r;
       sockaddr_storage addr;
       socklen_t addrlen = sizeof(addr);
@@ -820,7 +860,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   }
 
   std::string localAddress() const {
-    if (af == AF_INET) {
+    if (af == AF_INET || af == AF_INET6) {
       sockaddr_storage addr;
       socklen_t addrlen = sizeof(addr);
       if (::getsockname(fd, (sockaddr*)&addr, &addrlen)) {
@@ -833,7 +873,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   }
 
   std::string remoteAddress() const {
-    if (af == AF_INET) {
+    if (af == AF_INET || af == AF_INET6) {
       sockaddr_storage addr;
       socklen_t addrlen = sizeof(addr);
       if (::getpeername(fd, (sockaddr*)&addr, &addrlen)) {
@@ -843,6 +883,44 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     } else {
       return "";
     }
+  }
+
+  void resolve(std::string_view address, int port, Function<void(void*, size_t)> callback) {
+    std::unique_lock wl(writeMutex);
+    if (closed.load(std::memory_order_relaxed)) {
+      return;
+    }
+    uint32_t resolveKey = resolveCounter++;
+    resolveHandles[resolveKey] = nullptr;
+    wl.unlock();
+    int socktype = isUdp ? SOCK_DGRAM : SOCK_STREAM;
+    auto h = resolveIpAddress(
+        address, port, true,
+        [this, me = shared_from_this(), address = std::string(address), socktype, callback,
+         resolveKey](Error* e, addrinfo* aix) {
+          std::unique_lock rl(readMutex);
+          std::unique_lock wl(writeMutex);
+          resolveHandles.erase(resolveKey);
+          if (closed.load(std::memory_order_relaxed)) {
+            return;
+          }
+          if (!e) {
+            for (auto* i = aix; i; i = i->ai_next) {
+              if ((i->ai_family == AF_INET || i->ai_family == AF_INET6) && i->ai_socktype == socktype) {
+                callback(i->ai_addr, i->ai_addrlen);
+              }
+            }
+          }
+        });
+    wl.lock();
+    if (resolveHandles.contains(resolveKey)) {
+      resolveHandles[resolveKey] = std::move(h);
+    }
+  }
+  void resolve(std::string_view address, Function<void(void*, size_t)> callback) {
+    int port = 0;
+    std::tie(address, port) = decodeIpAddress(address);
+    resolve(address, port, std::move(callback));
   }
 };
 
@@ -978,6 +1056,18 @@ Socket Socket::Tcp() {
   return r;
 }
 
+Socket Socket::Udp(bool ipv6) {
+  Socket r;
+  r.impl = std::make_shared<SocketImpl>();
+  r.impl->af = ipv6 ? AF_INET6 : AF_INET;
+  r.impl->fd = ::socket(r.impl->af, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_UDP);
+  r.impl->isUdp = true;
+  if (r.impl->fd == -1) {
+    throw std::system_error(errno, std::generic_category(), "socket");
+  }
+  return r;
+}
+
 Socket::Socket() {}
 Socket::Socket(Socket&& n) {
   std::swap(impl, n.impl);
@@ -1010,6 +1100,10 @@ void Socket::writev(const iovec* vec, size_t veclen, Function<void(Error*)> call
 
 void Socket::listen(std::string_view address) {
   impl->listen(address);
+}
+
+bool Socket::bind(int port) {
+  return impl->bind(port);
 }
 
 void Socket::accept(Function<void(Error*, Socket)> callback) {
@@ -1050,6 +1144,22 @@ std::string Socket::remoteAddress() const {
 
 int Socket::nativeFd() const {
   return impl->fd;
+}
+
+void Socket::resolve(std::string_view address, Function<void(void*, size_t)> callback) {
+  impl->resolve(address, std::move(callback));
+}
+
+void Socket::resolve(std::string_view address, int port, Function<void(void*, size_t)> callback) {
+  impl->resolve(address, port, std::move(callback));
+}
+
+std::string Socket::ipAndPort(const void* addr, size_t addrlen) {
+  return SocketImpl::ipAndPort((const sockaddr*)addr, (socklen_t)addrlen);
+}
+
+std::pair<const void*, size_t> Socket::recvFromAddr() {
+  return {&impl->recvFromAddr, impl->recvFromAddrLen};
 }
 
 } // namespace moodist
