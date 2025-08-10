@@ -26,6 +26,7 @@ static constexpr uint8_t messageDone = 0x3;
 static constexpr uint8_t messageSet = 0x4;
 static constexpr uint8_t messageGet = 0x5;
 static constexpr uint8_t messageCheck = 0x6;
+static constexpr uint8_t messageWait = 0x7;
 
 static TcpContext context;
 
@@ -543,16 +544,22 @@ struct StoreImpl {
         i->second->futex = 1;
         futexWakeAll(&i->second->futex);
       }
-    } else if (t == messageGet) {
+    } else if (t == messageGet || t == messageWait) {
       std::string key;
       deserializeBufferPart(view, key);
-      internalStoreGetValue(key, [this, edgeRank, seq, sourceRank, id](const std::vector<uint8_t>& data) {
+      internalStoreGetValue(key, [this, edgeRank, seq, sourceRank, id, t, key](const std::vector<uint8_t>& data) {
         CHECK(edgeRank != -1);
         auto& pi = getEdge(edgeRank);
         uint32_t seq = pi.outgoingSeq++;
-        sendMessage(
-            edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone, data),
-            pi);
+        if (t == messageGet) {
+          sendMessage(
+              edgeRank, seq,
+              serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone, data), pi);
+        } else {
+          sendMessage(
+              edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone),
+              pi);
+        }
       });
     } else if (t == messageCheck) {
       std::string key;
@@ -1004,7 +1011,8 @@ struct StoreImpl {
   }
 
   template<typename... Args>
-  std::shared_ptr<Wait> doWaitOp(uint8_t messageType, std::string_view key, const Args&... args) {
+  std::shared_ptr<Wait> doWaitOp(
+      std::chrono::steady_clock::duration timeout, uint8_t messageType, std::string_view key, const Args&... args) {
     uint32_t id = nextId.fetch_add(1);
     uint32_t r = storeRank(key);
     std::unique_lock l(mutex);
@@ -1024,6 +1032,11 @@ struct StoreImpl {
     w->start = std::chrono::steady_clock::now();
     w->end = w->start + timeout;
     return w;
+  }
+
+  template<typename... Args>
+  std::shared_ptr<Wait> doWaitOp(uint8_t messageType, std::string_view key, const Args&... args) {
+    return doWaitOp(timeout, messageType, key, args...);
   }
 
   void set(std::string_view key, const std::vector<uint8_t>& value) {
@@ -1067,6 +1080,22 @@ struct StoreImpl {
     }
     return r;
   }
+
+  void wait(const std::vector<std::string>& keys, std::chrono::steady_clock::duration timeout) {
+    Vector<std::shared_ptr<Wait>> v;
+    for (auto& k : keys) {
+      v.push_back(doWaitOp(messageWait, k));
+    }
+    bool r = true;
+    for (auto& w : v) {
+      w->wait();
+      if (w->timedOut) {
+        throw std::runtime_error(fmt::sprintf(
+            "Moodist Store wait(%s) timed out after %g seconds", fmt::to_string(fmt::join(keys, ", ")),
+            seconds(timeout)));
+      }
+    }
+  }
 };
 
 TcpStore::TcpStore(
@@ -1101,11 +1130,11 @@ int64_t TcpStore::getNumKeys() {
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys) {
-  throw std::runtime_error("Moodist Store wait method is not implemented");
+  impl->wait(keys, impl->timeout);
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) {
-  throw std::runtime_error("Moodist Store wait method is not implemented");
+  impl->wait(keys, timeout);
 }
 
 } // namespace moodist
