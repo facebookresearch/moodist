@@ -136,8 +136,34 @@ def create_moodist_backend(
     return obj
 
 
+def rendezvous_handler(
+    url, timeout: timedelta = torch.distributed.distributed_c10d.default_pg_timeout
+):
+    import urllib.parse
+
+    result = urllib.parse.urlparse(url)
+    assert result.hostname is not None
+    assert result.port is not None
+    query = urllib.parse.parse_qs(result.query)
+    assert "rank" in query
+    assert "world_size" in query
+
+    world_size = int(query["world_size"][0])
+    rank = int(query["rank"][0])
+
+    yield (
+        TcpStore(result.hostname, result.port, "foo", world_size, rank, timeout),
+        rank,
+        world_size,
+    )
+
+
 torch.distributed.Backend.register_backend(
     "moodist", create_moodist_backend, devices=("cpu", "cuda")
+)
+
+torch.distributed.distributed_c10d.register_rendezvous_handler(
+    "moodist", rendezvous_handler
 )
 
 __all__ = [
