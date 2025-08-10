@@ -1586,6 +1586,8 @@ struct ProcessGroupImpl {
     uintptr_t outputAddress = (uintptr_t)output.data_ptr();
 
     bool workaroundMean = false;
+    bool premul = false;
+    float premulValue;
 
     Dtype dindex;
     switch (dtype.toScalarType()) {
@@ -1623,9 +1625,23 @@ struct ProcessGroupImpl {
       opindex = Reduction::sum;
       workaroundMean = true;
       break;
+    case c10d::ReduceOp::PREMUL_SUM:
+      opindex = Reduction::sum;
+      premul = true;
+      if (dindex == Dtype::float32) {
+        auto* x = reinterpret_cast<c10d::NCCLPreMulSumSupplement*>(reduceOp.supplement_.get());
+        if (x->tensor_factor.defined()) {
+          premulValue = x->tensor_factor.item<float>();
+        } else {
+          premulValue = x->double_factor;
+        }
+      } else {
+        throw std::runtime_error(
+            fmt::sprintf("moodist: reduce_scatter: Pre-mul with dtype %s is not supported", std::string(dtype.name())));
+      }
+      break;
     default:
-      throw std::runtime_error(
-          fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %s", std::string(dtype.name())));
+      throw std::runtime_error(fmt::sprintf("moodist: reduce_scatter: Unsupported reduceOp %d", reduceOp));
     }
 
     Group* group = &*this->group;
@@ -1635,7 +1651,14 @@ struct ProcessGroupImpl {
     auto& sendRanks = reduceScatter.sendRanks;
     auto& recvRanks = reduceScatter.recvRanks;
 
+    torch::Tensor premulTensor;
+
     if (!isCuda) {
+      if (premul) {
+        premulTensor = input * premulValue;
+        inputAddress = (uintptr_t)premulTensor.data_ptr();
+        CHECK(premulTensor.numel() * premulTensor.itemsize() == inputBytes);
+      }
       StreamData& sd = group->getStreamData(nullptr);
       std::atomic_uint32_t cpuDone = 0;
       QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();
@@ -1664,6 +1687,12 @@ struct ProcessGroupImpl {
     StreamData& sd = group->getStreamData(stream);
     EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
     c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
+
+    if (premul) {
+      premulTensor = input * premulValue;
+      inputAddress = (uintptr_t)premulTensor.data_ptr();
+      CHECK(premulTensor.numel() * premulTensor.itemsize() == inputBytes);
+    }
 
     IpcMapper* ipcMapper = &*group->ipcMapper;
 
