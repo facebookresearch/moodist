@@ -38,7 +38,6 @@ struct StoreImpl {
   uint32_t worldSize;
   uint32_t rank;
   std::string storekey;
-  std::chrono::steady_clock::duration timeout;
   std::string myId;
 
   std::atomic_bool dead = false;
@@ -672,10 +671,8 @@ struct StoreImpl {
     // }
   }
 
-  StoreImpl(
-      std::string hostname, int port, std::string key, int worldSize, int rank,
-      std::chrono::steady_clock::duration timeout)
-      : hostname(hostname), port(port), worldSize(worldSize), rank(rank), timeout(timeout) {
+  StoreImpl(std::string hostname, int port, std::string key, int worldSize, int rank)
+      : hostname(hostname), port(port), worldSize(worldSize), rank(rank) {
     log.init();
     if (key.size() > 80) {
       key.resize(80);
@@ -1034,39 +1031,39 @@ struct StoreImpl {
     return w;
   }
 
-  template<typename... Args>
-  std::shared_ptr<Wait> doWaitOp(uint8_t messageType, std::string_view key, const Args&... args) {
-    return doWaitOp(timeout, messageType, key, args...);
-  }
+  // template<typename... Args>
+  // std::shared_ptr<Wait> doWaitOp(uint8_t messageType, std::string_view key, const Args&... args) {
+  //   return doWaitOp(timeout, messageType, key, args...);
+  // }
 
-  void set(std::string_view key, const std::vector<uint8_t>& value) {
-    auto w = doWaitOp(messageSet, key, value);
+  void set(std::chrono::steady_clock::duration timeout, std::string_view key, const std::vector<uint8_t>& value) {
+    auto w = doWaitOp(timeout, messageSet, key, value);
     w->wait();
     if (w->timedOut) {
       throw std::runtime_error(fmt::sprintf("Moodist Store set(%s) timed out after %g seconds", key, seconds(timeout)));
     }
   }
 
-  std::vector<uint8_t> get(std::string_view key) {
-    auto w = doWaitOp(messageGet, key);
+  std::vector<uint8_t> get(std::chrono::steady_clock::duration timeout, std::string_view key) {
+    auto w = doWaitOp(timeout, messageGet, key);
     w->wait();
     if (w->timedOut) {
       throw std::runtime_error(fmt::sprintf("Moodist Store get(%s) timed out after %g seconds", key, seconds(timeout)));
     }
     return std::move(w->data);
   }
-  bool check(std::string_view key) {
-    auto w = doWaitOp(messageCheck, key);
+  bool check(std::chrono::steady_clock::duration timeout, std::string_view key) {
+    auto w = doWaitOp(timeout, messageCheck, key);
     w->wait();
     if (w->timedOut) {
       throw std::runtime_error(fmt::sprintf("Moodist Store get(%s) timed out after %g seconds", key, seconds(timeout)));
     }
     return w->b;
   }
-  bool check(const std::vector<std::string>& keys) {
+  bool check(std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
     Vector<std::shared_ptr<Wait>> v;
     for (auto& k : keys) {
-      v.push_back(doWaitOp(messageCheck, k));
+      v.push_back(doWaitOp(timeout, messageCheck, k));
     }
     bool r = true;
     for (auto& w : v) {
@@ -1081,10 +1078,10 @@ struct StoreImpl {
     return r;
   }
 
-  void wait(const std::vector<std::string>& keys, std::chrono::steady_clock::duration timeout) {
+  void wait(std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
     Vector<std::shared_ptr<Wait>> v;
     for (auto& k : keys) {
-      v.push_back(doWaitOp(messageWait, k));
+      v.push_back(doWaitOp(timeout, messageWait, k));
     }
     bool r = true;
     for (auto& w : v) {
@@ -1101,15 +1098,16 @@ struct StoreImpl {
 TcpStore::TcpStore(
     std::string hostname, int port, std::string key, int worldSize, int rank,
     std::chrono::steady_clock::duration timeout) {
-  impl = std::make_shared<StoreImpl>(hostname, port, key, worldSize, rank, timeout);
+  impl = std::make_shared<StoreImpl>(hostname, port, key, worldSize, rank);
+  timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
 }
 
 void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {
-  impl->set(key, value);
+  impl->set(timeout_, key, value);
 }
 
 std::vector<uint8_t> TcpStore::get(const std::string& key) {
-  return impl->get(key);
+  return impl->get(timeout_, key);
 }
 
 int64_t TcpStore::add(const std::string& key, int64_t value) {
@@ -1122,7 +1120,7 @@ bool TcpStore::deleteKey(const std::string& key) {
 }
 
 bool TcpStore::check(const std::vector<std::string>& keys) {
-  return impl->check(keys);
+  return impl->check(timeout_, keys);
 }
 
 int64_t TcpStore::getNumKeys() {
@@ -1130,11 +1128,11 @@ int64_t TcpStore::getNumKeys() {
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys) {
-  impl->wait(keys, impl->timeout);
+  impl->wait(timeout_, keys);
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) {
-  impl->wait(keys, timeout);
+  impl->wait(timeout, keys);
 }
 
 } // namespace moodist
