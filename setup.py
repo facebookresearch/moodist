@@ -65,16 +65,16 @@ def main():
         extra_version = "-dev"
 
     global moodist_version
-    # moodist_version = "%s%s+torch.%s" % (
-    #     open("version.txt").read().strip(),
-    #     extra_version,
-    #     torch_version,
-    # )
-
-    moodist_version = "%s%s" % (
+    moodist_version = "%s%s+torch.%s" % (
         open("version.txt").read().strip(),
         extra_version,
+        torch_version,
     )
+
+    # moodist_version = "%s%s" % (
+    #     open("version.txt").read().strip(),
+    #     extra_version,
+    # )
 
     torch_req_version = ".".join(torch_version.split(".")[:2]) + ".*"
     
