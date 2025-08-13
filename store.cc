@@ -13,8 +13,8 @@
 
 namespace moodist {
 
-static constexpr uint64_t signatureConnect = 0x10f963c0941561a4;
-static constexpr uint64_t signatureConnectAck = 0x10f963c0941561a5;
+static constexpr uint64_t signatureConnect = 0x120a63c0941561a4;
+static constexpr uint64_t signatureConnectAck = 0x120a63c0941561a5;
 static constexpr uint64_t signatureAddresses = 0x10f963c0941561a6;
 static constexpr uint64_t signatureAddressesAck = 0x10f963c0941561a7;
 static constexpr uint64_t signatureMessage = 0x220a74d1a52672b8;
@@ -69,11 +69,12 @@ struct StoreImpl {
 
   std::atomic_bool connectAcked = false;
   int connectCounter = 0;
+  HashMap<uint32_t, std::string> unackedAddresses;
 
   struct PeerInfo {
     std::string uid;
     std::string networkKey;
-    std::vector<std::string> addresses;
+    HashMap<uint32_t, std::string> addresses;
     Vector<char> udpaddr;
     HashMap<uint32_t, bool> connected;
 
@@ -129,13 +130,9 @@ struct StoreImpl {
         uint32_t sourceRank;
         std::string uid;
         std::string networkKey;
-        std::vector<std::string> addresses;
+        std::vector<std::pair<uint32_t, std::string>> addresses;
         deserializeBufferPart(view, key, sourceRank, uid, networkKey, addresses);
         if (key == storekey && sourceRank < worldSize && rank == 0) {
-          // log.debug(
-          //     "rank %d is connecting with bootid %s, addresses %s\n", sourceRank, networkKey,
-          //     fmt::to_string(fmt::join(addresses, ", ")));
-
           auto udpaddr = socket->recvFromAddr();
 
           {
@@ -154,12 +151,19 @@ struct StoreImpl {
             PeerInfo& pi = *opt;
             pi.uid = uid;
             pi.networkKey = networkKey;
-            pi.addresses = addresses;
+            for (auto& v : addresses) {
+              pi.addresses.insert(v);
+            }
             pi.udpaddr.resize(udpaddr.second);
             std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
           }
 
-          auto buf = serializeToBuffer(signatureConnectAck, key, sourceRank, uid);
+          std::vector<uint32_t> ra;
+          for (auto& v : addresses) {
+            ra.push_back(v.first);
+          }
+
+          auto buf = serializeToBuffer(signatureConnectAck, key, sourceRank, uid, ra);
 
           ::sendto(
               socket->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)udpaddr.first, udpaddr.second);
@@ -172,17 +176,30 @@ struct StoreImpl {
         std::string key;
         uint32_t sourceRank;
         std::string uid;
-        deserializeBufferPart(view, key, sourceRank, uid);
+        std::vector<uint32_t> addresses;
+        deserializeBufferPart(view, key, sourceRank, uid, addresses);
         if (key == storekey && sourceRank == rank && uid == myId) {
           // log.info("Moodist store connected\n");
-          connectAcked = true;
+          std::lock_guard l(mutex);
+          size_t n = 0;
+          for (uint32_t i : addresses) {
+            auto it = unackedAddresses.find(i);
+            if (it != unackedAddresses.end()) {
+              unackedAddresses.erase(it);
+              ++n;
+            }
+          }
+          // log.info("acked %d addresses, %d left\n", n, unackedAddresses.size());
+          if (unackedAddresses.empty()) {
+            connectAcked = true;
+          }
         }
       } else if (signature == signatureAddresses) {
         std::string key;
         uint32_t sourceRank;
         std::string sourceId;
         std::string networkKey;
-        std::vector<std::string> addresses;
+        std::vector<std::pair<uint32_t, std::string>> addresses;
         deserializeBufferPart(view, key, sourceRank, sourceId, networkKey, addresses);
         if (key == storekey && sourceRank < worldSize) {
           {
@@ -191,7 +208,9 @@ struct StoreImpl {
             PeerInfo& pi = getEdge(sourceRank);
             pi.uid = sourceId;
             pi.networkKey = networkKey;
-            pi.addresses = addresses;
+            for (auto& v : addresses) {
+              pi.addresses.insert(v);
+            }
             auto udpaddr = socket->recvFromAddr();
             pi.udpaddr.resize(udpaddr.second);
             std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
@@ -254,21 +273,23 @@ struct StoreImpl {
     std::string uid = pi.uid;
     size_t n = 0;
     for (auto& a : pi.addresses) {
-      if (!context.isReachable(pi.networkKey, a)) {
+      if (!context.isReachable(pi.networkKey, a.second)) {
         continue;
       }
-      addCallback(std::chrono::steady_clock::now() + std::chrono::milliseconds(250 * n), [this, a, edge, uid] {
-        std::lock_guard l(mutex);
-        CHECK(edge != -1);
-        if (dead || !getEdge(edge).tcpconnections.empty()) {
-          return;
-        }
-        auto connection = context.connect(a);
-        auto buffer = serializeToBuffer(signatureConnect, storekey, rank, myId, edge, uid);
-        connection->write(std::move(buffer), nullptr);
+      addCallback(
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(250 * n), [this, a = a.second, edge, uid] {
+            std::lock_guard l(mutex);
+            CHECK(edge != -1);
+            if (dead || !getEdge(edge).tcpconnections.empty()) {
+              return;
+            }
+            // log.info("connecting to edge %d at %s\n", edge, a);
+            auto connection = context.connect(a);
+            auto buffer = serializeToBuffer(signatureConnect, storekey, rank, myId, edge, uid);
+            connection->write(std::move(buffer), nullptr);
 
-        addConnection(std::move(connection));
-      });
+            addConnection(std::move(connection));
+          });
       ++n;
     }
   }
@@ -281,10 +302,18 @@ struct StoreImpl {
     if (!pi2 || pi2->connected.contains(sourceRank)) {
       return;
     }
-    auto buf = serializeToBuffer(signatureAddresses, storekey, sourceRank, pi->uid, pi->networkKey, pi->addresses);
+    Vector<std::pair<uint32_t, std::string>> addresses;
+    for (auto& v : pi->addresses) {
+      addresses.push_back(v);
+    }
+    if (addresses.size() > 8) {
+      std::ranges::shuffle(addresses, getRng());
+      addresses.resize(8);
+    }
+    auto buf = serializeToBuffer(signatureAddresses, storekey, sourceRank, pi->uid, pi->networkKey, addresses);
     int r = ::sendto(
-        udps[0]->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)pi2->udpaddr.data(),
-        pi2->udpaddr.size());
+        udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+        (sockaddr*)pi2->udpaddr.data(), pi2->udpaddr.size());
     auto t = std::chrono::milliseconds(2000);
     if (r < 0) {
       t = std::chrono::milliseconds(250);
@@ -385,8 +414,8 @@ struct StoreImpl {
 
                 auto buf = serializeToBuffer(signatureAddressesAck, key, rank, sourceRank);
                 ::sendto(
-                    udps.at(0)->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)pi.udpaddr.data(),
-                    pi.udpaddr.size());
+                    udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+                    (sockaddr*)pi.udpaddr.data(), pi.udpaddr.size());
 
                 if (signature == signatureConnect) {
                   auto buffer = serializeToBuffer(signatureConnectAck, key, rank, myId, sourceRank, sourceId);
@@ -681,6 +710,8 @@ struct StoreImpl {
     CHECK(worldSize > 0);
     CHECK(rank >= 0 && rank < worldSize);
 
+    std::lock_guard l(mutex);
+
     myId = randomName();
 
     findPaths();
@@ -691,7 +722,7 @@ struct StoreImpl {
       bool success = listen(port, true);
       success |= listen(port, false);
       for (int i : range(success ? 4 : 16)) {
-        if (listen(57360 + i, true) || listen(57360 + i, false)) {
+        if (listen(57360 + i, true) | listen(57360 + i, false)) {
           break;
         }
       }
@@ -726,6 +757,13 @@ struct StoreImpl {
 
       } catch (const std::exception& e) {
         log.error("Error while listening on '%s': %s\n", addr, e.what());
+      }
+    }
+
+    CHECK(unackedAddresses.empty());
+    for (auto& v : listeners) {
+      for (auto& x : v->localAddresses()) {
+        unackedAddresses[unackedAddresses.size()] = x;
       }
     }
 
@@ -866,49 +904,52 @@ struct StoreImpl {
       return;
     }
 
+    std::lock_guard l(mutex);
+
     auto t = [this](int port) {
       if (connectAcked) {
         return;
       }
-      udps[0]->resolve(hostname, port, [this](void* addr, size_t addrlen) {
+      udps.at(random<size_t>(0, udps.size() - 1))->resolve(hostname, port, [this](void* addr, size_t addrlen) {
         Vector<char> addrbuf;
         addrbuf.resize(addrlen);
         std::memcpy(addrbuf.data(), addr, addrlen);
 
-        std::vector<std::string> tcpaddresses;
-        for (auto& v : listeners) {
-          for (auto& x : v->localAddresses()) {
-            tcpaddresses.push_back(x);
-          }
-        }
+        addCallback(std::chrono::steady_clock::now(), [this, addrbuf] {
+          std::lock_guard l(mutex);
 
-        if (tcpaddresses.size() > 8) {
-          std::ranges::shuffle(tcpaddresses, getRng());
-          tcpaddresses.resize(8);
-        }
-
-        for (size_t i = 0; i != udps.size(); ++i) {
-          auto now = std::chrono::steady_clock::now();
-          auto t = now;
-          {
-            std::lock_guard l(mutex);
-            t = std::min(
+          for (size_t i = 0; i != udps.size(); ++i) {
+            auto now = std::chrono::steady_clock::now();
+            auto t = std::min(
                 std::max(prevConnectTime + std::chrono::milliseconds(250), now), now + std::chrono::seconds(2));
             prevConnectTime = t;
+            addCallback(t, [this, i, addrbuf]() {
+              if (connectAcked) {
+                return;
+              }
+
+              std::lock_guard l(mutex);
+
+              Vector<std::pair<uint32_t, std::string>> tcpaddresses;
+              for (auto& v : unackedAddresses) {
+                tcpaddresses.push_back(v);
+              }
+              if (tcpaddresses.size() > 8) {
+                std::ranges::shuffle(tcpaddresses, getRng());
+                tcpaddresses.resize(8);
+              }
+
+              auto buf =
+                  serializeToBuffer(signatureConnect, storekey, rank, myId, context.getNetworkKey(), tcpaddresses);
+
+              // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
+
+              ::sendto(
+                  udps[random<size_t>(0, udps.size() - 1)]->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+                  (sockaddr*)addrbuf.data(), addrbuf.size());
+            });
           }
-          addCallback(t, [this, i, addrbuf, tcpaddresses]() {
-            if (connectAcked) {
-              return;
-            }
-
-            auto buf = serializeToBuffer(signatureConnect, storekey, rank, myId, context.getNetworkKey(), tcpaddresses);
-
-            // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
-
-            ::sendto(
-                udps[0]->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)addrbuf.data(), addrbuf.size());
-          });
-        }
+        });
       });
     };
 
