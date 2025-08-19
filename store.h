@@ -10,12 +10,15 @@ struct StoreImpl;
 
 class TORCH_API TcpStore final : public c10d::Store {
 public:
-  TcpStore(std::shared_ptr<StoreImpl> impl) : impl(impl) {}
+  TcpStore(StoreImpl* impl);
   TcpStore(
       std::string hostname, int port, std::string key, int worldSize, int rank,
       std::chrono::steady_clock::duration timeout);
+  ~TcpStore();
+  TcpStore(const TcpStore&) = delete;
+  TcpStore& operator=(const TcpStore&) = delete;
 
-  std::shared_ptr<StoreImpl> impl;
+  StoreImpl* impl = nullptr;
 
   virtual c10::intrusive_ptr<Store> clone() {
     return c10::make_intrusive<TcpStore>(impl);

@@ -27,11 +27,33 @@ static constexpr uint8_t messageSet = 0x4;
 static constexpr uint8_t messageGet = 0x5;
 static constexpr uint8_t messageCheck = 0x6;
 static constexpr uint8_t messageWait = 0x7;
+static constexpr uint8_t messageExit = 0x8;
 
-static TcpContext context;
+namespace {
+TcpContext context;
+
+template<typename T>
+struct Indestructible {
+  std::aligned_storage_t<sizeof(T), alignof(T)> storage;
+  Indestructible() {
+    new (&storage) T();
+  }
+  T& operator*() {
+    return (T&)storage;
+  }
+  T* operator->() {
+    return &**this;
+  }
+};
+
+Indestructible<SpinMutex> activeStoresMutex;
+Indestructible<Vector<StoreImpl*>> activeStores;
+} // namespace
 
 struct StoreImpl {
   Vector<std::shared_ptr<Socket>> udps;
+
+  std::atomic_size_t refcount = 0;
 
   std::string hostname;
   int port;
@@ -71,6 +93,13 @@ struct StoreImpl {
   int connectCounter = 0;
   HashMap<uint32_t, std::string> unackedAddresses;
 
+  bool destroyed = false;
+  std::chrono::steady_clock::time_point destroyTime;
+  std::optional<uint32_t> destroySourceRank;
+
+  bool deletionInitiated = false;
+  bool deleted = false;
+
   struct PeerInfo {
     std::string uid;
     std::string networkKey;
@@ -96,6 +125,8 @@ struct StoreImpl {
     };
 
     Vector<IncomingMessage> incomingQueue;
+
+    bool destroyed = false;
   };
   Vector<std::optional<PeerInfo>> peerInfos;
 
@@ -280,7 +311,8 @@ struct StoreImpl {
           std::chrono::steady_clock::now() + std::chrono::milliseconds(250 * n), [this, a = a.second, edge, uid] {
             std::lock_guard l(mutex);
             CHECK(edge != -1);
-            if (dead || !getEdge(edge).tcpconnections.empty()) {
+            auto& pi = getEdge(edge);
+            if (dead || !pi.tcpconnections.empty() || pi.destroyed || destroyed) {
               return;
             }
             // log.info("connecting to edge %d at %s\n", edge, a);
@@ -556,7 +588,7 @@ struct StoreImpl {
       sendMessage(
           edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone), pi);
     } else if (t == messageDone) {
-      bool b;
+      bool b = false;
       std::vector<uint8_t> value;
       if (view.size()) {
         if (view.size() == 1) {
@@ -571,6 +603,7 @@ struct StoreImpl {
         i->second->data = std::move(value);
         i->second->futex = 1;
         futexWakeAll(&i->second->futex);
+        waits.erase(i);
       }
     } else if (t == messageGet || t == messageWait) {
       std::string key;
@@ -598,6 +631,14 @@ struct StoreImpl {
       uint32_t seq = pi.outgoingSeq++;
       sendMessage(
           edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone, r), pi);
+    } else if (t == messageExit) {
+      CHECK(edgeRank != -1);
+      auto& pi = getEdge(edgeRank);
+      pi.destroyed = true;
+      if (!destroySourceRank) {
+        destroySourceRank = sourceRank;
+      }
+      addCallback(std::chrono::steady_clock::now(), [this] { destroy(); });
     }
   }
 
@@ -771,6 +812,11 @@ struct StoreImpl {
 
     addCallback(std::chrono::steady_clock::now(), [this]() { connect(); });
     addCallback(std::chrono::steady_clock::now() + std::chrono::seconds(8), [this]() { keepalive(); });
+
+    {
+      std::lock_guard l(*activeStoresMutex);
+      activeStores->push_back(this);
+    }
   }
 
   template<typename Container>
@@ -790,9 +836,12 @@ struct StoreImpl {
   }
 
   ~StoreImpl() {
-    dead = true;
-    anyQueued = 1;
-    futexWakeAll(&anyQueued);
+    {
+      std::unique_lock l(mutex);
+      dead = true;
+      anyQueued = 1;
+      futexWakeAll(&anyQueued);
+    }
     closeAll(listeners);
     closeAll(floatingConnections);
     while (true) {
@@ -813,6 +862,71 @@ struct StoreImpl {
     thread.join();
     for (auto& v : udps) {
       v->close();
+    }
+
+    {
+      std::lock_guard l(*activeStoresMutex);
+      auto i = std::ranges::find(*activeStores, this);
+      CHECK(i != activeStores->end());
+      activeStores->erase(i);
+    }
+  }
+
+  void destroy() {
+    std::unique_lock l(mutex);
+    if (!destroyed) {
+      destroyed = true;
+      destroyTime = std::chrono::steady_clock::now();
+      if (!destroySourceRank) {
+        destroySourceRank = rank;
+      }
+      for (auto& v : waits) {
+        destroyWait(v.second);
+      }
+      addCallback(std::chrono::steady_clock::now(), [this] {
+        std::unique_lock l(mutex);
+        for (auto& v : edgePeers) {
+          auto& pi = *v.second;
+          if (!pi.tcpconnections.empty()) {
+            uint32_t edgeRank = v.first;
+            uint32_t seq = pi.outgoingSeq++;
+            sendMessage(
+                edgeRank, seq,
+                serializeToBuffer(
+                    signatureMessage, worldSize, seq, edgeRank, (uint32_t)0, *destroySourceRank, messageExit),
+                pi);
+          }
+        }
+      });
+    }
+
+    if (refcount == 0 && !deletionInitiated) {
+      deletionInitiated = true;
+      auto t = std::chrono::milliseconds(50);
+      while (t < std::chrono::seconds(2)) {
+        addCallback(std::chrono::steady_clock::now() + t, [this] {
+          std::lock_guard l(mutex);
+          for (auto& v : edgePeers) {
+            auto& pi = *v.second;
+            if (!pi.tcpconnections.empty() && !pi.destroyed) {
+              return;
+            }
+          }
+          if (!deleted) {
+            deleted = true;
+            scheduler.run([this] { delete this; });
+          }
+        });
+        t += std::chrono::milliseconds(50);
+      }
+
+      addCallback(std::chrono::steady_clock::now() + std::chrono::seconds(2), [this] {
+        std::lock_guard l(mutex);
+        if (!deleted) {
+          deleted = true;
+          scheduler.run([this] { delete this; });
+        }
+      });
     }
   }
 
@@ -982,12 +1096,15 @@ struct StoreImpl {
     bool b = false;
     std::vector<uint8_t> data;
     std::atomic_uint32_t futex = 0;
-    bool timedOut = false;
+    bool error = false;
+    std::string errorMessage;
 
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
-    void wait() {
+    SpinMutex mutex;
+
+    std::optional<std::string> wait() {
       auto now = std::chrono::steady_clock::now();
 
       while (true) {
@@ -997,10 +1114,18 @@ struct StoreImpl {
         }
         now = std::chrono::steady_clock::now();
         if (now >= end) {
-          timedOut = true;
-          return;
+          std::lock_guard l(mutex);
+          if (!error) {
+            return fmt::sprintf("timed out after %g seconds", seconds(end - start));
+          }
+          break;
         }
       }
+      std::lock_guard l(mutex);
+      if (error) {
+        return errorMessage;
+      }
+      return {};
     }
   };
 
@@ -1048,6 +1173,18 @@ struct StoreImpl {
     }
   }
 
+  void destroyWait(std::shared_ptr<Wait>& w) {
+    std::lock_guard l(w->mutex);
+    w->error = true;
+    if (destroySourceRank && destroySourceRank != rank) {
+      w->errorMessage = fmt::sprintf("store was destroyed on rank %d", *destroySourceRank);
+    } else {
+      w->errorMessage = fmt::sprintf("store was destroyed");
+    }
+    w->futex = 1;
+    futexWakeAll(&w->futex);
+  }
+
   template<typename... Args>
   std::shared_ptr<Wait> doWaitOp(
       std::chrono::steady_clock::duration timeout, uint8_t messageType, std::string_view key, const Args&... args) {
@@ -1061,10 +1198,15 @@ struct StoreImpl {
     uint32_t seq = pi.outgoingSeq++;
 
     auto w = std::make_shared<Wait>();
-    waits[id] = w;
 
-    sendMessage(
-        edge, seq, serializeToBuffer(signatureMessage, worldSize, seq, r, id, rank, messageType, key, args...), pi);
+    if (destroyed) {
+      destroyWait(w);
+    } else {
+      waits[id] = w;
+
+      sendMessage(
+          edge, seq, serializeToBuffer(signatureMessage, worldSize, seq, r, id, rank, messageType, key, args...), pi);
+    }
     l.unlock();
 
     w->start = std::chrono::steady_clock::now();
@@ -1072,32 +1214,27 @@ struct StoreImpl {
     return w;
   }
 
-  // template<typename... Args>
-  // std::shared_ptr<Wait> doWaitOp(uint8_t messageType, std::string_view key, const Args&... args) {
-  //   return doWaitOp(timeout, messageType, key, args...);
-  // }
-
   void set(std::chrono::steady_clock::duration timeout, std::string_view key, const std::vector<uint8_t>& value) {
     auto w = doWaitOp(timeout, messageSet, key, value);
-    w->wait();
-    if (w->timedOut) {
-      throw std::runtime_error(fmt::sprintf("Moodist Store set(%s) timed out after %g seconds", key, seconds(timeout)));
+    auto error = w->wait();
+    if (error) {
+      throw std::runtime_error(fmt::sprintf("Moodist Store set(%s): %s", key, *error));
     }
   }
 
   std::vector<uint8_t> get(std::chrono::steady_clock::duration timeout, std::string_view key) {
     auto w = doWaitOp(timeout, messageGet, key);
-    w->wait();
-    if (w->timedOut) {
-      throw std::runtime_error(fmt::sprintf("Moodist Store get(%s) timed out after %g seconds", key, seconds(timeout)));
+    auto error = w->wait();
+    if (error) {
+      throw std::runtime_error(fmt::sprintf("Moodist Store get(%s): %s", key, *error));
     }
     return std::move(w->data);
   }
   bool check(std::chrono::steady_clock::duration timeout, std::string_view key) {
     auto w = doWaitOp(timeout, messageCheck, key);
-    w->wait();
-    if (w->timedOut) {
-      throw std::runtime_error(fmt::sprintf("Moodist Store get(%s) timed out after %g seconds", key, seconds(timeout)));
+    auto error = w->wait();
+    if (error) {
+      throw std::runtime_error(fmt::sprintf("Moodist Store get(%s): %s", key, *error));
     }
     return w->b;
   }
@@ -1108,11 +1245,10 @@ struct StoreImpl {
     }
     bool r = true;
     for (auto& w : v) {
-      w->wait();
-      if (w->timedOut) {
-        throw std::runtime_error(fmt::sprintf(
-            "Moodist Store check(%s) timed out after %g seconds", fmt::to_string(fmt::join(keys, ", ")),
-            seconds(timeout)));
+      auto error = w->wait();
+      if (error) {
+        throw std::runtime_error(
+            fmt::sprintf("Moodist Store check(%s): %s", fmt::to_string(fmt::join(keys, ", ")), *error));
       }
       r &= w->b;
     }
@@ -1126,21 +1262,58 @@ struct StoreImpl {
     }
     bool r = true;
     for (auto& w : v) {
-      w->wait();
-      if (w->timedOut) {
-        throw std::runtime_error(fmt::sprintf(
-            "Moodist Store wait(%s) timed out after %g seconds", fmt::to_string(fmt::join(keys, ", ")),
-            seconds(timeout)));
+      auto error = w->wait();
+      if (error) {
+        throw std::runtime_error(
+            fmt::sprintf("Moodist Store wait(%s): %s", fmt::to_string(fmt::join(keys, ", ")), *error));
       }
     }
   }
 };
 
+namespace {
+
+struct Dtor {
+  ~Dtor() {
+    auto now = std::chrono::steady_clock::now();
+    auto end = now;
+    std::unique_lock l(*activeStoresMutex);
+    for (auto* x : *activeStores) {
+      x->destroy();
+      end = std::max(end, x->destroyTime + std::chrono::seconds(2));
+    }
+    l.unlock();
+    while (now < end) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      l.lock();
+      if (activeStores->empty()) {
+        l.unlock();
+        break;
+      }
+      l.unlock();
+      now = std::chrono::steady_clock::now();
+    }
+  }
+} dtor;
+
+} // namespace
+
+TcpStore::TcpStore(StoreImpl* impl) {
+  ++impl->refcount;
+}
+
 TcpStore::TcpStore(
     std::string hostname, int port, std::string key, int worldSize, int rank,
     std::chrono::steady_clock::duration timeout) {
-  impl = std::make_shared<StoreImpl>(hostname, port, key, worldSize, rank);
+  impl = new StoreImpl(hostname, port, key, worldSize, rank);
+  ++impl->refcount;
   timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
+}
+
+TcpStore::~TcpStore() {
+  if (--impl->refcount == 0) {
+    impl->destroy();
+  }
 }
 
 void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {
