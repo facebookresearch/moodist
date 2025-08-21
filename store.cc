@@ -1298,7 +1298,7 @@ struct Dtor {
 
 } // namespace
 
-TcpStore::TcpStore(StoreImpl* impl) {
+TcpStore::TcpStore(StoreImpl* impl) : impl(impl) {
   ++impl->refcount;
 }
 
