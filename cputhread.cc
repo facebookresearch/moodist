@@ -6204,10 +6204,15 @@ struct CpuThreadImpl {
       auto prevRunTime = std::chrono::steady_clock::now();
 
       bool debugCpuTime = false;
+      bool heartbeatEnabled = true;
       {
         const char* c = std::getenv("MOODIST_DEBUG_CPU");
         if (c && !strcmp(c, "1")) {
           debugCpuTime = true;
+        }
+        c = std::getenv("MOODIST_DISABLE_HEARTBEAT");
+        if (c && !strcmp(c, "1")) {
+          heartbeatEnabled = false;
         }
       }
 
@@ -6216,7 +6221,9 @@ struct CpuThreadImpl {
         auto now = std::chrono::steady_clock::now();
         if (now - prevHeartbeatTime >= heartbeatInterval) {
           prevHeartbeatTime = now;
-          heartbeat(now);
+          if (heartbeatEnabled) {
+            heartbeat(now);
+          }
           if (debugCpuTime) {
             checkPreemptions(true);
           }
