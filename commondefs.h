@@ -56,9 +56,21 @@ struct CudaError : std::runtime_error {
   throw std::system_error(e, std::generic_category(), text);
 }
 
+#define CAT2(a, b) a##b
+#define CAT(a, b) CAT2(a, b)
+
 #define NORETURN(...) [&] [[noreturn]] [[gnu::cold]] [[gnu::noinline]] () -> decltype(auto) { __VA_ARGS__ }();
 #define NOINLINE(...) [&] [[gnu::noinline]] () -> decltype(auto) { __VA_ARGS__ }();
 #define NOINLINE_COLD(...) [&] [[gnu::noinline]] [[gnu::cold]] () -> decltype(auto) { __VA_ARGS__ }();
+
+template<typename F>
+struct CtorCall {
+  CtorCall(F&& f) {
+    std::forward<F>(f)();
+  }
+};
+
+#define OUTLINE CtorCall CAT(ctorcall_, __LINE__) = [&] [[gnu::noinline]] () -> decltype(auto)
 
 #define CHECK_NVRTC(x)                                                                                                 \
   {                                                                                                                    \

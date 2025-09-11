@@ -27,7 +27,7 @@ inline LogLevel currentLogLevel = LOG_INFO;
 inline std::mutex logMutex;
 
 template<typename... Args>
-[[gnu::cold]] void logat(LogLevel level, const char* fmt, Args&&... args) {
+[[gnu::cold]] [[gnu::noinline]] void logatstr(LogLevel level, std::string str) {
   std::lock_guard l(logMutex);
   FILE* ftarget = stdout;
   FILE* fother = stderr;
@@ -41,14 +41,18 @@ template<typename... Args>
   localtime_r(&tt, &tm);
   char buf[0x40];
   std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", &tm);
-  auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
   int microseconds = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() % 1000000;
-  if (!s.empty() && s.back() == '\n') {
-    fmt::fprintf(ftarget, "%s.%.06d moodist: %s", buf, microseconds, s);
+  if (!str.empty() && str.back() == '\n') {
+    fmt::fprintf(ftarget, "%s.%.06d moodist: %s", buf, microseconds, str);
   } else {
-    fmt::fprintf(ftarget, "%s.%.06d moodist: %s\n", buf, microseconds, s);
+    fmt::fprintf(ftarget, "%s.%.06d moodist: %s\n", buf, microseconds, str);
   }
   fflush(ftarget);
+}
+
+template<typename... Args>
+[[gnu::cold]] [[gnu::noinline]] void logat(LogLevel level, const char* fmt, Args&&... args) {
+  logatstr(level, fmt::sprintf(fmt, std::forward<Args>(args)...));
 }
 
 inline std::once_flag loggingInitFlag;

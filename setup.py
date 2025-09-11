@@ -34,8 +34,8 @@ class Build(build_ext.build_ext):
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=%s" % output_path,
         ]
 
-        if "bdist_wheel" in sys.argv:
-            cmake_cmd.append("-DIS_BUILDING_WHEEL=1")
+        # if "bdist_wheel" in sys.argv:
+        #     cmake_cmd.append("-DIS_BUILDING_WHEEL=1")
 
         build_cmd = ["cmake", "--build", ".", "--parallel"]
 

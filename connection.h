@@ -62,7 +62,11 @@ struct Connection : std::enable_shared_from_this<Connection> {
   template<typename Buffer>
   void write(Buffer buffer, Function<void(Error*)>);
   template<typename Buffer>
+  void write(Buffer buffer, std::span<iovec> extra, Function<void(Error*)>);
+  template<typename Buffer>
   void writefd(Buffer buffer, int fd);
+
+  void inread_iovec(void* ptr, size_t bytes, Function<void()> callback);
 
   std::string localAddress() const;
   std::string remoteAddress() const;

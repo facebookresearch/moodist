@@ -3,6 +3,7 @@
 #include "queue.h"
 #include "common.h"
 #include "cputhread.h"
+#include "cuda_copy.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
 #include "simple_vector.h"
@@ -20,12 +21,19 @@ struct WorkCudaDone {
   uint32_t value = 1;
   void clear() {}
 };
-
 using WorkCudaDonePtr = FLPtr<WorkCudaDone>;
+
+struct WorkCudaMappedDone {
+  uintptr_t address = 0;
+  uint32_t value = 1;
+  void clear() {}
+};
+using WorkCudaMappedDonePtr = FLPtr<WorkCudaDone>;
 
 struct QueueWorkImpl {
   std::atomic_uint32_t done = 0;
   WorkCudaDonePtr cudaDone = nullptr;
+  WorkCudaDonePtr cudaMappedDone = nullptr;
   bool queuedPutReady;
   uint32_t transactionKey = 0;
   ~QueueWorkImpl() {}
@@ -33,6 +41,9 @@ struct QueueWorkImpl {
     if (cudaDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
           c10::cuda::getCurrentCUDAStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+    } else if (cudaMappedDone != nullptr) {
+      CHECK_CU(cuStreamWaitValue32(
+          c10::cuda::getCurrentCUDAStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else {
       while (done == 0) {
         futexWait(&done, 0, std::chrono::seconds(1));
@@ -283,16 +294,18 @@ void sendPut(
   if (work) {
     e->callback = [work = std::move(work),
                    tensor = std::move(tensor)](uintptr_t* cudaDoneAddress, uint32_t* cudaDoneValue) {
-      // log.info("yey send put callback called!\n");
       if (tensor->isCuda) {
         CHECK(work->cudaDone != nullptr);
         *cudaDoneAddress = work->cudaDone->address;
         *cudaDoneValue = work->cudaDone->value;
       } else {
-        work->done = 1;
-        futexWakeAll(&work->done);
+        if (work->cudaMappedDone != nullptr) {
+          *(volatile uint32_t*)work->cudaMappedDone->address = work->cudaMappedDone->value;
+        } else {
+          work->done = 1;
+          futexWakeAll(&work->done);
+        }
       }
-      // log.info("yey send put callback finished!\n");
     };
   } else {
     e->callback = [tensor = std::move(tensor)](uintptr_t*, uint32_t*) {};
@@ -604,13 +617,25 @@ struct QueueImpl {
         sendPut(&*group, location, qs->streaming, remoteAddress, std::move(td), work, 0, transactionKey);
       }
     } else {
-      td->isCuda = true;
+      if (group->rdmaSupportsCuda) {
+        td->isCuda = true;
+        work->cudaDone = WorkCudaDonePtr::make();
+        if (!work->cudaDone->address) {
+          work->cudaDone->address = group->getNextCudaUint32();
+        }
+        ++work->cudaDone->value;
+      } else {
+        td->buffer = AllocatedCpuBufferSharedPtr::make();
+        *td->buffer = group->allocateCpu(td->dataBytes);
+        td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
+        cudaCopy(td->data(), tensorAddress, td->bytes(), c10::cuda::getCurrentCUDAStream());
 
-      work->cudaDone = WorkCudaDonePtr::make();
-      if (!work->cudaDone->address) {
-        work->cudaDone->address = group->getNextCudaUint32();
+        work->cudaMappedDone = WorkCudaMappedDonePtr::make();
+        if (!work->cudaMappedDone->address) {
+          work->cudaMappedDone->address = group->getNextCudaMappedUint32();
+        }
+        ++work->cudaMappedDone->value;
       }
-      ++work->cudaDone->value;
 
       work->queuedPutReady = false;
 
@@ -649,10 +674,6 @@ struct QueueImpl {
           }
         }
       };
-
-      // Function<void()> f = [group = this->group, location, remoteAddress, work, td = std::move(td)]() mutable {
-      //   sendPut(&*group, location, remoteAddress, std::move(td), std::move(work));
-      // };
 
       CHECK_CU(cuLaunchHostFunc(
           c10::cuda::getCurrentCUDAStream(), [](void* ptr) { Function<void()>((FunctionPointer)ptr)(); }, f.release()));

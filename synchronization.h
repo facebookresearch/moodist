@@ -140,14 +140,21 @@ public:
 class SpinMutex {
   std::atomic<bool> locked = false;
 
-public:
-  void lock() {
-    __tsan_mutex_pre_lock(this, 0);
+  [[gnu::noinline]]
+  void lockLoop() {
     do {
       while (locked.load(std::memory_order_relaxed)) {
         _mm_pause();
       }
     } while (locked.exchange(true, std::memory_order_acq_rel));
+  }
+
+public:
+  void lock() {
+    __tsan_mutex_pre_lock(this, 0);
+    if (locked.exchange(true, std::memory_order_acq_rel)) [[unlikely]] {
+      lockLoop();
+    }
     __tsan_mutex_post_lock(this, 0, 0);
   }
   void unlock() {

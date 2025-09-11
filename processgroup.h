@@ -129,6 +129,9 @@ public:
 
   std::vector<torch::Tensor> share(const torch::Tensor& input);
   void cudaBarrier();
+
+
+  virtual void shutdown() override;
 };
 
 } // namespace moodist

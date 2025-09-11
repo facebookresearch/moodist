@@ -5,6 +5,7 @@
 #include "common.h"
 #include "hash_map.h"
 #include "logging.h"
+#include "rdma.h"
 #include "simple_vector.h"
 #include "vector.h"
 
@@ -26,12 +27,6 @@ enum class Reduction { sum, min, max, avg, count };
 static constexpr size_t maxConcurrency = 16;
 static constexpr size_t maxDevices = 4;
 static constexpr size_t maxChunks = 8;
-
-struct alignas(64) Progress {
-  uint32_t stepValue;
-  uint32_t cpuStepValue;
-};
-
 struct alignas(64) CpuAddresses {
   uint32_t stepValue;
   int pid;
@@ -41,7 +36,6 @@ struct alignas(64) CpuAddresses {
 };
 
 struct DynamicAddressesNoKeys {
-  uint32_t stepValue;
   uint32_t opType;
   uintptr_t gatherAddress;
   size_t gatherBytes;
@@ -49,6 +43,7 @@ struct DynamicAddressesNoKeys {
 
 struct DynamicAddressesBase : DynamicAddressesNoKeys {
   std::array<uint32_t, maxDevices> gatherKey;
+  uint32_t stepValue;
 };
 
 struct alignas(128) DynamicAddresses : DynamicAddressesBase {};
@@ -61,28 +56,10 @@ struct alignas(64) CpuDynamicAddresses {
   size_t gatherBytes;
 };
 
-struct AddressPair {
-  uintptr_t inputAddress;
-  size_t inputBytes;
-  uintptr_t outputAddress;
-  size_t outputBytes;
-};
-
 struct StreamData {
-  // AllocatedBuffer sendBuffer;
-  // AllocatedBuffer recvBuffer;
-  // AllocatedBuffer alignedBuffer;
-  // AllocatedBuffer alignedBuffer2;
   size_t cpuThreadIndex = -1;
   StreamData();
   ~StreamData();
-};
-
-struct SyncData {
-  std::atomic_bool shouldSync = false;
-  std::atomic_uint32_t syncStepValue = 0;
-  std::atomic_uint32_t myStepValue = 0;
-  std::atomic_uint32_t syncStepValue2 = 0;
 };
 
 struct TreeSendsRecvs {
@@ -106,8 +83,9 @@ struct Group {
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
-  std::vector<std::unique_ptr<IbCommon>> ibDevs;
+  std::vector<std::unique_ptr<Rdma>> rdmaDevs;
   size_t numTrueIbDevs = 0;
+  bool rdmaSupportsCuda = false;
   std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
@@ -156,12 +134,8 @@ struct Group {
   std::array<void*, 8> peerSharedMem;
   DynamicAddresses* localDyns = nullptr;
   CpuDynamicAddresses* cpuLocalDyns = nullptr;
-  Progress* localProgress = nullptr;
   CpuAddresses* cpuAddresses = nullptr;
-  SyncData* syncData = nullptr;
   uint32_t* cpuProxyReady = nullptr;
-
-  Progress* localProgress2 = nullptr;
 
   uint32_t* cpuStepValues = nullptr;
   uint32_t* cpuStepValuesDeviceChunks = nullptr;
@@ -271,6 +245,10 @@ struct Group {
   std::vector<AllocatedBuffer> cudaUint32List;
   size_t cudaUint32Offset = 0;
   uintptr_t getNextCudaUint32();
+  std::mutex cudaMappedUint32Mutex;
+  std::vector<AllocatedBuffer> cudaMappedUint32List;
+  size_t cudaMappedUint32Offset = 0;
+  uintptr_t getNextCudaMappedUint32();
 };
 
 template<typename T, size_t poolSize = 0x1000>

@@ -8,6 +8,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #pragma push_macro("assert")
@@ -48,10 +49,16 @@ struct Vector {
     clear();
     reserve(n.size());
     size_t k = n.size();
-    for (size_t i = 0; i != k; ++i) {
-      new (endptr) T(n[i]);
-      ++endptr;
-      ++msize;
+    if constexpr (std::is_trivially_constructible_v<T, T>) {
+      endptr += k;
+      msize += k;
+      std::memcpy(beginptr, &n[0], sizeof(T) * k);
+    } else {
+      for (size_t i = 0; i != k; ++i) {
+        new (endptr) T(n[i]);
+        ++endptr;
+        ++msize;
+      }
     }
     return *this;
   }

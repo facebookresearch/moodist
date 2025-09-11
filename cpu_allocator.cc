@@ -631,6 +631,7 @@ std::pair<uintptr_t, size_t> regionAt(const void* ptr) {
   return regionAt((uintptr_t)ptr);
 }
 
+[[gnu::malloc]]
 void* moo_alloc(size_t bytes) {
   void* r = moo_alloc2(bytes);
   // if (!owns(r)) {

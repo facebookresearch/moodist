@@ -55,7 +55,7 @@ struct ThreadPool {
   std::list<Thread> threads;
   std::atomic_size_t numThreads = 0;
   size_t maxThreads = 0;
-  std::string name;
+  std::string name = "async";
   ThreadPool(std::string name = "async") noexcept : name(std::move(name)) {
     maxThreads = std::thread::hardware_concurrency();
     cpu_set_t set;

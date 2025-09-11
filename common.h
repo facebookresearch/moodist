@@ -161,25 +161,37 @@ struct PeerArrayRef {
   }
 };
 
+inline size_t bufferHash(const void* data, size_t len) {
+  auto rotl = [&](auto v, int n) {
+    static_assert(std::is_unsigned_v<decltype(v)>);
+    return (v << n) | (v >> (8 * sizeof(v) - n));
+  };
+
+  const char* ptr = (const char*)data;
+  const char* end = ptr + len / sizeof(size_t) * sizeof(size_t);
+  size_t r = 0;
+  while (ptr != end) {
+    size_t v;
+    std::memcpy(&v, ptr, sizeof(size_t));
+    r = rotl(r + v * 31, 15);
+    ptr += sizeof(size_t);
+  }
+  len -= len / sizeof(size_t) * sizeof(size_t);
+  while (len) {
+    uint8_t v;
+    std::memcpy(&v, ptr, sizeof(uint8_t));
+    r = rotl(r + v * 31, 15);
+    ptr += sizeof(uint8_t);
+    --len;
+  }
+  return r * 11400714819323198485llu;
+}
+
 struct IpcMemHash {
   template<typename T>
   size_t operator()(const T& v) const {
     static_assert(sizeof(v) % sizeof(size_t) == 0);
-    auto rotl = [&](auto v, int n) {
-      static_assert(std::is_unsigned_v<decltype(v)>);
-      return (v << n) | (v >> (8 * sizeof(v) - n));
-    };
-
-    const char* ptr = (const char*)&v;
-    const char* end = ptr + sizeof(v);
-    size_t r = 0;
-    while (ptr != end) {
-      size_t v;
-      std::memcpy(&v, ptr, sizeof(size_t));
-      r = rotl(r + v * 31, 15);
-      ptr += sizeof(size_t);
-    }
-    return r * 11400714819323198485llu;
+    return bufferHash(&v, sizeof(v));
   }
 };
 struct IpcMemEqual {
@@ -367,6 +379,7 @@ struct FLPtr {
   Storage* ptr = nullptr;
   FLPtr(std::nullptr_t) {}
   FLPtr() = default;
+  FLPtr(void* ptr) : ptr((Storage*)ptr) {}
   ~FLPtr() {
     if (ptr) {
       ptr->clear();
@@ -388,6 +401,9 @@ struct FLPtr {
     FLPtr r;
     r.ptr = ptr;
     return r;
+  }
+  void* release() {
+    return std::exchange(ptr, nullptr);
   }
   FLPtr& operator=(FLPtr&& n) {
     std::swap(ptr, n.ptr);
@@ -618,5 +634,54 @@ struct InternalAllocator {
 
 template<typename T>
 using IVector = Vector<T, InternalAllocator<T>>;
+
+template<size_t size, size_t alignment>
+struct AlignedStorage {
+  alignas(alignment) unsigned char storage[size];
+};
+
+template<typename U>
+struct UniqueImpl {
+  U u;
+  UniqueImpl() = default;
+  ~UniqueImpl() {
+    if (u.impl) [[unlikely]] {
+      u.destroy();
+    }
+  }
+  UniqueImpl(std::nullptr_t) {}
+  UniqueImpl(UniqueImpl&& n) {
+    u.impl = std::exchange(n.u.impl, nullptr);
+  }
+  UniqueImpl(const UniqueImpl&) = delete;
+  UniqueImpl& operator=(UniqueImpl&& n) {
+    std::swap(u.impl, n.u.impl);
+    return *this;
+  }
+  UniqueImpl& operator=(const UniqueImpl&) = delete;
+
+  UniqueImpl& operator=(std::nullptr_t) {
+    if (u.impl) [[unlikely]] {
+      u.destroy();
+      u.impl = nullptr;
+    }
+    return *this;
+  }
+
+  operator U*() {
+    return &u;
+  }
+  U& operator*() {
+    return u;
+  }
+  U* operator->() {
+    return &u;
+  }
+
+  template<typename T>
+  T* as() {
+    return (T*)u.impl;
+  }
+};
 
 } // namespace moodist

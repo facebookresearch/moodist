@@ -594,73 +594,9 @@ struct ProcessGroupImpl {
       sync(stepValue);
       return;
     }
-
-    // if (ipcMapper->hasQueuedUnmaps.load(std::memory_order_relaxed) ||
-    //     group->syncData->shouldSync.load(std::memory_order_relaxed)) {
-
-    //   group->syncData->syncStepValue = stepValue;
-    //   for (size_t i : peerIndices) {
-    //     group->getPeerVar(i, group->syncData)->shouldSync = true;
-    //   }
-    //   log.info("%d: attempting to sync up at step %#x!\n", rank, stepValue);
-    //   bool failed = false;
-    //   while (true) {
-    //     uint32_t minStepValue = std::numeric_limits<uint32_t>::max();
-    //     uint32_t maxStepValue = 0;
-    //     for (size_t i : peerIndices) {
-    //       uint32_t v = group->getPeerVar(i, group->syncData)->myStepValue.load();
-    //       minStepValue = std::min(minStepValue, v);
-    //       maxStepValue = std::max(maxStepValue, v);
-    //     }
-    //     // log.info("%d: min %d max %d\n", rank, minStepValue, maxStepValue);
-    //     if (maxStepValue >= stepValue) {
-    //       log.info("failed to sync up, unmap later!\n");
-    //       failed = true;
-    //       break;
-    //     }
-    //     if (minStepValue == maxStepValue) {
-    //       bool synced = true;
-    //       for (size_t i : peerIndices) {
-    //         if (group->getPeerVar(i, group->syncData)->syncStepValue.load() != stepValue) {
-    //           synced = false;
-    //           break;
-    //         }
-    //       }
-    //       if (synced) {
-    //         break;
-    //       }
-    //     }
-    //   }
-    //   if (!failed) {
-    //     group->syncData->syncStepValue2 = stepValue;
-    //     for (size_t i : peerIndices) {
-    //       while (group->getPeerVar(i, group->syncData)->syncStepValue2.load() < stepValue) {
-    //         _mm_pause();
-    //       }
-    //     }
-    //     log.info("%d: all synced up, execute unmaps!\n", rank);
-    //     for (size_t i : peerIndices) {
-    //       uint32_t v = group->getPeerVar(i, group->syncData)->syncStepValue.load();
-    //       CHECK(v == stepValue);
-    //     }
-    //     ipcMapper->executeQueuedUnmaps();
-    //     for (size_t i : peerIndices) {
-    //       uint32_t v = group->getPeerVar(i, group->syncData)->syncStepValue.load();
-    //       CHECK(v == stepValue);
-    //     }
-    //     group->syncData->shouldSync = false;
-
-    //     group->syncData->syncStepValue2 = stepValue + 1;
-    //     for (size_t i : peerIndices) {
-    //       while (group->getPeerVar(i, group->syncData)->syncStepValue2.load() < stepValue + 1) {
-    //         _mm_pause();
-    //       }
-    //     }
-    //   }
-    // }
-    // group->syncData->myStepValue.store(stepValue, std::memory_order_relaxed);
     ipcMapper->setStepValue(stepValue);
   }
+
   AllocatedBuffer alloccuda(size_t size, CUstream stream) {
     if (size == 0) {
       return {};
@@ -1288,7 +1224,7 @@ struct ProcessGroupImpl {
         e->numDevices = 4;
       }
       e->numParallel = 1;
-      e->numDevices = std::min(e->numDevices, group->ibDevs.size());
+      e->numDevices = std::min(e->numDevices, group->rdmaDevs.size());
       e->numDevices = std::max(e->numDevices, (size_t)1);
       e->numChunks = std::max(e->numChunks, (size_t)1);
       chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
@@ -1829,7 +1765,7 @@ struct ProcessGroupImpl {
       // if (copy) {
       //   e->numDevices = group->ibDevs.size();
       // }
-      e->numDevices = std::min(e->numDevices, group->ibDevs.size());
+      e->numDevices = std::min(e->numDevices, group->rdmaDevs.size());
       e->numDevices = std::max(e->numDevices, (size_t)1);
       e->numChunks = std::max(e->numChunks, (size_t)1);
       e->numParallel = 1;
@@ -2059,17 +1995,15 @@ struct ProcessGroupImpl {
   void peerWriteDyn(
       uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, uintptr_t gatherAddress,
       size_t bytes) {
-    {
-      auto& dyn = group->getPeerVar(peerIndex, group->cpuLocalDyns)[size * concurrencyIndex + rank];
-      dyn.opType = opType;
-      dyn.gatherAddress = gatherAddress;
-      dyn.gatherBytes = bytes;
-      dyn.stepValue = stepValue;
+    auto& dyn = group->getPeerVar(peerIndex, group->cpuLocalDyns)[size * concurrencyIndex + rank];
+    dyn.opType = opType;
+    dyn.gatherAddress = gatherAddress;
+    dyn.gatherBytes = bytes;
+    dyn.stepValue = stepValue;
 
-      group->getPeerVar(peerIndex, group->atomicStepValue)[size * concurrencyIndex + rank] = stepValue;
+    group->getPeerVar(peerIndex, group->atomicStepValue)[size * concurrencyIndex + rank] = stepValue;
 
-      group->ipcMapper->push(peerIndex, std::make_pair(concurrencyIndex, stepValue));
-    }
+    group->ipcMapper->push(peerIndex, std::make_pair(concurrencyIndex, stepValue));
   }
   uintptr_t
   peerWaitDyn(uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, size_t bytes) {
@@ -2167,7 +2101,7 @@ struct ProcessGroupImpl {
       numDevices = std::min(bytes / 65536, std::max((size_t)4, group->numTrueIbDevs));
       numChunks = std::min(bytes / 65536, (size_t)4);
     }
-    numDevices = std::min(numDevices, group->ibDevs.size());
+    numDevices = std::min(numDevices, group->rdmaDevs.size());
     numDevices = std::max(numDevices, (size_t)1);
     numChunks = std::max(numChunks, (size_t)1);
     size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
@@ -2367,7 +2301,7 @@ struct ProcessGroupImpl {
       numDevices = std::min(bytes / 65536, std::max((size_t)4, group->numTrueIbDevs));
       numChunks = std::min(bytes / 65536, (size_t)4);
     }
-    numDevices = std::min(numDevices, group->ibDevs.size());
+    numDevices = std::min(numDevices, group->rdmaDevs.size());
     numDevices = std::max(numDevices, (size_t)1);
     numChunks = std::max(numChunks, (size_t)1);
     size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
@@ -3095,6 +3029,10 @@ struct ProcessGroupImpl {
     freePendingIpcEvents();
     syncPeers(stream);
   }
+
+  void shutdown() {
+    group->cpuThread->kill(false);
+  }
 };
 
 void globalsDtor() {
@@ -3420,7 +3358,7 @@ c10::intrusive_ptr<Work> ProcessGroup::scatter(
     }
   }
   if (getRank() == opts.rootRank) {
-    CHECK(inputTensors.size() == 1)
+    CHECK(inputTensors.size() == 1);
     auto& inputs = inputTensors[0];
     CHECK(inputs.size() == getSize());
     for (size_t i = 0; i != inputs.size(); ++i) {
@@ -3536,6 +3474,10 @@ Future ProcessGroup::copy(torch::Tensor& destination, const torch::Tensor& sourc
 
 std::string ProcessGroup::moodist_name() const {
   return impl->group->name;
+}
+
+void ProcessGroup::shutdown() {
+  impl->shutdown();
 }
 
 Future::Future() {}

@@ -22,8 +22,8 @@ struct OpsBase {
   const size_t size = 0;
 };
 
-template<typename F, typename R, typename... Args>
-struct TemplatedStorage;
+template<typename F>
+struct TemplatedStorageObject;
 
 struct Storage {
   union {
@@ -35,19 +35,22 @@ struct Storage {
   void* callPtr = nullptr;
   const OpsBase* ops = nullptr;
   Storage() {}
-  template<typename F, typename R, typename... Args>
+  template<typename F>
   F& as() {
-    return (F&)((TemplatedStorage<F, R, Args...>*)this)->f;
+    return (F&)((TemplatedStorageObject<F>*)this)->f;
   }
 };
 
 template<typename F, typename R, typename... Args>
 struct OpsConstructor;
 
-template<typename F, typename R, typename... Args>
-struct TemplatedStorage : Storage {
+template<typename F>
+struct TemplatedStorageObject : Storage {
   std::aligned_storage_t<sizeof(F), alignof(F)> f;
+};
 
+template<typename F, typename R, typename... Args>
+struct TemplatedStorage : TemplatedStorageObject<F> {
   static TemplatedStorage* pop() {
     TemplatedStorage* r = FreeList<TemplatedStorage>::pop();
     if (r) {
@@ -86,12 +89,9 @@ template<typename F, typename R, typename... Args>
 struct OpsConstructor {
   static constexpr Ops<R, Args...> make() {
     Ops<R, Args...> r{{sizeof(F)}};
-    r.call = [](Storage& s, Args&&... args) {
-      // return std::invoke(s.as<F>(), std::forward<Args>(args)...);
-      return s.template as<F, R, Args...>()(std::forward<Args>(args)...);
-    };
+    r.call = [](Storage& s, Args&&... args) { return s.template as<F>()(std::forward<Args>(args)...); };
     r.callAndDtor = [](Storage& s, Args&&... args) {
-      F& f = s.template as<F, R, Args...>();
+      F& f = s.template as<F>();
       if constexpr (std::is_same_v<R, void>) {
         f(std::forward<Args>(args)...);
         f.~F();
@@ -104,12 +104,12 @@ struct OpsConstructor {
       }
     };
     r.dtor = [](Storage& s) {
-      s.template as<F, R, Args...>().~F();
+      s.template as<F>().~F();
       TemplatedStorage<F, R, Args...>::push((TemplatedStorage<F, R, Args...>*)&s);
     };
     r.copy = [](Storage& to, Storage& from) {
       if constexpr (std::is_copy_assignable_v<F>) {
-        to.template as<F, R, Args...>() = from.template as<F, R, Args...>();
+        to.template as<F>() = from.template as<F>();
       } else {
         throw std::runtime_error("function is not copy assignable");
       }
@@ -117,7 +117,7 @@ struct OpsConstructor {
     r.copyCtor = [](Storage& from) -> Storage* {
       if constexpr (std::is_copy_constructible_v<F>) {
         Storage* r = TemplatedStorage<F, R, Args...>::pop();
-        new (&r->template as<F, R, Args...>()) F(from.template as<F, R, Args...>());
+        new (&r->template as<F>()) F(from.template as<F>());
         return r;
       } else {
         throw std::runtime_error("function is not copy constructible");
@@ -139,6 +139,14 @@ class Function;
 template<typename R, typename... Args>
 class Function<R(Args...)> {
   Storage* storage = nullptr;
+
+  using CallType = R (*)(Storage&, Args&&...);
+  CallType getCall() const {
+    return (CallType)storage->callPtr;
+  }
+  const Ops<R, Args...>* getOps() const {
+    return (const Ops<R, Args...>*)storage->ops;
+  }
 
 public:
   Function() = default;
@@ -164,12 +172,8 @@ public:
     *this = nullptr;
   }
 
-  using CallType = R (*)(Storage&, Args&&...);
-  CallType getCall() const {
-    return (CallType)storage->callPtr;
-  }
-  const Ops<R, Args...>* getOps() const {
-    return (const Ops<R, Args...>*)storage->ops;
+  FunctionPointer getPointer() const {
+    return storage;
   }
 
   FunctionPointer release() noexcept {
@@ -238,7 +242,7 @@ public:
     using FT = std::remove_reference_t<F>;
     auto* newStorage = TemplatedStorage<FT, R, Args...>::pop();
     try {
-      new (&newStorage->template as<FT, R, Args...>()) FT(std::forward<F>(f));
+      new (&newStorage->template as<FT>()) FT(std::forward<F>(f));
     } catch (...) {
       TemplatedStorage<FT, R, Args...>::push(newStorage);
       throw;

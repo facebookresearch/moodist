@@ -12,7 +12,7 @@
 
 namespace moodist {
 
-constexpr uint8_t taskTerminate = 0;
+constexpr uint8_t taskShutdown = 0;
 constexpr uint8_t taskBarrier = 1;
 constexpr uint8_t taskAllGather = 2;
 constexpr uint8_t taskReduceScatter = 3;
@@ -90,6 +90,8 @@ OPTYPE(CreateQueueNamedResult);
 
 OPTYPE(Cat);
 OPTYPE(Cached);
+
+OPTYPE(MessageShutdown);
 
 template<typename DynamicAddresses>
 inline void badOp(
@@ -255,6 +257,7 @@ struct QueueEntryQueueRead : QueueEntry {
 
 struct QueueEntryQueueReadFinished : QueueEntry {
   uint32_t key = 0;
+  uint32_t cudaDoneValue;
 };
 
 struct QueueEntryQueueTransaction : QueueEntry {
@@ -324,7 +327,7 @@ struct CpuThread {
   std::atomic_bool ready = false;
   std::atomic_bool busy = false;
 
-  QueueEntryFreeList<QueueEntry> freelistTerminate;
+  QueueEntryFreeList<QueueEntry> freelistShutdown;
   QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
   QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
   QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
@@ -350,7 +353,7 @@ struct CpuThread {
 
   CpuThread(Group*);
   ~CpuThread();
-  void kill();
+  void kill(bool wait = true);
 
   void start();
   void enqueue(QueueEntry* e) {

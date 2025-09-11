@@ -25,8 +25,10 @@ std::vector<std::string> Listener::localAddresses() const {
   return socket.localAddresses();
 }
 
-const uint32_t sigSocketData = 0x40ea69f4;
-const uint32_t sigSocketDataFd = 0xf555d4e4;
+namespace {
+
+constexpr uint32_t sigSocketData = 0x40ea69f4;
+constexpr uint32_t sigSocketDataFd = 0xf555d4e4;
 
 SharedBufferHandle toShared(SharedBufferHandle h) {
   return h;
@@ -34,6 +36,14 @@ SharedBufferHandle toShared(SharedBufferHandle h) {
 SharedBufferHandle toShared(BufferHandle h) {
   return SharedBufferHandle(h.release());
 }
+
+constexpr int stateZero = 0;
+constexpr int stateSocketReadIovecs = 1;
+constexpr int stateRecvFd = 2;
+constexpr int stateAllDone = 3;
+constexpr int stateReadMore = 4;
+
+} // namespace
 
 template<typename Buffer>
 void Connection::write(Buffer buffer, Function<void(Error*)> callback) {
@@ -61,6 +71,33 @@ template void Connection::write(BufferHandle, Function<void(Error*)>);
 template void Connection::write(SharedBufferHandle, Function<void(Error*)>);
 
 template<typename Buffer>
+void Connection::write(Buffer buffer, std::span<iovec> extra, Function<void(Error*)> callback) {
+  uint32_t size = buffer->size();
+  if ((size_t)size != buffer->size()) {
+    throw Error("write: buffer is too large (size does not fit in 32 bits)");
+  }
+
+  auto buffer0 = serializeToBuffer(sigSocketData, size);
+  std::array<iovec, 16> iovec;
+  iovec[0].iov_base = buffer0->data();
+  iovec[0].iov_len = buffer0->size();
+  iovec[1].iov_base = buffer->data();
+  iovec[1].iov_len = buffer->size();
+  CHECK(2 + extra.size() <= 16);
+  std::memcpy(&iovec[2], extra.data(), sizeof(::iovec) * extra.size());
+  socket.writev(
+      iovec.data(), 2 + extra.size(),
+      [buffer0 = std::move(buffer0), buffer = std::move(buffer), callback = std::move(callback)](Error* error) {
+        if (callback) {
+          callback(error);
+        }
+      });
+}
+
+template void Connection::write(BufferHandle, std::span<iovec>, Function<void(Error*)>);
+template void Connection::write(SharedBufferHandle, std::span<iovec>, Function<void(Error*)>);
+
+template<typename Buffer>
 void Connection::writefd(Buffer buffer, int fd) {
   uint32_t size = buffer->size();
   if ((size_t)size != buffer->size()) {
@@ -68,8 +105,6 @@ void Connection::writefd(Buffer buffer, int fd) {
   }
 
   int dupfd = ::dup(fd);
-
-  log.info("writefd dupfd is %d\n", dupfd);
 
   auto buffer0 = serializeToBuffer(sigSocketDataFd, size);
   std::array<iovec, 2> iovec;
@@ -102,6 +137,7 @@ struct ReadState {
   Function<void(Error*, BufferHandle, int)> fdcallback;
   BufferHandle buffer;
   CachedReader reader;
+  Function<void()> readMoreCallback;
   ReadState(Connection* connection, Function<void(Error*, BufferHandle)> callback)
       : connection(connection), reader(&connection->socket), callback(std::move(callback)) {}
   ReadState(Connection* connection, Function<void(Error*, BufferHandle, int)> fdcallback)
@@ -118,11 +154,6 @@ struct ReadState {
       callError(error);
       return;
     }
-
-    static constexpr int stateZero = 0;
-    static constexpr int stateSocketReadIovecs = 1;
-    static constexpr int stateRecvFd = 2;
-    static constexpr int stateAllDone = 3;
 
     while (true) {
       switch (state) {
@@ -182,6 +213,14 @@ struct ReadState {
         }
         break;
       }
+      case stateReadMore:
+        if (!reader.done()) {
+          return;
+        } else {
+          state = stateZero;
+          std::move(readMoreCallback)();
+          break;
+        }
       }
     }
   }
@@ -193,6 +232,16 @@ void Connection::read(Function<void(Error*, BufferHandle)> callback) {
 
 void Connection::readfd(Function<void(Error*, BufferHandle, int)> callback) {
   socket.setOnRead(ReadState(this, std::move(callback)));
+}
+
+void Connection::inread_iovec(void* ptr, size_t bytes, Function<void()> callback) {
+  auto& rs = socket.onReadFunction()->as<ReadState>();
+  CHECK(rs.state = stateAllDone);
+  rs.reader.newRead();
+  rs.reader.addIovec(ptr, bytes);
+  rs.reader.startRead();
+  rs.readMoreCallback = std::move(callback);
+  rs.state = stateReadMore;
 }
 
 std::string Connection::localAddress() const {

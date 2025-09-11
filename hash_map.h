@@ -50,6 +50,10 @@ private:
   SecondaryItem* secondary = nullptr;
 
 public:
+  using key_type = Key;
+  using mapped_type = Value;
+  using value_type = std::pair<Key, Value>;
+
   struct iterator {
   private:
   public:

@@ -324,6 +324,9 @@ struct PollThread {
   int eventFd = -1;
   std::atomic_uint32_t removeCount = 0;
 
+  SpinMutex mutex;
+  HashMap<int, Function<void()>> callbacksContainer;
+
   void entry() {
     std::array<epoll_event, 1024> events;
 
@@ -377,11 +380,14 @@ struct PollThread {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 
     epoll_event e;
-    e.data.ptr = callback.release();
+    e.data.ptr = callback.getPointer();
     e.events = EPOLLIN | EPOLLOUT | EPOLLET;
     if (epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &e)) {
       throwErrno(errno, "epoll_ctl");
     }
+
+    std::lock_guard l(mutex);
+    callbacksContainer[fd] = std::move(callback);
   }
   void remove(int fd) {
     epoll_event e;
@@ -395,6 +401,11 @@ struct PollThread {
       futexWait(&removeCount, rc, std::chrono::seconds(1));
       rc = removeCount;
     }
+
+    std::lock_guard l(mutex);
+    auto i = callbacksContainer.find(fd);
+    CHECK(i != callbacksContainer.end());
+    callbacksContainer.erase(i);
   }
 };
 PollThread* pollThread = new PollThread();

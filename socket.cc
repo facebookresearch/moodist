@@ -625,6 +625,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
         }
         if (writtenForCallback >= callbacks[0].first) {
           writtenForCallback -= callbacks[0].first;
+          std::move(callbacks[0].second)(nullptr);
           ++callbacks;
           --callbacksLen;
         } else {
@@ -1116,6 +1117,10 @@ void Socket::connect(std::string_view address, Function<void(Error*)> callback) 
 
 void Socket::setOnRead(Function<void(Error*)> callback) {
   impl->setOnRead(std::move(callback));
+}
+
+FunctionPointer Socket::onReadFunction() const {
+  return impl->onRead.getPointer();
 }
 
 size_t Socket::readv(const iovec* vec, size_t veclen) {

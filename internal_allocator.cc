@@ -495,6 +495,7 @@ size_t moo_alloc_size(void* p) {
 
 } // namespace
 
+[[gnu::malloc]]
 void* internalAlloc(size_t bytes) {
   std::lock_guard l(globals->mutex);
   return moo_alloc(bytes);

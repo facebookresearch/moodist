@@ -15,6 +15,7 @@
 #include "ipc_mapper.h"
 #include "logging.h"
 #include "queue.h"
+#include "rdma.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
@@ -44,156 +45,30 @@ namespace moodist {
 
 extern bool profilingEnabled;
 
-struct CpuThreadImpl;
-
-struct TemporaryBufferHandle;
-
 namespace {
 
-struct MemoryRegistration {
-  std::array<ibv_mr*, Group::maxDevices> mrs{};
-};
-
-struct CudaMapping {
-  uint64_t bufferId;
-  uintptr_t address;
-  size_t bytes;
-  MemoryRegistration mr;
-};
-
-struct CpuMapping {
-  size_t bytes;
-  MemoryRegistration mr;
-};
-
-struct TemporaryLkeyBuffers {
-  Vector<TemporaryBufferHandle> free;
-  size_t offset = 0;
-  Vector<TemporaryBufferHandle> busy;
-};
-
-struct Device;
-struct Callback;
-struct QueuedWr {
-  size_t i;
-  void* localAddress;
-  uint32_t lkey;
-  size_t bytes;
-  Callback* callback;
-};
-struct SmallFunction;
 struct Device {
+  bool active = false;
   IntrusiveListLink<Device> link;
-  IbCommon* ib;
-  ibv_pd* protectionDomain;
-  ibv_cq* cq;
-  size_t currentCqEntries = 0;
-  bool efa;
-  size_t numCqEvents = 0;
+  Rdma* rdma;
 
-  TemporaryLkeyBuffers temporaryLkeyBuffers;
+  // ibv_pd* protectionDomain;
+  // ibv_cq* cq;
+  // size_t currentCqEntries = 0;
+  // bool efa;
+  // size_t numCqEvents = 0;
 
-  IVector<Function<void()>> queuedWrs;
+  // TemporaryLkeyBuffers temporaryLkeyBuffers;
+
+  // IVector<Function<void()>> queuedWrs;
 };
 
-struct SmallFunction {
-  std::aligned_storage_t<0x40, alignof(std::max_align_t)> storage;
-  void (*call)(SmallFunction*) = nullptr;
-  void (*dtor)(SmallFunction*) = nullptr;
-
-  SmallFunction& operator=(std::nullptr_t) {
-    if (dtor) {
-      dtor(this);
-    }
-    call = nullptr;
-    dtor = nullptr;
-    return *this;
-  }
-
-  ~SmallFunction() {
-    if (dtor) {
-      dtor(this);
-    }
-  }
-
-  template<typename F>
-  SmallFunction& operator=(F&& f) {
-    static_assert(sizeof(F) <= sizeof(storage));
-    if (dtor) {
-      dtor(this);
-    }
-    new (&storage) F(std::forward<F>(f));
-    call = [](SmallFunction* self) { ((F&)self->storage)(); };
-    if constexpr (std::is_trivially_destructible_v<F>) {
-      dtor = nullptr;
-    } else {
-      dtor = [](SmallFunction* self) { ((F&)self->storage).~F(); };
-    }
-    return *this;
-  }
-
-  void operator()() {
-    return call(this);
-  }
-
-  operator bool() const {
-    return call != nullptr;
-  }
-};
-
-struct Callback {
-  IntrusiveListLink<Callback> link;
-  SmallFunction onComplete;
-  size_t refcount = 0;
-  Callback* next = nullptr;
-
-  size_t* counter = nullptr;
-  size_t i = -1;
-
-  void decref() {
-    CHECK(refcount >= 1);
-    if (--refcount == 0) {
-      if (onComplete) {
-        std::move(onComplete)();
-      } else if (counter) {
-        --*counter;
-      }
-      FreeList<Callback>::push(this, 0x1000);
-    }
-  }
-};
+using Callback = RdmaCallback;
 
 struct RemoteAddressAndKey {
   uintptr_t address;
   SimpleVector<uint32_t> keys;
 };
-
-struct CallbackWrapper {
-  Callback* callback = nullptr;
-  CallbackWrapper() = default;
-  CallbackWrapper(std::nullptr_t) {}
-  CallbackWrapper(Callback* callback) : callback(callback) {
-    if (callback) {
-      ++callback->refcount;
-    }
-  }
-  ~CallbackWrapper() {
-    if (callback) {
-      callback->decref();
-    }
-  }
-  operator Callback*() {
-    return callback;
-  }
-  Callback* operator->() {
-    return callback;
-  }
-  Callback& operator*() {
-    return *callback;
-  }
-};
-
-} // namespace
 
 template<Dtype dtype>
 struct CpuTypes;
@@ -276,37 +151,20 @@ struct CpuReductions {
 std::atomic_int nextThreadId;
 thread_local int currentThreadId = ++nextThreadId;
 
-template<typename T>
-struct MTList {
-  std::atomic_size_t n = 0;
-  SpinMutex mutex;
-  IVector<T> list;
-
-  template<typename U>
-  void push(U&& u) {
-    std::lock_guard l(mutex);
-    list.push_back(std::forward<U>(u));
-    ++n;
-  }
-  void clear() {
-    std::lock_guard l(mutex);
-    list.clear();
-    n = 0;
-  }
+struct MemoryRegistration {
+  std::array<RdmaMr*, Group::maxDevices> mrs{};
 };
 
-template<typename T>
-struct MTHandle {
-  std::optional<T> obj;
-  MTList<T>* list;
-  MTHandle() = default;
-  MTHandle(T&& n, MTList<T>& list) : obj(std::move(n)), list(&list) {}
-  MTHandle(MTHandle&& n) = default;
-  ~MTHandle() {
-    if (list) {
-      list->push(*std::move(obj));
-    }
-  }
+struct CudaMapping {
+  uint64_t bufferId;
+  uintptr_t address;
+  size_t bytes;
+  MemoryRegistration mr;
+};
+
+struct CpuMapping {
+  size_t bytes;
+  MemoryRegistration mr;
 };
 
 struct TemporaryBufferHandle {
@@ -361,28 +219,24 @@ Stats stats;
 struct CpuThreadImpl {
   CpuThread* cpuThread;
   Group* group = cpuThread->group;
-  bool dead = false;
 
   CpuThreadImpl(CpuThread* cpuThread) : cpuThread(cpuThread) {
     CHECK(devices.size() <= maxDevices);
   }
   ~CpuThreadImpl() {
     destroyReceives();
-    dead = true;
+    for (auto& v : devices) {
+      v.rdma->close();
+    }
+    localMrs.clear();
   }
 
   const size_t rank = group->rank;
   const size_t size = group->size;
 
-  static constexpr size_t maxWr = IbCommon::maxWr;
-  static constexpr size_t maxCqEntries = IbCommon::maxCqEntries;
-  static constexpr size_t maxSrqEntries = IbCommon::maxSrqEntries;
-
   SetupComms* setupComms = &*group->setupComms;
   SimpleVector<Device> devices = initDevices();
   IntrusiveList<Device, &Device::link> activeDevices;
-
-  MTList<TemporaryBufferHandle> returnedTemporaryBufferHandles;
 
   size_t bytesWritten = 0;
   size_t bytesRead = 0;
@@ -391,7 +245,7 @@ struct CpuThreadImpl {
   bool cqErrored = false;
   std::chrono::steady_clock::time_point errorTime;
 
-  IVector<IbvMr> localMrs;
+  IVector<std::unique_ptr<RdmaMr>> localMrs;
 
   IVector<std::unique_ptr<CudaMapping>> cudaMappings;
   IVector<std::unique_ptr<CpuMapping>> cpuMappings;
@@ -411,11 +265,14 @@ struct CpuThreadImpl {
   // uint32_t* cudaStepValuesDeviceChunks = group->cudaStepValuesDeviceChunks;
 
   struct RankInfo {
-    std::array<char, 64> hostname;
-    int pid;
-    int device;
-    size_t heartbeatValue;
-    bool exited;
+    std::array<char, 64> hostname = {0};
+    int pid = 0;
+    int device = -1;
+    size_t heartbeatValue = 0;
+    bool shutdown = false;
+    bool exited = false;
+    std::chrono::steady_clock::time_point shutdownTime;
+    std::chrono::steady_clock::time_point exitTime;
   };
 
   AllocatedArray rankInfo = group->allocateArrayHost(sizeof(RankInfo), size);
@@ -565,29 +422,23 @@ struct CpuThreadImpl {
 
   SimpleVector<Device> initDevices() {
     SimpleVector<Device> devices;
-    for (auto& v : group->ibDevs) {
-      devices.resize(devices.size() + 1);
-      auto& dev = devices.back();
-      dev.ib = &*v;
-      dev.protectionDomain = v->protectionDomain;
-      dev.cq = v->cq;
-      dev.efa = dev.ib->qpex != nullptr;
+    devices.resize(group->rdmaDevs.size());
+    for (size_t i : indices(group->rdmaDevs)) {
+      auto& dev = devices[i];
+
+      RdmaCpuThreadApi cpuThreadApi;
+      cpuThreadApi.impl = this;
+      cpuThreadApi.context = &dev;
+
+      dev.rdma = &*group->rdmaDevs[i];
+      dev.rdma->setCpuThreadApi(cpuThreadApi);
     }
     return devices;
   }
 
   template<typename F>
-  CallbackWrapper makeCallback(F&& f) {
-    Callback* callback = FreeList<Callback>::pop();
-    if (!callback) {
-      // callback = new Callback();
-      callback = new (internalAlloc(sizeof(Callback))) Callback();
-    }
-    CHECK(callback->refcount == 0);
-    callback->onComplete = std::move(f);
-    callback->counter = nullptr;
-    callback->i = -1;
-    return CallbackWrapper(callback);
+  auto makeCallback(F&& f) {
+    return makeRdmaCallback(std::forward<F>(f));
   }
 
   void setErrorState() {
@@ -600,169 +451,31 @@ struct CpuThreadImpl {
         "The process group is now in an error state, and Moodist will shortly forcefully terminate the process.\n");
   }
 
-  struct PollState {
-    IntrusiveList<Device, &Device::link>::iterator i;
-    std::array<ibv_wc, 8> wcs;
-    size_t wcsn = 0;
-    size_t wcsi = 0;
-  };
-  PollState pollState{activeDevices.end()};
+  bool pollCalledRecursively = false;
 
   void poll() {
-    auto& s = pollState;
-
-    if (s.i == activeDevices.end()) {
-      s.i = activeDevices.begin();
-      if (s.i == activeDevices.end()) {
-        return;
-      }
+    CHECK(!pollCalledRecursively);
+    pollCalledRecursively = true;
+    for (auto i = activeDevices.begin(); i != activeDevices.end();) {
+      auto& dev = *i++;
+      CHECK(dev.active);
+      dev.rdma->poll();
     }
-
-    size_t n = devices.size();
-    for (size_t t = 0; t != n; ++t) {
-
-      Device& dev = *s.i;
-
-      if (s.wcsi != s.wcsn) {
-        ibv_wc& wc = s.wcs[s.wcsi];
-        ++s.wcsi;
-        if (wc.status) [[unlikely]] {
-          NOINLINE_COLD({
-            // fatal("rank %d Work completion with status %d (opcode %d, id %#x)\n", rank, wc.status, wc.opcode,
-            // wc.wr_id);
-            cqErrored = true;
-            Callback* callback = (Callback*)(void*)wc.wr_id;
-            log.error(
-                "%s: Error communicating with %s: Work completion with status %d (%s).\n", groupName(),
-                rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
-            setErrorState();
-          });
-        } else {
-          CHECK(dev.currentCqEntries != 0);
-          if (!dev.queuedWrs.empty()) {
-            CHECK(dev.currentCqEntries == maxCqEntries);
-            dev.queuedWrs.pop_front_value()();
-          } else {
-            --dev.currentCqEntries;
-            if (dev.currentCqEntries == 0) {
-              CHECK(s.wcsi == s.wcsn);
-              ++s.i;
-              activeDevices.erase(dev);
-
-              if (!dev.temporaryLkeyBuffers.busy.empty()) {
-                for (auto& v : dev.temporaryLkeyBuffers.busy) {
-                  dev.temporaryLkeyBuffers.free.push_back(std::move(v));
-                }
-                dev.temporaryLkeyBuffers.busy.clear();
-              }
-            }
-          }
-          CHECK(wc.wr_id != 0);
-          Callback* callback = (Callback*)(void*)wc.wr_id;
-          callback->decref();
-        }
-        return;
-      }
-
-      s.wcsn = ibv_poll_cq(dev.cq, s.wcs.size(), s.wcs.data());
-      s.wcsi = 0;
-      if (s.wcsn == 0) {
-        ++s.i;
-        if (s.i == activeDevices.end()) {
-          s.i = activeDevices.begin();
-        }
-      }
-    }
-  }
-
-  std::pair<void*, uint32_t> temporaryLkey(Device& dev, void* address, size_t bytes) {
-    CHECK(bytes <= 64);
-    auto& st = dev.temporaryLkeyBuffers;
-    if (st.free.empty()) {
-      st.offset = 0;
-      st.free.push_back(allocateTemporaryBuffer(1024));
-      log.debug("allocate new temporary lkey buffer\n");
-    }
-    CHECK(!st.free.empty() && st.free.front()->bytes - st.offset >= 64);
-    auto& buf = st.free.front();
-    uintptr_t r = (uintptr_t)buf->cpuPointer + st.offset;
-    st.offset += 64;
-    uint32_t lkey = buf.mr->mrs[&dev - devices.data()]->lkey;
-    if (st.offset >= buf->bytes) {
-      st.busy.push_back(std::move(buf));
-      st.free.pop_front();
-      st.offset = 0;
-    }
-    [[assume(bytes <= 64)]];
-    std::memcpy((void*)r, address, bytes);
-    return {(void*)r, lkey};
-  }
-
-  void postWriteImpl(
-      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
-      size_t bytes, Callback* callback, bool allowInline) {
-    CHECK(i >= 0 && i < size);
-
-    bytesWritten += bytes;
-
-    ibv_qp_ex* qp = dev.ib->qpex;
-
-    // log.info(
-    //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
-
-    bool efa = qp != nullptr;
-    if (!efa) {
-      qp = dev.ib->qpexs[i];
-      CHECK(qp != nullptr);
-    }
-
-    ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)callback;
-    qp->wr_flags = IBV_SEND_SIGNALED;
-    ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
-    if (allowInline && bytes <= dev.ib->inlineBytes) {
-      ibv_wr_set_inline_data(qp, localAddress, bytes);
-    } else {
-      if (!lkey) {
-        std::tie(localAddress, lkey) = temporaryLkey(dev, localAddress, bytes);
-      }
-      ibv_wr_set_sge(qp, *lkey, (uintptr_t)localAddress, bytes);
-    }
-
-    if (efa) {
-      ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
-    }
-    int error = ibv_wr_complete(qp);
-    if (error) {
-      throwErrno(error, "ibv_wr_complete");
-    }
+    pollCalledRecursively = false;
   }
 
   void postWrite(
-      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
-      size_t bytes, Callback* callback, bool allowInline) {
-    CHECK(i >= 0 && i < size);
-
-    callback->i = i;
-    ++callback->refcount;
-
-    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
-      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline] {
-        postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
-      });
-      return;
-    }
-    ++dev.currentCqEntries;
-    if (dev.currentCqEntries == 1) {
-      activeDevices.push_back(dev);
-    }
-    postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
+      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      Callback* callback, bool allowInline) {
+    // log.info(
+    //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
+    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+    dev.rdma->postWrite(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
   }
 
   void writeData(
-      Device& dev, size_t i, void* localAddress, std::optional<uint32_t> lkey, void* remoteAddress, uint32_t rkey,
-      size_t bytes, Callback* callback, bool allowInline = true) {
+      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      Callback* callback, bool allowInline = true) {
     CHECK(i >= 0 && i < size);
 
     callback->i = i;
@@ -793,58 +506,10 @@ struct CpuThreadImpl {
     return writeData(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, false);
   }
 
-  void postReadImpl(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback) {
-    CHECK(i >= 0 && i < size);
-
-    bytesRead += bytes;
-
-    ibv_qp_ex* qp = dev.ib->qpex;
-
-    // log.info(
-    //     "%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
-
-    bool efa = qp != nullptr;
-    if (!efa) {
-      qp = dev.ib->qpexs[i];
-      CHECK(qp != nullptr);
-    }
-
-    ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)callback;
-    qp->wr_flags = IBV_SEND_SIGNALED;
-    ibv_wr_rdma_read(qp, rkey, (uintptr_t)remoteAddress);
-    ibv_wr_set_sge(qp, lkey, (uintptr_t)localAddress, bytes);
-
-    if (efa) {
-      ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
-    }
-    int error = ibv_wr_complete(qp);
-    if (error) {
-      fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
-    }
-  }
-
   void postRead(
       Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       Callback* callback) {
-    callback->i = i;
-    ++callback->refcount;
-
-    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
-      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
-        postReadImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
-      });
-      return;
-    }
-    ++dev.currentCqEntries;
-    if (dev.currentCqEntries == 1) {
-      activeDevices.push_back(dev);
-    }
-
-    return postReadImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+    dev.rdma->postRead(i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
   }
 
   void readData(
@@ -879,109 +544,17 @@ struct CpuThreadImpl {
 
     auto callbackobj = makeCallback(nullptr);
     Callback* callback = callbackobj;
-    callback->i = i;
-
     callback->counter = &concurrencyLiveControlTransfers[concurrencyIndex];
-    ++callback->refcount;
-
     ++concurrencyLiveControlTransfers[concurrencyIndex];
-
-    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
-      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
-        postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
-      });
-      return;
-    }
-    ++dev.currentCqEntries;
-    if (dev.currentCqEntries == 1) {
-      activeDevices.push_back(dev);
-    }
-
-    postWriteImpl(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
-  }
-
-  void postSendImpl(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
-    CHECK(i >= 0 && i < size);
-
-    bytesWritten += bytes;
-
-    // log.info(
-    //     "%d: post send %d bytes (%p lkey %#x) (dev %d, i %d, dev.currentCqEntries %d)\n", rank, bytes,
-    //     localAddress, lkey, &dev - devices.data(), i, dev.currentCqEntries);
-
-    ibv_qp_ex* qp = dev.ib->qpex;
-    bool efa = qp != nullptr;
-    if (!efa) {
-      qp = dev.ib->qpexs[i];
-      CHECK(qp != nullptr);
-    }
-
-    ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)callback;
-    qp->wr_flags = IBV_SEND_SIGNALED;
-    ibv_wr_send(qp);
-    ibv_wr_set_sge(qp, lkey, (uintptr_t)localAddress, bytes);
-
-    if (efa) {
-      ibv_wr_set_ud_addr(qp, dev.ib->ahs[i], dev.ib->remoteAddresses[i].qpNum, 0x4242);
-    }
-    int error = ibv_wr_complete(qp);
-    if (error) {
-      fatal("ibv_wr_complete failed with error %d: %s\n", error, std::strerror(error));
-    }
+    postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
   }
 
   void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
-    callback->i = i;
-    ++callback->refcount;
-
-    if (dev.currentCqEntries == maxCqEntries) [[unlikely]] {
-      dev.queuedWrs.push_back([this, &dev, i, localAddress, lkey, bytes, callback] {
-        postSendImpl(dev, i, localAddress, lkey, bytes, callback);
-      });
-      return;
-    }
-
-    ++dev.currentCqEntries;
-    if (dev.currentCqEntries == 1) {
-      activeDevices.push_back(dev);
-    }
-
-    postSendImpl(dev, i, localAddress, lkey, bytes, callback);
+    dev.rdma->postSend(i, localAddress, lkey, bytes, callback);
   }
 
   void postRecv(Device& dev, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
-    ibv_sge sge;
-    sge.addr = (uintptr_t)localAddress;
-    sge.length = bytes;
-    sge.lkey = lkey;
-
-    bytesWritten += bytes;
-
-    ++callback->refcount;
-
-    // log.info("%d: post recv %d bytes (%p lkey %#x) (dev %d)\n", rank, bytes, localAddress, lkey, &dev -
-    // devices.data());
-
-    ibv_recv_wr wr;
-    wr.wr_id = (uint64_t)(void*)callback;
-    wr.next = nullptr;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-
-    ibv_recv_wr* badWr = nullptr;
-    if (dev.ib->qpex) {
-      int error = ibv_post_recv(dev.ib->qp, &wr, &badWr);
-      if (error) {
-        fatal("ibv_post_recv failed with error %d: %s\n", error, std::strerror(error));
-      }
-    } else {
-      CHECK(dev.ib->sharedReceiveQueue != nullptr);
-      int error = ibv_post_srq_recv(dev.ib->sharedReceiveQueue, &wr, &badWr);
-      if (error) {
-        fatal("ibv_post_srq_recv failed with error %d: %s\n", error, std::strerror(error));
-      }
-    }
+    dev.rdma->postRecv(localAddress, lkey, bytes, callback);
   }
 
   void readDataDistributed(
@@ -1077,6 +650,9 @@ struct CpuThreadImpl {
         case opTypeCreateQueueNamedResult:
           onRecvCreateQueueNamedResult(view);
           break;
+        case opTypeMessageShutdown:
+          onRecvMessageShutdown(view, source);
+          break;
         default:
           fatal("Received unknown message type %#x", type);
         }
@@ -1129,47 +705,9 @@ struct CpuThreadImpl {
 
     for (size_t di = 0; di != devices.size(); ++di) {
       auto& dev = devices[di];
-      for (size_t i = 0; i != maxSrqEntries; ++i) {
+      for (size_t i = 0; i != IbCommon::maxSrqEntries; ++i) {
         postRecv(dev, allocateTemporaryBuffer(4096));
       }
-
-      CHECK(dev.ib->recvChannel != nullptr);
-      ib_poll::add(dev.ib->recvChannel->fd, [this, &dev, channel = (ibv_comp_channel*)dev.ib->recvChannel] {
-        CHECK(!dead);
-
-        void* ctx;
-        ibv_cq* cq = nullptr;
-        if (ibv_get_cq_event(channel, &cq, &ctx)) {
-          perror("ibv_get_cq_event");
-          CHECK(false);
-        }
-        CHECK(cq == dev.ib->recvCq);
-        ++dev.numCqEvents;
-
-        CHECK(ibv_req_notify_cq(cq, 0) == 0);
-
-        while (true) {
-          std::array<ibv_wc, 4> wcs;
-          int n = ibv_poll_cq(cq, wcs.size(), wcs.data());
-          CHECK(n >= 0);
-          for (size_t i = 0; i != n; ++i) {
-            ibv_wc& wc = wcs[i];
-            if (wc.status) {
-              fatal(
-                  "rank %d Work completion with status %d (opcode %d, id %#x) (recv)\n", rank, wc.status, wc.opcode,
-                  wc.wr_id);
-            } else {
-              Callback* callback = (Callback*)(void*)wc.wr_id;
-              callback->decref();
-            }
-          }
-          if (n < wcs.size()) {
-            break;
-          }
-        }
-      });
-
-      CHECK(ibv_req_notify_cq(dev.ib->recvCq, 0) == 0);
     }
   }
 
@@ -1179,16 +717,13 @@ struct CpuThreadImpl {
     }
     for (size_t di = 0; di != devices.size(); ++di) {
       auto& dev = devices[di];
-      CHECK(dev.ib->recvChannel != nullptr);
-      ib_poll::remove(dev.ib->recvChannel->fd);
-
-      ibv_ack_cq_events(dev.ib->recvCq, dev.numCqEvents);
+      dev.rdma->stopReceives();
     }
   }
 
   MemoryRegistration* regMr(uintptr_t address, size_t bytes) {
     auto region = cpu_allocator::regionAt(address);
-    if (region.first) {
+    if (region.first) [[likely]] {
       uintptr_t inputBegin = address;
       uintptr_t inputEnd = address + bytes;
       CHECK(address + bytes <= region.first + region.second);
@@ -1207,8 +742,8 @@ struct CpuThreadImpl {
       CHECK(address <= inputBegin && address + bytes >= inputEnd);
     }
     auto i = mrMap.find(address);
-    if (i != mrMap.end()) {
-      if (i->second->bytes >= bytes) {
+    if (i != mrMap.end()) [[likely]] {
+      if (i->second->bytes >= bytes) [[likely]] {
         return &i->second->mr;
       }
     }
@@ -1218,7 +753,7 @@ struct CpuThreadImpl {
     CHECK(devices.size() <= ptr->mr.mrs.size());
     for (size_t i = 0; i != devices.size(); ++i) {
       for (size_t i2 = 0; i2 != i; ++i2) {
-        if (devices[i2].protectionDomain == devices[i].protectionDomain) {
+        if (devices[i2].rdma->mrCompatible(devices[i].rdma)) {
           ptr->mr.mrs[i] = ptr->mr.mrs[i2];
           break;
         }
@@ -1227,18 +762,12 @@ struct CpuThreadImpl {
         continue;
       }
       auto start = std::chrono::steady_clock::now();
-      ibv_mr* mr = ibv_reg_mr(
-          devices[i].ib->protectionDomain, (void*)address, bytes,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
-      if (!mr) {
-        perror("ibv_reg_mr");
-        fatal("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
-      }
-      ptr->mr.mrs[i] = mr;
-      localMrs.push_back(mr);
+      auto mr = devices[i].rdma->regMrCpu((void*)address, bytes);
+      ptr->mr.mrs[i] = &*mr;
       log.debug(
           "new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x) (registration took %gs)\n", bytes, address,
           mr->lkey, mr->rkey, seconds(std::chrono::steady_clock::now() - start));
+      localMrs.push_back(std::move(mr));
     }
     MemoryRegistration* r = &ptr->mr;
     mrMap[address] = &*ptr;
@@ -1304,7 +833,7 @@ struct CpuThreadImpl {
     CHECK(devices.size() <= ptr->mr.mrs.size());
     for (size_t i = 0; i != devices.size(); ++i) {
       for (size_t i2 = 0; i2 != i; ++i2) {
-        if (devices[i2].protectionDomain == devices[i].protectionDomain) {
+        if (devices[i2].rdma->mrCompatible(devices[i].rdma)) {
           ptr->mr.mrs[i] = ptr->mr.mrs[i2];
           break;
         }
@@ -1315,18 +844,12 @@ struct CpuThreadImpl {
       if (bytes == 0) {
         break;
       }
-      ibv_mr* mr = ibv_reg_mr(
-          devices[i].protectionDomain, (void*)address, bytes,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
-      if (!mr) {
-        perror("ibv_reg_mr");
-        fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
-      }
-      ptr->mr.mrs[i] = mr;
-      localMrs.push_back(mr);
+      auto mr = devices[i].rdma->regMrCuda((void*)address, bytes);
+      ptr->mr.mrs[i] = &*mr;
       log.debug(
           "new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
           mr->lkey, mr->rkey);
+      localMrs.push_back(std::move(mr));
     }
     // ptr can be destructed here, but r is a plain pointer
     // fixme: return some kind of handle instead?
@@ -1374,7 +897,25 @@ struct CpuThreadImpl {
     }
   }
 
+  struct TimeoutHelper {
+    std::chrono::steady_clock::time_point start;
+    std::chrono::steady_clock::time_point end;
+    TimeoutHelper(std::chrono::steady_clock::duration timeout) {
+      start = std::chrono::steady_clock::now();
+      end = start + timeout;
+    }
+    void check() {
+      auto now = std::chrono::steady_clock::now();
+      if (now >= end) {
+        throw std::runtime_error(
+            "Moodist timed out while initializing communication. This indicates that some process had an error during "
+            "early process-group startup.");
+      }
+    }
+  };
+
   void runTests() {
+    TimeoutHelper timeout(std::chrono::seconds(60));
     AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
     for (size_t i = 0; i != 1; ++i) {
       log.debug("rank %d starting CPU test %d!\n", rank, i);
@@ -1406,6 +947,7 @@ struct CpuThreadImpl {
       }
       while (remaining && !errorState) {
         poll();
+        timeout.check();
       }
       if (errorState) {
         break;
@@ -1426,37 +968,40 @@ struct CpuThreadImpl {
 
       log.debug("rank %d CPU test done!\n", rank);
     }
-    for (size_t i = 0; i != 1; ++i) {
-      log.debug("rank %d starting CUDA test %d!\n", rank, i);
-      AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
-      auto* testMr = regMrCuda((uintptr_t)testBuffer.cudaPointer, testBuffer.bytes);
-      auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cudaPointer, testMr);
-      uint64_t* testPtr = (uint64_t*)testBuffer.cudaPointer;
-      size_t remaining = 0;
-      for (size_t i = 0; i != size; ++i) {
-        if (i == rank) {
-          continue;
+    if (std::ranges::all_of(devices, [](auto& v) { return v.rdma->supportsCuda(); })) {
+      for (size_t i = 0; i != 1; ++i) {
+        log.debug("rank %d starting CUDA test %d!\n", rank, i);
+        AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
+        auto* testMr = regMrCuda((uintptr_t)testBuffer.cudaPointer, testBuffer.bytes);
+        auto testRemote = distributeAddressAndKeys((uintptr_t)testBuffer.cudaPointer, testMr);
+        uint64_t* testPtr = (uint64_t*)testBuffer.cudaPointer;
+        size_t remaining = 0;
+        for (size_t i = 0; i != size; ++i) {
+          if (i == rank) {
+            continue;
+          }
+          size_t offset = 512 * rank;
+          for (size_t di = 0; di != devices.size(); ++di) {
+            auto& dev = devices[di];
+            size_t n = 512 / devices.size();
+            ++remaining;
+            writeDataNoInline(
+                dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
+                testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+            offset += n;
+          }
         }
-        size_t offset = 512 * rank;
-        for (size_t di = 0; di != devices.size(); ++di) {
-          auto& dev = devices[di];
-          size_t n = 512 / devices.size();
-          ++remaining;
-          writeDataNoInline(
-              dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
-              testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
-          offset += n;
+        while (remaining && !errorState) {
+          poll();
+          timeout.check();
         }
-      }
-      while (remaining && !errorState) {
-        poll();
-      }
-      if (errorState) {
-        break;
-      }
-      setupComms->allgather(0);
+        if (errorState) {
+          break;
+        }
+        setupComms->allgather(0);
 
-      log.debug("rank %d CUDA test done!\n", rank);
+        log.debug("rank %d CUDA test done!\n", rank);
+      }
     }
   }
 
@@ -1477,64 +1022,62 @@ struct CpuThreadImpl {
   int pidForTracing = syscall(SYS_gettid);
 
   template<typename... Args>
-  void trace(int threadId, int subThreadId, const char* fmt, Args&&... args) {
-    // return;
-    if (profilingEnabled || !traceEvents.empty()) {
-      NOINLINE_COLD({
-        threadId = 10 * threadId + subThreadId;
-        if (!profilingEnabled) {
-          if (!traceEvents.empty()) {
-            std::string fn = fmt::sprintf("moodist-trace-cpu-%s-%d.json", group->name, rank);
-            FILE* f = fopen(fn.c_str(), "wb");
-            CHECK(f != nullptr);
-            fmt::fprintf(
-                f, R"({"traceEvents": [)"
-                   "\n");
-            bool first = true;
-            for (auto& e : traceEvents) {
-              if (!first) {
-                fmt::fprintf(f, ",\n");
-              } else {
-                first = false;
-              }
-              fmt::fprintf(
-                  f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", e.name,
-                  std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
-                  std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId,
-                  pidForTracing);
-            }
-            fmt::fprintf(f, "]}\n");
-            fclose(f);
-            log.info("Chrome trace dumped to %s\n", fn);
-            traceEvents.clear();
+  [[gnu::noinline]] [[gnu::cold]] void trace_outlined(int threadId, int subThreadId, const char* fmt, Args&&... args) {
+    threadId = 10 * threadId + subThreadId;
+    if (!profilingEnabled) {
+      if (!traceEvents.empty()) {
+        std::string fn = fmt::sprintf("moodist-trace-cpu-%s-%d.json", group->name, rank);
+        FILE* f = fopen(fn.c_str(), "wb");
+        CHECK(f != nullptr);
+        fmt::fprintf(
+            f, R"({"traceEvents": [)"
+               "\n");
+        bool first = true;
+        for (auto& e : traceEvents) {
+          if (!first) {
+            fmt::fprintf(f, ",\n");
+          } else {
+            first = false;
           }
-          return;
+          fmt::fprintf(
+              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", e.name,
+              std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
+              std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId,
+              pidForTracing);
         }
-        auto now = std::chrono::system_clock::now();
-        if (traceEvents.empty() && currentTraceName.empty()) {
-          beginning = now;
-        }
-        std::string name = fmt::sprintf(fmt, std::forward<Args>(args)...);
-        if (currentTraceName[threadId] == name) {
-          return;
-        }
-        if (!currentTraceName[threadId].empty()) {
-          traceEvents.emplace_back();
-          TraceEvent& e = traceEvents.back();
-          e.name = std::move(currentTraceName[threadId]);
-          e.begin = currentTraceBegin[threadId];
-          e.end = now;
-          e.threadId = threadId;
-        }
-        currentTraceBegin[threadId] = now;
-        currentTraceName[threadId] = name;
-      });
+        fmt::fprintf(f, "]}\n");
+        fclose(f);
+        log.info("Chrome trace dumped to %s\n", fn);
+        traceEvents.clear();
+      }
+      return;
+    }
+    auto now = std::chrono::system_clock::now();
+    if (traceEvents.empty() && currentTraceName.empty()) {
+      beginning = now;
+    }
+    std::string name = fmt::sprintf(fmt, std::forward<Args>(args)...);
+    if (currentTraceName[threadId] == name) {
+      return;
+    }
+    if (!currentTraceName[threadId].empty()) {
+      traceEvents.emplace_back();
+      TraceEvent& e = traceEvents.back();
+      e.name = std::move(currentTraceName[threadId]);
+      e.begin = currentTraceBegin[threadId];
+      e.end = now;
+      e.threadId = threadId;
+    }
+    currentTraceBegin[threadId] = now;
+    currentTraceName[threadId] = name;
+  }
+
+  template<typename... Args>
+  [[gnu::always_inline]] void trace(int threadId, int subThreadId, const char* fmt, Args&&... args) {
+    if (profilingEnabled | !traceEvents.empty()) [[unlikely]] {
+      trace_outlined(threadId, subThreadId, fmt, std::forward<Args>(args)...);
     }
   }
-  // template<typename... Args>
-  // void trace(const char* fmt, Args&&... args) {
-  //   trace(threadId, fmt, std::forward<Args>(args)...);
-  // }
 
   struct WorkBase {
     IntrusiveListLink<WorkBase> freeLink;
@@ -1564,8 +1107,6 @@ struct CpuThreadImpl {
     }
   };
 
-#define CAT2(a, b) a##b
-#define CAT(a, b) CAT2(a, b)
 #define ENTER                                                                                                          \
   {                                                                                                                    \
     if (this->state) {                                                                                                 \
@@ -1692,15 +1233,6 @@ struct CpuThreadImpl {
         concurrencyIndex, dev, rank, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(group->cpuOutBuffer.cuda(concurrencyIndex) + offset),
         cpuOutMr->mrs[di]->rkey, sizeof(uint32_t));
-  }
-
-  void writeCuda(uintptr_t targetAddress, uint32_t value) {
-    size_t di = 0;
-    auto& dev = devices[di];
-    auto* mr = regMrCuda(targetAddress, 4);
-    writeData(
-        dev, rank, (void*)&value, std::nullopt, (void*)targetAddress, mr->mrs[di]->rkey, sizeof(uint32_t),
-        makeCallback(nullptr));
   }
 
   struct WorkBarrier : Work {
@@ -4423,7 +3955,7 @@ struct CpuThreadImpl {
         CHECK(reduceIndex == nSends);
       }
 
-      CHECK(nSends <= 1)
+      CHECK(nSends <= 1);
       for (i = 0; i != nSends; ++i) {
         self.trace(concurrencyIndex, 0, "wait for remote reads");
         while (self.inStepValueDeviceChunk(concurrencyIndex, rank, 0, 0) != stepValue) {
@@ -5270,22 +4802,36 @@ struct CpuThreadImpl {
       fatal("Queue put callback key %#x not found", params.key);
     }
     uintptr_t cudaDoneAddress = 0;
-    uint32_t cudaDoneValue;
-    std::move(i->second)(&cudaDoneAddress, &cudaDoneValue);
+    std::move(i->second)(&cudaDoneAddress, &params.cudaDoneValue);
     if (cudaDoneAddress) {
-      writeCuda(cudaDoneAddress, cudaDoneValue);
+      size_t di = 0;
+      auto& dev = devices[di];
+      auto* mr = regMrCuda(cudaDoneAddress, 4);
+      uintptr_t sourceAddress = (uintptr_t)&params.cudaDoneValue;
+      auto* sourceMr = regMr(sourceAddress, 4);
+      writeData(
+          dev, rank, (void*)sourceAddress, sourceMr->mrs[di]->lkey, (void*)cudaDoneAddress, mr->mrs[di]->rkey,
+          sizeof(uint32_t), makeCallback([this, &params] { cpuThread->freelistQueueReadFinished.push(&params); }));
+    } else {
+      cpuThread->freelistQueueReadFinished.push(&params);
     }
     queuePutCallbacks.erase(i);
-    cpuThread->freelistQueueReadFinished.push(&params);
   }
 
-  void sendBuffer(size_t i, TemporaryBufferHandle buffer, size_t bytes) {
+  template<typename F = std::nullptr_t>
+  void sendBuffer(size_t i, TemporaryBufferHandle buffer, size_t bytes, F&& callback = nullptr) {
     CHECK(bytes <= buffer->bytes);
     void* cpuPointer = buffer->cpuPointer;
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     uint32_t lkey = buffer.mr->mrs[di]->lkey;
-    postSend(dev, i, cpuPointer, lkey, bytes, makeCallback([this, buffer = std::move(buffer)] {}));
+    if constexpr (std::is_null_pointer_v<F>) {
+      postSend(dev, i, cpuPointer, lkey, bytes, makeCallback([this, buffer = std::move(buffer)] {}));
+    } else {
+      postSend(
+          dev, i, cpuPointer, lkey, bytes,
+          makeCallback([this, buffer = std::move(buffer), callback = std::move(callback)] { callback(); }));
+    }
   }
 
   void sendQueueReadFinished(uint32_t source, uint32_t remoteOpKey) {
@@ -5948,6 +5494,110 @@ struct CpuThreadImpl {
     futexWakeAll(params.cpuDone);
   }
 
+  void onRecvMessageShutdown(std::string_view view, uint32_t sourceRank) {
+    bool shutdown;
+    deserializeBufferPart(view, shutdown);
+    if (shutdown) {
+      enqueueCallback([this, sourceRank] {
+        auto& ri = rankInfo.at<RankInfo>(sourceRank);
+        ri.shutdownTime = std::chrono::steady_clock::now();
+        ri.shutdown = true;
+      });
+    } else {
+      enqueueCallback([this, sourceRank] {
+        auto& ri = rankInfo.at<RankInfo>(sourceRank);
+        ri.exitTime = std::chrono::steady_clock::now();
+        ri.exited = true;
+
+        if (!shutdownInProgress) {
+          log.error("%s: Received unexpected exit from %s\n", groupName(), rankName(sourceRank));
+        }
+      });
+    }
+  }
+
+  struct WorkShutdown : Work {
+    QueueEntry& params;
+    size_t i;
+
+    std::chrono::steady_clock::time_point start;
+    std::shared_ptr<size_t> counter = std::make_shared<size_t>(0);
+
+    WorkShutdown(CpuThreadImpl& self, QueueEntry& params) : Work(self, params), params(params) {}
+
+    void step() {
+      ENTER
+
+      while (self.numActiveWorks != 1) {
+        YIELD
+      }
+
+      if (!self.shutdownInProgress) {
+        self.shutdownInProgress = true;
+
+        start = std::chrono::steady_clock::now();
+
+        for (size_t i = 0; i != size; ++i) {
+          size_t di = 0;
+          auto& dev = self.devices[di];
+          ++*counter;
+          auto buffer = self.allocateTemporaryBuffer(64);
+          size_t bytes = serializeToUnchecked(buffer->cpuPointer, self.header(opTypeMessageShutdown, i), true);
+          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] { --*counter; });
+        }
+        while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+          YIELD
+        }
+        for (i = 0; i != size; ++i) {
+          while (!self.rankInfo.at<RankInfo>(i).shutdown &&
+                 std::chrono::steady_clock::now() - start < std::chrono::seconds(self.cqErrored ? 4 : 8)) {
+            YIELD
+          }
+        }
+        {
+          Vector<size_t> list;
+          for (size_t i : range(size)) {
+            if (!self.rankInfo.at<RankInfo>(i).shutdown) {
+              list.push_back(i);
+            }
+          }
+          if (!list.empty()) {
+            std::vector<std::string> strs;
+            for (size_t i : list) {
+              strs.push_back(self.rankName(i));
+            }
+            log.error(
+                "%s: Failed to synchronize shutdown with the following ranks: %s\n", self.groupName(),
+                fmt::to_string(fmt::join(strs, ", ")));
+          }
+        }
+        self.shutdownSuppressErrors = true;
+        start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i != size; ++i) {
+          size_t di = 0;
+          auto& dev = self.devices[di];
+          ++*counter;
+          auto buffer = self.allocateTemporaryBuffer(64);
+          size_t bytes = serializeToUnchecked(buffer->cpuPointer, self.header(opTypeMessageShutdown, i), false);
+          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] { --*counter; });
+        }
+        while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+          YIELD
+        }
+        for (i = 0; i != size; ++i) {
+          while (!self.rankInfo.at<RankInfo>(i).exited &&
+                 std::chrono::steady_clock::now() - start < std::chrono::seconds(8)) {
+            YIELD
+          }
+        }
+      }
+
+      self.cpuThread->freelistShutdown.push(&params);
+      self.allocatorShutdown.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -5955,7 +5605,7 @@ struct CpuThreadImpl {
     size_t nAllocated = 0;
     template<typename... Args>
     T* allocate(Args&&... args) {
-      if (!free.empty()) {
+      if (!free.empty()) [[likely]] {
         T* r = (T*)&free.front();
         free.pop_front();
         r->~T();
@@ -5989,6 +5639,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkAllGatherBroadcast> allocatorAllGatherBroadcast;
   WorkAllocator<WorkAllGatherDirectRead> allocatorAllGatherDirectRead;
   WorkAllocator<WorkAllGatherDirectWrite> allocatorAllGatherDirectWrite;
+  WorkAllocator<WorkShutdown> allocatorShutdown;
 
   size_t numActiveWorks = 0;
 
@@ -6006,7 +5657,16 @@ struct CpuThreadImpl {
 
   size_t heartbeatIndex = 0;
 
+  bool shutdownInProgress = false;
+  bool shutdownScheduled = false;
+  std::atomic_bool shutdownSuppressErrors = false;
+
   void heartbeat(std::chrono::steady_clock::time_point now) {
+
+    if (shutdownInProgress) {
+      return;
+    }
+
     ++localHeartbeatValue;
 
     CHECK(heartbeatStates.size() == size);
@@ -6054,21 +5714,20 @@ struct CpuThreadImpl {
         }
         continue;
       }
+      auto* mr = regMr((uintptr_t)&localHeartbeatValue, sizeof(localHeartbeatValue));
       state.activeWrite = now;
       size_t di = (localHeartbeatValue + rank + i) % devices.size();
       auto& dev = devices[di];
       writeData(
-          dev, i, &localHeartbeatValue, std::nullopt,
+          dev, i, &localHeartbeatValue, mr->mrs[di]->lkey,
           (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, heartbeatValue)),
           remoteRankInfo[i].keys[di], sizeof(uint32_t), makeCallback([&state] { state.activeWrite.reset(); }));
-    }
-
-    if (errorState && now - errorTime >= std::chrono::seconds(60)) {
-      fatal("Moodist is terminating the process due to the aforementioned errors\n");
     }
   }
 
   void sendRankInfo() {
+    TimeoutHelper timeout(std::chrono::seconds(60));
+
     auto buffer = group->allocateCpu(sizeof(RankInfo));
     RankInfo* local = new (buffer.cpuPointer) RankInfo();
     ::gethostname(local->hostname.data(), local->hostname.size());
@@ -6091,6 +5750,7 @@ struct CpuThreadImpl {
 
     while (*activeWrites && !errorState) {
       poll();
+      timeout.check();
     }
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i != size; ++i) {
@@ -6101,25 +5761,8 @@ struct CpuThreadImpl {
     }
   }
 
-  void sendExited() {
-    auto start = std::chrono::steady_clock::now();
-    auto counter = std::make_shared<size_t>(0);
-    bool exitValue = true;
-    for (size_t i = 0; i != size; ++i) {
-      size_t di = 0;
-      auto& dev = devices[di];
-      writeData(
-          dev, i, &exitValue, std::nullopt,
-          (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, exited)),
-          remoteRankInfo[i].keys[di], sizeof(bool), makeCallback([counter] { --*counter; }));
-    }
-    while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-      poll();
-    }
-  }
-
   std::string groupName() {
-    return fmt::sprintf("(group of size %d, rank %d)", size, rank);
+    return fmt::sprintf("(group '%s' of size %d, rank %d)", group->name, size, rank);
   }
 
   std::string rankName(size_t i) {
@@ -6173,7 +5816,7 @@ struct CpuThreadImpl {
 
       initReceives();
 
-      log.info("%s (%s) started", groupName(), group->name);
+      log.info("%s started", groupName());
 
       cpuThread->ready = true;
 
@@ -6216,8 +5859,7 @@ struct CpuThreadImpl {
         }
       }
 
-      bool terminate = false;
-      while (!terminate) {
+      while (true) {
         auto now = std::chrono::steady_clock::now();
         if (now - prevHeartbeatTime >= heartbeatInterval) {
           prevHeartbeatTime = now;
@@ -6227,9 +5869,9 @@ struct CpuThreadImpl {
           if (debugCpuTime) {
             checkPreemptions(true);
           }
-        }
-        if (returnedTemporaryBufferHandles.n.load(std::memory_order_relaxed) != 0) {
-          returnedTemporaryBufferHandles.clear();
+          if (errorState && now - errorTime >= std::chrono::seconds(60)) {
+            fatal("Moodist is terminating the process due to the aforementioned errors\n");
+          }
         }
         if (debugCpuTime) {
           auto now = std::chrono::steady_clock::now();
@@ -6247,7 +5889,7 @@ struct CpuThreadImpl {
               }
               cpuThread->busy.store(false, std::memory_order_relaxed);
             }
-            if (terminate) {
+            if (shutdownInProgress) {
               break;
             }
             ++waitCount;
@@ -6270,89 +5912,95 @@ struct CpuThreadImpl {
 
             CHECK(queueEntry.stepValue < (1ul << 31));
 
-            switch (queueEntry.task) {
-            case taskBarrier:
-              enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
-              break;
-            case taskAllGather:
-              enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
-              break;
-            case taskReduceScatter:
-              enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
-              break;
-            case taskTerminate:
-              terminate = true;
-              cpuThread->freelistTerminate.push(&queueEntry);
-              break;
-            case taskBroadcast:
-              enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
-              break;
-            case taskAllGatherCpu:
-              enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
-              break;
-            case taskReduceScatterCpu:
-              enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
-              break;
-            case taskGatherCpu:
-              enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
-              break;
-            case taskBroadcastCpu:
-              enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
-              break;
-            case taskInternalBarrier:
-              enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
-              break;
-            case taskReduce:
-              enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
-              break;
-            case taskCreateQueue:
-              enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
-              break;
-            case taskCreateQueueNamed:
-              executeCreateQueueNamed((QueueEntryCreateQueue&)queueEntry);
-              break;
-            case taskQueuePut:
-              executeQueuePut((QueueEntryQueuePut&)queueEntry);
-              break;
-            case taskQueueRead:
-              executeQueueRead((QueueEntryQueueRead&)queueEntry);
-              break;
-            case taskQueueReadFinished:
-              executeQueueReadFinished((QueueEntryQueueReadFinished&)queueEntry);
-              break;
-            case taskQueueGet:
-              executeQueueGet((QueueEntryQueueGet&)queueEntry);
-              break;
-            case taskQueueTransaction:
-              executeQueueTransaction((QueueEntryQueueTransaction&)queueEntry);
-              break;
-            case taskCat:
-              enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
-              break;
-            case taskCopy:
-              executeCopy((QueueEntryCopy&)queueEntry);
-              break;
-            case taskCached:
-              enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
-              break;
-            case taskReduceScatterDirect:
-              enqueue(allocatorReduceScatterDirectRead, (QueueEntryReduceScatter&)queueEntry);
-              break;
-            case taskAllGatherBroadcast:
-              enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
-              break;
-            case taskCallback:
-              executeCallback((QueueEntryCallback&)queueEntry);
-              break;
-            case taskAllGatherDirect:
-              enqueue(allocatorAllGatherDirectRead, (QueueEntryAllGather&)queueEntry);
-              break;
-            default:
-              throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+            if (shutdownScheduled && queueEntry.task != taskCallback) [[unlikely]] {
+              if (queueEntry.task != taskShutdown) {
+                log.error(
+                    "Work (%d) has been scheduled in a process group after shutdown. This work cannot complete.",
+                    queueEntry.task);
+                setErrorState();
+              }
+            } else {
+              switch (queueEntry.task) {
+              case taskBarrier:
+                enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
+                break;
+              case taskAllGather:
+                enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
+                break;
+              case taskReduceScatter:
+                enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
+                break;
+              case taskShutdown:
+                shutdownScheduled = true;
+                enqueue(allocatorShutdown, queueEntry);
+                break;
+              case taskBroadcast:
+                enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
+                break;
+              case taskAllGatherCpu:
+                enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
+                break;
+              case taskReduceScatterCpu:
+                enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
+                break;
+              case taskGatherCpu:
+                enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
+                break;
+              case taskBroadcastCpu:
+                enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
+                break;
+              case taskInternalBarrier:
+                enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
+                break;
+              case taskReduce:
+                enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
+                break;
+              case taskCreateQueue:
+                enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
+                break;
+              case taskCreateQueueNamed:
+                executeCreateQueueNamed((QueueEntryCreateQueue&)queueEntry);
+                break;
+              case taskQueuePut:
+                executeQueuePut((QueueEntryQueuePut&)queueEntry);
+                break;
+              case taskQueueRead:
+                executeQueueRead((QueueEntryQueueRead&)queueEntry);
+                break;
+              case taskQueueReadFinished:
+                executeQueueReadFinished((QueueEntryQueueReadFinished&)queueEntry);
+                break;
+              case taskQueueGet:
+                executeQueueGet((QueueEntryQueueGet&)queueEntry);
+                break;
+              case taskQueueTransaction:
+                executeQueueTransaction((QueueEntryQueueTransaction&)queueEntry);
+                break;
+              case taskCat:
+                enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
+                break;
+              case taskCopy:
+                executeCopy((QueueEntryCopy&)queueEntry);
+                break;
+              case taskCached:
+                enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
+                break;
+              case taskReduceScatterDirect:
+                enqueue(allocatorReduceScatterDirectRead, (QueueEntryReduceScatter&)queueEntry);
+                break;
+              case taskAllGatherBroadcast:
+                enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
+                break;
+              case taskCallback:
+                executeCallback((QueueEntryCallback&)queueEntry);
+                break;
+              case taskAllGatherDirect:
+                enqueue(allocatorAllGatherDirectRead, (QueueEntryAllGather&)queueEntry);
+                break;
+              default:
+                throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+              }
             }
-          }
-          if (terminate) {
-            break;
           }
           poll();
 
@@ -6392,7 +6040,6 @@ struct CpuThreadImpl {
         }
       }
 
-      sendExited();
     } catch (const std::exception& e) {
       const CudaError* ce = dynamic_cast<const CudaError*>(&e);
       if (ce && ce->error == CUDA_ERROR_DEINITIALIZED) {
@@ -6404,22 +6051,65 @@ struct CpuThreadImpl {
   }
 };
 
+} // namespace
+
+void RdmaCpuThreadApi::setActive() {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  Device& dev = *(Device*)context;
+  CHECK(!dev.active);
+  self->activeDevices.push_back(dev);
+  dev.active = true;
+}
+
+void RdmaCpuThreadApi::setInactive() {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  Device& dev = *(Device*)context;
+  CHECK(dev.active);
+  self->activeDevices.erase(dev);
+  dev.active = false;
+}
+
+std::string RdmaCpuThreadApi::groupName() {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  return self->groupName();
+}
+
+std::string RdmaCpuThreadApi::rankName(size_t i) {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  return self->rankName(i);
+}
+
+[[gnu::noinline]] [[gnu::cold]] void RdmaCpuThreadApi::setError() {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  self->cqErrored = true;
+  self->setErrorState();
+}
+
+bool RdmaCpuThreadApi::suppressErrors() {
+  CpuThreadImpl* self = (CpuThreadImpl*)impl;
+  return self->shutdownSuppressErrors;
+}
+
 CpuThread::CpuThread(Group* group) : group(group) {}
 CpuThread::~CpuThread() {
   kill();
 }
 
-void CpuThread::kill() {
+void CpuThread::kill(bool wait) {
   if (thread.joinable()) {
-    QueueEntry* e = freelistTerminate.pop();
-    e->task = taskTerminate;
+    QueueEntry* e = freelistShutdown.pop();
+    e->task = taskShutdown;
+    e->concurrencyIndex = 0;
+    e->sd = &group->getStreamData(nullptr);
     std::unique_lock l(mutex);
     queue.push_back(*e);
     l.unlock();
     ++queueSize;
     futexWakeAll(&queueSize);
 
-    thread.join();
+    if (wait) {
+      thread.join();
+    }
   }
 }
 

@@ -58,6 +58,7 @@ struct Socket {
   void writev(const iovec* vec, size_t veclen, Function<void(Error*)> callback);
 
   void setOnRead(Function<void(Error*)> callback);
+  FunctionPointer onReadFunction() const;
 
   size_t readv(const iovec* vec, size_t veclen);
 

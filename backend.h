@@ -132,6 +132,10 @@ public:
   c10::intrusive_ptr<Work> recvAnysource(std::vector<at::Tensor>& tensors, int tag) override {
     return pg.recvAnysource(tensors, tag);
   }
+
+  virtual void shutdown() override {
+    pg.shutdown();
+  }
 };
 
 } // namespace moodist

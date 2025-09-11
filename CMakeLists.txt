@@ -5,11 +5,15 @@ project(moodist)
 project(moodist LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_C_STANDARD 23)
-set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3 -mtls-dialect=gnu2")
+set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3 -mtls-dialect=gnu2 -U_FORTIFY_SOURCE -fno-stack-protector")
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -ftemplate-backtrace-limit=0 ${COMPILE_FLAGS}")
 set(CMAKE_C_FLAGS
     "${CMAKE_C_FLAGS} ${COMPILE_FLAGS}")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
+    "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O3 -gz")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO
+    "${CMAKE_C_FLAGS_RELWITHDEBINFO} -O3 -gz")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
@@ -141,13 +145,16 @@ pybind11_add_module(_C
   alltoall.cc
   internal_allocator.cc
   store.cc
+  rdma_ib.cc
+  tcpdev.cc
+  rdma_tcp.cc
   fmt/src/format.cc
   ${rdma_sources}
 )
-if (TARGET CUDA::nvrtc_static AND TARGET CUDA::nvrtc_builtins_static AND TARGET CUDA::nvml_static)
-  target_link_libraries(_C PRIVATE CUDA::nvrtc_static CUDA::nvrtc_builtins_static CUDA::nvml_static)
+if (TARGET CUDA::nvrtc_static AND TARGET CUDA::nvrtc_builtins_static)
+  target_link_libraries(_C PRIVATE CUDA::nvrtc_static CUDA::nvrtc_builtins_static)
 else()
-  target_link_libraries(_C PRIVATE CUDA::nvrtc CUDA::nvml)
+  target_link_libraries(_C PRIVATE CUDA::nvrtc)
   # if (DEFINED IS_BUILDING_WHEEL)
   #   message(FATAL_ERROR "Could not find static cuda libraries. Refusing to continue as we are building a wheel.")
   # endif()
@@ -156,6 +163,7 @@ else()
 endif()
 target_link_libraries(_C PRIVATE
   CUDA::cuda_driver
+  CUDA::nvml
   ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
   anl
