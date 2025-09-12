@@ -43,11 +43,22 @@ struct MrManager {
   }
 
   void dereg(uint32_t lkey) {
-    std::lock_guard l(mutex);
+    std::unique_lock l(mutex);
     CHECK(lkey < mrs.size());
     CHECK(mrs[lkey].active);
+    auto now = std::chrono::steady_clock::now();
+    auto start = now;
+    int iterations = 0;
     while (mrs[lkey].refcount) {
+      if (now - start >= std::chrono::seconds(5) && iterations >= 500) {
+        log.error("TCP: Timed out deregistering memory region %d\n", lkey);
+        return;
+      }
+      ++iterations;
+      l.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      now = std::chrono::steady_clock::now();
+      l.lock();
     }
     mrs[lkey].active = false;
     freeIndices.push_back(lkey);
@@ -493,16 +504,22 @@ struct RdmaTcp : Rdma {
   void close() {
     tcp->close();
     cpuThreadApi = {};
+    {
+      std::lock_guard l(mutex);
+      activeReads.clear();
+    }
   }
 };
 
 } // namespace
 
 void tcpOnReadCallback(size_t i, BufferHandle buffer, void* destination, void* source) {
+  CHECK(destination != nullptr);
   ((RdmaTcp*)destination)->onRead(i, std::move(buffer), source);
 }
 
 void tcpOnErrorCallback(void* handle, size_t i, Error* error) {
+  CHECK(handle != nullptr);
   ((RdmaTcp*)handle)->onError(i, error);
 }
 

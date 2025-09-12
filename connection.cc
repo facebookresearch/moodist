@@ -121,13 +121,7 @@ void Connection::writefd(Buffer buffer, int fd) {
 template void Connection::writefd(BufferHandle, int);
 template void Connection::writefd(SharedBufferHandle, int);
 
-void Connection::close() {
-  socket.close();
-}
-bool Connection::closed() const {
-  return socket.closed();
-}
-
+namespace {
 struct ReadState {
   Connection* connection;
   int state = 0;
@@ -226,6 +220,15 @@ struct ReadState {
   }
 };
 
+} // namespace
+
+void Connection::close() {
+  socket.close();
+}
+bool Connection::closed() const {
+  return socket.closed();
+}
+
 void Connection::read(Function<void(Error*, BufferHandle)> callback) {
   socket.setOnRead(ReadState(this, std::move(callback)));
 }
@@ -293,7 +296,7 @@ std::string readBootId() {
   return buf;
 }
 
-std::string bootId = readBootId();
+static std::string bootId = readBootId();
 
 bool UnixContext::isReachable(std::string_view networkKey, std::string_view address) {
   return networkKey == bootId;

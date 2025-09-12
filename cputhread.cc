@@ -5528,7 +5528,7 @@ struct CpuThreadImpl {
     void step() {
       ENTER
 
-      while (self.numActiveWorks != 1) {
+      while (self.numActiveWorks != 1 || !self.activeDevices.empty()) {
         YIELD
       }
 
@@ -5881,23 +5881,29 @@ struct CpuThreadImpl {
           prevRunTime = now;
         }
         if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
-          if (activeWorks.empty() && activeDevices.empty()) {
-            {
-              std::unique_lock l(cpuThread->mutex);
-              if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
-                continue;
+          if (activeWorks.empty()) {
+            if (activeDevices.empty()) {
+              {
+                std::unique_lock l(cpuThread->mutex);
+                if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
+                  continue;
+                }
+                cpuThread->busy.store(false, std::memory_order_relaxed);
               }
-              cpuThread->busy.store(false, std::memory_order_relaxed);
+              if (shutdownInProgress) {
+                break;
+              }
+              ++waitCount;
+              futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+              if (debugCpuTime) {
+                prevRunTime = std::chrono::steady_clock::now();
+              }
+              continue;
+            } else {
+              if (shutdownInProgress) {
+                break;
+              }
             }
-            if (shutdownInProgress) {
-              break;
-            }
-            ++waitCount;
-            futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
-            if (debugCpuTime) {
-              prevRunTime = std::chrono::steady_clock::now();
-            }
-            continue;
           }
         }
         for (int i = 0; i != 256; ++i) {

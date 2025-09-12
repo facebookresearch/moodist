@@ -137,6 +137,11 @@ struct TcpDevImpl {
   }
 
   void close() {
+    {
+      std::lock_guard l(mutex);
+      dead = true;
+      queuedSends.clear();
+    }
     for (auto& v : listeners) {
       v->close();
     }

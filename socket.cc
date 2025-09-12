@@ -173,6 +173,8 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     queuedWrites.clear();
     queuedWriteCallbacks.clear();
     resolveHandles.clear();
+    CHECK(newWriteCallbacks.empty());
+    CHECK(activeWriteCallbacks.empty());
     if (fd != -1) {
       ::close(fd);
       fd = -1;
@@ -552,6 +554,8 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
       const iovec* vec, size_t veclen, std::pair<size_t, Function<void(Error*)>>* callbacks, size_t callbacksLen,
       std::unique_lock<SpinMutex>& ql) {
     if (closed.load(std::memory_order_relaxed)) {
+      activeWrites.clear();
+      activeWriteCallbacks.clear();
       return false;
     }
 
