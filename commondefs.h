@@ -22,9 +22,9 @@ void numa_run_on_node(int node);
 void numa_move(void* ptr, size_t bytes, int node);
 void numa_membind(int node);
 
-extern int internalAllocatorNode;
 void* internalAlloc(size_t bytes);
 void internalFree(void* ptr);
+void internalAllocatorSetNode(int node);
 
 struct CudaError : std::runtime_error {
   CUresult error;

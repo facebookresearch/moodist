@@ -1327,7 +1327,7 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     throw std::runtime_error("moodist CUDAAllocator::setCheckpointPoolState: not implemented");
   }
   virtual std::string name() override {
-    throw std::runtime_error("moodist CUDAAllocator::name: not implemented");
+    return "moodist";
   }
 };
 

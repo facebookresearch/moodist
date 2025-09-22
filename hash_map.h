@@ -22,11 +22,15 @@
 
 namespace moodist {
 
+namespace {
+
 static constexpr int8_t none = -1;
 template<typename T>
 bool isNone(const T& v) {
   return v == (T)none;
 }
+
+} // namespace
 
 template<
     typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>,

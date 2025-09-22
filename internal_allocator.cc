@@ -16,7 +16,6 @@ int internalAllocatorNode = -1;
 namespace {
 
 void* nalloc(size_t bytes) {
-  CHECK(internalAllocatorNode != -1);
   void* r = numa_alloc_onnode(bytes, internalAllocatorNode);
   if (!r) {
     log.error("ERROR: Failed to allocate %d bytes of memory\n", bytes);
@@ -308,6 +307,13 @@ uint64_t rng() {
 
 size_t mmappedBytes;
 
+void move_pages() {
+  for (auto& v : allMappedRegions) {
+    log.debug("moving %#x of %d bytes to numa node %d\n", v.begin, v.end - v.begin, internalAllocatorNode);
+    numa_move((void*)v.begin, v.end - v.begin, internalAllocatorNode);
+  }
+}
+
 void allocate_memory(size_t index) {
   CHECK(index != 0);
 
@@ -364,7 +370,9 @@ void allocate_memory(size_t index) {
     }
   }
 
-  numa_move(rv, bytes, internalAllocatorNode);
+  if (internalAllocatorNode != -1) {
+    numa_move(rv, bytes, internalAllocatorNode);
+  }
 
   mmappedBytes += bytes;
   uintptr_t e = ((uintptr_t)rv + bytes) / alignment * alignment;
@@ -506,6 +514,16 @@ void internalFree(void* ptr) {
 }
 size_t internalAllocSize(void* ptr) {
   return moo_alloc_size(ptr);
+}
+
+void internalAllocatorSetNode(int node) {
+  std::lock_guard l(globals->mutex);
+  if (internalAllocatorNode == node) {
+    return;
+  }
+  log.debug("allocator node changed from %d to %d\n", internalAllocatorNode, node);
+  internalAllocatorNode = node;
+  move_pages();
 }
 
 } // namespace moodist
