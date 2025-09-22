@@ -7,7 +7,7 @@ set -e -u -x
 
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
 
-dnf install -y cuda-toolkit
+dnf install -y cuda-toolkit-12
 
 versions="cp39-cp39 cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
 
