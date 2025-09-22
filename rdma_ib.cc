@@ -351,7 +351,7 @@ struct RdmaIb : Rdma {
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
       perror("ibv_reg_mr");
-      fatal("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, address, bytes);
+      fatal("rank %d failed to register CPU memory at %#x size %#x\n", group->rank, (uintptr_t)address, bytes);
     }
     return std::make_unique<Mr>(mr);
   }
@@ -361,7 +361,7 @@ struct RdmaIb : Rdma {
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
       perror("ibv_reg_mr");
-      fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, address, bytes);
+      fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, (uintptr_t)address, bytes);
     }
     return std::make_unique<Mr>(mr);
   }

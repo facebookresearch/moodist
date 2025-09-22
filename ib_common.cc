@@ -126,6 +126,8 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     std::memset(&attr.ah_attr, 0, sizeof(attr.ah_attr));
+    attr.ah_attr.grh.dgid = remoteAddress.gid;
+    attr.ah_attr.is_global = true;
     attr.ah_attr.port_num = portNum;
     attr.ah_attr.dlid = remoteAddress.lid;
     attr.path_mtu = portAttributes.active_mtu;

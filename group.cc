@@ -237,7 +237,9 @@ void Group::init(Function<void()> f) {
       const char* c = std::getenv("MOODIST_USE_TCP");
       if (c && !strcmp(c, "1")) {
         useTcp = true;
-        log.info("Moodist is using TCP for the process group '%s' since the MOODIST_USE_TCP environment variable is set\n", name);
+        log.info(
+            "Moodist is using TCP for the process group '%s' since the MOODIST_USE_TCP environment variable is set\n",
+            name);
       }
     }
 
@@ -390,7 +392,7 @@ void Group::init(Function<void()> f) {
             }
             std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
             for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
-              if (std::get<0>(v.score) && !taken[v.ibPath]) {
+              if (!taken[v.ibPath]) {
                 sorted.emplace_back(v.score, &v);
               }
             }
@@ -415,8 +417,8 @@ void Group::init(Function<void()> f) {
             if (!useDevices.empty()) {
               break;
             }
-            throw std::runtime_error(fmt::sprintf(
-                "No usable InfiniBand device found for rank %d (refusing to use devices routed through CPU)", rank));
+            throw std::runtime_error(
+                fmt::sprintf("No usable InfiniBand device found for rank %d (unreachable?)", rank));
           }
 
           for (auto* v : best) {
