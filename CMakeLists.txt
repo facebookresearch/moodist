@@ -151,19 +151,10 @@ pybind11_add_module(_C
   fmt/src/format.cc
   ${rdma_sources}
 )
-if (TARGET CUDA::nvrtc_static AND TARGET CUDA::nvrtc_builtins_static)
-  target_link_libraries(_C PRIVATE CUDA::nvrtc_static CUDA::nvrtc_builtins_static)
-else()
-  target_link_libraries(_C PRIVATE CUDA::nvrtc)
-  # if (DEFINED IS_BUILDING_WHEEL)
-  #   message(FATAL_ERROR "Could not find static cuda libraries. Refusing to continue as we are building a wheel.")
-  # endif()
-  message(WARNING "Linking dynamically to cuda libraries as the static libraries could not be found.")
-  message(WARNING "Moodist may throw runtime errors if there is a cuda version mismatch between build and runtime.")
-endif()
 target_link_libraries(_C PRIVATE
   CUDA::cuda_driver
   CUDA::nvml
+  CUDA::nvrtc
   ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
   anl
