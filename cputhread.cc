@@ -5511,6 +5511,7 @@ struct CpuThreadImpl {
 
         if (!shutdownInProgress) {
           log.error("%s: Received unexpected exit from %s\n", groupName(), rankName(sourceRank));
+          setErrorState();
         }
       });
     }
