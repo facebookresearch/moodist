@@ -684,4 +684,20 @@ struct UniqueImpl {
   }
 };
 
+template<typename... Args>
+struct Global {
+  std::optional<std::tuple<Args...>> args;
+  Global(Args&&... args) {
+    this->args.emplace(std::forward<Args>(args)...);
+  }
+  template<typename T>
+  operator T&() {
+    static_assert(alignof(T) <= alignof(std::max_align_t));
+    CHECK(args);
+    return std::apply(
+        []<typename... X>(X&&... args) -> T& { return *new (internalAlloc(sizeof(T))) T(std::forward<X>(args)...); },
+        std::move(*args));
+  }
+};
+
 } // namespace moodist

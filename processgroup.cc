@@ -36,7 +36,7 @@ namespace moodist {
 
 extern bool profilingEnabled;
 
-async::Scheduler& scheduler = *new async::Scheduler(1);
+async::Scheduler& scheduler = Global(1);
 
 void throwCuHelper(CUresult error, const char* file, int line) {
   throwCu(error, file, line);
@@ -50,11 +50,14 @@ struct GlobalsDestroyed {
     value = true;
     globalsDtor();
   }
+  operator bool() {
+    return value;
+  }
 } globalsDestroyed;
 
 struct ProcessGroupImpl;
-std::mutex& activeProcessGroupsMutex = *new std::mutex();
-std::vector<ProcessGroupImpl*>& activeProcessGroups = *new std::vector<ProcessGroupImpl*>();
+std::mutex& activeProcessGroupsMutex = Global();
+std::vector<ProcessGroupImpl*>& activeProcessGroups = Global();
 
 std::atomic_bool globalPreferKernelLess = false;
 
@@ -424,9 +427,11 @@ struct ProcessGroupImpl {
   ~ProcessGroupImpl() {
     trace("");
     std::lock_guard l(activeProcessGroupsMutex);
-    auto i = std::find(activeProcessGroups.begin(), activeProcessGroups.end(), this);
-    if (i != activeProcessGroups.end()) {
-      activeProcessGroups.erase(i);
+    if (!globalsDestroyed) {
+      auto i = std::find(activeProcessGroups.begin(), activeProcessGroups.end(), this);
+      if (i != activeProcessGroups.end()) {
+        activeProcessGroups.erase(i);
+      }
     }
   }
 
@@ -3040,6 +3045,11 @@ void globalsDtor() {
   {
     std::lock_guard l(activeProcessGroupsMutex);
     pgs = activeProcessGroups;
+  }
+  for (auto* pg : pgs) {
+    if (pg->group && pg->group->cpuThread) {
+      pg->shutdown();
+    }
   }
   for (auto* pg : pgs) {
     if (pg->group && pg->group->cpuThread) {
