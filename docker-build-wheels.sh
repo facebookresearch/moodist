@@ -11,24 +11,42 @@ dnf install -y cuda-toolkit-12
 
 versions="cp39-cp39 cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
 
-torch_versions="2.8"
+torch_versions="2.7 2.8"
 
-pre_torch_versions=""
+pre_torch_versions="2.9"
+
+moodist_version=$(cat version.txt)
 
 orig_path=$PATH
 for ver in $versions; do
     export PATH=/opt/python/$ver/bin:$orig_path
 
     for torchver in $torch_versions; do
-        pip install torch==$torchver
+        pip install torch==$torchver.*
         python setup.py clean --all
         python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+        pip uninstall torch -y
     done
 
     for torchver in $pre_torch_versions; do
-        pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch==$torchver
+        pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch==$torchver.*
         python setup.py clean --all
         python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+        pip uninstall torch -y
     done
+
+    whl_list=""
+    for x in $torch_versions $pre_torch_versions; do
+        fn=(dist/moodist-$moodist_version+torch.$x.*-$ver-manylinux_2_28_x86_64.whl)
+        fn="${fn[@]}"
+        if [[ "$whl_list" == "" ]]; then
+            whl_list=$fn
+        else
+            whl_list=$whl_list,$fn
+        fi
+    done
+    MOODIST_WHL_LIST=$whl_list python setup.py clean --all
+    MOODIST_WHL_LIST=$whl_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 
+
 done
 

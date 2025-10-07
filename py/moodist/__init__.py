@@ -1,29 +1,64 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-import weakref
-import torch.distributed
-from ._C import (
-    MoodistProcessGroup,
-    MoodistBackend,
-    enable_profiling,
-    enable_cuda_allocator,
-    enable_cpu_allocator,
-    cpu_allocator_debug,
-    cuda_copy,
-    set_prefer_kernel_less,
-    TcpStore,
-)
-from .version import __version__
-
-from datetime import timedelta
 import pickle
+import weakref
+from datetime import timedelta
 from queue import Empty
-
 from typing import TYPE_CHECKING
+import importlib
+
+import torch
+import torch.distributed
+
+from .version import __version__, cversions
+
+clist = [
+    "MoodistProcessGroup",
+    "MoodistBackend",
+    "enable_profiling",
+    "enable_cuda_allocator",
+    "enable_cpu_allocator",
+    "cpu_allocator_debug",
+    "cuda_copy",
+    "set_prefer_kernel_less",
+    "TcpStore",
+]
+
+torchversion = torch.__version__
+
+found = False
+for k, v in cversions.items():
+    if torchversion.startswith(k):
+        assert not found, "Moodist matched multiple pytorch versions? %s %s" % (
+            torchversion,
+            list(cversions.keys()),
+        )
+        _C = importlib.import_module(v, "moodist")
+        found = True
+
+if not found:
+    raise RuntimeError(
+        "Moodist was not built for the currently installed pytorch version."
+        " Found pytorch %s. Moodist was built for: %s"
+        % (torchversion, list(cversions.keys()))
+    )
+
+for n in clist:
+    globals()[n] = getattr(_C, n)
 
 if TYPE_CHECKING:
 
     class MoodistProcessGroup(torch.distributed.ProcessGroup): ...
+
+    class TcpStore(torch.distributed.Store):
+        def __init__(
+            hostname: str,
+            port: int,
+            key: str,
+            world_size: int,
+            rank: int,
+            timeout: timedelta,
+        ): ...
 
 
 class TransactionContextManager:
@@ -166,16 +201,9 @@ torch.distributed.distributed_c10d.register_rendezvous_handler(
     "moodist", rendezvous_handler
 )
 
+
 __all__ = [
-    "MoodistProcessGroup",
-    "MoodistBackend",
-    "enable_profiling",
-    "enable_cuda_allocator",
-    "enable_cpu_allocator",
-    "cpu_allocator_debug",
+    *clist,
     "create_moodist_backend",
     "Empty",
-    "cuda_copy",
-    "set_prefer_kernel_less",
-    "TcpStore",
 ]

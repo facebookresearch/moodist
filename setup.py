@@ -10,6 +10,8 @@ import setuptools
 from setuptools.command import build_ext
 from distutils import spawn
 
+zip_files = {}
+
 
 class Build(build_ext.build_ext):
     def run(self):  # Necessary for pip install -e.
@@ -22,10 +24,19 @@ class Build(build_ext.build_ext):
 
         os.makedirs(self.build_temp, exist_ok=True)
 
-        global moodist_version
+        os.makedirs(output_path, exist_ok=True)
+
+        global moodist_version, moodist_cversions
 
         with open(output_path / "version.py", "w") as f:
             f.write('__version__ = "%s"\n' % moodist_version)
+            f.write("cversions = %s\n" % str(moodist_cversions))
+
+        if ext.name.startswith("moodist.pt"):
+            os.rename(output_path / "version.py", output_path.parent / "version.py")
+            z, fn = zip_files[ext.name]
+            open(self.get_ext_fullpath(ext.name), "wb").write(z.open(fn).read())
+            return
 
         cmake_cmd = [
             "cmake",
@@ -54,31 +65,91 @@ class Build(build_ext.build_ext):
 
 def main():
 
-    import torch
-
-    torch_version = torch.__version__
-    if "+" in torch_version:
-        torch_version = torch_version[: torch_version.index("+")]
-
     extra_version = ""
     if "bdist_wheel" not in sys.argv:
         extra_version = "-dev"
 
     global moodist_version
-    moodist_version = "%s%s+torch.%s" % (
-        open("version.txt").read().strip(),
-        extra_version,
-        torch_version,
-    )
+    global moodist_cversions
 
-    # moodist_version = "%s%s" % (
-    #     open("version.txt").read().strip(),
-    #     extra_version,
-    # )
+    if "MOODIST_WHL_LIST" in os.environ:
+        moodist_version = "%s%s" % (
+            open("version.txt").read().strip(),
+            extra_version,
+        )
 
-    torch_req_version = ".".join(torch_version.split(".")[:2]) + ".*"
-    
-    print("Building for torch==%s" % torch_req_version)
+        import zipfile
+
+        cversions = {}
+
+        ext_modules = []
+
+        min_version = None
+        max_version = None
+
+        for fn in os.environ["MOODIST_WHL_LIST"].split(","):
+            z = zipfile.ZipFile(fn)
+
+            g = dict()
+            exec(z.open("moodist/version.py").read(), g)
+
+            cv = g["cversions"]
+
+            assert len(cv) == 1
+
+            cfn = None
+
+            for n in z.filelist:
+                if n.filename.startswith("moodist/_C."):
+                    assert cfn is None
+                    cfn = n.filename
+            assert cfn is not None
+
+            tv: str = next(iter(cv.keys()))
+
+            foldername = "pt%s" % tv.replace(".", "")
+            assert foldername.isalnum()
+
+            modname = "moodist.%s._C" % foldername
+
+            ext_modules.append(setuptools.Extension(modname, sources=[]))
+
+            zip_files[modname] = (z, cfn)
+
+            assert tv not in cversions
+            cversions[tv] = modname
+
+            maj, min = (int(x) for x in tv.split("."))
+            v = (maj, min)
+            if min_version is None or v < min_version:
+                min_version = v
+            if max_version is None or v >= max_version:
+                max_version = (maj, min + 1)
+
+        torch_req_version = ">=%s, <%s" % (
+            ".".join(str(x) for x in min_version),
+            ".".join(str(x) for x in max_version),
+        )
+        moodist_cversions = cversions
+    else:
+        import torch
+
+        torch_version = torch.__version__
+        if "+" in torch_version:
+            torch_version = torch_version[: torch_version.index("+")]
+
+        moodist_version = "%s%s+torch.%s" % (
+            open("version.txt").read().strip(),
+            extra_version,
+            torch_version,
+        )
+        torch_prefix_version = ".".join(torch_version.split(".")[:2])
+        torch_req_version = "==" + torch_prefix_version + ".*"
+
+        ext_modules = [setuptools.Extension("moodist._C", sources=[])]
+        moodist_cversions = {torch_prefix_version: "._C"}
+
+    print("Building for torch%s" % torch_req_version)
 
     setuptools.setup(
         name="moodist",
@@ -97,8 +168,8 @@ def main():
         ],
         packages=["moodist"],
         package_dir={"": "py"},
-        ext_modules=[setuptools.Extension("moodist._C", sources=[])],
-        install_requires=["torch==%s" % torch_req_version],
+        ext_modules=ext_modules,
+        install_requires=["torch%s" % torch_req_version],
         cmdclass={"build_ext": Build},
         zip_safe=False,
     )

@@ -133,7 +133,7 @@ public:
     return pg.recvAnysource(tensors, tag);
   }
 
-  virtual void shutdown() override {
+  virtual void shutdown() {
     pg.shutdown();
   }
 };
