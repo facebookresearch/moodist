@@ -9,7 +9,7 @@ dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda
 
 dnf install -y cuda-toolkit-12
 
-versions="cp39-cp39 cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
+versions="cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
 
 torch_versions="2.7 2.8"
 
