@@ -168,7 +168,7 @@ void Group::init(Function<void()> f) {
 
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
-  internalAllocatorNode = allocationNode;
+  internalAllocatorSetNode(allocationNode);
   cpuThread = new (internalAlloc(sizeof(CpuThread))) CpuThread(this);
 
   init2 = [&]() {
