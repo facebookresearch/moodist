@@ -4,7 +4,7 @@ import pickle
 import weakref
 from datetime import timedelta
 from queue import Empty
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import importlib
 
 import torch
@@ -22,6 +22,8 @@ clist = [
     "cuda_copy",
     "set_prefer_kernel_less",
     "TcpStore",
+    "serialize",
+    "deserialize",
 ]
 
 torchversion = torch.__version__
@@ -59,6 +61,9 @@ if TYPE_CHECKING:
             rank: int,
             timeout: timedelta,
         ): ...
+
+    def serialize(x: object) -> torch.Tensor: ...
+    def deserialize(x: torch.Tensor) -> Any: ...
 
 
 class TransactionContextManager:
@@ -129,19 +134,22 @@ class Queue:
             return r
 
     def put_object(self, object, *, transaction=0):
-        return self.impl.put(
-            torch.frombuffer(pickle.dumps(object), dtype=torch.uint8), transaction
-        )
+        return self.impl.put(serialize(object), transaction)
+        # return self.impl.put(
+        #     torch.frombuffer(pickle.dumps(object), dtype=torch.uint8), transaction
+        # )
 
     def get_object(self, block=True, timeout=None, return_size=False):
         if return_size:
             tensor, size = self.get_tensor(
                 block=block, timeout=timeout, return_size=True
             )
-            return pickle.loads(tensor.numpy().tobytes()), size
-        return pickle.loads(
-            self.get_tensor(block=block, timeout=timeout).numpy().tobytes()
-        )
+            return deserialize(tensor), size
+            # return pickle.loads(tensor.numpy().tobytes()), size
+        return deserialize(self.get_tensor(block=block, timeout=timeout))
+        # return pickle.loads(
+        #     self.get_tensor(block=block, timeout=timeout).numpy().tobytes()
+        # )
 
     def qsize(self):
         return self.impl.qsize()

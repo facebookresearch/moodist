@@ -11,12 +11,10 @@
 #include <cstring>
 #include <map>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -205,31 +203,32 @@ struct OpRead {};
 
 // This is not a cross platform serializer
 struct Serializer {
-  std::byte* write(OpSize, std::byte* dst, [[maybe_unused]] const void* src, size_t len) {
+  [[gnu::always_inline]] std::byte* write(OpSize, std::byte* dst, [[maybe_unused]] const void* src, size_t len) {
     return (std::byte*)((uintptr_t)dst + len);
   }
-  std::byte* write(OpWrite, std::byte* dst, const void* src, size_t len) {
+  [[gnu::always_inline]] std::byte* write(OpWrite, std::byte* dst, const void* src, size_t len) {
     std::memcpy(dst, src, len);
     return dst + len;
   }
   template<typename Op, typename T, std::enable_if_t<std::is_trivial_v<T>>* = nullptr>
-  std::byte* write(Op, std::byte* dst, T v) {
+  [[gnu::always_inline]] std::byte* write(Op, std::byte* dst, T v) {
     dst = write(Op{}, dst, (void*)&v, sizeof(v));
     return dst;
   }
   template<typename Op>
-  std::byte* write(Op, std::byte* dst, std::string_view str) {
+  [[gnu::always_inline]] std::byte* write(Op, std::byte* dst, std::string_view str) {
     dst = write(Op{}, dst, str.size());
     dst = write(Op{}, dst, str.data(), str.size());
     return dst;
   }
   template<typename Op, typename T>
-  std::byte* write(Op, std::byte* dst, std::basic_string_view<T> str) {
+  [[gnu::always_inline]] std::byte* write(Op, std::byte* dst, std::basic_string_view<T> str) {
     dst = write(Op{}, dst, str.size());
     dst = write(Op{}, dst, str.data(), sizeof(T) * str.size());
     return dst;
   }
 };
+template<bool checked>
 struct Deserializer {
   const char* base = nullptr;
   size_t offset = 0;
@@ -238,6 +237,7 @@ struct Deserializer {
   Deserializer(std::string_view buf) : base(buf.data()), offset(0), length(buf.size()) {}
   Deserializer(const void* data, size_t len) : base((const char*)data), offset(0), length(len) {}
   [[noreturn]] void eod() {
+    CHECK(checked)
     throw SerializationError("Deserializer: reached end of data");
   }
   [[gnu::always_inline]] void consume(size_t len) {
@@ -246,10 +246,13 @@ struct Deserializer {
   [[gnu::always_inline]] std::string_view buf() {
     return {base + offset, base + length};
   }
+  [[gnu::always_inline]] std::string_view buf() const {
+    return {base + offset, base + length};
+  }
   template<typename T>
   std::basic_string_view<T> readStringView() {
     size_t len = read<size_t>();
-    if (length - offset < sizeof(T) * len) [[unlikely]] {
+    if (checked && length - offset < sizeof(T) * len) [[unlikely]] {
       eod();
     }
     T* data = (T*)(base + offset);
@@ -258,7 +261,7 @@ struct Deserializer {
   }
   std::string_view readString() {
     size_t len = read<size_t>();
-    if (length - offset < len) [[unlikely]] {
+    if (checked && length - offset < len) [[unlikely]] {
       eod();
     }
     const char* data = base + offset;
@@ -267,7 +270,7 @@ struct Deserializer {
   }
   template<typename T, std::enable_if_t<std::is_trivial_v<T>>* = nullptr>
   [[gnu::always_inline]] void read(T& r) {
-    if (length - offset < sizeof(T)) [[unlikely]] {
+    if (checked && length - offset < sizeof(T)) [[unlikely]] {
       eod();
     }
     std::memcpy(&r, base + offset, sizeof(T));
@@ -318,7 +321,7 @@ struct Serialize {
   template<typename T>
   static const bool has_builtin_write = decltype(Serialize::has_builtin_write_f<T>(0))::value;
   template<typename T>
-  void operator()(const T& v) {
+  [[gnu::always_inline]] void operator()(const T& v) {
     if constexpr (has_serialize<const T>) {
       v.serialize(*this);
     } else if constexpr (has_serialize<T>) {
@@ -330,11 +333,11 @@ struct Serialize {
     }
   }
   template<typename... T>
-  void operator()(const T&... v) {
+  [[gnu::always_inline]] void operator()(const T&... v) {
     ((*this)(std::forward<const T&>(v)), ...);
   }
 
-  void write(const void* data, size_t len) {
+  [[gnu::always_inline]] void write(const void* data, size_t len) {
     dst = Serializer{}.write(Op{}, dst, (std::byte*)data, len);
   }
 
@@ -343,14 +346,93 @@ struct Serialize {
   }
 };
 
+struct SerializeExpandable {
+  BufferHandle buffer;
+  size_t size = 0;
+  template<typename T>
+  static std::false_type has_serialize_f(...);
+  template<typename T, typename = decltype(std::declval<T>().serialize(std::declval<SerializeExpandable&>()))>
+  static std::true_type has_serialize_f(int);
+  template<typename T>
+  static const bool has_serialize = decltype(SerializeExpandable::has_serialize_f<T>(0))::value;
+  template<typename T>
+  static std::false_type has_builtin_write_f(...);
+  template<
+      typename T,
+      typename = decltype(std::declval<Serializer>().write(OpWrite{}, (std::byte*)nullptr, std::declval<T>()))>
+  static std::true_type has_builtin_write_f(int);
+  template<typename T>
+  static const bool has_builtin_write = decltype(SerializeExpandable::has_builtin_write_f<T>(0))::value;
+  template<typename T>
+  [[gnu::always_inline]] void operator()(const T& v) {
+    if constexpr (has_serialize<const T>) {
+      v.serialize(*this);
+    } else if constexpr (has_serialize<T>) {
+      const_cast<T&>(v).serialize(*this);
+    } else if constexpr (has_builtin_write<const T>) {
+      twrite(v);
+    } else {
+      serialize(*this, v);
+    }
+  }
+  template<typename... T>
+  [[gnu::always_inline]] void operator()(const T&... v) {
+    ((*this)(std::forward<const T&>(v)), ...);
+  }
+
+  [[gnu::always_inline]] void write(const void* data, size_t len) {
+    // dst = Serializer{}.write(Op{}, dst, (std::byte*)data, len);
+    twrite(data, len);
+  }
+
+  [[gnu::noinline]] void expand(size_t nreq) {
+    BufferHandle newbuffer = makeBuffer(std::max(buffer->msize * 2, buffer->msize + nreq));
+    newbuffer->msize = internalAllocSize(newbuffer) - sizeof(Buffer);
+    std::memcpy(newbuffer->data(), buffer->data(), size);
+    std::swap(buffer, newbuffer);
+  }
+
+  template<typename... Args>
+  [[gnu::always_inline]] void twrite(Args&&... args) {
+    std::byte* zero = nullptr;
+    std::byte* end = Serializer{}.write(OpSize{}, zero, args...);
+    size_t nreq = end - zero;
+    if (nreq >= buffer->msize - size) [[unlikely]] {
+      expand(nreq);
+    }
+    Serializer{}.write(OpWrite{}, buffer->data() + size, args...);
+    size += nreq;
+  }
+
+  size_t tell() const {
+    return size;
+  }
+
+  void ensure(size_t n) {
+    if (buffer->msize - size < n) [[unlikely]] {
+      expand(n);
+    }
+  }
+  void* data() const {
+    return buffer->data() + size;
+  }
+  void advance(size_t n) {
+    size += n;
+  }
+};
+
 template<typename T>
 constexpr bool is_string_view = false;
 template<typename T>
 constexpr bool is_string_view<std::basic_string_view<T>> = true;
 
+template<bool checked = true>
 struct Deserialize {
-  Deserialize(Deserializer& des) : des(des) {}
-  Deserializer& des;
+  Deserializer<checked> des;
+
+  Deserialize() = default;
+  Deserialize(std::string_view buf) : des(buf) {}
+  Deserialize(const void* data, size_t len) : des(data, len) {}
 
   template<typename T>
   static std::false_type has_serialize_f(...);
@@ -360,7 +442,7 @@ struct Deserialize {
   static const bool has_serialize = decltype(Deserialize::has_serialize_f<T>(0))::value;
   template<typename T>
   static std::false_type has_builtin_read_f(...);
-  template<typename T, typename = decltype(std::declval<Deserializer>().read(std::declval<T&>()))>
+  template<typename T, typename = decltype(std::declval<Deserializer<checked>>().read(std::declval<T&>()))>
   static std::true_type has_builtin_read_f(int);
   template<typename T>
   static const bool has_builtin_read = decltype(Deserialize::has_builtin_read_f<T>(0))::value;
@@ -423,7 +505,7 @@ struct Deserialize {
     constexpr size_t nTrivial = numTrivials<0, A, T...>();
     if constexpr (nTrivial) {
       constexpr size_t nbytes = trivialBytes<0, A, T...>();
-      if (des.buf().size() < nbytes) [[unlikely]] {
+      if (checked && des.buf().size() < nbytes) [[unlikely]] {
         des.eod();
       }
       trivialCopy<0, nTrivial, A, T...>(a, v...);
@@ -435,7 +517,7 @@ struct Deserialize {
 
   const char* consume(size_t n) {
     const char* r = des.base + des.offset;
-    if (des.buf().size() < n) [[unlikely]] {
+    if (checked && des.buf().size() < n) [[unlikely]] {
       des.eod();
     }
     des.consume(n);
@@ -449,12 +531,31 @@ struct Deserialize {
       r.serialize(*this);
       return r;
     } else if constexpr (has_builtin_read<T>) {
-      return des.read<T>();
+      return des.template read<T>();
     } else {
       T r;
       serialize(*this, r);
       return r;
     }
+  }
+
+  size_t remaining() const {
+    return des.buf().size();
+  }
+
+  size_t tell() const {
+    return des.offset;
+  }
+
+  const void* data() const {
+    return des.base + des.offset;
+  }
+  void consumeNoCheck(size_t n) {
+    des.consume(n);
+  }
+
+  Deserialize<false>& unchecked() {
+    return (Deserialize<false>&)(*this);
   }
 };
 
@@ -483,6 +584,15 @@ template<typename... T>
 }
 
 template<typename... T>
+[[gnu::always_inline]] [[gnu::warn_unused_result]] inline BufferHandle serializeToBufferOneShot(const T&... v) {
+  SerializeExpandable x;
+  x.buffer = makeBuffer(0x80 - sizeof(Buffer));
+  (x(v), ...);
+  x.buffer->msize = x.size;
+  return std::move(x.buffer);
+}
+
+template<typename... T>
 [[gnu::always_inline]] inline void serializeToStringView(std::string_view buffer, const T&... v) {
   Serialize<OpSize> x{};
   (x(v), ...);
@@ -505,10 +615,9 @@ template<typename... T>
 
 template<typename... T>
 [[gnu::always_inline]] inline std::string_view deserializeBufferPart(const void* ptr, size_t len, T&... result) {
-  Deserializer des(std::string_view{(const char*)ptr, len});
-  Deserialize x(des);
+  Deserialize x(std::string_view{(const char*)ptr, len});
   x(result...);
-  return des.buf();
+  return x.des.buf();
 }
 
 template<typename... T>
@@ -518,11 +627,10 @@ template<typename... T>
 
 template<typename... T>
 [[gnu::always_inline]] inline void deserializeBuffer(const void* ptr, size_t len, T&... result) {
-  Deserializer des(std::string_view{(const char*)ptr, len});
-  Deserialize x(des);
+  Deserialize x(std::string_view{(const char*)ptr, len});
   x(result...);
-  if (des.buf().size() != 0) {
-    throw SerializationError("deserializeBuffer: " + std::to_string(des.buf().size()) + " trailing bytes");
+  if (x.des.buf().size() != 0) {
+    throw SerializationError("deserializeBuffer: " + std::to_string(x.des.buf().size()) + " trailing bytes");
   }
 }
 template<typename... T>
@@ -531,20 +639,18 @@ template<typename... T>
 }
 template<typename... T>
 [[gnu::always_inline]] inline void deserializeBuffer(Buffer* buffer, T&... result) {
-  Deserializer des(std::string_view{(const char*)buffer->data(), buffer->size()});
-  Deserialize x(des);
+  Deserialize x(std::string_view{(const char*)buffer->data(), buffer->size()});
   x(result...);
-  if (des.buf().size() != 0) {
-    throw SerializationError("deserializeBuffer: " + std::to_string(des.buf().size()) + " trailing bytes");
+  if (x.des.buf().size() != 0) {
+    throw SerializationError("deserializeBuffer: " + std::to_string(x.des.buf().size()) + " trailing bytes");
   }
 }
 
 template<typename... T>
 [[gnu::always_inline]] inline std::string_view deserializeBufferPart(Buffer* buffer, T&... result) {
-  Deserializer des(std::string_view{(const char*)buffer->data(), buffer->size()});
-  Deserialize x(des);
+  Deserialize x(std::string_view{(const char*)buffer->data(), buffer->size()});
   x(result...);
-  return des.buf();
+  return x.des.buf();
 }
 
 template<typename T>

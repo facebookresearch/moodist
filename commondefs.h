@@ -25,6 +25,7 @@ void numa_membind(int node);
 void* internalAlloc(size_t bytes);
 void internalFree(void* ptr);
 void internalAllocatorSetNode(int node);
+size_t internalAllocSize(void* ptr);
 
 struct CudaError : std::runtime_error {
   CUresult error;

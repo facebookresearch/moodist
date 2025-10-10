@@ -148,6 +148,7 @@ pybind11_add_module(_C
   rdma_ib.cc
   tcpdev.cc
   rdma_tcp.cc
+  serialize_object.cc
   fmt/src/format.cc
   ${rdma_sources}
 )

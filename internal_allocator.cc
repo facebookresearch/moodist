@@ -186,19 +186,19 @@ struct Span {
   uintptr_t end;
 };
 
-template<typename T>
-struct Indestructible {
-  std::aligned_storage_t<sizeof(T), alignof(T)> storage;
-  Indestructible() {
-    new (&storage) T();
-  }
-  T& operator*() {
-    return (T&)storage;
-  }
-  T* operator->() {
-    return &**this;
-  }
-};
+// template<typename T>
+//  struct Indestructible {
+//    std::aligned_storage_t<sizeof(T), alignof(T)> storage;
+//    Indestructible() {
+//      new (&storage) T();
+//    }
+//    T& operator*() {
+//      return (T&)storage;
+//    }
+//    T* operator->() {
+//      return &**this;
+//    }
+//  };
 
 struct Globals {
   SpinMutex mutex;
@@ -211,23 +211,30 @@ struct Globals {
   Vector<Span, basic::Allocator<Span>> allMappedRegions;
 };
 
-Indestructible<Globals> globals;
+// Indestructible<Globals> globals;
+AlignedStorage<sizeof(Globals), alignof(Globals)> globalsStorage;
+#define globals ((Globals&)globalsStorage)
+#define spans (globals.spans)
+#define allMappedRegions (globals.allMappedRegions)
+#define singleThread (globals.singleThread)
+#define freeRegions (globals.freeRegions)
+// Globals& globals = (Globals&)globalsStorage;
 
-Vector<Span, basic::Allocator<Span>>& spans = globals->spans;
-Vector<Span, basic::Allocator<Span>>& allMappedRegions = globals->allMappedRegions;
+// Vector<Span, basic::Allocator<Span>>& spans = globals.spans;
+// Vector<Span, basic::Allocator<Span>>& allMappedRegions = globals.allMappedRegions;
 
-Thread& singleThread = globals->singleThread;
-IntrusiveList<Region>& freeRegions = globals->freeRegions;
+// Thread& singleThread = globals.singleThread;
+// IntrusiveList<Region>& freeRegions = globals.freeRegions;
 
 constexpr size_t regionSize =
     (sizeof(Region) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) * alignof(std::max_align_t);
 
-void add_span(Vector<Span, basic::Allocator<Span>>& spans, uintptr_t begin, uintptr_t end) {
+void add_span(Vector<Span, basic::Allocator<Span>>& rspans, uintptr_t begin, uintptr_t end) {
   CHECK(end > begin);
-  Span* s = spans.data();
+  Span* s = rspans.data();
   size_t a = 0;
-  size_t b = spans.size();
-  size_t e = spans.size();
+  size_t b = rspans.size();
+  size_t e = rspans.size();
   if (b) {
     while (a < b) {
       size_t mid = (a + b) / 2;
@@ -242,7 +249,7 @@ void add_span(Vector<Span, basic::Allocator<Span>>& spans, uintptr_t begin, uint
       if (s[a - 1].end == begin) {
         if (a != e && s[a].begin == end) {
           s[a - 1].end = s[a].end;
-          spans.erase(spans.begin() + a);
+          rspans.erase(rspans.begin() + a);
           return;
         }
         s[a - 1].end = end;
@@ -254,8 +261,8 @@ void add_span(Vector<Span, basic::Allocator<Span>>& spans, uintptr_t begin, uint
       return;
     }
   }
-  CHECK(a <= spans.size());
-  spans.insert(spans.begin() + a, Span{begin, end});
+  CHECK(a <= rspans.size());
+  rspans.insert(rspans.begin() + a, Span{begin, end});
 }
 
 uintptr_t nextAddr;
@@ -505,11 +512,11 @@ size_t moo_alloc_size(void* p) {
 
 [[gnu::malloc]]
 void* internalAlloc(size_t bytes) {
-  std::lock_guard l(globals->mutex);
+  std::lock_guard l(globals.mutex);
   return moo_alloc(bytes);
 }
 void internalFree(void* ptr) {
-  std::lock_guard l(globals->mutex);
+  std::lock_guard l(globals.mutex);
   return moo_free(ptr);
 }
 size_t internalAllocSize(void* ptr) {
@@ -517,7 +524,7 @@ size_t internalAllocSize(void* ptr) {
 }
 
 void internalAllocatorSetNode(int node) {
-  std::lock_guard l(globals->mutex);
+  std::lock_guard l(globals.mutex);
   if (internalAllocatorNode == node) {
     return;
   }

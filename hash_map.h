@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <type_traits>
 
 #pragma push_macro("likely")
 #pragma push_macro("unlikely")
@@ -21,16 +22,6 @@
 #define assert(x)
 
 namespace moodist {
-
-namespace {
-
-static constexpr int8_t none = -1;
-template<typename T>
-bool isNone(const T& v) {
-  return v == (T)none;
-}
-
-} // namespace
 
 template<
     typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>,
@@ -47,6 +38,12 @@ private:
     Value value;
     size_t index;
   };
+
+  static constexpr int8_t none = -1;
+  template<typename T>
+  static bool isNone(const T& v) {
+    return v == (T)none;
+  }
 
   size_t ksize = 0;
   size_t msize = 0;
@@ -153,7 +150,9 @@ public:
 
   HashMap() = default;
   ~HashMap() {
-    clear();
+    if (!std::is_trivially_destructible_v<Key> || !std::is_trivially_destructible_v<Value>) {
+      clear();
+    }
     deallocate(primary, ksize);
     deallocate(secondary, ksize);
   }

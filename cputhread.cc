@@ -4655,8 +4655,7 @@ struct CpuThreadImpl {
     // log.info("view is %#x %d\n", (uintptr_t)view.data(), view.size());
     const char* inlineData = nullptr;
     {
-      Deserializer d(view);
-      Deserialize x(d);
+      Deserialize x(view);
       x(queueAddress, tensorAddress, bytes);
       x(remoteOpKey, getKey, transactionKey, queueSize);
       for (size_t i = 0; i != maxDevices; ++i) {
