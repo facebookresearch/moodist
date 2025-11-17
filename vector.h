@@ -36,6 +36,13 @@ struct Vector {
   Vector(size_t count) {
     resize(count);
   }
+  template<typename Iterator>
+  Vector(Iterator begin, Iterator end) {
+    while (begin != end) {
+      push_back(*begin);
+      ++begin;
+    }
+  }
   ~Vector() {
     if (beginptr != endptr) {
       clear();

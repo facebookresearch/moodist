@@ -229,23 +229,37 @@ void create(
 }
 
 void create(
-    Group* group, const SimpleVector<int>& locations, QueueStorage*& qs, SimpleVector<uintptr_t>& remoteAddress) {
+    Group* group, const SimpleVector<int>& locations, QueueStorage*& qs, SimpleVector<uintptr_t>& remoteAddress,
+    std::optional<std::string> name) {
   uintptr_t address = 0;
 
-  qs = new QueueStorage();
-
-  remoteAddress.resize(locations.size());
-  for (size_t i = 0; i != locations.size(); ++i) {
-    int location = locations[i];
-    if (location == group->rank) {
-      sendCreateQueue(group, location, (uintptr_t)qs, false, std::nullopt);
-      remoteAddress[i] = (uintptr_t)qs;
-    } else {
-      remoteAddress[i] = sendCreateQueue(group, location, 0, false, std::nullopt);
+  if (name) {
+    remoteAddress.resize(locations.size());
+    for (size_t i = 0; i != locations.size(); ++i) {
+      int location = locations[i];
+      std::string iname = fmt::sprintf("%s[loc-%d]", *name, i);
+      uintptr_t a = sendCreateQueue(group, location, 0, false, iname);
+      CHECK(a != 0);
+      if (location == group->rank) {
+        qs = (QueueStorage*)a;
+      }
+      remoteAddress[i] = a;
     }
-  }
+  } else {
+    qs = new QueueStorage();
 
-  barrier(group);
+    remoteAddress.resize(locations.size());
+    for (size_t i = 0; i != locations.size(); ++i) {
+      int location = locations[i];
+      if (location == group->rank) {
+        sendCreateQueue(group, location, (uintptr_t)qs, false, std::nullopt);
+        remoteAddress[i] = (uintptr_t)qs;
+      } else {
+        remoteAddress[i] = sendCreateQueue(group, location, 0, false, std::nullopt);
+      }
+    }
+    barrier(group);
+  }
 }
 
 void sendTransaction(
@@ -427,9 +441,6 @@ struct QueueImpl {
     if (streaming) {
       throw std::runtime_error("Streaming broadcast queues are currently not supported!");
     }
-    if (name) {
-      throw std::runtime_error("Named broadcast queues are currently not supported!");
-    }
     isMulticast = true;
     location = locations[0];
     isMulticastLocal = std::find(locations.begin(), locations.end(), group->rank) != locations.end();
@@ -447,7 +458,7 @@ struct QueueImpl {
 
       multicastLocations[i] = r;
     }
-    create(&*group, multicastLocations, qs, multicastRemoteAddresses);
+    create(&*group, multicastLocations, qs, multicastRemoteAddresses, name);
     CHECK(qs != nullptr);
     CHECK(remoteAddress == 0);
     CHECK(multicastRemoteAddresses.size() == multicastLocations.size());

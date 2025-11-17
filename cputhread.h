@@ -37,6 +37,7 @@ constexpr uint8_t taskAllGatherBroadcast = 21;
 constexpr uint8_t taskCallback = 22;
 constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
+constexpr uint8_t taskCustom = 25;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -90,6 +91,7 @@ OPTYPE(CreateQueueNamedResult);
 
 OPTYPE(Cat);
 OPTYPE(Cached);
+OPTYPE(Custom);
 
 OPTYPE(MessageShutdown);
 
@@ -290,6 +292,44 @@ struct QueueEntryCallback : QueueEntry {
   Function<void()> callback;
 };
 
+struct CustomOpDescriptor {
+  uint32_t id;
+  struct Read {
+    uint32_t rank;
+    uint32_t inputIndex;
+    uint32_t outputIndex;
+    size_t inputOffset;
+    size_t outputOffset;
+    size_t bytes;
+  };
+  struct Copy {
+    uint32_t index;
+    IVector<int64_t> offset;
+    IVector<int64_t> shape;
+  };
+
+  IVector<Read> reads;
+  IVector<Copy> inputCopies;
+  IVector<Copy> outputCopies;
+
+  IVector<size_t> inputs;
+  IVector<size_t> outputs;
+
+  IVector<IVector<int64_t>> inputShapes;
+  IVector<IVector<int64_t>> outputShapes;
+  torch::Dtype dtype;
+};
+
+struct QueueEntryCustom : QueueEntry {
+  std::shared_ptr<CustomOpDescriptor> op;
+  FutureImplSharedPtr future;
+  bool anyCuda;
+  bool anyCpu;
+
+  std::vector<TensorDataPtr> inputs;
+  std::vector<TensorDataPtr> outputs;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -347,6 +387,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCopy> freelistCopy;
   QueueEntryFreeList<QueueEntryCached> freelistCached;
   QueueEntryFreeList<QueueEntryCallback> freelistCallback;
+  QueueEntryFreeList<QueueEntryCustom> freelistCustom;
 
   std::exception_ptr initExceptionPtr;
   std::atomic_bool initException = false;

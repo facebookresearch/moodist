@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
     class TcpStore(torch.distributed.Store):
         def __init__(
+            self,
             hostname: str,
             port: int,
             key: str,
@@ -64,6 +65,8 @@ if TYPE_CHECKING:
 
     def serialize(x: object) -> torch.Tensor: ...
     def deserialize(x: torch.Tensor) -> Any: ...
+
+    def cuda_copy(dst: torch.Tensor, src: torch.Tensor) -> None: ...
 
 
 class TransactionContextManager:
@@ -109,13 +112,13 @@ class Queue:
         self.impl = process_group.Queue(
             location=location, streaming=streaming, name=name
         )
-        self.process_group = process_group
+        self.process_group_name = process_group.moodist_name()
         self.location = location
         self.streaming = streaming
 
     def __reduce__(self):
         return type(self), (
-            self.process_group.moodist_name(),
+            self.process_group_name,
             self.location,
             self.streaming,
             self.impl.name(),
@@ -135,9 +138,6 @@ class Queue:
 
     def put_object(self, object, *, transaction=0):
         return self.impl.put(serialize(object), transaction)
-        # return self.impl.put(
-        #     torch.frombuffer(pickle.dumps(object), dtype=torch.uint8), transaction
-        # )
 
     def get_object(self, block=True, timeout=None, return_size=False):
         if return_size:
@@ -145,11 +145,7 @@ class Queue:
                 block=block, timeout=timeout, return_size=True
             )
             return deserialize(tensor), size
-            # return pickle.loads(tensor.numpy().tobytes()), size
         return deserialize(self.get_tensor(block=block, timeout=timeout))
-        # return pickle.loads(
-        #     self.get_tensor(block=block, timeout=timeout).numpy().tobytes()
-        # )
 
     def qsize(self):
         return self.impl.qsize()
@@ -210,8 +206,10 @@ torch.distributed.distributed_c10d.register_rendezvous_handler(
 )
 
 
-__all__ = [
-    *clist,
-    "create_moodist_backend",
-    "Empty",
-]
+def compile_op(group, shape, dtype, inputs=None, outputs=None):
+    from .compile import compile_op
+
+    return compile_op(group, shape, dtype, inputs, outputs)
+
+
+__all__ = [*clist, "create_moodist_backend", "Empty", "compile_op"]

@@ -721,7 +721,12 @@ struct CpuThreadImpl {
     }
   }
 
+  MemoryRegistration nullRegistration;
+
   MemoryRegistration* regMr(uintptr_t address, size_t bytes) {
+    if (bytes == 0) [[unlikely]] {
+      return &nullRegistration;
+    }
     auto region = cpu_allocator::regionAt(address);
     if (region.first) [[likely]] {
       uintptr_t inputBegin = address;
@@ -795,6 +800,9 @@ struct CpuThreadImpl {
   }
 
   MemoryRegistration* regMrCuda(uintptr_t address, size_t bytes) {
+    if (bytes == 0) [[unlikely]] {
+      return &nullRegistration;
+    }
     unsigned long long bufferId = -1;
     CUdeviceptr base = 0;
     size_t size = 0;
@@ -5598,6 +5606,313 @@ struct CpuThreadImpl {
     }
   };
 
+  struct WorkCustom : Work {
+    QueueEntryCustom& params;
+    size_t i;
+    size_t o;
+    size_t readIndex;
+
+    CustomOpDescriptor* op = &*params.op;
+    TemporaryBufferHandle listBuffer;
+
+    struct InputTensor {
+      uintptr_t address;
+      size_t bytes;
+      std::array<uint32_t, maxDevices> rkey;
+    };
+
+    static constexpr size_t maxInlinedInputs = 2;
+
+    struct Header {
+      uint32_t opid;
+      uint32_t numInputs;
+      std::array<InputTensor, maxInlinedInputs> inputs;
+      uint32_t stepValue;
+    };
+
+    struct alignas(128) Dyn : DynamicAddressesBase {
+      Header custom;
+    };
+    static_assert(sizeof(Dyn) <= 128);
+
+    TemporaryBufferHandle dynbuf;
+
+    Vector<TemporaryBufferHandle> remoteInputList;
+    Vector<bool> remoteInputListReady;
+
+    Vector<CustomOpDescriptor::Read> reads;
+
+    size_t liveReads = 0;
+    std::array<size_t, maxDevices> deviceLiveReads{};
+
+    static constexpr size_t numParallel = 2;
+    const size_t numDevices = self.devices.size();
+
+    Vector<MemoryRegistration*> outputMrs;
+
+    WorkCustom(CpuThreadImpl& self, QueueEntryCustom& params) : Work(self, params), params(params) {}
+
+    void tryRead(size_t di) {
+      CHECK(readIndex < reads.size());
+
+      auto& read = reads[readIndex];
+      uint32_t source = read.rank;
+
+      if (!remoteInputListReady[source]) {
+        return;
+      }
+      ++readIndex;
+
+      // log.info(
+      //     "read from rank %d, input %d, offset %d, bytes %d, output %d, offset %d\n", source, read.inputIndex,
+      //     read.inputOffset, read.bytes, read.outputIndex, read.outputOffset);
+
+      CHECK(source < size);
+      InputTensor* arr = (InputTensor*)remoteInputList[source]->cpuPointer;
+      CHECK(arr != nullptr);
+      CHECK(remoteInputList[source]->bytes >= sizeof(InputTensor) * (read.inputIndex + 1));
+      auto& it = arr[read.inputIndex];
+      uintptr_t sourceAddress = it.address + read.inputOffset;
+      CHECK(read.inputOffset + read.bytes <= it.bytes);
+
+      CHECK(params.outputs.size() > read.outputIndex);
+      auto& ot = params.outputs[read.outputIndex];
+      CHECK(ot->bytes() >= read.outputOffset + read.bytes);
+
+      uintptr_t localAddress = ot->data() + read.outputOffset;
+
+      if (read.bytes == 0) {
+        return;
+      }
+
+      ++liveReads;
+      ++deviceLiveReads[di];
+
+      auto key = it.rkey;
+      auto& dev = self.devices[di];
+      self.readData(
+          dev, source, (void*)localAddress, outputMrs[read.outputIndex]->mrs[di]->lkey, (void*)sourceAddress, key[di],
+          read.bytes, self.makeCallback([this, di, source]() {
+            self.trace(concurrencyIndex, 1 + di, "");
+            --liveReads;
+            --deviceLiveReads[di];
+          }));
+    }
+
+    void step() {
+      ENTER
+
+      self.outStepValue(concurrencyIndex, 0) = stepValue;
+      self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+
+      // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
+      {
+        CHECK(params.inputs.size() == op->inputs.size() + op->inputCopies.size());
+        CHECK(params.outputs.size() == op->outputs.size() + op->outputCopies.size());
+
+        Dyn& out = (Dyn&)self.outDyn(concurrencyIndex, 0);
+        out.opType = opTypeCustom;
+        out.gatherBytes = 0;
+        out.stepValue = stepValue;
+
+        out.custom.opid = op->id;
+        out.custom.stepValue = stepValue;
+        out.custom.numInputs = params.inputs.size();
+
+        if (params.inputs.size() <= maxInlinedInputs) {
+
+          for (size_t i : indices(params.inputs)) {
+            auto& tensor = params.inputs[i];
+            auto& v = out.custom.inputs[i];
+            v.address = tensor->data();
+            v.bytes = tensor->bytes();
+            auto* mr = tensor->isCuda ? self.regMrCuda(v.address, v.bytes) : self.regMr(v.address, v.bytes);
+            for (size_t i = 0; i != maxDevices; ++i) {
+              v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
+            }
+          }
+
+          out.gatherAddress = 0;
+
+        } else {
+
+          dynbuf = self.allocateTemporaryBuffer(sizeof(InputTensor) * params.inputs.size());
+
+          InputTensor* l = (InputTensor*)dynbuf->cpuPointer;
+
+          for (size_t i : indices(params.inputs)) {
+            auto& tensor = params.inputs[i];
+            auto& v = l[i];
+            v.address = tensor->data();
+            v.bytes = tensor->bytes();
+            auto* mr = tensor->isCuda ? self.regMrCuda(v.address, v.bytes) : self.regMr(v.address, v.bytes);
+            for (size_t i = 0; i != maxDevices; ++i) {
+              v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
+            }
+          }
+
+          out.gatherAddress = (uintptr_t)dynbuf->cpuPointer;
+          for (size_t i = 0; i != maxDevices; ++i) {
+            out.gatherKey[i] = dynbuf.mr->mrs[i] ? dynbuf.mr->mrs[i]->rkey : 0;
+          }
+        }
+
+        for (o = 0; o != size; ++o) {
+          i = self.rank + o;
+          if (i >= size) {
+            i -= size;
+          }
+          CHECK(i >= 0 && i < size);
+          self.writeDyn(concurrencyIndex, i, 0, rank);
+        }
+      }
+
+      outputMrs.resize(params.outputs.size());
+      for (size_t i : indices(outputMrs)) {
+        auto& t = params.outputs[i];
+        outputMrs[i] = t->isCuda ? self.regMrCuda(t->data(), t->bytes()) : self.regMr(t->data(), t->bytes());
+      }
+
+      CHECK(remoteInputList.empty());
+      CHECK(remoteInputListReady.empty());
+      remoteInputList.resize(size);
+      remoteInputListReady.resize(size);
+
+      for (o = 0; o != size; ++o) {
+        i = self.rank - o;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+
+        while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+          YIELD
+        }
+        {
+          Dyn& dyn = (Dyn&)self.inDyn(concurrencyIndex, i);
+          CHECK_DYN(dyn, opTypeCustom, stepValue, 0);
+        }
+
+        while (((Dyn&)self.inDyn(concurrencyIndex, i)).custom.stepValue != stepValue) {
+          YIELD
+        }
+        Dyn& dyn = (Dyn&)self.inDyn(concurrencyIndex, i);
+
+        if (dyn.custom.opid != op->id) {
+          fatal("Mismatched custom operation: Local id is %d, remote id is %d", dyn.custom.opid, op->id);
+        }
+
+        auto& targetBuffer = remoteInputList[i];
+        size_t bytes = sizeof(InputTensor) * dyn.custom.numInputs;
+        targetBuffer = self.allocateTemporaryBuffer(bytes);
+
+        if (dyn.custom.numInputs <= maxInlinedInputs) {
+          std::memcpy(targetBuffer->cpuPointer, dyn.custom.inputs.data(), sizeof(InputTensor) * dyn.custom.numInputs);
+          remoteInputListReady[i] = true;
+        } else {
+          size_t di = o % self.devices.size();
+          auto& dev = self.devices[di];
+          self.readData(
+              dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
+              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] { remoteInputListReady[i] = true; }));
+        }
+      }
+
+      reads = op->reads;
+      std::ranges::shuffle(reads, getRng());
+
+      if (params.anyCuda) {
+        // wait for kernel
+        while (cpuIn[0] < stepValue) {
+          YIELD
+        }
+      }
+      for (size_t o = 0; o != size; ++o) {
+        i = self.rank + o;
+        if (i >= size) {
+          i -= size;
+        }
+        CHECK(i >= 0 && i < size);
+        self.writeStepValue(concurrencyIndex, i, 0, rank);
+      }
+      for (o = 0; o != size; ++o) {
+        i = self.rank - o;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+        while (self.inStepValue(concurrencyIndex, i) < stepValue) {
+          YIELD
+        }
+      }
+
+      readIndex = 0;
+
+      while (readIndex != reads.size()) {
+        {
+          size_t bestDevice = 0;
+          size_t bestLiveReads = numParallel;
+          for (size_t di = 0; di != numDevices; ++di) {
+            if (deviceLiveReads[di] < bestLiveReads) {
+              bestLiveReads = deviceLiveReads[di];
+              bestDevice = di;
+            }
+          }
+          if (bestLiveReads < numParallel) {
+            tryRead(bestDevice);
+          }
+        }
+        YIELD
+      }
+
+      while (liveReads) {
+        YIELD
+      }
+
+      for (size_t o = 0; o != size; ++o) {
+        i = self.rank + o;
+        if (i >= size) {
+          i -= size;
+        }
+        CHECK(i >= 0 && i < size);
+        self.writeStepValue(concurrencyIndex, i, 1, rank);
+      }
+      self.trace(concurrencyIndex, 0, "wait for remote reads");
+      for (o = 0; o != size; ++o) {
+        i = self.rank - o;
+        if (i >= size) {
+          i += size;
+        }
+        CHECK(i >= 0 && i < size);
+        while (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
+          YIELD
+        }
+      }
+
+      if (params.anyCuda) {
+        self.writeCpuOut(concurrencyIndex, 0, 0);
+      }
+
+      if (params.anyCpu) {
+        params.future->done = 1;
+        futexWakeAll(&params.future->done);
+      }
+      params.future.reset();
+
+      params.op.reset();
+
+      dynbuf = {};
+      remoteInputList.clear();
+
+      params.inputs.clear();
+      params.outputs.clear();
+
+      self.cpuThread->freelistCustom.push(&params);
+      self.allocatorCustom.deallocate(this);
+      DONE
+    }
+  };
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -5640,6 +5955,7 @@ struct CpuThreadImpl {
   WorkAllocator<WorkAllGatherDirectRead> allocatorAllGatherDirectRead;
   WorkAllocator<WorkAllGatherDirectWrite> allocatorAllGatherDirectWrite;
   WorkAllocator<WorkShutdown> allocatorShutdown;
+  WorkAllocator<WorkCustom> allocatorCustom;
 
   size_t numActiveWorks = 0;
 
@@ -6002,6 +6318,9 @@ struct CpuThreadImpl {
                 break;
               case taskAllGatherDirect:
                 enqueue(allocatorAllGatherDirectRead, (QueueEntryAllGather&)queueEntry);
+                break;
+              case taskCustom:
+                enqueue(allocatorCustom, (QueueEntryCustom&)queueEntry);
                 break;
               default:
                 throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

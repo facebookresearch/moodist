@@ -18,7 +18,9 @@
 
 #include <ATen/ops/from_blob.h>
 #include <ATen/ops/pad.h>
+#include <algorithm>
 #include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -29,8 +31,6 @@
 #include <stdexcept>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/types.h>
-
-#include <cublas.h>
 
 namespace moodist {
 
@@ -57,7 +57,8 @@ struct GlobalsDestroyed {
 
 struct ProcessGroupImpl;
 std::mutex& activeProcessGroupsMutex = Global();
-std::vector<ProcessGroupImpl*>& activeProcessGroups = Global();
+HashMap<uint32_t, ProcessGroupImpl*>& activeProcessGroups = Global();
+uint32_t nextProcessGroupActiveId = 1;
 
 std::atomic_bool globalPreferKernelLess = false;
 
@@ -201,7 +202,27 @@ struct EventSerializer {
   }
 };
 
-struct ProcessGroupImpl {
+template<typename... T>
+torch::Tensor serializeToTensor(const T&... v) {
+  auto buffer = serializeToBuffer(v...);
+  void* data = buffer->data();
+  size_t size = buffer->size();
+  SharedBufferHandle sharedBuffer(buffer.release());
+  return torch::from_blob(
+      data, {(int64_t)size}, [sharedBuffer = std::move(sharedBuffer)](void*) {},
+      torch::TensorOptions().dtype(torch::kUInt8));
+}
+
+std::string_view tensorView(torch::Tensor t) {
+  return std::string_view((const char*)t.data_ptr(), t.itemsize() * t.numel());
+}
+
+template<typename... T>
+void deserializeTensor(torch::Tensor t, T&... v) {
+  deserializeBuffer(tensorView(t), v...);
+}
+
+struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
   size_t rank = 0;
   size_t size = 0;
 
@@ -236,6 +257,8 @@ struct ProcessGroupImpl {
 
   int streamPriority = -1;
 
+  uint32_t activeId = 0;
+
   ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
     CHECK(rank >= 0 && size > 0 && rank < size);
 
@@ -245,12 +268,6 @@ struct ProcessGroupImpl {
 
     init(store);
 
-    {
-      std::call_once(freeMemoryCallbackOnceFlag, &registerFreeMemoryCallback);
-      std::lock_guard l(activeProcessGroupsMutex);
-      activeProcessGroups.push_back(this);
-    }
-
     for (auto& v : concurrencyEvents) {
       v = Event::create();
     }
@@ -259,6 +276,14 @@ struct ProcessGroupImpl {
 
     if (size - 1 == group->peerIndices.size()) {
       streamPriority = -10;
+    }
+
+    {
+      std::call_once(freeMemoryCallbackOnceFlag, &registerFreeMemoryCallback);
+      std::lock_guard l(activeProcessGroupsMutex);
+      activeId = nextProcessGroupActiveId++;
+      CHECK(!activeProcessGroups.contains(activeId));
+      activeProcessGroups[activeId] = this;
     }
   }
 
@@ -428,7 +453,7 @@ struct ProcessGroupImpl {
     trace("");
     std::lock_guard l(activeProcessGroupsMutex);
     if (!globalsDestroyed) {
-      auto i = std::find(activeProcessGroups.begin(), activeProcessGroups.end(), this);
+      auto i = activeProcessGroups.find(activeId);
       if (i != activeProcessGroups.end()) {
         activeProcessGroups.erase(i);
       }
@@ -2602,6 +2627,10 @@ struct ProcessGroupImpl {
   TensorDataPtr getTensorData(const torch::Tensor& tensor, bool allowCopy = true) {
     TensorDataPtr td = getTensorReference(tensor);
 
+    if (td->bytes() == 0) {
+      return td;
+    }
+
     if (!td->isCuda) {
       if (cpu_allocator::owns(td->dataPtr)) {
         auto handle = cpu_allocator::getCpuBuffer((uintptr_t)tensor.storage().data());
@@ -2626,6 +2655,10 @@ struct ProcessGroupImpl {
 
   TensorDataPtr getTensorReference(const torch::Tensor& tensor) {
     TensorDataPtr td = TensorDataPtr::make();
+
+    if (!tensor.is_contiguous()) {
+      throw std::runtime_error("Got a non-contiguous tensor. All tensors must be contiguous.");
+    }
 
     td->dtype = (int)tensor.dtype().toScalarType();
     const auto& shape = tensor.sizes();
@@ -3038,13 +3071,568 @@ struct ProcessGroupImpl {
   void shutdown() {
     group->cpuThread->kill(false);
   }
+
+  std::string descr(const IVector<int64_t>& shape, torch::Dtype dtype) {
+    return fmt::sprintf("shape [%s], dtype %s", fmt::to_string(fmt::join(shape, ", ")), torch::toString(dtype));
+  }
+  std::string descr(const TensorDataPtr& t) {
+    return fmt::sprintf(
+        "shape [%s], dtype %s", fmt::to_string(fmt::join(t->shape, ", ")),
+        torch::toString((torch::ScalarType)t->dtype));
+  }
+
+  Future customOp(
+      std::shared_ptr<CustomOpDescriptor> op, const std::vector<torch::Tensor>& inputs,
+      const std::vector<torch::Tensor>& outputs) {
+    std::unique_lock l(threadUnsafe);
+
+    size_t size = this->size;
+
+    uint32_t stepValue = getNextStepValue();
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    CHECK(stepValue < 0x80000000);
+
+    if (inputs.size() != op->inputs.size()) {
+      throw std::runtime_error(
+          fmt::sprintf("moodist: custom op expected %d inputs, but got %d", op->inputs.size(), inputs.size()));
+    }
+    if (outputs.size() != op->outputs.size()) {
+      throw std::runtime_error(
+          fmt::sprintf("moodist: custom op expected %d outputs, but got %d", op->outputs.size(), outputs.size()));
+    }
+
+    auto future = FutureImplSharedPtr::make();
+
+    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+    QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
+    e->task = taskCustom;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->op = op;
+    e->future = future;
+    bool anyCuda = false;
+    bool anyCpu = false;
+
+    CHECK(e->inputs.empty());
+    CHECK(e->outputs.empty());
+    for (size_t i : indices(inputs)) {
+      auto t = getTensorData(inputs[i], false);
+      if (t->bytes() != op->inputs[i]) {
+        throw std::runtime_error(fmt::sprintf(
+            "moodist: custom op input %d was expected to be %d bytes (%s), but got a tensor of %d bytes (%s)", i,
+            op->inputs[i], descr(op->inputShapes[i], op->dtype), t->bytes(), descr(t)));
+      }
+      anyCuda |= t->isCuda;
+      anyCpu |= !t->isCuda;
+      e->inputs.push_back(std::move(t));
+    }
+    for (size_t i : indices(outputs)) {
+      auto t = getTensorData(outputs[i], false);
+      if (t->bytes() != op->outputs[i]) {
+        throw std::runtime_error(fmt::sprintf(
+            "moodist: custom op output %d was expected to be %d bytes (%s), but got a tensor of %d bytes (%s)", i,
+            op->outputs[i], descr(op->outputShapes[i], op->dtype), t->bytes(), descr(t)));
+      }
+      anyCuda |= t->isCuda;
+      anyCpu |= !t->isCuda;
+      e->outputs.push_back(std::move(t));
+    }
+
+    Future r;
+
+    for (auto& x : op->inputCopies) {
+      CHECK(x.index < inputs.size());
+      torch::Tensor t = inputs[x.index];
+      CHECK(x.offset.size() == x.shape.size());
+      // log.info("making copy of input %d as input %d\n", x.index, e->inputs.size());
+      for (size_t i : indices(x.offset)) {
+        t = t.narrow(i, x.offset[i], x.shape[i]);
+      }
+      t = t.contiguous();
+      e->inputs.push_back(getTensorData(t, false));
+
+      r.tensors.push_back(t);
+    }
+
+    Vector<std::pair<torch::Tensor, torch::Tensor>> outputCopyTensors;
+
+    for (auto& x : op->outputCopies) {
+      CHECK(x.index < outputs.size());
+      torch::Tensor t =
+          torch::empty(x.shape, torch::TensorOptions().dtype(op->dtype).device(outputs[x.index].device()));
+      outputCopyTensors.emplace_back(t, outputs[x.index]);
+
+      // log.info("making copy of output %d as output %d\n", x.index, e->outputs.size());
+      e->outputs.push_back(getTensorData(t, false));
+
+      r.tensors.push_back(t);
+    }
+
+    e->anyCuda = anyCuda;
+    e->anyCpu = anyCpu;
+
+    if (anyCuda) {
+      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
+      memFlush(c10::cuda::getCurrentCUDAStream());
+    }
+
+    if (!anyCpu) {
+      future->done = 1;
+    }
+
+    group->cpuThread->enqueue(e);
+
+    for (auto& v : inputs) {
+      r.tensors.push_back(v);
+    }
+    for (auto& v : outputs) {
+      r.tensors.push_back(v);
+    }
+    r.impl = std::move(future);
+
+    if (!outputCopyTensors.empty()) {
+      r.waitDoneCallback = [tensors = std::move(outputCopyTensors), op, outputs, anyCuda, this, h = shared_from_this(),
+                            concurrencyIndex, stepValue]() {
+        if (anyCuda) {
+          memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+          memFlush(c10::cuda::getCurrentCUDAStream());
+        }
+        CHECK(tensors.size() == op->outputCopies.size());
+        for (size_t i : indices(op->outputCopies)) {
+          auto [src, dst] = tensors[i];
+          auto& x = op->outputCopies[i];
+          dst = dst.view(op->dtype);
+          for (size_t i : indices(x.offset)) {
+            dst = dst.narrow(i, x.offset[i], x.shape[i]);
+          }
+          dst.copy_(src);
+        }
+      };
+    } else if (anyCuda) {
+      r.waitDoneCallback = [this, h = shared_from_this(), concurrencyIndex, stepValue]() {
+        memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+        memFlush(c10::cuda::getCurrentCUDAStream());
+      };
+    }
+
+    return r;
+  }
+
+  uint32_t nextCustomOpId = 1;
+
+  template<typename T>
+  struct TInput {
+    bool contiguous = false;
+    T offset;
+    T shape;
+    uint32_t inputRank;
+    uint32_t outputRank;
+    uint32_t inputIndex;
+    uint32_t outputIndex;
+    size_t inputOffset;
+    size_t outputOffset;
+    bool outputContiguous;
+
+    template<typename X>
+    void serialize(X& x) {
+      x(contiguous, offset, shape, inputRank, outputRank, inputIndex, outputIndex, inputOffset, outputOffset,
+        outputContiguous);
+    }
+  };
+
+  template<int ndim>
+  CustomOp compileOpFullImpl(
+      const std::vector<int>& shape_arg, torch::Dtype dtype,
+      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
+      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg) {
+    using T = std::array<int, ndim>;
+    T shape;
+    std::ranges::copy(shape_arg, shape.begin());
+    struct TDescr {
+      uint32_t rank;
+      uint32_t index;
+      T shape;
+      T offset;
+      size_t numel;
+    };
+    const size_t numInputs = inputs_arg.size();
+    const size_t numOutputs = outputs_arg.size();
+
+    constexpr auto numel = [](const T& v) {
+      size_t numel = 1;
+      for (size_t n : v) {
+        numel *= n;
+      }
+      return numel;
+    };
+
+    IVector<TDescr> descrs;
+    IVector<TDescr*> inputs(numInputs);
+    IVector<TDescr*> outputs(numOutputs);
+    IVector<size_t> indexCounter(size);
+    for (size_t i : indices(inputs_arg)) {
+      auto& [rank, offset, nshape] = inputs_arg[i];
+      descrs.emplace_back();
+      TDescr& d = descrs.back();
+      d.rank = rank;
+      std::ranges::copy(offset, d.offset.begin());
+      std::ranges::copy(nshape, d.shape.begin());
+      d.numel = numel(d.shape);
+      d.index = indexCounter[rank]++;
+      inputs[i] = &d;
+    }
+    std::ranges::fill(indexCounter, 0);
+    for (size_t i : indices(outputs_arg)) {
+      auto& [rank, offset, nshape] = outputs_arg[i];
+      descrs.emplace_back();
+      TDescr& d = descrs.back();
+      d.rank = rank;
+      std::ranges::copy(offset, d.offset.begin());
+      std::ranges::copy(nshape, d.shape.begin());
+      d.numel = numel(d.shape);
+      d.index = indexCounter[rank]++;
+      outputs[i] = &d;
+    }
+
+    auto ref = [&](auto& v) {
+      return std::views::transform(v, [](auto& x) -> decltype(auto) {
+        if constexpr (std::is_pointer_v<std::remove_reference_t<decltype(x)>>) {
+          return *x;
+        } else {
+          return x;
+        }
+      });
+    };
+
+    IVector<IVector<const TDescr*>> outputsPerRank(size);
+    for (const TDescr& dst : ref(outputs)) {
+      CHECK(dst.index == outputsPerRank[dst.rank].size());
+      outputsPerRank[dst.rank].push_back(&dst);
+    }
+    for (size_t i : range(size)) {
+      CHECK(outputsPerRank[i].size() == indexCounter[i]);
+    }
+
+    std::ranges::stable_sort(inputs, std::greater<size_t>(), &TDescr::numel);
+    std::ranges::stable_sort(outputs, std::greater<size_t>(), &TDescr::numel);
+
+    constexpr auto intersecting = [](const auto& a, const auto& b) {
+      for (size_t i : range(ndim)) {
+        if (a.offset[i] >= b.offset[i] + b.shape[i]) {
+          return false;
+        }
+        if (b.offset[i] >= a.offset[i] + a.shape[i]) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    constexpr auto str = [](const T& v) { return fmt::sprintf("[%s]", fmt::to_string(fmt::join(v, ", "))); };
+
+    constexpr auto contiguous = [](const T& a, const T& b) {
+      for (size_t i : range(ndim)) {
+        if (i && a[i] != b[i]) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    struct FindResult {
+      T offset;
+      T shape;
+      size_t index;
+    };
+
+    auto find = [&](const auto& dst, const auto& list) -> IVector<FindResult> {
+      IVector<FindResult> rv;
+      size_t i = 0;
+      for (const auto& src : ref(list)) {
+        size_t index = i++;
+        if (!intersecting(src, dst)) {
+          continue;
+        }
+        T low;
+        T high;
+        T nshape;
+        for (size_t i : range(ndim)) {
+          low[i] = std::max(src.offset[i], dst.offset[i]);
+          high[i] = std::min(src.offset[i] + src.shape[i], dst.offset[i] + dst.shape[i]);
+          CHECK(low[i] <= high[i]);
+          nshape[i] = high[i] - low[i];
+        }
+
+        // log.info(
+        //     "found %s/%s intersection at %s %s\n", contiguous(src.shape, nshape) ? "contiguous" : "non-contiguous",
+        //     contiguous(dst.shape, nshape) ? "contiguous" : "non-contiguous", str(low), str(nshape));
+
+        FindResult r;
+        r.offset = low;
+        r.shape = nshape;
+        r.index = index;
+        rv.push_back(r);
+      }
+      return rv;
+    };
+
+    using Input = TInput<T>;
+
+    IVector<Input> distInputs;
+
+    IVector<FindResult> copyInputs;
+
+    IVector<TDescr*> myInputs;
+    for (auto& v : ref(inputs)) {
+      if (v.rank == this->rank) {
+        myInputs.push_back(&v);
+      }
+    }
+
+    constexpr auto sub = [](const T& a, const T& b) {
+      T r;
+      for (size_t i : range(ndim)) {
+        r[i] = a[i] - b[i];
+      }
+      return r;
+    };
+
+    for (const TDescr& dst : ref(outputs)) {
+      if (dst.numel == 0) {
+        continue;
+      }
+      auto r = find(dst, myInputs);
+
+      for (const FindResult& x : r) {
+        auto& src = *myInputs[x.index];
+        bool inputContiguous = contiguous(x.shape, src.shape);
+        if (!inputContiguous) {
+          auto rr = find(dst, copyInputs);
+          if (!rr.empty() && rr.size() < 4) {
+            size_t n = 0;
+            bool cc = true;
+            for (auto& x2 : rr) {
+              n += numel(x2.shape);
+              cc &= contiguous(x2.shape, copyInputs[x2.index].shape);
+              if (!cc) {
+                break;
+              }
+            }
+            // log.info("cc is %d, n is %d/%d\n", cc, n, numel(x.shape));
+            if (cc && n == numel(x.shape)) {
+              // log.info("Reusing existing copy input (%d)\n", rr.size());
+              for (auto& x : rr) {
+                distInputs.emplace_back();
+                Input& i = distInputs.back();
+                i.offset = x.offset;
+                i.shape = x.shape;
+                i.inputRank = this->rank;
+                i.outputRank = dst.rank;
+                i.inputIndex = myInputs.size() + x.index;
+                i.outputIndex = dst.index;
+                CHECK(i.inputIndex < myInputs.size() + copyInputs.size());
+
+                CHECK(&dst == outputsPerRank[i.outputRank][i.outputIndex]);
+
+                i.inputOffset = numel(sub(x.offset, copyInputs[x.index].offset));
+                i.outputOffset = numel(sub(x.offset, dst.offset));
+
+                i.outputContiguous = contiguous(x.shape, dst.shape);
+              }
+              continue;
+            }
+          }
+        }
+        distInputs.emplace_back();
+        Input& i = distInputs.back();
+        i.offset = x.offset;
+        i.shape = x.shape;
+        i.inputRank = this->rank;
+        i.outputRank = dst.rank;
+        i.inputIndex = x.index;
+        i.outputIndex = dst.index;
+        CHECK(i.inputIndex < myInputs.size());
+
+        CHECK(&dst == outputsPerRank[i.outputRank][i.outputIndex]);
+
+        i.inputOffset = numel(sub(x.offset, src.offset));
+        i.outputOffset = numel(sub(x.offset, dst.offset));
+
+        if (!inputContiguous) {
+          i.inputIndex = myInputs.size() + copyInputs.size();
+          i.inputOffset = 0;
+          copyInputs.push_back(x);
+
+          // log.info("Adding copy input %d at offset %s shape %s\n", x.index, str(x.offset), str(x.shape));
+        }
+        i.outputContiguous = contiguous(x.shape, dst.shape);
+      }
+    }
+
+    auto op = std::make_shared<CustomOpDescriptor>();
+    op->id = nextCustomOpId++;
+
+    op->dtype = dtype;
+
+    size_t itemsize = torch::elementSize(dtype);
+
+    for (auto& x : ref(inputs)) {
+      if (x.rank == this->rank) {
+        op->inputs.push_back(itemsize * numel(x.shape));
+        op->inputShapes.emplace_back(x.shape.begin(), x.shape.end());
+      }
+    }
+    for (auto& x : ref(outputs)) {
+      if (x.rank == this->rank) {
+        op->outputs.push_back(itemsize * numel(x.shape));
+        op->outputShapes.emplace_back(x.shape.begin(), x.shape.end());
+      }
+    }
+
+    barrier();
+
+    if (queues.empty()) {
+      for (size_t i : range(size)) {
+        queues.push_back(makeQueue(group, i, false, {}));
+      }
+    }
+
+    IVector<IVector<Input>> s(size);
+    for (const Input& x : distInputs) {
+      s[x.outputRank].push_back(x);
+    }
+
+    for (size_t i : range(size)) {
+      queues[i]->put(serializeToTensor(s[i]), 0);
+    }
+
+    size_t totalOutputNumel = 0;
+    for (const auto& x : ref(outputs)) {
+      if (x.rank == this->rank) {
+        totalOutputNumel += numel(x.shape);
+      }
+    }
+    size_t readNumel = 0;
+
+    for (size_t i : range(size)) {
+      IVector<Input> n;
+      deserializeTensor(*queues[this->rank]->get().first, n);
+      for (const Input& x : n) {
+        CHECK(x.outputRank == this->rank);
+
+        CustomOpDescriptor::Read r;
+        r.rank = x.inputRank;
+        r.inputIndex = x.inputIndex;
+        r.outputIndex = x.outputIndex;
+        r.inputOffset = itemsize * x.inputOffset;
+        r.outputOffset = itemsize * x.outputOffset;
+        size_t n = numel(x.shape);
+        r.bytes = itemsize * n;
+        readNumel += n;
+
+        if (!x.outputContiguous) {
+          // log.info("Adding copy output %d at offset %s shape %s\n", x.outputIndex, str(x.offset), str(x.shape));
+          CustomOpDescriptor::Copy c;
+          c.index = r.outputIndex;
+          auto offset = sub(x.offset, outputsPerRank[this->rank][x.outputIndex]->offset);
+          c.offset = {offset.begin(), offset.end()};
+          c.shape = {x.shape.begin(), x.shape.end()};
+          r.outputIndex = op->outputs.size() + op->outputCopies.size();
+          op->outputCopies.push_back(c);
+          r.outputOffset = 0;
+        }
+
+        op->reads.push_back(r);
+      }
+    }
+
+    if (readNumel != totalOutputNumel) {
+      for (size_t i : indices(outputsPerRank[this->rank])) {
+        const auto& dst = *outputsPerRank[this->rank][i];
+        size_t nmatched = 0;
+        for (const auto& r : op->reads) {
+          if (r.outputIndex == i) {
+            nmatched += r.bytes / itemsize;
+          }
+        }
+        if (nmatched != numel(dst.shape)) {
+          throw std::runtime_error(fmt::sprintf(
+              "moodist.compile_op_full: could not find input for output at offset %s shape %s]  (found %d/%d "
+              "elements)",
+              str(dst.offset), str(dst.shape), nmatched, numel(dst.shape)));
+        }
+      }
+      throw std::runtime_error("moodist.compile_op_full: unreachable; failed to find missing input");
+    }
+
+    barrier();
+
+    for (auto& x : copyInputs) {
+      CustomOpDescriptor::Copy c;
+      c.index = x.index;
+      auto offset = sub(x.offset, myInputs[x.index]->offset);
+      c.offset = {offset.begin(), offset.end()};
+      c.shape = {x.shape.begin(), x.shape.end()};
+      op->inputCopies.push_back(c);
+    }
+
+    CustomOp r;
+    r.op = [op = std::move(op), activeId = this->activeId](
+               const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs) {
+      std::unique_lock l(activeProcessGroupsMutex);
+      auto i = activeProcessGroups.find(activeId);
+      if (i == activeProcessGroups.end()) {
+        throw std::runtime_error("moodist: custom op process group was destroyed before op was called");
+      }
+      auto ref = i->second->shared_from_this();
+      l.unlock();
+      return ref->customOp(op, inputs, outputs);
+    };
+    return r;
+  }
+
+  CustomOp compileOpFull(
+      const std::vector<int>& shape, torch::Dtype dtype,
+      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
+      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
+    switch (shape.size()) {
+    case 0:
+      return compileOpFullImpl<0>(shape, dtype, inputs, outputs);
+    case 1:
+      return compileOpFullImpl<1>(shape, dtype, inputs, outputs);
+    case 2:
+      return compileOpFullImpl<2>(shape, dtype, inputs, outputs);
+    case 3:
+      return compileOpFullImpl<3>(shape, dtype, inputs, outputs);
+    case 4:
+      return compileOpFullImpl<4>(shape, dtype, inputs, outputs);
+    case 5:
+      return compileOpFullImpl<5>(shape, dtype, inputs, outputs);
+    case 6:
+      return compileOpFullImpl<6>(shape, dtype, inputs, outputs);
+    case 7:
+      return compileOpFullImpl<7>(shape, dtype, inputs, outputs);
+    case 8:
+      return compileOpFullImpl<8>(shape, dtype, inputs, outputs);
+    case 9:
+      return compileOpFullImpl<9>(shape, dtype, inputs, outputs);
+    case 10:
+      return compileOpFullImpl<10>(shape, dtype, inputs, outputs);
+    default:
+      throw std::runtime_error(
+          fmt::sprintf("moodist.compile_op_full: ndim %d is too large and not supported!", shape.size()));
+    }
+  }
 };
 
 void globalsDtor() {
   std::vector<ProcessGroupImpl*> pgs;
   {
     std::lock_guard l(activeProcessGroupsMutex);
-    pgs = activeProcessGroups;
+    for (auto& v : activeProcessGroups) {
+      pgs.push_back(v.second);
+    }
   }
   for (auto* pg : pgs) {
     if (pg->group && pg->group->cpuThread) {
@@ -3062,8 +3650,8 @@ struct FreeMemoryCallback : at::FreeMemoryCallback {
   virtual bool Execute() {
     std::unique_lock l(activeProcessGroupsMutex);
     std::unique_lock unmapLock(unmapMemoryMutex, std::try_to_lock);
-    for (auto* pg : activeProcessGroups) {
-      pg->freeMemory(unmapLock.owns_lock());
+    for (auto& v : activeProcessGroups) {
+      v.second->freeMemory(unmapLock.owns_lock());
     }
     return false;
   };
@@ -3075,7 +3663,7 @@ void registerFreeMemoryCallback() {
 
 ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
     : c10d::ProcessGroup(rank, size) {
-  impl = std::make_unique<ProcessGroupImpl>(store, rank, size);
+  impl = std::make_shared<ProcessGroupImpl>(store, rank, size);
 
   setBackend(torch::DeviceType::CPU, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
   setBackend(torch::DeviceType::CUDA, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
@@ -3490,8 +4078,15 @@ void ProcessGroup::shutdown() {
   impl->shutdown();
 }
 
+CustomOp ProcessGroup::compileOpFull(
+    const std::vector<int>& shape, torch::Dtype dtype,
+    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
+    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
+  return impl->compileOpFull(shape, dtype, inputs, outputs);
+}
+
 Future::Future() {}
-Future::~Future() {
+Future::~Future() noexcept(false) {
   if (impl) {
     wait();
   }
@@ -3499,6 +4094,9 @@ Future::~Future() {
 void Future::wait() {
   while (impl->done == 0) {
     futexWait(&impl->done, 0, std::chrono::seconds(1));
+  }
+  if (waitDoneCallback) {
+    std::move(waitDoneCallback)();
   }
   tensors.clear();
 }
