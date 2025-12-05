@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -30,7 +29,7 @@ struct Vector {
   Vector(const Vector& n) {
     *this = n;
   }
-  Vector(Vector&& n) {
+  Vector(Vector&& n) noexcept {
     *this = std::move(n);
   }
   Vector(size_t count) {
@@ -56,10 +55,10 @@ struct Vector {
     clear();
     reserve(n.size());
     size_t k = n.size();
-    if constexpr (std::is_trivially_constructible_v<T, T>) {
+    if constexpr (std::is_trivially_copyable_v<T>) {
       endptr += k;
       msize += k;
-      std::memcpy(beginptr, &n[0], sizeof(T) * k);
+      std::memcpy(beginptr, n.data(), sizeof(T) * k);
     } else {
       for (size_t i = 0; i != k; ++i) {
         new (endptr) T(n[i]);
@@ -69,7 +68,7 @@ struct Vector {
     }
     return *this;
   }
-  Vector& operator=(Vector&& n) {
+  Vector& operator=(Vector&& n) noexcept {
     std::swap(storagebegin, n.storagebegin);
     std::swap(storageend, n.storageend);
     std::swap(beginptr, n.beginptr);
@@ -215,13 +214,14 @@ struct Vector {
   bool empty() const {
     return msize == 0;
   }
-  size_t capacity() {
+  size_t capacity() const {
     return storageend - beginptr;
   }
   void reserveImpl(size_t n) {
     auto* lbegin = beginptr;
     auto* lend = endptr;
     auto* prevstorage = storagebegin;
+    size_t prevstoragesize = storageend - storagebegin;
     size_t msize = this->msize;
     T* newptr = Allocator().allocate(n);
     if (prevstorage) {
@@ -229,13 +229,24 @@ struct Vector {
         std::memcpy(newptr, lbegin, sizeof(T) * msize);
       } else {
         T* dst = newptr;
+        try {
+          for (T* i = lbegin; i != lend; ++i) {
+            new (dst) T(std::move(*i));
+            ++dst;
+          }
+        } catch (...) {
+          // Destroy elements we already moved to newptr
+          for (T* p = newptr; p != dst; ++p) {
+            p->~T();
+          }
+          Allocator().deallocate(newptr, n);
+          throw;
+        }
         for (T* i = lbegin; i != lend; ++i) {
-          new (dst) T(std::move(*i));
           i->~T();
-          ++dst;
         }
       }
-      Allocator().deallocate(prevstorage, storageend - prevstorage);
+      Allocator().deallocate(prevstorage, prevstoragesize);
     }
     storagebegin = newptr;
     storageend = newptr + n;
@@ -259,11 +270,10 @@ struct Vector {
   }
   template<typename... Args>
   void emplace_back(Args&&... args) {
-    if (endptr == storageend) {
+    if (endptr == storageend) [[unlikely]] {
       if (capacity() != size()) {
         __builtin_unreachable();
       }
-      [[unlikely]];
       expand();
     }
     new (endptr) T(std::forward<Args>(args)...);
@@ -308,47 +318,47 @@ struct Vector {
   }
   template<typename V>
   T* insert(T* at, V&& value) {
+    static_assert(std::is_default_constructible_v<T>);
     if (at == endptr) {
       push_back(std::forward<V>(value));
       return &back();
     }
-    if (endptr == storageend) {
+    if (endptr == storageend) [[unlikely]] {
       if (capacity() != size()) {
         __builtin_unreachable();
       }
-      [[unlikely]];
       size_t index = at - beginptr;
       expand();
       at = beginptr + index;
     }
     new (endptr) T();
-    move(at + 1, at, endptr);
-    *at = std::forward<V>(value);
     ++endptr;
     ++msize;
+    move(at + 1, at, endptr - 1);
+    *at = std::forward<V>(value);
     return at;
   }
   template<typename... Args>
   T* emplace(T* at, Args&&... args) {
+    static_assert(std::is_default_constructible_v<T>);
     if (at == endptr) {
       emplace_back(std::forward<Args>(args)...);
       return &back();
     }
-    if (endptr == storageend) {
+    if (endptr == storageend) [[unlikely]] {
       if (capacity() != size()) {
         __builtin_unreachable();
       }
-      [[unlikely]];
       size_t index = at - beginptr;
       expand();
       at = beginptr + index;
     }
     T tmp(std::forward<Args>(args)...);
     new (endptr) T();
-    move(at + 1, at, endptr);
-    *at = std::move(tmp);
     ++endptr;
     ++msize;
+    move(at + 1, at, endptr - 1);
+    *at = std::move(tmp);
     return at;
   }
 };

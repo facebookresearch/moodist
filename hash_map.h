@@ -137,7 +137,7 @@ public:
     }
     iterator operator++(int) noexcept {
       iterator r = *this;
-      ++r;
+      ++(*this);
       return r;
     }
     bool operator==(iterator n) const noexcept {
@@ -150,7 +150,7 @@ public:
 
   HashMap() = default;
   ~HashMap() {
-    if (!std::is_trivially_destructible_v<Key> || !std::is_trivially_destructible_v<Value>) {
+    if constexpr (!std::is_trivially_destructible_v<Key> || !std::is_trivially_destructible_v<Value>) {
       clear();
     }
     deallocate(primary, ksize);
@@ -298,19 +298,29 @@ public:
 
   template<typename KeyT, typename ValueT>
   iterator insert(KeyT&& key, ValueT&& value) {
-    return try_emplace(std::forward<Key>(key), std::forward<Value>(value)).first;
+    return try_emplace(std::forward<KeyT>(key), std::forward<ValueT>(value)).first;
   }
 
-  void rehash(size_t newBs) noexcept {
+  void rehash(size_t newBs) {
     if (newBs & (newBs - 1)) {
       printf("bucket count is not a multiple of 2!\n");
       std::abort();
     }
+
+    PrimaryItem* newPrimary = allocate<PrimaryItem>(newBs);
+    SecondaryItem* newSecondary;
+    try {
+      newSecondary = allocate<SecondaryItem>(newBs);
+    } catch (...) {
+      deallocate(newPrimary, newBs);
+      throw;
+    }
+
     PrimaryItem* oldPrimary = primary;
     SecondaryItem* oldSecondary = secondary;
 
-    primary = allocate<PrimaryItem>(newBs);
-    secondary = allocate<SecondaryItem>(newBs);
+    primary = newPrimary;
+    secondary = newSecondary;
 
     size_t bs = ksize;
 
@@ -326,25 +336,44 @@ public:
 
     if (oldPrimary) {
       PrimaryItem* pend = oldPrimary + bs;
-      for (auto* i = oldPrimary; i != pend; ++i) {
-        if (!isNone(i->size)) {
-          try_emplace(std::move(i->key), std::move(i->value));
-          i->key.~Key();
-          i->value.~Value();
-        }
-      }
       SecondaryItem* send = oldSecondary + bs;
-      for (auto* i = oldSecondary; i != send; ++i) {
-        if (!isNone(i->index)) {
-          try_emplace(std::move(i->key), std::move(i->value));
-          i->key.~Key();
-          i->value.~Value();
+      auto* pi = oldPrimary;
+      auto* si = oldSecondary;
+      try {
+        for (; pi != pend; ++pi) {
+          if (!isNone(pi->size)) {
+            try_emplace(std::move(pi->key), std::move(pi->value));
+            pi->key.~Key();
+            pi->value.~Value();
+          }
         }
+        for (; si != send; ++si) {
+          if (!isNone(si->index)) {
+            try_emplace(std::move(si->key), std::move(si->value));
+            si->key.~Key();
+            si->value.~Value();
+          }
+        }
+      } catch (...) {
+        for (; pi != pend; ++pi) {
+          if (!isNone(pi->size)) {
+            pi->key.~Key();
+            pi->value.~Value();
+          }
+        }
+        for (; si != send; ++si) {
+          if (!isNone(si->index)) {
+            si->key.~Key();
+            si->value.~Value();
+          }
+        }
+        deallocate(oldPrimary, bs);
+        deallocate(oldSecondary, bs);
+        throw;
       }
+      deallocate(oldPrimary, bs);
+      deallocate(oldSecondary, bs);
     }
-
-    deallocate(oldPrimary, bs);
-    deallocate(oldSecondary, bs);
   }
 
   template<typename KeyT>
