@@ -1885,6 +1885,14 @@ struct StoreImpl {
     return w;
   }
 
+  static std::string formatKeyList(const std::vector<std::string>& keys, size_t maxKeys = 5) {
+    if (keys.size() <= maxKeys) {
+      return fmt::to_string(fmt::join(keys, ", "));
+    }
+    std::vector<std::string_view> first(keys.begin(), keys.begin() + maxKeys);
+    return fmt::sprintf("%s, ... (%zu keys total)", fmt::to_string(fmt::join(first, ", ")), keys.size());
+  }
+
   void set(std::chrono::steady_clock::duration timeout, std::string_view key, const std::vector<uint8_t>& value) {
     auto w = doWaitOp(timeout, messageSet, key, value);
     auto error = w->wait();
@@ -1919,7 +1927,7 @@ struct StoreImpl {
       auto error = w->wait();
       if (error) {
         throw std::runtime_error(
-            fmt::sprintf("Moodist Store check(%s): %s", fmt::to_string(fmt::join(keys, ", ")), *error));
+            fmt::sprintf("Moodist Store check(%s): %s", formatKeyList(keys), *error));
       }
       r &= w->b;
     }
@@ -1936,7 +1944,7 @@ struct StoreImpl {
       auto error = w->wait();
       if (error) {
         throw std::runtime_error(
-            fmt::sprintf("Moodist Store wait(%s): %s", fmt::to_string(fmt::join(keys, ", ")), *error));
+            fmt::sprintf("Moodist Store wait(%s): %s", formatKeyList(keys), *error));
       }
     }
   }
