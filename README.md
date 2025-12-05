@@ -45,7 +45,12 @@ If it throws an error about building wheels and not finding CUDA static librarie
 
 ## Documentation
 
-Coming soon.
+API documentation is available in the [docs/](docs/) directory:
+- [`compile_op`](docs/api/compile_op.md) - Custom collective operation compiler
+- [`Queue`](docs/api/queue.md) - Distributed queue for inter-rank communication
+- [`TcpStore`](docs/api/tcp_store.md) - Distributed key-value store for coordination
+
+For more information, see the [API Documentation Index](docs/README.md).
 
 # License
 
