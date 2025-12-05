@@ -9,6 +9,7 @@
 #include "synchronization.h"
 
 #include <pybind11/gil.h>
+#include <netdb.h>
 #include <sys/socket.h>
 
 namespace moodist {
@@ -21,6 +22,9 @@ static constexpr uint64_t signatureMessage = 0x220a74d1a52672b8;
 static constexpr uint64_t signatureMessageAck = 0x220a74d1a52672b9;
 static constexpr uint64_t signatureKeepalive = 0x220a74d1a53772ba;
 static constexpr uint64_t signatureKeepaliveAck = 0x220a74d1a53772bb;
+static constexpr uint64_t signatureDiagnosticHello = 0x330b85e2b63783cc;
+static constexpr uint64_t signatureDiagnosticHelloAck = 0x330b85e2b63783cd;
+static constexpr uint64_t signatureDiagnosticInfo = 0x330b85e2b63783ce;
 
 static constexpr uint8_t messageDone = 0x3;
 static constexpr uint8_t messageSet = 0x4;
@@ -28,9 +32,38 @@ static constexpr uint8_t messageGet = 0x5;
 static constexpr uint8_t messageCheck = 0x6;
 static constexpr uint8_t messageWait = 0x7;
 static constexpr uint8_t messageExit = 0x8;
+static constexpr uint8_t messageDiagnosticSource = 0x9;
 
 namespace {
 TcpContext context;
+
+// Helper function to resolve an IP address string to sockaddr(s) synchronously
+Vector<Vector<char>> resolveAddressSync(std::string_view addrStr) {
+  Vector<Vector<char>> result;
+  auto [host, port] = decodeIpAddress(addrStr);
+
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_DGRAM;
+
+  std::string hostStr(host);
+  std::string portStr = std::to_string(port);
+
+  struct addrinfo* res = nullptr;
+  int err = getaddrinfo(hostStr.c_str(), portStr.c_str(), &hints, &res);
+  if (err == 0 && res) {
+    for (auto* p = res; p; p = p->ai_next) {
+      if (p->ai_family == AF_INET || p->ai_family == AF_INET6) {
+        Vector<char> addr;
+        addr.resize(p->ai_addrlen);
+        std::memcpy(addr.data(), p->ai_addr, p->ai_addrlen);
+        result.push_back(std::move(addr));
+      }
+    }
+    freeaddrinfo(res);
+  }
+  return result;
+}
 
 template<typename T>
 struct Indestructible {
@@ -116,6 +149,8 @@ struct StoreImpl {
     struct OutgoingMessage {
       uint32_t seq;
       SharedBufferHandle buffer;
+      std::chrono::steady_clock::time_point queueTime;
+      uint32_t diagnosticSource = -1;
     };
     Vector<OutgoingMessage> outgoingQueue;
 
@@ -127,10 +162,36 @@ struct StoreImpl {
     Vector<IncomingMessage> incomingQueue;
 
     bool destroyed = false;
+
+    // Tracks which diagnostic sources we've sent messageDiagnosticSource for to this edge
+    HashSet<uint32_t> sentDiagnosticSourceFor;
   };
   Vector<std::optional<PeerInfo>> peerInfos;
 
   HashMap<uint32_t, std::unique_ptr<PeerInfo>> edgePeers;
+
+  // Info about diagnostic sources (originators of requests) for sending diagnostics via UDP
+  struct DiagnosticSourceInfo {
+    Vector<std::string> addrStrings;  // original address strings
+    Vector<Vector<char>> resolvedAddrs;  // resolved sockaddrs
+    bool verified = false;  // have we received a hello ack?
+    Vector<char> verifiedAddr;  // the actual UDP address that worked (from recvFromAddr)
+    std::chrono::steady_clock::time_point lastAttempt;
+    int attemptCount = 0;
+  };
+  HashMap<uint32_t, DiagnosticSourceInfo> diagnosticSources;  // diagnosticSource rank -> info
+
+  // Our own UDP addresses for diagnostic purposes
+  Vector<std::string> myUdpAddresses;
+
+  // Received diagnostic info from intermediate ranks (for timeout error messages)
+  struct ReceivedDiagnostic {
+    uint32_t reportingRank;  // rank that sent the diagnostic
+    uint32_t stuckEdge;      // edge that the reporting rank is stuck on
+    std::string reason;
+    std::chrono::steady_clock::time_point receiveTime;
+  };
+  Vector<ReceivedDiagnostic> receivedDiagnostics;
 
   Vector<Vector<uint32_t>> edges;
   Vector<uint32_t> firsthop;
@@ -266,6 +327,57 @@ struct StoreImpl {
             peerInfos[sourceRank]->connected[edge] = true;
           }
         }
+      } else if (signature == signatureDiagnosticHello) {
+        // Another rank is trying to establish a diagnostic UDP path with us
+        std::string key;
+        uint32_t sourceRank;
+        deserializeBufferPart(view, key, sourceRank);
+        if (key == storekey && sourceRank < worldSize) {
+          // Send ack back
+          auto udpaddr = socket->recvFromAddr();
+          auto buf = serializeToBuffer(signatureDiagnosticHelloAck, key, rank);
+          ::sendto(
+              socket->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+              (sockaddr*)udpaddr.first, udpaddr.second);
+        }
+      } else if (signature == signatureDiagnosticHelloAck) {
+        // Our diagnostic hello was acknowledged - UDP path is verified
+        std::string key;
+        uint32_t sourceRank;
+        deserializeBufferPart(view, key, sourceRank);
+        if (key == storekey && sourceRank < worldSize) {
+          auto udpaddr = socket->recvFromAddr();
+          std::lock_guard l(mutex);
+          auto it = diagnosticSources.find(sourceRank);
+          if (it != diagnosticSources.end() && !it->second.verified) {
+            it->second.verified = true;
+            // Store the actual UDP address that worked
+            it->second.verifiedAddr.resize(udpaddr.second);
+            std::memcpy(it->second.verifiedAddr.data(), udpaddr.first, udpaddr.second);
+          }
+        }
+      } else if (signature == signatureDiagnosticInfo) {
+        // An intermediate rank is telling us about a problem it encountered
+        std::string key;
+        uint32_t reportingRank;
+        uint32_t stuckEdge;
+        std::string reason;
+        deserializeBufferPart(view, key, reportingRank, stuckEdge, reason);
+        if (key == storekey && reportingRank < worldSize) {
+          std::lock_guard l(mutex);
+          // Store the diagnostic info for later inclusion in timeout messages
+          receivedDiagnostics.push_back(ReceivedDiagnostic{
+              .reportingRank = reportingRank,
+              .stuckEdge = stuckEdge,
+              .reason = std::move(reason),
+              .receiveTime = std::chrono::steady_clock::now()
+          });
+          // Keep only recent diagnostics (last 60 seconds)
+          auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+          while (!receivedDiagnostics.empty() && receivedDiagnostics.front().receiveTime < cutoff) {
+            receivedDiagnostics.pop_front();
+          }
+        }
       }
 
     } catch (const SerializationError& e) {
@@ -353,6 +465,108 @@ struct StoreImpl {
     l.unlock();
 
     addCallback(std::chrono::steady_clock::now() + t, [this, sourceRank, edge] { sendAddresses(sourceRank, edge); });
+  }
+
+  // Try to establish a verified UDP connection to a diagnostic source
+  void tryDiagnosticHello(uint32_t diagnosticSource) {
+    std::unique_lock l(mutex);
+    auto it = diagnosticSources.find(diagnosticSource);
+    if (it == diagnosticSources.end() || it->second.verified || it->second.resolvedAddrs.empty()) {
+      return;
+    }
+
+    auto& info = it->second;
+    auto now = std::chrono::steady_clock::now();
+
+    // Don't retry too frequently
+    if (info.attemptCount > 0 && now - info.lastAttempt < std::chrono::milliseconds(500)) {
+      return;
+    }
+
+    info.lastAttempt = now;
+    info.attemptCount++;
+
+    // Try the next address in round-robin fashion
+    size_t addrIndex = (info.attemptCount - 1) % info.resolvedAddrs.size();
+    auto& addr = info.resolvedAddrs[addrIndex];
+
+    auto buf = serializeToBuffer(signatureDiagnosticHello, storekey, rank);
+    ::sendto(
+        udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+        (sockaddr*)addr.data(), addr.size());
+
+    // Schedule retry if not verified after some attempts
+    if (info.attemptCount < 10) {
+      l.unlock();
+      addCallback(now + std::chrono::milliseconds(500 * info.attemptCount), [this, diagnosticSource] {
+        tryDiagnosticHello(diagnosticSource);
+      });
+    }
+  }
+
+  // Send diagnostic info via UDP to a diagnostic source about a stuck edge
+  void sendDiagnosticInfo(uint32_t diagnosticSource, uint32_t stuckEdge, const std::string& reason) {
+    auto it = diagnosticSources.find(diagnosticSource);
+    if (it == diagnosticSources.end()) {
+      return;  // No info about this diagnostic source
+    }
+
+    auto& info = it->second;
+
+    // Prefer the verified address, but fall back to resolved addresses
+    const char* addr = nullptr;
+    size_t addrLen = 0;
+
+    if (!info.verifiedAddr.empty()) {
+      addr = info.verifiedAddr.data();
+      addrLen = info.verifiedAddr.size();
+    } else if (!info.resolvedAddrs.empty()) {
+      // Try the first resolved address
+      addr = info.resolvedAddrs[0].data();
+      addrLen = info.resolvedAddrs[0].size();
+    } else {
+      return;  // No addresses to try
+    }
+
+    auto buf = serializeToBuffer(signatureDiagnosticInfo, storekey, rank, stuckEdge, reason);
+    ::sendto(
+        udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+        (sockaddr*)addr, addrLen);
+  }
+
+  // Check for stuck messages and send diagnostic info
+  void checkStuckMessages() {
+    std::lock_guard l(mutex);
+    auto now = std::chrono::steady_clock::now();
+
+    for (auto& [edge, piPtr] : edgePeers) {
+      auto& pi = *piPtr;
+
+      for (auto& msg : pi.outgoingQueue) {
+        if (msg.diagnosticSource == (uint32_t)-1 || msg.diagnosticSource == rank) {
+          continue;  // Skip messages without diagnostic source or from ourselves
+        }
+
+        auto age = now - msg.queueTime;
+        if (age < std::chrono::seconds(5)) {
+          continue;  // Message hasn't been stuck long enough
+        }
+
+        // Determine the reason for being stuck
+        std::string reason;
+        if (pi.tcpconnections.empty()) {
+          if (pi.addresses.empty()) {
+            reason = fmt::sprintf("no TCP addresses for rank %d", edge);
+          } else {
+            reason = fmt::sprintf("no TCP connection to rank %d (addresses known)", edge);
+          }
+        } else {
+          reason = fmt::sprintf("message pending to rank %d for %.1fs (TCP connected)", edge, seconds(age));
+        }
+
+        sendDiagnosticInfo(msg.diagnosticSource, edge, reason);
+      }
+    }
   }
 
   bool listen(int port, bool ipv6) {
@@ -551,12 +765,13 @@ struct StoreImpl {
     uint32_t destinationRank;
     uint32_t id;
     uint32_t sourceRank;
+    uint32_t diagnosticSource;
     uint8_t t;
-    view = deserializeBufferPart(view, ttl, seq, destinationRank, id, sourceRank, t);
+    view = deserializeBufferPart(view, ttl, seq, destinationRank, id, sourceRank, diagnosticSource, t);
 
     // log.info(
-    //     "message ttl %d, seq %d, destination %d, id %#x, source %d, t %d\n", ttl, seq, destinationRank, id,
-    //     sourceRank, t);
+    //     "message ttl %d, seq %d, destination %d, id %#x, source %d, diagSrc %d, t %d\n", ttl, seq, destinationRank, id,
+    //     sourceRank, diagnosticSource, t);
 
     if (destinationRank != rank) {
       CHECK(ttl != 0);
@@ -571,7 +786,7 @@ struct StoreImpl {
 
       std::memcpy(&data->data()[12], &seq, sizeof(seq));
 
-      sendMessage(edge, seq, std::move(data), pi);
+      sendMessage(edge, seq, std::move(data), pi, diagnosticSource);
       return;
     }
 
@@ -586,7 +801,7 @@ struct StoreImpl {
       uint32_t seq = pi.outgoingSeq++;
 
       sendMessage(
-          edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone), pi);
+          edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, diagnosticSource, messageDone), pi, diagnosticSource);
     } else if (t == messageDone) {
       bool b = false;
       std::vector<uint8_t> value;
@@ -608,18 +823,18 @@ struct StoreImpl {
     } else if (t == messageGet || t == messageWait) {
       std::string key;
       deserializeBufferPart(view, key);
-      internalStoreGetValue(key, [this, edgeRank, seq, sourceRank, id, t, key](const std::vector<uint8_t>& data) {
+      internalStoreGetValue(key, [this, edgeRank, seq, sourceRank, diagnosticSource, id, t, key](const std::vector<uint8_t>& data) {
         CHECK(edgeRank != -1);
         auto& pi = getEdge(edgeRank);
         uint32_t seq = pi.outgoingSeq++;
         if (t == messageGet) {
           sendMessage(
               edgeRank, seq,
-              serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone, data), pi);
+              serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, diagnosticSource, messageDone, data), pi, diagnosticSource);
         } else {
           sendMessage(
-              edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone),
-              pi);
+              edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, diagnosticSource, messageDone),
+              pi, diagnosticSource);
         }
       });
     } else if (t == messageCheck) {
@@ -630,7 +845,7 @@ struct StoreImpl {
       auto& pi = getEdge(edgeRank);
       uint32_t seq = pi.outgoingSeq++;
       sendMessage(
-          edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, messageDone, r), pi);
+          edgeRank, seq, serializeToBuffer(signatureMessage, worldSize, seq, sourceRank, id, rank, diagnosticSource, messageDone, r), pi, diagnosticSource);
     } else if (t == messageExit) {
       CHECK(edgeRank != -1);
       auto& pi = getEdge(edgeRank);
@@ -639,6 +854,26 @@ struct StoreImpl {
         destroySourceRank = sourceRank;
       }
       addCallback(std::chrono::steady_clock::now(), [this] { destroy(); });
+    } else if (t == messageDiagnosticSource) {
+      // Receive diagnostic source UDP addresses from another rank
+      std::vector<std::string> addrs;
+      deserializeBufferPart(view, addrs);
+
+      auto& info = diagnosticSources[diagnosticSource];
+      info.addrStrings = Vector<std::string>(addrs.begin(), addrs.end());
+      // Resolve addresses synchronously
+      for (const auto& addrStr : addrs) {
+        auto resolved = resolveAddressSync(addrStr);
+        for (auto& addr : resolved) {
+          info.resolvedAddrs.push_back(std::move(addr));
+        }
+      }
+      // Shuffle to avoid bias (e.g., all IPv6 addresses first)
+      std::ranges::shuffle(info.resolvedAddrs, getRng());
+      // Start diagnostic hello handshake to verify UDP path
+      if (!info.resolvedAddrs.empty() && !info.verified) {
+        tryDiagnosticHello(diagnosticSource);
+      }
     }
   }
 
@@ -776,6 +1011,13 @@ struct StoreImpl {
       throw std::runtime_error("Moodist store failed to listen on any ports");
     }
 
+    // Collect our own UDP addresses for diagnostic purposes
+    for (auto& udp : udps) {
+      for (auto& addr : udp->localAddresses()) {
+        myUdpAddresses.push_back(addr);
+      }
+    }
+
     for (auto& addr : {"0.0.0.0:0", "[::]:0"}) {
 
       try {
@@ -890,11 +1132,12 @@ struct StoreImpl {
           if (!pi.tcpconnections.empty()) {
             uint32_t edgeRank = v.first;
             uint32_t seq = pi.outgoingSeq++;
+            // diagnosticSource = rank (not important for destroy, but needed for message format)
             sendMessage(
                 edgeRank, seq,
                 serializeToBuffer(
-                    signatureMessage, worldSize, seq, edgeRank, (uint32_t)0, *destroySourceRank, messageExit),
-                pi);
+                    signatureMessage, worldSize, seq, edgeRank, (uint32_t)0, *destroySourceRank, rank, messageExit),
+                pi, rank);
           }
         }
       });
@@ -975,6 +1218,9 @@ struct StoreImpl {
     for (uint32_t r : reconnect) {
       connectEdge(r);
     }
+
+    // Check for stuck messages and send diagnostics
+    checkStuckMessages();
 
     addCallback(std::chrono::steady_clock::now() + std::chrono::seconds(random(2, 8)), [this]() { keepalive(); });
   }
@@ -1102,6 +1348,11 @@ struct StoreImpl {
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
+    // Diagnostic info for timeout messages
+    StoreImpl* store = nullptr;
+    uint32_t targetRank = -1;
+    uint32_t firstHopEdge = -1;
+
     SpinMutex mutex;
 
     std::optional<std::string> wait() {
@@ -1116,7 +1367,11 @@ struct StoreImpl {
         if (now >= end) {
           std::lock_guard l(mutex);
           if (!error) {
-            return fmt::sprintf("timed out after %g seconds", seconds(end - start));
+            std::string msg = fmt::sprintf("timed out after %g seconds", seconds(end - start));
+            if (store) {
+              msg += store->getConnectionDiagnostics(targetRank, firstHopEdge);
+            }
+            return msg;
           }
           break;
         }
@@ -1134,19 +1389,143 @@ struct StoreImpl {
   HashMap<std::string, std::vector<uint8_t>> store;
   HashMap<std::string, Vector<Function<void(const std::vector<uint8_t>&)>>> storeWaiters;
 
-  void sendMessage(uint32_t edge, uint32_t seq, BufferHandle buffer, PeerInfo& pi) {
+  std::string getConnectionDiagnostics(uint32_t targetRank, uint32_t firstHopEdge) {
+    std::lock_guard l(mutex);
+    std::string result;
+
+    // Check if store was destroyed
+    if (destroyed) {
+      if (destroySourceRank) {
+        result += fmt::sprintf("\n  Store was destroyed by rank %d", *destroySourceRank);
+      } else {
+        result += "\n  Store was destroyed";
+      }
+      return result;
+    }
+
+    // Check if we've connected to rank 0 (for non-rank-0 processes)
+    if (rank != 0 && !connectAcked) {
+      result += "\n  Never received acknowledgment from rank 0 - rank 0 may not have started";
+    }
+
+    // On rank 0, report which ranks haven't connected via UDP
+    if (rank == 0) {
+      Vector<uint32_t> missingRanks;
+      for (uint32_t r = 0; r < worldSize; ++r) {
+        if (r != rank && !peerInfos[r].has_value()) {
+          missingRanks.push_back(r);
+        }
+      }
+      if (!missingRanks.empty()) {
+        result += fmt::sprintf("\n  Rank(s) never connected: %s", fmt::to_string(fmt::join(missingRanks, ", ")));
+        if (missingRanks.size() == worldSize - 1) {
+          result += " (no other ranks have connected - did they start?)";
+        }
+      }
+    }
+
+    // Check connection to first hop edge
+    if (firstHopEdge != (uint32_t)-1 && firstHopEdge != rank) {
+      auto edgeIt = edgePeers.find(firstHopEdge);
+      if (edgeIt != edgePeers.end()) {
+        auto& pi = *edgeIt->second;
+        if (pi.destroyed) {
+          result += fmt::sprintf("\n  Rank %d (first hop to target rank %d) has exited", firstHopEdge, targetRank);
+        } else if (pi.tcpconnections.empty()) {
+          result += fmt::sprintf("\n  No TCP connection to rank %d (first hop to target rank %d)", firstHopEdge, targetRank);
+          if (pi.addresses.empty()) {
+            result += " - no TCP addresses received";
+          }
+        } else {
+          // Connection exists but no response
+          result += fmt::sprintf("\n  TCP connected to rank %d but no response for target rank %d",
+                                 firstHopEdge, targetRank);
+          size_t pendingMsgs = pi.outgoingQueue.size();
+          if (pendingMsgs > 0) {
+            result += fmt::sprintf(" (%zu messages pending)", pendingMsgs);
+          }
+        }
+      } else {
+        result += fmt::sprintf("\n  No edge info for rank %d - address not received from rank 0", firstHopEdge);
+      }
+    }
+
+    // On rank 0, if target rank is different from first hop, check if we know about the target
+    if (rank == 0 && targetRank != firstHopEdge && targetRank != rank && targetRank != (uint32_t)-1) {
+      if (!peerInfos[targetRank].has_value()) {
+        result += fmt::sprintf("\n  Target rank %d never connected", targetRank);
+      } else if (peerInfos[targetRank]->destroyed) {
+        result += fmt::sprintf("\n  Target rank %d has exited", targetRank);
+      }
+    }
+
+    // Include any received diagnostics from intermediate ranks
+    if (!receivedDiagnostics.empty()) {
+      for (const auto& diag : receivedDiagnostics) {
+        result += fmt::sprintf("\n  Rank %d reports: %s", diag.reportingRank, diag.reason);
+      }
+    }
+
+    return result;
+  }
+
+  void sendMessage(uint32_t edge, uint32_t seq, BufferHandle buffer, PeerInfo& pi, uint32_t diagnosticSource) {
     if (edge == rank) {
       processMessage(std::move(buffer), edge);
       return;
     }
+
+    // Ensure diagnostic source info is sent before the actual message
+    ensureDiagnosticSourceSent(edge, diagnosticSource, pi);
+
     pi.outgoingQueue.emplace_back();
     auto& v = pi.outgoingQueue.back();
     v.seq = seq;
     v.buffer = SharedBufferHandle(buffer.release());
+    v.queueTime = std::chrono::steady_clock::now();
+    v.diagnosticSource = diagnosticSource;
 
     if (!pi.tcpconnections.empty()) {
       pi.tcpconnections.at(0)->connection->write(v.buffer, nullptr);
     }
+  }
+
+  // Send diagnostic source info to an edge if not already sent
+  // Must be called before sending a message with the given diagnosticSource to this edge
+  void ensureDiagnosticSourceSent(uint32_t edge, uint32_t diagnosticSource, PeerInfo& pi) {
+    if (edge == rank) {
+      return;  // No need to inform ourselves
+    }
+    if (pi.sentDiagnosticSourceFor.contains(diagnosticSource)) {
+      return;  // Already sent
+    }
+    pi.sentDiagnosticSourceFor.insert(diagnosticSource);
+
+    // Get the UDP addresses for this diagnostic source
+    std::vector<std::string> addrs;
+    if (diagnosticSource == rank) {
+      // We are the diagnostic source - use our own addresses
+      addrs = std::vector<std::string>(myUdpAddresses.begin(), myUdpAddresses.end());
+    } else {
+      // Forward the addresses we received
+      auto it = diagnosticSources.find(diagnosticSource);
+      if (it != diagnosticSources.end()) {
+        addrs = std::vector<std::string>(it->second.addrStrings.begin(), it->second.addrStrings.end());
+      }
+    }
+
+    if (addrs.empty()) {
+      return;  // No addresses to send
+    }
+
+    // Send messageDiagnosticSource
+    uint32_t seq = pi.outgoingSeq++;
+    // diagnosticSource field in the message indicates whose UDP addresses these are
+    // This will recurse into sendMessage, but sentDiagnosticSourceFor guard prevents infinite recursion
+    sendMessage(
+        edge, seq,
+        serializeToBuffer(signatureMessage, worldSize, seq, edge, 0, rank, diagnosticSource, messageDiagnosticSource, addrs),
+        pi, diagnosticSource);
   }
 
   void internalStoreSetValue(std::string key, std::vector<uint8_t> value) {
@@ -1198,14 +1577,19 @@ struct StoreImpl {
     uint32_t seq = pi.outgoingSeq++;
 
     auto w = std::make_shared<Wait>();
+    // Set diagnostic info for better timeout error messages
+    w->store = this;
+    w->targetRank = r;
+    w->firstHopEdge = edge;
 
     if (destroyed) {
       destroyWait(w);
     } else {
       waits[id] = w;
 
+      // diagnosticSource = rank (we are the originator)
       sendMessage(
-          edge, seq, serializeToBuffer(signatureMessage, worldSize, seq, r, id, rank, messageType, key, args...), pi);
+          edge, seq, serializeToBuffer(signatureMessage, worldSize, seq, r, id, rank, rank, messageType, key, args...), pi, rank);
     }
     l.unlock();
 
