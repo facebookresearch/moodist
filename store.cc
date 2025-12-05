@@ -33,6 +33,13 @@ static constexpr uint8_t messageWait = 0x7;
 static constexpr uint8_t messageExit = 0x8;
 static constexpr uint8_t messageDiagnosticSource = 0x9;
 
+// Diagnostic kind for filtering
+enum class DiagnosticKind : uint8_t {
+  Transient, // no addresses, no connection - filter if later success
+  Error,     // connection lost - always show
+  Success    // connected - supersedes Transient entries
+};
+
 struct MessageHeader {
   uint32_t ttl;
   uint32_t seq;
@@ -41,6 +48,91 @@ struct MessageHeader {
   uint32_t sourceRank;
   uint32_t diagnosticSource;
   uint8_t messageType;
+};
+
+struct DiagnosticInfoMessage {
+  std::string_view key;
+  uint32_t reportingRank;
+  uint32_t stuckEdge;
+  DiagnosticKind kind;
+  std::string_view reason;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, reportingRank, stuckEdge, kind, reason);
+  }
+};
+
+struct DiagnosticHelloMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank);
+  }
+};
+
+struct TcpConnectMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+  std::string_view sourceId;
+  uint32_t destinationRank;
+  std::string_view destinationId;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank, sourceId, destinationRank, destinationId);
+  }
+};
+
+struct UdpConnectMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+  std::string_view uid;
+  std::string_view networkKey;
+  Vector<std::pair<uint32_t, std::string>> addresses;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank, uid, networkKey, addresses);
+  }
+};
+
+struct UdpConnectAckMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+  std::string_view uid;
+  Vector<uint32_t> addresses;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank, uid, addresses);
+  }
+};
+
+struct AddressesMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+  std::string_view sourceId;
+  std::string_view networkKey;
+  Vector<std::pair<uint32_t, std::string>> addresses;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank, sourceId, networkKey, addresses);
+  }
+};
+
+struct AddressesAckMessage {
+  std::string_view key;
+  uint32_t sourceRank;
+  uint32_t edge;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(key, sourceRank, edge);
+  }
 };
 
 namespace {
@@ -147,6 +239,7 @@ struct StoreImpl {
     std::string networkKey;
     HashMap<uint32_t, std::string> addresses;
     Vector<char> udpaddr;
+    Socket* udpSocket = nullptr; // socket that successfully received from this peer
     HashMap<uint32_t, bool> connected;
 
     std::chrono::steady_clock::time_point lastConnectEdge;
@@ -186,6 +279,7 @@ struct StoreImpl {
     Vector<Vector<char>> resolvedAddrs; // resolved sockaddrs
     bool verified = false;              // have we received a hello ack?
     Vector<char> verifiedAddr;          // the actual UDP address that worked (from recvFromAddr)
+    Socket* verifiedSocket = nullptr;   // socket that successfully received from this source
     std::chrono::steady_clock::time_point lastAttempt;
     int attemptCount = 0;
   };
@@ -193,13 +287,6 @@ struct StoreImpl {
 
   // Our own UDP addresses for diagnostic purposes
   Vector<std::string> myUdpAddresses;
-
-  // Diagnostic kind for filtering
-  enum class DiagnosticKind : uint8_t {
-    Transient, // no addresses, no connection - filter if later success
-    Error,     // connection lost - always show
-    Success    // connected - supersedes Transient entries
-  };
 
   // Received diagnostic info from intermediate ranks (for timeout error messages)
   struct ReceivedDiagnostic {
@@ -216,6 +303,33 @@ struct StoreImpl {
 
   std::chrono::steady_clock::time_point prevConnectTime = {};
   std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+
+  // Add a diagnostic if it's not a duplicate of the most recent one for (reportingRank, stuckEdge).
+  // Returns true if added, false if duplicate.
+  // Precondition: mutex must be held
+  bool addDiagnosticIfNew(
+      Vector<ReceivedDiagnostic>& diagnostics, uint32_t reportingRank, uint32_t stuckEdge, DiagnosticKind kind,
+      std::string reason) {
+    auto reversed = diagnostics | std::views::reverse;
+    auto it = std::ranges::find_if(reversed, [&](const auto& d) {
+      return d.reportingRank == reportingRank && d.stuckEdge == stuckEdge;
+    });
+    if (it != reversed.end() && it->reason == reason) {
+      return false;
+    }
+    diagnostics.push_back(ReceivedDiagnostic{
+        .reportingRank = reportingRank,
+        .stuckEdge = stuckEdge,
+        .kind = kind,
+        .reason = std::move(reason),
+        .receiveTime = std::chrono::steady_clock::now()});
+    // Keep only recent diagnostics (last 60 seconds)
+    auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    while (!diagnostics.empty() && diagnostics.front().receiveTime < cutoff) {
+      diagnostics.pop_front();
+    }
+    return true;
+  }
 
   void onreadudp(Socket* socket, Error* e) {
     if (e) {
@@ -237,63 +351,62 @@ struct StoreImpl {
       std::memcpy(&signature, buf, 8);
       std::string_view view(&buf[8], &buf[n]);
       if (signature == signatureConnect) {
-        std::string key;
-        uint32_t sourceRank;
-        std::string uid;
-        std::string networkKey;
-        std::vector<std::pair<uint32_t, std::string>> addresses;
-        deserializeBufferPart(view, key, sourceRank, uid, networkKey, addresses);
-        if (key == storekey && sourceRank < worldSize && rank == 0) {
+        UdpConnectMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.sourceRank < worldSize && rank == 0) {
           auto udpaddr = socket->recvFromAddr();
 
           {
             std::lock_guard l(mutex);
-            auto& opt = peerInfos.at(sourceRank);
+            auto& opt = peerInfos.at(msg.sourceRank);
             if (opt) {
-              if (opt->uid != uid) {
+              if (opt->uid != msg.uid) {
                 log.error(
                     "Moodist store: two different processes connected, both claiming to be rank %d (uid %s vs %s)",
-                    sourceRank, opt->uid, uid);
+                    msg.sourceRank, std::string(opt->uid), std::string(msg.uid));
                 return;
               }
             } else {
               opt.emplace();
             }
             PeerInfo& pi = *opt;
-            pi.uid = uid;
-            pi.networkKey = networkKey;
-            for (auto& v : addresses) {
+            pi.uid = std::string(msg.uid);
+            pi.networkKey = std::string(msg.networkKey);
+            for (auto& v : msg.addresses) {
               pi.addresses.insert(v);
             }
             pi.udpaddr.resize(udpaddr.second);
             std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
+            pi.udpSocket = socket;
           }
 
-          std::vector<uint32_t> ra;
-          for (auto& v : addresses) {
+          Vector<uint32_t> ra;
+          for (auto& v : msg.addresses) {
             ra.push_back(v.first);
           }
 
-          auto buf = serializeToBuffer(signatureConnectAck, key, sourceRank, uid, ra);
+          auto buf = serializeToBuffer(signatureConnectAck, UdpConnectAckMessage{
+              .key = msg.key,
+              .sourceRank = msg.sourceRank,
+              .uid = msg.uid,
+              .addresses = std::move(ra),
+          });
 
           ::sendto(
               socket->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)udpaddr.first, udpaddr.second);
 
-          for (uint32_t e : edges[sourceRank]) {
-            sendAddresses(sourceRank, e);
+          for (uint32_t e : edges[msg.sourceRank]) {
+            sendAddresses(msg.sourceRank, e);
           }
         }
       } else if (signature == signatureConnectAck) {
-        std::string key;
-        uint32_t sourceRank;
-        std::string uid;
-        std::vector<uint32_t> addresses;
-        deserializeBufferPart(view, key, sourceRank, uid, addresses);
-        if (key == storekey && sourceRank == rank && uid == myId) {
+        UdpConnectAckMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.sourceRank == rank && msg.uid == myId) {
           // log.info("Moodist store connected\n");
           std::lock_guard l(mutex);
           size_t n = 0;
-          for (uint32_t i : addresses) {
+          for (uint32_t i : msg.addresses) {
             auto it = unackedAddresses.find(i);
             if (it != unackedAddresses.end()) {
               unackedAddresses.erase(it);
@@ -306,99 +419,81 @@ struct StoreImpl {
           }
         }
       } else if (signature == signatureAddresses) {
-        std::string key;
-        uint32_t sourceRank;
-        std::string sourceId;
-        std::string networkKey;
-        std::vector<std::pair<uint32_t, std::string>> addresses;
-        deserializeBufferPart(view, key, sourceRank, sourceId, networkKey, addresses);
-        if (key == storekey && sourceRank < worldSize) {
+        AddressesMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.sourceRank < worldSize) {
           {
             std::lock_guard l(mutex);
-            CHECK(sourceRank != -1);
-            PeerInfo& pi = getEdge(sourceRank);
-            pi.uid = sourceId;
-            pi.networkKey = networkKey;
-            for (auto& v : addresses) {
+            CHECK(msg.sourceRank != -1);
+            PeerInfo& pi = getEdge(msg.sourceRank);
+            pi.uid = msg.sourceId;
+            pi.networkKey = msg.networkKey;
+            for (auto& v : msg.addresses) {
               pi.addresses.insert(v);
             }
             auto udpaddr = socket->recvFromAddr();
             pi.udpaddr.resize(udpaddr.second);
             std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
+            pi.udpSocket = socket;
 
             if (!pi.tcpconnections.empty()) {
-              auto buf = serializeToBuffer(signatureAddressesAck, key, rank, sourceRank);
+              auto buf = serializeToBuffer(signatureAddressesAck, AddressesAckMessage{
+                  .key = storekey,
+                  .sourceRank = rank,
+                  .edge = msg.sourceRank,
+              });
               ::sendto(
                   socket->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)udpaddr.first, udpaddr.second);
             }
           }
-          connectEdge(sourceRank);
+          connectEdge(msg.sourceRank);
         }
       } else if (signature == signatureAddressesAck) {
-        std::string key;
-        uint32_t sourceRank;
-        uint32_t edge;
-        deserializeBufferPart(view, key, sourceRank, edge);
-        if (key == storekey && sourceRank < worldSize) {
+        AddressesAckMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.sourceRank < worldSize) {
           std::lock_guard l(mutex);
-          auto& pi = peerInfos[sourceRank];
+          auto& pi = peerInfos[msg.sourceRank];
           if (pi) {
-            peerInfos[sourceRank]->connected[edge] = true;
+            peerInfos[msg.sourceRank]->connected[msg.edge] = true;
           }
         }
       } else if (signature == signatureDiagnosticHello || signature == signatureDiagnosticHelloAck) {
-        std::string key;
-        uint32_t sourceRank;
-        deserializeBufferPart(view, key, sourceRank);
-        if (key == storekey && sourceRank < worldSize) {
+        DiagnosticHelloMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.sourceRank < worldSize) {
           auto udpaddr = socket->recvFromAddr();
 
           // Store the verified address
           {
             std::lock_guard l(mutex);
-            auto& info = diagnosticSources[sourceRank];
+            auto& info = diagnosticSources[msg.sourceRank];
             if (!info.verified) {
               info.verified = true;
               info.verifiedAddr.resize(udpaddr.second);
               std::memcpy(info.verifiedAddr.data(), udpaddr.first, udpaddr.second);
+              info.verifiedSocket = socket;
             }
           }
 
           // Send ack back for hello (not for ack)
           if (signature == signatureDiagnosticHello) {
-            auto buf = serializeToBuffer(signatureDiagnosticHelloAck, key, rank);
+            auto buf = serializeToBuffer(signatureDiagnosticHelloAck, DiagnosticHelloMessage{
+                .key = msg.key,
+                .sourceRank = rank,
+            });
             ::sendto(
                 socket->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)udpaddr.first, udpaddr.second);
           }
         }
       } else if (signature == signatureDiagnosticInfo) {
         // An intermediate rank is telling us about a problem it encountered
-        std::string key;
-        uint32_t reportingRank;
-        uint32_t stuckEdge;
-        uint8_t kindVal;
-        std::string reason;
-        deserializeBufferPart(view, key, reportingRank, stuckEdge, kindVal, reason);
-        if (key == storekey && reportingRank < worldSize) {
+        DiagnosticInfoMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.reportingRank < worldSize) {
           std::lock_guard l(mutex);
-          // Check for duplicate before adding
-          bool isDuplicate = std::ranges::any_of(receivedDiagnostics, [&](const auto& d) {
-            return d.reportingRank == reportingRank && d.stuckEdge == stuckEdge && d.reason == reason;
-          });
-          if (!isDuplicate) {
-            // Store the diagnostic info for later inclusion in timeout messages
-            receivedDiagnostics.push_back(ReceivedDiagnostic{
-                .reportingRank = reportingRank,
-                .stuckEdge = stuckEdge,
-                .kind = (DiagnosticKind)kindVal,
-                .reason = std::move(reason),
-                .receiveTime = std::chrono::steady_clock::now()});
-            // Keep only recent diagnostics (last 60 seconds)
-            auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-            while (!receivedDiagnostics.empty() && receivedDiagnostics.front().receiveTime < cutoff) {
-              receivedDiagnostics.pop_front();
-            }
-          }
+          addDiagnosticIfNew(
+              receivedDiagnostics, msg.reportingRank, msg.stuckEdge, msg.kind, std::string(msg.reason));
         }
       }
 
@@ -451,7 +546,13 @@ struct StoreImpl {
             }
             // log.info("connecting to edge %d at %s\n", edge, a);
             auto connection = context.connect(a);
-            auto buffer = serializeToBuffer(signatureConnect, storekey, rank, myId, edge, uid);
+            auto buffer = serializeToBuffer(signatureConnect, TcpConnectMessage{
+                .key = storekey,
+                .sourceRank = rank,
+                .sourceId = myId,
+                .destinationRank = edge,
+                .destinationId = uid,
+            });
             connection->write(std::move(buffer), nullptr);
 
             addConnection(std::move(connection));
@@ -476,12 +577,16 @@ struct StoreImpl {
       std::ranges::shuffle(addresses, getRng());
       addresses.resize(8);
     }
-    auto buf = serializeToBuffer(signatureAddresses, storekey, sourceRank, pi->uid, pi->networkKey, addresses);
-    // should we use a known-to-work udp here?
-    // same for any other uses of udps
-    // we already have a known-to-work udpaddr, so which socket did we receive that on?
+    auto buf = serializeToBuffer(signatureAddresses, AddressesMessage{
+        .key = storekey,
+        .sourceRank = sourceRank,
+        .sourceId = pi->uid,
+        .networkKey = pi->networkKey,
+        .addresses = std::move(addresses),
+    });
+    auto* sock = pi2->udpSocket ? pi2->udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
     int r = ::sendto(
-        udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+        sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
         (sockaddr*)pi2->udpaddr.data(), pi2->udpaddr.size());
     auto t = std::chrono::milliseconds(2000);
     if (r < 0) {
@@ -515,7 +620,10 @@ struct StoreImpl {
     size_t addrIndex = (info.attemptCount - 1) % info.resolvedAddrs.size();
     auto& addr = info.resolvedAddrs[addrIndex];
 
-    auto buf = serializeToBuffer(signatureDiagnosticHello, storekey, rank);
+    auto buf = serializeToBuffer(signatureDiagnosticHello, DiagnosticHelloMessage{
+        .key = storekey,
+        .sourceRank = rank,
+    });
     ::sendto(
         udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
         (sockaddr*)addr.data(), addr.size());
@@ -535,28 +643,9 @@ struct StoreImpl {
   // Precondition: mutex must be held
   void
   sendDiagnosticInfo(uint32_t diagnosticSource, uint32_t stuckEdge, DiagnosticKind kind, const std::string& reason) {
-    // Check for duplicate before adding
-    auto isDuplicate = [&](const Vector<ReceivedDiagnostic>& diagnostics) {
-      return std::ranges::any_of(diagnostics, [&](const auto& d) {
-        return d.reportingRank == rank && d.stuckEdge == stuckEdge && d.reason == reason;
-      });
-    };
-
     // If we are the diagnostic source, add directly to our own receivedDiagnostics
     if (diagnosticSource == rank) {
-      if (!isDuplicate(receivedDiagnostics)) {
-        receivedDiagnostics.push_back(ReceivedDiagnostic{
-            .reportingRank = rank,
-            .stuckEdge = stuckEdge,
-            .kind = kind,
-            .reason = reason,
-            .receiveTime = std::chrono::steady_clock::now()});
-        // Keep only recent diagnostics (last 60 seconds)
-        auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-        while (!receivedDiagnostics.empty() && receivedDiagnostics.front().receiveTime < cutoff) {
-          receivedDiagnostics.pop_front();
-        }
-      }
+      addDiagnosticIfNew(receivedDiagnostics, rank, stuckEdge, kind, reason);
       return;
     }
 
@@ -570,10 +659,12 @@ struct StoreImpl {
     // Prefer the verified address, but fall back to resolved addresses
     const char* addr = nullptr;
     size_t addrLen = 0;
+    Socket* sock = nullptr;
 
     if (!info.verifiedAddr.empty()) {
       addr = info.verifiedAddr.data();
       addrLen = info.verifiedAddr.size();
+      sock = info.verifiedSocket;
     } else if (!info.resolvedAddrs.empty()) {
       // Try the first resolved address
       addr = info.resolvedAddrs[0].data();
@@ -582,10 +673,18 @@ struct StoreImpl {
       return; // No addresses to try
     }
 
-    auto buf = serializeToBuffer(signatureDiagnosticInfo, storekey, rank, stuckEdge, (uint8_t)kind, reason);
-    ::sendto(
-        udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
-        (sockaddr*)addr, addrLen);
+    if (!sock) {
+      sock = udps.at(random<size_t>(0, udps.size() - 1)).get();
+    }
+
+    auto buf = serializeToBuffer(signatureDiagnosticInfo, DiagnosticInfoMessage{
+        .key = storekey,
+        .reportingRank = rank,
+        .stuckEdge = stuckEdge,
+        .kind = kind,
+        .reason = reason,
+    });
+    ::sendto(sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)addr, addrLen);
   }
 
   // Check for stuck messages and send diagnostic info
@@ -692,38 +791,45 @@ struct StoreImpl {
       std::memcpy(&signature, buf, 8);
       std::string_view view(&buf[8], &buf[n]);
       if (signature == signatureConnect || signature == signatureConnectAck) {
-        std::string key;
-        uint32_t sourceRank;
-        std::string sourceId;
-        uint32_t destinationRank;
-        std::string destinationId;
-        deserializeBufferPart(view, key, sourceRank, sourceId, destinationRank, destinationId);
-        if (key == storekey && destinationRank == rank && destinationId == myId) {
-          if (std::ranges::find(edges[rank], sourceRank) != edges[rank].end()) {
+        TcpConnectMessage msg;
+        deserializeBufferPart(view, msg);
+        if (msg.key == storekey && msg.destinationRank == rank && msg.destinationId == myId) {
+          if (std::ranges::find(edges[rank], msg.sourceRank) != edges[rank].end()) {
 
             auto now = std::chrono::steady_clock::now();
 
             {
               std::lock_guard l(mutex);
-              CHECK(sourceRank != -1);
-              auto& pi = getEdge(sourceRank);
+              CHECK(msg.sourceRank != -1);
+              auto& pi = getEdge(msg.sourceRank);
               if (dead || !pi.tcpconnections.empty()) {
                 ci->connection->close();
               } else {
-                ci->sourceRank = sourceRank;
+                ci->sourceRank = msg.sourceRank;
                 ci->lastReceive = std::chrono::steady_clock::now();
                 pi.tcpconnections.push_back(ci);
                 pi.everConnected = true;
 
-                // log.info("connected to rank %d\n", sourceRank);
+                // log.info("connected to rank %d\n", msg.sourceRank);
 
-                auto buf = serializeToBuffer(signatureAddressesAck, key, rank, sourceRank);
+                auto buf = serializeToBuffer(signatureAddressesAck, AddressesAckMessage{
+                    .key = msg.key,
+                    .sourceRank = rank,
+                    .edge = msg.sourceRank,
+                });
+                auto* sock = pi.udpSocket ? pi.udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
                 ::sendto(
-                    udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+                    sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
                     (sockaddr*)pi.udpaddr.data(), pi.udpaddr.size());
 
                 if (signature == signatureConnect) {
-                  auto buffer = serializeToBuffer(signatureConnectAck, key, rank, myId, sourceRank, sourceId);
+                  auto buffer = serializeToBuffer(signatureConnectAck, TcpConnectMessage{
+                      .key = msg.key,
+                      .sourceRank = rank,
+                      .sourceId = myId,
+                      .destinationRank = msg.sourceRank,
+                      .destinationId = msg.sourceId,
+                  });
                   ci->connection->write(std::move(buffer), nullptr);
                 }
 
@@ -731,8 +837,8 @@ struct StoreImpl {
                 for (auto& v : pi.outgoingQueue) {
                   if (v.diagnosticSource != (uint32_t)-1) {
                     sendDiagnosticInfo(
-                        v.diagnosticSource, sourceRank, DiagnosticKind::Success,
-                        fmt::sprintf("TCP connection to rank %d established", sourceRank));
+                        v.diagnosticSource, msg.sourceRank, DiagnosticKind::Success,
+                        fmt::sprintf("TCP connection to rank %d established", msg.sourceRank));
                   }
                 }
 
@@ -1413,7 +1519,13 @@ struct StoreImpl {
               }
 
               auto buf =
-                  serializeToBuffer(signatureConnect, storekey, rank, myId, context.getNetworkKey(), tcpaddresses);
+                  serializeToBuffer(signatureConnect, UdpConnectMessage{
+                      .key = storekey,
+                      .sourceRank = rank,
+                      .uid = myId,
+                      .networkKey = context.getNetworkKey(),
+                      .addresses = tcpaddresses,
+                  });
 
               // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
 
