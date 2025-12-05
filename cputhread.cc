@@ -172,10 +172,10 @@ struct TemporaryBufferHandle {
   MemoryRegistration* mr = nullptr;
   TemporaryBufferHandle() = default;
   TemporaryBufferHandle(AllocatedCpuBuffer buffer, MemoryRegistration* mr) : buffer(std::move(buffer)), mr(mr) {}
-  TemporaryBufferHandle(TemporaryBufferHandle&& n) {
+  TemporaryBufferHandle(TemporaryBufferHandle&& n) noexcept {
     *this = std::move(n);
   }
-  TemporaryBufferHandle& operator=(TemporaryBufferHandle&& n) {
+  TemporaryBufferHandle& operator=(TemporaryBufferHandle&& n) noexcept {
     std::swap(buffer, n.buffer);
     std::swap(mr, n.mr);
     return *this;

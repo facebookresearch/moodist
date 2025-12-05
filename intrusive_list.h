@@ -82,11 +82,11 @@ public:
     next(&head) = &head;
   }
   IntrusiveList(const IntrusiveList&) = delete;
-  IntrusiveList(IntrusiveList&& n) {
+  IntrusiveList(IntrusiveList&& n) noexcept {
     *this = std::move(n);
   }
   IntrusiveList& operator=(const IntrusiveList&) = delete;
-  IntrusiveList& operator=(IntrusiveList&& n) {
+  IntrusiveList& operator=(IntrusiveList&& n) noexcept {
     if (n.empty()) {
       clear();
     } else {

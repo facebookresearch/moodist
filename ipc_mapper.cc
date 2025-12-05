@@ -30,13 +30,13 @@ struct Memfd {
     }
   }
   Memfd(const Memfd&) = delete;
-  Memfd(Memfd&& n) {
+  Memfd(Memfd&& n) noexcept {
     std::swap(fd, n.fd);
     std::swap(base, n.base);
     std::swap(size, n.size);
   }
   Memfd& operator=(const Memfd&) = delete;
-  Memfd& operator=(Memfd&& n) {
+  Memfd& operator=(Memfd&& n) noexcept {
     std::swap(fd, n.fd);
     std::swap(base, n.base);
     std::swap(size, n.size);

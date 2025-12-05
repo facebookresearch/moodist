@@ -19,7 +19,7 @@ struct FreeCallbackHandle {
   uintptr_t baseAddress = 0;
   void* handle = nullptr;
   FreeCallbackHandle() = default;
-  FreeCallbackHandle(FreeCallbackHandle&& n) {
+  FreeCallbackHandle(FreeCallbackHandle&& n) noexcept {
     *this = std::move(n);
   }
   ~FreeCallbackHandle() {
@@ -27,7 +27,7 @@ struct FreeCallbackHandle {
       removeFreeCallback(baseAddress, handle);
     }
   }
-  FreeCallbackHandle& operator=(FreeCallbackHandle&& n) {
+  FreeCallbackHandle& operator=(FreeCallbackHandle&& n) noexcept {
     std::swap(baseAddress, n.baseAddress);
     std::swap(handle, n.handle);
     return *this;

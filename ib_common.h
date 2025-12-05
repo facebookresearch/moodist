@@ -34,10 +34,10 @@ struct IbvPtr {
   IbvPtr& operator=(const IbvPtr&) = delete;
   IbvPtr(std::nullptr_t) {}
   IbvPtr(T* value) : value(value) {}
-  IbvPtr(IbvPtr&& n) {
+  IbvPtr(IbvPtr&& n) noexcept {
     std::swap(value, n.value);
   }
-  IbvPtr& operator=(IbvPtr&& n) {
+  IbvPtr& operator=(IbvPtr&& n) noexcept {
     std::swap(value, n.value);
     return *this;
   }

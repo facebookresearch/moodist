@@ -39,10 +39,10 @@ struct Socket {
   std::shared_ptr<SocketImpl> impl;
   Socket();
   Socket(const Socket&) = delete;
-  Socket(Socket&& n);
+  Socket(Socket&& n) noexcept;
   ~Socket();
   Socket& operator=(const Socket&) = delete;
-  Socket& operator=(Socket&& n);
+  Socket& operator=(Socket&& n) noexcept;
   static Socket Unix();
   static Socket Tcp();
   static Socket Udp(bool ipv6);

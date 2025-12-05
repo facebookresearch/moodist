@@ -71,10 +71,10 @@ struct MrHandle {
   MrHandle(uint32_t key) : key(key) {
     ++mrManager.mrs[key].refcount;
   }
-  MrHandle(MrHandle&& n) {
+  MrHandle(MrHandle&& n) noexcept {
     key = std::exchange(n.key, 0);
   }
-  MrHandle& operator=(MrHandle&& n) {
+  MrHandle& operator=(MrHandle&& n) noexcept {
     std::swap(key, n.key);
     return *this;
   }

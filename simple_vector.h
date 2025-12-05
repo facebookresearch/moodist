@@ -28,7 +28,7 @@ struct SimpleVector {
   SimpleVector(const SimpleVector& n) {
     *this = n;
   }
-  SimpleVector(SimpleVector&& n) {
+  SimpleVector(SimpleVector&& n) noexcept {
     *this = std::move(n);
   }
   ~SimpleVector() {

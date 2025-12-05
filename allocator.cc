@@ -326,11 +326,11 @@ struct FreeList {
         owner->list.push_back(ptr);
       }
     }
-    Handle(Handle&& n) {
+    Handle(Handle&& n) noexcept {
       std::swap(owner, n.owner);
       std::swap(ptr, n.ptr);
     }
-    Handle& operator=(Handle&& n) {
+    Handle& operator=(Handle&& n) noexcept {
       std::swap(owner, n.owner);
       std::swap(ptr, n.ptr);
       return *this;

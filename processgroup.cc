@@ -78,10 +78,10 @@ struct WorkStream {
   WorkStream() = default;
   WorkStream(const WorkStream&) = delete;
   WorkStream& operator=(const WorkStream&) = delete;
-  WorkStream(WorkStream&& n) {
+  WorkStream(WorkStream&& n) noexcept {
     *this = std::move(n);
   }
-  WorkStream& operator=(WorkStream&& n) {
+  WorkStream& operator=(WorkStream&& n) noexcept {
     std::swap(stream, n.stream);
     std::swap(event, n.event);
     return *this;
@@ -160,11 +160,11 @@ struct ReusableHandle {
     }
   }
   ReusableHandle(ReusableHandle&) = delete;
-  ReusableHandle(ReusableHandle&& n) {
+  ReusableHandle(ReusableHandle&& n) noexcept {
     *this = std::move(n);
   }
   ReusableHandle& operator=(ReusableHandle& n) = delete;
-  ReusableHandle& operator=(ReusableHandle&& n) {
+  ReusableHandle& operator=(ReusableHandle&& n) noexcept {
     std::swap(container, n.container);
     std::swap(value, n.value);
     return *this;

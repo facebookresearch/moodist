@@ -264,7 +264,7 @@ struct Event {
   bool owning = false;
   Event() = default;
   Event(const Event&) = delete;
-  Event(Event&& n) {
+  Event(Event&& n) noexcept {
     *this = std::move(n);
   }
   ~Event() {
@@ -303,7 +303,7 @@ struct Event {
   }
 
   Event& operator=(const Event&) = delete;
-  Event& operator=(Event&& n) {
+  Event& operator=(Event&& n) noexcept {
     std::swap(event, n.event);
     std::swap(owning, n.owning);
     return *this;
@@ -330,7 +330,7 @@ struct Stream {
   bool owning = false;
   Stream() = default;
   Stream(const Stream&) = delete;
-  Stream(Stream&& n) {
+  Stream(Stream&& n) noexcept {
     *this = std::move(n);
   }
   ~Stream() {
@@ -339,7 +339,7 @@ struct Stream {
     }
   }
   Stream& operator=(const Stream&) = delete;
-  Stream& operator=(Stream&& n) {
+  Stream& operator=(Stream&& n) noexcept {
     std::swap(stream, n.stream);
     std::swap(owning, n.owning);
     return *this;
@@ -389,7 +389,7 @@ struct FLPtr {
   }
   FLPtr(const FLPtr&) = delete;
   FLPtr& operator=(const FLPtr&) = delete;
-  FLPtr(FLPtr&& n) {
+  FLPtr(FLPtr&& n) noexcept {
     ptr = std::exchange(n.ptr, nullptr);
   }
   static FLPtr make() {
@@ -405,7 +405,7 @@ struct FLPtr {
   void* release() {
     return std::exchange(ptr, nullptr);
   }
-  FLPtr& operator=(FLPtr&& n) {
+  FLPtr& operator=(FLPtr&& n) noexcept {
     std::swap(ptr, n.ptr);
     return *this;
   }
@@ -468,7 +468,7 @@ struct FLSharedPtr {
     }
     return *this;
   }
-  FLSharedPtr(FLSharedPtr&& n) {
+  FLSharedPtr(FLSharedPtr&& n) noexcept {
     ptr = std::exchange(n.ptr, nullptr);
   }
   static FLSharedPtr make() {
@@ -483,7 +483,7 @@ struct FLSharedPtr {
     r.ptr = ptr;
     return r;
   }
-  FLSharedPtr& operator=(FLSharedPtr&& n) {
+  FLSharedPtr& operator=(FLSharedPtr&& n) noexcept {
     std::swap(ptr, n.ptr);
     return *this;
   }
@@ -654,11 +654,11 @@ struct UniqueImpl {
     }
   }
   UniqueImpl(std::nullptr_t) {}
-  UniqueImpl(UniqueImpl&& n) {
+  UniqueImpl(UniqueImpl&& n) noexcept {
     u.impl = std::exchange(n.u.impl, nullptr);
   }
   UniqueImpl(const UniqueImpl&) = delete;
-  UniqueImpl& operator=(UniqueImpl&& n) {
+  UniqueImpl& operator=(UniqueImpl&& n) noexcept {
     std::swap(u.impl, n.u.impl);
     return *this;
   }

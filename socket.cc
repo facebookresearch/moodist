@@ -1074,10 +1074,10 @@ Socket Socket::Udp(bool ipv6) {
 }
 
 Socket::Socket() {}
-Socket::Socket(Socket&& n) {
+Socket::Socket(Socket&& n) noexcept {
   std::swap(impl, n.impl);
 }
-Socket& Socket::operator=(Socket&& n) {
+Socket& Socket::operator=(Socket&& n) noexcept {
   std::swap(impl, n.impl);
   return *this;
 }
