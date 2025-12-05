@@ -256,6 +256,52 @@ print(f"Rank {rank}: All ranks ready!")
 
 - **Not all methods implemented**: `add()`, `deleteKey()`, and `getNumKeys()` are not available.
 
+## Timeout Diagnostics
+
+When a `get()` or `wait()` operation times out, TcpStore provides detailed diagnostic information to help identify the cause. This is especially useful in large distributed systems where connectivity issues may be complex.
+
+### Example Error Message
+
+```
+RuntimeError: Moodist Store get(my_key): timed out after 30 seconds
+  No TCP connection to rank 5 (first hop to target rank 12)
+  [T+0.0s, 30.1s ago] Rank 3: TCP connection to rank 0 established
+  [T+0.1s, 30.0s ago] Rank 3: TCP connection to rank 4 established
+  [T+2.5s, 27.6s ago] Rank 3: TCP connection to rank 5 lost: Connection reset by peer
+  [T+15.0s, 15.1s ago] Rank 3: no TCP connection to rank 5 (addresses known)
+```
+
+### Understanding the Diagnostics
+
+The error message includes:
+
+1. **Local connection status**: The first line after the timeout message describes the local rank's connection state to the relevant peer (typically the first hop toward the target rank).
+
+2. **Diagnostic reports from other ranks**: Subsequent lines show connection events reported by intermediate ranks in the mesh topology. Each line includes:
+   - `[T+X.Xs, Y.Ys ago]`: Two timestamps - time since the store was created, and time before the timeout
+   - `Rank N`: The rank reporting the diagnostic
+   - The event description (connection established, lost, waiting, etc.)
+
+### Diagnostic Event Types
+
+- **TCP connection to rank N established**: A connection to another rank was successfully made
+- **TCP connection to rank N lost: \<error\>**: A previously working connection failed, with the error reason
+- **no TCP connection to rank N (addresses known)**: Cannot connect but have the peer's addresses
+- **waiting for rank N to reconnect**: Had a connection before, waiting for it to recover
+- **waiting for rank N to connect**: Never had a connection to this rank yet
+- **message pending to rank N for Xs (TCP connected)**: Connected but message not being processed
+
+### How Diagnostics Work
+
+The diagnostic system uses UDP to exchange connection state information between ranks:
+
+1. When a request is made, the originating rank becomes the "diagnostic source"
+2. Intermediate ranks that encounter connection issues report back to the diagnostic source via UDP
+3. These reports are collected and included in the timeout error message
+4. Reports are deduplicated and filtered to show the most relevant information
+
+This distributed diagnostic approach means you can identify connection problems anywhere in the mesh topology, not just on the local rank.
+
 ## See Also
 
 - [`moodist.MoodistProcessGroup`](process_group.md) - Process group management
