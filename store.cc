@@ -1935,7 +1935,7 @@ struct StoreImpl {
     auto w = doWaitOp(timeout, messageCheck, key);
     auto error = w->wait();
     if (error) {
-      throw std::runtime_error(fmt::sprintf("Moodist Store get(%s): %s", key, *error));
+      throw std::runtime_error(fmt::sprintf("Moodist Store check(%s): %s", key, *error));
     }
     return w->b;
   }
@@ -1960,7 +1960,6 @@ struct StoreImpl {
     for (auto& k : keys) {
       v.push_back(doWaitOp(timeout, messageWait, k));
     }
-    bool r = true;
     for (auto& w : v) {
       auto error = w->wait();
       if (error) {

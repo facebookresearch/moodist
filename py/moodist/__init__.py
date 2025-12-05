@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-import pickle
 import weakref
 from datetime import timedelta
 from queue import Empty
@@ -206,10 +205,10 @@ torch.distributed.distributed_c10d.register_rendezvous_handler(
 )
 
 
-def compile_op(group, shape, dtype, inputs=None, outputs=None):
+def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
     from .compile import compile_op
 
-    return compile_op(group, shape, dtype, inputs, outputs)
+    return compile_op(group, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
 
 
 __all__ = [*clist, "create_moodist_backend", "Empty", "compile_op"]
