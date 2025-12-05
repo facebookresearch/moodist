@@ -477,6 +477,17 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       auto set = [&](std::string key, std::string value) { store->set(key, tovec(value)); };
       auto get = [&](std::string key) { return fromvec(store->get(key)); };
 
+      // Phase 1: Verify all ranks have started (no dependencies between ranks)
+      set(fmt::sprintf("moodist_rank%d_started", rank), "1");
+      {
+        std::vector<std::string> startedKeys;
+        for (size_t i = 0; i != size; ++i) {
+          startedKeys.push_back(fmt::sprintf("moodist_rank%d_started", i));
+        }
+        store->wait(startedKeys);
+      }
+
+      // Phase 2: Exchange addresses
       if (rank == 0) {
         set("moodist_pg_key", key);
       } else {
@@ -499,6 +510,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       log.debug("%d: Waiting for setupComms\n", rank);
       group->setupComms->waitForConnections();
 
+      // Phase 3: Signal ready and wait for all ranks
       set(fmt::sprintf("moodist_rank%d_ready", rank), key);
       for (size_t i = 0; i != size; ++i) {
         CHECK(get(fmt::sprintf("moodist_rank%d_ready", i)) == key);
