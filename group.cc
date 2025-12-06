@@ -3,6 +3,7 @@
 #include "group.h"
 #include "allgather.h"
 #include "common.h"
+#include "connection.h"
 #include "cputhread.h"
 #include "ib_common.h"
 #include "ipc_mapper.h"
@@ -42,21 +43,6 @@ struct RankForIbSetup {
     x(bootId, ibDevices);
   }
 };
-
-static std::string readBootId() {
-  char buf[64];
-  std::memset(buf, 0, sizeof(buf));
-  FILE* f = ::fopen("/proc/sys/kernel/random/boot_id", "rb");
-  if (f) {
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    while (n && buf[n - 1] == '\n') {
-      --n;
-    }
-    buf[n] = 0;
-    fclose(f);
-  }
-  return buf;
-}
 
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
@@ -181,7 +167,7 @@ void Group::init(Function<void()> f) {
     std::vector<std::vector<LocalDeviceNode>> allDeviceNodes;
     allDeviceNodes.resize(allCudaPaths.size());
 
-    std::string bootId = readBootId();
+    const std::string& bootId = getBootId();
 
     std::vector<std::string> allRanksBootId = setupComms->allgather(bootId);
 

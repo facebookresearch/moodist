@@ -281,7 +281,7 @@ std::shared_ptr<Connection> TcpContext::connect(std::string_view addr) {
   return connection;
 }
 
-std::string readBootId() {
+static std::string readBootId() {
   char buf[64];
   std::memset(buf, 0, sizeof(buf));
   FILE* f = ::fopen("/proc/sys/kernel/random/boot_id", "rb");
@@ -297,6 +297,10 @@ std::string readBootId() {
 }
 
 static std::string bootId = readBootId();
+
+const std::string& getBootId() {
+  return bootId;
+}
 
 bool UnixContext::isReachable(std::string_view networkKey, std::string_view address) {
   return networkKey == bootId;

@@ -13,6 +13,8 @@
 
 namespace moodist {
 
+const std::string& getBootId();
+
 struct Connection;
 struct Listener;
 

@@ -43,11 +43,12 @@ void numa_run_on_node(int node) {
     size_t o = s.size();
     s.resize(o + 0x10);
     size_t n = fread(s.data() + o, 1, 0x10, f);
-    if (n < 0) {
-      log.error("setaffinity error: %s: read error\n", fn);
-      return;
-    }
     if (n < 0x10) {
+      if (ferror(f)) {
+        log.error("setaffinity error: %s: read error\n", fn);
+        fclose(f);
+        return;
+      }
       s.resize(o + n);
       break;
     }
