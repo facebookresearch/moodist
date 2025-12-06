@@ -32,6 +32,8 @@ def load_test_module(path: Path):
     """Load a test module and return it."""
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
+    # Register in sys.modules so pickle/deserialize can find classes defined in test files
+    sys.modules[path.stem] = module
     spec.loader.exec_module(module)
     return module
 

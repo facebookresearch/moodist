@@ -1025,7 +1025,8 @@ template<typename X>
 
   if (type == &PyUnicode_Type) {
     x(pyTypes::unicode, (uint8_t)PyUnicode_KIND(obj));
-    x(std::string_view((char*)PyUnicode_DATA(obj), PyUnicode_GET_LENGTH(obj)));
+    // PyUnicode_GET_LENGTH returns code points, multiply by kind to get bytes
+    x(std::string_view((char*)PyUnicode_DATA(obj), PyUnicode_GET_LENGTH(obj) * PyUnicode_KIND(obj)));
     return;
   }
 
@@ -1322,7 +1323,8 @@ template<typename X>
     uint8_t kind;
     std::string_view view;
     x(kind, view);
-    auto* obj = PyUnicode_FromKindAndData(kind, view.data(), view.size());
+    // view.size() is in bytes, PyUnicode_FromKindAndData expects code point count
+    auto* obj = PyUnicode_FromKindAndData(kind, view.data(), view.size() / kind);
     if (!obj) {
       throw py::error_already_set();
     }
