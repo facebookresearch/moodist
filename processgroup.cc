@@ -3279,6 +3279,17 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       return numel;
     };
 
+    // Compute linear offset for a position within a tensor of given shape (row-major layout)
+    constexpr auto linearOffset = [](const T& offset, const T& shape) {
+      size_t result = 0;
+      size_t stride = 1;
+      for (int i = ndim - 1; i >= 0; --i) {
+        result += offset[i] * stride;
+        stride *= shape[i];
+      }
+      return result;
+    };
+
     IVector<TDescr> descrs;
     IVector<TDescr*> inputs(numInputs);
     IVector<TDescr*> outputs(numOutputs);
@@ -3447,8 +3458,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
                 CHECK(&dst == outputsPerRank[i.outputRank][i.outputIndex]);
 
-                i.inputOffset = numel(sub(x.offset, copyInputs[x.index].offset));
-                i.outputOffset = numel(sub(x.offset, dst.offset));
+                i.inputOffset = linearOffset(sub(x.offset, copyInputs[x.index].offset), copyInputs[x.index].shape);
+                i.outputOffset = linearOffset(sub(x.offset, dst.offset), dst.shape);
 
                 i.outputContiguous = contiguous(x.shape, dst.shape);
               }
@@ -3468,8 +3479,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
         CHECK(&dst == outputsPerRank[i.outputRank][i.outputIndex]);
 
-        i.inputOffset = numel(sub(x.offset, src.offset));
-        i.outputOffset = numel(sub(x.offset, dst.offset));
+        i.inputOffset = linearOffset(sub(x.offset, src.offset), src.shape);
+        i.outputOffset = linearOffset(sub(x.offset, dst.offset), dst.shape);
 
         if (!inputContiguous) {
           i.inputIndex = myInputs.size() + copyInputs.size();
