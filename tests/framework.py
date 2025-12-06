@@ -194,16 +194,30 @@ class TestRunner:
         duration = time.monotonic() - start
         passed = error is None
 
+        # Print error immediately on the rank that had it
+        if error is not None:
+            print(f"    [rank {self.ctx.rank}] Error: {error}", flush=True)
+
+        # Communicate pass/fail status to all ranks via barrier store
+        status_key = f"test_{self._test_counter}_status_{self.ctx.rank}"
+        self.ctx.barrier_store.set(status_key, b"pass" if passed else b"fail")
+
+        # Check if any rank failed
+        any_failed = False
+        for r in range(self.ctx.world_size):
+            key = f"test_{self._test_counter}_status_{r}"
+            if self.ctx.barrier_store.get(key) == b"fail":
+                any_failed = True
+                if r != self.ctx.rank and self.ctx.rank == 0:
+                    print(f"    [rank {r} failed]", flush=True)
+
         # Barrier after test to ensure no rank exits early and destroys stores
-        try:
-            self.ctx.barrier()
-        except Exception:
-            pass  # Don't mask test failures with barrier failures
+        self.ctx.barrier()
 
         # Now it's safe to cleanup - all ranks have passed the barrier
         self.ctx._cleanup()
 
-        result = TestResult(name=name, passed=passed, duration=duration, error=error)
+        result = TestResult(name=name, passed=passed and not any_failed, duration=duration, error=error)
         self.results.append(result)
         return result
 
@@ -219,10 +233,6 @@ class TestRunner:
             # Only rank 0 prints summary line
             if self.ctx.rank == 0:
                 print(f"  {name:<50} {status}  ({result.duration:.3f}s)")
-
-            if not result.passed and self.ctx.rank == 0:
-                # Print error details
-                print(f"    Error: {result.error}")
 
     def summarize(self) -> bool:
         """Print summary, return True if all passed."""
@@ -296,7 +306,8 @@ def create_process_group(ctx: TestContext):
     import torch
     import moodist
 
-    store = ctx.create_store(key="pg", timeout=timedelta(seconds=60))
+    key = f"pg_{ctx._current_test_id}"
+    store = ctx.create_store(key=key, timeout=timedelta(seconds=60))
     torch.cuda.set_device(ctx.local_rank)
     pg = moodist.MoodistProcessGroup(store, ctx.rank, ctx.world_size)
     ctx.keep_alive(pg)
