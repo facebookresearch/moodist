@@ -83,10 +83,14 @@ def _process_tensor_specs(specs, shape_holder):
                 shape_holder['shape'] = x_shape
                 shape_holder['dtype'] = x_dtype
             else:
-                assert shape_holder['shape'] == x_shape, \
-                    f"All DTensors must have the same global shape, got {shape_holder['shape']} and {x_shape}"
-                assert shape_holder['dtype'] == x_dtype, \
-                    f"All DTensors must have the same dtype, got {shape_holder['dtype']} and {x_dtype}"
+                if shape_holder['shape'] != x_shape:
+                    raise ValueError(
+                        f"All DTensors must have the same global shape, got {shape_holder['shape']} and {x_shape}"
+                    )
+                if shape_holder['dtype'] != x_dtype:
+                    raise ValueError(
+                        f"All DTensors must have the same dtype, got {shape_holder['dtype']} and {x_dtype}"
+                    )
 
             processed.append(_get_shard_metadata(x))
         else:
@@ -126,9 +130,11 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
         specified collective communication pattern.
 
     Raises:
-        AssertionError: If dtype is not a torch.dtype, shape contains non-integers,
-                       input/output specifications are malformed, ranks specify inconsistent
-                       shapes or dtypes, or the queue is not empty at synchronization points.
+        ValueError: If shape/dtype are not provided (and not derivable from DTensors),
+                   input/output specifications are malformed, or ranks specify inconsistent
+                   shapes or dtypes.
+        TypeError: If dtype is not a torch.dtype, shape contains non-integers, or
+                  input/output specifications have wrong types.
 
     Example:
         >>> # Using dict specifications:
@@ -178,13 +184,17 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
     shape = shape_holder['shape']
     dtype = shape_holder['dtype']
 
-    assert shape is not None, "shape must be provided or derivable from DTensors"
-    assert dtype is not None, "dtype must be provided or derivable from DTensors"
-    assert isinstance(dtype, torch.dtype)
+    if shape is None:
+        raise ValueError("shape must be provided or derivable from DTensors")
+    if dtype is None:
+        raise ValueError("dtype must be provided or derivable from DTensors")
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
 
     shape = tuple(shape)
-    for x in shape:
-        assert isinstance(x, int)
+    for i, x in enumerate(shape):
+        if not isinstance(x, int):
+            raise TypeError(f"shape[{i}] must be an int, got {type(x).__name__}")
 
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
     if name not in weak_group:
@@ -194,22 +204,24 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
     assert isinstance(queue, moodist.Queue)
 
     def check(l):
-        assert isinstance(l, (tuple, list))
+        if not isinstance(l, (tuple, list)):
+            raise TypeError(f"inputs/outputs must be a tuple or list, got {type(l).__name__}")
         for x in l:
-            assert isinstance(x, dict)
+            if not isinstance(x, dict):
+                raise TypeError(f"each input/output spec must be a dict, got {type(x).__name__}")
             for n in ("offset", "shape"):
-                assert n in x, "%s is missing for an input or output" % n
+                if n not in x:
+                    raise ValueError(f"'{n}' is missing for an input or output")
                 v = x[n]
-                assert isinstance(v, (tuple, list)), "%s must be a tuple or list" % n
-                assert len(v) == len(
-                    shape
-                ), "expected %s with %d dimensions, but got %d" % (
-                    n,
-                    len(shape),
-                    len(v),
-                )
-                for z in v:
-                    assert isinstance(z, int)
+                if not isinstance(v, (tuple, list)):
+                    raise TypeError(f"'{n}' must be a tuple or list, got {type(v).__name__}")
+                if len(v) != len(shape):
+                    raise ValueError(
+                        f"expected '{n}' with {len(shape)} dimensions, but got {len(v)}"
+                    )
+                for i, z in enumerate(v):
+                    if not isinstance(z, int):
+                        raise TypeError(f"{n}[{i}] must be an int, got {type(z).__name__}")
         return tuple((tuple(x["offset"]), tuple(x["shape"])) for x in l)
 
     if inputs is not None:
@@ -228,8 +240,14 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
 
     for _ in range(group.size()):
         source_rank, nshape, ndtype, ninput, noutput = queue.get_object()
-        assert nshape == shape, "moodist.compile_op: Ranks specified different shapes"
-        assert ndtype == dtype, "moodist.compile_op: Ranks specified different dtypes"
+        if nshape != shape:
+            raise ValueError(
+                f"moodist.compile_op: Ranks specified different shapes: {shape} vs {nshape}"
+            )
+        if ndtype != dtype:
+            raise ValueError(
+                f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype}"
+            )
 
         if ninput is not None:
             for o, s in ninput:

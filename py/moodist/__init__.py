@@ -100,9 +100,10 @@ class Queue:
         if isinstance(process_group, str):
             pg_name = process_group
             process_group = find_process_group(pg_name)
-            assert process_group is not None, (
-                "The Moodist process group by name '%s' could not be found" % pg_name
-            )
+            if process_group is None:
+                raise ValueError(
+                    "The Moodist process group by name '%s' could not be found" % pg_name
+                )
         if not hasattr(process_group, "Queue"):
             raise RuntimeError(
                 "moodist.Queue process_group parameter must be a MoodistProcessGroup, but got %s"
@@ -180,11 +181,15 @@ def rendezvous_handler(
     import urllib.parse
 
     result = urllib.parse.urlparse(url)
-    assert result.hostname is not None
-    assert result.port is not None
+    if result.hostname is None:
+        raise ValueError(f"Moodist rendezvous URL missing hostname: {url}")
+    if result.port is None:
+        raise ValueError(f"Moodist rendezvous URL missing port: {url}")
     query = urllib.parse.parse_qs(result.query)
-    assert "rank" in query
-    assert "world_size" in query
+    if "rank" not in query:
+        raise ValueError(f"Moodist rendezvous URL missing 'rank' query parameter: {url}")
+    if "world_size" not in query:
+        raise ValueError(f"Moodist rendezvous URL missing 'world_size' query parameter: {url}")
 
     world_size = int(query["world_size"][0])
     rank = int(query["rank"][0])
