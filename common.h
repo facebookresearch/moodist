@@ -462,9 +462,12 @@ struct FLSharedPtr {
     }
   }
   FLSharedPtr& operator=(const FLSharedPtr& n) {
-    ptr = n.ptr;
-    if (ptr) {
-      ++ptr->refcount;
+    if (ptr != n.ptr) {
+      reset();
+      ptr = n.ptr;
+      if (ptr) {
+        ++ptr->refcount;
+      }
     }
     return *this;
   }
@@ -508,9 +511,11 @@ struct FLSharedPtr {
   }
 
   void reset() {
-    if (ptr && --ptr->refcount == 0) {
-      ptr->clear();
-      FreeList<Storage>::push(ptr, maxThreadLocalEntries);
+    if (ptr) {
+      if (--ptr->refcount == 0) {
+        ptr->clear();
+        FreeList<Storage>::push(ptr, maxThreadLocalEntries);
+      }
       ptr = nullptr;
     }
   }
