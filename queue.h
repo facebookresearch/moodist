@@ -15,6 +15,7 @@ struct QueueWorkImpl;
 struct QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
   std::optional<torch::Storage> storage;
+  bool waitOnDestroy = true;
   QueueWork();
   ~QueueWork();
   QueueWork(const QueueWork&) = delete;
@@ -30,7 +31,7 @@ struct Queue {
   Queue& operator=(Queue) = delete;
   ~Queue();
   std::pair<std::optional<torch::Tensor>, size_t> get(bool block = true, std::optional<float> timeout = {});
-  QueueWork put(torch::Tensor value, uint32_t transactionKey);
+  QueueWork put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy = true);
   size_t qsize() const;
   bool wait(std::optional<float> timeout) const;
 

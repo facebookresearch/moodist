@@ -99,7 +99,7 @@ PYBIND11_MODULE(_C, m) {
   py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
       .def(
           "put", &moodist::Queue::put, py::arg("tensor"), py::arg("transaction"),
-          py::call_guard<py::gil_scoped_release>())
+          py::arg("wait_on_destroy") = true, py::call_guard<py::gil_scoped_release>())
       .def("get", &moodist::Queue::get, py::arg("block"), py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
       .def("qsize", &moodist::Queue::qsize, py::call_guard<py::gil_scoped_release>())
       .def("wait", &moodist::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())

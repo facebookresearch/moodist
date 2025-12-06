@@ -104,17 +104,21 @@ Send a tensor to the queue.
 
 **Returns:** `QueueWork` object for synchronization
 
-**Usage:**
-```python
-tensor = torch.randn(10, 20)
-work = queue.put_tensor(tensor)
-# work.wait() is called automatically when work goes out of scope
-```
-
 **Synchronization behavior:**
+- The `QueueWork` destructor automatically calls `wait()`, blocking until the transfer completes
 - For **CUDA tensors**: `work.wait()` inserts a GPU stream wait, allowing the CPU to continue
 - For **CPU tensors**: `work.wait()` blocks the CPU until the transfer completes
-- The `QueueWork` destructor automatically calls `wait()` if not already called
+
+**Usage:**
+```python
+# Default: waits for completion when work goes out of scope
+queue.put_tensor(tensor)
+
+# Capture work object to wait later (allows overlapping work)
+work = queue.put_tensor(tensor)
+# ... do other work ...
+work.wait()
+```
 
 ### `get_tensor(block=True, timeout=None, return_size=False)`
 
@@ -162,12 +166,21 @@ The object is serialized using `moodist.serialize()` before being sent. The rece
 
 **Returns:** `QueueWork` object for synchronization
 
+**Synchronization behavior:**
+- The `QueueWork` destructor does **not** wait (fire-and-forget behavior)
+- This is safe because serialized objects are copied to internal buffers, so the original object can be safely modified immediately
+- If you need to ensure the object has been delivered, call `.wait()` on the returned work object
+
 **Usage:**
 ```python
-# Send various Python objects
+# Default (fire-and-forget): no automatic wait
 queue.put_object({'key': 'value', 'data': [1, 2, 3]})
 queue.put_object((42, 'hello', None))
 queue.put_object(MyCustomClass())
+
+# If you need to wait for delivery:
+work = queue.put_object(data)
+work.wait()
 ```
 
 ### `get_object(block=True, timeout=None, return_size=False)`

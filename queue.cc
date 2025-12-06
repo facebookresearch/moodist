@@ -559,7 +559,7 @@ struct QueueImpl {
     }
   }
 
-  QueueWork put(torch::Tensor value, uint32_t transactionKey) {
+  QueueWork put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy = true) {
     // CHECK(location != group->rank);
     // CHECK(qs == nullptr);
 
@@ -628,6 +628,9 @@ struct QueueImpl {
         sendPut(&*group, location, qs->streaming, remoteAddress, std::move(td), work, 0, transactionKey);
       }
     } else {
+      // CUDA tensors must always wait - we need to keep storage alive until transfer completes
+      waitOnDestroy = true;
+
       if (group->rdmaSupportsCuda) {
         td->isCuda = true;
         work->cudaDone = WorkCudaDonePtr::make();
@@ -688,10 +691,10 @@ struct QueueImpl {
 
       CHECK_CU(cuLaunchHostFunc(
           c10::cuda::getCurrentCUDAStream(), [](void* ptr) { Function<void()>((FunctionPointer)ptr)(); }, f.release()));
-
-      r.storage = value.storage();
     }
 
+    r.storage = value.storage();
+    r.waitOnDestroy = waitOnDestroy;
     r.impl = std::move(work);
     return r;
   }
@@ -758,7 +761,7 @@ struct QueueImpl {
 
 QueueWork::QueueWork() {}
 QueueWork::~QueueWork() {
-  if (storage.has_value()) {
+  if (waitOnDestroy) {
     wait();
   }
 }
@@ -777,8 +780,8 @@ Queue::~Queue() {
 std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::optional<float> timeout) {
   return ((QueueImpl*)impl)->get(block, timeout);
 }
-QueueWork Queue::put(torch::Tensor value, uint32_t transactionKey) {
-  return ((QueueImpl*)impl)->put(value, transactionKey);
+QueueWork Queue::put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy) {
+  return ((QueueImpl*)impl)->put(value, transactionKey, waitOnDestroy);
 }
 size_t Queue::qsize() const {
   return ((QueueImpl*)impl)->qsize();

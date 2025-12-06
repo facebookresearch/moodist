@@ -70,7 +70,7 @@ struct QueueStorage {
 };
 ```
 
-### QueueWork / QueueWorkImpl (queue.cc:40-80, 759-771)
+### QueueWork / QueueWorkImpl (queue.cc:40-80, 762-775)
 Handle returned by `put_tensor()` for tracking async operation completion.
 
 ```cpp
@@ -84,11 +84,12 @@ struct QueueWorkImpl {
 };
 
 struct QueueWork {
-  std::optional<c10::Storage> storage;    // Holds tensor storage alive
   std::shared_ptr<QueueWorkImpl> impl;
+  std::optional<c10::Storage> storage;    // Holds tensor storage alive
+  bool waitOnDestroy = true;              // Whether destructor calls wait()
 
   ~QueueWork() {
-    if (storage.has_value()) {  // IMPORTANT: only waits if storage is set!
+    if (waitOnDestroy) {
       wait();
     }
   }
@@ -101,7 +102,7 @@ struct QueueWork {
 
 ```
 1. User: queue.put_tensor(cpu_tensor)
-   └─> QueueImpl::put() [queue.cc:560]
+   └─> QueueImpl::put() [queue.cc:562]
 
 2. put() allocates TensorDataPtr, copies tensor data if needed
    └─> Checks if value.is_cpu() [line 598]
@@ -111,8 +112,10 @@ struct QueueWork {
    └─> Enqueues to group->cpuThread [line 327]
    └─> Returns immediately
 
-4. Returns QueueWork with impl set, but storage NOT set (BUG!)
-   └─> Destructor won't call wait()
+4. Returns QueueWork with:
+   └─> impl set to track completion
+   └─> storage set to keep tensor alive
+   └─> waitOnDestroy controls destructor behavior
 
 5. [ASYNC] CpuThread processes taskQueuePut
    └─> executeQueuePut() [cputhread.cc:4741]
@@ -134,35 +137,43 @@ struct QueueWork {
    └─> executeQueueReadFinished() [cputhread.cc:4806]
    └─> Looks up and invokes callback [line 4812]
    └─> Callback sets work->done = 1, wakes futex [queue.cc:319-320]
+
+9. When QueueWork is destroyed (if waitOnDestroy=true):
+   └─> Destructor calls wait()
+   └─> Blocks until done == 1
 ```
 
 ### CUDA Tensor Put (Local Queue)
 
 ```
 1. User: queue.put_tensor(cuda_tensor)
-   └─> QueueImpl::put() [queue.cc:560]
+   └─> QueueImpl::put() [queue.cc:562]
 
 2. put() allocates TensorDataPtr
    └─> Checks !value.is_cpu() [line 630]
+   └─> Forces waitOnDestroy = true (CUDA always waits)
 
 3. Sets up CUDA completion tracking
-   └─> If rdmaSupportsCuda: uses cudaDone pointer [lines 631-637]
-   └─> Else: copies to CPU buffer, uses cudaMappedDone [lines 638-649]
+   └─> If rdmaSupportsCuda: uses cudaDone pointer [lines 634-640]
+   └─> Else: copies to CPU buffer, uses cudaMappedDone [lines 641-651]
 
-4. Queues the put operation [lines 653-666]
+4. Queues the put operation [lines 655-668]
    └─> Will be processed when CUDA stream reaches the host callback
 
-5. Launches host callback on CUDA stream [lines 668-690]
+5. Launches host callback on CUDA stream [lines 670-693]
    └─> cuLaunchHostFunc() schedules callback after GPU work completes
    └─> Callback calls sendPut() to actually send the data
 
-6. Sets r.storage = value.storage() [line 692]
-   └─> Destructor WILL call wait()
+6. Returns QueueWork with:
+   └─> impl set to track completion
+   └─> storage set to keep tensor memory alive for RDMA
+   └─> waitOnDestroy = true (always, for CUDA safety)
 
-7. Returns QueueWork
-   └─> If user discards it, destructor waits for completion
+7-11. Same as CPU steps 5-8, but triggered by CUDA callback
 
-8-12. Same as CPU steps 5-8, but triggered by CUDA callback
+12. When QueueWork is destroyed:
+   └─> Destructor always calls wait() (waitOnDestroy forced true)
+   └─> Ensures RDMA completes before storage is freed
 ```
 
 ### Remote Put (Different Rank)
@@ -204,15 +215,24 @@ The `QueueReadFinished` message comes back from the remote rank.
    └─> Wakes waiting thread
 ```
 
+## Design Notes
+
+### waitOnDestroy Parameter
+
+The `put()` function accepts a `waitOnDestroy` parameter in C++ that controls whether the
+`QueueWork` destructor calls `wait()`.
+
+- `waitOnDestroy=true`: Destructor blocks until transfer completes
+- `waitOnDestroy=false`: Destructor does not wait (fire-and-forget)
+
+The Python layer does not expose this parameter directly. Instead, the behavior differs by method:
+- `put_tensor()`: Always passes `waitOnDestroy=true` (safe for tensor memory)
+- `put_object()`: Always passes `waitOnDestroy=false` (fire-and-forget, since data is serialized to internal buffer)
+
+For CUDA tensors, the C++ layer forces `waitOnDestroy=true` regardless of the parameter value,
+since we need to keep storage alive until the transfer completes (RDMA requires valid source memory).
+
 ## Known Issues
-
-### BUG: CPU put destructor doesn't wait (UNFIXED)
-
-In `put()`, `r.storage` is only set for CUDA tensors (line 692), not CPU tensors.
-The destructor only calls `wait()` if `storage.has_value()`.
-Result: CPU puts don't block on completion when QueueWork is destroyed.
-
-**Fix:** Add `r.storage = value.storage();` after the CPU sendPut() call (around line 629).
 
 ### FIXME: Local vs remote get ordering (queue.cc:473-475)
 
@@ -239,7 +259,7 @@ Streaming would allow the caller to provide a pre-allocated output tensor.
 
 ### What `work.wait()` guarantees
 
-For CPU tensors (after the bug is fixed):
+For CPU tensors:
 - The tensor data has been copied to the queue storage
 - `qs->size` has been incremented
 - `qsize()` will reflect the put

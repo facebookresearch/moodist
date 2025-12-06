@@ -124,7 +124,7 @@ class Queue:
         )
 
     def put_tensor(self, tensor, *, transaction=0):
-        return self.impl.put(tensor, transaction)
+        return self.impl.put(tensor, transaction, True)  # waitOnDestroy=True
 
     def get_tensor(self, block=True, timeout=None, return_size=False):
         r, size = self.impl.get(block=block, timeout=timeout)
@@ -136,7 +136,7 @@ class Queue:
             return r
 
     def put_object(self, object, *, transaction=0):
-        return self.impl.put(serialize(object), transaction)
+        return self.impl.put(serialize(object), transaction, False)  # waitOnDestroy=False
 
     def get_object(self, block=True, timeout=None, return_size=False):
         if return_size:
