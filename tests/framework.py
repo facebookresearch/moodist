@@ -119,6 +119,35 @@ def test(fn: Callable[[TestContext], None]) -> Callable[[TestContext], None]:
     return fn
 
 
+def test_devices(*devices: str):
+    """Decorator to run a test for each specified device.
+
+    Usage:
+        @test_devices("cpu", "cuda")
+        def test_something(ctx: TestContext, device: str):
+            tensor = torch.tensor([1.0], device=device)
+            ...
+
+    This registers test_something_cpu and test_something_cuda.
+    """
+    def decorator(fn: Callable[[TestContext, str], None]):
+        for device in devices:
+            def make_wrapper(dev):
+                def wrapper(ctx: TestContext):
+                    return fn(ctx, dev)
+                return wrapper
+            wrapper = make_wrapper(device)
+            wrapper.__name__ = f"{fn.__name__}_{device}"
+            _tests.append((wrapper.__name__, wrapper))
+        return fn
+    return decorator
+
+
+def test_cpu_cuda(fn: Callable[[TestContext, str], None]):
+    """Shortcut for @test_devices("cpu", "cuda")."""
+    return test_devices("cpu", "cuda")(fn)
+
+
 def get_tests() -> list[tuple[str, Callable[[TestContext], None]]]:
     """Return list of (name, function) for all registered tests."""
     return _tests.copy()

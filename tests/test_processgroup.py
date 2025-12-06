@@ -7,7 +7,7 @@ to avoid side effects and allow per-test isolation.
 """
 
 import torch
-from framework import TestContext, test, create_process_group
+from framework import TestContext, test, test_cpu_cuda, create_process_group
 
 
 @test
@@ -18,20 +18,20 @@ def test_pg_creation(ctx: TestContext):
     ctx.assert_equal(pg.size(), ctx.world_size)
 
 
-@test
-def test_pg_allgather_base(ctx: TestContext):
+@test_cpu_cuda
+def test_pg_allgather_base(ctx: TestContext, device: str):
     """Test _allgather_base: each rank contributes a chunk, gather all chunks."""
     pg = create_process_group(ctx)
 
     # Each rank has a small tensor with its rank value
     chunk_size = 4
     input_tensor = torch.full(
-        (chunk_size,), float(ctx.rank), device="cuda", dtype=torch.float32
+        (chunk_size,), float(ctx.rank), device=device, dtype=torch.float32
     )
 
     # Output tensor to hold all chunks
     output_tensor = torch.zeros(
-        (chunk_size * ctx.world_size,), device="cuda", dtype=torch.float32
+        (chunk_size * ctx.world_size,), device=device, dtype=torch.float32
     )
 
     # Run allgather
@@ -40,7 +40,7 @@ def test_pg_allgather_base(ctx: TestContext):
 
     # Verify: output should be [0,0,0,0, 1,1,1,1, 2,2,2,2, ...]
     expected = torch.cat([
-        torch.full((chunk_size,), float(r), device="cuda", dtype=torch.float32)
+        torch.full((chunk_size,), float(r), device=device, dtype=torch.float32)
         for r in range(ctx.world_size)
     ])
     ctx.assert_true(
@@ -49,8 +49,8 @@ def test_pg_allgather_base(ctx: TestContext):
     )
 
 
-@test
-def test_pg_reduce_scatter_base(ctx: TestContext):
+@test_cpu_cuda
+def test_pg_reduce_scatter_base(ctx: TestContext, device: str):
     """Test _reduce_scatter_base: sum across ranks, each gets a chunk."""
     pg = create_process_group(ctx)
 
@@ -58,11 +58,11 @@ def test_pg_reduce_scatter_base(ctx: TestContext):
     # Each rank has full-size input with rank-specific values
     # After reduce-scatter with sum, each rank gets sum of corresponding chunks
     input_tensor = torch.full(
-        (chunk_size * ctx.world_size,), float(ctx.rank + 1), device="cuda", dtype=torch.float32
+        (chunk_size * ctx.world_size,), float(ctx.rank + 1), device=device, dtype=torch.float32
     )
 
     output_tensor = torch.zeros(
-        (chunk_size,), device="cuda", dtype=torch.float32
+        (chunk_size,), device=device, dtype=torch.float32
     )
 
     # Run reduce-scatter
@@ -72,7 +72,7 @@ def test_pg_reduce_scatter_base(ctx: TestContext):
     # Each rank gets its chunk, which is the sum of all ranks' contributions
     # All ranks contribute (rank+1), so sum = 1+2+3+...+world_size = world_size*(world_size+1)/2
     expected_value = ctx.world_size * (ctx.world_size + 1) / 2
-    expected = torch.full((chunk_size,), expected_value, device="cuda", dtype=torch.float32)
+    expected = torch.full((chunk_size,), expected_value, device=device, dtype=torch.float32)
 
     ctx.assert_true(
         torch.allclose(output_tensor, expected),
@@ -80,19 +80,19 @@ def test_pg_reduce_scatter_base(ctx: TestContext):
     )
 
 
-@test
-def test_pg_allgather_varying_data(ctx: TestContext):
+@test_cpu_cuda
+def test_pg_allgather_varying_data(ctx: TestContext, device: str):
     """Test allgather with different data per rank."""
     pg = create_process_group(ctx)
 
     chunk_size = 8
     # Each rank contributes unique data: [rank*100, rank*100+1, ...]
     input_tensor = torch.arange(
-        ctx.rank * 100, ctx.rank * 100 + chunk_size, device="cuda", dtype=torch.float32
+        ctx.rank * 100, ctx.rank * 100 + chunk_size, device=device, dtype=torch.float32
     )
 
     output_tensor = torch.zeros(
-        (chunk_size * ctx.world_size,), device="cuda", dtype=torch.float32
+        (chunk_size * ctx.world_size,), device=device, dtype=torch.float32
     )
 
     work = pg._allgather_base(output_tensor, input_tensor)
@@ -101,7 +101,7 @@ def test_pg_allgather_varying_data(ctx: TestContext):
     # Verify each chunk
     for r in range(ctx.world_size):
         expected_chunk = torch.arange(
-            r * 100, r * 100 + chunk_size, device="cuda", dtype=torch.float32
+            r * 100, r * 100 + chunk_size, device=device, dtype=torch.float32
         )
         actual_chunk = output_tensor[r * chunk_size : (r + 1) * chunk_size]
         ctx.assert_true(
@@ -110,8 +110,8 @@ def test_pg_allgather_varying_data(ctx: TestContext):
         )
 
 
-@test
-def test_pg_large_allgather(ctx: TestContext):
+@test_cpu_cuda
+def test_pg_large_allgather(ctx: TestContext, device: str):
     """Test allgather with larger tensors."""
     pg = create_process_group(ctx)
 
@@ -120,10 +120,10 @@ def test_pg_large_allgather(ctx: TestContext):
 
     # Use a deterministic pattern based on rank
     torch.manual_seed(ctx.rank + 42)
-    input_tensor = torch.randn(chunk_size, device="cuda", dtype=torch.float32)
+    input_tensor = torch.randn(chunk_size, device=device, dtype=torch.float32)
 
     output_tensor = torch.zeros(
-        chunk_size * ctx.world_size, device="cuda", dtype=torch.float32
+        chunk_size * ctx.world_size, device=device, dtype=torch.float32
     )
 
     work = pg._allgather_base(output_tensor, input_tensor)
@@ -139,7 +139,7 @@ def test_pg_large_allgather(ctx: TestContext):
     # Verify other ranks' chunks with same seeds
     for r in range(ctx.world_size):
         torch.manual_seed(r + 42)
-        expected = torch.randn(chunk_size, device="cuda", dtype=torch.float32)
+        expected = torch.randn(chunk_size, device=device, dtype=torch.float32)
         actual = output_tensor[r * chunk_size : (r + 1) * chunk_size]
         ctx.assert_true(
             torch.equal(actual, expected),
