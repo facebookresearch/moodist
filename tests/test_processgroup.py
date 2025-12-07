@@ -145,3 +145,121 @@ def test_pg_large_allgather(ctx: TestContext, device: str):
             torch.equal(actual, expected),
             f"rank {r} chunk mismatch"
         )
+
+
+@test_cpu_cuda
+def test_pg_broadcast(ctx: TestContext, device: str):
+    """Test broadcast: root rank sends data to all other ranks."""
+    pg = create_process_group(ctx)
+
+    root_rank = 0
+    tensor_size = 16
+
+    if ctx.rank == root_rank:
+        # Root has the data to broadcast
+        tensor = torch.arange(tensor_size, device=device, dtype=torch.float32)
+    else:
+        # Other ranks have zeros, will receive the broadcast
+        tensor = torch.zeros(tensor_size, device=device, dtype=torch.float32)
+
+    work = pg.broadcast(tensor, root_rank)
+    work.wait()
+
+    # All ranks should have the same data as root
+    expected = torch.arange(tensor_size, device=device, dtype=torch.float32)
+    ctx.assert_true(
+        torch.equal(tensor, expected),
+        f"broadcast result mismatch: got {tensor}, expected {expected}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_broadcast_nonzero_root(ctx: TestContext, device: str):
+    """Test broadcast with a non-zero root rank."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+
+    root_rank = ctx.world_size - 1  # Last rank is root
+    tensor_size = 8
+
+    if ctx.rank == root_rank:
+        tensor = torch.full((tensor_size,), 42.0, device=device, dtype=torch.float32)
+    else:
+        tensor = torch.zeros(tensor_size, device=device, dtype=torch.float32)
+
+    work = pg.broadcast(tensor, root_rank)
+    work.wait()
+
+    expected = torch.full((tensor_size,), 42.0, device=device, dtype=torch.float32)
+    ctx.assert_true(
+        torch.equal(tensor, expected),
+        f"broadcast from rank {root_rank} failed: got {tensor}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_allreduce_sum(ctx: TestContext, device: str):
+    """Test allreduce with sum: each rank contributes, result is sum on all ranks."""
+    pg = create_process_group(ctx)
+
+    tensor_size = 8
+    # Each rank has tensor filled with (rank + 1)
+    tensor = torch.full((tensor_size,), float(ctx.rank + 1), device=device, dtype=torch.float32)
+
+    work = pg.allreduce([tensor])
+    work.wait()
+
+    # Sum of all ranks' contributions: 1 + 2 + ... + world_size
+    expected_value = ctx.world_size * (ctx.world_size + 1) / 2
+    expected = torch.full((tensor_size,), expected_value, device=device, dtype=torch.float32)
+
+    ctx.assert_true(
+        torch.allclose(tensor, expected),
+        f"allreduce sum mismatch: got {tensor}, expected {expected}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_allreduce_varying_data(ctx: TestContext, device: str):
+    """Test allreduce with element-wise varying data."""
+    pg = create_process_group(ctx)
+
+    tensor_size = 4
+    # Each rank has [rank, rank+1, rank+2, rank+3]
+    tensor = torch.arange(ctx.rank, ctx.rank + tensor_size, device=device, dtype=torch.float32)
+
+    work = pg.allreduce([tensor])
+    work.wait()
+
+    # Element i should be sum of (rank + i) for all ranks
+    # = sum(rank for all ranks) + i * world_size
+    # = (0 + 1 + ... + world_size-1) + i * world_size
+    # = world_size*(world_size-1)/2 + i * world_size
+    rank_sum = ctx.world_size * (ctx.world_size - 1) / 2
+    expected = torch.tensor(
+        [rank_sum + i * ctx.world_size for i in range(tensor_size)],
+        device=device, dtype=torch.float32
+    )
+
+    ctx.assert_true(
+        torch.allclose(tensor, expected),
+        f"allreduce varying data mismatch: got {tensor}, expected {expected}"
+    )
+
+
+@test
+def test_pg_barrier(ctx: TestContext):
+    """Test barrier: all ranks synchronize."""
+    pg = create_process_group(ctx)
+
+    # Simple barrier - if it returns, it worked
+    work = pg.barrier()
+    work.wait()
+
+    # Do it a few times to ensure it's reliable
+    for _ in range(3):
+        work = pg.barrier()
+        work.wait()
+
