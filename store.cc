@@ -30,8 +30,9 @@ static constexpr uint8_t messageSet = 0x4;
 static constexpr uint8_t messageGet = 0x5;
 static constexpr uint8_t messageCheck = 0x6;
 static constexpr uint8_t messageWait = 0x7;
-static constexpr uint8_t messageExit = 0x8;
-static constexpr uint8_t messageDiagnosticSource = 0x9;
+static constexpr uint8_t messageShutdown = 0x8;
+static constexpr uint8_t messageExit = 0x9;
+static constexpr uint8_t messageDiagnosticSource = 0xa;
 
 // Diagnostic kind for filtering
 enum class DiagnosticKind : uint8_t {
@@ -79,10 +80,12 @@ struct TcpConnectMessage {
   std::string_view sourceId;
   uint32_t destinationRank;
   std::string_view destinationId;
+  // Ranks for which the sender uses the receiver as first hop (for broadcast routing)
+  Vector<uint32_t> broadcastForwardRanks;
 
   template<typename X>
   void serialize(X& x) {
-    x(key, sourceRank, sourceId, destinationRank, destinationId);
+    x(key, sourceRank, sourceId, destinationRank, destinationId, broadcastForwardRanks);
   }
 };
 
@@ -227,14 +230,13 @@ struct StoreImpl {
   int connectCounter = 0;
   HashMap<uint32_t, std::string> unackedAddresses;
 
-  bool destroyed = false;
-  std::chrono::steady_clock::time_point destroyTime;
-  std::optional<uint32_t> destroySourceRank;
+  bool shuttingDown = false;  // Phase 1: we've started shutdown sequence
+  bool exited = false;        // Phase 2: we've exited, waits should error
+  std::chrono::steady_clock::time_point exitTime;
+  std::optional<uint32_t> exitSourceRank;  // Rank that initiated the shutdown
 
-  bool deletionInitiated = false;
-  bool deleted = false;
-
-  struct PeerInfo {
+  // EdgeInfo: connection/communication state for direct edge peers
+  struct EdgeInfo {
     std::string uid;
     std::string networkKey;
     HashMap<uint32_t, std::string> addresses;
@@ -263,15 +265,35 @@ struct StoreImpl {
 
     Vector<IncomingMessage> incomingQueue;
 
-    bool destroyed = false;
     bool everConnected = false; // true if we ever had a TCP connection to this peer
 
     // Tracks which diagnostic sources we've sent messageDiagnosticSource for to this edge
     HashMap<uint32_t, bool> sentDiagnosticSourceFor;
-  };
-  Vector<std::optional<PeerInfo>> peerInfos;
 
-  HashMap<uint32_t, std::unique_ptr<PeerInfo>> edgePeers;
+    // For broadcast routing: ranks for which this edge uses us as their first hop
+    // When we receive a broadcast from source S, we forward to this edge if S is in this set
+    HashMap<uint32_t, bool> broadcastForwardFor;
+  };
+
+  // RankInfo: info about a rank received via UDP connect (only used on rank 0)
+  struct RankInfo {
+    std::string uid;
+    std::string networkKey;
+    HashMap<uint32_t, std::string> addresses;
+    Vector<char> udpaddr;
+    Socket* udpSocket = nullptr;
+    HashMap<uint32_t, bool> connected;  // tracks which edges this rank is connected to
+  };
+
+  // ShutdownState: tracks shutdown protocol state for each peer (used on all ranks)
+  struct ShutdownState {
+    bool shutdown = false;  // peer has signaled shutdown (phase 1)
+    bool exited = false;    // peer has signaled exit (phase 2)
+  };
+
+  Vector<std::optional<RankInfo>> rankInfos;  // Only populated on rank 0
+  Vector<ShutdownState> shutdownStates;        // Indexed by rank, used on all ranks
+  HashMap<uint32_t, std::unique_ptr<EdgeInfo>> edgePeers;
 
   // Info about diagnostic sources (originators of requests) for sending diagnostics via UDP
   struct DiagnosticSourceInfo {
@@ -357,7 +379,7 @@ struct StoreImpl {
 
           {
             std::lock_guard l(mutex);
-            auto& opt = peerInfos.at(msg.sourceRank);
+            auto& opt = rankInfos.at(msg.sourceRank);
             if (opt) {
               if (opt->uid != msg.uid) {
                 log.error(
@@ -368,15 +390,15 @@ struct StoreImpl {
             } else {
               opt.emplace();
             }
-            PeerInfo& pi = *opt;
-            pi.uid = std::string(msg.uid);
-            pi.networkKey = std::string(msg.networkKey);
+            RankInfo& ri = *opt;
+            ri.uid = std::string(msg.uid);
+            ri.networkKey = std::string(msg.networkKey);
             for (auto& v : msg.addresses) {
-              pi.addresses.insert(v);
+              ri.addresses.insert(v);
             }
-            pi.udpaddr.resize(udpaddr.second);
-            std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
-            pi.udpSocket = socket;
+            ri.udpaddr.resize(udpaddr.second);
+            std::memcpy(ri.udpaddr.data(), udpaddr.first, udpaddr.second);
+            ri.udpSocket = socket;
           }
 
           Vector<uint32_t> ra;
@@ -425,18 +447,18 @@ struct StoreImpl {
           {
             std::lock_guard l(mutex);
             CHECK(msg.sourceRank != -1);
-            PeerInfo& pi = getEdge(msg.sourceRank);
-            pi.uid = msg.sourceId;
-            pi.networkKey = msg.networkKey;
+            EdgeInfo& ei = getEdge(msg.sourceRank);
+            ei.uid = msg.sourceId;
+            ei.networkKey = msg.networkKey;
             for (auto& v : msg.addresses) {
-              pi.addresses.insert(v);
+              ei.addresses.insert(v);
             }
             auto udpaddr = socket->recvFromAddr();
-            pi.udpaddr.resize(udpaddr.second);
-            std::memcpy(pi.udpaddr.data(), udpaddr.first, udpaddr.second);
-            pi.udpSocket = socket;
+            ei.udpaddr.resize(udpaddr.second);
+            std::memcpy(ei.udpaddr.data(), udpaddr.first, udpaddr.second);
+            ei.udpSocket = socket;
 
-            if (!pi.tcpconnections.empty()) {
+            if (!ei.tcpconnections.empty()) {
               auto buf = serializeToBuffer(
                   signatureAddressesAck, AddressesAckMessage{
                                              .key = storekey,
@@ -454,9 +476,9 @@ struct StoreImpl {
         deserializeBufferPart(view, msg);
         if (msg.key == storekey && msg.sourceRank < worldSize) {
           std::lock_guard l(mutex);
-          auto& pi = peerInfos[msg.sourceRank];
-          if (pi) {
-            peerInfos[msg.sourceRank]->connected[msg.edge] = true;
+          auto& ri = rankInfos[msg.sourceRank];
+          if (ri) {
+            rankInfos[msg.sourceRank]->connected[msg.edge] = true;
           }
         }
       } else if (signature == signatureDiagnosticHello || signature == signatureDiagnosticHelloAck) {
@@ -503,7 +525,7 @@ struct StoreImpl {
     }
   }
 
-  void reaptcpconnections(PeerInfo& pi) {
+  void reaptcpconnections(EdgeInfo& pi) {
     for (auto i = pi.tcpconnections.begin(); i != pi.tcpconnections.end();) {
       auto& v = *i;
       if (v->connection->closed()) {
@@ -541,8 +563,8 @@ struct StoreImpl {
           std::chrono::steady_clock::now() + std::chrono::milliseconds(250 * n), [this, a = a.second, edge, uid] {
             std::lock_guard l(mutex);
             CHECK(edge != -1);
-            auto& pi = getEdge(edge);
-            if (dead || !pi.tcpconnections.empty() || pi.destroyed || destroyed) {
+            auto& ei = getEdge(edge);
+            if (dead || !ei.tcpconnections.empty() || shutdownStates[edge].exited || exited) {
               return;
             }
             // log.info("connecting to edge %d at %s\n", edge, a);
@@ -554,6 +576,7 @@ struct StoreImpl {
                                       .sourceId = myId,
                                       .destinationRank = edge,
                                       .destinationId = uid,
+                                      .broadcastForwardRanks = getBroadcastForwardRanks(edge),
                                   });
             connection->write(std::move(buffer), nullptr);
 
@@ -565,14 +588,14 @@ struct StoreImpl {
 
   void sendAddresses(uint32_t sourceRank, uint32_t edge) {
     std::unique_lock l(mutex);
-    auto& pi = peerInfos[sourceRank];
-    CHECK(pi);
-    auto& pi2 = peerInfos[edge];
-    if (!pi2 || pi2->connected.contains(sourceRank)) {
+    auto& ri = rankInfos[sourceRank];
+    CHECK(ri);
+    auto& ri2 = rankInfos[edge];
+    if (!ri2 || ri2->connected.contains(sourceRank)) {
       return;
     }
     Vector<std::pair<uint32_t, std::string>> addresses;
-    for (auto& v : pi->addresses) {
+    for (auto& v : ri->addresses) {
       addresses.push_back(v);
     }
     if (addresses.size() > 8) {
@@ -583,13 +606,13 @@ struct StoreImpl {
         signatureAddresses, AddressesMessage{
                                 .key = storekey,
                                 .sourceRank = sourceRank,
-                                .sourceId = pi->uid,
-                                .networkKey = pi->networkKey,
+                                .sourceId = ri->uid,
+                                .networkKey = ri->networkKey,
                                 .addresses = std::move(addresses),
                             });
-    auto* sock = pi2->udpSocket ? pi2->udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
+    auto* sock = ri2->udpSocket ? ri2->udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
     int r = ::sendto(
-        sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)pi2->udpaddr.data(), pi2->udpaddr.size());
+        sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)ri2->udpaddr.data(), ri2->udpaddr.size());
     auto t = std::chrono::milliseconds(2000);
     if (r < 0) {
       t = std::chrono::milliseconds(250);
@@ -814,6 +837,12 @@ struct StoreImpl {
                 pi.tcpconnections.push_back(ci);
                 pi.everConnected = true;
 
+                // Store broadcast routing info from peer
+                // This tells us which ranks we should forward broadcasts to this edge for
+                for (uint32_t r : msg.broadcastForwardRanks) {
+                  pi.broadcastForwardFor[r] = true;
+                }
+
                 // log.info("connected to rank %d\n", msg.sourceRank);
 
                 auto buf = serializeToBuffer(
@@ -835,6 +864,7 @@ struct StoreImpl {
                                                .sourceId = myId,
                                                .destinationRank = msg.sourceRank,
                                                .destinationId = msg.sourceId,
+                                               .broadcastForwardRanks = getBroadcastForwardRanks(msg.sourceRank),
                                            });
                   ci->connection->write(std::move(buffer), nullptr);
                 }
@@ -926,10 +956,10 @@ struct StoreImpl {
     }
   }
 
-  PeerInfo& getEdge(uint32_t rank) {
+  EdgeInfo& getEdge(uint32_t rank) {
     auto& ptr = edgePeers[rank];
     if (!ptr) {
-      ptr = std::make_unique<PeerInfo>();
+      ptr = std::make_unique<EdgeInfo>();
     }
     return *ptr;
   }
@@ -1065,14 +1095,45 @@ struct StoreImpl {
               },
               r),
           pi, hdr.diagnosticSource);
-    } else if (hdr.messageType == messageExit) {
-      CHECK(edgeRank != -1);
-      auto& pi = getEdge(edgeRank);
-      pi.destroyed = true;
-      if (!destroySourceRank) {
-        destroySourceRank = hdr.sourceRank;
+    } else if (hdr.messageType == messageShutdown) {
+      // Phase 1: peer is signaling it wants to shutdown
+      // sourceRank is the rank that is shutting down
+      if (hdr.sourceRank < shutdownStates.size() && !shutdownStates[hdr.sourceRank].shutdown) {
+        shutdownStates[hdr.sourceRank].shutdown = true;
+        forwardBroadcast(hdr.sourceRank, messageShutdown, edgeRank);
       }
-      addCallback(std::chrono::steady_clock::now(), [this] { destroy(); });
+      // Start our own shutdown if we haven't already
+      if (!shuttingDown) {
+        shuttingDown = true;
+        if (!exitSourceRank) {
+          exitSourceRank = hdr.sourceRank;
+        }
+        // Broadcast our own shutdown to all ranks
+        broadcastMessage(messageShutdown);
+      }
+    } else if (hdr.messageType == messageExit) {
+      // Phase 2: peer is actually exiting
+      // sourceRank is the rank that is exiting
+      if (hdr.sourceRank < shutdownStates.size() && !shutdownStates[hdr.sourceRank].exited) {
+        shutdownStates[hdr.sourceRank].exited = true;
+        forwardBroadcast(hdr.sourceRank, messageExit, edgeRank);
+      }
+      if (!exited) {
+        if (!shuttingDown) {
+          // Peer exited while we haven't started shutdown - this is unexpected
+          // Record which rank caused the unexpected exit for error messages
+          if (!exitSourceRank) {
+            exitSourceRank = hdr.sourceRank;
+          }
+        }
+        // Mark ourselves as exited, wake any pending waits, and broadcast
+        exited = true;
+        exitTime = std::chrono::steady_clock::now();
+        for (auto& v : waits) {
+          exitWait(v.second);
+        }
+        broadcastMessage(messageExit);
+      }
     } else if (hdr.messageType == messageDiagnosticSource) {
       // Receive diagnostic source UDP addresses from another rank
       std::vector<std::string> addrs;
@@ -1113,14 +1174,23 @@ struct StoreImpl {
 
     std::mt19937_64 rng(64 + stringHash(storekey));
 
-    Vector<uint32_t> connections;
-    connections.resize(worldSize);
+    // Build the mesh topology:
+    // - For worldSize <= 4: simple ring (each rank connects to neighbors)
+    //   This makes debugging easier with small process counts
+    // - For worldSize > 4: ring + random shortcuts for better connectivity
     for (uint32_t i : range(worldSize)) {
-      connections[i] = i;
-    };
-    std::ranges::shuffle(connections, rng);
+      addedge(i, (i + 1) % worldSize);
+    }
 
     if (worldSize > 4) {
+      // Add random shortcut connections (non-neighbor, non-self)
+      Vector<uint32_t> connections;
+      connections.resize(worldSize);
+      for (uint32_t i : range(worldSize)) {
+        connections[i] = i;
+      };
+      std::ranges::shuffle(connections, rng);
+
       auto neighbors = [&](uint32_t a, uint32_t b) {
         uint32_t x = a > b ? a - b : b - a;
         return x == 1 || x == worldSize - 1;
@@ -1133,11 +1203,10 @@ struct StoreImpl {
           }
         }
       }
-    }
 
-    for (uint32_t i : range(worldSize)) {
-      addedge(i, (i + 1) % worldSize);
-      addedge(i, connections[i]);
+      for (uint32_t i : range(worldSize)) {
+        addedge(i, connections[i]);
+      }
     }
     for (auto& v : edges) {
       std::ranges::shuffle(v, getRng());
@@ -1195,6 +1264,18 @@ struct StoreImpl {
     // }
   }
 
+  // Get list of ranks for which the given edge is our first hop
+  // Used for broadcast routing - we tell each edge which ranks we route through them
+  Vector<uint32_t> getBroadcastForwardRanks(uint32_t edge) {
+    Vector<uint32_t> result;
+    for (uint32_t r : range(worldSize)) {
+      if (firsthop[r] == edge) {
+        result.push_back(r);
+      }
+    }
+    return result;
+  }
+
   StoreImpl(std::string hostname, int port, std::string key, int worldSize, int rank)
       : hostname(hostname), port(port), worldSize(worldSize), rank(rank) {
     log.init();
@@ -1211,7 +1292,8 @@ struct StoreImpl {
 
     findPaths();
 
-    peerInfos.resize(worldSize);
+    rankInfos.resize(worldSize);
+    shutdownStates.resize(worldSize);
 
     if (rank == 0) {
       bool success = listen(port, true);
@@ -1333,70 +1415,74 @@ struct StoreImpl {
     }
   }
 
-  void destroy() {
+  void shutdown() {
     std::unique_lock l(mutex);
-    if (!destroyed) {
-      destroyed = true;
-      destroyTime = std::chrono::steady_clock::now();
-      if (!destroySourceRank) {
-        destroySourceRank = rank;
+    if (!shuttingDown) {
+      shuttingDown = true;
+      if (!exitSourceRank) {
+        exitSourceRank = rank;
       }
-      for (auto& v : waits) {
-        destroyWait(v.second);
-      }
-      addCallback(std::chrono::steady_clock::now(), [this] {
-        std::unique_lock l(mutex);
-        for (auto& v : edgePeers) {
-          auto& pi = *v.second;
-          if (!pi.tcpconnections.empty()) {
-            uint32_t edgeRank = v.first;
-            // diagnosticSource = rank (not important for destroy, but needed for message format)
-            sendMessage(
-                edgeRank,
-                serializeToBuffer(
-                    signatureMessage,
-                    MessageHeader{
-                        .ttl = worldSize,
-                        .seq = 0,
-                        .destinationRank = edgeRank,
-                        .id = 0,
-                        .sourceRank = *destroySourceRank,
-                        .diagnosticSource = rank,
-                        .messageType = messageExit,
-                    }),
-                pi, rank);
-          }
-        }
-      });
+      // Broadcast shutdown message to all ranks
+      broadcastMessage(messageShutdown);
     }
 
-    if (refcount == 0 && !deletionInitiated) {
-      deletionInitiated = true;
-      auto t = std::chrono::milliseconds(50);
-      while (t < std::chrono::seconds(2)) {
-        addCallback(std::chrono::steady_clock::now() + t, [this] {
-          std::lock_guard l(mutex);
-          for (auto& v : edgePeers) {
-            auto& pi = *v.second;
-            if (!pi.tcpconnections.empty() && !pi.destroyed) {
-              return;
-            }
+    if (refcount == 0) {
+      // Two-phase shutdown protocol (only when this is the last reference)
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+      // Phase 1: Wait for all ranks to acknowledge shutdown
+      // This is needed even if we were triggered by another rank's shutdown
+      while (std::chrono::steady_clock::now() < deadline) {
+        bool allShutdown = true;
+        for (uint32_t r : range(worldSize)) {
+          if (r == rank) continue;
+          if (!shutdownStates[r].shutdown) {
+            allShutdown = false;
+            break;
           }
-          if (!deleted) {
-            deleted = true;
-            scheduler.run([this] { delete this; });
-          }
-        });
-        t += std::chrono::milliseconds(50);
+        }
+        if (allShutdown) {
+          break;
+        }
+        l.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        l.lock();
       }
 
-      addCallback(std::chrono::steady_clock::now() + std::chrono::seconds(2), [this] {
-        std::lock_guard l(mutex);
-        if (!deleted) {
-          deleted = true;
-          scheduler.run([this] { delete this; });
+      // Phase 2: Broadcast exit message to all ranks
+      // Also mark ourselves as exited and wake local waits
+      if (!exited) {
+        exited = true;
+        exitTime = std::chrono::steady_clock::now();
+        for (auto& v : waits) {
+          exitWait(v.second);
         }
-      });
+      }
+      broadcastMessage(messageExit);
+
+      // Wait for all ranks to acknowledge exit
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (std::chrono::steady_clock::now() < deadline) {
+        bool allExited = true;
+        for (uint32_t r : range(worldSize)) {
+          if (r == rank) continue;
+          if (!shutdownStates[r].exited) {
+            allExited = false;
+            break;
+          }
+        }
+        if (allExited) {
+          break;
+        }
+        l.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        l.lock();
+      }
+
+      // Brief delay to allow exit messages to be sent before connections are closed
+      l.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      l.lock();
     }
   }
 
@@ -1513,7 +1599,7 @@ struct StoreImpl {
         addCallback(std::chrono::steady_clock::now(), [this, addrbuf] {
           std::lock_guard l(mutex);
 
-          for (size_t i = 0; i != udps.size(); ++i) {
+          for (size_t i : indices(udps)) {
             auto now = std::chrono::steady_clock::now();
             auto t = std::min(
                 std::max(prevConnectTime + std::chrono::milliseconds(250), now), now + std::chrono::seconds(2));
@@ -1634,12 +1720,12 @@ struct StoreImpl {
     std::lock_guard l(mutex);
     std::string result;
 
-    // Check if store was destroyed
-    if (destroyed) {
-      if (destroySourceRank) {
-        result += fmt::sprintf("\n  Store was destroyed by rank %d", *destroySourceRank);
+    // Check if store has exited
+    if (exited) {
+      if (exitSourceRank) {
+        result += fmt::sprintf("\n  Store was shut down by rank %d", *exitSourceRank);
       } else {
-        result += "\n  Store was destroyed";
+        result += "\n  Store was shut down";
       }
       return result;
     }
@@ -1652,8 +1738,8 @@ struct StoreImpl {
     // On rank 0, report which ranks haven't connected via UDP
     if (rank == 0) {
       Vector<uint32_t> missingRanks;
-      for (uint32_t r = 0; r < worldSize; ++r) {
-        if (r != rank && !peerInfos[r].has_value()) {
+      for (uint32_t r : range(worldSize)) {
+        if (r != rank && !rankInfos[r].has_value()) {
           missingRanks.push_back(r);
         }
       }
@@ -1667,36 +1753,41 @@ struct StoreImpl {
 
     // Check connection to first hop edge
     if (firstHopEdge != (uint32_t)-1 && firstHopEdge != rank) {
-      auto edgeIt = edgePeers.find(firstHopEdge);
-      if (edgeIt != edgePeers.end()) {
-        auto& pi = *edgeIt->second;
-        if (pi.destroyed) {
-          result += fmt::sprintf("\n  Rank %d (first hop to target rank %d) has exited", firstHopEdge, targetRank);
-        } else if (pi.tcpconnections.empty()) {
-          result +=
-              fmt::sprintf("\n  No TCP connection to rank %d (first hop to target rank %d)", firstHopEdge, targetRank);
-          if (pi.addresses.empty()) {
-            result += " - no TCP addresses received";
+      // Check if the first hop has exited
+      bool firstHopExited = firstHopEdge < shutdownStates.size() &&
+                            shutdownStates[firstHopEdge].exited;
+      if (firstHopExited) {
+        result += fmt::sprintf("\n  Rank %d (first hop to target rank %d) has exited", firstHopEdge, targetRank);
+      } else {
+        auto edgeIt = edgePeers.find(firstHopEdge);
+        if (edgeIt != edgePeers.end()) {
+          auto& pi = *edgeIt->second;
+          if (pi.tcpconnections.empty()) {
+            result +=
+                fmt::sprintf("\n  No TCP connection to rank %d (first hop to target rank %d)", firstHopEdge, targetRank);
+            if (pi.addresses.empty()) {
+              result += " - no TCP addresses received";
+            }
+          } else {
+            // Connection exists but no response
+            result +=
+                fmt::sprintf("\n  TCP connected to rank %d but no response for target rank %d", firstHopEdge, targetRank);
+            size_t pendingMsgs = pi.outgoingQueue.size();
+            if (pendingMsgs > 0) {
+              result += fmt::sprintf(" (%zu messages pending)", pendingMsgs);
+            }
           }
         } else {
-          // Connection exists but no response
-          result +=
-              fmt::sprintf("\n  TCP connected to rank %d but no response for target rank %d", firstHopEdge, targetRank);
-          size_t pendingMsgs = pi.outgoingQueue.size();
-          if (pendingMsgs > 0) {
-            result += fmt::sprintf(" (%zu messages pending)", pendingMsgs);
-          }
+          result += fmt::sprintf("\n  No edge info for rank %d - address not received from rank 0", firstHopEdge);
         }
-      } else {
-        result += fmt::sprintf("\n  No edge info for rank %d - address not received from rank 0", firstHopEdge);
       }
     }
 
     // On rank 0, if target rank is different from first hop, check if we know about the target
     if (rank == 0 && targetRank != firstHopEdge && targetRank != rank && targetRank != (uint32_t)-1) {
-      if (!peerInfos[targetRank].has_value()) {
+      if (!rankInfos[targetRank].has_value()) {
         result += fmt::sprintf("\n  Target rank %d never connected", targetRank);
-      } else if (peerInfos[targetRank]->destroyed) {
+      } else if (shutdownStates[targetRank].exited) {
         result += fmt::sprintf("\n  Target rank %d has exited", targetRank);
       }
     }
@@ -1707,7 +1798,7 @@ struct StoreImpl {
       // Since the list is chronological, index order == time order
       // Key is (reportingRank << 32) | stuckEdge
       HashMap<uint64_t, size_t> lastSuccessIndex;
-      for (size_t i = 0; i < receivedDiagnostics.size(); ++i) {
+      for (size_t i : indices(receivedDiagnostics)) {
         const auto& diag = receivedDiagnostics[i];
         if (diag.kind == DiagnosticKind::Success) {
           uint64_t key = ((uint64_t)diag.reportingRank << 32) | diag.stuckEdge;
@@ -1716,7 +1807,7 @@ struct StoreImpl {
       }
 
       auto now = std::chrono::steady_clock::now();
-      for (size_t i = 0; i < receivedDiagnostics.size(); ++i) {
+      for (size_t i : indices(receivedDiagnostics)) {
         const auto& diag = receivedDiagnostics[i];
         // Only skip Transient entries that were later superseded by a success
         // Error entries (like connection lost) are always shown
@@ -1736,7 +1827,57 @@ struct StoreImpl {
     return result;
   }
 
-  void sendMessage(uint32_t edge, BufferHandle buffer, PeerInfo& pi, uint32_t diagnosticSource) {
+  // Forward a broadcast message to edges that should receive it based on spanning tree routing.
+  // Called when we receive a broadcast from sourceRank and need to forward to our subtree.
+  // senderEdge is the edge we received from (to avoid sending back).
+  void forwardBroadcast(uint32_t sourceRank, uint8_t messageType, int32_t senderEdge) {
+    for (auto& [edge, piPtr] : edgePeers) {
+      auto& pi = *piPtr;
+      if (!pi.broadcastForwardFor.contains(sourceRank)) continue;
+
+      // The sender should never be in broadcastForwardFor - we can't be on the path
+      // from the source to the sender (the sender forwarded to us, not vice versa)
+      CHECK(edge != (uint32_t)senderEdge);
+
+      auto buffer = serializeToBuffer(
+          signatureMessage,
+          MessageHeader{
+              .ttl = worldSize,
+              .seq = 0,
+              .destinationRank = edge,
+              .id = 0,
+              .sourceRank = sourceRank,
+              .diagnosticSource = rank,
+              .messageType = messageType,
+          });
+      sendMessage(edge, std::move(buffer), pi, rank);
+    }
+  }
+
+  // Broadcast a message to all ranks in the mesh.
+  // Uses spanning tree routing: send to all edges, each edge forwards to ranks
+  // that use them as first hop to reach us.
+  template<typename... Args>
+  void broadcastMessage(uint8_t messageType, const Args&... args) {
+    for (auto& [edge, piPtr] : edgePeers) {
+      auto& pi = *piPtr;
+      auto buffer = serializeToBuffer(
+          signatureMessage,
+          MessageHeader{
+              .ttl = worldSize,
+              .seq = 0,  // Will be patched by sendMessage
+              .destinationRank = edge,
+              .id = 0,
+              .sourceRank = rank,
+              .diagnosticSource = rank,
+              .messageType = messageType,
+          },
+          args...);
+      sendMessage(edge, std::move(buffer), pi, rank);
+    }
+  }
+
+  void sendMessage(uint32_t edge, BufferHandle buffer, EdgeInfo& pi, uint32_t diagnosticSource) {
     if (edge == rank) {
       processMessage(std::move(buffer), edge);
       return;
@@ -1779,7 +1920,7 @@ struct StoreImpl {
 
   // Send diagnostic source info to an edge if not already sent
   // Must be called before sending a message with the given diagnosticSource to this edge
-  void ensureDiagnosticSourceSent(uint32_t edge, uint32_t diagnosticSource, PeerInfo& pi) {
+  void ensureDiagnosticSourceSent(uint32_t edge, uint32_t diagnosticSource, EdgeInfo& pi) {
     if (edge == rank) {
       return; // No need to inform ourselves
     }
@@ -1849,13 +1990,13 @@ struct StoreImpl {
     }
   }
 
-  void destroyWait(std::shared_ptr<Wait>& w) {
+  void exitWait(std::shared_ptr<Wait>& w) {
     std::lock_guard l(w->mutex);
     w->error = true;
-    if (destroySourceRank && destroySourceRank != rank) {
-      w->errorMessage = fmt::sprintf("store was destroyed on rank %d", *destroySourceRank);
+    if (exitSourceRank && exitSourceRank != rank) {
+      w->errorMessage = fmt::sprintf("store was shut down on rank %d", *exitSourceRank);
     } else {
-      w->errorMessage = fmt::sprintf("store was destroyed");
+      w->errorMessage = fmt::sprintf("store was shut down");
     }
     w->futex = 1;
     futexWakeAll(&w->futex);
@@ -1878,8 +2019,8 @@ struct StoreImpl {
     w->targetRank = r;
     w->firstHopEdge = edge;
 
-    if (destroyed) {
-      destroyWait(w);
+    if (exited) {
+      exitWait(w);
     } else {
       waits[id] = w;
 
@@ -1973,23 +2114,12 @@ namespace {
 
 struct Dtor {
   ~Dtor() {
-    auto now = std::chrono::steady_clock::now();
-    auto end = now;
-    std::unique_lock l(*activeStoresMutex);
+    // Send exit messages to peers for any stores still alive at process exit.
+    // The stores themselves may not be deleted (if TcpStore objects still exist),
+    // but we notify peers that we're shutting down.
+    std::lock_guard l(*activeStoresMutex);
     for (auto* x : *activeStores) {
-      x->destroy();
-      end = std::max(end, x->destroyTime + std::chrono::seconds(2));
-    }
-    l.unlock();
-    while (now < end) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      l.lock();
-      if (activeStores->empty()) {
-        l.unlock();
-        break;
-      }
-      l.unlock();
-      now = std::chrono::steady_clock::now();
+      x->shutdown();
     }
   }
 } dtor;
@@ -2010,7 +2140,8 @@ TcpStore::TcpStore(
 
 TcpStore::~TcpStore() {
   if (--impl->refcount == 0) {
-    impl->destroy();
+    impl->shutdown();
+    delete impl;
   }
 }
 

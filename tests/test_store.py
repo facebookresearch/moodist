@@ -191,3 +191,92 @@ def test_store_timeout_on_missing_key(ctx: TestContext):
         store.get,
         "this_key_does_not_exist"
     )
+
+
+@test
+def test_store_graceful_shutdown(ctx: TestContext):
+    """Test that stores shut down gracefully without 'store was shut down' errors.
+
+    This verifies the two-phase shutdown protocol:
+    1. All ranks signal shutdown
+    2. All ranks wait for peers to acknowledge
+    3. All ranks signal exit
+    4. No spurious errors during coordinated shutdown
+    """
+    import time
+
+    # Create store directly (not via create_store) so we have full control
+    # over when it's destroyed - create_store keeps a reference in _keepalive
+    store = moodist.TcpStore(
+        ctx.master_addr,
+        ctx.master_port + 1900,  # Use unique port to avoid conflicts
+        "shutdown_test",
+        ctx.world_size,
+        ctx.rank,
+        timedelta(seconds=30),
+    )
+
+    # Do some operations to ensure the store is fully connected
+    store.set(f"key_{ctx.rank}", f"value_{ctx.rank}".encode())
+    ctx.barrier()
+
+    # Verify all keys are readable
+    for r in range(ctx.world_size):
+        result = store.get(f"key_{r}")
+        ctx.assert_equal(result, f"value_{r}".encode())
+
+    # Stagger the shutdown slightly - rank 0 destroys first, others follow
+    # This tests that the two-phase protocol handles asymmetric shutdown timing
+    # Cap at 500ms to stay well under the 2s timeout even for large world sizes
+    time.sleep(min(0.01 * ctx.rank, 0.5))
+
+    # Explicitly delete the store to trigger shutdown
+    # The two-phase protocol should prevent "store was shut down on rank X" errors
+    del store
+
+    # If we get here without exceptions, the graceful shutdown worked
+    ctx.barrier()
+
+
+@test
+def test_store_unexpected_shutdown_error(ctx: TestContext):
+    """Test that unexpected shutdown still produces 'store was shut down' error."""
+    import time
+
+    if ctx.world_size < 2:
+        return
+
+    # Create store directly (not via create_store) so we have full control
+    # over when it's destroyed - create_store keeps a reference in _keepalive
+    store = moodist.TcpStore(
+        ctx.master_addr,
+        ctx.master_port + 2000,  # Use unique port to avoid conflicts
+        "unexpected_shutdown_test",
+        ctx.world_size,
+        ctx.rank,
+        timedelta(seconds=10),  # Longer than 2s shutdown grace period
+    )
+
+    # Ensure store is connected
+    store.set(f"key_{ctx.rank}", f"value_{ctx.rank}".encode())
+    ctx.barrier()
+
+    if ctx.rank == 0:
+        del store
+        time.sleep(3.0)
+    elif ctx.rank == 1:
+        time.sleep(0.1)
+        try:
+            store.wait(["key_that_was_never_set"])
+            ctx.assert_true(False, "Expected RuntimeError but wait() returned")
+        except RuntimeError as e:
+            ctx.assert_true(
+                "shut down" in str(e).lower(),
+                f"Expected 'shut down' in error message, got: {e}"
+            )
+        del store
+    else:
+        time.sleep(0.5)
+        del store
+
+    ctx.barrier()
