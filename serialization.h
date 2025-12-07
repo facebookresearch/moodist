@@ -105,7 +105,7 @@ void serializeVector(X& x, const Vector& v) {
 template<typename X, typename Vector>
 void serializeVector(X& x, Vector& v) {
   using T = typename Vector::value_type;
-  if constexpr (std::is_trivial_v<T> && !has_serialize_helper<X>::template has_serialize<T>) {
+  if constexpr (std::is_trivially_copyable_v<T> && !has_serialize_helper<X>::template has_serialize<T>) {
     std::basic_string_view<T> view;
     x(view);
     v.resize(view.size());
@@ -210,7 +210,7 @@ struct Serializer {
     std::memcpy(dst, src, len);
     return dst + len;
   }
-  template<typename Op, typename T, std::enable_if_t<std::is_trivial_v<T>>* = nullptr>
+  template<typename Op, typename T, std::enable_if_t<std::is_trivially_copyable_v<T>>* = nullptr>
   [[gnu::always_inline]] std::byte* write(Op, std::byte* dst, T v) {
     dst = write(Op{}, dst, (void*)&v, sizeof(v));
     return dst;
@@ -268,7 +268,7 @@ struct Deserializer {
     consume(len);
     return {data, len};
   }
-  template<typename T, std::enable_if_t<std::is_trivial_v<T>>* = nullptr>
+  template<typename T, std::enable_if_t<std::is_trivially_copyable_v<T>>* = nullptr>
   [[gnu::always_inline]] void read(T& r) {
     if (checked && length - offset < sizeof(T)) [[unlikely]] {
       eod();
