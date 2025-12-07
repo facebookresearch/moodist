@@ -25,7 +25,7 @@ from pathlib import Path
 tests_dir = Path(__file__).parent
 sys.path.insert(0, str(tests_dir))
 
-from framework import TestRunner, create_context_from_env, get_tests, clear_tests
+from framework import TestRunner, create_context_from_env, get_tests, clear_tests, clear_process_group_cache
 
 
 def load_test_module(path: Path):
@@ -76,8 +76,9 @@ def main():
         if ctx.rank == 0:
             print(f"=== {test_file.name} ===")
 
-        # Clear any previously registered tests
+        # Clear any previously registered tests and cached process groups
         clear_tests()
+        clear_process_group_cache()
 
         # Load the test module (this registers tests via @test decorator)
         try:

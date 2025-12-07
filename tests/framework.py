@@ -296,19 +296,42 @@ def create_context_from_env() -> TestContext:
     )
 
 
-def create_process_group(ctx: TestContext):
-    """Helper to create a ProcessGroup for testing.
+# Cached process group for faster tests (shared within a test file)
+_cached_pg = None
+_cached_pg_store = None
 
-    Creates a new MoodistProcessGroup with its own store. The process group
-    is automatically kept alive until after the post-test barrier.
+
+def clear_process_group_cache():
+    """Clear the cached process group. Called between test files."""
+    global _cached_pg, _cached_pg_store
+    _cached_pg = None
+    _cached_pg_store = None
+
+
+def create_process_group(ctx: TestContext, fresh: bool = False):
+    """Helper to create or reuse a ProcessGroup for testing.
+
+    By default, returns a cached ProcessGroup shared across tests in the same
+    file. This is faster since moodist doesn't need to reinitialize CUDA.
+
+    Args:
+        ctx: Test context
+        fresh: If True, create a new ProcessGroup instead of using cache
+
+    Returns:
+        MoodistProcessGroup instance
     """
+    global _cached_pg, _cached_pg_store
     from datetime import timedelta
     import torch
     import moodist
 
-    key = f"pg_{ctx._current_test_id}"
-    store = ctx.create_store(key=key, timeout=timedelta(seconds=60))
-    torch.cuda.set_device(ctx.local_rank)
-    pg = moodist.MoodistProcessGroup(store, ctx.rank, ctx.world_size)
-    ctx.keep_alive(pg)
-    return pg
+    if fresh or _cached_pg is None:
+        key = f"pg_{ctx._current_test_id}"
+        store = ctx.create_store(key=key, timeout=timedelta(seconds=60))
+        torch.cuda.set_device(ctx.local_rank)
+        pg = moodist.MoodistProcessGroup(store, ctx.rank, ctx.world_size)
+        _cached_pg = pg
+        _cached_pg_store = store
+
+    return _cached_pg
