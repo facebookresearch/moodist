@@ -9,6 +9,9 @@ Usage:
     # Run specific test files:
     torchrun --nproc-per-node 8 tests/run.py test_store.py test_queue.py
 
+    # Run a specific test by name:
+    torchrun --nproc-per-node 8 tests/run.py test_store.py::test_store_basic_set_get
+
     # Run single-process (for non-distributed tests like serialize):
     python tests/run.py test_serialize.py
 
@@ -43,6 +46,14 @@ def discover_test_files(tests_dir: Path) -> list[Path]:
     return sorted(tests_dir.glob("test_*.py"))
 
 
+def parse_test_arg(arg: str) -> tuple[str, str | None]:
+    """Parse a test argument like 'test_store.py::test_name' into (file, test_name)."""
+    if "::" in arg:
+        file_part, test_name = arg.split("::", 1)
+        return file_part, test_name
+    return arg, None
+
+
 def main():
     ctx = create_context_from_env()
 
@@ -52,9 +63,15 @@ def main():
         print()
 
     # Determine which test files to run
+    test_filter = None  # Optional filter for specific test name
     if len(sys.argv) > 1:
-        # Specific files provided
-        test_files = [tests_dir / arg for arg in sys.argv[1:]]
+        # Parse arguments - support file.py::test_name syntax
+        test_files = []
+        for arg in sys.argv[1:]:
+            file_part, test_name = parse_test_arg(arg)
+            test_files.append(tests_dir / file_part)
+            if test_name:
+                test_filter = test_name
     else:
         # Discover all test files
         test_files = discover_test_files(tests_dir)
@@ -95,6 +112,15 @@ def main():
             if ctx.rank == 0:
                 print("  (no tests found)")
             continue
+
+        # Filter tests if a specific test name was requested
+        if test_filter:
+            tests = [(name, fn) for name, fn in tests if name == test_filter]
+            if not tests:
+                if ctx.rank == 0:
+                    print(f"  Test '{test_filter}' not found")
+                all_passed = False
+                continue
 
         runner.run_all(tests)
 
