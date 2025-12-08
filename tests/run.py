@@ -20,7 +20,7 @@ Usage:
 
     # Output each rank to separate log files:
     torchrun --nproc-per-node 8 tests/run.py --per-rank-logs
-    # Creates test_logs/rank_000.log, test_logs/rank_001.log, etc.
+    # Creates test_logs/rank_0.log, test_logs/rank_1.log, etc.
 """
 
 import importlib.util
@@ -35,14 +35,12 @@ sys.path.insert(0, str(tests_dir))
 from framework import TestRunner, create_context_from_env, get_tests, clear_tests, clear_process_group_cache
 
 
-def setup_per_rank_logging(rank: int, world_size: int, log_dir: str):
+def setup_per_rank_logging(rank: int, log_dir: str):
     """Redirect stdout/stderr to per-rank log files."""
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # Zero-pad rank based on world size
-    width = len(str(world_size - 1))
-    log_file = log_path / f"rank_{rank:0{width}d}.log"
+    log_file = log_path / f"rank_{rank}.log"
 
     # Open file and redirect at the OS level to capture C++ output too
     f = open(log_file, "w", buffering=1)  # Line buffered
@@ -92,7 +90,7 @@ def main():
             remaining_args.append(arg)
 
     if per_rank_logs:
-        log_file = setup_per_rank_logging(ctx.rank, ctx.world_size, "test_logs")
+        log_file = setup_per_rank_logging(ctx.rank, "test_logs")
         ctx.per_rank_logs = True
 
     if ctx.rank == 0 or per_rank_logs:
