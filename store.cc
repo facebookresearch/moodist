@@ -279,6 +279,14 @@ struct StoreImpl {
     // For broadcast routing: ranks for which this edge uses us as their first hop
     // When we receive a broadcast from source S, we forward to this edge if S is in this set
     HashMap<uint32_t, bool> broadcastForwardFor;
+
+    // Pending broadcasts received before we knew broadcastForwardFor for this edge
+    // Replayed when the edge connects and tells us which source ranks to forward
+    struct PendingBroadcast {
+      uint32_t sourceRank;
+      BufferHandle buffer;
+    };
+    Vector<PendingBroadcast> pendingBroadcasts;
   };
 
   // RankInfo: info about a rank received via UDP connect (only used on rank 0)
@@ -855,6 +863,9 @@ struct StoreImpl {
                 for (uint32_t r : msg.broadcastForwardRanks) {
                   pi.broadcastForwardFor[r] = true;
                 }
+
+                // Replay any pending broadcasts that should be forwarded to this edge
+                replayPendingBroadcasts(msg.sourceRank, pi);
 
                 // log.info("connected to rank %d\n", msg.sourceRank);
 
@@ -1791,28 +1802,55 @@ struct StoreImpl {
     return result;
   }
 
+  // Replay pending broadcasts when an edge connects and we learn its broadcastForwardFor set.
+  // Sends any queued broadcasts whose sourceRank matches the edge's broadcastForwardFor.
+  void replayPendingBroadcasts(uint32_t edge, EdgeInfo& pi) {
+    for (auto& pending : pi.pendingBroadcasts) {
+      if (!pi.broadcastForwardFor.contains(pending.sourceRank)) continue;
+
+      // Buffer is already prepared with correct TTL and destinationRank
+      sendMessage(edge, std::move(pending.buffer), pi, rank);
+    }
+    pi.pendingBroadcasts.clear();
+  }
+
   // Forward a broadcast message to edges in our spanning tree subtree.
-  // Makes a copy of the buffer for each edge, patching destinationRank.
+  // Makes a copy of the buffer for each edge, patching destinationRank and decrementing TTL.
+  // If an edge hasn't connected yet, queue the broadcast to be replayed when the edge connects.
   void forwardBroadcast(uint32_t sourceRank, const BufferHandle& originalBuffer, int32_t senderEdge) {
     // Buffer layout: signature(8) + ttl(4) + seq(4) + destinationRank(4) + ...
+    constexpr size_t ttlOffset = 8;
     constexpr size_t destRankOffset = 8 + 4 + 4;  // offset 16
+
+    uint32_t ttl;
+    std::memcpy(&ttl, &originalBuffer->data()[ttlOffset], sizeof(ttl));
+    CHECK(ttl != 0);
+    --ttl;
 
     for (size_t i : range(edgePeerCount)) {
       auto& [edge, pi] = edgePeers[i];
-      if (!pi.broadcastForwardFor.contains(sourceRank)) continue;
 
-      // The sender should never be in broadcastForwardFor - we can't be on the path
-      // from the source to the sender (the sender forwarded to us, not vice versa)
-      CHECK(edge != (uint32_t)senderEdge);
+      // Skip the edge we received this broadcast from
+      if (edge == (uint32_t)senderEdge) continue;
 
-      // Copy the original buffer
+      // If edge has connected, check if we should forward to it
+      if (pi.everConnected && !pi.broadcastForwardFor.contains(sourceRank)) continue;
+
+      // Copy the original buffer, patch TTL and destinationRank
       auto buffer = makeBuffer(originalBuffer->size());
       std::memcpy(buffer->data(), originalBuffer->data(), originalBuffer->size());
-
-      // Patch destinationRank for this edge
+      std::memcpy(&buffer->data()[ttlOffset], &ttl, sizeof(ttl));
       std::memcpy(&buffer->data()[destRankOffset], &edge, sizeof(edge));
 
-      sendMessage(edge, std::move(buffer), pi, rank);
+      if (!pi.everConnected) {
+        // Queue the broadcast to replay when the edge connects
+        pi.pendingBroadcasts.emplace_back(EdgeInfo::PendingBroadcast{
+            .sourceRank = sourceRank,
+            .buffer = std::move(buffer),
+        });
+      } else {
+        sendMessage(edge, std::move(buffer), pi, rank);
+      }
     }
   }
 
