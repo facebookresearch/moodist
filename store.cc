@@ -49,7 +49,13 @@ struct MessageHeader {
   uint32_t sourceRank;
   uint32_t diagnosticSource;
   uint8_t messageType;
+  bool broadcast = false;  // If true, forward to broadcastForwardFor edges
 };
+
+// Verify struct layout for code that patches fields directly in buffers
+static_assert(offsetof(MessageHeader, ttl) == 0);
+static_assert(offsetof(MessageHeader, seq) == 4);
+static_assert(offsetof(MessageHeader, destinationRank) == 8);
 
 struct DiagnosticInfoMessage {
   std::string_view key;
@@ -992,6 +998,11 @@ struct StoreImpl {
       return;
     }
 
+    // Handle broadcast forwarding before processing the message
+    if (hdr.broadcast) {
+      forwardBroadcast(hdr.sourceRank, data, edgeRank);
+    }
+
     if (hdr.messageType == messageSet) {
       std::string key;
       std::vector<uint8_t> value;
@@ -1097,10 +1108,8 @@ struct StoreImpl {
           pi, hdr.diagnosticSource);
     } else if (hdr.messageType == messageShutdown) {
       // Phase 1: peer is signaling it wants to shutdown
-      // sourceRank is the rank that is shutting down
-      if (hdr.sourceRank < shutdownStates.size() && !shutdownStates[hdr.sourceRank].shutdown) {
+      if (hdr.sourceRank < shutdownStates.size()) {
         shutdownStates[hdr.sourceRank].shutdown = true;
-        forwardBroadcast(hdr.sourceRank, messageShutdown, edgeRank);
       }
       // Start our own shutdown if we haven't already
       if (!shuttingDown) {
@@ -1113,10 +1122,8 @@ struct StoreImpl {
       }
     } else if (hdr.messageType == messageExit) {
       // Phase 2: peer is actually exiting
-      // sourceRank is the rank that is exiting
-      if (hdr.sourceRank < shutdownStates.size() && !shutdownStates[hdr.sourceRank].exited) {
+      if (hdr.sourceRank < shutdownStates.size()) {
         shutdownStates[hdr.sourceRank].exited = true;
-        forwardBroadcast(hdr.sourceRank, messageExit, edgeRank);
       }
       if (!exited) {
         if (!shuttingDown) {
@@ -1827,10 +1834,12 @@ struct StoreImpl {
     return result;
   }
 
-  // Forward a broadcast message to edges that should receive it based on spanning tree routing.
-  // Called when we receive a broadcast from sourceRank and need to forward to our subtree.
-  // senderEdge is the edge we received from (to avoid sending back).
-  void forwardBroadcast(uint32_t sourceRank, uint8_t messageType, int32_t senderEdge) {
+  // Forward a broadcast message to edges in our spanning tree subtree.
+  // Makes a copy of the buffer for each edge, patching destinationRank.
+  void forwardBroadcast(uint32_t sourceRank, const BufferHandle& originalBuffer, int32_t senderEdge) {
+    // Buffer layout: signature(8) + ttl(4) + seq(4) + destinationRank(4) + ...
+    constexpr size_t destRankOffset = 8 + 4 + 4;  // offset 16
+
     for (auto& [edge, piPtr] : edgePeers) {
       auto& pi = *piPtr;
       if (!pi.broadcastForwardFor.contains(sourceRank)) continue;
@@ -1839,17 +1848,13 @@ struct StoreImpl {
       // from the source to the sender (the sender forwarded to us, not vice versa)
       CHECK(edge != (uint32_t)senderEdge);
 
-      auto buffer = serializeToBuffer(
-          signatureMessage,
-          MessageHeader{
-              .ttl = worldSize,
-              .seq = 0,
-              .destinationRank = edge,
-              .id = 0,
-              .sourceRank = sourceRank,
-              .diagnosticSource = rank,
-              .messageType = messageType,
-          });
+      // Copy the original buffer
+      auto buffer = makeBuffer(originalBuffer->size());
+      std::memcpy(buffer->data(), originalBuffer->data(), originalBuffer->size());
+
+      // Patch destinationRank for this edge
+      std::memcpy(&buffer->data()[destRankOffset], &edge, sizeof(edge));
+
       sendMessage(edge, std::move(buffer), pi, rank);
     }
   }
@@ -1871,6 +1876,7 @@ struct StoreImpl {
               .sourceRank = rank,
               .diagnosticSource = rank,
               .messageType = messageType,
+              .broadcast = true,
           },
           args...);
       sendMessage(edge, std::move(buffer), pi, rank);

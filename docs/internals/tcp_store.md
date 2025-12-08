@@ -119,37 +119,21 @@ std::optional<uint32_t> exitSourceRank;  // Rank that caused unexpected exit (fo
 
 ## Broadcast Routing
 
-Two functions handle broadcast routing:
+Messages can be broadcast to all ranks using spanning tree routing. The `MessageHeader` has a `broadcast` flag - when set, each rank automatically forwards the message to its subtree before processing.
 
 **`broadcastMessage(messageType, args...)`** - Initiate a broadcast from this rank:
+- Sets `broadcast = true` in the header
 - Sends to all direct edges (neighbors in the mesh)
-- Each edge forwards to ranks in its `broadcastForwardFor` set
 - Variadic template allows passing additional payload after the header
 
-```cpp
-template<typename... Args>
-void broadcastMessage(uint8_t messageType, const Args&... args) {
-  for (auto& [edge, piPtr] : edgePeers) {
-    auto buffer = serializeToBuffer(signatureMessage, header, args...);
-    sendMessage(edge, std::move(buffer), pi, rank);
-  }
-}
-```
-
-**`forwardBroadcast(sourceRank, messageType, senderEdge)`** - Forward a received broadcast:
-- Called when we receive a broadcast from another rank
+**`forwardBroadcast(sourceRank, buffer, senderEdge)`** - Forward a received broadcast:
+- Called automatically in `processMessage` when `hdr.broadcast` is true
+- Makes a copy of the original buffer for each forwarding edge
+- Patches `destinationRank` in each copy before sending
 - Forwards to edges that have `sourceRank` in their `broadcastForwardFor` set
 - `senderEdge` prevents sending back to the edge we received from
 
-```cpp
-void forwardBroadcast(uint32_t sourceRank, uint8_t messageType, int32_t senderEdge) {
-  for (auto& [edge, piPtr] : edgePeers) {
-    if (!pi.broadcastForwardFor.contains(sourceRank)) continue;
-    CHECK(edge != (uint32_t)senderEdge);  // Never send back to sender
-    sendMessage(edge, ...);
-  }
-}
-```
+The spanning tree structure guarantees each rank receives the broadcast exactly once - no deduplication needed.
 
 ## Key Distribution
 
