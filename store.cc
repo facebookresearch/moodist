@@ -299,7 +299,15 @@ struct StoreImpl {
 
   Vector<std::optional<RankInfo>> rankInfos;  // Only populated on rank 0
   Vector<ShutdownState> shutdownStates;        // Indexed by rank, used on all ranks
-  HashMap<uint32_t, std::unique_ptr<EdgeInfo>> edgePeers;
+
+  // Edge peers: at most 4 edges in the mesh topology
+  static constexpr size_t maxEdgePeers = 4;
+  struct EdgePeerEntry {
+    uint32_t rank = -1;
+    EdgeInfo info;
+  };
+  std::array<EdgePeerEntry, maxEdgePeers> edgePeers;
+  size_t edgePeerCount = 0;
 
   // Info about diagnostic sources (originators of requests) for sending diagnostics via UDP
   struct DiagnosticSourceInfo {
@@ -547,7 +555,6 @@ struct StoreImpl {
     if (dead) {
       return;
     }
-    CHECK(edgePeers.contains(edge));
     CHECK(edge != -1);
     auto& pi = getEdge(edge);
     reaptcpconnections(pi);
@@ -725,8 +732,8 @@ struct StoreImpl {
     std::lock_guard l(mutex);
     auto now = std::chrono::steady_clock::now();
 
-    for (auto& [edge, piPtr] : edgePeers) {
-      auto& pi = *piPtr;
+    for (size_t i : range(edgePeerCount)) {
+      auto& [edge, pi] = edgePeers[i];
 
       for (auto& msg : pi.outgoingQueue) {
         if (msg.diagnosticSource == (uint32_t)-1) {
@@ -897,7 +904,6 @@ struct StoreImpl {
         deserializeBufferPart(view, ttl, seq);
         CHECK(ttl != 0);
         std::lock_guard l(mutex);
-        CHECK(edgePeers.contains(ci->sourceRank));
         CHECK(ci->sourceRank != -1);
         auto& pi = getEdge(ci->sourceRank);
 
@@ -938,7 +944,6 @@ struct StoreImpl {
         deserializeBufferPart(view, seq);
         std::lock_guard l(mutex);
         ci->lastReceive = std::chrono::steady_clock::now();
-        CHECK(edgePeers.contains(ci->sourceRank));
         CHECK(ci->sourceRank != -1);
         auto& pi = getEdge(ci->sourceRank);
         for (auto i = pi.outgoingQueue.begin(); i != pi.outgoingQueue.end(); ++i) {
@@ -962,12 +967,17 @@ struct StoreImpl {
     }
   }
 
-  EdgeInfo& getEdge(uint32_t rank) {
-    auto& ptr = edgePeers[rank];
-    if (!ptr) {
-      ptr = std::make_unique<EdgeInfo>();
+  EdgeInfo* findEdge(uint32_t rank) {
+    for (size_t i : range(edgePeerCount)) {
+      if (edgePeers[i].rank == rank) return &edgePeers[i].info;
     }
-    return *ptr;
+    return nullptr;
+  }
+
+  EdgeInfo& getEdge(uint32_t rank) {
+    auto* e = findEdge(rank);
+    CHECK(e);
+    return *e;
   }
 
   void processMessage(BufferHandle data, uint32_t edgeRank) {
@@ -1238,6 +1248,13 @@ struct StoreImpl {
 
     findPaths();
 
+    // Pre-populate edgePeers for all our mesh edges
+    edgePeerCount = edges[rank].size();
+    CHECK(edgePeerCount <= maxEdgePeers);
+    for (size_t i : range(edgePeerCount)) {
+      edgePeers[i].rank = edges[rank][i];
+    }
+
     rankInfos.resize(worldSize);
     shutdownStates.resize(worldSize);
 
@@ -1336,11 +1353,12 @@ struct StoreImpl {
     while (true) {
       Vector<std::shared_ptr<ConnectionInfo>> allconnections;
       std::unique_lock l(mutex);
-      for (auto& v : edgePeers) {
-        for (auto& x : v.second->tcpconnections) {
+      for (size_t i : range(edgePeerCount)) {
+        auto& pi = edgePeers[i].info;
+        for (auto& x : pi.tcpconnections) {
           allconnections.push_back(x);
         }
-        v.second->tcpconnections.clear();
+        pi.tcpconnections.clear();
       }
       l.unlock();
       if (allconnections.empty()) {
@@ -1439,10 +1457,10 @@ struct StoreImpl {
 
     Vector<uint32_t> reconnect;
 
-    for (auto& v : edgePeers) {
-      auto& pi = *v.second;
+    for (size_t i : range(edgePeerCount)) {
+      auto& [edgeRank, pi] = edgePeers[i];
       if (pi.tcpconnections.empty() && !pi.addresses.empty()) {
-        reconnect.push_back(v.first);
+        reconnect.push_back(edgeRank);
       }
       for (auto& ci : pi.tcpconnections) {
         if (now - ci->lastReceive >= std::chrono::seconds(40) || ci->connection->closed()) {
@@ -1705,9 +1723,9 @@ struct StoreImpl {
       if (firstHopExited) {
         result += fmt::sprintf("\n  Rank %d (first hop to target rank %d) has exited", firstHopEdge, targetRank);
       } else {
-        auto edgeIt = edgePeers.find(firstHopEdge);
-        if (edgeIt != edgePeers.end()) {
-          auto& pi = *edgeIt->second;
+        auto* piPtr = findEdge(firstHopEdge);
+        if (piPtr) {
+          auto& pi = *piPtr;
           if (pi.tcpconnections.empty()) {
             result +=
                 fmt::sprintf("\n  No TCP connection to rank %d (first hop to target rank %d)", firstHopEdge, targetRank);
@@ -1779,8 +1797,8 @@ struct StoreImpl {
     // Buffer layout: signature(8) + ttl(4) + seq(4) + destinationRank(4) + ...
     constexpr size_t destRankOffset = 8 + 4 + 4;  // offset 16
 
-    for (auto& [edge, piPtr] : edgePeers) {
-      auto& pi = *piPtr;
+    for (size_t i : range(edgePeerCount)) {
+      auto& [edge, pi] = edgePeers[i];
       if (!pi.broadcastForwardFor.contains(sourceRank)) continue;
 
       // The sender should never be in broadcastForwardFor - we can't be on the path
@@ -1803,8 +1821,8 @@ struct StoreImpl {
   // that use them as first hop to reach us.
   template<typename... Args>
   void broadcastMessage(uint8_t messageType, const Args&... args) {
-    for (auto& [edge, piPtr] : edgePeers) {
-      auto& pi = *piPtr;
+    for (size_t i : range(edgePeerCount)) {
+      auto& [edge, pi] = edgePeers[i];
       auto buffer = serializeToBuffer(
           signatureMessage,
           MessageHeader{
@@ -1828,7 +1846,6 @@ struct StoreImpl {
   void sendMessageTo(uint32_t destinationRank, uint32_t id, uint32_t diagnosticSource,
                      uint8_t messageType, const Args&... args) {
     uint32_t edge = firsthop[destinationRank];
-    auto& pi = getEdge(edge);
     auto buffer = serializeToBuffer(
         signatureMessage,
         MessageHeader{
@@ -1841,7 +1858,12 @@ struct StoreImpl {
             .messageType = messageType,
         },
         args...);
-    sendMessage(edge, std::move(buffer), pi, diagnosticSource);
+    if (edge == rank) {
+      processMessage(std::move(buffer), edge);
+    } else {
+      auto& pi = getEdge(edge);
+      sendMessage(edge, std::move(buffer), pi, diagnosticSource);
+    }
   }
 
   void sendMessage(uint32_t edge, BufferHandle buffer, EdgeInfo& pi, uint32_t diagnosticSource) {
@@ -1964,7 +1986,6 @@ struct StoreImpl {
     uint32_t edge = firsthop[r];
     CHECK(edge != worldSize);
     CHECK(edge != -1);
-    auto& pi = getEdge(edge);
 
     auto w = std::make_shared<Wait>();
     // Set diagnostic info for better timeout error messages
