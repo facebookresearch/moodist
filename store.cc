@@ -32,7 +32,8 @@ static constexpr uint8_t messageCheck = 0x6;
 static constexpr uint8_t messageWait = 0x7;
 static constexpr uint8_t messageShutdown = 0x8;
 static constexpr uint8_t messageExit = 0x9;
-static constexpr uint8_t messageDiagnosticSource = 0xa;
+static constexpr uint8_t messageExitAck = 0xa;
+static constexpr uint8_t messageDiagnosticSource = 0xb;
 
 // Diagnostic kind for filtering
 enum class DiagnosticKind : uint8_t {
@@ -303,6 +304,7 @@ struct StoreImpl {
   struct ShutdownState {
     bool shutdown = false;  // peer has signaled shutdown (phase 1)
     bool exited = false;    // peer has signaled exit (phase 2)
+    bool exitAck = false;   // peer has acknowledged exit (phase 3)
   };
 
   Vector<std::optional<RankInfo>> rankInfos;  // Only populated on rank 0
@@ -1067,39 +1069,35 @@ struct StoreImpl {
       bool r = store.find(key) != store.end();
       sendMessageTo(hdr.sourceRank, hdr.id, hdr.diagnosticSource, messageDone, r);
     } else if (hdr.messageType == messageShutdown) {
-      // Phase 1: peer is signaling it wants to shutdown
+      uint32_t originRank;
+      deserializeBufferPart(view, originRank);
       if (hdr.sourceRank < shutdownStates.size()) {
         shutdownStates[hdr.sourceRank].shutdown = true;
       }
-      // Start our own shutdown if we haven't already
-      if (!shuttingDown) {
-        shuttingDown = true;
-        if (!exitSourceRank) {
-          exitSourceRank = hdr.sourceRank;
-        }
-        // Broadcast our own shutdown to all ranks
-        broadcastMessage(messageShutdown);
+      // Record origin for error messages, but don't initiate shutdown
+      if (!exitSourceRank) {
+        exitSourceRank = originRank;
       }
     } else if (hdr.messageType == messageExit) {
-      // Phase 2: peer is actually exiting
+      uint32_t originRank;
+      deserializeBufferPart(view, originRank);
       if (hdr.sourceRank < shutdownStates.size()) {
         shutdownStates[hdr.sourceRank].exited = true;
       }
       if (!exited) {
-        if (!shuttingDown) {
-          // Peer exited while we haven't started shutdown - this is unexpected
-          // Record which rank caused the unexpected exit for error messages
-          if (!exitSourceRank) {
-            exitSourceRank = hdr.sourceRank;
-          }
+        if (!shuttingDown && !exitSourceRank) {
+          exitSourceRank = originRank;
         }
-        // Mark ourselves as exited, wake any pending waits, and broadcast
         exited = true;
         exitTime = std::chrono::steady_clock::now();
         for (auto& v : waits) {
           exitWait(v.second);
         }
-        broadcastMessage(messageExit);
+        broadcastMessage(messageExit, originRank);
+      }
+    } else if (hdr.messageType == messageExitAck) {
+      if (hdr.sourceRank < shutdownStates.size()) {
+        shutdownStates[hdr.sourceRank].exitAck = true;
       }
     } else if (hdr.messageType == messageDiagnosticSource) {
       // Receive diagnostic source UDP addresses from another rank
@@ -1397,16 +1395,12 @@ struct StoreImpl {
       if (!exitSourceRank) {
         exitSourceRank = rank;
       }
-      // Broadcast shutdown message to all ranks
-      broadcastMessage(messageShutdown);
+      broadcastMessage(messageShutdown, rank);
     }
 
     if (refcount == 0) {
-      // Two-phase shutdown protocol (only when this is the last reference)
+      // Phase 1: wait for all peers to signal shutdown
       auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-
-      // Phase 1: Wait for all ranks to acknowledge shutdown
-      // This is needed even if we were triggered by another rank's shutdown
       while (std::chrono::steady_clock::now() < deadline) {
         bool allShutdown = true;
         for (uint32_t r : range(worldSize)) {
@@ -1424,19 +1418,18 @@ struct StoreImpl {
         l.lock();
       }
 
-      // Phase 2: Broadcast exit message to all ranks
-      // Also mark ourselves as exited and wake local waits
+      // Phase 2: broadcast exit, wake local waits
       if (!exited) {
         exited = true;
         exitTime = std::chrono::steady_clock::now();
         for (auto& v : waits) {
           exitWait(v.second);
         }
+        broadcastMessage(messageExit, *exitSourceRank);
       }
-      broadcastMessage(messageExit);
 
-      // Wait for all ranks to acknowledge exit
-      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      // Wait for all peers to exit
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
       while (std::chrono::steady_clock::now() < deadline) {
         bool allExited = true;
         for (uint32_t r : range(worldSize)) {
@@ -1454,10 +1447,26 @@ struct StoreImpl {
         l.lock();
       }
 
-      // Brief delay to allow exit messages to be sent before connections are closed
-      l.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      l.lock();
+      // Phase 3: broadcast ack, wait briefly for peers
+      broadcastMessage(messageExitAck);
+
+      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+      while (std::chrono::steady_clock::now() < deadline) {
+        bool allAcked = true;
+        for (uint32_t r : range(worldSize)) {
+          if (r == rank) continue;
+          if (!shutdownStates[r].exitAck) {
+            allAcked = false;
+            break;
+          }
+        }
+        if (allAcked) {
+          break;
+        }
+        l.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        l.lock();
+      }
     }
   }
 
