@@ -3291,6 +3291,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     };
 
     IVector<TDescr> descrs;
+    descrs.reserve(numInputs + numOutputs);  // Pre-allocate to prevent pointer invalidation
     IVector<TDescr*> inputs(numInputs);
     IVector<TDescr*> outputs(numOutputs);
     IVector<size_t> indexCounter(size);

@@ -464,7 +464,7 @@ struct QueueImpl {
     CHECK(multicastRemoteAddresses.size() == multicastLocations.size());
 
     qs->isMulticast = isMulticast;
-    qs->isMulticast = isMulticastLocal;
+    qs->isMulticastLocal = isMulticastLocal;
     qs->multicastLocations = multicastLocations;
     qs->multicastRemoteAddresses = multicastRemoteAddresses;
   }
