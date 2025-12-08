@@ -8,7 +8,7 @@ TcpStore is a decentralized distributed key-value store. Key implementation deta
 
 - **Mesh network topology** with spanning tree routing
 - **Consistent hashing** for key distribution across ranks
-- **Two-phase shutdown protocol** for graceful termination
+- **Three-phase shutdown protocol** for graceful termination
 - **UDP diagnostics** for timeout debugging
 
 Code location: `store.cc`
@@ -49,10 +49,11 @@ Key message types for shutdown:
 |---------|---------|
 | `messageShutdown` | Phase 1: Rank signals intent to shut down |
 | `messageExit` | Phase 2: Rank is actually exiting |
+| `messageExitAck` | Phase 3: Rank acknowledges receipt of exit messages |
 
 Other message types include `messageSet`, `messageGet`, `messageWait`, `messageCheck`, `messageDone`, etc.
 
-## Two-Phase Shutdown Protocol
+## Three-Phase Shutdown Protocol
 
 ### Problem
 
@@ -61,42 +62,56 @@ Without coordination, when one rank's store is destroyed:
 2. Other ranks with pending operations (get, wait) see connection errors
 3. Users get confusing "connection reset" errors instead of meaningful messages
 
-### Solution: Two-Phase Shutdown
+### Solution: Three-Phase Shutdown
 
 **Phase 1 - Shutdown Signal (`messageShutdown`):**
 1. When a rank's store destructor is called, it broadcasts `messageShutdown` to all ranks
 2. Each rank that receives `messageShutdown` records the sender in `shutdownStates[rank].shutdown = true`
-3. Each rank also triggers its own shutdown and broadcasts `messageShutdown`
-4. The initiating rank waits (up to 2 seconds) for all peers to acknowledge shutdown
+3. Receiving `messageShutdown` does NOT trigger our own shutdown - each rank only starts shutdown when its own store is destroyed
+4. This allows pending operations to complete before we signal readiness
+5. The initiating rank waits (up to 2 seconds) for all peers to signal shutdown
 
 **Phase 2 - Exit Signal (`messageExit`):**
-1. After all ranks have acknowledged shutdown (or timeout), the rank broadcasts `messageExit`
+1. After all ranks have signaled shutdown (or timeout), the rank broadcasts `messageExit`
 2. Each rank that receives `messageExit` marks `shutdownStates[rank].exited = true`
 3. The rank wakes all pending waits with an appropriate error
-4. The rank waits (up to 2 seconds) for all peers to acknowledge exit
-5. Brief delay (50ms) to allow exit messages to propagate before closing connections
+4. The rank waits (up to 1 second) for all peers to signal exit
+
+**Phase 3 - Exit Acknowledgment (`messageExitAck`):**
+1. After all ranks have signaled exit (or timeout), the rank broadcasts `messageExitAck`
+2. Each rank that receives `messageExitAck` marks `shutdownStates[rank].exitAck = true`
+3. The rank waits (up to 50ms) for all peers to acknowledge
+4. If all peers ack early, shutdown completes immediately without waiting the full timeout
+
+### Origin Tracking
+
+Shutdown and exit messages include the original initiator rank as payload. This ensures error messages correctly blame the rank that initiated shutdown, not a forwarding rank in the spanning tree.
+
+```cpp
+// When initiating shutdown
+broadcastMessage(messageShutdown, rank);
+
+// When forwarding
+broadcastMessage(messageShutdown, originRank);  // Preserve original
+```
 
 ### Graceful vs Unexpected Shutdown
 
-**Graceful shutdown:** All ranks call `shutdown()` (via destructor). The two-phase protocol completes normally, pending waits receive a generic "store was shut down" error.
+**Graceful shutdown:** All ranks call `shutdown()` (via destructor). The three-phase protocol completes normally, pending waits receive a generic "store was shut down" error.
 
 **Unexpected shutdown:** A rank exits without calling `shutdown()` (crash, early termination). Other ranks receive `messageExit` without prior `messageShutdown`. In this case:
-- `exitSourceRank` is set to the offending rank
+- `exitSourceRank` is set to the origin rank from the message payload
 - Error messages say "store was shut down on rank X" to help debugging
 
 ```cpp
-if (!shuttingDown) {
-  // Peer exited while we haven't started shutdown - unexpected
-  if (!exitSourceRank) {
-    exitSourceRank = hdr.sourceRank;
-  }
+if (!shuttingDown && !exitSourceRank) {
+  exitSourceRank = originRank;
 }
-// Mark ourselves as exited, wake waits, broadcast exit
 exited = true;
 for (auto& v : waits) {
   exitWait(v.second);
 }
-broadcastMessage(messageExit);
+broadcastMessage(messageExit, originRank);
 ```
 
 ### State Tracking
@@ -106,6 +121,7 @@ Per-rank shutdown state:
 struct ShutdownState {
   bool shutdown = false;  // Phase 1: received messageShutdown from this rank
   bool exited = false;    // Phase 2: received messageExit from this rank
+  bool exitAck = false;   // Phase 3: received messageExitAck from this rank
 };
 Vector<ShutdownState> shutdownStates;  // Indexed by rank
 ```
@@ -172,5 +188,12 @@ The store uses a `SpinMutex` for the main data structures. Operations that block
 Shutdown behavior is tested in `tests/test_store.py`:
 - `test_store_graceful_shutdown`: Verifies coordinated shutdown without errors
 - `test_store_unexpected_shutdown_error`: Verifies unexpected exit produces proper error messages
+- `test_noop`: Dummy test for isolating barrier store shutdown behavior
+
+For debugging at scale, use `--per-rank-logs` to redirect each rank to a separate log file:
+```bash
+torchrun --nproc-per-node 8 tests/run.py test_store.py --per-rank-logs
+# Creates test_logs/rank_000.log, test_logs/rank_001.log, etc.
+```
 
 Note: These tests create stores directly with `moodist.TcpStore()` rather than using `ctx.create_store()` to have full control over store lifetime (avoiding the `_keepalive` reference in the test framework).
