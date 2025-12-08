@@ -20,6 +20,42 @@
 
 namespace moodist {
 
+// Helper to prevent implicit conversions in SFINAE checks for free serialize functions.
+// For class types: inherits from T so template argument deduction still works.
+// For non-class types: wraps value with explicit conversion only to T.
+template<typename T, bool = std::is_class_v<T>>
+struct ExactType;
+
+template<typename T>
+struct ExactType<T, true> : T {
+  using T::T;
+};
+
+template<typename T>
+struct ExactType<T, false> {
+  const T& value;
+  operator const T&() const { return value; }
+  template<typename U, std::enable_if_t<!std::is_same_v<U, T>>* = nullptr>
+  operator U() const = delete;
+};
+
+// Mutable version for deserialization
+template<typename T, bool = std::is_class_v<T>>
+struct ExactTypeMut;
+
+template<typename T>
+struct ExactTypeMut<T, true> : T {
+  using T::T;
+};
+
+template<typename T>
+struct ExactTypeMut<T, false> {
+  T& value;
+  operator T&() const { return value; }
+  template<typename U, std::enable_if_t<!std::is_same_v<U, T>>* = nullptr>
+  operator U&() const = delete;
+};
+
 template<typename X>
 struct has_serialize_helper {
   template<typename T>
@@ -321,15 +357,23 @@ struct Serialize {
   template<typename T>
   static const bool has_builtin_write = decltype(Serialize::has_builtin_write_f<T>(0))::value;
   template<typename T>
+  static std::false_type has_free_serialize_f(...);
+  template<typename T, typename = decltype(serialize(std::declval<Serialize&>(), std::declval<ExactType<T>>()))>
+  static std::true_type has_free_serialize_f(int);
+  template<typename T>
+  static const bool has_free_serialize = decltype(Serialize::has_free_serialize_f<T>(0))::value;
+  template<typename T>
   [[gnu::always_inline]] void operator()(const T& v) {
     if constexpr (has_serialize<const T>) {
       v.serialize(*this);
     } else if constexpr (has_serialize<T>) {
       const_cast<T&>(v).serialize(*this);
+    } else if constexpr (has_free_serialize<T>) {
+      serialize(*this, v);
     } else if constexpr (has_builtin_write<const T>) {
       dst = Serializer{}.write(Op{}, dst, v);
     } else {
-      serialize(*this, v);
+      static_assert(false, "No serialization defined for type");
     }
   }
   template<typename... T>
@@ -364,15 +408,23 @@ struct SerializeExpandable {
   template<typename T>
   static const bool has_builtin_write = decltype(SerializeExpandable::has_builtin_write_f<T>(0))::value;
   template<typename T>
+  static std::false_type has_free_serialize_f(...);
+  template<typename T, typename = decltype(serialize(std::declval<SerializeExpandable&>(), std::declval<ExactType<T>>()))>
+  static std::true_type has_free_serialize_f(int);
+  template<typename T>
+  static const bool has_free_serialize = decltype(SerializeExpandable::has_free_serialize_f<T>(0))::value;
+  template<typename T>
   [[gnu::always_inline]] void operator()(const T& v) {
     if constexpr (has_serialize<const T>) {
       v.serialize(*this);
     } else if constexpr (has_serialize<T>) {
       const_cast<T&>(v).serialize(*this);
+    } else if constexpr (has_free_serialize<T>) {
+      serialize(*this, v);
     } else if constexpr (has_builtin_write<const T>) {
       twrite(v);
     } else {
-      serialize(*this, v);
+      static_assert(false, "No serialization defined for type");
     }
   }
   template<typename... T>
@@ -447,13 +499,21 @@ struct Deserialize {
   template<typename T>
   static const bool has_builtin_read = decltype(Deserialize::has_builtin_read_f<T>(0))::value;
   template<typename T>
+  static std::false_type has_free_serialize_f(...);
+  template<typename T, typename = decltype(serialize(std::declval<Deserialize&>(), std::declval<ExactTypeMut<T>>()))>
+  static std::true_type has_free_serialize_f(int);
+  template<typename T>
+  static const bool has_free_serialize = decltype(Deserialize::has_free_serialize_f<T>(0))::value;
+  template<typename T>
   [[gnu::always_inline]] void operator()(T& v) {
     if constexpr (has_serialize<T>) {
       v.serialize(*this);
+    } else if constexpr (has_free_serialize<T>) {
+      serialize(*this, v);
     } else if constexpr (has_builtin_read<T>) {
       des.read(v);
     } else {
-      serialize(*this, v);
+      static_assert(false, "No deserialization defined for type");
     }
   }
 
