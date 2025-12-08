@@ -37,6 +37,7 @@ class TestContext:
     master_addr: str
     master_port: int
     barrier_store: "moodist.TcpStore"  # Created at startup, shared across all tests
+    per_rank_logs: bool = False  # If True, all ranks print (for separate log files)
 
     _barrier_count: int = field(default=0, repr=False)
     _test_store_count: int = field(default=0, repr=False)
@@ -230,8 +231,8 @@ class TestRunner:
             result = self.run_test(name, fn)
             status = "\033[32mPASS\033[0m" if result.passed else "\033[31mFAIL\033[0m"
 
-            # Only rank 0 prints summary line
-            if self.ctx.rank == 0:
+            # Print on all ranks if per_rank_logs, otherwise only rank 0
+            if self.ctx.rank == 0 or self.ctx.per_rank_logs:
                 print(f"  {name:<50} {status}  ({result.duration:.3f}s)")
 
     def summarize(self) -> bool:
@@ -240,7 +241,7 @@ class TestRunner:
         total = len(self.results)
         failed = total - passed
 
-        if self.ctx.rank == 0:
+        if self.ctx.rank == 0 or self.ctx.per_rank_logs:
             print()
             if failed == 0:
                 print(f"\033[32m{passed}/{total} tests passed - ALL OK\033[0m")

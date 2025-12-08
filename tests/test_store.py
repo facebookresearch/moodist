@@ -12,6 +12,12 @@ from framework import TestContext, test
 
 
 @test
+def test_noop(ctx: TestContext):
+    """Dummy test that does nothing - tests barrier store shutdown only."""
+    pass
+
+
+@test
 def test_store_basic_set_get(ctx: TestContext):
     """Each rank sets its own key and retrieves it."""
     store = ctx.create_store()
@@ -224,6 +230,9 @@ def test_store_graceful_shutdown(ctx: TestContext):
     for r in range(ctx.world_size):
         result = store.get(f"key_{r}")
         ctx.assert_equal(result, f"value_{r}".encode())
+
+    # Ensure all ranks finish their gets before any rank starts shutdown
+    ctx.barrier()
 
     # Stagger the shutdown slightly - rank 0 destroys first, others follow
     # This tests that the two-phase protocol handles asymmetric shutdown timing
