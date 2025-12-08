@@ -1009,23 +1009,7 @@ struct StoreImpl {
       deserializeBufferPart(view, key, value);
       internalStoreSetValue(key, std::move(value));
 
-      CHECK(edgeRank != -1);
-      auto& pi = getEdge(edgeRank);
-
-      sendMessage(
-          edgeRank,
-          serializeToBuffer(
-              signatureMessage,
-              MessageHeader{
-                  .ttl = worldSize,
-                  .seq = 0,
-                  .destinationRank = hdr.sourceRank,
-                  .id = hdr.id,
-                  .sourceRank = rank,
-                  .diagnosticSource = hdr.diagnosticSource,
-                  .messageType = messageDone,
-              }),
-          pi, hdr.diagnosticSource);
+      sendMessageTo(hdr.sourceRank, hdr.id, hdr.diagnosticSource, messageDone);
     } else if (hdr.messageType == messageDone) {
       bool b = false;
       std::vector<uint8_t> value;
@@ -1048,64 +1032,19 @@ struct StoreImpl {
       std::string key;
       deserializeBufferPart(view, key);
       internalStoreGetValue(
-          key, [this, edgeRank, messageType = hdr.messageType, sourceRank = hdr.sourceRank, id = hdr.id,
-                diagnosticSource = hdr.diagnosticSource, key](const std::vector<uint8_t>& data) {
-            CHECK(edgeRank != -1);
-            auto& pi = getEdge(edgeRank);
+          key, [this, messageType = hdr.messageType, sourceRank = hdr.sourceRank, id = hdr.id,
+                diagnosticSource = hdr.diagnosticSource](const std::vector<uint8_t>& data) {
             if (messageType == messageGet) {
-              sendMessage(
-                  edgeRank,
-                  serializeToBuffer(
-                      signatureMessage,
-                      MessageHeader{
-                          .ttl = worldSize,
-                          .seq = 0,
-                          .destinationRank = sourceRank,
-                          .id = id,
-                          .sourceRank = rank,
-                          .diagnosticSource = diagnosticSource,
-                          .messageType = messageDone,
-                      },
-                      data),
-                  pi, diagnosticSource);
+              sendMessageTo(sourceRank, id, diagnosticSource, messageDone, data);
             } else {
-              sendMessage(
-                  edgeRank,
-                  serializeToBuffer(
-                      signatureMessage,
-                      MessageHeader{
-                          .ttl = worldSize,
-                          .seq = 0,
-                          .destinationRank = sourceRank,
-                          .id = id,
-                          .sourceRank = rank,
-                          .diagnosticSource = diagnosticSource,
-                          .messageType = messageDone,
-                      }),
-                  pi, diagnosticSource);
+              sendMessageTo(sourceRank, id, diagnosticSource, messageDone);
             }
           });
     } else if (hdr.messageType == messageCheck) {
       std::string key;
       deserializeBufferPart(view, key);
       bool r = store.find(key) != store.end();
-      CHECK(edgeRank != -1);
-      auto& pi = getEdge(edgeRank);
-      sendMessage(
-          edgeRank,
-          serializeToBuffer(
-              signatureMessage,
-              MessageHeader{
-                  .ttl = worldSize,
-                  .seq = 0,
-                  .destinationRank = hdr.sourceRank,
-                  .id = hdr.id,
-                  .sourceRank = rank,
-                  .diagnosticSource = hdr.diagnosticSource,
-                  .messageType = messageDone,
-              },
-              r),
-          pi, hdr.diagnosticSource);
+      sendMessageTo(hdr.sourceRank, hdr.id, hdr.diagnosticSource, messageDone, r);
     } else if (hdr.messageType == messageShutdown) {
       // Phase 1: peer is signaling it wants to shutdown
       if (hdr.sourceRank < shutdownStates.size()) {
@@ -1883,6 +1822,28 @@ struct StoreImpl {
     }
   }
 
+  // Convenience wrapper: build and send a message to a destination rank.
+  // Handles routing (firsthop lookup) and serialization internally.
+  template<typename... Args>
+  void sendMessageTo(uint32_t destinationRank, uint32_t id, uint32_t diagnosticSource,
+                     uint8_t messageType, const Args&... args) {
+    uint32_t edge = firsthop[destinationRank];
+    auto& pi = getEdge(edge);
+    auto buffer = serializeToBuffer(
+        signatureMessage,
+        MessageHeader{
+            .ttl = worldSize,
+            .seq = 0,
+            .destinationRank = destinationRank,
+            .id = id,
+            .sourceRank = rank,
+            .diagnosticSource = diagnosticSource,
+            .messageType = messageType,
+        },
+        args...);
+    sendMessage(edge, std::move(buffer), pi, diagnosticSource);
+  }
+
   void sendMessage(uint32_t edge, BufferHandle buffer, EdgeInfo& pi, uint32_t diagnosticSource) {
     if (edge == rank) {
       processMessage(std::move(buffer), edge);
@@ -1955,21 +1916,7 @@ struct StoreImpl {
     // Send messageDiagnosticSource
     // diagnosticSource field in the message indicates whose UDP addresses these are
     // This will recurse into sendMessage, but sentDiagnosticSourceFor guard prevents infinite recursion
-    sendMessage(
-        edge,
-        serializeToBuffer(
-            signatureMessage,
-            MessageHeader{
-                .ttl = worldSize,
-                .seq = 0,
-                .destinationRank = edge,
-                .id = 0,
-                .sourceRank = rank,
-                .diagnosticSource = diagnosticSource,
-                .messageType = messageDiagnosticSource,
-            },
-            addrs),
-        pi, diagnosticSource);
+    sendMessageTo(edge, 0, diagnosticSource, messageDiagnosticSource, addrs);
   }
 
   void internalStoreSetValue(std::string key, std::vector<uint8_t> value) {
@@ -2031,21 +1978,7 @@ struct StoreImpl {
       waits[id] = w;
 
       // diagnosticSource = rank (we are the originator)
-      sendMessage(
-          edge,
-          serializeToBuffer(
-              signatureMessage,
-              MessageHeader{
-                  .ttl = worldSize,
-                  .seq = 0,
-                  .destinationRank = r,
-                  .id = id,
-                  .sourceRank = rank,
-                  .diagnosticSource = rank,
-                  .messageType = messageType,
-              },
-              key, args...),
-          pi, rank);
+      sendMessageTo(r, id, rank, messageType, key, args...);
     }
     l.unlock();
 
