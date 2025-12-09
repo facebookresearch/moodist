@@ -13,8 +13,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 
-#include <cpython/longintrepr.h>
-
 #include <pyerrors.h>
 #include <torch/python.h>
 #include <torch/torch.h>
@@ -122,14 +120,12 @@ struct ObjMap {
 
   static std::tuple<Item*, size_t*> alloc(size_t n) {
     auto* items = InternalAllocator<Item>().allocate(n);
-    auto* indices = InternalAllocator<size_t>().allocate(n);
-    if (!items || !indices) {
-      if (items) {
-        InternalAllocator<Item>().deallocate(items, n);
-      }
-      if (indices) {
-        InternalAllocator<size_t>().deallocate(indices, n);
-      }
+    size_t* indices;
+    try {
+      indices = InternalAllocator<size_t>().allocate(n);
+    } catch (...) {
+      InternalAllocator<Item>().deallocate(items, n);
+      throw;
     }
     return {items, indices};
   }
@@ -148,6 +144,7 @@ struct ObjMap {
   }
 
   [[gnu::noinline]] [[gnu::cold]] void expand() {
+    size_t oldallocated = allocated;
     size_t newallocated = allocated * 2;
     auto [newitems, newindices] = alloc(newallocated);
     std::memset(newitems, 0, sizeof(Item) * newallocated);
@@ -165,12 +162,12 @@ struct ObjMap {
         add(olditems[index].key, olditems[index].value);
       }
     } catch (...) {
-      InternalAllocator<size_t>().deallocate(oldindices, allocated);
-      InternalAllocator<Item>().deallocate(olditems, allocated);
+      InternalAllocator<size_t>().deallocate(oldindices, oldallocated);
+      InternalAllocator<Item>().deallocate(olditems, oldallocated);
       throw;
     }
-    InternalAllocator<size_t>().deallocate(oldindices, allocated);
-    InternalAllocator<Item>().deallocate(olditems, allocated);
+    InternalAllocator<size_t>().deallocate(oldindices, oldallocated);
+    InternalAllocator<Item>().deallocate(olditems, oldallocated);
   }
 
   [[gnu::always_inline]] [[gnu::hot]] std::optional<Value> add(Key key, Value value) {
