@@ -104,100 +104,6 @@ struct ObjHash {
   }
 };
 
-// template<typename Key, typename Value>
-// struct ObjMap {
-//   static_assert(std::is_trivial_v<Key>);
-//   static_assert(std::is_trivial_v<Value>);
-
-//   size_t allocated = 0;
-//   size_t msize = 0;
-
-//   Key* keys = nullptr;
-//   Value* values = nullptr;
-//   size_t* indices = nullptr;
-
-//   static std::tuple<Key*, Value*, size_t*> alloc(size_t n) {
-//     auto* keys = InternalAllocator<Key>().allocate(n);
-//     auto* values = InternalAllocator<Value>().allocate(n);
-//     auto* indices = InternalAllocator<size_t>().allocate(n);
-//     if (!keys || !values || !indices) {
-//       if (keys) {
-//         InternalAllocator<Key>().deallocate(keys, n);
-//       }
-//       if (values) {
-//         InternalAllocator<Value>().deallocate(values, n);
-//       }
-//       if (indices) {
-//         InternalAllocator<size_t>().deallocate(indices, n);
-//       }
-//     }
-//     return {keys, values, indices};
-//   }
-
-//   ObjMap() {
-//     allocated = 16;
-//     std::tie(keys, values, indices) = alloc(allocated);
-//     std::memset(keys, 0, sizeof(Key) * allocated);
-//   }
-
-//   ~ObjMap() {
-//     InternalAllocator<Key>().deallocate(keys, allocated);
-//     InternalAllocator<Value>().deallocate(values, allocated);
-//     InternalAllocator<size_t>().deallocate(indices, allocated);
-//   }
-
-//   [[gnu::noinline]] void expand() {
-//     size_t newallocated = allocated * 2;
-//     auto [newkeys, newvalues, newindices] = alloc(newallocated);
-//     std::memset(newkeys, 0, sizeof(Key) * newallocated);
-//     for (size_t i = 0; i != msize; ++i) {
-//       size_t oldindex = indices[i];
-//       auto key = keys[oldindex];
-//       size_t newindex = ObjHash()(key) % (newallocated - 1);
-
-//       newkeys[newindex] = key;
-//       newvalues[newindex] = values[i];
-//       newindices[i] = newindex;
-//     }
-//     InternalAllocator<Key>().deallocate(keys, allocated);
-//     InternalAllocator<Value>().deallocate(values, allocated);
-//     InternalAllocator<size_t>().deallocate(indices, allocated);
-//     keys = newkeys;
-//     values = newvalues;
-//     indices = newindices;
-//     allocated = newallocated;
-//   }
-
-//   std::optional<size_t> add(Key key, Value offset) {
-//     while (true) {
-//       size_t index = ObjHash()(key) % (allocated - 1);
-//       for (size_t o = 0; o != 2; ++o) {
-//         if (keys[index + o] == key) {
-//           return values[index + o];
-//         }
-//       }
-//       for (size_t o = 0; o != 2; ++o) {
-//         if (!keys[index + o]) {
-//           indices[msize] = index + o;
-//           ++msize;
-//           keys[index + o] = key;
-//           values[index + o] = offset;
-//           return {};
-//         }
-//       }
-//       expand();
-//     }
-//   }
-
-//   void clear() {
-//     for (size_t i = 0; i != msize; ++i) {
-//       keys[indices[i]] = {};
-//     }
-//     msize = 0;
-//     // std::memset(keys, 0, sizeof(Key) * size);
-//   }
-// };
-
 template<typename Key, typename Value>
 struct ObjMap {
   static_assert(std::is_trivial_v<Key>);
@@ -241,24 +147,6 @@ struct ObjMap {
     InternalAllocator<size_t>().deallocate(indices, allocated);
   }
 
-  // [[gnu::noinline]] void expand() {
-  //   size_t newallocated = allocated * 2;
-  //   auto [newitems, newindices] = alloc(newallocated);
-  //   std::memset(newitems, 0, sizeof(Item) * newallocated);
-  //   for (size_t i = 0; i != msize; ++i) {
-  //     size_t oldindex = indices[i];
-  //     auto key = items[oldindex].key;
-  //     size_t newindex = ObjHash()(key) % (newallocated - 1);
-  //     newitems[newindex] = items[i];
-  //     newindices[i] = newindex;
-  //   }
-  //   InternalAllocator<Item>().deallocate(items, allocated);
-  //   InternalAllocator<size_t>().deallocate(indices, allocated);
-  //   items = newitems;
-  //   indices = newindices;
-  //   allocated = newallocated;
-  // }
-
   [[gnu::noinline]] [[gnu::cold]] void expand() {
     size_t newallocated = allocated * 2;
     auto [newitems, newindices] = alloc(newallocated);
@@ -299,22 +187,6 @@ struct ObjMap {
           return items[index + o].value;
         }
       }
-      // static_assert(sizeof(Key) <= sizeof(long));
-      // static_assert(sizeof(Value) <= sizeof(long));
-      // Value r;
-      // asm("xor %0, %0\n"
-      //     "cmp %1, %2\n"
-      //     "cmove %5, %0\n"
-      //     "cmp %1, %3\n"
-      //     "cmove %6, %0\n"
-      //     "cmp %1, %4\n"
-      //     "cmove %7, %0\n"
-      //     : "=&r"(r)
-      //     : "r"(key), "r"(items[index].key), "r"(items[index + 1].key), "r"(items[index + 2].key),
-      //       "r"(items[index].value), "r"(items[index + 1].value), "r"(items[index + 2].value));
-      // if (r) {
-      //   return r;
-      // }
       for (size_t o = 0; o != 4; ++o) {
         ++index;
         if (!items[index].key) {
@@ -368,12 +240,6 @@ struct SerializeObject : SerializeExpandable {
   }
 
   std::optional<size_t> add(PyObject* obj, size_t offset) {
-    // auto it = offsets.try_emplace(obj, offset);
-    // if (it.second) {
-    //   refs.push_back(py::reinterpret_borrow<py::object>(obj));
-    //   return {};
-    // }
-    // return it.first->second;
     auto r = offsets->add(obj, offset);
     if (!r) {
       refs.push_back(py::reinterpret_borrow<py::object>(obj));
@@ -453,18 +319,6 @@ template<typename X, bool checked = true>
   std::memcpy(ptr + 1, &value, 8);
 
   x.advance(1 + bytes);
-
-  // if ((long)(int16_t)value == value) {
-  //   if ((long)(int8_t)value == value) {
-  //     x(pyTypes::int8, (int8_t)value);
-  //   } else {
-  //     x(pyTypes::int16, (int16_t)value);
-  //   }
-  // } else if ((long)(int32_t)value == value) {
-  //   x(pyTypes::int32, (int32_t)value);
-  // } else {
-  //   x(pyTypes::int64, (int64_t)value);
-  // }
 }
 
 template<typename X>
@@ -570,42 +424,6 @@ template<typename X>
   for (size_t i = 0; i != n; ++i) {
     v[i] = x.template read<py::object>();
   }
-}
-// template<typename X>
-// void serialize(X& x, const py::str& v) {
-//   x(pyStrView(v).first);
-// }
-// template<typename X>
-// void serialize(X& x, py::str& v) {
-//   auto view = x.template read<std::string_view>();
-//   v = py::str(view.data(), view.size());
-// }
-template<typename X>
-void serialize(X& x, const py::array& v) {
-  ssize_t ndim = v.ndim();
-  if (ndim < 0) {
-    throw SerializationError("Cant serialize this array");
-  }
-  x(ndim);
-  auto* shape = v.shape();
-  auto* strides = v.strides();
-  for (ssize_t i = 0; i != v.ndim(); ++i) {
-    x((ssize_t)shape[i]);
-    x((ssize_t)strides[i]);
-  }
-  size_t bytes = 1;
-  for (ssize_t i = 0; i != v.ndim(); ++i) {
-    if (shape[i] == 0) {
-      bytes = 0;
-    }
-    bytes += strides[i] * (shape[i] - 1);
-  }
-  bytes *= v.itemsize();
-  x(std::string_view((const char*)v.data(), bytes));
-}
-template<typename X>
-void serialize([[maybe_unused]] X& x, [[maybe_unused]] py::array& v) {
-  throw SerializationError("Sorry, deserializing arrays is not implemented :((");
 }
 
 template<typename X>
@@ -908,9 +726,6 @@ template<typename X>
       if (Py_TYPE(o.ptr()) != &PyTuple_Type || ConstructorTuple::size(o.ptr()) != 2) {
         throw std::runtime_error("Moodist serialize: dict item is not a tuple of size 2");
       }
-      log.info(
-          "key is of type %s\n",
-          (std::string)(py::str)py::reinterpret_borrow<py::object>(ConstructorTuple::get(o.ptr(), 0)).get_type());
       x(ConstructorTuple::get(o.ptr(), 0), ConstructorTuple::get(o.ptr(), 1));
       ++n;
     }
@@ -985,7 +800,6 @@ template<typename X>
       py::object key;
       py::object value;
       x(key, value);
-      log.info("get key is of type %s\n", (std::string)(py::str)key.get_type());
       if (PyObject_SetItem(r.ptr(), key.ptr(), value.ptr())) {
         throw py::error_already_set();
       }
@@ -1059,10 +873,6 @@ template<typename X>
 
 template<typename X>
 [[gnu::always_inline]] [[gnu::hot]] static inline void serialize(X& x, const py::handle& v) {
-  // if (!v) {
-  //   throw SerializationError("Attempt to serialize a null python handle");
-  // }
-
   PyObject* obj = v.ptr();
 
   auto* type = Py_TYPE(obj);
@@ -1111,69 +921,7 @@ template<typename X>
   }
 
   serialize2(x, obj, type);
-
-  // if (py::isinstance<py::dict>(v)) {
-  //   x(pyTypes::dict, py::reinterpret_borrow<py::dict>(v));
-  // } else if (py::isinstance<py::str>(v)) {
-  //   x(pyTypes::str, py::reinterpret_borrow<py::str>(v));
-  // } else if (py::isinstance<py::array>(v)) {
-  //   x(pyTypes::array, py::reinterpret_borrow<py::array>(v));
-  // } else if (py::isinstance<py::int_>(v)) {
-  //   x(pyTypes::int_, (int64_t)py::reinterpret_borrow<py::int_>(v));
-  // } else if (py::isinstance<py::list>(v)) {
-  //   x(pyTypes::list, py::reinterpret_borrow<py::list>(v));
-  // } else if (auto t = tryFromPython(v.ptr()); t) {
-  //   x(pyTypes::tensor, *t);
-  // } else if (py::isinstance<py::tuple>(v)) {
-  //   x(pyTypes::tuple, py::reinterpret_borrow<py::tuple>(v));
-  // } else if (py::isinstance<py::args>(v)) {
-  //   x(pyTypes::args, py::reinterpret_borrow<py::args>(v));
-  // } else if (py::isinstance<py::kwargs>(v)) {
-  //   x(pyTypes::kwargs, py::reinterpret_borrow<py::kwargs>(v));
-  // } else {
-  //   x(pyTypes::pickled);
-  //   picklex(x, v);
-  // }
 }
-
-// template<size_t IN, typename X, typename F>
-// inline void getn(size_t n, X& x, F&& f) {
-//   using enum pyTypes;
-
-//   std::array<py::object, IN> objs;
-
-//   while (n) {
-//     for (auto& v : objs) {
-//       pyTypes type;
-//       x(type);
-
-//       if (type == int8) {
-//         CHECK(false);
-//       } else if (type == int16) {
-//         CHECK(false);
-//       } else if (type == int32) {
-//         CHECK(false);
-//       } else if (type == int64) {
-//         CHECK(false);
-//       } else if (type == list) {
-//         py::list o;
-//         size_t n;
-//         x(n);
-//         getn<1>(n, x, [&](auto& a) { o.append(std::move(a[0])); });
-//         v = std::move(o);
-//       } else {
-//         throw SerializationError("Can't deserialize python type (unknown type " + std::to_string(type) + ")");
-//       }
-//     }
-//     f(objs);
-//     --n;
-//   }
-// }
-
-// template<typename X>
-// inline void serialize(X& x, py::object& v) {
-//   getn<1>(1, x, [&](auto& a) { v = std::move(a[0]); });
-// }
 
 template<typename X, typename Constructor = ConstructorList>
 [[gnu::noinline]] [[gnu::hot]] static inline py::object getList(X& x, size_t offset, bool store) {
@@ -1370,34 +1118,6 @@ template<typename X>
       PyObject* arr[3] = {Py_None, Py_True, Py_False};
       return py::reinterpret_borrow<py::object>(arr[type]);
     }
-    // if (x.remaining() >= 8) {
-    //   int64_t value;
-    //   static_assert(sizeof(int64_t) == 8);
-    //   std::memcpy(&value, x.data(), 8);
-    //   int8_t v8 = value;
-    //   int16_t v16 = value;
-    //   int32_t v32 = value;
-    //   if (type == float_) {
-    //     double fv;
-    //     static_assert(sizeof(double) == 8);
-    //     std::memcpy(&fv, &value, sizeof(double));
-    //     x.consumeNoCheck(8);
-    //     return py::float_(fv);
-    //   }
-    //   uint8_t nbytes[4] = {1, 2, 4, 8};
-    //   x.consumeNoCheck(nbytes[type - int8]);
-    //   int64_t arr[4] = {v8, v16, v32, value};
-    //   return toint(arr[type - int8]);
-    // }
-    // if (type == none) {
-    //   return py::none();
-    // }
-    // if (type == bool_true) {
-    //   return py::bool_(true);
-    // }
-    // if (type == bool_false) {
-    //   return py::bool_(true);
-    // }
     if (type == int8) {
       return toint(x.template read<int8_t>());
     }
@@ -1441,19 +1161,12 @@ void serialize(X& x, py::tuple& v) {
   }
 }
 
-// HashMap<PyObject*, size_t, ObjHash> offsetsReuse;
-
 template<typename... T>
 [[gnu::always_inline]] [[gnu::warn_unused_result]] inline BufferHandle serializeObjectToBuffer(const T&... v) {
   SerializeObject x;
-  // std::swap(x.offsets, offsetsReuse);
   x.buffer = makeBuffer(0x80 - sizeof(Buffer));
   (x(v), ...);
   x.buffer->msize = x.size;
-  // log.info("offsets has %d entries with %d buckets\n", x.offsets.size(), x.offsets.bucket_count());
-  //   x.offsets.clear();
-  //    std::swap(x.offsets, offsetsReuse);
-  // log.info("objmap size is %d, allocated %d\n", x.offsets->msize, x.offsets->allocated);
   return std::move(x.buffer);
 }
 
