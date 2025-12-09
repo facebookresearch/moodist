@@ -5827,20 +5827,18 @@ struct CpuThreadImpl {
           YIELD
         }
       }
-      for (size_t o = 0; o != size; ++o) {
+      for (size_t o = 1; o < size; ++o) {
         i = self.rank + o;
         if (i >= size) {
           i -= size;
         }
-        CHECK(i >= 0 && i < size);
         self.writeStepValue(concurrencyIndex, i, 0, rank);
       }
-      for (o = 0; o != size; ++o) {
+      for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
           i += size;
         }
-        CHECK(i >= 0 && i < size);
         while (self.inStepValue(concurrencyIndex, i) < stepValue) {
           YIELD
         }
@@ -5869,21 +5867,24 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      for (size_t o = 0; o != size; ++o) {
+      // Ensure first writeStepValue loop (stepValue) completes before second loop (stepValue+1).
+      // Both write to the same remote address; without this, RDMA reordering could cause
+      // stepValue+1 to arrive first and then be overwritten by stepValue.
+      WAIT_CONTROL
+
+      for (size_t o = 1; o < size; ++o) {
         i = self.rank + o;
         if (i >= size) {
           i -= size;
         }
-        CHECK(i >= 0 && i < size);
         self.writeStepValue(concurrencyIndex, i, 1, rank);
       }
       self.trace(concurrencyIndex, 0, "wait for remote reads");
-      for (o = 0; o != size; ++o) {
+      for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
           i += size;
         }
-        CHECK(i >= 0 && i < size);
         while (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
           YIELD
         }

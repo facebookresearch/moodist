@@ -21,11 +21,18 @@ Usage:
     # Output each rank to separate log files:
     torchrun --nproc-per-node 8 tests/run.py --per-rank-logs
     # Creates test_logs/rank_0.log, test_logs/rank_1.log, etc.
+
+    # Set timeout for entire test run (captures stack trace on timeout):
+    torchrun --nproc-per-node 8 tests/run.py --timeout 60
+    # If py-spy is installed, uses it for detailed stack traces including C++ frames
 """
 
 import importlib.util
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Add tests directory to path so test files can import framework
@@ -75,49 +82,164 @@ def parse_test_arg(arg: str) -> tuple[str, str | None]:
     return arg, None
 
 
-def main():
-    ctx = create_context_from_env()
-
-    # Parse --per-rank-logs option before anything else
-    log_file = None
-    args = sys.argv[1:]
-    per_rank_logs = False
-    remaining_args = []
-    for arg in args:
-        if arg == "--per-rank-logs":
-            per_rank_logs = True
-        else:
-            remaining_args.append(arg)
-
-    if per_rank_logs:
-        log_file = setup_per_rank_logging(ctx.rank, "test_logs")
-        ctx.per_rank_logs = True
-
-    if ctx.rank == 0 or per_rank_logs:
-        print(f"Running tests with {ctx.world_size} processes")
-        print(f"Master: {ctx.master_addr}:{ctx.master_port}")
-        if per_rank_logs:
-            print(f"Per-rank logs: test_logs/rank_*.log")
-        print()
-
-    # Determine which test files to run
-    test_filter = None  # Optional filter for specific test name
-    if remaining_args:
-        # Parse arguments - support file.py::test_name syntax
-        test_files = []
-        for arg in remaining_args:
-            file_part, test_name = parse_test_arg(arg)
-            test_files.append(tests_dir / file_part)
-            if test_name:
-                test_filter = test_name
+def get_rank_from_env() -> int:
+    """Get rank from environment variables (torchrun or slurm style)."""
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
+    elif "SLURM_PROCID" in os.environ:
+        return int(os.environ["SLURM_PROCID"])
     else:
-        # Discover all test files
-        test_files = discover_test_files(tests_dir)
+        return 0
 
-    if (ctx.rank == 0 or per_rank_logs) and not test_files:
-        print("No test files found!")
+
+def capture_stack_trace(pid: int) -> str:
+    """Capture stack trace of a process using py-spy and pstack."""
+    output = []
+
+    # py-spy for Python + native frames on Python threads
+    try:
+        result = subprocess.run(
+            ["py-spy", "dump", "--native", "--pid", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            output.append("=== py-spy (Python threads) ===")
+            output.append(result.stdout)
+        else:
+            output.append(f"py-spy failed (exit {result.returncode}): {result.stderr}")
+    except FileNotFoundError:
+        output.append("(py-spy not installed)")
+    except subprocess.TimeoutExpired:
+        output.append("(py-spy timed out)")
+    except Exception as e:
+        output.append(f"(py-spy failed: {e})")
+
+    # pstack/gstack for all threads including C++ background threads
+    for cmd in ["pstack", "gstack"]:
+        try:
+            result = subprocess.run(
+                [cmd, str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                output.append(f"\n=== {cmd} (all threads) ===")
+                output.append(result.stdout)
+                break
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            output.append(f"({cmd} timed out)")
+            break
+        except Exception as e:
+            output.append(f"({cmd} failed: {e})")
+            break
+    else:
+        # Fallback to gdb if pstack/gstack not available
+        try:
+            result = subprocess.run(
+                ["gdb", "-batch", "-ex", "thread apply all bt", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                output.append("\n=== gdb (all threads) ===")
+                output.append(result.stdout)
+        except FileNotFoundError:
+            output.append("(gdb not installed)")
+        except subprocess.TimeoutExpired:
+            output.append("(gdb timed out)")
+        except Exception as e:
+            output.append(f"(gdb failed: {e})")
+
+    return "\n".join(output) if output else "(no stack trace tools available)"
+
+
+def run_with_timeout(timeout: float, remaining_args: list[str], per_rank_logs: bool) -> int:
+    """Fork and run tests in child process with timeout monitoring from parent.
+
+    Returns exit code (0 = success, 1 = failure, 2 = timeout).
+    """
+    # Fork before any CUDA initialization
+    pid = os.fork()
+
+    if pid == 0:
+        # Child process: run tests normally
+        # Re-exec without --timeout to avoid infinite recursion
+        new_args = [sys.executable, sys.argv[0]] + remaining_args
+        os.execv(sys.executable, new_args)
+        # execv doesn't return on success
         sys.exit(1)
 
+    # Parent process: monitor child with timeout
+    start_time = time.monotonic()
+    deadline = start_time + timeout
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Timeout! Set up logging to a separate timeout log file
+            log_file = None
+            if per_rank_logs:
+                rank = get_rank_from_env()
+                log_path = Path("test_logs")
+                log_path.mkdir(parents=True, exist_ok=True)
+                log_file_path = log_path / f"timeout_rank_{rank}.log"
+                log_file = open(log_file_path, "w", buffering=1)
+                os.dup2(log_file.fileno(), sys.stdout.fileno())
+                os.dup2(log_file.fileno(), sys.stderr.fileno())
+                sys.stdout = log_file
+                sys.stderr = log_file
+
+            # Capture stack trace and kill child
+            print(f"\n\033[33m{'='*60}\033[0m")
+            print(f"\033[33mTIMEOUT after {timeout}s - capturing stack trace...\033[0m")
+            print(f"\033[33m{'='*60}\033[0m\n")
+            sys.stdout.flush()
+
+            stack_trace = capture_stack_trace(pid)
+            print(stack_trace)
+            sys.stdout.flush()
+
+            print(f"\n\033[33mKilling child process {pid}...\033[0m")
+            sys.stdout.flush()
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+
+            if log_file:
+                log_file.close()
+            return 2  # Timeout exit code
+
+        # Wait for child with a short timeout so we can check deadline
+        try:
+            wait_pid, status = os.waitpid(pid, os.WNOHANG)
+            if wait_pid == pid:
+                # Child exited normally
+                if os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    sig = os.WTERMSIG(status)
+                    print(f"Child killed by signal {sig}")
+                    return 1
+                else:
+                    return 1
+        except ChildProcessError:
+            # Child already gone
+            return 1
+
+        # Sleep briefly before checking again
+        time.sleep(0.1)
+
+
+def run_tests(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str | None, log_file) -> bool:
+    """Run the actual tests. Returns True if all passed."""
     all_passed = True
     runner = TestRunner(ctx)
 
@@ -169,6 +291,74 @@ def main():
     if log_file:
         log_file.close()
 
+    return all_passed
+
+
+def main():
+    # Parse options before creating context (so we can fork early for timeout)
+    args = sys.argv[1:]
+    per_rank_logs = False
+    test_timeout = None
+    remaining_args = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--per-rank-logs":
+            per_rank_logs = True
+            remaining_args.append(arg)
+        elif arg == "--timeout":
+            i += 1
+            if i < len(args):
+                test_timeout = float(args[i])
+            else:
+                print("Error: --timeout requires a value in seconds", file=sys.stderr)
+                sys.exit(1)
+        elif arg.startswith("--timeout="):
+            test_timeout = float(arg.split("=", 1)[1])
+        else:
+            remaining_args.append(arg)
+        i += 1
+
+    # If timeout is set, fork and monitor
+    if test_timeout is not None:
+        exit_code = run_with_timeout(test_timeout, remaining_args, per_rank_logs)
+        sys.exit(exit_code)
+
+    # No timeout - run tests directly
+    ctx = create_context_from_env()
+    log_file = None
+
+    if per_rank_logs:
+        log_file = setup_per_rank_logging(ctx.rank, "test_logs")
+        ctx.per_rank_logs = True
+
+    if ctx.rank == 0 or per_rank_logs:
+        print(f"Running tests with {ctx.world_size} processes")
+        print(f"Master: {ctx.master_addr}:{ctx.master_port}")
+        if per_rank_logs:
+            print(f"Per-rank logs: test_logs/rank_*.log")
+        print()
+
+    # Determine which test files to run
+    test_filter = None  # Optional filter for specific test name
+    test_args = [arg for arg in remaining_args if not arg.startswith("--")]
+    if test_args:
+        # Parse arguments - support file.py::test_name syntax
+        test_files = []
+        for arg in test_args:
+            file_part, test_name = parse_test_arg(arg)
+            test_files.append(tests_dir / file_part)
+            if test_name:
+                test_filter = test_name
+    else:
+        # Discover all test files
+        test_files = discover_test_files(tests_dir)
+
+    if (ctx.rank == 0 or per_rank_logs) and not test_files:
+        print("No test files found!")
+        sys.exit(1)
+
+    all_passed = run_tests(ctx, per_rank_logs, test_files, test_filter, log_file)
     sys.exit(0 if all_passed else 1)
 
 
