@@ -3,6 +3,7 @@
 #include "pybind11/numpy.h"
 #include <ATen/ops/from_blob.h>
 #include <abstract.h>
+#include <array>
 #include <c10/util/python_stub.h>
 #include <dictobject.h>
 #include <floatobject.h>
@@ -91,14 +92,13 @@ void globalsInit() {
 }
 
 struct ObjHash {
-  size_t operator()(PyObject* o) {
-    // return ((uintptr_t)o / 16ul);
-    return ((uintptr_t)o / 16ul) % 137438953471ul;
-    // return ((uintptr_t)o * 2654435761);
-    //  return ((uintptr_t)o) % 137438953471ul;
+  [[gnu::always_inline]] size_t operator()(PyObject* o) const {
+    // Shift out alignment bits (16-byte aligned pointers), then multiply
+    // Use 64-bit constant for proper mixing with 128-bit reduce
+    return ((uintptr_t)o >> 4) * 0x9E3779B97F4A7C15ul;
   }
-  size_t operator()(size_t v) {
-    return v * 2654435761;
+  [[gnu::always_inline]] size_t operator()(size_t v) const {
+    return v * 0x9E3779B97F4A7C15ul;
   }
 };
 
@@ -106,6 +106,8 @@ template<typename Key, typename Value>
 struct ObjMap {
   static_assert(std::is_trivial_v<Key>);
   static_assert(std::is_trivial_v<Value>);
+
+  static constexpr size_t PROBE_LIMIT = 4;  // Allow some probing for stability
 
   size_t allocated = 0;
   size_t msize = 0;
@@ -117,6 +119,12 @@ struct ObjMap {
 
   Item* items = nullptr;
   size_t* indices = nullptr;
+
+  // Multiply-shift range reduction: maps hash to [0, allocated-PROBE_LIMIT)
+  // Uses upper 64 bits of 128-bit multiply (requires 64-bit hash constant)
+  [[gnu::always_inline]] size_t reduce(size_t hash) const {
+    return ((__uint128_t)hash * (allocated - PROBE_LIMIT)) >> 64;
+  }
 
   static std::tuple<Item*, size_t*> alloc(size_t n) {
     auto* items = InternalAllocator<Item>().allocate(n);
@@ -131,7 +139,7 @@ struct ObjMap {
   }
 
   ObjMap() {
-    allocated = 16;
+    allocated = 20;  // 16 usable + probe space
     std::tie(items, indices) = alloc(allocated);
     std::memset(items, 0, sizeof(Item) * allocated);
   }
@@ -145,7 +153,8 @@ struct ObjMap {
 
   [[gnu::noinline]] [[gnu::cold]] void expand() {
     size_t oldallocated = allocated;
-    size_t newallocated = allocated * 2;
+    size_t newallocated = (allocated - PROBE_LIMIT) * 2 + PROBE_LIMIT;  // double the usable capacity
+
     auto [newitems, newindices] = alloc(newallocated);
     std::memset(newitems, 0, sizeof(Item) * newallocated);
     auto* olditems = items;
@@ -172,19 +181,19 @@ struct ObjMap {
 
   [[gnu::always_inline]] [[gnu::hot]] std::optional<Value> add(Key key, Value value) {
     while (true) {
-      size_t index = ObjHash()(key) % (allocated - 1);
+      size_t index = reduce(ObjHash()(key));
       if (!items[index].key) [[likely]] {
         indices[msize] = index;
         ++msize;
         items[index] = {key, value};
         return {};
       }
-      for (size_t o = 0; o != 4; ++o) {
+      for (size_t o = 0; o <= PROBE_LIMIT; ++o) {
         if (items[index + o].key == key) {
           return items[index + o].value;
         }
       }
-      for (size_t o = 0; o != 4; ++o) {
+      for (size_t o = 0; o < PROBE_LIMIT; ++o) {
         ++index;
         if (!items[index].key) {
           indices[msize] = index;
@@ -205,8 +214,8 @@ struct ObjMap {
   }
 
   Value get(Key key) {
-    size_t index = ObjHash()(key) % (allocated - 1);
-    for (size_t o = 0; o != 4; ++o) {
+    size_t index = reduce(ObjHash()(key));
+    for (size_t o = 0; o <= PROBE_LIMIT; ++o) {
       if (items[index + o].key == key) {
         return items[index + o].value;
       }
