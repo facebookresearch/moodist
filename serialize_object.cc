@@ -131,7 +131,7 @@ struct ObjMap {
   }
 
   ObjMap() {
-    allocated = 1024 * 1024;
+    allocated = 16;
     std::tie(items, indices) = alloc(allocated);
     std::memset(items, 0, sizeof(Item) * allocated);
   }
@@ -331,7 +331,7 @@ long getint(X& x) {
   if (type == int16) {
     return x.template read<int16_t>();
   }
-  asm volatile("");
+  asm volatile("");  // Prevent compiler from converting if-chain to switch/jump table
   if (type == int32) {
     return x.template read<int32_t>();
   }
@@ -1121,7 +1121,7 @@ template<typename X>
     if (type == int16) {
       return toint(x.template read<int16_t>());
     }
-    asm volatile("");
+    asm volatile("");  // Prevent compiler from converting if-chain to switch/jump table
     if (type == int32) {
       return toint(x.template read<int32_t>());
     }
