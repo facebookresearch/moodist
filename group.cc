@@ -1,5 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "torch_includes.h"
+
 #include "group.h"
 #include "allgather.h"
 #include "common.h"

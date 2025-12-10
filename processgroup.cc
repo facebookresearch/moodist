@@ -14,23 +14,13 @@
 #include "serialization.h"
 #include "setup_comms.h"
 #include "synchronization.h"
+#include "torch_includes.h"
 #include "vector.h"
 
-#include <ATen/ops/from_blob.h>
-#include <ATen/ops/pad.h>
 #include <algorithm>
-#include <c10/core/Device.h>
-#include <c10/core/ScalarType.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/util/intrusive_ptr.h>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
-#include <torch/csrc/distributed/c10d/Types.hpp>
-#include <torch/types.h>
 
 namespace moodist {
 
@@ -648,9 +638,11 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     }
     c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
     AllocatedBuffer buffer;
-    buffer.dataPtr = c10::cuda::CUDACachingAllocator::get()->allocate(size);
+    auto dataPtr = c10::cuda::CUDACachingAllocator::get()->allocate(size);
+    buffer.cudaPointer = (uintptr_t)dataPtr.get();
     buffer.bytes = size;
-    buffer.cudaPointer = (uintptr_t)buffer.dataPtr->get();
+    // Capture DataPtr in the cleanup function - it will be freed when the function is called
+    buffer.externalAlloc = DeferredCleanup(Function<void()>([dataPtr = std::move(dataPtr)]() mutable {}));
     CHECK(buffer.cudaPointer != 0);
     return buffer;
   };

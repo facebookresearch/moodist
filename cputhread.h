@@ -6,6 +6,7 @@
 #include "intrusive_list.h"
 #include "simple_vector.h"
 #include "synchronization.h"
+#include "tensor_types.h"
 
 #include <exception>
 #include <forward_list>

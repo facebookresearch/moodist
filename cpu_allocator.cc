@@ -3,9 +3,9 @@
 #include "cpu_allocator.h"
 #include "common.h"
 #include "hash_map.h"
+#include "torch_includes.h"
 #include "vector.h"
 
-#include <c10/cuda/CUDAFunctions.h>
 #include <sys/mman.h>
 #include <type_traits>
 

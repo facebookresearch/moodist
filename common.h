@@ -8,25 +8,26 @@
 
 #include "async.h"
 #include "cpu_allocator.h"
+#include "function.h"
 #include "logging.h"
 #include "vector.h"
 
 #include "fmt/printf.h"
 
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-
 #include <cuda.h>
 #include <nvml.h>
 #include <nvrtc.h>
-#include <torch/cuda.h>
-#include <torch/types.h>
 
+#include <deque>
+#include <functional>
+#include <map>
 #include <optional>
 #include <random>
 #include <ranges>
+#include <set>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #undef CHECK
@@ -44,6 +45,35 @@ inline std::string removePciPathPrefix(std::string path) {
   return path;
 }
 
+// Type-erased destructor for external allocations.
+// Used to release memory from external allocators (e.g., PyTorch's CUDA caching allocator)
+// without depending on their types in this header.
+// The destructor function captures the original allocation and frees it when called.
+struct DeferredCleanup {
+  Function<void()> destructor;
+
+  DeferredCleanup() = default;
+  DeferredCleanup(Function<void()>&& f) : destructor(std::move(f)) {}
+  ~DeferredCleanup() { reset(); }
+
+  DeferredCleanup(const DeferredCleanup&) = delete;
+  DeferredCleanup& operator=(const DeferredCleanup&) = delete;
+
+  DeferredCleanup(DeferredCleanup&& n) noexcept : destructor(std::move(n.destructor)) {}
+  DeferredCleanup& operator=(DeferredCleanup&& n) noexcept {
+    std::swap(destructor, n.destructor);
+    return *this;
+  }
+
+  explicit operator bool() const { return destructor != nullptr; }
+
+  void reset() {
+    if (destructor) {
+      std::move(destructor)();
+    }
+  }
+};
+
 struct AllocatedBuffer {
   void* cpuPointer = nullptr;
   uintptr_t cudaPointer = 0;
@@ -52,7 +82,7 @@ struct AllocatedBuffer {
   bool hostAllocated = false;
   bool numaAllocated = false;
   bool handleAllocated = false;
-  std::optional<torch::DataPtr> dataPtr;
+  DeferredCleanup externalAlloc;  // For memory from external allocators (e.g., PyTorch CUDA caching allocator)
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
@@ -65,7 +95,7 @@ struct AllocatedBuffer {
     std::swap(bytes, n.bytes);
     std::swap(hostAllocated, n.hostAllocated);
     std::swap(numaAllocated, n.numaAllocated);
-    std::swap(dataPtr, n.dataPtr);
+    std::swap(externalAlloc, n.externalAlloc);
     return *this;
   }
 
@@ -89,8 +119,8 @@ struct AllocatedBuffer {
         cuMemRelease(handle);
       }
     } else {
-      if (dataPtr) {
-        dataPtr.reset();
+      if (externalAlloc) {
+        externalAlloc.reset();
       } else if (cudaPointer) {
         log.verbose("free %d bytes of cuda memory at %#x\n", bytes, cudaPointer);
         cuMemFree(cudaPointer);
@@ -527,83 +557,11 @@ struct FLSharedPtr {
 
 using AllocatedCpuBufferSharedPtr = FLSharedPtr<AllocatedCpuBuffer>;
 
-struct TensorData {
-  AllocatedCpuBufferSharedPtr buffer;
-  uintptr_t dataPtr;
-  size_t dataBytes;
-  int dtype;
-  std::vector<int64_t> shape;
-  bool isCuda;
-
-  void clear() {
-    buffer = {};
-    dtype = -1;
-    shape.clear();
-    dataPtr = 0;
-    dataBytes = 0;
-    isCuda = false;
-  }
-
-  uintptr_t data() {
-    return dataPtr;
-  }
-  size_t bytes() {
-    return dataBytes;
-  }
-  size_t itemsize() {
-    return torch::elementSize(((torch::ScalarType)dtype));
-  }
-  size_t numel() {
-    size_t r = 1;
-    for (int64_t n : shape) {
-      r *= n;
-    }
-    return r;
-  }
-};
-
-using TensorDataPtr = FLPtr<TensorData>;
-using TensorDataSharedPtr = FLSharedPtr<TensorData>;
-
 namespace cpu_allocator {
 AllocatedCpuBufferSharedPtr getCpuBuffer(uintptr_t address);
 void refCpuBuffer(AllocatedCpuBufferSharedPtr ptr);
 void derefCpuBuffer(uintptr_t address);
 } // namespace cpu_allocator
-
-inline torch::Tensor makeTensor(TensorDataPtr ptr) {
-  torch::Device device(torch::kCPU);
-
-  CHECK(ptr != nullptr);
-
-  CHECK(!ptr->isCuda);
-
-  cpu_allocator::refCpuBuffer(ptr->buffer);
-
-  TensorData* td = &*ptr;
-
-  CHECK(td->data() != 0);
-
-  Function<void()> f = [ptr = std::move(ptr)]() mutable { cpu_allocator::derefCpuBuffer(ptr->data()); };
-  auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
-  auto data = torch::DataPtr((void*)td->data(), (void*)f.release(), deleter, device);
-
-  torch::Storage storage(torch::Storage::use_byte_size_t(), td->bytes(), std::move(data), nullptr, false);
-  return torch::empty({0}, torch::TensorOptions((torch::ScalarType)td->dtype).device(device))
-      .set_(std::move(storage), 0, td->shape);
-}
-
-struct FutureImpl {
-  TensorDataPtr result;
-  std::atomic_uint32_t done = 0;
-  // WorkCudaDonePtr cudaDone = nullptr;
-  void clear() {
-    result = nullptr;
-    done = 0;
-  }
-};
-
-using FutureImplSharedPtr = FLSharedPtr<FutureImpl>;
 
 template<typename T>
 auto range(T begin, T end) {

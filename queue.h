@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "group.h"
+#include "tensor_types.h"
 
 namespace moodist {
 

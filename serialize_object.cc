@@ -1,10 +1,10 @@
+#include "torch_includes.h"
 
 #include "buffer.h"
 #include "pybind11/numpy.h"
-#include <ATen/ops/from_blob.h>
+
 #include <abstract.h>
 #include <array>
-#include <c10/util/python_stub.h>
 #include <dictobject.h>
 #include <floatobject.h>
 #include <listobject.h>
@@ -13,11 +13,7 @@
 #include <pybind11/chrono.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
-
 #include <pyerrors.h>
-#include <torch/python.h>
-#include <torch/torch.h>
-#include <torch/types.h>
 #include <unicodeobject.h>
 
 #include "common.h"

@@ -8,9 +8,8 @@
 #include "intrusive_list.h"
 #include "simple_vector.h"
 #include "synchronization.h"
+#include "torch_includes.h"
 
-#include <c10/core/Storage.h>
-#include <c10/cuda/CUDAStream.h>
 #include <mutex>
 #include <pybind11/pybind11.h>
 

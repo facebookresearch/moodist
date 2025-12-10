@@ -6,13 +6,9 @@
 #include "group.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
+#include "torch_includes.h"
 #include "vector.h"
 
-#include <c10/core/Allocator.h>
-#include <c10/core/DeviceType.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/cuda/CUDAStream.h>
 #include <type_traits>
 
 namespace moodist {

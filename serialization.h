@@ -273,7 +273,7 @@ struct Deserializer {
   Deserializer(std::string_view buf) : base(buf.data()), offset(0), length(buf.size()) {}
   Deserializer(const void* data, size_t len) : base((const char*)data), offset(0), length(len) {}
   [[noreturn]] void eod() {
-    CHECK(checked)
+    CHECK(checked);
     throw SerializationError("Deserializer: reached end of data");
   }
   [[gnu::always_inline]] void consume(size_t len) {

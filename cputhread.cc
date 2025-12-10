@@ -35,7 +35,6 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
-#include <torch/types.h>
 #include <type_traits>
 #include <utility>
 

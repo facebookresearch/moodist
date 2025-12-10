@@ -4,21 +4,15 @@
 
 #include "common.h"
 #include "queue.h"
-
-#include <torch/torch.h>
-
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
-#include <torch/csrc/distributed/c10d/Types.hpp>
+#include "tensor_types.h"
+#include "torch_includes.h"
 
 #include <memory>
-#include <torch/types.h>
 
 namespace moodist {
 
 struct ProcessGroupImpl;
 
-struct FutureImpl;
 struct Future {
   FutureImplSharedPtr impl;
   std::vector<torch::Tensor> tensors;

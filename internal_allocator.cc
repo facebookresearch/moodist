@@ -5,7 +5,6 @@
 #include "hash_map.h"
 #include "vector.h"
 
-#include <c10/cuda/CUDAFunctions.h>
 #include <sys/mman.h>
 #include <type_traits>
 
