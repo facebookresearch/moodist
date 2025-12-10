@@ -34,7 +34,9 @@ struct ExactType<T, true> : T {
 template<typename T>
 struct ExactType<T, false> {
   const T& value;
-  operator const T&() const { return value; }
+  operator const T&() const {
+    return value;
+  }
   template<typename U, std::enable_if_t<!std::is_same_v<U, T>>* = nullptr>
   operator U() const = delete;
 };
@@ -51,7 +53,9 @@ struct ExactTypeMut<T, true> : T {
 template<typename T>
 struct ExactTypeMut<T, false> {
   T& value;
-  operator T&() const { return value; }
+  operator T&() const {
+    return value;
+  }
   template<typename U, std::enable_if_t<!std::is_same_v<U, T>>* = nullptr>
   operator U&() const = delete;
 };
@@ -101,7 +105,11 @@ void serialize(X& x, std::optional<T>& v) {
 template<typename X, typename... T>
 void serialize(X& x, const std::variant<T...>& v) {
   x(v.index());
-  std::visit([&](auto& v2) { x(v2); }, v);
+  std::visit(
+      [&](auto& v2) {
+        x(v2);
+      },
+      v);
 }
 
 template<size_t I, typename X, typename Variant, typename A, typename... T>
@@ -122,12 +130,20 @@ void serialize(X& x, std::variant<T...>& v) {
 
 template<typename X, typename... T>
 void serialize(X& x, const std::tuple<T...>& v) {
-  std::apply([&x](const std::decay_t<T>&... v) { x(v...); }, v);
+  std::apply(
+      [&x](const std::decay_t<T>&... v) {
+        x(v...);
+      },
+      v);
 }
 
 template<typename X, typename... T>
 void serialize(X& x, std::tuple<T...>& v) {
-  std::apply([&x](std::decay_t<T>&... v) { x(v...); }, v);
+  std::apply(
+      [&x](std::decay_t<T>&... v) {
+        x(v...);
+      },
+      v);
 }
 
 template<typename X, typename Vector>
@@ -350,8 +366,7 @@ struct Serialize {
   static const bool has_serialize = decltype(Serialize::has_serialize_f<T>(0))::value;
   template<typename T>
   static std::false_type has_builtin_write_f(...);
-  template<
-      typename T,
+  template<typename T,
       typename = decltype(std::declval<Serializer>().write(OpWrite{}, (std::byte*)nullptr, std::declval<T>()))>
   static std::true_type has_builtin_write_f(int);
   template<typename T>
@@ -401,15 +416,15 @@ struct SerializeExpandable {
   static const bool has_serialize = decltype(SerializeExpandable::has_serialize_f<T>(0))::value;
   template<typename T>
   static std::false_type has_builtin_write_f(...);
-  template<
-      typename T,
+  template<typename T,
       typename = decltype(std::declval<Serializer>().write(OpWrite{}, (std::byte*)nullptr, std::declval<T>()))>
   static std::true_type has_builtin_write_f(int);
   template<typename T>
   static const bool has_builtin_write = decltype(SerializeExpandable::has_builtin_write_f<T>(0))::value;
   template<typename T>
   static std::false_type has_free_serialize_f(...);
-  template<typename T, typename = decltype(serialize(std::declval<SerializeExpandable&>(), std::declval<ExactType<T>>()))>
+  template<typename T,
+      typename = decltype(serialize(std::declval<SerializeExpandable&>(), std::declval<ExactType<T>>()))>
   static std::true_type has_free_serialize_f(int);
   template<typename T>
   static const bool has_free_serialize = decltype(SerializeExpandable::has_free_serialize_f<T>(0))::value;

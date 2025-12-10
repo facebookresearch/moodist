@@ -14,14 +14,23 @@ namespace py = pybind11;
 // RAII wrapper for Buffer* - movable so it can be captured by lambda
 class BufferGuard {
   Buffer* buf_;
+
 public:
   explicit BufferGuard(Buffer* buf) : buf_(buf) {}
-  ~BufferGuard() { if (buf_) serializeBufferDecRef(buf_); }
+  ~BufferGuard() {
+    if (buf_) {
+      serializeBufferDecRef(buf_);
+    }
+  }
 
-  BufferGuard(BufferGuard&& other) noexcept : buf_(other.buf_) { other.buf_ = nullptr; }
+  BufferGuard(BufferGuard&& other) noexcept : buf_(other.buf_) {
+    other.buf_ = nullptr;
+  }
   BufferGuard& operator=(BufferGuard&& other) noexcept {
     if (this != &other) {
-      if (buf_) serializeBufferDecRef(buf_);
+      if (buf_) {
+        serializeBufferDecRef(buf_);
+      }
       buf_ = other.buf_;
       other.buf_ = nullptr;
     }
@@ -31,7 +40,9 @@ public:
   BufferGuard(const BufferGuard&) = delete;
   BufferGuard& operator=(const BufferGuard&) = delete;
 
-  Buffer* get() const { return buf_; }
+  Buffer* get() const {
+    return buf_;
+  }
 };
 
 torch::Tensor serializeObject(py::object o) {
@@ -41,8 +52,7 @@ torch::Tensor serializeObject(py::object o) {
 
   // Move guard into lambda - destructor handles cleanup when tensor is freed
   return torch::from_blob(
-      ptr, {static_cast<int64_t>(size)},
-      [guard = std::move(guard)](void*) {},
+      ptr, {static_cast<int64_t>(size)}, [guard = std::move(guard)](void*) {},
       torch::TensorOptions().dtype(torch::kUInt8));
 }
 

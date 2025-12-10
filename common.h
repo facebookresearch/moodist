@@ -54,7 +54,9 @@ struct DeferredCleanup {
 
   DeferredCleanup() = default;
   DeferredCleanup(Function<void()>&& f) : destructor(std::move(f)) {}
-  ~DeferredCleanup() { reset(); }
+  ~DeferredCleanup() {
+    reset();
+  }
 
   DeferredCleanup(const DeferredCleanup&) = delete;
   DeferredCleanup& operator=(const DeferredCleanup&) = delete;
@@ -65,7 +67,9 @@ struct DeferredCleanup {
     return *this;
   }
 
-  explicit operator bool() const { return destructor != nullptr; }
+  explicit operator bool() const {
+    return destructor != nullptr;
+  }
 
   void reset() {
     if (destructor) {
@@ -82,7 +86,7 @@ struct AllocatedBuffer {
   bool hostAllocated = false;
   bool numaAllocated = false;
   bool handleAllocated = false;
-  DeferredCleanup externalAlloc;  // For memory from external allocators (e.g., PyTorch CUDA caching allocator)
+  DeferredCleanup externalAlloc; // For memory from external allocators (e.g., PyTorch CUDA caching allocator)
 
   AllocatedBuffer() = default;
   AllocatedBuffer(AllocatedBuffer&& n) noexcept {
@@ -245,12 +249,12 @@ inline auto seedRng() {
   auto start = std::chrono::high_resolution_clock::now();
   std::seed_seq ss(
       {(uint32_t)dev(), (uint32_t)dev(), (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(),
-       (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count(), (uint32_t)dev(),
-       (uint32_t)std::chrono::system_clock::now().time_since_epoch().count(),
-       (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count(),
-       (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(), (uint32_t)dev(),
-       (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(), (uint32_t)dev(),
-       (uint32_t)std::hash<std::thread::id>()(std::this_thread::get_id())});
+          (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count(), (uint32_t)dev(),
+          (uint32_t)std::chrono::system_clock::now().time_since_epoch().count(),
+          (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count(),
+          (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(), (uint32_t)dev(),
+          (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(), (uint32_t)dev(),
+          (uint32_t)std::hash<std::thread::id>()(std::this_thread::get_id())});
   return std::mt19937_64(ss);
 };
 
@@ -662,7 +666,9 @@ struct Global {
     static_assert(alignof(T) <= alignof(std::max_align_t));
     CHECK(args);
     return std::apply(
-        []<typename... X>(X&&... args) -> T& { return *new (internalAlloc(sizeof(T))) T(std::forward<X>(args)...); },
+        []<typename... X>(X&&... args) -> T& {
+          return *new (internalAlloc(sizeof(T))) T(std::forward<X>(args)...);
+        },
         std::move(*args));
   }
 };

@@ -23,8 +23,7 @@
 
 namespace moodist {
 
-template<
-    typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>,
+template<typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>,
     typename Allocator = std::allocator<void>>
 struct HashMap {
 private:

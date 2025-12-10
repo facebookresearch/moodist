@@ -58,8 +58,7 @@ void Connection::write(Buffer buffer, Function<void(Error*)> callback) {
   iovec[0].iov_len = buffer0->size();
   iovec[1].iov_base = buffer->data();
   iovec[1].iov_len = buffer->size();
-  socket.writev(
-      iovec.data(), iovec.size(),
+  socket.writev(iovec.data(), iovec.size(),
       [buffer0 = std::move(buffer0), buffer = std::move(buffer), callback = std::move(callback)](Error* error) {
         if (callback) {
           callback(error);
@@ -85,8 +84,7 @@ void Connection::write(Buffer buffer, std::span<iovec> extra, Function<void(Erro
   iovec[1].iov_len = buffer->size();
   CHECK(2 + extra.size() <= 16);
   std::memcpy(&iovec[2], extra.data(), sizeof(::iovec) * extra.size());
-  socket.writev(
-      iovec.data(), 2 + extra.size(),
+  socket.writev(iovec.data(), 2 + extra.size(),
       [buffer0 = std::move(buffer0), buffer = std::move(buffer), callback = std::move(callback)](Error* error) {
         if (callback) {
           callback(error);
@@ -115,7 +113,9 @@ void Connection::writefd(Buffer buffer, int fd) {
   socket.writev(
       iovec.data(), iovec.size(), [buffer0 = std::move(buffer0), buffer = std::move(buffer)](Error* error) {});
 
-  socket.sendFd(dupfd, [dupfd](Error* error) { ::close(dupfd); });
+  socket.sendFd(dupfd, [dupfd](Error* error) {
+    ::close(dupfd);
+  });
 }
 
 template void Connection::writefd(BufferHandle, int);

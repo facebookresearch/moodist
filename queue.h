@@ -11,12 +11,12 @@
 
 namespace moodist {
 
-struct Group;  // forward declaration
+struct Group; // forward declaration
 struct QueueWorkImpl;
 
 struct QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
-  StorageWrapper storage;  // keeps tensor storage alive during async put (safer than TensorWrapper)
+  StorageWrapper storage; // keeps tensor storage alive during async put (safer than TensorWrapper)
   bool waitOnDestroy = true;
   MOODIST_API QueueWork();
   MOODIST_API ~QueueWork();
@@ -44,8 +44,9 @@ struct Queue {
   MOODIST_API std::string_view name() const;
 };
 
-MOODIST_API std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming, std::string_view name = {});
-MOODIST_API std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
+MOODIST_API std::shared_ptr<Queue> makeQueue(
+    std::shared_ptr<Group>, int location, bool streaming, std::string_view name = {});
+MOODIST_API std::shared_ptr<Queue> makeQueue(
+    std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
 
 } // namespace moodist

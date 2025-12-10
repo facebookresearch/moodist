@@ -15,7 +15,9 @@ std::string generate_alltoall(const Group* group) {
 
   const auto& reduceScatter = *group->reduceScatter;
 
-  const auto& replace = [&]<typename... T>(T&&... v) { return reduceScatter.replace(std::forward<T>(v)...); };
+  const auto& replace = [&]<typename... T>(T&&... v) {
+    return reduceScatter.replace(std::forward<T>(v)...);
+  };
   const auto& concurrencyIndex = [&]<typename... T>(T&&... v) {
     return reduceScatter.concurrencyIndex(std::forward<T>(v)...);
   };
@@ -26,16 +28,14 @@ std::string generate_alltoall(const Group* group) {
   std::string globaldefs;
 
   auto addCopy = [&](std::string dst, std::string src, std::string bytes) {
-    return replace(
-        "dynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes",
-        bytes);
+    return replace("dynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src,
+        "$bytes", bytes);
   };
 
   std::string code;
   for (size_t i : peerIndices) {
-    code += addCopy(
-        replace("(void*)params.outputAddress[$i]", "$i", i), replace("(void*)params.peerInputAddresses[$i]", "$i", i),
-        "params.bytes");
+    code += addCopy(replace("(void*)params.outputAddress[$i]", "$i", i),
+        replace("(void*)params.peerInputAddresses[$i]", "$i", i), "params.bytes");
   }
 
   std::string source = replace(

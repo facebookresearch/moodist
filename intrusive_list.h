@@ -13,7 +13,7 @@ struct IntrusiveListLink {
   T* next = nullptr;
 };
 
-template<typename T, IntrusiveListLink<T> T::*link>
+template<typename T, IntrusiveListLink<T> T::* link>
 struct IntrusiveList {
 private:
   T head;

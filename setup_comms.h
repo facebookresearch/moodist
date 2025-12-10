@@ -44,8 +44,8 @@ struct SetupComms {
 
   template<typename T>
   void sendTo(size_t rank, const T& v) {
-    auto buffer =
-        serializeToBuffer((uint64_t)0, (uint64_t)0, (uint32_t)0, (uint32_t)0, (uint32_t)0, std::string_view(typeid(T).name()), v);
+    auto buffer = serializeToBuffer(
+        (uint64_t)0, (uint64_t)0, (uint32_t)0, (uint32_t)0, (uint32_t)0, std::string_view(typeid(T).name()), v);
     sendBufferTo(rank, std::move(buffer));
   }
   template<typename T>

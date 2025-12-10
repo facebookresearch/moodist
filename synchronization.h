@@ -101,9 +101,8 @@ public:
         }
         if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(100)) {
           int* p = owner.load();
-          printf(
-              "deadlock detected in thread %d! held by thread %d (my return address %p, owner return address %p, "
-              "&mutexThreadIdCounter is %p)\n",
+          printf("deadlock detected in thread %d! held by thread %d (my return address %p, owner return address %p, "
+                 "&mutexThreadIdCounter is %p)\n",
               mutexThreadId, p ? *p : -1, __builtin_return_address(0), ownerAddress.load(),
               (void*)&mutexThreadIdCounter);
           start = std::chrono::steady_clock::now();

@@ -67,8 +67,8 @@ struct IpcMapper {
 
   void init(int node);
 
-  void
-  sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback);
+  void sendRequestAddress(
+      size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback);
   void sendRequestEvent(size_t peerIndex, const CUipcEventHandle& handle, Function<void(uintptr_t)> callback);
 
   void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback);
@@ -121,8 +121,7 @@ struct IpcMapper {
       if (i == ipcMap.end()) {
         continue;
       }
-      log.debug(
-          "tryToUnmapList: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
+      log.debug("tryToUnmapList: requesting unmap of %#x bytes at %#x (mapped at %#x)!\n", i->second.size,
           i->second.localAddress, i->second.peerAddress);
       ++waitCount;
       uintptr_t peerAddress = i->second.peerAddress;
@@ -157,8 +156,8 @@ struct IpcMapper {
   }
 
   template<typename Callback>
-  void
-  requestAddress(size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
+  void requestAddress(
+      size_t peerIndex, uintptr_t address, size_t length, Callback&& callback, bool unmappable = false) {
     CHECK(length > 0);
     CHECK(address != 0);
 
@@ -201,17 +200,15 @@ struct IpcMapper {
     }
 
     CHECK(size >= length);
-    log.debug(
-        "requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length, address,
-        size, base, bufferId);
+    log.debug("requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length,
+        address, size, base, bufferId);
     CUipcMemHandle handle;
     CHECK_CU(cuIpcGetMemHandle(&handle, base));
     size_t offset = address - base;
     Mapped& mapped = peerIpcMap[peerIndex][handle];
     uintptr_t baseAddress = mapped.peerAddress;
     if (baseAddress) {
-      log.debug(
-          "requestAddress: (allocation mapped) %#x bytes at %#x is already mapped at %#x (offset %#x)\n", length,
+      log.debug("requestAddress: (allocation mapped) %#x bytes at %#x is already mapped at %#x (offset %#x)\n", length,
           address, baseAddress + offset, offset);
       CHECK(mapped.localAddress == base);
       CHECK(mapped.size == size);
@@ -258,8 +255,7 @@ struct IpcMapper {
       e.address = address;
       l.unlock();
       ++waitCount;
-      sendRequestAddress(
-          peerIndex, handle, size,
+      sendRequestAddress(peerIndex, handle, size,
           [this, peerIndex, handle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
             auto& v = peerIpcMap[peerIndex][handle];
             v.localAddress = base;
@@ -273,9 +269,8 @@ struct IpcMapper {
             CHECK(q.bufferId == bufferId);
             CHECK(!q.list.empty());
             for (auto& e : q.list) {
-              log.debug(
-                  "requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length, e.address,
-                  mappedAddress + e.offset, e.offset);
+              log.debug("requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length,
+                  e.address, mappedAddress + e.offset, e.offset);
               peerIpcAddressMap[peerIndex][e.address] = {mappedAddress, bufferId};
               std::move(e.callback)(mappedAddress + e.offset);
             }
@@ -286,7 +281,12 @@ struct IpcMapper {
   }
 
   void requestAddress(size_t peerIndex, uintptr_t address, size_t length, uintptr_t* ptr, bool unmappable = false) {
-    return requestAddress(peerIndex, address, length, [ptr](uintptr_t value) { *ptr = value; }, unmappable);
+    return requestAddress(
+        peerIndex, address, length,
+        [ptr](uintptr_t value) {
+          *ptr = value;
+        },
+        unmappable);
   }
 
   template<typename Callback>
@@ -337,7 +337,9 @@ struct IpcMapper {
   }
 
   void requestEvent(size_t peerIndex, CUevent event, uintptr_t* ptr) {
-    return requestEvent(peerIndex, event, [ptr](uintptr_t value) { *ptr = value; });
+    return requestEvent(peerIndex, event, [ptr](uintptr_t value) {
+      *ptr = value;
+    });
   }
 
   void wait() {
@@ -370,7 +372,9 @@ struct IpcMapper {
 
   void pushEvent(size_t peerIndex, CUevent event) {
     static_assert(sizeof(CUevent) == sizeof(uintptr_t));
-    requestEvent(peerIndex, event, [this, peerIndex](uintptr_t value) { push(peerIndex, value); });
+    requestEvent(peerIndex, event, [this, peerIndex](uintptr_t value) {
+      push(peerIndex, value);
+    });
     wait();
   }
   CUevent popEvent(size_t peerIndex) {

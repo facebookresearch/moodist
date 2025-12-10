@@ -265,7 +265,9 @@ struct SchedulerImpl {
           }
 
           while (pool.numThreads.load(std::memory_order_relaxed) <= index) {
-            pool.addThread(f, [this](Thread* t) { wait(t); });
+            pool.addThread(f, [this](Thread* t) {
+              wait(t);
+            });
           }
           return;
         }

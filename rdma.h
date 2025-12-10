@@ -19,7 +19,9 @@ inline constexpr struct Ops {
 } nullops;
 template<typename SF, typename F>
 struct TemplatedOps {
-  void (*call)(SmallFunction*) = [](SF* self) { ((F&)self->storage)(); };
+  void (*call)(SmallFunction*) = [](SF* self) {
+    ((F&)self->storage)();
+  };
   void (*dtor)(SmallFunction*) = std::is_trivially_destructible_v<F> ? (void (*)(SmallFunction*)) nullptr
                                                                      : (void (*)(SmallFunction*))[](SF * self) {
     ((F&)self->storage).~F();
@@ -179,11 +181,9 @@ struct Rdma {
   virtual ~Rdma() {}
   virtual void setCpuThreadApi(RdmaCpuThreadApi cpuThreadApi) = 0;
   virtual void poll() = 0;
-  virtual void postWrite(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  virtual void postWrite(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback, bool allowInline) = 0;
-  virtual void postRead(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  virtual void postRead(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback) = 0;
   virtual void postSend(size_t i, void* localAddress, uint32_t lkey, size_t bytes, RdmaCallback* callback) = 0;
   virtual void postRecv(void* localAddress, uint32_t lkey, size_t bytes, RdmaCallback* callback) = 0;

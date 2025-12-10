@@ -16,7 +16,9 @@ std::string generate_reduce_scatter_direct(
 
   const auto& reduceScatter = *group->reduceScatter;
 
-  const auto& replace = [&]<typename... T>(T&&... v) { return reduceScatter.replace(std::forward<T>(v)...); };
+  const auto& replace = [&]<typename... T>(T&&... v) {
+    return reduceScatter.replace(std::forward<T>(v)...);
+  };
   const auto& concurrencyIndex = [&]<typename... T>(T&&... v) {
     return reduceScatter.concurrencyIndex(std::forward<T>(v)...);
   };
@@ -37,9 +39,8 @@ std::string generate_reduce_scatter_direct(
   for (auto& v : instructions) {
     instructionsHex.push_back(fmt::sprintf("%#x", v));
   }
-  std::string instructionsArray = fmt::sprintf(
-      "__constant__ uint32_t reduceScatterInstructions[%d] = {%s};", instructions.size(),
-      fmt::to_string(fmt::join(instructionsHex, ", ")));
+  std::string instructionsArray = fmt::sprintf("__constant__ uint32_t reduceScatterInstructions[%d] = {%s};",
+      instructions.size(), fmt::to_string(fmt::join(instructionsHex, ", ")));
 
   if (instructions.empty()) {
     instructionsArray = "";
@@ -50,15 +51,14 @@ std::string generate_reduce_scatter_direct(
   std::string prevReduceSrc;
   std::string prevReduceBytes;
   auto callMemcpy = [&](std::string dst, std::string src, std::string bytes) {
-    reduceCode += replace(
-        "newDynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src,
-        "$bytes", bytes);
+    reduceCode += replace("newDynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst,
+        "$src", src, "$bytes", bytes);
   };
   auto callReduceAdd = [&](std::string dst, std::string src1, std::string src2, std::string bytes) {
-    reduceCode += replace(
-        "newDynamicBlockIndex = reduce2<T, R>(dynamicBlockIndex, (T*)$dst, (const T*)$src1, (const T*)$src2, "
-        "($bytes) / sizeof(T));\n",
-        "$dst", dst, "$src1", src1, "$src2", src2, "$bytes", bytes);
+    reduceCode +=
+        replace("newDynamicBlockIndex = reduce2<T, R>(dynamicBlockIndex, (T*)$dst, (const T*)$src1, (const T*)$src2, "
+                "($bytes) / sizeof(T));\n",
+            "$dst", dst, "$src1", src1, "$src2", src2, "$bytes", bytes);
   };
   auto reduceFlush = [&]() {
     if (prevReduceDst != "" && prevReduceSrc != "") {
@@ -108,8 +108,7 @@ std::string generate_reduce_scatter_direct(
   std::string syncWait;
   if (false) {
     for (size_t peerIndex : peerIndices) {
-      syncForward += replace(
-          "*(volatile uint32_t*)($forwardPtr + 4 * n) = stepValue;\n", "$forwardPtr",
+      syncForward += replace("*(volatile uint32_t*)($forwardPtr + 4 * n) = stepValue;\n", "$forwardPtr",
           concurrencyIndex(peerCudaProxyReady[peerIndex], sizeof(uint32_t) * size * peerMyRemoteIndex[peerIndex]),
           "$peerIndex", peerIndex);
       syncWait += replace(
@@ -170,11 +169,9 @@ std::string generate_reduce_scatter_direct(
     std::string addr = "(T*)(params.sendAddress + params.pitch * n + chunkOffset)";
     reduceAdd(addr, "(const T*)(params.inputAddress + params.pitch * source + chunkOffset)", "currentChunkSize");
     for (size_t peerIndex : peerIndices) {
-      reduceAdd(
-          addr,
-          replace(
-              "(const T*)(params.peerInputAddresses[$peerIndex] + params.pitch * source + chunkOffset)", "$peerIndex",
-              peerIndex),
+      reduceAdd(addr,
+          replace("(const T*)(params.peerInputAddresses[$peerIndex] + params.pitch * source + chunkOffset)",
+              "$peerIndex", peerIndex),
           "currentChunkSize");
     }
     reduceFlush();

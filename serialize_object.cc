@@ -103,7 +103,7 @@ struct ObjMap {
   static_assert(std::is_trivial_v<Key>);
   static_assert(std::is_trivial_v<Value>);
 
-  static constexpr size_t PROBE_LIMIT = 4;  // Allow some probing for stability
+  static constexpr size_t PROBE_LIMIT = 4; // Allow some probing for stability
 
   size_t allocated = 0;
   size_t msize = 0;
@@ -135,7 +135,7 @@ struct ObjMap {
   }
 
   ObjMap() {
-    allocated = 20;  // 16 usable + probe space
+    allocated = 20; // 16 usable + probe space
     std::tie(items, indices) = alloc(allocated);
     std::memset(items, 0, sizeof(Item) * allocated);
   }
@@ -149,7 +149,7 @@ struct ObjMap {
 
   [[gnu::noinline]] [[gnu::cold]] void expand() {
     size_t oldallocated = allocated;
-    size_t newallocated = (allocated - PROBE_LIMIT) * 2 + PROBE_LIMIT;  // double the usable capacity
+    size_t newallocated = (allocated - PROBE_LIMIT) * 2 + PROBE_LIMIT; // double the usable capacity
 
     auto [newitems, newindices] = alloc(newallocated);
     std::memset(newitems, 0, sizeof(Item) * newallocated);
@@ -336,7 +336,7 @@ long getint(X& x) {
   if (type == int16) {
     return x.template read<int16_t>();
   }
-  asm volatile("");  // Prevent compiler from converting if-chain to switch/jump table
+  asm volatile(""); // Prevent compiler from converting if-chain to switch/jump table
   if (type == int32) {
     return x.template read<int32_t>();
   }
@@ -593,9 +593,9 @@ template<typename X>
 
   x(name, moduleName);
 
-  auto key = std::make_pair(
-      std::string_view((char*)PyUnicode_DATA(moduleName.ptr()), PyUnicode_GET_LENGTH(moduleName.ptr())),
-      std::string_view((char*)PyUnicode_DATA(name.ptr()), PyUnicode_GET_LENGTH(name.ptr())));
+  auto key =
+      std::make_pair(std::string_view((char*)PyUnicode_DATA(moduleName.ptr()), PyUnicode_GET_LENGTH(moduleName.ptr())),
+          std::string_view((char*)PyUnicode_DATA(name.ptr()), PyUnicode_GET_LENGTH(name.ptr())));
   auto it = cachedGlobals.find(key);
   if (it != cachedGlobals.end()) [[likely]] {
     return py::reinterpret_borrow<py::object>(it->second);
@@ -652,8 +652,7 @@ template<typename X>
     return;
   }
   if (type != &PyTuple_Type) {
-    throw std::runtime_error(fmt::sprintf(
-        "Moodist.serialize: %s.__reduce__ must return a tuple, but got %s\n",
+    throw std::runtime_error(fmt::sprintf("Moodist.serialize: %s.__reduce__ must return a tuple, but got %s\n",
         (std::string)py::str((PyObject*)Py_TYPE(obj)), (std::string)py::str(reduce.get_type())));
   }
   size_t n = ConstructorTuple::size(reduce.ptr());
@@ -664,9 +663,9 @@ template<typename X>
   PyObject* dictIterator = n < 5 ? Py_None : ConstructorTuple::get(reduce.ptr(), 4);
   PyObject* setstate = n < 6 ? Py_None : ConstructorTuple::get(reduce.ptr(), 5);
   if (!func || !args) {
-    throw std::runtime_error(fmt::sprintf(
-        "Moodist.serialize: %s.__reduce__ must return a tuple of minimum length 2 (got %d)\n",
-        (std::string)py::str((PyObject*)Py_TYPE(obj)), n));
+    throw std::runtime_error(
+        fmt::sprintf("Moodist.serialize: %s.__reduce__ must return a tuple of minimum length 2 (got %d)\n",
+            (std::string)py::str((PyObject*)Py_TYPE(obj)), n));
   }
 
   // log.info("func is %s\n", (std::string)(py::str)((py::handle)func).attr("__name__"));
@@ -1126,7 +1125,7 @@ template<typename X>
     if (type == int16) {
       return toint(x.template read<int16_t>());
     }
-    asm volatile("");  // Prevent compiler from converting if-chain to switch/jump table
+    asm volatile(""); // Prevent compiler from converting if-chain to switch/jump table
     if (type == int32) {
       return toint(x.template read<int32_t>());
     }
@@ -1186,7 +1185,7 @@ Buffer* serializeObjectImpl(PyObject* o) {
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>(o));
   Buffer* buf = buffer.release();
-  buf->refcount.fetch_add(1, std::memory_order_acquire);  // set refcount to 1
+  buf->refcount.fetch_add(1, std::memory_order_acquire); // set refcount to 1
   return buf;
 }
 

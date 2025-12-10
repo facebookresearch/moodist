@@ -31,7 +31,7 @@ struct Group;
 struct CollectiveBase {
   Group* group;
 
-  CollectiveBase(Group* group) : group(group){};
+  CollectiveBase(Group* group) : group(group) {};
   virtual ~CollectiveBase() {}
 
   const size_t rank = group->rank;
@@ -42,7 +42,9 @@ struct CollectiveBase {
   std::vector<std::string> supportedReductions = {"rsum", "rmin", "rmax", "ravg"};
 
   static std::string replace(std::string str, std::vector<std::pair<std::string, std::string>> vars) {
-    std::sort(vars.begin(), vars.end(), [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+    std::sort(vars.begin(), vars.end(), [](auto& a, auto& b) {
+      return a.first.size() > b.first.size();
+    });
     size_t pos = 0;
     while (pos != str.size()) {
       std::string key;
@@ -250,9 +252,8 @@ struct CollectiveBase {
           std::string_view original(s, c - s);
           if (name == "syncthreads" && args == "") {
             r.append(p, s - p);
-            r += replace(
-                R"(/* $original */ asm volatile ("barrier.sync $n;" :: ); )", "$original", original, "$n", ++n % 16,
-                "$rank", rank);
+            r += replace(R"(/* $original */ asm volatile ("barrier.sync $n;" :: ); )", "$original", original, "$n",
+                ++n % 16, "$rank", rank);
             p = c;
           } else if (name == "barriernumber" && args == "") {
             r.append(p, s - p);

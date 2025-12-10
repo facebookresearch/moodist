@@ -44,8 +44,12 @@ struct DeviceInfo {
   int index_ = -1;
   bool is_cuda_ = false;
 
-  int index() const { return index_; }
-  bool is_cuda() const { return is_cuda_; }
+  int index() const {
+    return index_;
+  }
+  bool is_cuda() const {
+    return is_cuda_;
+  }
 };
 
 class TensorWrapper {
@@ -80,7 +84,7 @@ public:
   MOODIST_API bool is_contiguous() const;
   MOODIST_API bool is_cuda() const;
   MOODIST_API bool is_cpu() const;
-  MOODIST_API const void* storage_data() const;  // returns tensor.storage().data()
+  MOODIST_API const void* storage_data() const; // returns tensor.storage().data()
 
   // Shape info
   MOODIST_API int64_t ndim() const;
@@ -90,20 +94,22 @@ public:
   MOODIST_API std::vector<int64_t> strides() const;
 
   // Access underlying storage (for wrapper implementation only)
-  void* storage() { return storage_; }
-  const void* storage() const { return storage_; }
-  void setValid(bool v) { valid_ = v; }
+  void* storage() {
+    return storage_;
+  }
+  const void* storage() const {
+    return storage_;
+  }
+  void setValid(bool v) {
+    valid_ = v;
+  }
 };
 
 // Factory functions - implemented in wrapper
-MOODIST_API TensorWrapper tensorFromBlob(
-    void* data, const std::vector<int64_t>& sizes, DType dtype, int device_index);
-MOODIST_API TensorWrapper tensorFromBlob(
-    void* data, const std::vector<int64_t>& sizes, DType dtype, DeviceInfo device);
-MOODIST_API TensorWrapper tensorEmpty(
-    const std::vector<int64_t>& sizes, DType dtype, int device_index);
-MOODIST_API TensorWrapper tensorEmpty(
-    const std::vector<int64_t>& sizes, DType dtype, DeviceInfo device);
+MOODIST_API TensorWrapper tensorFromBlob(void* data, const std::vector<int64_t>& sizes, DType dtype, int device_index);
+MOODIST_API TensorWrapper tensorFromBlob(void* data, const std::vector<int64_t>& sizes, DType dtype, DeviceInfo device);
+MOODIST_API TensorWrapper tensorEmpty(const std::vector<int64_t>& sizes, DType dtype, int device_index);
+MOODIST_API TensorWrapper tensorEmpty(const std::vector<int64_t>& sizes, DType dtype, DeviceInfo device);
 
 // Tensor operations - implemented in wrapper
 MOODIST_API void tensorSumOut(TensorWrapper& dst, const TensorWrapper& src, int dim);
@@ -145,9 +151,15 @@ public:
   MOODIST_API void reset();
 
   // Access underlying storage (for wrapper implementation only)
-  void* storage() { return storage_; }
-  const void* storage() const { return storage_; }
-  void setValid(bool v) { valid_ = v; }
+  void* storage() {
+    return storage_;
+  }
+  const void* storage() const {
+    return storage_;
+  }
+  void setValid(bool v) {
+    valid_ = v;
+  }
 };
 
 // Extract storage from tensor (implemented in wrapper)
@@ -155,7 +167,8 @@ MOODIST_API StorageWrapper storageFromTensor(const TensorWrapper& t);
 
 // Forward declaration for TensorDataPtr conversion
 struct TensorData;
-template<typename T, size_t maxThreadLocalEntries> struct FLPtr;
+template<typename T, size_t maxThreadLocalEntries>
+struct FLPtr;
 using TensorDataPtr = FLPtr<TensorData, 0x40>;
 
 // Create TensorWrapper from TensorDataPtr (implemented in wrapper)

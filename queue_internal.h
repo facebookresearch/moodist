@@ -17,9 +17,8 @@ constexpr uint8_t transactionOpCommit = 1;
 constexpr uint8_t transactionOpCancel = 2;
 
 uint32_t queuePrepare(uintptr_t queueAddress, uint32_t source, uint32_t getKey, uint32_t transactionKey);
-void queueFinish(
-    Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor, uint32_t getKey,
-    uint32_t transactionKey, size_t queueSize);
+void queueFinish(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor,
+    uint32_t getKey, uint32_t transactionKey, size_t queueSize);
 
 void queueRemoteGetStart(
     Group* group, uintptr_t queueAddress, uint32_t source, uintptr_t remoteQueueAddress, uint32_t key);

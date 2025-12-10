@@ -341,9 +341,8 @@ struct RdmaTcp : Rdma {
     }
     if ((uintptr_t)address < (uintptr_t)i.address || (uintptr_t)address + bytes > (uintptr_t)i.address + i.bytes ||
         (uintptr_t)address + bytes < (uintptr_t)address) {
-      log.error(
-          "TCP: memory op out of range. (requested [%#x, %#x], registration [%#x, %#x])\n", (uintptr_t)address, bytes,
-          (uintptr_t)i.address, i.bytes);
+      log.error("TCP: memory op out of range. (requested [%#x, %#x], registration [%#x, %#x])\n", (uintptr_t)address,
+          bytes, (uintptr_t)i.address, i.bytes);
       setError();
       return false;
     }
@@ -394,8 +393,7 @@ struct RdmaTcp : Rdma {
     };
   }
 
-  void postWrite(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postWrite(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback, bool allowInline) {
     callback->i = i;
     ++callback->refcount;
@@ -411,12 +409,10 @@ struct RdmaTcp : Rdma {
     std::unique_lock l(mutex);
     activeCallbacks[index] = callback;
     l.unlock();
-    tcp->send(
-        i, serializeToBuffer(messageWrite, index, rkey, remoteAddress, bytes), localAddress, bytes,
+    tcp->send(i, serializeToBuffer(messageWrite, index, rkey, remoteAddress, bytes), localAddress, bytes,
         writeCallback(std::move(mr)));
   }
-  void postRead(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postRead(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback) {
     callback->i = i;
     ++callback->refcount;

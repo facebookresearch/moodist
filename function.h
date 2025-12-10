@@ -89,7 +89,9 @@ template<typename F, typename R, typename... Args>
 struct OpsConstructor {
   static constexpr Ops<R, Args...> make() {
     Ops<R, Args...> r{{sizeof(F)}};
-    r.call = [](Storage& s, Args&&... args) { return s.template as<F>()(std::forward<Args>(args)...); };
+    r.call = [](Storage& s, Args&&... args) {
+      return s.template as<F>()(std::forward<Args>(args)...);
+    };
     r.callAndDtor = [](Storage& s, Args&&... args) {
       F& f = s.template as<F>();
       if constexpr (std::is_same_v<R, void>) {

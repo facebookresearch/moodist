@@ -50,8 +50,7 @@ struct RdmaIb : Rdma {
     this->cpuThreadApi = cpuThreadApi;
   }
 
-  void postWriteImpl(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postWriteImpl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback, bool allowInline) {
     CHECK(i >= 0 && i < group->size);
 
@@ -88,8 +87,7 @@ struct RdmaIb : Rdma {
     }
   }
 
-  void postWrite(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postWrite(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback, bool allowInline) {
     CHECK(i >= 0 && i < group->size);
 
@@ -110,8 +108,7 @@ struct RdmaIb : Rdma {
     postWriteImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
   }
 
-  void postReadImpl(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postReadImpl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback) {
     CHECK(i >= 0 && i < group->size);
 
@@ -144,8 +141,7 @@ struct RdmaIb : Rdma {
     }
   }
 
-  void postRead(
-      size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+  void postRead(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback) {
     callback->i = i;
     ++callback->refcount;
@@ -201,8 +197,9 @@ struct RdmaIb : Rdma {
     ++callback->refcount;
 
     if (currentCqEntries == maxCqEntries) [[unlikely]] {
-      queuedWrs.push_back(
-          [this, i, localAddress, lkey, bytes, callback] { postSendImpl(i, localAddress, lkey, bytes, callback); });
+      queuedWrs.push_back([this, i, localAddress, lkey, bytes, callback] {
+        postSendImpl(i, localAddress, lkey, bytes, callback);
+      });
       return;
     }
 
@@ -277,8 +274,7 @@ struct RdmaIb : Rdma {
         for (size_t i = 0; i != n; ++i) {
           ibv_wc& wc = wcs[i];
           if (wc.status) {
-            fatal(
-                "rank %d Work completion with status %d (opcode %d, id %#x) (recv)\n", group->rank, wc.status,
+            fatal("rank %d Work completion with status %d (opcode %d, id %#x) (recv)\n", group->rank, wc.status,
                 wc.opcode, wc.wr_id);
           } else {
             RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
@@ -313,9 +309,8 @@ struct RdmaIb : Rdma {
         NOINLINE_COLD({
           RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
           if (cpuThreadApi.suppressErrors()) {
-            log.error(
-                "%s: Error communicating with %s: Work completion with status %d (%s).\n", cpuThreadApi.groupName(),
-                cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
+            log.error("%s: Error communicating with %s: Work completion with status %d (%s).\n",
+                cpuThreadApi.groupName(), cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
             cpuThreadApi.setError();
           }
         });
@@ -346,8 +341,7 @@ struct RdmaIb : Rdma {
   }
 
   std::unique_ptr<RdmaMr> regMrCpu(void* address, size_t bytes) {
-    ibv_mr* mr = ibv_reg_mr(
-        ib->protectionDomain, address, bytes,
+    ibv_mr* mr = ibv_reg_mr(ib->protectionDomain, address, bytes,
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
       perror("ibv_reg_mr");
@@ -356,8 +350,7 @@ struct RdmaIb : Rdma {
     return std::make_unique<Mr>(mr);
   }
   std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
-    ibv_mr* mr = ibv_reg_mr(
-        ib->protectionDomain, address, bytes,
+    ibv_mr* mr = ibv_reg_mr(ib->protectionDomain, address, bytes,
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
       perror("ibv_reg_mr");

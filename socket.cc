@@ -78,7 +78,9 @@ std::shared_ptr<ResolveHandle> resolveIpAddress(std::string_view address, int po
   memset(&h->sevp, 0, sizeof(h->sevp));
   h->sevp.sigev_notify = asynchronous ? SIGEV_THREAD : SIGEV_NONE;
   h->sevp.sigev_value.sival_ptr = f.release();
-  h->sevp.sigev_notify_function = [](sigval v) { Function<void()>((FunctionPointer)v.sival_ptr)(); };
+  h->sevp.sigev_notify_function = [](sigval v) {
+    Function<void()>((FunctionPointer)v.sival_ptr)();
+  };
   gaicb* ptr = &h->req;
   int r;
   do {
@@ -89,7 +91,9 @@ std::shared_ptr<ResolveHandle> resolveIpAddress(std::string_view address, int po
     std::string str = r == EAI_SYSTEM ? std::strerror(errno) : gai_strerror(r);
     Error e(std::move(str));
     if (asynchronous) {
-      scheduler.run([e = std::move(e), h]() mutable { h->callback(&e, nullptr); });
+      scheduler.run([e = std::move(e), h]() mutable {
+        h->callback(&e, nullptr);
+      });
     } else {
       h->callback(&e, nullptr);
     }
@@ -332,7 +336,9 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
           s.impl->fd = r;
           s.impl->setTcpSockOpts();
           poll::add(s.impl);
-          scheduler.run([s = std::move(s), sharedCallback]() mutable { (*sharedCallback)(nullptr, std::move(s)); });
+          scheduler.run([s = std::move(s), sharedCallback]() mutable {
+            (*sharedCallback)(nullptr, std::move(s));
+          });
         }
       }
     };
@@ -365,8 +371,7 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
       wl.unlock();
       int port = 0;
       std::tie(address, port) = decodeIpAddress(address);
-      auto h = resolveIpAddress(
-          address, port, true,
+      auto h = resolveIpAddress(address, port, true,
           [this, me = shared_from_this(), address = std::string(address), resolveKey](Error* e, addrinfo* aix) {
             std::unique_lock rl(readMutex);
             std::unique_lock wl(writeMutex);
@@ -553,9 +558,8 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     }
   }
 
-  bool writevImpl(
-      const iovec* vec, size_t veclen, std::pair<size_t, Function<void(Error*)>>* callbacks, size_t callbacksLen,
-      std::unique_lock<SpinMutex>& ql) {
+  bool writevImpl(const iovec* vec, size_t veclen, std::pair<size_t, Function<void(Error*)>>* callbacks,
+      size_t callbacksLen, std::unique_lock<SpinMutex>& ql) {
     if (closed.load(std::memory_order_relaxed)) {
       activeWrites.clear();
       activeWriteCallbacks.clear();
@@ -902,10 +906,9 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
     resolveHandles[resolveKey] = nullptr;
     wl.unlock();
     int socktype = isUdp ? SOCK_DGRAM : SOCK_STREAM;
-    auto h = resolveIpAddress(
-        address, port, true,
-        [this, me = shared_from_this(), address = std::string(address), socktype, callback,
-         resolveKey](Error* e, addrinfo* aix) {
+    auto h = resolveIpAddress(address, port, true,
+        [this, me = shared_from_this(), address = std::string(address), socktype, callback, resolveKey](
+            Error* e, addrinfo* aix) {
           std::unique_lock rl(readMutex);
           std::unique_lock wl(writeMutex);
           resolveHandles.erase(resolveKey);

@@ -136,8 +136,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     attr.max_dest_rd_atomic = 8;
     attr.min_rnr_timer = 5; // 0.06ms
     // attr.min_rnr_timer = 22;
-    error = ibv_modify_qp(
-        qp, &attr,
+    error = ibv_modify_qp(qp, &attr,
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
             IBV_QP_MIN_RNR_TIMER);
     if (error) {
@@ -158,8 +157,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     // attr.rnr_retry = 7; // infinite
     attr.max_rd_atomic = 8;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    error = ibv_modify_qp(
-        qp, &attr,
+    error = ibv_modify_qp(qp, &attr,
         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC |
             IBV_QP_ACCESS_FLAGS);
     if (error) {

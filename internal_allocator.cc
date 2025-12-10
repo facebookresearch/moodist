@@ -384,9 +384,8 @@ void allocate_memory(size_t index) {
   rv = (void*)(((uintptr_t)rv + alignment - 1) / alignment * alignment);
   bytes = e - (uintptr_t)rv;
 
-  log.verbose(
-      "(internal) mapped %d bytes at %#x (total %d bytes, %dG) on node %d\n", bytes, (uintptr_t)rv, mmappedBytes,
-      mmappedBytes / 1024 / 1024 / 1024, internalAllocatorNode);
+  log.verbose("(internal) mapped %d bytes at %#x (total %d bytes, %dG) on node %d\n", bytes, (uintptr_t)rv,
+      mmappedBytes, mmappedBytes / 1024 / 1024 / 1024, internalAllocatorNode);
 
   // auto start = std::chrono::steady_clock::now();
   // mlock(rv, bytes);
@@ -433,10 +432,9 @@ void allocate_memory(size_t index) {
 size_t currentLiveAllocations = 0;
 
 [[gnu::noinline]] void* moo_alloc(size_t bytes) {
-  size_t index = __builtin_ia32_lzcnt_u64(
-      (std::max(bytes, (size_t)1) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) *
-          alignof(std::max_align_t) -
-      1);
+  size_t index = __builtin_ia32_lzcnt_u64((std::max(bytes, (size_t)1) + alignof(std::max_align_t) - 1) /
+                                              alignof(std::max_align_t) * alignof(std::max_align_t) -
+                                          1);
   CHECK(index && index < 64);
   Thread* thread = &singleThread;
   if (!thread->activeRegions[index].empty()) [[likely]] {

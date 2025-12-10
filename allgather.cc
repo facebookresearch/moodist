@@ -122,7 +122,9 @@ void AllGather::init() {
   };
   std::sort(paths.begin(), paths.end(), sortFn);
 
-  std::stable_partition(paths.begin(), paths.end(), [&](auto& a) { return a[0] == rank; });
+  std::stable_partition(paths.begin(), paths.end(), [&](auto& a) {
+    return a[0] == rank;
+  });
   std::stable_partition(paths.begin(), paths.end(), [&](auto& a) {
     if (a.size() < 3) {
       return true;
@@ -372,9 +374,8 @@ std::string AllGather::generate() {
   };
 
   auto addCopy = [&](std::string dst, std::string src, std::string bytes) {
-    return replace(
-        "dynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src, "$bytes",
-        bytes);
+    return replace("dynamicBlockIndex = copy_impl(dynamicBlockIndex, $dst, $src, $bytes);\n", "$dst", dst, "$src", src,
+        "$bytes", bytes);
   };
 
   std::string localCopies;
@@ -382,10 +383,8 @@ std::string AllGather::generate() {
       "(void*)(params.outputAddress + params.pitch * $rank)", "(const void*)params.inputAddress", "params.bytes");
   for (size_t peerIndex : peerIndices) {
     size_t i = ipcRanks[peerIndex];
-    localCopies += addCopy(
-        replace("(void*)(params.outputAddress + params.pitch * $i)", "$i", i),
-        replace(
-            "*(const void**)$src", "$src",
+    localCopies += addCopy(replace("(void*)(params.outputAddress + params.pitch * $i)", "$i", i),
+        replace("*(const void**)$src", "$src",
             concurrencyIndex(group->cudaPeerAddresses, (sizeof(uintptr_t) * 2 * peerIndex))),
         "params.bytes");
   }
@@ -439,9 +438,8 @@ std::string AllGather::generate() {
   for (auto& v : instructions) {
     instructionsHex.push_back(fmt::sprintf("%#x", v));
   }
-  std::string instructionsArray = fmt::sprintf(
-      "__constant__ uint32_t allGatherInstructions[%d] = {%s};", instructions.size(),
-      fmt::to_string(fmt::join(instructionsHex, ", ")));
+  std::string instructionsArray = fmt::sprintf("__constant__ uint32_t allGatherInstructions[%d] = {%s};",
+      instructions.size(), fmt::to_string(fmt::join(instructionsHex, ", ")));
 
   for (size_t chunkIndex = 0; chunkIndex != maxChunks; ++chunkIndex) {
     recvCopies += R"(
@@ -487,10 +485,8 @@ std::string AllGather::generate() {
 
       recvCopies += "}\n__syncwarp();\n";
 
-      recvCopies += addCopy(
-          "(void*)(params.outputAddress + params.pitch * pdi_source + chunkOffset)",
-          replace(
-              "(void*)(*(uintptr_t*)$src + params.pitch * pdi_source + chunkOffset)", "$src",
+      recvCopies += addCopy("(void*)(params.outputAddress + params.pitch * pdi_source + chunkOffset)",
+          replace("(void*)(*(uintptr_t*)$src + params.pitch * pdi_source + chunkOffset)", "$src",
               concurrencyIndex(
                   group->cudaPeerAddresses, "(sizeof(uintptr_t) * 2 * proxyPeerIndex + sizeof(uintptr_t))")),
           "currentChunkSize");
@@ -620,7 +616,9 @@ const IVector<std::pair<size_t, size_t>>& AllGather::shuffledReads(size_t numRec
     }
     std::minstd_rand rng(131071 + size * 8191 + numRecvs * 49 + numChunks);
     std::ranges::shuffle(rr, rng);
-    std::ranges::stable_sort(rr, [](auto& a, auto& b) { return a.second < b.second; });
+    std::ranges::stable_sort(rr, [](auto& a, auto& b) {
+      return a.second < b.second;
+    });
     IVector<std::pair<size_t, size_t>> r;
     for (auto& v : rr) {
       auto i = std::ranges::find(sortedRanks, v.first);

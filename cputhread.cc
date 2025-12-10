@@ -463,18 +463,16 @@ struct CpuThreadImpl {
     pollCalledRecursively = false;
   }
 
-  void postWrite(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback, bool allowInline) {
+  void postWrite(Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback, bool allowInline) {
     // log.info(
     //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
     //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
     dev.rdma->postWrite(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
   }
 
-  void writeData(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback, bool allowInline = true) {
+  void writeData(Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback, bool allowInline = true) {
     CHECK(i >= 0 && i < size);
 
     callback->i = i;
@@ -499,21 +497,18 @@ struct CpuThreadImpl {
     }
   }
 
-  void writeDataNoInline(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback) {
+  void writeDataNoInline(Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback) {
     return writeData(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, false);
   }
 
-  void postRead(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback) {
+  void postRead(Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback) {
     dev.rdma->postRead(i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
   }
 
-  void readData(
-      Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      Callback* callback) {
+  void readData(Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, Callback* callback) {
     CHECK(i >= 0 && i < size);
 
     const size_t threshold = 1024ull * 1024 * 896;
@@ -536,9 +531,8 @@ struct CpuThreadImpl {
     }
   }
 
-  void writeControl(
-      size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey, void* remoteAddress,
-      uint32_t rkey, size_t bytes) {
+  void writeControl(size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey,
+      void* remoteAddress, uint32_t rkey, size_t bytes) {
     CHECK(i >= 0 && i < size);
 
     auto callbackobj = makeCallback(nullptr);
@@ -556,9 +550,8 @@ struct CpuThreadImpl {
     dev.rdma->postRecv(localAddress, lkey, bytes, callback);
   }
 
-  void readDataDistributed(
-      size_t i, void* localAddress, const std::array<uint32_t, maxDevices>& lkeys, void* remoteAddress,
-      const std::array<uint32_t, maxDevices>& rkeys, size_t bytes, Callback* callback = nullptr) {
+  void readDataDistributed(size_t i, void* localAddress, const std::array<uint32_t, maxDevices>& lkeys,
+      void* remoteAddress, const std::array<uint32_t, maxDevices>& rkeys, size_t bytes, Callback* callback = nullptr) {
     size_t numDevices = std::min((bytes + 262143) / 262144, std::max((size_t)4, group->numTrueIbDevs));
     numDevices = std::min(numDevices, devices.size());
     size_t numChunks = numDevices;
@@ -568,8 +561,7 @@ struct CpuThreadImpl {
       auto& dev = devices[di];
       size_t offset = chunkSize * di;
       size_t n = std::min(bytes - offset, chunkSize);
-      readData(
-          dev, i, (void*)((uintptr_t)localAddress + offset), lkeys[di], (void*)((uintptr_t)remoteAddress + offset),
+      readData(dev, i, (void*)((uintptr_t)localAddress + offset), lkeys[di], (void*)((uintptr_t)remoteAddress + offset),
           rkeys[di], n, callback);
       if (offset + n == bytes) {
         break;
@@ -610,21 +602,21 @@ struct CpuThreadImpl {
       seq_t& expectedSeqId = incomingSeqId[source];
       if (seqid != expectedSeqId) {
         uint32_t expectedValue = expectedSeqId;
-        queue.emplace(
-            std::ranges::lower_bound(
-                queue, seqid,
-                [expectedValue](auto& a, auto& b) {
-                  auto p = [expectedValue](auto& v) {
-                    if constexpr (std::is_same_v<std::decay_t<decltype(v)>, seq_t>) {
-                      return seq_t(v - expectedValue);
-                    } else {
-                      return seq_t(v.first - expectedValue);
-                    }
-                  };
-                  return p(a) < p(b);
-                }),
+        queue.emplace(std::ranges::lower_bound(queue, seqid,
+                          [expectedValue](auto& a, auto& b) {
+                            auto p = [expectedValue](auto& v) {
+                              if constexpr (std::is_same_v<std::decay_t<decltype(v)>, seq_t>) {
+                                return seq_t(v - expectedValue);
+                              } else {
+                                return seq_t(v.first - expectedValue);
+                              }
+                            };
+                            return p(a) < p(b);
+                          }),
             seqid, std::move(buffer));
-        enqueueCallback([this, &dev]() { postRecv(dev, allocateTemporaryBuffer(4096)); });
+        enqueueCallback([this, &dev]() {
+          postRecv(dev, allocateTemporaryBuffer(4096));
+        });
         return;
       }
       bool first = true;
@@ -686,8 +678,8 @@ struct CpuThreadImpl {
     size_t bytes = buffer->bytes;
     uint32_t lkey = buffer.mr->mrs[di]->lkey;
     postRecv(dev, pointer, lkey, bytes, makeCallback([this, &dev, buffer = std::move(buffer)]() mutable {
-               onRecv(dev, std::move(buffer));
-             }));
+      onRecv(dev, std::move(buffer));
+    }));
     // fixme? on shutdown, work requests are not completed, so their callbacks are leaked.
     //        do we care?
   }
@@ -768,9 +760,8 @@ struct CpuThreadImpl {
       auto start = std::chrono::steady_clock::now();
       auto mr = devices[i].rdma->regMrCpu((void*)address, bytes);
       ptr->mr.mrs[i] = &*mr;
-      log.debug(
-          "new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x) (registration took %gs)\n", bytes, address,
-          mr->lkey, mr->rkey, seconds(std::chrono::steady_clock::now() - start));
+      log.debug("new cpu mapped range of %d bytes at %#x (mr lkey %#x rkey %#x) (registration took %gs)\n", bytes,
+          address, mr->lkey, mr->rkey, seconds(std::chrono::steady_clock::now() - start));
       localMrs.push_back(std::move(mr));
     }
     MemoryRegistration* r = &ptr->mr;
@@ -853,8 +844,7 @@ struct CpuThreadImpl {
       }
       auto mr = devices[i].rdma->regMrCuda((void*)address, bytes);
       ptr->mr.mrs[i] = &*mr;
-      log.debug(
-          "new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
+      log.debug("new cuda mapped range of %d bytes at %#x -> fd %d  (mr lkey %#x rkey %#x)\n", bytes, address, bufferId,
           mr->lkey, mr->rkey);
       localMrs.push_back(std::move(mr));
     }
@@ -886,8 +876,7 @@ struct CpuThreadImpl {
     return r;
   }
 
-  void writeDataDistributed(
-      size_t dst, uintptr_t srcAddr, size_t len, MemoryRegistration* mr, uint64_t dstAddr,
+  void writeDataDistributed(size_t dst, uintptr_t srcAddr, size_t len, MemoryRegistration* mr, uint64_t dstAddr,
       const std::array<uint32_t, maxDevices>& key, Callback* callback) {
     CHECK(len > 0);
     size_t offset = 0;
@@ -946,9 +935,10 @@ struct CpuThreadImpl {
           auto& dev = devices[di];
           size_t n = 512 / devices.size();
           ++remaining;
-          writeData(
-              dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
-              testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+          writeData(dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
+              testRemote[i].keys[di], n * 8, makeCallback([&]() {
+                --remaining;
+              }));
           offset += n;
         }
       }
@@ -975,7 +965,9 @@ struct CpuThreadImpl {
 
       log.debug("rank %d CPU test done!\n", rank);
     }
-    if (std::ranges::all_of(devices, [](auto& v) { return v.rdma->supportsCuda(); })) {
+    if (std::ranges::all_of(devices, [](auto& v) {
+          return v.rdma->supportsCuda();
+        })) {
       for (size_t i = 0; i != 1; ++i) {
         log.debug("rank %d starting CUDA test %d!\n", rank, i);
         AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
@@ -992,9 +984,10 @@ struct CpuThreadImpl {
             auto& dev = devices[di];
             size_t n = 512 / devices.size();
             ++remaining;
-            writeDataNoInline(
-                dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
-                testRemote[i].keys[di], n * 8, makeCallback([&]() { --remaining; }));
+            writeDataNoInline(dev, i, testPtr + offset, testMr->mrs[di]->lkey,
+                (uint64_t*)testRemote[i].address + offset, testRemote[i].keys[di], n * 8, makeCallback([&]() {
+                  --remaining;
+                }));
             offset += n;
           }
         }
@@ -1036,9 +1029,8 @@ struct CpuThreadImpl {
         std::string fn = fmt::sprintf("moodist-trace-cpu-%s-%d.json", group->name, rank);
         FILE* f = fopen(fn.c_str(), "wb");
         CHECK(f != nullptr);
-        fmt::fprintf(
-            f, R"({"traceEvents": [)"
-               "\n");
+        fmt::fprintf(f, R"({"traceEvents": [)"
+                        "\n");
         bool first = true;
         for (auto& e : traceEvents) {
           if (!first) {
@@ -1046,8 +1038,7 @@ struct CpuThreadImpl {
           } else {
             first = false;
           }
-          fmt::fprintf(
-              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", e.name,
+          fmt::fprintf(f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", e.name,
               std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
               std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), e.threadId,
               pidForTracing);
@@ -1110,7 +1101,9 @@ struct CpuThreadImpl {
 
     template<typename T>
     auto getStepPtr() {
-      return [](Work* w) { ((T*)w)->step(); };
+      return [](Work* w) {
+        ((T*)w)->step();
+      };
     }
   };
 
@@ -1187,8 +1180,7 @@ struct CpuThreadImpl {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inDyn(concurrencyIndex, dstIndex));
-    writeControl(
-        concurrencyIndex, dev, i, (void*)&outDyn(concurrencyIndex, srcIndex), outDynsMr->mrs[di]->lkey,
+    writeControl(concurrencyIndex, dev, i, (void*)&outDyn(concurrencyIndex, srcIndex), outDynsMr->mrs[di]->lkey,
         (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses) * numDyns);
   }
 
@@ -1196,8 +1188,7 @@ struct CpuThreadImpl {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inStepValue(concurrencyIndex, dstIndex));
-    writeControl(
-        concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(uint32_t));
   }
@@ -1212,8 +1203,7 @@ struct CpuThreadImpl {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inStepValueDeviceChunk(concurrencyIndex, dstIndex, device, chunk));
-    writeControl(
-        concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(uint32_t));
   }
@@ -1224,8 +1214,7 @@ struct CpuThreadImpl {
     auto& dev = devices[di];
     size_t index = stepValueDeviceChunkIndex(concurrencyIndex, dstIndex, device, chunk);
     size_t offset = sizeof(uint32_t) * index;
-    writeControl(
-        concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteCudaStepValuesDeviceChunks[i].address + offset),
         remoteCudaStepValuesDeviceChunks[i].keys[di], sizeof(uint32_t));
   }
@@ -1236,8 +1225,7 @@ struct CpuThreadImpl {
     size_t di = 0;
     auto& dev = devices[di];
     auto offset = sizeof(uint32_t) * dstIndex;
-    writeControl(
-        concurrencyIndex, dev, rank, (void*)&outStepValue(concurrencyIndex, srcIndex),
+    writeControl(concurrencyIndex, dev, rank, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(group->cpuOutBuffer.cuda(concurrencyIndex) + offset),
         cpuOutMr->mrs[di]->rkey, sizeof(uint32_t));
   }
@@ -1319,8 +1307,7 @@ struct CpuThreadImpl {
         }
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
-        self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
+        self.writeControl(concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
@@ -1341,8 +1328,7 @@ struct CpuThreadImpl {
         }
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
-        self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
+        self.writeControl(concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
@@ -1714,9 +1700,8 @@ struct CpuThreadImpl {
         uintptr_t srcAddr = dyn.gatherAddress + params.pitch * index;
         auto key = dyn.gatherKey;
         auto& dev = self.devices[di];
-        self.readData(
-            dev, recvNeighbor, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
-            key[di], n, self.makeCallback([this, di, source, chunkIndex]() {
+        self.readData(dev, recvNeighbor, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey,
+            (void*)(srcAddr + readOffset), key[di], n, self.makeCallback([this, di, source, chunkIndex]() {
               --liveReads;
               --deviceLiveReads[di];
               self.writeCpuOut(concurrencyIndex, 16 + size * chunkIndex + source, 0);
@@ -1775,7 +1760,9 @@ struct CpuThreadImpl {
       }
 
       self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0, 1);
-      { WAIT_DYN(opTypeReduceScatterRingCuda, 0); }
+      {
+        WAIT_DYN(opTypeReduceScatterRingCuda, 0);
+      }
 
       tryRead(0);
 
@@ -1960,9 +1947,8 @@ struct CpuThreadImpl {
       uintptr_t srcAddr = dyn.gatherAddress;
       auto key = dyn.gatherKey;
       auto& dev = self.devices[di];
-      self.readData(
-          dev, source, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di], n,
-          self.makeCallback([this, di, source, chunkIndex, index]() {
+      self.readData(dev, source, (void*)(dstAddr + readOffset), recvMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
+          key[di], n, self.makeCallback([this, di, source, chunkIndex, index]() {
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
             --deviceLiveReads[di];
@@ -2191,9 +2177,8 @@ struct CpuThreadImpl {
       self.trace(
           concurrencyIndex, 1 + maxDevices + di, "WRITE di %d destination %d chunk %d", di, destination, chunkIndex);
 
-      self.writeDataNoInline(
-          dev, destination, (void*)(srcAddr + writeOffset), sendMr->mrs[di]->lkey, (void*)(dstAddr + writeOffset),
-          key[di], n, self.makeCallback([this, destination, chunkIndex, di] {
+      self.writeDataNoInline(dev, destination, (void*)(srcAddr + writeOffset), sendMr->mrs[di]->lkey,
+          (void*)(dstAddr + writeOffset), key[di], n, self.makeCallback([this, destination, chunkIndex, di] {
             self.writeStepValueDeviceChunk(concurrencyIndex, destination, 0, rank, 2, chunkIndex);
             self.trace(concurrencyIndex, 1 + maxDevices + di, "");
             --deviceLiveWrites[di];
@@ -2464,9 +2449,8 @@ struct CpuThreadImpl {
         auto key = dyn.gatherKey;
 
         auto& dev = self.devices[di];
-        self.readData(
-            dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
-            n, self.makeCallback([this, di, source, index, chunkIndex]() {
+        self.readData(dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey,
+            (void*)(srcAddr + readOffset), key[di], n, self.makeCallback([this, di, source, index, chunkIndex]() {
               --liveReads;
               --deviceLiveReads[di];
               self.writeStepValueDeviceChunk(concurrencyIndex, source, 0, rank, 0, chunkIndex);
@@ -2721,9 +2705,9 @@ struct CpuThreadImpl {
         uintptr_t srcAddr = source == recvNeighbor ? dyn.gatherAddress : dyn.gatherAddress + params.pitch * source;
         auto key = dyn.gatherKey;
         auto& dev = self.devices[di];
-        self.readData(
-            dev, recvNeighbor, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
-            key[di], n, self.makeCallback([this, di, source, chunkIndex /*, parallelIndex*/]() {
+        self.readData(dev, recvNeighbor, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey,
+            (void*)(srcAddr + readOffset), key[di], n,
+            self.makeCallback([this, di, source, chunkIndex /*, parallelIndex*/]() {
               self.trace(concurrencyIndex, 1 + di, "");
               --liveReads;
               --deviceLiveReads[di];
@@ -2786,8 +2770,12 @@ struct CpuThreadImpl {
       self.trace(concurrencyIndex, 0, "wait-dyn");
 
       self.writeDyn(concurrencyIndex, sendNeighbor, 0, 0, 2);
-      { WAIT_DYN(opTypeAllGatherRingCuda, 0); }
-      { WAIT_DYN(opTypeAllGatherRingCuda, 1); }
+      {
+        WAIT_DYN(opTypeAllGatherRingCuda, 0);
+      }
+      {
+        WAIT_DYN(opTypeAllGatherRingCuda, 1);
+      }
 
       self.trace(concurrencyIndex, 0, "read loop");
 
@@ -2970,9 +2958,8 @@ struct CpuThreadImpl {
       auto& dev = self.devices[di];
       // log.info("read di %d source %d chunk %d bytes %d dst %#x src %#x offset %#x\n", di, source, chunkIndex, n,
       // dstAddr, srcAddr, readOffset);
-      self.readData(
-          dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
-          n, self.makeCallback([this, di, source, chunkIndex, index]() {
+      self.readData(dev, source, (void*)(dstAddr + readOffset), outputMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
+          key[di], n, self.makeCallback([this, di, source, chunkIndex, index]() {
             // log.info("read FINISHED di %d source %d chunk %d\n", di, source, chunkIndex);
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
@@ -3171,9 +3158,8 @@ struct CpuThreadImpl {
       self.trace(
           concurrencyIndex, 1 + maxDevices + di, "WRITE di %d destination %d chunk %d", di, destination, chunkIndex);
 
-      self.writeDataNoInline(
-          dev, destination, (void*)(srcAddr + writeOffset), inputMr->mrs[di]->lkey, (void*)(dstAddr + writeOffset),
-          key[di], n, self.makeCallback([this, destination, chunkIndex, di] {
+      self.writeDataNoInline(dev, destination, (void*)(srcAddr + writeOffset), inputMr->mrs[di]->lkey,
+          (void*)(dstAddr + writeOffset), key[di], n, self.makeCallback([this, destination, chunkIndex, di] {
             self.writeStepValueDeviceChunk(concurrencyIndex, destination, 0, rank, 1, chunkIndex);
             self.trace(concurrencyIndex, 1 + maxDevices + di, "");
             --deviceLiveWrites[di];
@@ -3446,8 +3432,7 @@ struct CpuThreadImpl {
           uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
           ++liveSends;
-          self.writeDataDistributed(
-              i, srcAddr, params.bytes, inputBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
+          self.writeDataDistributed(i, srcAddr, params.bytes, inputBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
               self.makeCallback([this, i = this->i] {
                 --liveSends;
                 self.writeStepValue(concurrencyIndex, i, 0, rank);
@@ -3479,9 +3464,8 @@ struct CpuThreadImpl {
             }
           } else {
             // log.info("rank %d got recv source %d (forward to %d)\n", rank, i, proxyInfo[recvIndex].destination);
-            self.group->getPeerVar(
-                proxyInfo[recvIndex].destinationPeerIndex, self.group->cpuProxyReady)[size * concurrencyIndex + i] =
-                stepValue;
+            self.group->getPeerVar(proxyInfo[recvIndex].destinationPeerIndex,
+                self.group->cpuProxyReady)[size * concurrencyIndex + i] = stepValue;
             ++recvIndex;
 
             // log.info(
@@ -3516,8 +3500,7 @@ struct CpuThreadImpl {
         while (self.inStepValue(concurrencyIndex, i) != stepValue) {
           YIELD
         }
-        std::memcpy(
-            (void*)(params.outputAddress + params.pitch * i),
+        std::memcpy((void*)(params.outputAddress + params.pitch * i),
             (void*)((uintptr_t)outputBuffer->cpuPointer + params.pitch * i), params.bytes);
       }
 
@@ -3572,7 +3555,9 @@ struct CpuThreadImpl {
     template<typename T, size_t dindex = 0, size_t opindex = 0>
     decltype(stepPtr) getStepPtr() {
       if (dindex == (size_t)params.dindex && opindex == (size_t)params.opindex) {
-        return [](Work* w) { ((T*)w)->template step<(Dtype)dindex, (Reduction)opindex>(); };
+        return [](Work* w) {
+          ((T*)w)->template step<(Dtype)dindex, (Reduction)opindex>();
+        };
       }
       if constexpr (dindex + 1 < (size_t)Dtype::count) {
         return getStepPtr<T, dindex + 1, opindex>();
@@ -3681,8 +3666,7 @@ struct CpuThreadImpl {
           uintptr_t srcAddr = (uintptr_t)sendBuffer->cpuPointer + params.pitch * index;
 
           ++liveSends;
-          self.writeDataDistributed(
-              i, srcAddr, params.bytes, sendBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
+          self.writeDataDistributed(i, srcAddr, params.bytes, sendBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
               self.makeCallback([this, i = this->i] {
                 --liveSends;
                 self.writeStepValue(concurrencyIndex, i, 0, rank);
@@ -3811,9 +3795,8 @@ struct CpuThreadImpl {
         //     hasReduceStep ? "reduce" : "broadcast", stepValue, params.tensorAddress, recvAddress,
         //     recvMr ? recvMr->mrs[0]->lkey : 0, (void*)recvMr, (void*)recvMr->mrs[0], dstAddr, readOffset, di,
         //     srcMr->mrs[di]->lkey);
-        self.readData(
-            dev, recvFrom, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset), key[di],
-            n, self.makeCallback([this, di, source, chunkIndex, sendTo, index]() {
+        self.readData(dev, recvFrom, (void*)(dstAddr + readOffset), srcMr->mrs[di]->lkey, (void*)(srcAddr + readOffset),
+            key[di], n, self.makeCallback([this, di, source, chunkIndex, sendTo, index]() {
               --liveReads;
               --deviceLiveReads[di];
               if (!hasReduceStep && sendTo != rank) {
@@ -4337,9 +4320,8 @@ struct CpuThreadImpl {
                   ++state.liveSends;
                   uintptr_t dstAddr = dyn.gatherAddress;
                   auto key = dyn.gatherKey;
-                  self.writeData(
-                      dev, sendTo, (void*)(srcAddr + sendOffset), srcMr->mrs[di]->lkey, (void*)(dstAddr + sendOffset),
-                      key[di], n, self.makeCallback([this, di, source, chunkIndex]() {
+                  self.writeData(dev, sendTo, (void*)(srcAddr + sendOffset), srcMr->mrs[di]->lkey,
+                      (void*)(dstAddr + sendOffset), key[di], n, self.makeCallback([this, di, source, chunkIndex]() {
                         --sendStates[di].liveSends;
                         self.writeStepValueDeviceChunk(concurrencyIndex, sendTo, 0, source, di, chunkIndex);
                       }));
@@ -4350,8 +4332,7 @@ struct CpuThreadImpl {
                   continue;
                 }
               }
-              std::memcpy(
-                  (void*)(params.tensorAddress + sendOffset),
+              std::memcpy((void*)(params.tensorAddress + sendOffset),
                   (void*)((uintptr_t)temporaryBuffer->cpuPointer + sendOffset), n);
 
               if (isLastChunk) {
@@ -4515,8 +4496,7 @@ struct CpuThreadImpl {
         uintptr_t srcAddr = (uintptr_t)inputBuffer->cpuPointer;
 
         ++liveSends;
-        self.writeDataDistributed(
-            i, srcAddr, params.bytes, inputBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
+        self.writeDataDistributed(i, srcAddr, params.bytes, inputBuffer.mr, dyn.gatherAddress, dyn.gatherKey,
             self.makeCallback([this, i = this->i] {
               --liveSends;
               self.writeStepValue(concurrencyIndex, i, 0, rank);
@@ -4581,16 +4561,14 @@ struct CpuThreadImpl {
       } else {
         WAIT_DYN(opTypeCreateQueue, 0);
         if (params.location != dyn.gatherKey[0]) {
-          fatal(
-              "Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location "
-              "%d",
+          fatal("Queue location mismatch. Queue was created on rank %d with location %d, but on rank %d with location "
+                "%d",
               rank, params.location, params.location, dyn.gatherKey[0]);
         }
         if (params.streaming != dyn.gatherKey[1]) {
-          fatal(
-              "Queue streaming mismatch. Queue was created on rank %d with streaming %d, but on rank %d with "
-              "streaming "
-              "%d",
+          fatal("Queue streaming mismatch. Queue was created on rank %d with streaming %d, but on rank %d with "
+                "streaming "
+                "%d",
               rank, params.streaming, params.location, dyn.gatherKey[1]);
         }
         *params.outAddress = dyn.gatherAddress;
@@ -4601,8 +4579,7 @@ struct CpuThreadImpl {
         }
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
-        self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
+        self.writeControl(concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 1),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank)),
@@ -4622,8 +4599,7 @@ struct CpuThreadImpl {
         }
         size_t di = (rank + i) % self.devices.size();
         auto& dev = self.devices[di];
-        self.writeControl(
-            concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
+        self.writeControl(concurrencyIndex, dev, i, (void*)&self.outStepValue(concurrencyIndex, 2),
             self.outStepValuesStorageMr->mrs[di]->lkey,
             (void*)(self.remoteInternalInStepValueBuffer[i].address +
                     sizeof(uint32_t) * (2 * size * concurrencyIndex + 2 * rank + 1)),
@@ -4697,10 +4673,11 @@ struct CpuThreadImpl {
         tensor->shape[i] = shapeArr[i];
       }
 
-      queueFinish(
-          group, queueAddress, source, queuePrepare(queueAddress, source, getKey, transactionKey), std::move(tensor),
-          getKey, transactionKey, queueSize);
-      enqueueCallback([this, source, remoteOpKey] { sendQueueReadFinished(source, remoteOpKey); });
+      queueFinish(group, queueAddress, source, queuePrepare(queueAddress, source, getKey, transactionKey),
+          std::move(tensor), getKey, transactionKey, queueSize);
+      enqueueCallback([this, source, remoteOpKey] {
+        sendQueueReadFinished(source, remoteOpKey);
+      });
       return;
     }
 
@@ -4767,20 +4744,19 @@ struct CpuThreadImpl {
     auto buffer = allocateTemporaryBuffer(4096);
     size_t i = params.location;
     void* cpuPointer = buffer->cpuPointer;
-    size_t serializedBytes =
-        serializeToUnchecked(cpuPointer, SerializeFunction([&](auto& x) {
-                               x(header(opTypeQueuePut, i), params.remoteAddress, tensorAddress, bytes);
-                               x(params.putKey, params.remoteGetKey, params.transactionKey, params.queueSize);
-                               for (size_t i = 0; i != maxDevices; ++i) {
-                                 x(tensorMr && tensorMr->mrs[i] ? tensorMr->mrs[i]->rkey : 0);
-                               }
-                               x(params.tensor->dtype);
-                               x((uint8_t)params.tensor->shape.size());
-                               for (int64_t v : params.tensor->shape) {
-                                 x(v);
-                               }
-                               x(false);
-                             }));
+    size_t serializedBytes = serializeToUnchecked(cpuPointer, SerializeFunction([&](auto& x) {
+      x(header(opTypeQueuePut, i), params.remoteAddress, tensorAddress, bytes);
+      x(params.putKey, params.remoteGetKey, params.transactionKey, params.queueSize);
+      for (size_t i = 0; i != maxDevices; ++i) {
+        x(tensorMr && tensorMr->mrs[i] ? tensorMr->mrs[i]->rkey : 0);
+      }
+      x(params.tensor->dtype);
+      x((uint8_t)params.tensor->shape.size());
+      for (int64_t v : params.tensor->shape) {
+        x(v);
+      }
+      x(false);
+    }));
     if ((!isCuda && !params.streaming) || bytes == 0) {
       if (serializedBytes + bytes <= buffer->bytes) {
         bool inlineFlag = true;
@@ -4815,9 +4791,10 @@ struct CpuThreadImpl {
       auto* mr = regMrCuda(cudaDoneAddress, 4);
       uintptr_t sourceAddress = (uintptr_t)&params.cudaDoneValue;
       auto* sourceMr = regMr(sourceAddress, 4);
-      writeData(
-          dev, rank, (void*)sourceAddress, sourceMr->mrs[di]->lkey, (void*)cudaDoneAddress, mr->mrs[di]->rkey,
-          sizeof(uint32_t), makeCallback([this, &params] { cpuThread->freelistQueueReadFinished.push(&params); }));
+      writeData(dev, rank, (void*)sourceAddress, sourceMr->mrs[di]->lkey, (void*)cudaDoneAddress, mr->mrs[di]->rkey,
+          sizeof(uint32_t), makeCallback([this, &params] {
+            cpuThread->freelistQueueReadFinished.push(&params);
+          }));
     } else {
       cpuThread->freelistQueueReadFinished.push(&params);
     }
@@ -4834,9 +4811,10 @@ struct CpuThreadImpl {
     if constexpr (std::is_null_pointer_v<F>) {
       postSend(dev, i, cpuPointer, lkey, bytes, makeCallback([this, buffer = std::move(buffer)] {}));
     } else {
-      postSend(
-          dev, i, cpuPointer, lkey, bytes,
-          makeCallback([this, buffer = std::move(buffer), callback = std::move(callback)] { callback(); }));
+      postSend(dev, i, cpuPointer, lkey, bytes,
+          makeCallback([this, buffer = std::move(buffer), callback = std::move(callback)] {
+            callback();
+          }));
     }
   }
 
@@ -4876,8 +4854,7 @@ struct CpuThreadImpl {
 
     auto callback = makeCallback([this, &params, tensor = std::move(tensor)]() mutable {
       // log.info("queue read finished! %#x\n", params.localOpKey);
-      queueFinish(
-          group, params.queueAddress, params.source, params.localOpKey, std::move(tensor), params.getKey,
+      queueFinish(group, params.queueAddress, params.source, params.localOpKey, std::move(tensor), params.getKey,
           params.transactionKey, params.queueSize);
       sendQueueReadFinished(params.source, params.remoteOpKey);
 
@@ -4911,9 +4888,8 @@ struct CpuThreadImpl {
 
   void executeQueueGet(QueueEntryQueueGet& params) {
     auto buffer = allocateTemporaryBuffer(4096);
-    size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, header(opTypeQueueGet, params.location), params.op, params.remoteQueueAddress,
-        params.localQueueAddress, params.key);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeQueueGet, params.location), params.op,
+        params.remoteQueueAddress, params.localQueueAddress, params.key);
     sendBuffer(params.location, std::move(buffer), bytes);
     cpuThread->freelistQueueGet.push(&params);
   }
@@ -4940,9 +4916,8 @@ struct CpuThreadImpl {
   void executeQueueTransaction(QueueEntryQueueTransaction& params) {
     CHECK(params.remoteAddress != 0);
     auto buffer = allocateTemporaryBuffer(4096);
-    size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, header(opTypeQueueTransaction, params.location), params.remoteAddress, params.op,
-        params.transactionKey);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeQueueTransaction, params.location),
+        params.remoteAddress, params.op, params.transactionKey);
     sendBuffer(params.location, std::move(buffer), bytes);
     cpuThread->freelistQueueTransaction.push(&params);
   }
@@ -5132,9 +5107,10 @@ struct CpuThreadImpl {
 
           size_t di = o % self.devices.size();
           auto& dev = self.devices[di];
-          self.readData(
-              dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
-              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] { remoteListReady[i] = 1; }));
+          self.readData(dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
+              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] {
+                remoteListReady[i] = 1;
+              }));
         }
       }
 
@@ -5190,8 +5166,7 @@ struct CpuThreadImpl {
             }
           } else {
             if (ndim != resultTensor->shape.size()) {
-              fatal(
-                  "cat: expected all tensors to have the same number of dimensions, but got %d and %d",
+              fatal("cat: expected all tensors to have the same number of dimensions, but got %d and %d",
                   resultTensor->shape.size(), ndim);
             }
             resultTensor->shape[0] += shapeptr[0];
@@ -5200,9 +5175,8 @@ struct CpuThreadImpl {
                 continue;
               }
               if (resultTensor->shape[i] != shapeptr[i]) {
-                fatal(
-                    "cat: expected all tensors to have same shape except in cat dimension (0), but got %d and %d in "
-                    "dimension %d",
+                fatal("cat: expected all tensors to have same shape except in cat dimension (0), but got %d and %d in "
+                      "dimension %d",
                     resultTensor->shape[i], shapeptr[i], i);
               }
             }
@@ -5297,8 +5271,7 @@ struct CpuThreadImpl {
       rkeys[i] = sourceMr->mrs[i] ? sourceMr->mrs[i]->lkey : 0;
     }
 
-    readDataDistributed(
-        rank, (void*)params.destination->data(), lkeys, (void*)params.source->data(), rkeys,
+    readDataDistributed(rank, (void*)params.destination->data(), lkeys, (void*)params.source->data(), rkeys,
         params.destination->bytes(), makeCallback([&params] {
           params.future->done = 1;
           futexWakeAll(&params.future->done);
@@ -5371,9 +5344,10 @@ struct CpuThreadImpl {
 
         size_t di = 1 % self.devices.size();
         auto& dev = self.devices[di];
-        self.readData(
-            dev, i, remoteInfoBuffer->cpuPointer, remoteInfoBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
-            dyn.gatherKey[di], sizeof(Info), self.makeCallback([this, i = this->i] { readDone = true; }));
+        self.readData(dev, i, remoteInfoBuffer->cpuPointer, remoteInfoBuffer.mr->mrs[di]->lkey,
+            (void*)dyn.gatherAddress, dyn.gatherKey[di], sizeof(Info), self.makeCallback([this, i = this->i] {
+              readDone = true;
+            }));
       }
 
       if (size > 1) {
@@ -5392,9 +5366,8 @@ struct CpuThreadImpl {
         if (ri.op != params.op || ri.identifier != params.identifier || ri.inputBytes != params.inputBytes ||
             ri.outputBytes != params.outputBytes) {
           // fixme: this op could be synchronous, and errors raised as exceptions
-          fatal(
-              "Mismatched cached operation detected.\nLocal s: op %d, identifier %d, input bytes %d, output "
-              "bytes %d\nRemote parameters: op %d, identifier %d, input bytes %d, output bytes %d\n",
+          fatal("Mismatched cached operation detected.\nLocal s: op %d, identifier %d, input bytes %d, output "
+                "bytes %d\nRemote parameters: op %d, identifier %d, input bytes %d, output bytes %d\n",
               params.op, params.identifier, params.inputBytes, params.outputBytes, ri.op, ri.identifier, ri.inputBytes,
               ri.outputBytes);
         }
@@ -5447,9 +5420,8 @@ struct CpuThreadImpl {
     CHECK(params.name != std::nullopt);
     queueCreateOutgoing[key] = &params;
     auto buffer = allocateTemporaryBuffer(4096);
-    size_t bytes = serializeToUnchecked(
-        buffer->cpuPointer, header(opTypeCreateQueueNamed, params.location), key, *params.name,
-        (uint32_t)params.location, params.streaming);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeCreateQueueNamed, params.location), key,
+        *params.name, (uint32_t)params.location, params.streaming);
     sendBuffer(params.location, std::move(buffer), bytes);
   }
 
@@ -5466,9 +5438,8 @@ struct CpuThreadImpl {
 
     enqueueCallback([this, qi, key, sourceRank] {
       auto buffer = allocateTemporaryBuffer(4096);
-      size_t bytes = serializeToUnchecked(
-          buffer->cpuPointer, header(opTypeCreateQueueNamedResult, sourceRank), key, qi.address, (uint32_t)qi.location,
-          qi.streaming);
+      size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeCreateQueueNamedResult, sourceRank), key,
+          qi.address, (uint32_t)qi.location, qi.streaming);
       sendBuffer(sourceRank, std::move(buffer), bytes);
     });
   }
@@ -5550,7 +5521,9 @@ struct CpuThreadImpl {
           ++*counter;
           auto buffer = self.allocateTemporaryBuffer(64);
           size_t bytes = serializeToUnchecked(buffer->cpuPointer, self.header(opTypeMessageShutdown, i), true);
-          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] { --*counter; });
+          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] {
+            --*counter;
+          });
         }
         while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
           YIELD
@@ -5573,8 +5546,7 @@ struct CpuThreadImpl {
             for (size_t i : list) {
               strs.push_back(self.rankName(i));
             }
-            log.error(
-                "%s: Failed to synchronize shutdown with the following ranks: %s\n", self.groupName(),
+            log.error("%s: Failed to synchronize shutdown with the following ranks: %s\n", self.groupName(),
                 fmt::to_string(fmt::join(strs, ", ")));
           }
         }
@@ -5586,7 +5558,9 @@ struct CpuThreadImpl {
           ++*counter;
           auto buffer = self.allocateTemporaryBuffer(64);
           size_t bytes = serializeToUnchecked(buffer->cpuPointer, self.header(opTypeMessageShutdown, i), false);
-          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] { --*counter; });
+          self.sendBuffer(i, std::move(buffer), bytes, [counter = counter] {
+            --*counter;
+          });
         }
         while (*counter && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
           YIELD
@@ -5689,9 +5663,8 @@ struct CpuThreadImpl {
 
       auto key = it.rkey;
       auto& dev = self.devices[di];
-      self.readData(
-          dev, source, (void*)localAddress, outputMrs[read.outputIndex]->mrs[di]->lkey, (void*)sourceAddress, key[di],
-          read.bytes, self.makeCallback([this, di, source]() {
+      self.readData(dev, source, (void*)localAddress, outputMrs[read.outputIndex]->mrs[di]->lkey, (void*)sourceAddress,
+          key[di], read.bytes, self.makeCallback([this, di, source]() {
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
             --deviceLiveReads[di];
@@ -5811,9 +5784,10 @@ struct CpuThreadImpl {
         } else {
           size_t di = o % self.devices.size();
           auto& dev = self.devices[di];
-          self.readData(
-              dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
-              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] { remoteInputListReady[i] = true; }));
+          self.readData(dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
+              dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] {
+                remoteInputListReady[i] = true;
+              }));
         }
       }
 
@@ -6021,8 +5995,7 @@ struct CpuThreadImpl {
         }
       }
       if (state.activeWrite) {
-        log.error(
-            "%s: Heartbeat to %s has not completed after %g seconds\n", groupName(), rankName(i),
+        log.error("%s: Heartbeat to %s has not completed after %g seconds\n", groupName(), rankName(i),
             seconds(now - *state.activeWrite));
 
         if (now - *state.activeWrite >= heartbeatInterval * 6) {
@@ -6034,10 +6007,11 @@ struct CpuThreadImpl {
       state.activeWrite = now;
       size_t di = (localHeartbeatValue + rank + i) % devices.size();
       auto& dev = devices[di];
-      writeData(
-          dev, i, &localHeartbeatValue, mr->mrs[di]->lkey,
+      writeData(dev, i, &localHeartbeatValue, mr->mrs[di]->lkey,
           (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank + offsetof(RankInfo, heartbeatValue)),
-          remoteRankInfo[i].keys[di], sizeof(uint32_t), makeCallback([&state] { state.activeWrite.reset(); }));
+          remoteRankInfo[i].keys[di], sizeof(uint32_t), makeCallback([&state] {
+            state.activeWrite.reset();
+          }));
     }
   }
 
@@ -6059,9 +6033,10 @@ struct CpuThreadImpl {
       size_t di = 0;
       auto& dev = devices[di];
       ++*activeWrites;
-      writeData(
-          dev, i, local, mr->mrs[di]->lkey, (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank),
-          remoteRankInfo[i].keys[di], sizeof(RankInfo), makeCallback([activeWrites] { --*activeWrites; }));
+      writeData(dev, i, local, mr->mrs[di]->lkey, (void*)(remoteRankInfo[i].address + sizeof(RankInfo) * rank),
+          remoteRankInfo[i].keys[di], sizeof(RankInfo), makeCallback([activeWrites] {
+            --*activeWrites;
+          }));
     }
 
     while (*activeWrites && !errorState) {
@@ -6236,8 +6211,7 @@ struct CpuThreadImpl {
 
             if (shutdownScheduled && queueEntry.task != taskCallback) [[unlikely]] {
               if (queueEntry.task != taskShutdown) {
-                log.error(
-                    "Work (%d) has been scheduled in a process group after shutdown. This work cannot complete.",
+                log.error("Work (%d) has been scheduled in a process group after shutdown. This work cannot complete.",
                     queueEntry.task);
                 setErrorState();
               }

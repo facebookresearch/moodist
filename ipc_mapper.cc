@@ -202,14 +202,12 @@ struct IpcMapperImpl : IpcMapper {
             size_t sourceRank = v.sourceRank;
             CHECK(sourceRank < group->size);
             if (v.kind == requestUnmap) {
-              log.debug(
-                  "%d: got ipc unmap request (address %#x size %#x) from rank %d!\n", group->rank,
+              log.debug("%d: got ipc unmap request (address %#x size %#x) from rank %d!\n", group->rank,
                   v.requestUnmapAddress, v.requestBytes, sourceRank);
               std::lock_guard l(mutex);
               if (this->stepValue > v.requestStepValue) {
                 v.response = 0;
-                log.error(
-                    "Cannot unmap due to local stepvalue %#x vs request stepvalue %#x\n", this->stepValue,
+                log.error("Cannot unmap due to local stepvalue %#x vs request stepvalue %#x\n", this->stepValue,
                     v.requestStepValue);
               } else {
                 auto i = activeMaps.find(v.requestUnmapAddress);
@@ -296,16 +294,15 @@ struct IpcMapperImpl : IpcMapper {
 
     auto& slot = nshared->slots[slotIndex];
     f(slot);
-    log.debug(
-        "sending ipc request (kind %d) to rank %d using slot %d\n", slot.kind, group->ipcRanks.at(peerIndex),
+    log.debug("sending ipc request (kind %d) to rank %d using slot %d\n", slot.kind, group->ipcRanks.at(peerIndex),
         slotIndex);
     slot.stage = 2;
     ++nshared->count;
     futexWakeAll(&nshared->count);
   }
 
-  void
-  sendRequestAddress(size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
+  void sendRequestAddress(
+      size_t peerIndex, const CUipcMemHandle& handle, size_t size, Function<void(uintptr_t)> callback) {
     enqueue(peerIndex, std::move(callback), [&](auto& slot) {
       slot.kind = requestMapAddress;
       slot.sourceRank = group->rank;
@@ -406,7 +403,9 @@ struct IpcMapperImpl : IpcMapper {
       }
       log.debug("got a new connection!\n");
       auto s = std::make_shared<SocketHelper>(std::move(socket));
-      s->socket.setOnRead([s, &onRead](Error* error) { onRead(s, error); });
+      s->socket.setOnRead([s, &onRead](Error* error) {
+        onRead(s, error);
+      });
     });
 
     for (size_t i : group->ipcRanks) {
@@ -456,7 +455,9 @@ struct IpcMapperImpl : IpcMapper {
       peershared[i] = (SharedStruct*)peermem[i].base;
     }
 
-    thread = std::thread([this] { entry(); });
+    thread = std::thread([this] {
+      entry();
+    });
   }
 
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size) {

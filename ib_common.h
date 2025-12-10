@@ -45,8 +45,7 @@ struct IbvPtr {
     if (value) [[unlikely]] {
       int error = destroy(value);
       if (error) [[unlikely]] {
-        NOINLINE_COLD(log.error(
-            "Failed to destroy ibv instance of type %s: error %d: %s\n", typeid(T).name(), error,
+        NOINLINE_COLD(log.error("Failed to destroy ibv instance of type %s: error %d: %s\n", typeid(T).name(), error,
             std::strerror(error)););
       }
     }

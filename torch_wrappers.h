@@ -19,6 +19,7 @@ MOODIST_API CUstream cudaGetCurrentStream();
 // Stream guard - RAII wrapper for c10::cuda::CUDAStreamGuard
 class StreamGuard {
   alignas(64) char storage_[128];
+
 public:
   MOODIST_API StreamGuard(CUstream stream, int device_index);
   MOODIST_API ~StreamGuard();
@@ -32,6 +33,7 @@ public:
 class DataPtrWrapper {
   alignas(64) char storage_[128];
   bool valid_ = false;
+
 public:
   MOODIST_API DataPtrWrapper();
   MOODIST_API ~DataPtrWrapper();
@@ -44,9 +46,15 @@ public:
   MOODIST_API void* get() const;
   MOODIST_API explicit operator bool() const;
 
-  void* storage() { return storage_; }
-  const void* storage() const { return storage_; }
-  void setValid(bool v) { valid_ = v; }
+  void* storage() {
+    return storage_;
+  }
+  const void* storage() const {
+    return storage_;
+  }
+  void setValid(bool v) {
+    valid_ = v;
+  }
 };
 
 MOODIST_API DataPtrWrapper cudaAllocate(size_t bytes);

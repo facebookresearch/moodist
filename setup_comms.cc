@@ -188,8 +188,7 @@ struct SetupCommsImpl : SetupComms {
         bool isPrev = !prev && sourceRank == (rank + size - 1) % size;
         bool isNext = !next && sourceRank == (rank + 1) % size;
         if (isPrev || isNext) {
-          log.debug(
-              "%d: Got %s connection to rank %d (id %#x) (destination %d)\n", rank, isNext ? "next" : "prev",
+          log.debug("%d: Got %s connection to rank %d (id %#x) (destination %d)\n", rank, isNext ? "next" : "prev",
               sourceRank, rankId, destinationRank);
           (isNext ? next : prev) = connection;
           connectionIds[sourceRank] = rankId;
@@ -206,9 +205,8 @@ struct SetupCommsImpl : SetupComms {
       }
       if ((sourceRank == (rank + size - 1) % size || sourceRank == (rank + 1) % size) &&
           rankId != connectionIds[sourceRank]) {
-        throw std::runtime_error(fmt::sprintf(
-            "Connection id mismatch for source rank %d. Got %#x, expected %#x", sourceRank, rankId,
-            connectionIds[sourceRank]));
+        throw std::runtime_error(fmt::sprintf("Connection id mismatch for source rank %d. Got %#x, expected %#x",
+            sourceRank, rankId, connectionIds[sourceRank]));
       }
       return;
     }

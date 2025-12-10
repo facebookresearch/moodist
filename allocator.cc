@@ -279,8 +279,9 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
 
     tmp.clear();
 
-    CHECK(
-        std::is_sorted(v.events.begin(), v.events.end(), [](auto& a, auto& b) { return a.span.begin < b.span.begin; }));
+    CHECK(std::is_sorted(v.events.begin(), v.events.end(), [](auto& a, auto& b) {
+      return a.span.begin < b.span.begin;
+    }));
     uintptr_t ee = v.span.begin;
     for (auto& v2 : v.events) {
       // memlog.info(" event %#x %#x\n", v2.span.begin, v2.span.end);
@@ -436,8 +437,8 @@ struct CudaAllocatorImpl {
 
   // template<typename EventRegionList = std::array<EventRegion*, 0>>
   template<typename EventRegionList>
-  std::set<Region, RegionCompare>::iterator
-  insertRegion(Regions& regions, Span span, const EventRegionList& eventRegionList) {
+  std::set<Region, RegionCompare>::iterator insertRegion(
+      Regions& regions, Span span, const EventRegionList& eventRegionList) {
     auto& map = regions.map;
     auto& sizeMap = regions.sizes;
     auto i = map.upper_bound(span);
@@ -812,11 +813,11 @@ struct CudaAllocatorImpl {
     }
     size_t nAllocated = nMapped - nFree;
 
-    throw std::runtime_error(fmt::sprintf(
-        "Moodist CUDA Allocator failed to allocate %s. We have mapped %s (in %d regions), of which %s are "
-        "currently allocated, and %s are free. The largest free chunk is %s",
-        this->bytes(bytes), this->bytes(nMapped), nMappedRegions, this->bytes(nAllocated), this->bytes(nFree),
-        this->bytes(largestChunk)));
+    throw std::runtime_error(
+        fmt::sprintf("Moodist CUDA Allocator failed to allocate %s. We have mapped %s (in %d regions), of which %s are "
+                     "currently allocated, and %s are free. The largest free chunk is %s",
+            this->bytes(bytes), this->bytes(nMapped), nMappedRegions, this->bytes(nAllocated), this->bytes(nFree),
+            this->bytes(largestChunk)));
   }
 
   // void deallocateImpl(uintptr_t cudaPtr, size_t alignedbytes, Vector<CUstream>& streams) {
@@ -1037,9 +1038,8 @@ struct CudaAllocatorImpl {
       }
       CHECK(prevEnd <= v.end);
     }
-    s += fmt::sprintf(
-        "%s total, %s used, %s free. Largest free chunk %s\n", bytes(totalMappedBytes), bytes(totalMappedBytes - total),
-        bytes(total), bytes(largestChunk));
+    s += fmt::sprintf("%s total, %s used, %s free. Largest free chunk %s\n", bytes(totalMappedBytes),
+        bytes(totalMappedBytes - total), bytes(total), bytes(largestChunk));
 
     // s += fmt::sprintf("%d live cuda tensors:\n", cudaCpuMappings.size());
     // for (auto& v : cudaCpuMappings) {
@@ -1178,7 +1178,9 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       deviceStats.allocated_bytes[0].decrease(alignedbytes);
       deviceStats.active_bytes[0].decrease(alignedbytes);
     };
-    auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
+    auto deleter = [](void* c) {
+      Function<void()>(FunctionPointer(c))();
+    };
     torch::Device device = torch::Device(torch::kCUDA, deviceIndex);
     memlog.debug("allocate(%d) returning cudaPtr %#x\n", bytes, cudaPtr);
     return torch::DataPtr((void*)cudaPtr, (void*)f.release(), deleter, device);
@@ -1285,14 +1287,12 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual std::shared_ptr<void> getIpcDevPtr(std::string handle) override {
     throw std::runtime_error("moodist CUDAAllocator::getIpcDevPtr: not implemented");
   }
-  virtual void recordHistory(
-      bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder, size_t alloc_trace_max_entries,
-      c10::cuda::CUDACachingAllocator::RecordContext when) {
+  virtual void recordHistory(bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
+      size_t alloc_trace_max_entries, c10::cuda::CUDACachingAllocator::RecordContext when) {
     // throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
   }
-  virtual void recordHistory(
-      bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder, size_t alloc_trace_max_entries,
-      c10::cuda::CUDACachingAllocator::RecordContext when, bool) {
+  virtual void recordHistory(bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
+      size_t alloc_trace_max_entries, c10::cuda::CUDACachingAllocator::RecordContext when, bool) {
     // throw std::runtime_error("moodist CUDAAllocator::recordHistory: not implemented");
   }
   virtual void attachOutOfMemoryObserver(c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) override {
@@ -1307,15 +1307,14 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     // throw std::runtime_error("moodist CUDAAllocator::enablePeerAccess: not implemented");
   }
 
-  virtual cudaError_t memcpyAsync(
-      void* dst, int dstDevice, const void* src, int srcDevice, size_t count, cudaStream_t stream,
-      bool p2p_enabled) override {
+  virtual cudaError_t memcpyAsync(void* dst, int dstDevice, const void* src, int srcDevice, size_t count,
+      cudaStream_t stream, bool p2p_enabled) override {
     CHECK_CU(cuMemcpyAsync((uintptr_t)dst, (uintptr_t)src, count, stream));
     // throw std::runtime_error("moodist CUDAAllocator::memcpyAsync: not implemented");
     return cudaSuccess;
   }
-  virtual std::shared_ptr<c10::cuda::CUDACachingAllocator::AllocatorState>
-  getCheckpointState(c10::DeviceIndex device, c10::cuda::MempoolId_t id) override {
+  virtual std::shared_ptr<c10::cuda::CUDACachingAllocator::AllocatorState> getCheckpointState(
+      c10::DeviceIndex device, c10::cuda::MempoolId_t id) override {
     throw std::runtime_error("moodist CUDAAllocator::getCheckpointState: not implemented");
   }
   virtual c10::cuda::CUDACachingAllocator::CheckpointDelta setCheckpointPoolState(

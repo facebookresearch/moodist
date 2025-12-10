@@ -13,8 +13,7 @@ namespace moodist {
 class TORCH_API TcpStore final : public c10d::Store {
 public:
   TcpStore(StoreImpl* impl);
-  TcpStore(
-      std::string hostname, int port, std::string key, int worldSize, int rank,
+  TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
       std::chrono::steady_clock::duration timeout);
   ~TcpStore();
   TcpStore(const TcpStore&) = delete;

@@ -10,8 +10,7 @@ TcpStore::TcpStore(StoreImpl* impl) : impl(impl) {
   storeImplAddRef(impl);
 }
 
-TcpStore::TcpStore(
-    std::string hostname, int port, std::string key, int worldSize, int rank,
+TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
     std::chrono::steady_clock::duration timeout) {
   impl = createStoreImpl(std::move(hostname), port, std::move(key), worldSize, rank);
   storeImplAddRef(impl);

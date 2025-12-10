@@ -26,66 +26,59 @@ public:
     return "moodist";
   }
 
-  c10::intrusive_ptr<Work>
-  broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override {
+  c10::intrusive_ptr<Work> broadcast(
+      std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override {
     return pg.broadcast(tensors, opts);
   }
 
-  c10::intrusive_ptr<Work>
-  allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts = c10d::AllreduceOptions()) override {
+  c10::intrusive_ptr<Work> allreduce(
+      std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts = c10d::AllreduceOptions()) override {
     return pg.allreduce(tensors, opts);
   }
 
-  c10::intrusive_ptr<Work> allreduce_coalesced(
-      std::vector<at::Tensor>& tensors,
+  c10::intrusive_ptr<Work> allreduce_coalesced(std::vector<at::Tensor>& tensors,
       const c10d::AllreduceCoalescedOptions& opts = c10d::AllreduceCoalescedOptions()) override {
     return pg.allreduce_coalesced(tensors, opts);
   }
 
-  virtual c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(
-      std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
+  virtual c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
+      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
     return pg.allgather_into_tensor_coalesced(outputTensors, inputTensors, opts);
   }
 
-  c10::intrusive_ptr<Work>
-  reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts = c10d::ReduceOptions()) override {
+  c10::intrusive_ptr<Work> reduce(
+      std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts = c10d::ReduceOptions()) override {
     return pg.reduce(tensors, opts);
   }
 
-  c10::intrusive_ptr<Work> allgather(
-      std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
+  c10::intrusive_ptr<Work> allgather(std::vector<std::vector<at::Tensor>>& outputTensors,
+      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
     return pg.allgather(outputTensors, inputTensors, opts);
   }
 
-  c10::intrusive_ptr<Work> _allgather_base(
-      at::Tensor& outputbuffer, at::Tensor& inputbuffer,
+  c10::intrusive_ptr<Work> _allgather_base(at::Tensor& outputbuffer, at::Tensor& inputbuffer,
       const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
     return pg._allgather_base(outputbuffer, inputbuffer, opts);
   }
 
-  c10::intrusive_ptr<Work> allgather_coalesced(
-      std::vector<std::vector<at::Tensor>>& outputTensorLists, std::vector<at::Tensor>& inputTensors,
-      const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
+  c10::intrusive_ptr<Work> allgather_coalesced(std::vector<std::vector<at::Tensor>>& outputTensorLists,
+      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
     return pg.allgather_coalesced(outputTensorLists, inputTensors, opts);
   }
 
-  c10::intrusive_ptr<Work> reduce_scatter(
-      std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
+  c10::intrusive_ptr<Work> reduce_scatter(std::vector<at::Tensor>& outputTensors,
+      std::vector<std::vector<at::Tensor>>& inputTensors,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
     return pg.reduce_scatter(outputTensors, inputTensors, opts);
   }
 
-  c10::intrusive_ptr<Work> _reduce_scatter_base(
-      at::Tensor& outputTensor, at::Tensor& inputTensor,
+  c10::intrusive_ptr<Work> _reduce_scatter_base(at::Tensor& outputTensor, at::Tensor& inputTensor,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
     return pg._reduce_scatter_base(outputTensor, inputTensor, opts);
   }
 
-  virtual c10::intrusive_ptr<Work> reduce_scatter_tensor_coalesced(
-      std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::ReduceScatterOptions& opts) override {
+  virtual c10::intrusive_ptr<Work> reduce_scatter_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
+      std::vector<at::Tensor>& inputTensors, const c10d::ReduceScatterOptions& opts) override {
     return pg.reduce_scatter_tensor_coalesced(outputTensors, inputTensors, opts);
   }
 
@@ -93,14 +86,13 @@ public:
     return pg.barrier(opts);
   }
 
-  c10::intrusive_ptr<Work> alltoall_base(
-      at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
-      std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
+  c10::intrusive_ptr<Work> alltoall_base(at::Tensor& outputTensor, at::Tensor& inputTensor,
+      std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes,
+      const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
     return pg.alltoall_base(outputTensor, inputTensor, outputSplitSizes, inputSplitSizes, opts);
   }
 
-  c10::intrusive_ptr<Work> alltoall(
-      std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
+  c10::intrusive_ptr<Work> alltoall(std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
       const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override {
     return pg.alltoall(outputTensors, inputTensors, opts);
   }
@@ -113,14 +105,13 @@ public:
     return pg.recv(tensors, srcRank, tag);
   }
 
-  c10::intrusive_ptr<Work> gather(
-      std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-      const c10d::GatherOptions& opts = c10d::GatherOptions()) override {
+  c10::intrusive_ptr<Work> gather(std::vector<std::vector<at::Tensor>>& outputTensors,
+      std::vector<at::Tensor>& inputTensors, const c10d::GatherOptions& opts = c10d::GatherOptions()) override {
     return pg.gather(outputTensors, inputTensors, opts);
   }
 
-  c10::intrusive_ptr<Work> scatter(
-      std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
+  c10::intrusive_ptr<Work> scatter(std::vector<at::Tensor>& outputTensors,
+      std::vector<std::vector<at::Tensor>>& inputTensors,
       const c10d::ScatterOptions& opts = c10d::ScatterOptions()) override {
     return pg.scatter(outputTensors, inputTensors, opts);
   }

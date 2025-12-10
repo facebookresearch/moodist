@@ -1,13 +1,17 @@
 BasedOnStyle: LLVM
 
 AccessModifierOffset: -2
-AlignAfterOpenBracket: AlwaysBreak
+AlignAfterOpenBracket: DontAlign
 AllowShortFunctionsOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: true
+AllowShortLambdasOnASingleLine: Empty
 AllowShortLoopsOnASingleLine: false
 AlwaysBreakTemplateDeclarations: true
 ColumnLimit: 120
 ConstructorInitializerAllOnOneLineOrOnePerLine: false
 DerivePointerAlignment: false
+InsertBraces: true
 PointerAlignment: Left
 SpaceAfterTemplateKeyword: false
+
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 10000

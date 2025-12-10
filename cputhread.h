@@ -97,8 +97,7 @@ OPTYPE(Custom);
 OPTYPE(MessageShutdown);
 
 template<typename DynamicAddresses>
-inline void badOp(
-    const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
+inline void badOp(const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
     size_t bytes) {
   fatal(
       "Mismatched collectives detected at %s:%d.\nLocal parameters: op %s, step %#x, bytes %#x\nRemote parameters: op "

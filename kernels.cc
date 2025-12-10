@@ -25,9 +25,8 @@ Kernels::~Kernels() {
   }
 }
 
-std::string Kernels::emitCopySeq(
-    std::vector<std::string> sources, std::vector<std::string> destinations, std::string bytes, size_t gridSize,
-    size_t blockSize, std::string threadIndex, std::string blockIndex) {
+std::string Kernels::emitCopySeq(std::vector<std::string> sources, std::vector<std::string> destinations,
+    std::string bytes, size_t gridSize, size_t blockSize, std::string threadIndex, std::string blockIndex) {
   CHECK(sources.size() == destinations.size());
   auto genCopy = [&](std::string type, int typesize, int unroll) {
     std::string nbytes;
@@ -128,9 +127,8 @@ std::string Kernels::emitCopySeq(
     return s;
   };
   std::string s;
-  s += fmt::sprintf(
-      "/* copy  bytes: %s  gridSize: %d  blockSize: %d  threadIndex: %s  blockIndex: %s */\n", bytes, gridSize,
-      blockSize, threadIndex, blockIndex);
+  s += fmt::sprintf("/* copy  bytes: %s  gridSize: %d  blockSize: %d  threadIndex: %s  blockIndex: %s */\n", bytes,
+      gridSize, blockSize, threadIndex, blockIndex);
   s += R"(
   const size_t %bytes = $bytes;
   const uint32_t %threadIndex = $threadIndex;
@@ -170,9 +168,8 @@ std::string Kernels::emitCopySeq(
   return s;
 }
 
-std::string Kernels::emitReduceFunctionSeq(
-    std::string sourcetype, size_t sourcetypesize, size_t nsources, std::string op, size_t gridSize, size_t blockSize,
-    std::string threadIndex, std::string blockIndex) {
+std::string Kernels::emitReduceFunctionSeq(std::string sourcetype, size_t sourcetypesize, size_t nsources,
+    std::string op, size_t gridSize, size_t blockSize, std::string threadIndex, std::string blockIndex) {
   CHECK(sourcetype != "");
   std::string sourcesargs;
   for (size_t i = 0; i != nsources; ++i) {
@@ -365,8 +362,7 @@ std::string Kernels::emitReduceFunctionSeq(
     }
     size_t loopbytes = datatypesize * unroll * blockSize;
     s = replace(s, "$preloop", preloop, "$postloop", postloop, "$loop", loop, "$loopbytes", loopbytes);
-    s = replace(
-        s, "$datatype", datatype, "$datatypesize", datatypesize, "$sourcetype", sourcetype, "$sourcetypesize",
+    s = replace(s, "$datatype", datatype, "$datatypesize", datatypesize, "$sourcetype", sourcetype, "$sourcetypesize",
         sourcetypesize, "$loopbytes", loopbytes, "$unroll", unroll);
     return s;
   };
@@ -540,8 +536,7 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
   for (auto& v : peerCudaProxyReady) {
     peerCudaProxyReadyArray.push_back(replace("$base", "$base", v.base));
   }
-  constantDefs += fmt::sprintf(
-      "__constant__ uintptr_t peerCudaProxyReady[%d] = {%s};", peerCudaProxyReady.size(),
+  constantDefs += fmt::sprintf("__constant__ uintptr_t peerCudaProxyReady[%d] = {%s};", peerCudaProxyReady.size(),
       fmt::to_string(fmt::join(peerCudaProxyReadyArray, ", ")));
 
   source = replace(source, "$constantDefs", constantDefs);
@@ -557,16 +552,14 @@ __device__ uint32_t reduce_n2(uint32_t dynamicBlockIndex, size_t numel, T* __res
     gridSize = 4;
   }
 
-  source = replace(
-      source, "$copyCode",
+  source = replace(source, "$copyCode",
       emitCopySeq({"src"}, {"dst"}, "bytes", gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex"));
 
   if (flags & (CompileReduceScatter | CompileReduceScatterDirect)) {
     auto i = std::find(supportedTypes.begin(), supportedTypes.end(), compileType);
     CHECK(i != supportedTypes.end());
-    source += emitReduceFunctionSeq(
-        compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction, gridSize * blockSize / 32, 32,
-        "threadIdx.x % 32u", "dynamicBlockIndex");
+    source += emitReduceFunctionSeq(compileType, supportedTypeSizes[i - supportedTypes.begin()], 2, compileReduction,
+        gridSize * blockSize / 32, 32, "threadIdx.x % 32u", "dynamicBlockIndex");
   }
 
   source += R"(
@@ -735,7 +728,9 @@ extern "C" __global__ void dummy_signal() {
       "$writes1", writes1, "$writes2", writes2, "$waits", waits, "$waitForCopyDones", waitForCopyDones,
       "$copyDoneAllCode", copyDoneAllCode);
 
-  auto fn = [&](CUfunction& ref, std::string name) { functions.emplace_back(&ref, name); };
+  auto fn = [&](CUfunction& ref, std::string name) {
+    functions.emplace_back(&ref, name);
+  };
 
   if (flags & CompileAllGather) {
     source += group->allGather->generate();
@@ -753,7 +748,7 @@ extern "C" __global__ void dummy_signal() {
     size_t t = i - supportedTypes.begin();
     size_t r = i2 - supportedReductions.begin();
     fn(cuReduceScatterLocal[t][r],
-       replace("reduce_scatter_local_$type_$red", "$type", compileType, "$red", compileReduction));
+        replace("reduce_scatter_local_$type_$red", "$type", compileType, "$red", compileReduction));
     fn(cuReduceScatter[t][r], replace("reduce_scatter_$type_$red", "$type", compileType, "$red", compileReduction));
   }
   if (flags & CompileReduceScatterDirect) {
@@ -766,7 +761,7 @@ extern "C" __global__ void dummy_signal() {
     size_t t = i - supportedTypes.begin();
     size_t r = i2 - supportedReductions.begin();
     fn(cuReduceScatterDirect[t][r],
-       replace("reduce_scatter_direct_$type_$red", "$type", compileType, "$red", compileReduction));
+        replace("reduce_scatter_direct_$type_$red", "$type", compileType, "$red", compileReduction));
   }
   if (flags & CompileAllToAll) {
     source += generate_alltoall(group);
@@ -779,12 +774,10 @@ extern "C" __global__ void dummy_signal() {
   source = replace(source, "$launchBounds", "__launch_bounds__($blockSize, $blocksPerSm)");
   source = replace(source, "$gridSize", gridSize, "$blockSize", blockSize, "$blocksPerSm", blocksPerSm);
 
-  source = replace(
-      source, "$cpuOut", cast("volatile uint32_t*", concurrencyIndex(cpuOutBuffer)), "$cpuIn",
+  source = replace(source, "$cpuOut", cast("volatile uint32_t*", concurrencyIndex(cpuOutBuffer)), "$cpuIn",
       cast("volatile uint32_t*", concurrencyIndex(cpuInBuffer)));
-  source = replace(
-      source, "$rank", rank, "$size", size, "$maxConcurrency", Group::maxConcurrency, "$maxChunks", Group::maxChunks,
-      "$maxDevices", Group::maxDevices);
+  source = replace(source, "$rank", rank, "$size", size, "$maxConcurrency", Group::maxConcurrency, "$maxChunks",
+      Group::maxChunks, "$maxDevices", Group::maxDevices);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);

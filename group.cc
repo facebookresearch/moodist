@@ -8,10 +8,10 @@
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "torch_wrappers.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
+#include "torch_wrappers.h"
 
 #include <algorithm>
 #include <cstring>
@@ -434,9 +434,9 @@ void Group::init(Function<void()> f) {
       auto peersDeviceCounts = setupComms->allgather(useDevices.size());
       for (size_t i = 0; i != size; ++i) {
         if (peersDeviceCounts[i] != useDevices.size()) {
-          throw std::runtime_error(fmt::sprintf(
-              "Topology mismatch: rank %d has %d ib devices, but rank %d has %d ib devices", rank, useDevices.size(), i,
-              peersDeviceCounts[i]));
+          throw std::runtime_error(
+              fmt::sprintf("Topology mismatch: rank %d has %d ib devices, but rank %d has %d ib devices", rank,
+                  useDevices.size(), i, peersDeviceCounts[i]));
         }
       }
 
@@ -505,7 +505,9 @@ void Group::init(Function<void()> f) {
       rdmaDevs.push_back(makeRdmaTcp(this));
     }
 
-    rdmaSupportsCuda = std::ranges::all_of(rdmaDevs, [](auto& v) { return v->supportsCuda(); });
+    rdmaSupportsCuda = std::ranges::all_of(rdmaDevs, [](auto& v) {
+      return v->supportsCuda();
+    });
 
     std::vector<std::string> allRanksBootIds = setupComms->allgather(bootId);
 
@@ -556,7 +558,9 @@ void Group::init(Function<void()> f) {
     }
 
     std::sort(ipcRanks.begin(), ipcRanks.end());
-    std::stable_partition(ipcRanks.begin(), ipcRanks.end(), [&](size_t i) { return i > rank; });
+    std::stable_partition(ipcRanks.begin(), ipcRanks.end(), [&](size_t i) {
+      return i > rank;
+    });
 
     std::vector<IVector<size_t>> peerIpcRanks = setupComms->allgather(ipcRanks);
 
@@ -692,8 +696,9 @@ void Group::init(Function<void()> f) {
       std::array<uintptr_t, 8> peerMapping;
 
       for (size_t i : peerIndices) {
-        ipcMapper->requestAddress(
-            i, localBuffer.cudaPointer, localBuffer.bytes, [&, i](uintptr_t address) { peerMapping[i] = address; });
+        ipcMapper->requestAddress(i, localBuffer.cudaPointer, localBuffer.bytes, [&, i](uintptr_t address) {
+          peerMapping[i] = address;
+        });
       }
       ipcMapper->wait();
       for (size_t i : peerIndices) {
@@ -839,9 +844,8 @@ AllocatedBuffer Group::allocateHostMapped(size_t bytes) {
   CUdeviceptr ptr;
   CHECK_CU(cuMemHostGetDevicePointer(&ptr, r.cpuPointer, 0));
   r.cudaPointer = ptr;
-  log.verbose(
-      "allocated device mapped host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer,
-      r.bytes, allocationNode);
+  log.verbose("allocated device mapped host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer,
+      r.cudaPointer, r.bytes, allocationNode);
   bytesHost += bytes;
   reportBytes();
   return r;
@@ -857,9 +861,8 @@ AllocatedBuffer Group::allocateHost(size_t bytes) {
   std::memset(r.cpuPointer, 0, bytes);
   r.numaAllocated = true;
   r.cudaPointer = (uintptr_t)r.cpuPointer;
-  log.verbose(
-      "allocated host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer, r.bytes,
-      allocationNode);
+  log.verbose("allocated host memory (%p %#x) of %#x bytes (numa allocated on %d)\n", r.cpuPointer, r.cudaPointer,
+      r.bytes, allocationNode);
   bytesHost += bytes;
   reportBytes();
   return r;

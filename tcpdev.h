@@ -13,7 +13,8 @@ struct TcpDev {
 
   void setOnRead(void*);
 
-  void send(size_t i, BufferHandle&& buffer, void* payload, size_t payloadBytes, Function<void(Error*)> callback = nullptr);
+  void send(
+      size_t i, BufferHandle&& buffer, void* payload, size_t payloadBytes, Function<void(Error*)> callback = nullptr);
   void send(size_t i, BufferHandle buffer, Function<void(Error*)> callback = nullptr);
   void read(void* handle, void* address, size_t bytes, Function<void()> callback);
 

@@ -25,8 +25,12 @@ inline torch::Tensor makeTensor(TensorDataPtr ptr) {
 
   CHECK(td->data() != 0);
 
-  Function<void()> f = [ptr = std::move(ptr)]() mutable { cpu_allocator::derefCpuBuffer(ptr->data()); };
-  auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
+  Function<void()> f = [ptr = std::move(ptr)]() mutable {
+    cpu_allocator::derefCpuBuffer(ptr->data());
+  };
+  auto deleter = [](void* c) {
+    Function<void()>(FunctionPointer(c))();
+  };
   auto data = torch::DataPtr((void*)td->data(), (void*)f.release(), deleter, device);
 
   torch::Storage storage(torch::Storage::use_byte_size_t(), td->bytes(), std::move(data), nullptr, false);

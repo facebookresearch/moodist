@@ -369,8 +369,7 @@ void allocate_memory(size_t index) {
   rv = (void*)(((uintptr_t)rv + alignment - 1) / alignment * alignment);
   bytes = e - (uintptr_t)rv;
 
-  log.info(
-      "mapped %d bytes at %#x (total %d bytes, %dG)\n", bytes, (uintptr_t)rv, mmappedBytes,
+  log.info("mapped %d bytes at %#x (total %d bytes, %dG)\n", bytes, (uintptr_t)rv, mmappedBytes,
       mmappedBytes / 1024 / 1024 / 1024);
 
   // auto start = std::chrono::steady_clock::now();
@@ -418,10 +417,9 @@ void allocate_memory(size_t index) {
 size_t currentLiveAllocations = 0;
 
 [[gnu::noinline]] void* moo_alloc(size_t bytes) {
-  size_t index = __builtin_ia32_lzcnt_u64(
-      (std::max(bytes, (size_t)1) + alignof(std::max_align_t) - 1) / alignof(std::max_align_t) *
-          alignof(std::max_align_t) -
-      1);
+  size_t index = __builtin_ia32_lzcnt_u64((std::max(bytes, (size_t)1) + alignof(std::max_align_t) - 1) /
+                                              alignof(std::max_align_t) * alignof(std::max_align_t) -
+                                          1);
   CHECK(index && index < 64);
   Thread* thread = &singleThread;
   if (!thread->activeRegions[index].empty()) [[likely]] {
@@ -529,7 +527,9 @@ struct CpuAllocator : torch::Allocator {
       l.unlock();
     };
 
-    auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
+    auto deleter = [](void* c) {
+      Function<void()>(FunctionPointer(c))();
+    };
     torch::Device device(torch::kCPU);
     return torch::DataPtr((void*)ptr, (void*)f.release(), deleter, device);
   }

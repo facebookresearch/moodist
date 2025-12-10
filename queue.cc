@@ -1,12 +1,12 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "queue.h"
-#include "queue_internal.h"
 #include "common.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
+#include "queue_internal.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "torch_wrappers.h"
@@ -38,8 +38,8 @@ struct QueueWorkImpl {
   ~QueueWorkImpl() {}
   void wait() {
     if (cudaDone != nullptr) {
-      CHECK_CU(cuStreamWaitValue32(
-          cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+      CHECK_CU(
+          cuStreamWaitValue32(cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else if (cudaMappedDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
           cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
@@ -165,8 +165,8 @@ void barrier(Group* group) {
   }
 }
 
-uintptr_t
-sendCreateQueue(Group* group, int location, uintptr_t address, bool streaming, std::optional<std::string> name) {
+uintptr_t sendCreateQueue(
+    Group* group, int location, uintptr_t address, bool streaming, std::optional<std::string> name) {
   uint32_t concurrencyIndex = 0;
   std::atomic_uintptr_t outAddress = 0;
   std::string outError;
@@ -193,8 +193,7 @@ sendCreateQueue(Group* group, int location, uintptr_t address, bool streaming, s
   return outAddress;
 }
 
-void create(
-    Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress, bool streaming,
+void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddress, bool streaming,
     std::optional<std::string> name) {
   CHECK(location >= 0 && location < group->size);
   if (streaming) {
@@ -227,8 +226,7 @@ void create(
   }
 }
 
-void create(
-    Group* group, const SimpleVector<int>& locations, QueueStorage*& qs, SimpleVector<uintptr_t>& remoteAddress,
+void create(Group* group, const SimpleVector<int>& locations, QueueStorage*& qs, SimpleVector<uintptr_t>& remoteAddress,
     std::optional<std::string> name) {
   uintptr_t address = 0;
 
@@ -276,8 +274,7 @@ void sendTransaction(
 std::atomic_uint32_t nextPutKey = getRng()();
 
 template<typename Tensor>
-void sendPut(
-    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor,
+void sendPut(Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor,
     std::shared_ptr<QueueWorkImpl> work, uint32_t remoteGetKey, uint32_t transactionKey, size_t queueSize = -1) {
   size_t numel = tensor->numel();
   size_t bytes = numel * tensor->itemsize();
@@ -305,8 +302,8 @@ void sendPut(
   e->queueSize = queueSize;
   e->streaming = streaming;
   if (work) {
-    e->callback = [work = std::move(work),
-                   tensor = std::move(tensor)](uintptr_t* cudaDoneAddress, uint32_t* cudaDoneValue) {
+    e->callback = [work = std::move(work), tensor = std::move(tensor)](
+                      uintptr_t* cudaDoneAddress, uint32_t* cudaDoneValue) {
       if (tensor->isCuda) {
         CHECK(work->cudaDone != nullptr);
         *cudaDoneAddress = work->cudaDone->address;
@@ -327,9 +324,8 @@ void sendPut(
 }
 
 template<typename Tensor>
-void sendPutRemote(
-    Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor, uint32_t remoteGetKey,
-    size_t queueSize) {
+void sendPutRemote(Group* group, int location, bool streaming, uintptr_t remoteAddress, Tensor tensor,
+    uint32_t remoteGetKey, size_t queueSize) {
   CHECK(location != group->rank);
   sendPut(group, location, streaming, remoteAddress, std::move(tensor), nullptr, remoteGetKey, 0, queueSize);
 }
@@ -523,10 +519,10 @@ struct QueueImpl {
     }
 
     if (isMulticast && !isMulticastLocal) {
-      throw std::runtime_error(fmt::sprintf(
-          "Rank %d cannot call get on this multicast Queue since it was not specified as a location on "
-          "construction",
-          group->rank));
+      throw std::runtime_error(
+          fmt::sprintf("Rank %d cannot call get on this multicast Queue since it was not specified as a location on "
+                       "construction",
+              group->rank));
     }
 
     {
@@ -676,8 +672,7 @@ struct QueueImpl {
           if (i->transactionOp != 0) {
             sendTransaction(&*group, i->location, i->remoteAddress, i->transactionKey, i->transactionOp);
           } else {
-            sendPut(
-                &*group, i->location, qs->streaming, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0,
+            sendPut(&*group, i->location, qs->streaming, i->remoteAddress, std::move(i->tensor), std::move(i->work), 0,
                 i->transactionKey);
           }
           qs->putQueue.pop_front();
@@ -689,7 +684,11 @@ struct QueueImpl {
       };
 
       CHECK_CU(cuLaunchHostFunc(
-          cudaGetCurrentStream(), [](void* ptr) { Function<void()>((FunctionPointer)ptr)(); }, f.release()));
+          cudaGetCurrentStream(),
+          [](void* ptr) {
+            Function<void()>((FunctionPointer)ptr)();
+          },
+          f.release()));
     }
 
     r.storage = storageFromTensor(value);
@@ -769,7 +768,7 @@ void QueueWork::wait() {
     return;
   }
   impl->wait();
-  storage.reset();  // release the storage
+  storage.reset(); // release the storage
 }
 
 Queue::~Queue() {
@@ -812,16 +811,15 @@ Queue::Queue(void* p) {
   CHECK(p == &foo);
 }
 
-std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::string_view name) {
+std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
   return r;
 }
 
-std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
+std::shared_ptr<Queue> makeQueue(
+    std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
@@ -900,9 +898,8 @@ void transferQueuedItems(Group* group, QueueStorage* qs, IncomingSource* ptr, st
   futexWakeAll(&qs->size);
 }
 
-void queueFinish(
-    Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor, uint32_t getKey,
-    uint32_t transactionKey, size_t queueSize) {
+void queueFinish(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor,
+    uint32_t getKey, uint32_t transactionKey, size_t queueSize) {
   CHECK(tensor != nullptr);
   auto* qs = (QueueStorage*)queueAddress;
   std::unique_lock l(qs->mutex);
@@ -1094,7 +1091,7 @@ void queueTransactionCancel(Group* group, uintptr_t queueAddress, uint32_t sourc
 
 QueueInfo queueGetOrCreate(std::string_view name, int location, bool streaming) {
   std::lock_guard l(namedQueuesMutex);
-  std::string nameStr(name);  // Convert once for map operations
+  std::string nameStr(name); // Convert once for map operations
   auto i = namedQueues.find(nameStr);
   if (i == namedQueues.end()) {
     QueueStorage* qs = new QueueStorage();

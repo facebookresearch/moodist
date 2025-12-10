@@ -44,10 +44,9 @@ PYBIND11_MODULE(_C, m) {
   py::class_<moodist::TcpStore, c10::intrusive_ptr<moodist::TcpStore>, c10d::Store>(m, "TcpStore", R"d(
     A moodist tcp store.
   )d")
-      .def(
-          py::init<std::string, int, std::string, int, int, std::chrono::steady_clock::duration>(), py::arg("hostname"),
-          py::arg("port"), py::arg("key"), py::arg("world_size"), py::arg("rank"), py::arg("timeout"),
-          py::call_guard<py::gil_scoped_release>());
+      .def(py::init<std::string, int, std::string, int, int, std::chrono::steady_clock::duration>(),
+          py::arg("hostname"), py::arg("port"), py::arg("key"), py::arg("world_size"), py::arg("rank"),
+          py::arg("timeout"), py::call_guard<py::gil_scoped_release>());
 
   m.def("serialize", &moodist::serializeObject);
   m.def("deserialize", &moodist::deserializeObject);

@@ -402,9 +402,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         std::string fn = fmt::sprintf("moodist-trace-pg-%d.json", rank);
         FILE* f = fopen(fn.c_str(), "wb");
         CHECK(f != nullptr);
-        fmt::fprintf(
-            f, R"({"traceEvents": [)"
-               "\n");
+        fmt::fprintf(f, R"({"traceEvents": [)"
+                        "\n");
         bool first = true;
         for (auto& e : traceEvents) {
           if (!first) {
@@ -412,8 +411,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
           } else {
             first = false;
           }
-          fmt::fprintf(
-              f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
+          fmt::fprintf(f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d})", e.name,
               std::chrono::duration_cast<std::chrono::microseconds>(e.begin.time_since_epoch()).count(),
               std::chrono::duration_cast<std::chrono::microseconds>(e.end - e.begin).count(), threadId);
         }
@@ -462,11 +460,19 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     auto f = [&]() {
       std::string key = randomName();
 
-      auto tovec = [&](std::string str) { return std::vector<uint8_t>(str.begin(), str.end()); };
-      auto fromvec = [&](std::vector<uint8_t> vec) { return std::string(vec.begin(), vec.end()); };
+      auto tovec = [&](std::string str) {
+        return std::vector<uint8_t>(str.begin(), str.end());
+      };
+      auto fromvec = [&](std::vector<uint8_t> vec) {
+        return std::string(vec.begin(), vec.end());
+      };
 
-      auto set = [&](std::string key, std::string value) { store->set(key, tovec(value)); };
-      auto get = [&](std::string key) { return fromvec(store->get(key)); };
+      auto set = [&](std::string key, std::string value) {
+        store->set(key, tovec(value));
+      };
+      auto get = [&](std::string key) {
+        return fromvec(store->get(key));
+      };
 
       // Phase 1: Verify all ranks have started (no dependencies between ranks)
       set(fmt::sprintf("moodist_rank%d_started", rank), "1");
@@ -698,8 +704,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     std::array<uintptr_t, 8> peerAddresses;
     for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(
-          concurrencyIndex, peerIndex, opTypeAllGatherLocalCuda, stepValue, peerMappedAddresses[peerIndex],
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeAllGatherLocalCuda, stepValue, peerMappedAddresses[peerIndex],
           outputBytes);
     }
     for (size_t peerIndex : peerIndices) {
@@ -866,9 +871,9 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     }
   }
 
-  void kernelLess_all_gather_impl(
-      uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress, size_t inputBytes, uintptr_t outputAddress,
-      size_t outputBytes, CUstream stream, const std::array<uintptr_t, 8>& peerMappedInputAddresses,
+  void kernelLess_all_gather_impl(uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress,
+      size_t inputBytes, uintptr_t outputAddress, size_t outputBytes, CUstream stream,
+      const std::array<uintptr_t, 8>& peerMappedInputAddresses,
       const std::array<uintptr_t, 8>& peerMappedOutputAddresses, bool direct, size_t numChunks, size_t chunkSize) {
 
     if (!allGather2dCopies) {
@@ -908,9 +913,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     std::array<uintptr_t, 8> peerAddresses;
 
     for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(
-          concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue, peerMappedOutputAddresses[peerIndex],
-          outputBytes);
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue,
+          peerMappedOutputAddresses[peerIndex], outputBytes);
     }
     for (size_t peerIndex : peerIndices) {
       peerAddresses[peerIndex] =
@@ -1031,9 +1035,9 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     }
   }
 
-  void kernelLess_all_gather_ring_copies(
-      uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress, size_t inputBytes, uintptr_t outputAddress,
-      size_t outputBytes, CUstream stream, const std::array<uintptr_t, 8>& peerMappedInputAddresses,
+  void kernelLess_all_gather_ring_copies(uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress,
+      size_t inputBytes, uintptr_t outputAddress, size_t outputBytes, CUstream stream,
+      const std::array<uintptr_t, 8>& peerMappedInputAddresses,
       const std::array<uintptr_t, 8>& peerMappedOutputAddresses, bool direct, size_t numChunks, size_t chunkSize) {
 
     if (!allGather2dCopies) {
@@ -1065,9 +1069,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     std::array<uintptr_t, 8> peerAddresses;
 
     for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(
-          concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue, peerMappedOutputAddresses[peerIndex],
-          outputBytes);
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue,
+          peerMappedOutputAddresses[peerIndex], outputBytes);
     }
     for (size_t peerIndex : peerIndices) {
       peerAddresses[peerIndex] =
@@ -1220,10 +1223,18 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, bytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, inputAddress, bytes,
+          [ptr = &peerInputAddresses[i]](uintptr_t address) {
+            *ptr = address;
+          },
+          true);
 
       ipcMapper->requestAddress(
-          i, outputAddress, outputBytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, outputAddress, outputBytes,
+          [ptr = &peerOutputAddresses[i]](uintptr_t address) {
+            *ptr = address;
+          },
+          true);
     }
 
     ipcMapper->wait();
@@ -1269,9 +1280,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     }
 
     if (kernelLess_ring) {
-      kernelLess_all_gather_ring_copies(
-          concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,
-          peerOutputAddresses, direct, numChunks, chunkSize);
+      kernelLess_all_gather_ring_copies(concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes,
+          stream, peerInputAddresses, peerOutputAddresses, direct, numChunks, chunkSize);
       return;
     }
 
@@ -1281,9 +1291,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       // kernelLess_all_gather_impl(
       //     concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,
       //     peerOutputAddresses, chunkSize);
-      kernelLess_all_gather_impl(
-          concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream, peerInputAddresses,
-          peerOutputAddresses, direct, numChunks, chunkSize);
+      kernelLess_all_gather_impl(concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream,
+          peerInputAddresses, peerOutputAddresses, direct, numChunks, chunkSize);
       return;
     }
     CHECK(!direct);
@@ -1395,9 +1404,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     uint32_t value = nextMemSyncPeersValue;
     ++nextMemSyncPeersValue;
     for (size_t peerIndex : peerIndices) {
-      memWrite(
-          group->peerCudaMemSync[peerIndex].get(concurrencyIndex) +
-              sizeof(uint32_t) * group->peerMyRemoteIndex[peerIndex],
+      memWrite(group->peerCudaMemSync[peerIndex].get(concurrencyIndex) +
+                   sizeof(uint32_t) * group->peerMyRemoteIndex[peerIndex],
           value);
     }
     for (size_t peerIndex : peerIndices) {
@@ -1406,10 +1414,10 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     memFlush(stream);
   }
 
-  void reduce_scatter_copy_prepare_sends(
-      uint32_t concurrencyIndex, uint32_t stepValue, const std::array<uintptr_t, 8>& peerInputAddresses,
-      uintptr_t inputAddress, uintptr_t bufferAddress, uintptr_t sendAddress, size_t bytes, const auto& dtype,
-      const auto& device, size_t numel, Reduction opindex, CUstream stream, size_t copyBatchSize) {
+  void reduce_scatter_copy_prepare_sends(uint32_t concurrencyIndex, uint32_t stepValue,
+      const std::array<uintptr_t, 8>& peerInputAddresses, uintptr_t inputAddress, uintptr_t bufferAddress,
+      uintptr_t sendAddress, size_t bytes, const auto& dtype, const auto& device, size_t numel, Reduction opindex,
+      CUstream stream, size_t copyBatchSize) {
     ReduceScatter& reduceScatter = *group->reduceScatter;
     IpcMapper* ipcMapper = &*group->ipcMapper;
     const auto& ipcRanks = group->ipcRanks;
@@ -1420,9 +1428,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     std::array<uintptr_t, 8> peerAddresses;
 
     for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(
-          concurrencyIndex, peerIndex, opTypeReduceScatterKernelLessCuda, stepValue, peerInputAddresses[peerIndex],
-          bytes);
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceScatterKernelLessCuda, stepValue,
+          peerInputAddresses[peerIndex], bytes);
     }
     for (size_t peerIndex : peerIndices) {
       peerAddresses[peerIndex] =
@@ -1434,14 +1441,13 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
 
-    torch::Tensor bufferTensor = torch::from_blob(
-        (void*)bufferAddress, {(int64_t)((1 + peerIndices.size()) * copyBatchSize), (int64_t)numel},
-        at::TensorOptions().dtype(dtype).device(device));
+    torch::Tensor bufferTensor =
+        torch::from_blob((void*)bufferAddress, {(int64_t)((1 + peerIndices.size()) * copyBatchSize), (int64_t)numel},
+            at::TensorOptions().dtype(dtype).device(device));
 
     if (sendRanks.size()) {
       CHECK(copyBatchSize >= 1);
-      torch::Tensor outTensor = torch::from_blob(
-          (void*)sendAddress, {(int64_t)sendRanks.size(), (int64_t)numel},
+      torch::Tensor outTensor = torch::from_blob((void*)sendAddress, {(int64_t)sendRanks.size(), (int64_t)numel},
           at::TensorOptions().dtype(dtype).device(device));
 
       auto buft = bufferTensor.view({(int64_t)copyBatchSize, (int64_t)(1 + peerIndices.size()), (int64_t)numel});
@@ -1748,10 +1754,18 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     for (size_t i : peerIndices) {
       ipcMapper->requestAddress(
-          i, inputAddress, inputBytes, [ptr = &peerInputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, inputAddress, inputBytes,
+          [ptr = &peerInputAddresses[i]](uintptr_t address) {
+            *ptr = address;
+          },
+          true);
 
       ipcMapper->requestAddress(
-          i, outputAddress, bytes, [ptr = &peerOutputAddresses[i]](uintptr_t address) { *ptr = address; }, true);
+          i, outputAddress, bytes,
+          [ptr = &peerOutputAddresses[i]](uintptr_t address) {
+            *ptr = address;
+          },
+          true);
     }
 
     ipcMapper->wait();
@@ -1817,8 +1831,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         CHECK(!isLocalOnly);
 
         if (!group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex]) {
-          group->kernels->compile(
-              CompileReduceScatterDirect, group->kernels->supportedTypes[(size_t)dindex],
+          group->kernels->compile(CompileReduceScatterDirect, group->kernels->supportedTypes[(size_t)dindex],
               group->kernels->supportedReductions[(size_t)opindex]);
           CHECK(group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex] != nullptr);
         }
@@ -1826,9 +1839,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         std::array<uintptr_t, 8> peerAddresses;
 
         for (size_t peerIndex : peerIndices) {
-          peerWriteDyn(
-              concurrencyIndex, peerIndex, opTypeReduceScatterDirectCuda, stepValue, peerInputAddresses[peerIndex],
-              bytes);
+          peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceScatterDirectCuda, stepValue,
+              peerInputAddresses[peerIndex], bytes);
         }
         for (size_t peerIndex : peerIndices) {
           peerAddresses[peerIndex] =
@@ -1862,14 +1874,12 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         size_t gridSize = group->kernels->gridSize;
         size_t blockSize = group->kernels->blockSize;
 
-        CHECK_CU(cuLaunchKernel(
-            group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex], gridSize * 4, 1, 1, blockSize, 1, 1,
-            0, stream, params.data(), nullptr));
+        CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex], gridSize * 4, 1,
+            1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
 
         for (size_t peerIndex : peerIndices) {
-          cudaCopy(
-              recvAddress + pitch * recvRanks.size() + pitch * (1 + peerIndex), peerAddresses[peerIndex] + pitch * rank,
-              bytes, stream);
+          cudaCopy(recvAddress + pitch * recvRanks.size() + pitch * (1 + peerIndex),
+              peerAddresses[peerIndex] + pitch * rank, bytes, stream);
         }
 
       } else {
@@ -1882,9 +1892,9 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
         if (!isNoLocal) {
           CHECK(sendAddress != 0);
-          reduce_scatter_copy_prepare_sends(
-              concurrencyIndex, stepValue, peerInputAddresses, inputAddress, recvAddress + bytes * recvRanks.size(),
-              sendAddress, bytes, output.dtype(), output.device(), numel, opindex, stream, copyBatchSize);
+          reduce_scatter_copy_prepare_sends(concurrencyIndex, stepValue, peerInputAddresses, inputAddress,
+              recvAddress + bytes * recvRanks.size(), sendAddress, bytes, output.dtype(), output.device(), numel,
+              opindex, stream, copyBatchSize);
         }
       }
 
@@ -1910,8 +1920,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device()));
         auto tensor = output.flatten();
         CHECK((uintptr_t)tensor.const_data_ptr() == outputAddress);
-        torch::Tensor buffer = torch::from_blob(
-            (void*)recvAddress, {(int64_t)(1 + recvRanks.size() + peerIndices.size()), (int64_t)(pitch / itemsize)},
+        torch::Tensor buffer = torch::from_blob((void*)recvAddress,
+            {(int64_t)(1 + recvRanks.size() + peerIndices.size()), (int64_t)(pitch / itemsize)},
             at::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
         if (buffer.size(1) != numel) {
           buffer = buffer.narrow(1, 0, numel);
@@ -1937,8 +1947,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       trace("launch");
 
       if (!group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex]) {
-        group->kernels->compile(
-            CompileReduceScatter, group->kernels->supportedTypes[(size_t)dindex],
+        group->kernels->compile(CompileReduceScatter, group->kernels->supportedTypes[(size_t)dindex],
             group->kernels->supportedReductions[(size_t)opindex]);
         CHECK(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex] != nullptr);
         CHECK(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex] != nullptr);
@@ -1963,13 +1972,11 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       size_t blockSize = group->kernels->blockSize;
 
       if (isLocalOnly) {
-        CHECK_CU(cuLaunchKernel(
-            group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0,
-            stream, params.data(), nullptr));
+        CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
+            blockSize, 1, 1, 0, stream, params.data(), nullptr));
       } else {
-        CHECK_CU(cuLaunchKernel(
-            group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize, 1, 1, 0,
-            stream, params.data(), nullptr));
+        CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
+            blockSize, 1, 1, 0, stream, params.data(), nullptr));
       }
     }
 
@@ -1989,7 +1996,12 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
   }
 
   void hostFunc(CUstream stream, Function<void()> f) {
-    CHECK_CU(cuLaunchHostFunc(stream, [](void* c) { Function<void()>(FunctionPointer(c))(); }, f.release()));
+    CHECK_CU(cuLaunchHostFunc(
+        stream,
+        [](void* c) {
+          Function<void()>(FunctionPointer(c))();
+        },
+        f.release()));
   }
 
   Vector<CUstreamBatchMemOpParams> memops;
@@ -2027,9 +2039,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     memops.clear();
   }
 
-  void peerWriteDyn(
-      uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, uintptr_t gatherAddress,
-      size_t bytes) {
+  void peerWriteDyn(uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue,
+      uintptr_t gatherAddress, size_t bytes) {
     auto& dyn = group->getPeerVar(peerIndex, group->cpuLocalDyns)[size * concurrencyIndex + rank];
     dyn.opType = opType;
     dyn.gatherAddress = gatherAddress;
@@ -2040,8 +2051,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     group->ipcMapper->push(peerIndex, std::make_pair(concurrencyIndex, stepValue));
   }
-  uintptr_t
-  peerWaitDyn(uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, size_t bytes) {
+  uintptr_t peerWaitDyn(
+      uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, size_t bytes) {
     size_t i = group->ipcRanks[peerIndex];
     while (group->atomicStepValue[size * concurrencyIndex + i].load() < stepValue) {
       _mm_pause();
@@ -2049,9 +2060,8 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     auto& dyn = group->cpuLocalDyns[size * concurrencyIndex + i];
     CHECK_DYN(dyn, opType, stepValue, bytes);
 
-    CHECK(
-        (group->ipcMapper->pop<std::pair<uint32_t, uint32_t>>(peerIndex) ==
-         std::make_pair(concurrencyIndex, stepValue)));
+    CHECK((group->ipcMapper->pop<std::pair<uint32_t, uint32_t>>(peerIndex) ==
+           std::make_pair(concurrencyIndex, stepValue)));
 
     return dyn.gatherAddress;
   }
@@ -2491,8 +2501,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         localEvent.wait(*reduceStream);
       }
 
-      torch::Tensor buffer = torch::from_blob(
-          (void*)reduceBuffer.cudaPointer, {(int64_t)bufferSize, (int64_t)numel},
+      torch::Tensor buffer = torch::from_blob((void*)reduceBuffer.cudaPointer, {(int64_t)bufferSize, (int64_t)numel},
           at::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
 
       CHECK(buffer.numel() * buffer.itemsize() == bytes * bufferSize);
@@ -2505,8 +2514,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
           size_t currentChunkSize = std::min(chunkSize, bytes - offset);
 
           for (size_t index = 0; index != tree->recvs.size(); ++index) {
-            memWaitGeq(
-                group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
+            memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
                 stepValue);
           }
 
@@ -2530,8 +2538,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
           CHECK(tree->sends.size() <= 1);
           for (size_t index = 0; index != tree->sends.size(); ++index) {
-            memWrite(
-                group->cpuInBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
+            memWrite(group->cpuInBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
                 stepValue);
           }
 
@@ -2967,8 +2974,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     syncPeers(stream);
     for (size_t peerIndex : peerIndices) {
-      torch::Tensor peerTensor = torch::from_blob(
-          (void*)peerAddresses[peerIndex], {(int64_t)numel},
+      torch::Tensor peerTensor = torch::from_blob((void*)peerAddresses[peerIndex], {(int64_t)numel},
           at::TensorOptions().dtype(tensor.dtype()).device(tensor.device()));
 
       switch (reduceOp) {
@@ -3048,8 +3054,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         r.push_back(input);
       } else {
         size_t peerIndex = group->getPeerIndex(i);
-        r.push_back(torch::from_blob(
-            (void*)peerAddresses[peerIndex], input.sizes(),
+        r.push_back(torch::from_blob((void*)peerAddresses[peerIndex], input.sizes(),
             at::TensorOptions().dtype(input.dtype()).device(input.device())));
       }
     }
@@ -3081,13 +3086,11 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     return fmt::sprintf("shape [%s], dtype %s", fmt::to_string(fmt::join(shape, ", ")), torch::toString(dtype));
   }
   std::string descr(const TensorDataPtr& t) {
-    return fmt::sprintf(
-        "shape [%s], dtype %s", fmt::to_string(fmt::join(t->shape, ", ")),
+    return fmt::sprintf("shape [%s], dtype %s", fmt::to_string(fmt::join(t->shape, ", ")),
         torch::toString((torch::ScalarType)t->dtype));
   }
 
-  Future customOp(
-      std::shared_ptr<CustomOpDescriptor> op, const std::vector<torch::Tensor>& inputs,
+  Future customOp(std::shared_ptr<CustomOpDescriptor> op, const std::vector<torch::Tensor>& inputs,
       const std::vector<torch::Tensor>& outputs) {
     std::unique_lock l(threadUnsafe);
 
@@ -3198,7 +3201,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
     if (!outputCopyTensors.empty()) {
       r.waitDoneCallback = [tensors = std::move(outputCopyTensors), op, outputs, anyCuda, this, h = shared_from_this(),
-                            concurrencyIndex, stepValue]() {
+                               concurrencyIndex, stepValue]() {
         if (anyCuda) {
           memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
           memFlush(c10::cuda::getCurrentCUDAStream());
@@ -3242,13 +3245,12 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     template<typename X>
     void serialize(X& x) {
       x(contiguous, offset, shape, inputRank, outputRank, inputIndex, outputIndex, inputOffset, outputOffset,
-        outputContiguous);
+          outputContiguous);
     }
   };
 
   template<int ndim>
-  CustomOp compileOpFullImpl(
-      const std::vector<int>& shape_arg, torch::Dtype dtype,
+  CustomOp compileOpFullImpl(const std::vector<int>& shape_arg, torch::Dtype dtype,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg) {
     using T = std::array<int, ndim>;
@@ -3284,7 +3286,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     };
 
     IVector<TDescr> descrs;
-    descrs.reserve(numInputs + numOutputs);  // Pre-allocate to prevent pointer invalidation
+    descrs.reserve(numInputs + numOutputs); // Pre-allocate to prevent pointer invalidation
     IVector<TDescr*> inputs(numInputs);
     IVector<TDescr*> outputs(numOutputs);
     IVector<size_t> indexCounter(size);
@@ -3346,7 +3348,9 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
       return true;
     };
 
-    constexpr auto str = [](const T& v) { return fmt::sprintf("[%s]", fmt::to_string(fmt::join(v, ", "))); };
+    constexpr auto str = [](const T& v) {
+      return fmt::sprintf("[%s]", fmt::to_string(fmt::join(v, ", ")));
+    };
 
     constexpr auto contiguous = [](const T& a, const T& b) {
       for (size_t i : range(ndim)) {
@@ -3609,8 +3613,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     return r;
   }
 
-  CustomOp compileOpFull(
-      const std::vector<int>& shape, torch::Dtype dtype,
+  CustomOp compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
     switch (shape.size()) {
@@ -3675,7 +3678,9 @@ struct FreeMemoryCallback : at::FreeMemoryCallback {
 };
 
 void registerFreeMemoryCallback() {
-  at::FreeCudaMemoryCallbacksRegistry()->Register("moodist", []() { return std::make_unique<FreeMemoryCallback>(); });
+  at::FreeCudaMemoryCallbacksRegistry()->Register("moodist", []() {
+    return std::make_unique<FreeMemoryCallback>();
+  });
 }
 
 ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
@@ -3721,8 +3726,7 @@ struct WorkImpl : c10d::Work {
     return true;
   }
 
-  WorkImpl(
-      std::optional<std::variant<torch::Tensor, std::vector<torch::Tensor>>> outputs,
+  WorkImpl(std::optional<std::variant<torch::Tensor, std::vector<torch::Tensor>>> outputs,
       std::optional<std::variant<torch::Tensor, std::vector<torch::Tensor>>> inputs, WorkStream* w = nullptr)
       : outputs(std::move(outputs)), inputs(std::move(inputs)), w(w) {}
 
@@ -3753,9 +3757,8 @@ struct WorkImpl : c10d::Work {
   }
 };
 
-c10::intrusive_ptr<Work> ProcessGroup::allgather(
-    std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-    const c10d::AllgatherOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::allgather(std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts) {
   CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
   const auto& input = inputTensors[0];
   int64_t numel = input.numel();
@@ -3787,8 +3790,8 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(
   return c10::make_intrusive<WorkImpl>(outputList, input);
 }
 
-c10::intrusive_ptr<Work>
-ProcessGroup::_allgather_base(at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::_allgather_base(
+    at::Tensor& outputbuffer, at::Tensor& inputbuffer, const c10d::AllgatherOptions& opts) {
   bool isCuda = outputbuffer.is_cuda();
   CUstream stream = isCuda ? (CUstream)c10::cuda::getCurrentCUDAStream() : nullptr;
   if (isCuda) {
@@ -3832,9 +3835,8 @@ c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
   }
 }
 
-c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
-    std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
-    const c10d::ReduceScatterOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::ReduceScatterOptions& opts) {
   CHECK(outputTensors.size() == 1);
   CHECK(inputTensors.size() == 1);
   return _reduce_scatter_base(outputTensors[0], inputTensors[0], opts);
@@ -3927,14 +3929,13 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   return c10::make_intrusive<WorkImpl>(tensors, std::nullopt, w);
 }
 
-c10::intrusive_ptr<Work>
-ProcessGroup::allreduce_coalesced(std::vector<at::Tensor>& tensors, const c10d::AllreduceCoalescedOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::allreduce_coalesced(
+    std::vector<at::Tensor>& tensors, const c10d::AllreduceCoalescedOptions& opts) {
   return allreduce(tensors, opts);
 }
 
-c10::intrusive_ptr<Work> ProcessGroup::gather(
-    std::vector<std::vector<at::Tensor>>& outputTensors, std::vector<at::Tensor>& inputTensors,
-    const c10d::GatherOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::gather(std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::GatherOptions& opts) {
   CHECK(outputTensors.size() <= 1);
   CHECK(inputTensors.size() == 1);
   impl->gather(outputTensors.empty() ? std::vector<at::Tensor>() : outputTensors[0], inputTensors[0], opts.rootRank);
@@ -3962,9 +3963,8 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
   }
 }
 
-c10::intrusive_ptr<Work> ProcessGroup::scatter(
-    std::vector<at::Tensor>& outputTensors, std::vector<std::vector<at::Tensor>>& inputTensors,
-    const c10d::ScatterOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::scatter(std::vector<at::Tensor>& outputTensors,
+    std::vector<std::vector<at::Tensor>>& inputTensors, const c10d::ScatterOptions& opts) {
   CHECK(outputTensors.size() == 1);
   auto& outputs = outputTensors[0];
   if (impl->queues.empty()) {
@@ -4029,9 +4029,8 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
   }
 }
 
-c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
-    at::Tensor& outputTensor, at::Tensor& inputTensor, std::vector<int64_t>& outputSplitSizes,
-    std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts) {
+c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(at::Tensor& outputTensor, at::Tensor& inputTensor,
+    std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts) {
 
   CHECK(outputSplitSizes.size() == 0);
   CHECK(inputSplitSizes.size() == 0);
@@ -4074,8 +4073,8 @@ std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std
   return moodist::makeQueue(impl->group, location, streaming, name ? std::string_view(*name) : std::string_view{});
 }
 
-std::shared_ptr<Queue>
-ProcessGroup::makeQueue(std::vector<int> location, bool streaming, std::optional<std::string> name) {
+std::shared_ptr<Queue> ProcessGroup::makeQueue(
+    std::vector<int> location, bool streaming, std::optional<std::string> name) {
   return moodist::makeQueue(impl->group, location, streaming, name ? std::string_view(*name) : std::string_view{});
 }
 
@@ -4095,8 +4094,7 @@ void ProcessGroup::shutdown() {
   impl->shutdown();
 }
 
-CustomOp ProcessGroup::compileOpFull(
-    const std::vector<int>& shape, torch::Dtype dtype,
+CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
   return impl->compileOpFull(shape, dtype, inputs, outputs);
