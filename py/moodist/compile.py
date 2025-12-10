@@ -1,7 +1,8 @@
 import weakref
 
 import torch
-import moodist
+
+from .queue import Queue
 
 
 weak_group = weakref.WeakValueDictionary()
@@ -199,9 +200,9 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
     if name not in weak_group:
         weak_group[name] = group
-        weak_queue[name] = moodist.Queue(group, range(group.size()), name=name)
+        weak_queue[name] = Queue(group, range(group.size()), name=name)
     queue = weak_queue.get(name)
-    assert isinstance(queue, moodist.Queue)
+    assert isinstance(queue, Queue)
 
     def check(l):
         if not isinstance(l, (tuple, list)):
