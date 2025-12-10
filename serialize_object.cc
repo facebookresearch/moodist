@@ -1,4 +1,4 @@
-#include "torch_includes.h"
+#include "serialize_api.h"
 
 #include "buffer.h"
 #include "pybind11/numpy.h"
@@ -1181,24 +1181,35 @@ template<typename... T>
   }
 }
 
-torch::Tensor serializeObject(py::object o) {
+// Core implementation - returns Buffer* with refcount=1
+Buffer* serializeObjectImpl(PyObject* o) {
   std::call_once(globalsInitFlag, globalsInit);
-
-  auto buffer = serializeObjectToBuffer(o);
-  void* data = buffer->data();
-  size_t size = buffer->size();
-  SharedBufferHandle sharedBuffer(buffer.release());
-  return torch::from_blob(
-      data, {(int64_t)size}, [sharedBuffer = std::move(sharedBuffer)](void*) {},
-      torch::TensorOptions().dtype(torch::kUInt8));
+  auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>(o));
+  Buffer* buf = buffer.release();
+  buf->refcount.fetch_add(1, std::memory_order_acquire);  // set refcount to 1
+  return buf;
 }
 
-py::object deserializeObject(torch::Tensor t) {
-  std::call_once(globalsInitFlag, globalsInit);
+void* serializeBufferPtr(Buffer* buf) {
+  return buf->data();
+}
 
+size_t serializeBufferSize(Buffer* buf) {
+  return buf->size();
+}
+
+void serializeBufferDecRef(Buffer* buf) {
+  if (buf->refcount.fetch_sub(1) == 1) {
+    internalFree(buf);
+  }
+}
+
+// Core implementation - takes raw pointer/size, returns new reference
+PyObject* deserializeObjectImpl(const void* ptr, size_t len) {
+  std::call_once(globalsInitFlag, globalsInit);
   py::object o;
-  deserializeObjectFromBuffer(t.data_ptr(), t.itemsize() * t.numel(), o);
-  return o;
+  deserializeObjectFromBuffer(ptr, len, o);
+  return o.release().ptr();
 }
 
 } // namespace moodist

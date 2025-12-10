@@ -14,6 +14,7 @@
 #include "serialization.h"
 #include "setup_comms.h"
 #include "synchronization.h"
+#include "tensor_factory.h"
 #include "torch_includes.h"
 #include "vector.h"
 
@@ -4070,12 +4071,12 @@ void ProcessGroup::cudaBarrier() {
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
-  return moodist::makeQueue(impl->group, location, streaming, name);
+  return moodist::makeQueue(impl->group, location, streaming, name ? std::string_view(*name) : std::string_view{});
 }
 
 std::shared_ptr<Queue>
 ProcessGroup::makeQueue(std::vector<int> location, bool streaming, std::optional<std::string> name) {
-  return moodist::makeQueue(impl->group, location, streaming, name);
+  return moodist::makeQueue(impl->group, location, streaming, name ? std::string_view(*name) : std::string_view{});
 }
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out) {

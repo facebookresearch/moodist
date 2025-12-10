@@ -1,12 +1,14 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+// TcpStore - PyTorch-compatible wrapper around StoreImpl.
+// This class inherits from c10d::Store and lives in the _C wrapper library.
+
 #pragma once
 
+#include "store_api.h"
 #include "torch_includes.h"
 
 namespace moodist {
-
-struct StoreImpl;
 
 class TORCH_API TcpStore final : public c10d::Store {
 public:
@@ -21,6 +23,7 @@ public:
   StoreImpl* impl = nullptr;
 
   virtual c10::intrusive_ptr<Store> clone() {
+    storeImplAddRef(impl);
     return c10::make_intrusive<TcpStore>(impl);
   }
 

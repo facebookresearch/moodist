@@ -2,71 +2,50 @@
 
 #pragma once
 
-#include "common.h"
-#include "group.h"
-#include "tensor_types.h"
+#include "commondefs.h"
+#include "tensor_wrapper.h"
+
+#include <memory>
+#include <optional>
+#include <string_view>
 
 namespace moodist {
 
-constexpr uint8_t transactionOpCommit = 1;
-constexpr uint8_t transactionOpCancel = 2;
-
+struct Group;  // forward declaration
 struct QueueWorkImpl;
 
 struct QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
-  std::optional<torch::Storage> storage;
+  StorageWrapper storage;  // keeps tensor storage alive during async put (safer than TensorWrapper)
   bool waitOnDestroy = true;
-  QueueWork();
-  ~QueueWork();
+  MOODIST_API QueueWork();
+  MOODIST_API ~QueueWork();
   QueueWork(const QueueWork&) = delete;
   QueueWork(QueueWork&&) = default;
-  void wait();
+  MOODIST_API void wait();
 };
 
 struct Queue {
   void* impl = nullptr;
   Queue() = delete;
-  Queue(void*);
+  MOODIST_API Queue(void*);
   Queue(Queue&) = delete;
   Queue& operator=(Queue) = delete;
-  ~Queue();
-  std::pair<std::optional<torch::Tensor>, size_t> get(bool block = true, std::optional<float> timeout = {});
-  QueueWork put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy = true);
-  size_t qsize() const;
-  bool wait(std::optional<float> timeout) const;
+  MOODIST_API ~Queue();
+  MOODIST_API std::pair<std::optional<TensorWrapper>, size_t> get(bool block = true, std::optional<float> timeout = {});
+  MOODIST_API QueueWork put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy = true);
+  MOODIST_API size_t qsize() const;
+  MOODIST_API bool wait(std::optional<float> timeout) const;
 
-  uint32_t transactionBegin();
-  void transactionCancel(uint32_t id);
-  void transactionCommit(uint32_t id);
+  MOODIST_API uint32_t transactionBegin();
+  MOODIST_API void transactionCancel(uint32_t id);
+  MOODIST_API void transactionCommit(uint32_t id);
 
-  std::string name() const;
+  MOODIST_API std::string_view name() const;
 };
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming, std::optional<std::string> name);
-std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::optional<std::string> name);
-
-uint32_t queuePrepare(uintptr_t queueAddress, uint32_t source, uint32_t getKey, uint32_t transactionKey);
-void queueFinish(
-    Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key, TensorDataPtr tensor, uint32_t getKey,
-    uint32_t transactionKey, size_t queueSize);
-
-void queueRemoteGetStart(
-    Group* group, uintptr_t queueAddress, uint32_t source, uintptr_t remoteQueueAddress, uint32_t key);
-void queueRemoteGetStop(
-    Group* group, uintptr_t queueAddress, uint32_t source, uintptr_t remoteQueueAddress, uint32_t key);
-void queueRemoteGetStopAck(
-    Group* group, uintptr_t queueAddress, uint32_t source, uintptr_t remoteQueueAddress, uint32_t key);
-
-void queueTransactionCommit(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key);
-void queueTransactionCancel(Group* group, uintptr_t queueAddress, uint32_t source, uint32_t key);
-
-struct QueueInfo {
-  uintptr_t address;
-  int location;
-  bool streaming;
-};
-QueueInfo queueGetOrCreate(const std::string& name, int location, bool streaming);
+MOODIST_API std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group>, int location, bool streaming, std::string_view name = {});
+MOODIST_API std::shared_ptr<Queue>
+makeQueue(std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
 
 } // namespace moodist

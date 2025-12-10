@@ -1,7 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "torch_includes.h"
-
 #include "group.h"
 #include "allgather.h"
 #include "common.h"
@@ -10,6 +8,7 @@
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "torch_wrappers.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
@@ -66,7 +65,7 @@ void Group::init(Function<void()> f) {
 
   auto start = std::chrono::steady_clock::now();
 
-  deviceIndex = c10::cuda::current_device();
+  deviceIndex = cudaCurrentDevice();
   pid = ::getpid();
 
   cuContext = nullptr;

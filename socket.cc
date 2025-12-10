@@ -25,6 +25,9 @@
 
 namespace moodist {
 
+// Global scheduler instance - used by socket.cc and tcpdev.cc
+async::Scheduler& scheduler = Global(1);
+
 namespace poll {
 void add(std::shared_ptr<SocketImpl> impl);
 }

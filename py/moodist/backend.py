@@ -23,6 +23,8 @@ def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
     """Create a MoodistProcessGroup and register it by name."""
+    if MoodistProcessGroup is None:
+        raise RuntimeError("MoodistProcessGroup not available in this build")
     obj = MoodistProcessGroup(store, rank, size)
     _name_to_group[obj.moodist_name()] = obj
     return obj
@@ -33,6 +35,9 @@ def rendezvous_handler(
 ):
     """Handle moodist:// rendezvous URLs for torch.distributed.init_process_group."""
     import urllib.parse
+
+    if TcpStore is None:
+        raise RuntimeError("TcpStore not available in this build")
 
     result = urllib.parse.urlparse(url)
     if result.hostname is None:
@@ -55,11 +60,13 @@ def rendezvous_handler(
     )
 
 
-# Register backend with PyTorch distributed
-torch.distributed.Backend.register_backend(
-    "moodist", create_moodist_backend, devices=("cpu", "cuda")
-)
+# Register backend with PyTorch distributed (only if MoodistProcessGroup is available)
+if MoodistProcessGroup is not None:
+    torch.distributed.Backend.register_backend(
+        "moodist", create_moodist_backend, devices=("cpu", "cuda")
+    )
 
-torch.distributed.distributed_c10d.register_rendezvous_handler(
-    "moodist", rendezvous_handler
-)
+if TcpStore is not None:
+    torch.distributed.distributed_c10d.register_rendezvous_handler(
+        "moodist", rendezvous_handler
+    )

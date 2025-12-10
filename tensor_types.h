@@ -3,7 +3,7 @@
 #pragma once
 
 #include "common.h"
-#include "torch_includes.h"
+#include "tensor_wrapper.h"
 
 namespace moodist {
 
@@ -31,7 +31,7 @@ struct TensorData {
     return dataBytes;
   }
   size_t itemsize() {
-    return torch::elementSize(((torch::ScalarType)dtype));
+    return dtypeItemsize(static_cast<DType>(dtype));
   }
   size_t numel() {
     size_t r = 1;
@@ -45,27 +45,7 @@ struct TensorData {
 using TensorDataPtr = FLPtr<TensorData>;
 using TensorDataSharedPtr = FLSharedPtr<TensorData>;
 
-inline torch::Tensor makeTensor(TensorDataPtr ptr) {
-  torch::Device device(torch::kCPU);
-
-  CHECK(ptr != nullptr);
-
-  CHECK(!ptr->isCuda);
-
-  cpu_allocator::refCpuBuffer(ptr->buffer);
-
-  TensorData* td = &*ptr;
-
-  CHECK(td->data() != 0);
-
-  Function<void()> f = [ptr = std::move(ptr)]() mutable { cpu_allocator::derefCpuBuffer(ptr->data()); };
-  auto deleter = [](void* c) { Function<void()>(FunctionPointer(c))(); };
-  auto data = torch::DataPtr((void*)td->data(), (void*)f.release(), deleter, device);
-
-  torch::Storage storage(torch::Storage::use_byte_size_t(), td->bytes(), std::move(data), nullptr, false);
-  return torch::empty({0}, torch::TensorOptions((torch::ScalarType)td->dtype).device(device))
-      .set_(std::move(storage), 0, td->shape);
-}
+// makeTensor() is declared in tensor_factory.h (wrapper library)
 
 struct FutureImpl {
   TensorDataPtr result;

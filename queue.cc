@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "queue.h"
+#include "queue_internal.h"
 #include "common.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
@@ -8,10 +9,9 @@
 #include "intrusive_list.h"
 #include "simple_vector.h"
 #include "synchronization.h"
-#include "torch_includes.h"
+#include "torch_wrappers.h"
 
 #include <mutex>
-#include <pybind11/pybind11.h>
 
 namespace moodist {
 
@@ -39,10 +39,10 @@ struct QueueWorkImpl {
   void wait() {
     if (cudaDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          c10::cuda::getCurrentCUDAStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else if (cudaMappedDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          c10::cuda::getCurrentCUDAStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else {
       while (done == 0) {
         futexWait(&done, 0, std::chrono::seconds(1));
@@ -468,7 +468,7 @@ struct QueueImpl {
     qs->multicastRemoteAddresses = multicastRemoteAddresses;
   }
 
-  std::pair<std::optional<torch::Tensor>, size_t> get(bool block, std::optional<float> timeout) {
+  std::pair<std::optional<TensorWrapper>, size_t> get(bool block, std::optional<float> timeout) {
     // fixme: this needs to be refactored such that -
     //        local get is fairly queued alongside remote gets
     //        multi-threaded gets (local & remote) on the same object are also fairly queued
@@ -517,7 +517,7 @@ struct QueueImpl {
       CHECK(result.queueSize != -1);
 
       if (result.data != nullptr) {
-        return {makeTensor(std::move(result.data)), result.queueSize};
+        return {tensorFromData(std::move(result.data)), result.queueSize};
       }
       return {std::nullopt, result.queueSize};
     }
@@ -537,7 +537,7 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {makeTensor(std::move(r)), queueSize};
+        return {tensorFromData(std::move(r)), queueSize};
       }
     }
 
@@ -550,7 +550,7 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {makeTensor(std::move(r)), 0};
+        return {tensorFromData(std::move(r)), 0};
       }
       if (timeouthelper.expired()) {
         return {std::nullopt, 0};
@@ -558,7 +558,7 @@ struct QueueImpl {
     }
   }
 
-  QueueWork put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy = true) {
+  QueueWork put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy = true) {
     // CHECK(location != group->rank);
     // CHECK(qs == nullptr);
 
@@ -568,8 +568,8 @@ struct QueueImpl {
 
     TensorDataPtr td = TensorDataPtr::make();
 
-    td->dtype = (int)value.dtype().toScalarType();
-    const auto& shape = value.sizes();
+    td->dtype = static_cast<int>(value.dtype());
+    auto shape = value.sizes();
     td->shape.resize(shape.size());
     for (size_t i = 0; i != td->shape.size(); ++i) {
       td->shape[i] = shape[i];
@@ -596,7 +596,7 @@ struct QueueImpl {
 
     if (value.is_cpu()) {
       if (cpu_allocator::owns(tensorAddress)) {
-        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)value.storage().data());
+        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)value.storage_data());
         CHECK(handle != nullptr);
         td->buffer = std::move(handle);
       } else {
@@ -641,7 +641,7 @@ struct QueueImpl {
         td->buffer = AllocatedCpuBufferSharedPtr::make();
         *td->buffer = group->allocateCpu(td->dataBytes);
         td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
-        cudaCopy(td->data(), tensorAddress, td->bytes(), c10::cuda::getCurrentCUDAStream());
+        cudaCopy(td->data(), tensorAddress, td->bytes(), cudaGetCurrentStream());
 
         work->cudaMappedDone = WorkCudaMappedDonePtr::make();
         if (!work->cudaMappedDone->address) {
@@ -689,10 +689,10 @@ struct QueueImpl {
       };
 
       CHECK_CU(cuLaunchHostFunc(
-          c10::cuda::getCurrentCUDAStream(), [](void* ptr) { Function<void()>((FunctionPointer)ptr)(); }, f.release()));
+          cudaGetCurrentStream(), [](void* ptr) { Function<void()>((FunctionPointer)ptr)(); }, f.release()));
     }
 
-    r.storage = value.storage();
+    r.storage = storageFromTensor(value);
     r.waitOnDestroy = waitOnDestroy;
     r.impl = std::move(work);
     return r;
@@ -769,18 +769,18 @@ void QueueWork::wait() {
     return;
   }
   impl->wait();
-  storage.reset();
+  storage.reset();  // release the storage
 }
 
 Queue::~Queue() {
   delete (QueueImpl*)impl;
 }
 
-std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::optional<float> timeout) {
+std::pair<std::optional<TensorWrapper>, size_t> Queue::get(bool block, std::optional<float> timeout) {
   return ((QueueImpl*)impl)->get(block, timeout);
 }
-QueueWork Queue::put(torch::Tensor value, uint32_t transactionKey, bool waitOnDestroy) {
-  return ((QueueImpl*)impl)->put(value, transactionKey, waitOnDestroy);
+QueueWork Queue::put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy) {
+  return ((QueueImpl*)impl)->put(std::move(value), transactionKey, waitOnDestroy);
 }
 size_t Queue::qsize() const {
   return ((QueueImpl*)impl)->qsize();
@@ -799,7 +799,7 @@ void Queue::transactionCommit(uint32_t id) {
   return ((QueueImpl*)impl)->transactionCommit(id);
 }
 
-std::string Queue::name() const {
+std::string_view Queue::name() const {
   if (!((QueueImpl*)impl)->name) {
     throw std::runtime_error("This Queue has no name");
   }
@@ -813,16 +813,18 @@ Queue::Queue(void* p) {
 }
 
 std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::optional<std::string> name) {
+makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location, streaming, name);
+  std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
+  r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
   return r;
 }
 
 std::shared_ptr<Queue>
-makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::optional<std::string> name) {
+makeQueue(std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
-  r->impl = (void*)new QueueImpl(group, location, streaming, name);
+  std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
+  r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
   return r;
 }
 
@@ -1090,14 +1092,15 @@ void queueTransactionCancel(Group* group, uintptr_t queueAddress, uint32_t sourc
   ptr->transactions.erase(key);
 }
 
-QueueInfo queueGetOrCreate(const std::string& name, int location, bool streaming) {
+QueueInfo queueGetOrCreate(std::string_view name, int location, bool streaming) {
   std::lock_guard l(namedQueuesMutex);
-  auto i = namedQueues.find(name);
+  std::string nameStr(name);  // Convert once for map operations
+  auto i = namedQueues.find(nameStr);
   if (i == namedQueues.end()) {
     QueueStorage* qs = new QueueStorage();
     qs->location = location;
     qs->streaming = streaming;
-    i = namedQueues.emplace(name, qs).first;
+    i = namedQueues.emplace(std::move(nameStr), qs).first;
   }
   QueueInfo r;
   r.address = (uintptr_t)i->second;

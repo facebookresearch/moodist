@@ -14,7 +14,7 @@
 #include "intrusive_list.h"
 #include "ipc_mapper.h"
 #include "logging.h"
-#include "queue.h"
+#include "queue_internal.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "serialization.h"

@@ -318,7 +318,7 @@ struct CustomOpDescriptor {
 
   IVector<IVector<int64_t>> inputShapes;
   IVector<IVector<int64_t>> outputShapes;
-  torch::Dtype dtype;
+  DType dtype;
 };
 
 struct QueueEntryCustom : QueueEntry {

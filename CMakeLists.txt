@@ -18,7 +18,7 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
-set(CMAKE_SKIP_RPATH TRUE)
+# set(CMAKE_SKIP_RPATH TRUE)  # Disabled to allow _C to find libmoodist.so via rpath
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
@@ -68,7 +68,8 @@ endif()
 message(STATUS "Using -fabi-version=${ABI_VERSION}")
 message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fabi-version=${ABI_VERSION}")
+# Note: -fabi-version and _GLIBCXX_USE_CXX11_ABI are set per-target, not globally
+# Core library uses system default ABI, wrapper matches PyTorch's ABI
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -123,54 +124,96 @@ set(rdma_sources
   ${efa_sources}
 )
 
-pybind11_add_module(_C
-  processgroup.cc
-  group.cc
-  setup_comms.cc
-  connection.cc
-  socket.cc 
-  async.cc
-  ipc_mapper.cc
-  cputhread.cc
-  pybind.cc
-  ib_common.cc
-  allgather.cc
-  kernels.cc
-  reduce_scatter.cc
-  reduce_scatter_direct.cc
-  allocator.cc
-  queue.cc
-  cpu_allocator.cc
-  numa.cc
-  alltoall.cc
-  internal_allocator.cc
+# Core library sources - uses wrapper interfaces, no direct PyTorch
+# MINIMAL BUILD: Just store + dependencies for now
+set(core_sources
+  # Minimal for store:
   store.cc
-  rdma_ib.cc
-  tcpdev.cc
-  rdma_tcp.cc
-  serialize_object.cc
+  socket.cc
+  async.cc
+  connection.cc
+  internal_allocator.cc  # needed by Global template in common.h
+  numa.cc  # needed by internal_allocator.cc
+  serialize_object.cc  # serialization core (no torch dependency)
   fmt/src/format.cc
-  ${rdma_sources}
+  # Commented out until store works:
+  # group.cc  # uses torch - needs migration
+  # setup_comms.cc
+  # ipc_mapper.cc
+  # cputhread.cc
+  # ib_common.cc
+  # allgather.cc
+  # kernels.cc
+  # reduce_scatter.cc
+  # reduce_scatter_direct.cc
+  # numa.cc
+  # alltoall.cc
+  # internal_allocator.cc
+  # rdma_ib.cc
+  # tcpdev.cc
+  # rdma_tcp.cc
+  # queue.cc
+  # processgroup.cc  # uses torch - needs migration
+  # allocator.cc  # uses torch - needs migration
+  # cpu_allocator.cc  # uses torch - needs migration
+  # serialize_object.cc  # uses torch - needs migration
+  # ${rdma_sources}
 )
-target_link_libraries(_C PRIVATE
+
+# Core library - compiled once, shared across PyTorch versions
+add_library(moodist SHARED ${core_sources})
+# MINIMAL BUILD: Keep CUDA includes since commondefs.h includes cuda
+target_link_libraries(moodist PRIVATE
   CUDA::cuda_driver
   CUDA::nvml
   CUDA::nvrtc
-  ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
   anl
-  kern-abi
+  # kern-abi  # Not needed for store-only (rdma-core)
+)
+target_include_directories(moodist SYSTEM PRIVATE
+  fmt/include
+  # rdma-core  # Not needed for store-only
+  # ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include  # Not needed for store-only
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
+  ${Python_INCLUDE_DIRS}  # For serialize_object.cc
+)
+target_compile_definitions(moodist PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
+target_compile_definitions(moodist PRIVATE _STATIC_LIBRARY_BUILD_)
+set_property(TARGET moodist PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+# Wrapper library sources - implements PyTorch wrappers and pybind
+# MINIMAL BUILD: Just store wrapper and pybind for now
+set(wrapper_sources
+  # torch_wrappers.cc  # Not needed for store-only build
+  pybind.cc
+  store_wrapper.cc
+  serialize_wrapper.cc  # torch::Tensor wrapper for serialize/deserialize
+)
+
+# Wrapper library - compiled per PyTorch version
+pybind11_add_module(_C ${wrapper_sources})
+target_link_libraries(_C PRIVATE
+  moodist
+  ${TorchPath}/lib/libtorch_python.so
+  Threads::Threads
 )
 target_include_directories(_C SYSTEM PRIVATE
   fmt/include
-  rdma-core
-  ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
   ${TorchPath}/include
   ${TorchPath}/include/torch/csrc/api/include
   ${CUDAToolkit_INCLUDE_DIRS}
 )
+target_compile_options(_C PRIVATE -fabi-version=${ABI_VERSION})
 target_compile_definitions(_C PRIVATE _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI})
-target_compile_definitions(_C PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
-target_compile_definitions(_C PRIVATE _STATIC_LIBRARY_BUILD_)
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+# Set rpath so _C can find libmoodist.so in the same directory
+set_target_properties(_C PROPERTIES
+  SKIP_BUILD_RPATH FALSE
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "$ORIGIN"
+  INSTALL_RPATH_USE_LINK_PATH FALSE
+)

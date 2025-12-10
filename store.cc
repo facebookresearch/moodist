@@ -1,6 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "store.h"
+#include "store_api.h"
 #include "buffer.h"
 #include "common.h"
 #include "connection.h"
@@ -2133,55 +2133,45 @@ struct Dtor {
 
 } // namespace
 
-TcpStore::TcpStore(StoreImpl* impl) : impl(impl) {
+// C-style interface for StoreImpl - used by TcpStore wrapper in _C
+
+StoreImpl* createStoreImpl(
+    std::string hostname, int port, std::string key, int worldSize, int rank) {
+  return new StoreImpl(std::move(hostname), port, std::move(key), worldSize, rank);
+}
+
+void storeImplAddRef(StoreImpl* impl) {
   ++impl->refcount;
 }
 
-TcpStore::TcpStore(
-    std::string hostname, int port, std::string key, int worldSize, int rank,
-    std::chrono::steady_clock::duration timeout) {
-  impl = new StoreImpl(hostname, port, key, worldSize, rank);
-  ++impl->refcount;
-  timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
-}
-
-TcpStore::~TcpStore() {
+void storeImplDecRef(StoreImpl* impl) {
   if (--impl->refcount == 0) {
     impl->shutdown();
     delete impl;
   }
 }
 
-void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {
-  impl->set(timeout_, key, value);
+void storeImplSet(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+    const std::string& key, const std::vector<uint8_t>& value) {
+  impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> TcpStore::get(const std::string& key) {
-  return impl->get(timeout_, key);
+std::vector<uint8_t> storeImplGet(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+    const std::string& key) {
+  return impl->get(timeout, key);
 }
 
-int64_t TcpStore::add(const std::string& key, int64_t value) {
-  throw std::runtime_error("Moodist Store add method is not implemented");
-  return 0;
+bool storeImplCheck(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+    const std::vector<std::string>& keys) {
+  return impl->check(timeout, keys);
 }
 
-bool TcpStore::deleteKey(const std::string& key) {
-  throw std::runtime_error("Moodist Store deleteKey method is not implemented");
-}
-
-bool TcpStore::check(const std::vector<std::string>& keys) {
-  return impl->check(timeout_, keys);
-}
-
-int64_t TcpStore::getNumKeys() {
-  throw std::runtime_error("Moodist Store getNumKeys method is not implemented");
-}
-
-void TcpStore::wait(const std::vector<std::string>& keys) {
-  impl->wait(timeout_, keys);
-}
-
-void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) {
+void storeImplWait(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+    const std::vector<std::string>& keys) {
   impl->wait(timeout, keys);
 }
 

@@ -8,20 +8,6 @@ import torch
 
 from .version import __version__, cversions
 
-_clist = [
-    "MoodistProcessGroup",
-    "MoodistBackend",
-    "enable_profiling",
-    "enable_cuda_allocator",
-    "enable_cpu_allocator",
-    "cpu_allocator_debug",
-    "cuda_copy",
-    "set_prefer_kernel_less",
-    "TcpStore",
-    "serialize",
-    "deserialize",
-]
-
 _torchversion = torch.__version__
 
 _found = False
@@ -42,15 +28,15 @@ if not _found:
         % (_torchversion, list(cversions.keys()))
     )
 
-# Export C extension symbols
-MoodistProcessGroup = _C.MoodistProcessGroup
-MoodistBackend = _C.MoodistBackend
-enable_profiling = _C.enable_profiling
-enable_cuda_allocator = _C.enable_cuda_allocator
-enable_cpu_allocator = _C.enable_cpu_allocator
-cpu_allocator_debug = _C.cpu_allocator_debug
-cuda_copy = _C.cuda_copy
-set_prefer_kernel_less = _C.set_prefer_kernel_less
-TcpStore = _C.TcpStore
-serialize = _C.serialize
-deserialize = _C.deserialize
+# Export C extension symbols - use getattr with None default for optional symbols
+MoodistProcessGroup = getattr(_C, "MoodistProcessGroup", None)
+MoodistBackend = getattr(_C, "MoodistBackend", None)
+enable_profiling = getattr(_C, "enable_profiling", None)
+enable_cuda_allocator = getattr(_C, "enable_cuda_allocator", None)
+enable_cpu_allocator = getattr(_C, "enable_cpu_allocator", None)
+cpu_allocator_debug = getattr(_C, "cpu_allocator_debug", None)
+cuda_copy = getattr(_C, "cuda_copy", None)
+set_prefer_kernel_less = getattr(_C, "set_prefer_kernel_less", None)
+TcpStore = getattr(_C, "TcpStore", None)
+serialize = getattr(_C, "serialize", None)
+deserialize = getattr(_C, "deserialize", None)
