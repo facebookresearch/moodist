@@ -40,6 +40,9 @@ namespace py = pybind11;
 // using MoodistBackend = moodist::Backend;
 
 PYBIND11_MODULE(_C, m) {
+  // Initialize the moodist API (loads libmoodist.so)
+  moodist::initMoodistAPI();
+
   // MINIMAL BUILD: TcpStore + serialize/deserialize
   py::class_<moodist::TcpStore, c10::intrusive_ptr<moodist::TcpStore>, c10d::Store>(m, "TcpStore", R"d(
     A moodist tcp store.

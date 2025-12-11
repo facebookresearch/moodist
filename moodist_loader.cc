@@ -1,6 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Loads libmoodist.so via dlopen and registers API function implementations
+// Loads libmoodist.so via dlopen and provides wrapper functions for PyTorch APIs
 
 #include "moodist_loader.h"
 #include "moodist_api.h"
@@ -24,10 +24,11 @@ struct Tensor {
 };
 
 // ============================================================================
-// API function implementations
+// Wrapper functions - these wrap PyTorch APIs and are called by libmoodist.so
+// In _C.so, TensorPtr calls these directly via wrappers::
 // ============================================================================
 
-namespace {
+namespace wrappers {
 
 // CUDA device/stream functions
 int cudaCurrentDevice() {
@@ -180,42 +181,11 @@ size_t dtypeSize(DType dtype) {
   return torch::elementSize(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
 }
 
-// Register all API function implementations
-void registerAPIFunctions(MoodistAPI* api) {
-  api->cudaCurrentDevice = cudaCurrentDevice;
-  api->cudaGetCurrentStream = cudaGetCurrentStream;
-  api->cudaStreamGuardEnter = cudaStreamGuardEnter;
-  api->cudaStreamGuardExit = cudaStreamGuardExit;
-  api->tensorFromBlob = tensorFromBlob;
-  api->tensorEmpty = tensorEmpty;
-  api->tensorAddRef = tensorAddRef;
-  api->tensorDecRef = tensorDecRef;
-  api->tensorDataPtr = tensorDataPtr;
-  api->tensorNumel = tensorNumel;
-  api->tensorNdim = tensorNdim;
-  api->tensorSize = tensorSize;
-  api->tensorStride = tensorStride;
-  api->tensorDtype = tensorDtype;
-  api->tensorDevice = tensorDevice;
-  api->tensorIsContiguous = tensorIsContiguous;
-  api->tensorIsCuda = tensorIsCuda;
-  api->tensorIsCpu = tensorIsCpu;
-  api->tensorItemsize = tensorItemsize;
-  api->tensorView = tensorView;
-  api->tensorNarrow = tensorNarrow;
-  api->tensorContiguous = tensorContiguous;
-  api->tensorMulScalar = tensorMulScalar;
-  api->tensorMulScalar_ = tensorMulScalar_;
-  api->tensorRecordStream = tensorRecordStream;
-  api->tensorCopy_ = tensorCopy_;
-  api->tensorSumOut = tensorSumOut;
-  api->tensorAmaxOut = tensorAmaxOut;
-  api->tensorAminOut = tensorAminOut;
-  api->dtypeSize = dtypeSize;
-}
+} // namespace wrappers
+
+namespace {
 
 void* libHandle = nullptr;
-MoodistAPI* api = nullptr;
 
 std::string getLibraryPath() {
   // Get path to this module (_C.so)
@@ -252,10 +222,48 @@ std::string getLibraryPath() {
 
 } // namespace
 
-MoodistAPI* getMoodistAPI() {
-  if (api != nullptr) {
-    return api;
+// Global CoreAPI object - function pointers copied here after loading
+// Using an object (not pointer) means each function pointer access is a single memory read
+CoreAPI coreAPI = {};
+
+void initMoodistAPI() {
+  if (coreAPI.magic != 0) {
+    return; // Already initialized
   }
+
+  // Build WrapperAPI with pointers to our wrapper functions
+  WrapperAPI wrapper = {
+      .cudaCurrentDevice = wrappers::cudaCurrentDevice,
+      .cudaGetCurrentStream = wrappers::cudaGetCurrentStream,
+      .cudaStreamGuardEnter = wrappers::cudaStreamGuardEnter,
+      .cudaStreamGuardExit = wrappers::cudaStreamGuardExit,
+      .tensorFromBlob = wrappers::tensorFromBlob,
+      .tensorEmpty = wrappers::tensorEmpty,
+      .tensorAddRef = wrappers::tensorAddRef,
+      .tensorDecRef = wrappers::tensorDecRef,
+      .tensorDataPtr = wrappers::tensorDataPtr,
+      .tensorNumel = wrappers::tensorNumel,
+      .tensorNdim = wrappers::tensorNdim,
+      .tensorSize = wrappers::tensorSize,
+      .tensorStride = wrappers::tensorStride,
+      .tensorDtype = wrappers::tensorDtype,
+      .tensorDevice = wrappers::tensorDevice,
+      .tensorIsContiguous = wrappers::tensorIsContiguous,
+      .tensorIsCuda = wrappers::tensorIsCuda,
+      .tensorIsCpu = wrappers::tensorIsCpu,
+      .tensorItemsize = wrappers::tensorItemsize,
+      .tensorView = wrappers::tensorView,
+      .tensorNarrow = wrappers::tensorNarrow,
+      .tensorContiguous = wrappers::tensorContiguous,
+      .tensorMulScalar = wrappers::tensorMulScalar,
+      .tensorMulScalar_ = wrappers::tensorMulScalar_,
+      .tensorRecordStream = wrappers::tensorRecordStream,
+      .tensorCopy_ = wrappers::tensorCopy_,
+      .tensorSumOut = wrappers::tensorSumOut,
+      .tensorAmaxOut = wrappers::tensorAmaxOut,
+      .tensorAminOut = wrappers::tensorAminOut,
+      .dtypeSize = wrappers::dtypeSize,
+  };
 
   std::string libPath = getLibraryPath();
 
@@ -264,14 +272,14 @@ MoodistAPI* getMoodistAPI() {
     throw std::runtime_error(std::string("Failed to load libmoodist.so: ") + dlerror());
   }
 
-  auto getAPI = reinterpret_cast<MoodistAPI* (*)(uint32_t)>(dlsym(libHandle, "moodistGetAPI"));
+  auto getAPI = reinterpret_cast<CoreAPI* (*)(uint32_t, const WrapperAPI*)>(dlsym(libHandle, "moodistGetAPI"));
   if (getAPI == nullptr) {
     dlclose(libHandle);
     libHandle = nullptr;
     throw std::runtime_error(std::string("Failed to find moodistGetAPI: ") + dlerror());
   }
 
-  api = getAPI(kMoodistAPIVersion);
+  CoreAPI* api = getAPI(kMoodistAPIVersion, &wrapper);
   if (api == nullptr) {
     dlclose(libHandle);
     libHandle = nullptr;
@@ -281,14 +289,11 @@ MoodistAPI* getMoodistAPI() {
   if (api->magic != kMoodistBuildMagic) {
     dlclose(libHandle);
     libHandle = nullptr;
-    api = nullptr;
     throw std::runtime_error("moodist build magic mismatch: _C.so and libmoodist.so are from different builds");
   }
 
-  // Register API function implementations so core can call back into _C
-  registerAPIFunctions(api);
-
-  return api;
+  // Copy the CoreAPI to our global
+  coreAPI = *api;
 }
 
 TensorPtr wrapTensor(torch::Tensor t) {

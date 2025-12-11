@@ -10,8 +10,8 @@
 
 namespace moodist {
 
-// Forward declaration
-MoodistAPI* getMoodistAPI();
+// Global CoreAPI object - defined in moodist_loader.cc
+extern CoreAPI coreAPI;
 
 class TORCH_API TcpStore final : public c10d::Store {
 public:

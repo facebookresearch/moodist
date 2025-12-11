@@ -8,10 +8,10 @@
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "moodist_loader.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
+#include "tensor_ptr.h"
 
 #include <algorithm>
 #include <cstring>
@@ -65,7 +65,7 @@ void Group::init(Function<void()> f) {
 
   auto start = std::chrono::steady_clock::now();
 
-  deviceIndex = getMoodistAPI()->cudaCurrentDevice();
+  deviceIndex = wrapperAPI.cudaCurrentDevice();
   pid = ::getpid();
 
   cuContext = nullptr;

@@ -6,10 +6,10 @@
 #include "cuda_copy.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
-#include "moodist_loader.h"
 #include "queue_internal.h"
 #include "simple_vector.h"
 #include "synchronization.h"
+#include "tensor_ptr.h"
 
 #include <mutex>
 
@@ -51,13 +51,12 @@ struct QueueWorkImpl {
   uint32_t transactionKey = 0;
   ~QueueWorkImpl() {}
   void wait() {
-    auto* api = getMoodistAPI();
     if (cudaDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          api->cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          wrapperAPI.cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else if (cudaMappedDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          api->cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          wrapperAPI.cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else {
       while (done == 0) {
         futexWait(&done, 0, std::chrono::seconds(1));
@@ -701,7 +700,7 @@ struct QueueImpl {
       };
 
       CHECK_CU(cuLaunchHostFunc(
-          getMoodistAPI()->cudaGetCurrentStream(),
+          wrapperAPI.cudaGetCurrentStream(),
           [](void* ptr) {
             Function<void()>((FunctionPointer)ptr)();
           },

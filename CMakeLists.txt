@@ -233,7 +233,10 @@ target_include_directories(_C SYSTEM PRIVATE
   ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_compile_options(_C PRIVATE -fabi-version=${ABI_VERSION})
-target_compile_definitions(_C PRIVATE _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI})
+target_compile_definitions(_C PRIVATE
+  _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}
+  MOODIST_WRAPPER  # Enable direct wrapper function calls in _C.so
+)
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 

@@ -1,7 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 // TensorPtr - RAII smart pointer for Tensor* with torch::Tensor-like API
-// Used by core library to work with tensors without manual refcounting.
+// Used by both _C.so and libmoodist.so to work with tensors.
+//
+// In _C.so (compiled with -DMOODIST_WRAPPER):
+//   - Calls wrapper functions directly via wrappers:: namespace
+//
+// In libmoodist.so:
+//   - Calls wrapper functions through the global wrapperAPI struct
 
 #pragma once
 
@@ -13,9 +19,54 @@
 
 namespace moodist {
 
-// Forward declaration - getMoodistAPI() is in moodist_loader.h (wrapper)
-// For core, this is resolved at link time
-MoodistAPI* getMoodistAPI();
+// =============================================================================
+// Conditional wrapper function access
+// =============================================================================
+
+#ifdef MOODIST_WRAPPER
+// In _C.so - call wrapper functions directly (they're in the same library)
+namespace wrappers {
+int cudaCurrentDevice();
+CUstream cudaGetCurrentStream();
+void* cudaStreamGuardEnter(CUstream stream, int device);
+void cudaStreamGuardExit(void* guard);
+Tensor* tensorFromBlob(void* data, const int64_t* sizes, int ndim, DType dtype, int device);
+Tensor* tensorEmpty(const int64_t* sizes, int ndim, DType dtype, int device);
+void tensorAddRef(Tensor* t);
+void tensorDecRef(Tensor* t);
+void* tensorDataPtr(Tensor* t);
+int64_t tensorNumel(Tensor* t);
+int tensorNdim(Tensor* t);
+int64_t tensorSize(Tensor* t, int dim);
+int64_t tensorStride(Tensor* t, int dim);
+DType tensorDtype(Tensor* t);
+int tensorDevice(Tensor* t);
+bool tensorIsContiguous(Tensor* t);
+bool tensorIsCuda(Tensor* t);
+bool tensorIsCpu(Tensor* t);
+int64_t tensorItemsize(Tensor* t);
+Tensor* tensorView(Tensor* t, const int64_t* sizes, int ndim);
+Tensor* tensorNarrow(Tensor* t, int dim, int64_t start, int64_t length);
+Tensor* tensorContiguous(Tensor* t);
+Tensor* tensorMulScalar(Tensor* t, double scalar);
+void tensorMulScalar_(Tensor* t, double scalar);
+void tensorRecordStream(Tensor* t, CUstream stream);
+void tensorCopy_(Tensor* dst, Tensor* src);
+void tensorSumOut(Tensor* dst, Tensor* src, int dim);
+void tensorAmaxOut(Tensor* dst, Tensor* src, int dim);
+void tensorAminOut(Tensor* dst, Tensor* src, int dim);
+size_t dtypeSize(DType dtype);
+} // namespace wrappers
+#define W wrappers::
+#else
+// In libmoodist.so - call through global WrapperAPI struct
+extern WrapperAPI wrapperAPI;
+#define W wrapperAPI.
+#endif
+
+// =============================================================================
+// TensorPtr class
+// =============================================================================
 
 class TensorPtr {
   Tensor* ptr_ = nullptr;
@@ -32,7 +83,7 @@ public:
 
   ~TensorPtr() {
     if (ptr_) {
-      getMoodistAPI()->tensorDecRef(ptr_);
+      W tensorDecRef(ptr_);
     }
   }
 
@@ -47,7 +98,7 @@ public:
   TensorPtr& operator=(TensorPtr&& other) noexcept {
     if (this != &other) {
       if (ptr_) {
-        getMoodistAPI()->tensorDecRef(ptr_);
+        W tensorDecRef(ptr_);
       }
       ptr_ = other.ptr_;
       other.ptr_ = nullptr;
@@ -61,18 +112,18 @@ public:
 
   TensorPtr(const TensorPtr& other) : ptr_(other.ptr_) {
     if (ptr_) {
-      getMoodistAPI()->tensorAddRef(ptr_);
+      W tensorAddRef(ptr_);
     }
   }
 
   TensorPtr& operator=(const TensorPtr& other) {
     if (this != &other) {
       if (ptr_) {
-        getMoodistAPI()->tensorDecRef(ptr_);
+        W tensorDecRef(ptr_);
       }
       ptr_ = other.ptr_;
       if (ptr_) {
-        getMoodistAPI()->tensorAddRef(ptr_);
+        W tensorAddRef(ptr_);
       }
     }
     return *this;
@@ -107,7 +158,7 @@ public:
   // Reset to a new pointer (takes ownership)
   void reset(Tensor* p = nullptr) {
     if (ptr_) {
-      getMoodistAPI()->tensorDecRef(ptr_);
+      W tensorDecRef(ptr_);
     }
     ptr_ = p;
   }
@@ -117,15 +168,15 @@ public:
   // =========================================================================
 
   void* data_ptr() const {
-    return getMoodistAPI()->tensorDataPtr(ptr_);
+    return W tensorDataPtr(ptr_);
   }
 
   int64_t numel() const {
-    return getMoodistAPI()->tensorNumel(ptr_);
+    return W tensorNumel(ptr_);
   }
 
   int ndimension() const {
-    return getMoodistAPI()->tensorNdim(ptr_);
+    return W tensorNdim(ptr_);
   }
 
   int dim() const {
@@ -133,11 +184,11 @@ public:
   }
 
   int64_t size(int dim) const {
-    return getMoodistAPI()->tensorSize(ptr_, dim);
+    return W tensorSize(ptr_, dim);
   }
 
   int64_t stride(int dim) const {
-    return getMoodistAPI()->tensorStride(ptr_, dim);
+    return W tensorStride(ptr_, dim);
   }
 
   std::vector<int64_t> sizes() const {
@@ -159,7 +210,7 @@ public:
   }
 
   DType scalar_type() const {
-    return getMoodistAPI()->tensorDtype(ptr_);
+    return W tensorDtype(ptr_);
   }
 
   DType dtype() const {
@@ -167,23 +218,23 @@ public:
   }
 
   int device_index() const {
-    return getMoodistAPI()->tensorDevice(ptr_);
+    return W tensorDevice(ptr_);
   }
 
   bool is_contiguous() const {
-    return getMoodistAPI()->tensorIsContiguous(ptr_);
+    return W tensorIsContiguous(ptr_);
   }
 
   bool is_cuda() const {
-    return getMoodistAPI()->tensorIsCuda(ptr_);
+    return W tensorIsCuda(ptr_);
   }
 
   bool is_cpu() const {
-    return getMoodistAPI()->tensorIsCpu(ptr_);
+    return W tensorIsCpu(ptr_);
   }
 
   int64_t itemsize() const {
-    return getMoodistAPI()->tensorItemsize(ptr_);
+    return W tensorItemsize(ptr_);
   }
 
   int64_t element_size() const {
@@ -199,7 +250,7 @@ public:
   // =========================================================================
 
   TensorPtr view(std::span<const int64_t> sizes) const {
-    return TensorPtr(getMoodistAPI()->tensorView(ptr_, sizes.data(), static_cast<int>(sizes.size())));
+    return TensorPtr(W tensorView(ptr_, sizes.data(), static_cast<int>(sizes.size())));
   }
 
   TensorPtr view(std::initializer_list<int64_t> sizes) const {
@@ -207,11 +258,11 @@ public:
   }
 
   TensorPtr narrow(int dim, int64_t start, int64_t length) const {
-    return TensorPtr(getMoodistAPI()->tensorNarrow(ptr_, dim, start, length));
+    return TensorPtr(W tensorNarrow(ptr_, dim, start, length));
   }
 
   TensorPtr contiguous() const {
-    return TensorPtr(getMoodistAPI()->tensorContiguous(ptr_));
+    return TensorPtr(W tensorContiguous(ptr_));
   }
 
   // =========================================================================
@@ -219,11 +270,11 @@ public:
   // =========================================================================
 
   TensorPtr operator*(double scalar) const {
-    return TensorPtr(getMoodistAPI()->tensorMulScalar(ptr_, scalar));
+    return TensorPtr(W tensorMulScalar(ptr_, scalar));
   }
 
   TensorPtr& mul_(double scalar) {
-    getMoodistAPI()->tensorMulScalar_(ptr_, scalar);
+    W tensorMulScalar_(ptr_, scalar);
     return *this;
   }
 
@@ -232,12 +283,12 @@ public:
   // =========================================================================
 
   TensorPtr& copy_(const TensorPtr& src) {
-    getMoodistAPI()->tensorCopy_(ptr_, src.ptr_);
+    W tensorCopy_(ptr_, src.ptr_);
     return *this;
   }
 
   void record_stream(CUstream stream) {
-    getMoodistAPI()->tensorRecordStream(ptr_, stream);
+    W tensorRecordStream(ptr_, stream);
   }
 
   // =========================================================================
@@ -245,12 +296,11 @@ public:
   // =========================================================================
 
   static TensorPtr from_blob(void* data, std::span<const int64_t> sizes, DType dtype, int device) {
-    return TensorPtr(
-        getMoodistAPI()->tensorFromBlob(data, sizes.data(), static_cast<int>(sizes.size()), dtype, device));
+    return TensorPtr(W tensorFromBlob(data, sizes.data(), static_cast<int>(sizes.size()), dtype, device));
   }
 
   static TensorPtr empty(std::span<const int64_t> sizes, DType dtype, int device) {
-    return TensorPtr(getMoodistAPI()->tensorEmpty(sizes.data(), static_cast<int>(sizes.size()), dtype, device));
+    return TensorPtr(W tensorEmpty(sizes.data(), static_cast<int>(sizes.size()), dtype, device));
   }
 };
 
@@ -259,15 +309,15 @@ public:
 // =========================================================================
 
 inline void sum_out(TensorPtr& dst, const TensorPtr& src, int dim) {
-  getMoodistAPI()->tensorSumOut(dst.get(), src.get(), dim);
+  W tensorSumOut(dst.get(), src.get(), dim);
 }
 
 inline void amax_out(TensorPtr& dst, const TensorPtr& src, int dim) {
-  getMoodistAPI()->tensorAmaxOut(dst.get(), src.get(), dim);
+  W tensorAmaxOut(dst.get(), src.get(), dim);
 }
 
 inline void amin_out(TensorPtr& dst, const TensorPtr& src, int dim) {
-  getMoodistAPI()->tensorAminOut(dst.get(), src.get(), dim);
+  W tensorAminOut(dst.get(), src.get(), dim);
 }
 
 // =========================================================================
@@ -275,7 +325,9 @@ inline void amin_out(TensorPtr& dst, const TensorPtr& src, int dim) {
 // =========================================================================
 
 inline size_t dtype_size(DType dtype) {
-  return getMoodistAPI()->dtypeSize(dtype);
+  return W dtypeSize(dtype);
 }
+
+#undef W
 
 } // namespace moodist

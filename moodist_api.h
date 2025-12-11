@@ -1,7 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// API struct for moodist - bidirectional interface between libmoodist.so and _C.so
-// Core functions are populated by moodistGetAPI(), wrapper functions by _C after loading.
+// API structs for moodist - bidirectional interface between libmoodist.so and _C.so
+// - WrapperAPI: functions in _C.so that libmoodist.so needs to call (tensor/cuda ops)
+// - CoreAPI: functions in libmoodist.so that _C.so needs to call (store/serialize)
 
 #pragma once
 
@@ -51,46 +52,15 @@ enum class ReduceOp : uint8_t {
   PREMUL_SUM = 8,
 };
 
-// API struct containing all function pointers
-struct MoodistAPI {
-  // Magic value for runtime verification (changes per build)
-  uint64_t magic;
-
-  // =========================================================================
-  // Core functions - populated by libmoodist.so (moodistGetAPI)
-  // =========================================================================
-
-  // Store functions
-  StoreImpl* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
-  void (*storeImplAddRef)(StoreImpl* impl);
-  void (*storeImplDecRef)(StoreImpl* impl);
-  void (*storeImplSet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
-      const std::vector<uint8_t>& value);
-  std::vector<uint8_t> (*storeImplGet)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key);
-  bool (*storeImplCheck)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
-  void (*storeImplWait)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
-
-  // Serialize functions
-  Buffer* (*serializeObjectImpl)(PyObject* o);
-  void* (*serializeBufferPtr)(Buffer* buf);
-  size_t (*serializeBufferSize)(Buffer* buf);
-  void (*serializeBufferAddRef)(Buffer* buf);
-  void (*serializeBufferDecRef)(Buffer* buf);
-  PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
-
-  // =========================================================================
-  // Wrapper functions - populated by _C.so after loading
-  // These wrap PyTorch APIs that core needs to call
-  // =========================================================================
-
+// =============================================================================
+// WrapperAPI - functions implemented in _C.so, called by libmoodist.so
+// These wrap PyTorch APIs that core needs to call
+// =============================================================================
+struct WrapperAPI {
   // CUDA device/stream functions
   int (*cudaCurrentDevice)();
   CUstream (*cudaGetCurrentStream)();
-  // Note: CUDAStreamGuard handled via enter/exit pattern
-  void* (*cudaStreamGuardEnter)(CUstream stream, int device); // Returns opaque guard handle
+  void* (*cudaStreamGuardEnter)(CUstream stream, int device);
   void (*cudaStreamGuardExit)(void* guard);
 
   // Tensor creation - returns opaque Tensor handle
@@ -136,11 +106,42 @@ struct MoodistAPI {
   size_t (*dtypeSize)(DType dtype);
 };
 
+// =============================================================================
+// CoreAPI - functions implemented in libmoodist.so, called by _C.so
+// =============================================================================
+struct CoreAPI {
+  // Magic value for runtime verification (changes per build)
+  uint64_t magic;
+
+  // Store functions
+  StoreImpl* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+  void (*storeImplAddRef)(StoreImpl* impl);
+  void (*storeImplDecRef)(StoreImpl* impl);
+  void (*storeImplSet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+      const std::vector<uint8_t>& value);
+  std::vector<uint8_t> (*storeImplGet)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key);
+  bool (*storeImplCheck)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+  void (*storeImplWait)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+
+  // Serialize functions
+  Buffer* (*serializeObjectImpl)(PyObject* o);
+  void* (*serializeBufferPtr)(Buffer* buf);
+  size_t (*serializeBufferSize)(Buffer* buf);
+  void (*serializeBufferAddRef)(Buffer* buf);
+  void (*serializeBufferDecRef)(Buffer* buf);
+  PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
+};
+
 } // namespace moodist
 
 // C linkage for dlsym
 extern "C" {
-// Returns API struct if version matches, nullptr otherwise
-// Caller should also verify api->magic == kMoodistBuildMagic
-__attribute__((visibility("default"))) moodist::MoodistAPI* moodistGetAPI(uint32_t expectedVersion);
+// Returns CoreAPI struct if version matches, nullptr otherwise
+// Caller passes WrapperAPI which libmoodist copies to its global
+// Caller should verify returned api->magic == kMoodistBuildMagic
+__attribute__((visibility("default"))) moodist::CoreAPI* moodistGetAPI(
+    uint32_t expectedVersion, const moodist::WrapperAPI* wrapperAPI);
 }
