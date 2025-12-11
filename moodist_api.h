@@ -1,8 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// API structs for moodist - bidirectional interface between libmoodist.so and _C.so
-// - WrapperAPI: functions in _C.so that libmoodist.so needs to call (tensor/cuda ops)
-// - CoreAPI: functions in libmoodist.so that _C.so needs to call (store/serialize)
+// Api structs for moodist - bidirectional interface between libmoodist.so and _C.so
+// - WrapperApi: functions in _C.so that libmoodist.so needs to call (tensor/cuda ops)
+// - CoreApi: functions in libmoodist.so that _C.so needs to call (store/serialize)
 
 #pragma once
 
@@ -22,7 +22,8 @@ namespace moodist {
 // Forward declarations (opaque types)
 struct StoreImpl;
 struct Buffer;
-struct Tensor; // Opaque wrapper for torch::Tensor
+struct Tensor;            // Opaque wrapper for torch::Tensor
+struct CudaAllocatorImpl; // CUDA allocator implementation
 
 // DType enum - matches torch::ScalarType values
 enum class DType : int8_t {
@@ -53,10 +54,10 @@ enum class ReduceOp : uint8_t {
 };
 
 // =============================================================================
-// WrapperAPI - functions implemented in _C.so, called by libmoodist.so
+// WrapperApi - functions implemented in _C.so, called by libmoodist.so
 // These wrap PyTorch APIs that core needs to call
 // =============================================================================
-struct WrapperAPI {
+struct WrapperApi {
   // CUDA device/stream functions
   int (*cudaCurrentDevice)();
   CUstream (*cudaGetCurrentStream)();
@@ -107,9 +108,9 @@ struct WrapperAPI {
 };
 
 // =============================================================================
-// CoreAPI - functions implemented in libmoodist.so, called by _C.so
+// CoreApi - functions implemented in libmoodist.so, called by _C.so
 // =============================================================================
-struct CoreAPI {
+struct CoreApi {
   // Magic value for runtime verification (changes per build)
   uint64_t magic;
 
@@ -133,15 +134,32 @@ struct CoreAPI {
   void (*serializeBufferAddRef)(Buffer* buf);
   void (*serializeBufferDecRef)(Buffer* buf);
   PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
+
+  // CPU allocator functions
+  // cpuAllocatorAlloc: allocates bytes, returns ptr and sets *cleanupCtx for deleter
+  // cpuAllocatorFree: deleter function pointer (void(*)(void*)) to pass to DataPtr
+  void* (*cpuAllocatorAlloc)(size_t bytes, void** cleanupCtx);
+  void (*cpuAllocatorFree)(void* cleanupCtx);
+
+  // CUDA allocator functions
+  CudaAllocatorImpl* (*createCudaAllocatorImpl)();
+  void (*setCudaAllocatorImpl)(CudaAllocatorImpl* impl);
+  uintptr_t (*cudaAllocatorImplAllocate)(
+      CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex, void** cleanupCtx);
+  void (*cudaAllocatorImplDeallocate)(
+      CudaAllocatorImpl* impl, uintptr_t ptr, size_t bytes, CUstream* streams, size_t streamCount);
+  void (*cudaAllocatorImplFree)(void* cleanupCtx);
+  bool (*allocatorOwns)(uintptr_t address);
+  std::pair<uintptr_t, size_t> (*allocatorMappedRegion)(uintptr_t address);
 };
 
 } // namespace moodist
 
 // C linkage for dlsym
 extern "C" {
-// Returns CoreAPI struct if version matches, nullptr otherwise
-// Caller passes WrapperAPI which libmoodist copies to its global
+// Returns CoreApi struct if version matches, nullptr otherwise
+// Caller passes WrapperApi which libmoodist copies to its global
 // Caller should verify returned api->magic == kMoodistBuildMagic
-__attribute__((visibility("default"))) moodist::CoreAPI* moodistGetAPI(
-    uint32_t expectedVersion, const moodist::WrapperAPI* wrapperAPI);
+__attribute__((visibility("default"))) moodist::CoreApi* moodistGetApi(
+    uint32_t expectedVersion, const moodist::WrapperApi* wrapperApi);
 }

@@ -3,8 +3,11 @@
 #include "cpu_allocator.h"
 #include "common.h"
 #include "hash_map.h"
-#include "torch_includes.h"
 #include "vector.h"
+
+#ifdef MOODIST_WRAPPER
+#include "torch_includes.h"
+#endif
 
 #include <sys/mman.h>
 #include <type_traits>
@@ -497,6 +500,7 @@ size_t moo_alloc_size(void* p) {
   return std::max(1ul << (64 - r->index), alignof(std::max_align_t));
 }
 
+#ifdef MOODIST_WRAPPER
 struct CpuAllocator : torch::Allocator {
 
   int deviceIndex = -1;
@@ -543,6 +547,7 @@ struct CpuAllocator : torch::Allocator {
 
 std::mutex assignmentMutex;
 CpuAllocator* cpuAllocator = nullptr;
+#endif // MOODIST_WRAPPER
 
 void* moo_alloc2(size_t bytes) {
   std::lock_guard l(globals->mutex);
@@ -553,8 +558,50 @@ void moo_free2(void* ptr) {
   return moo_free(ptr);
 }
 
+// CoreApi function: allocate and register handle, return ptr and cleanup context
+void* cpuAllocatorAllocImpl(size_t bytes, void** cleanupCtx) {
+  if (bytes == 0) {
+    *cleanupCtx = nullptr;
+    return nullptr;
+  }
+  AllocatedCpuBufferSharedPtr handle = AllocatedCpuBufferSharedPtr::make();
+
+  std::lock_guard l(globals->mutex);
+
+  void* ptr = moo_alloc(bytes);
+
+  handle->cpuPointer = ptr;
+  handle->bytes = bytes;
+
+  CHECK(handle.ptr->refcount == 1);
+
+  globals->sharedHandles[(uintptr_t)ptr] = std::move(handle);
+
+  // Create cleanup function that removes from sharedHandles
+  Function<void()> f = [ptr] {
+    std::unique_lock l(globals->mutex);
+    auto i = globals->sharedHandles.find((uintptr_t)ptr);
+    CHECK(i != globals->sharedHandles.end());
+    auto handle = std::move(i->second);
+    globals->sharedHandles.erase(i);
+    l.unlock();
+    // handle destructor calls moo_free via AllocatedCpuBuffer::clear()
+  };
+
+  *cleanupCtx = (void*)f.release();
+  return ptr;
+}
+
+// CoreApi function: deleter for DataPtr - calls cleanup function
+void cpuAllocatorFreeImpl(void* cleanupCtx) {
+  if (cleanupCtx) {
+    Function<void()>(FunctionPointer(cleanupCtx))();
+  }
+}
+
 } // namespace
 
+#ifdef MOODIST_WRAPPER
 void enableCpuAllocator() {
   std::lock_guard l(assignmentMutex);
   if (!cpuAllocator) {
@@ -562,6 +609,7 @@ void enableCpuAllocator() {
   }
   torch::SetAllocator(torch::kCPU, cpuAllocator);
 }
+#endif // MOODIST_WRAPPER
 
 void cpuAllocatorDebug() {
   std::lock_guard l(globals->mutex);
@@ -670,5 +718,14 @@ void derefCpuBuffer(uintptr_t address) {
 }
 
 } // namespace cpu_allocator
+
+// Public CoreApi functions (called via function pointers from _C.so)
+void* cpuAllocatorAlloc(size_t bytes, void** cleanupCtx) {
+  return cpuAllocatorAllocImpl(bytes, cleanupCtx);
+}
+
+void cpuAllocatorFree(void* cleanupCtx) {
+  cpuAllocatorFreeImpl(cleanupCtx);
+}
 
 } // namespace moodist

@@ -1,19 +1,21 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Implementation of moodistGetAPI() - returns CoreAPI, receives WrapperAPI
+// Implementation of moodistGetApi() - returns CoreApi, receives WrapperApi
 
 #include "moodist_api.h"
+#include "allocator_api.h"
+#include "cpu_allocator.h"
 #include "serialize_api.h"
 #include "store_api.h"
 
 namespace moodist {
 
-// Global WrapperAPI - copied from _C.so during initialization
+// Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
-WrapperAPI wrapperAPI = {};
+WrapperApi wrapperApi = {};
 
-// Static CoreAPI - populated with libmoodist.so functions
-static CoreAPI coreAPI = {
+// Static CoreApi - populated with libmoodist.so functions
+static CoreApi coreApi = {
     // Magic for build verification
     .magic = kMoodistBuildMagic,
 
@@ -33,18 +35,31 @@ static CoreAPI coreAPI = {
     .serializeBufferAddRef = serializeBufferAddRef,
     .serializeBufferDecRef = serializeBufferDecRef,
     .deserializeObjectImpl = deserializeObjectImpl,
+
+    // CPU allocator functions
+    .cpuAllocatorAlloc = cpuAllocatorAlloc,
+    .cpuAllocatorFree = cpuAllocatorFree,
+
+    // CUDA allocator functions
+    .createCudaAllocatorImpl = createCudaAllocatorImpl,
+    .setCudaAllocatorImpl = setCudaAllocatorImpl,
+    .cudaAllocatorImplAllocate = cudaAllocatorImplAllocate,
+    .cudaAllocatorImplDeallocate = cudaAllocatorImplDeallocate,
+    .cudaAllocatorImplFree = cudaAllocatorImplFree,
+    .allocatorOwns = allocatorOwns,
+    .allocatorMappedRegion = allocatorMappedRegion,
 };
 
 } // namespace moodist
 
 extern "C" {
-__attribute__((visibility("default"))) moodist::CoreAPI* moodistGetAPI(
-    uint32_t expectedVersion, const moodist::WrapperAPI* wrapper) {
-  if (expectedVersion != moodist::kMoodistAPIVersion) {
+__attribute__((visibility("default"))) moodist::CoreApi* moodistGetApi(
+    uint32_t expectedVersion, const moodist::WrapperApi* wrapper) {
+  if (expectedVersion != moodist::kMoodistApiVersion) {
     return nullptr;
   }
-  // Copy WrapperAPI to our global so libmoodist.so code can use it
-  moodist::wrapperAPI = *wrapper;
-  return &moodist::coreAPI;
+  // Copy WrapperApi to our global so libmoodist.so code can use it
+  moodist::wrapperApi = *wrapper;
+  return &moodist::coreApi;
 }
 }

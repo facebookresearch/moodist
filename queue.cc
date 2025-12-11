@@ -53,10 +53,10 @@ struct QueueWorkImpl {
   void wait() {
     if (cudaDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          wrapperAPI.cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          wrapperApi.cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else if (cudaMappedDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          wrapperAPI.cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          wrapperApi.cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else {
       while (done == 0) {
         futexWait(&done, 0, std::chrono::seconds(1));
@@ -700,7 +700,7 @@ struct QueueImpl {
       };
 
       CHECK_CU(cuLaunchHostFunc(
-          wrapperAPI.cudaGetCurrentStream(),
+          wrapperApi.cudaGetCurrentStream(),
           [](void* ptr) {
             Function<void()>((FunctionPointer)ptr)();
           },

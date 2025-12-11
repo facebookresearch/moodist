@@ -140,9 +140,8 @@ set(rdma_sources
 set(MOODIST_PREBUILT_CORE "" CACHE FILEPATH "Path to pre-built libmoodist.so (skip building core)")
 
 # Core library sources - uses wrapper interfaces, no direct PyTorch
-# MINIMAL BUILD: Just store + dependencies for now
 set(core_sources
-  # Minimal for store:
+  # Store and basic infrastructure:
   store.cc
   socket.cc
   async.cc
@@ -152,28 +151,25 @@ set(core_sources
   serialize_object.cc  # serialization core (no torch dependency)
   moodist_api.cc  # C API struct for _C wrapper
   fmt/src/format.cc
-  # Commented out until store works:
-  # group.cc  # uses torch - needs migration
-  # setup_comms.cc
-  # ipc_mapper.cc
-  # cputhread.cc
-  # ib_common.cc
-  # allgather.cc
-  # kernels.cc
-  # reduce_scatter.cc
-  # reduce_scatter_direct.cc
-  # numa.cc
-  # alltoall.cc
-  # internal_allocator.cc
-  # rdma_ib.cc
-  # tcpdev.cc
-  # rdma_tcp.cc
-  # queue.cc
+  # Group and collectives (torch dependency removed via wrapperAPI):
+  group.cc
+  setup_comms.cc
+  ipc_mapper.cc
+  cputhread.cc
+  ib_common.cc
+  allgather.cc
+  kernels.cc
+  reduce_scatter.cc
+  reduce_scatter_direct.cc
+  alltoall.cc
+  rdma_ib.cc
+  tcpdev.cc
+  rdma_tcp.cc
+  ${rdma_sources}
+  cpu_allocator.cc  # Core allocation logic (torch parts ifdef'd out)
+  allocator.cc  # CUDA allocator core logic (torch parts ifdef'd out)
+  # queue.cc  # needs testing after group.cc works
   # processgroup.cc  # uses torch - needs migration
-  # allocator.cc  # uses torch - needs migration
-  # cpu_allocator.cc  # uses torch - needs migration
-  # serialize_object.cc  # uses torch - needs migration
-  # ${rdma_sources}
 )
 
 if(MOODIST_PREBUILT_CORE)
@@ -186,19 +182,18 @@ if(MOODIST_PREBUILT_CORE)
 else()
   # Build core library from source
   add_library(moodist SHARED ${core_sources})
-  # MINIMAL BUILD: Keep CUDA includes since commondefs.h includes cuda
   target_link_libraries(moodist PRIVATE
     CUDA::cuda_driver
     CUDA::nvml
     CUDA::nvrtc
     Threads::Threads
     anl
-    # kern-abi  # Not needed for store-only (rdma-core)
+    kern-abi  # rdma-core kernel ABI
   )
   target_include_directories(moodist SYSTEM PRIVATE
     fmt/include
-    # rdma-core  # Not needed for store-only
-    # ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include  # Not needed for store-only
+    rdma-core
+    ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
     ${CUDAToolkit_INCLUDE_DIRS}
     ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
     ${Python_INCLUDE_DIRS}  # For serialize_object.cc
@@ -216,6 +211,7 @@ set(wrapper_sources
   store_wrapper.cc
   serialize_wrapper.cc  # torch::Tensor wrapper for serialize/deserialize
   moodist_loader.cc  # dlopen loader for libmoodist.so
+  allocator_wrapper.cc  # CUDA allocator wrapper (CUDAAllocator class)
 )
 
 # Wrapper library - compiled per PyTorch version

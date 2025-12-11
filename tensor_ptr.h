@@ -7,7 +7,7 @@
 //   - Calls wrapper functions directly via wrappers:: namespace
 //
 // In libmoodist.so:
-//   - Calls wrapper functions through the global wrapperAPI struct
+//   - Calls wrapper functions through the global wrapperApi struct
 
 #pragma once
 
@@ -59,9 +59,9 @@ size_t dtypeSize(DType dtype);
 } // namespace wrappers
 #define W wrappers::
 #else
-// In libmoodist.so - call through global WrapperAPI struct
-extern WrapperAPI wrapperAPI;
-#define W wrapperAPI.
+// In libmoodist.so - call through global WrapperApi struct
+extern WrapperApi wrapperApi;
+#define W wrapperApi.
 #endif
 
 // =============================================================================

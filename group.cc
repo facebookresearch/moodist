@@ -65,7 +65,7 @@ void Group::init(Function<void()> f) {
 
   auto start = std::chrono::steady_clock::now();
 
-  deviceIndex = wrapperAPI.cudaCurrentDevice();
+  deviceIndex = wrapperApi.cudaCurrentDevice();
   pid = ::getpid();
 
   cuContext = nullptr;

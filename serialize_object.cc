@@ -653,7 +653,7 @@ template<typename X>
   }
   if (type != &PyTuple_Type) {
     throw std::runtime_error(fmt::sprintf("Moodist.serialize: %s.__reduce__ must return a tuple, but got %s\n",
-        (std::string)py::str((PyObject*)Py_TYPE(obj)), (std::string)py::str(reduce.get_type())));
+        (std::string)py::str((PyObject*)Py_TYPE(obj)), (std::string)py::str(py::type::of(reduce))));
   }
   size_t n = ConstructorTuple::size(reduce.ptr());
   PyObject* func = n < 1 ? nullptr : ConstructorTuple::get(reduce.ptr(), 0);

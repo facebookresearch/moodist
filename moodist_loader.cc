@@ -222,17 +222,17 @@ std::string getLibraryPath() {
 
 } // namespace
 
-// Global CoreAPI object - function pointers copied here after loading
+// Global CoreApi object - function pointers copied here after loading
 // Using an object (not pointer) means each function pointer access is a single memory read
-CoreAPI coreAPI = {};
+CoreApi coreApi = {};
 
-void initMoodistAPI() {
-  if (coreAPI.magic != 0) {
+void initMoodistApi() {
+  if (coreApi.magic != 0) {
     return; // Already initialized
   }
 
-  // Build WrapperAPI with pointers to our wrapper functions
-  WrapperAPI wrapper = {
+  // Build WrapperApi with pointers to our wrapper functions
+  WrapperApi wrapper = {
       .cudaCurrentDevice = wrappers::cudaCurrentDevice,
       .cudaGetCurrentStream = wrappers::cudaGetCurrentStream,
       .cudaStreamGuardEnter = wrappers::cudaStreamGuardEnter,
@@ -272,18 +272,18 @@ void initMoodistAPI() {
     throw std::runtime_error(std::string("Failed to load libmoodist.so: ") + dlerror());
   }
 
-  auto getAPI = reinterpret_cast<CoreAPI* (*)(uint32_t, const WrapperAPI*)>(dlsym(libHandle, "moodistGetAPI"));
-  if (getAPI == nullptr) {
+  auto getApi = reinterpret_cast<CoreApi* (*)(uint32_t, const WrapperApi*)>(dlsym(libHandle, "moodistGetApi"));
+  if (getApi == nullptr) {
     dlclose(libHandle);
     libHandle = nullptr;
-    throw std::runtime_error(std::string("Failed to find moodistGetAPI: ") + dlerror());
+    throw std::runtime_error(std::string("Failed to find moodistGetApi: ") + dlerror());
   }
 
-  CoreAPI* api = getAPI(kMoodistAPIVersion, &wrapper);
+  CoreApi* api = getApi(kMoodistApiVersion, &wrapper);
   if (api == nullptr) {
     dlclose(libHandle);
     libHandle = nullptr;
-    throw std::runtime_error("moodist API version mismatch: _C.so and libmoodist.so are incompatible");
+    throw std::runtime_error("moodist Api version mismatch: _C.so and libmoodist.so are incompatible");
   }
 
   if (api->magic != kMoodistBuildMagic) {
@@ -292,8 +292,8 @@ void initMoodistAPI() {
     throw std::runtime_error("moodist build magic mismatch: _C.so and libmoodist.so are from different builds");
   }
 
-  // Copy the CoreAPI to our global
-  coreAPI = *api;
+  // Copy the CoreApi to our global
+  coreApi = *api;
 }
 
 TensorPtr wrapTensor(torch::Tensor t) {
