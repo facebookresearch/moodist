@@ -24,11 +24,7 @@ public:
 
   StoreImpl* impl = nullptr;
 
-  virtual c10::intrusive_ptr<Store> clone() {
-    // Need to increment refcount - but we don't have addRef in C API
-    // For now, create a new connection (not ideal but works)
-    throw std::runtime_error("TcpStore::clone not implemented");
-  }
+  virtual c10::intrusive_ptr<Store> clone() override;
 
   virtual void set(const std::string& key, const std::vector<uint8_t>& value) override;
   virtual std::vector<uint8_t> get(const std::string& key) override;

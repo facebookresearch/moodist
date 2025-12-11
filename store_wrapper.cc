@@ -13,7 +13,7 @@ TcpStore::TcpStore(StoreImpl* impl) : impl(impl) {
 }
 
 TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
-                   std::chrono::steady_clock::duration timeout) {
+    std::chrono::steady_clock::duration timeout) {
   auto* api = getMoodistAPI();
   impl = api->createStoreImpl(hostname, port, key, worldSize, rank);
   timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
@@ -22,6 +22,14 @@ TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSiz
 TcpStore::~TcpStore() {
   auto* api = getMoodistAPI();
   api->storeImplDecRef(impl);
+}
+
+c10::intrusive_ptr<c10d::Store> TcpStore::clone() {
+  auto* api = getMoodistAPI();
+  api->storeImplAddRef(impl);
+  auto cloned = c10::make_intrusive<TcpStore>(impl);
+  cloned->timeout_ = timeout_;
+  return cloned;
 }
 
 void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {

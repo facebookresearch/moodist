@@ -2149,9 +2149,14 @@ struct Dtor {
 
 // API for StoreImpl - used by _C wrapper via function pointers
 
-StoreImpl* createStoreImpl(std::string_view hostname, int port, std::string_view key,
-                           int worldSize, int rank) {
-  return new StoreImpl(std::string(hostname), port, std::string(key), worldSize, rank);
+StoreImpl* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
+  auto* impl = new StoreImpl(std::string(hostname), port, std::string(key), worldSize, rank);
+  impl->refcount = 1; // Caller owns one reference
+  return impl;
+}
+
+void storeImplAddRef(StoreImpl* impl) {
+  ++impl->refcount;
 }
 
 void storeImplDecRef(StoreImpl* impl) {
@@ -2161,18 +2166,17 @@ void storeImplDecRef(StoreImpl* impl) {
   }
 }
 
-void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                  std::string_view key, const std::vector<uint8_t>& value) {
+void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+    const std::vector<uint8_t>& value) {
   impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeImplGet(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                                   std::string_view key) {
+std::vector<uint8_t> storeImplGet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key) {
   return impl->get(timeout, key);
 }
 
-bool storeImplCheck(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                    std::span<const std::string_view> keys) {
+bool storeImplCheck(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {
@@ -2181,8 +2185,8 @@ bool storeImplCheck(StoreImpl* impl, std::chrono::steady_clock::duration timeout
   return impl->check(timeout, keysVec);
 }
 
-void storeImplWait(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                   std::span<const std::string_view> keys) {
+void storeImplWait(
+    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {

@@ -15,6 +15,7 @@ static MoodistAPI api = {
 
     // Store functions
     .createStoreImpl = createStoreImpl,
+    .storeImplAddRef = storeImplAddRef,
     .storeImplDecRef = storeImplDecRef,
     .storeImplSet = storeImplSet,
     .storeImplGet = storeImplGet,
@@ -33,8 +34,7 @@ static MoodistAPI api = {
 } // namespace moodist
 
 extern "C" {
-__attribute__((visibility("default")))
-moodist::MoodistAPI* moodistGetAPI(uint32_t expectedVersion) {
+__attribute__((visibility("default"))) moodist::MoodistAPI* moodistGetAPI(uint32_t expectedVersion) {
   if (expectedVersion != moodist::kMoodistAPIVersion) {
     return nullptr;
   }

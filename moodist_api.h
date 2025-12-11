@@ -27,17 +27,17 @@ struct MoodistAPI {
   uint64_t magic;
 
   // Store functions
-  StoreImpl* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key,
-                                 int worldSize, int rank);
+  StoreImpl* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+  void (*storeImplAddRef)(StoreImpl* impl);
   void (*storeImplDecRef)(StoreImpl* impl);
-  void (*storeImplSet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                       std::string_view key, const std::vector<uint8_t>& value);
-  std::vector<uint8_t> (*storeImplGet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                                        std::string_view key);
-  bool (*storeImplCheck)(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                         std::span<const std::string_view> keys);
-  void (*storeImplWait)(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
-                        std::span<const std::string_view> keys);
+  void (*storeImplSet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+      const std::vector<uint8_t>& value);
+  std::vector<uint8_t> (*storeImplGet)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key);
+  bool (*storeImplCheck)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+  void (*storeImplWait)(
+      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions
   Buffer* (*serializeObjectImpl)(PyObject* o);
@@ -54,6 +54,5 @@ struct MoodistAPI {
 extern "C" {
 // Returns API struct if version matches, nullptr otherwise
 // Caller should also verify api->magic == kMoodistBuildMagic
-__attribute__((visibility("default")))
-moodist::MoodistAPI* moodistGetAPI(uint32_t expectedVersion);
+__attribute__((visibility("default"))) moodist::MoodistAPI* moodistGetAPI(uint32_t expectedVersion);
 }
