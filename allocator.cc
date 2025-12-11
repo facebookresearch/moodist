@@ -373,9 +373,22 @@ struct PointerHash {
 struct CudaAllocatorImpl {
   CudaAllocatorImpl() {}
 
-  // PoolAllocator<MemoryEvent> memoryEventAllocator;
-  // Vector<MemoryEvent*> memoryEventFreelist;
+  // Mutex for all allocator operations
+  SpinMutex mutex;
 
+  // CUDA context - initialized on first allocation
+  CUcontext cuContext = nullptr;
+  CUdevice cuDevice = 0;
+  int deviceIndex = -1;
+
+  // Stream tracking for recordStream (ptr -> list of streams that have used it)
+  HashMap<uintptr_t, std::unique_ptr<Vector<CUstream>>, PointerHash> streamUses;
+  Vector<std::unique_ptr<Vector<CUstream>>> streamListFree;
+
+  // Free callbacks (ptr -> linked list of callbacks)
+  HashMap<uintptr_t, FunctionPointer, PointerHash> freeCallbacks;
+
+  // Memory region tracking
   SpinMutex mappedRegionsMutex;
 
   Vector<Span> mappedRegions;
@@ -392,8 +405,6 @@ struct CudaAllocatorImpl {
   std::atomic_size_t reservedSize = 0;
   std::atomic_uintptr_t reservedBase = 0;
   size_t nextMapBase = 0;
-
-  int deviceIndex = -1;
 
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
 
@@ -1075,11 +1086,13 @@ struct CudaAllocatorImpl {
   // }
 };
 
-// CudaAllocatorImpl& cudaAllocImpl = *new CudaAllocatorImpl();
-
-// void deleter_func(void* ptr) {
-//   cudaAllocImpl.deallocate((uintptr_t)ptr);
-// }
+// Cleanup context structure - stored per allocation
+struct CudaAllocCleanupCtx {
+  CudaAllocatorImpl* impl;
+  uintptr_t ptr;
+  size_t bytes;
+  CUstream allocStream; // Stream used for allocation
+};
 
 // Global allocator impl pointer for allocator::owns/mappedRegion
 CudaAllocatorImpl* globalCudaAllocatorImpl = nullptr;
@@ -1093,37 +1106,153 @@ void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
   globalCudaAllocatorImpl = impl;
 }
 
-uintptr_t cudaAllocatorImplAllocate(
-    CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex, void** cleanupCtx) {
-  // Wrapper provides cleanup via lambda - for now just return the ptr
-  // The actual cleanup context is handled by the wrapper's CUDAAllocator
-  if (cleanupCtx) {
-    *cleanupCtx = nullptr;
+CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
+  std::lock_guard l(impl->mutex);
+
+  // Initialize CUDA context on first allocation
+  if (impl->deviceIndex == -1) {
+    if (deviceIndex == -1) {
+      // Auto-detect from current context
+      CUdevice dev;
+      CHECK_CU(cuCtxGetDevice(&dev));
+      int devIndex;
+      CHECK_CU(cuDeviceGet(&devIndex, dev));
+      deviceIndex = devIndex;
+    }
+    impl->deviceIndex = deviceIndex;
+
+    cuCtxGetCurrent(&impl->cuContext);
+    if (!impl->cuContext) {
+      CHECK_CU(cuInit(0));
+      CHECK_CU(cuDeviceGet(&impl->cuDevice, deviceIndex));
+      CHECK_CU(cuDevicePrimaryCtxRetain(&impl->cuContext, impl->cuDevice));
+      CHECK_CU(cuCtxSetCurrent(impl->cuContext));
+    } else {
+      CHECK_CU(cuDeviceGet(&impl->cuDevice, deviceIndex));
+    }
+  } else {
+    // Verify we're still on the same device
+    if (deviceIndex != -1 && deviceIndex != impl->deviceIndex) {
+      throw std::runtime_error("Moodist CUDA Allocator can only be used on one device. It was initialized on device " +
+                               std::to_string(impl->deviceIndex) + ", but the requested allocation is on device " +
+                               std::to_string(deviceIndex) + ". This is not supported.");
+    }
+    // Ensure context is set
+    CUcontext currentContext = nullptr;
+    cuCtxGetCurrent(&currentContext);
+    if (!currentContext) {
+      CHECK_CU(cuCtxSetCurrent(impl->cuContext));
+    } else if (currentContext != impl->cuContext) {
+      throw std::runtime_error("Moodist CUDA Allocator CUDA context changed. The Moodist CUDA "
+                               "Allocator can only be used on one CUDA context.");
+    }
   }
-  return impl->allocate(bytes, stream, deviceIndex);
+
+  // Align allocation
+  constexpr size_t alignment = 0x100;
+  size_t alignedBytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
+
+  // Allocate
+  uintptr_t ptr = impl->allocate(alignedBytes, stream, impl->deviceIndex);
+
+  // Create cleanup context
+  auto* ctx = new CudaAllocCleanupCtx{impl, ptr, alignedBytes, stream};
+
+  return CudaAllocation{ptr, ctx, impl->deviceIndex};
 }
 
-void cudaAllocatorImplFree(void* cleanupCtx) {
-  // Cleanup is handled by wrapper's lambda - this is called with wrapper's context
-  if (cleanupCtx) {
-    Function<void()>(FunctionPointer(cleanupCtx))();
+void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
+  if (!cleanupCtx) {
+    return;
   }
+
+  auto* ctx = static_cast<CudaAllocCleanupCtx*>(cleanupCtx);
+  CudaAllocatorImpl* impl = ctx->impl;
+
+  std::lock_guard l(impl->mutex);
+
+  // Invoke any registered free callbacks for this address
+  auto cbIt = impl->freeCallbacks.find(ctx->ptr);
+  if (cbIt != impl->freeCallbacks.end()) {
+    FunctionPointer head = cbIt->second;
+    while (head) {
+      FunctionPointer next = head->next;
+      Function<void()>{head}();
+      head = next;
+    }
+    impl->freeCallbacks.erase(cbIt);
+  }
+
+  // Collect streams for deallocation
+  auto it = impl->streamUses.find(ctx->ptr);
+  if (it != impl->streamUses.end()) {
+    auto& list = it->second;
+    // Add the free stream to the list
+    list->insert(list->begin(), freeStream);
+    impl->deallocate<false>(ctx->ptr, ctx->bytes, *list);
+    list->clear();
+    impl->streamListFree.push_back(std::move(list));
+    impl->streamUses.erase(it);
+  } else {
+    // No recorded streams, just use the free stream
+    CUstream streams[1] = {freeStream};
+    struct StreamArrayView {
+      CUstream* data;
+      size_t count;
+      CUstream* begin() const {
+        return data;
+      }
+      CUstream* end() const {
+        return data + count;
+      }
+    };
+    impl->deallocate<false>(ctx->ptr, ctx->bytes, StreamArrayView{streams, 1});
+  }
+
+  delete ctx;
 }
 
-void cudaAllocatorImplDeallocate(
-    CudaAllocatorImpl* impl, uintptr_t ptr, size_t bytes, CUstream* streams, size_t streamCount) {
-  // Wrap the raw array in a span-like view for the template
-  struct StreamArrayView {
-    CUstream* data;
-    size_t count;
-    CUstream* begin() const {
-      return data;
+void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstream stream) {
+  std::lock_guard l(impl->mutex);
+
+  auto& list = impl->streamUses[ptr];
+  if (!list) {
+    if (!impl->streamListFree.empty()) {
+      list = std::move(impl->streamListFree.back());
+      impl->streamListFree.pop_back();
+    } else {
+      list = std::make_unique<Vector<CUstream>>();
     }
-    CUstream* end() const {
-      return data + count;
+  }
+  list->push_back(stream);
+}
+
+int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl) {
+  return impl->deviceIndex;
+}
+
+void* allocatorAddFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* callbackFn) {
+  std::lock_guard l(impl->mutex);
+  FunctionPointer fp = static_cast<FunctionPointer>(callbackFn);
+  auto& head = impl->freeCallbacks[baseAddress];
+  fp->next = head;
+  head = fp;
+  return fp;
+}
+
+void allocatorRemoveFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle) {
+  std::lock_guard l(impl->mutex);
+  auto** head = &impl->freeCallbacks[baseAddress];
+  while (*head) {
+    if (*head == handle) {
+      FunctionPointer f = *head;
+      *head = (*head)->next;
+      Function<void()>{f}; // Destroy without calling
+      return;
     }
-  };
-  impl->deallocate<false>(ptr, bytes, StreamArrayView{streams, streamCount});
+    head = &(*head)->next;
+  }
+  throw std::runtime_error("allocatorRemoveFreeCallback: no such handle");
 }
 
 bool allocatorOwns(uintptr_t address) {
@@ -1150,6 +1279,23 @@ std::pair<uintptr_t, size_t> allocatorMappedRegion(uintptr_t address) {
     }
   }
   return {0, 0};
+}
+
+// C-style API wrappers for CoreApi function pointers
+// These use out params to avoid ABI issues with returning structs
+
+void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
+    uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex) {
+  CudaAllocation alloc = cudaAllocatorImplAllocate(impl, bytes, stream, deviceIndex);
+  *outPtr = alloc.ptr;
+  *outCleanupCtx = alloc.cleanupCtx;
+  *outDeviceIndex = alloc.deviceIndex;
+}
+
+void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize) {
+  auto result = allocatorMappedRegion(address);
+  *outBase = result.first;
+  *outSize = result.second;
 }
 
 // allocator namespace functions that are in core

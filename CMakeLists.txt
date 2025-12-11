@@ -212,6 +212,7 @@ set(wrapper_sources
   serialize_wrapper.cc  # torch::Tensor wrapper for serialize/deserialize
   moodist_loader.cc  # dlopen loader for libmoodist.so
   allocator_wrapper.cc  # CUDA allocator wrapper (CUDAAllocator class)
+  cpu_allocator_wrapper.cc  # CPU allocator wrapper (CpuAllocator class)
 )
 
 # Wrapper library - compiled per PyTorch version

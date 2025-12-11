@@ -5,10 +5,6 @@
 #include "hash_map.h"
 #include "vector.h"
 
-#ifdef MOODIST_WRAPPER
-#include "torch_includes.h"
-#endif
-
 #include <sys/mman.h>
 #include <type_traits>
 
@@ -500,55 +496,6 @@ size_t moo_alloc_size(void* p) {
   return std::max(1ul << (64 - r->index), alignof(std::max_align_t));
 }
 
-#ifdef MOODIST_WRAPPER
-struct CpuAllocator : torch::Allocator {
-
-  int deviceIndex = -1;
-
-  virtual torch::DataPtr allocate(size_t bytes) override {
-    if (bytes == 0) {
-      return torch::DataPtr(nullptr, nullptr, nullptr, torch::Device(torch::kCPU));
-    }
-    AllocatedCpuBufferSharedPtr handle = AllocatedCpuBufferSharedPtr::make();
-
-    std::lock_guard l(globals->mutex);
-
-    void* ptr = moo_alloc(bytes);
-
-    handle->cpuPointer = ptr;
-    handle->bytes = bytes;
-
-    CHECK(handle.ptr->refcount == 1);
-
-    globals->sharedHandles[(uintptr_t)ptr] = std::move(handle);
-
-    Function<void()> f = [this, ptr] {
-      std::unique_lock l(globals->mutex);
-      auto i = globals->sharedHandles.find((uintptr_t)ptr);
-      CHECK(i != globals->sharedHandles.end());
-      auto handle = std::move(i->second);
-      globals->sharedHandles.erase(i);
-      l.unlock();
-    };
-
-    auto deleter = [](void* c) {
-      Function<void()>(FunctionPointer(c))();
-    };
-    torch::Device device(torch::kCPU);
-    return torch::DataPtr((void*)ptr, (void*)f.release(), deleter, device);
-  }
-  virtual torch::DeleterFnPtr raw_deleter() const override {
-    return nullptr;
-  }
-  virtual void copy_data(void* dest, const void* src, std::size_t count) const override {
-    throw std::runtime_error("moodist CpuAllocator::copy_data: not implemented");
-  }
-};
-
-std::mutex assignmentMutex;
-CpuAllocator* cpuAllocator = nullptr;
-#endif // MOODIST_WRAPPER
-
 void* moo_alloc2(size_t bytes) {
   std::lock_guard l(globals->mutex);
   return moo_alloc(bytes);
@@ -600,16 +547,6 @@ void cpuAllocatorFreeImpl(void* cleanupCtx) {
 }
 
 } // namespace
-
-#ifdef MOODIST_WRAPPER
-void enableCpuAllocator() {
-  std::lock_guard l(assignmentMutex);
-  if (!cpuAllocator) {
-    cpuAllocator = new CpuAllocator();
-  }
-  torch::SetAllocator(torch::kCPU, cpuAllocator);
-}
-#endif // MOODIST_WRAPPER
 
 void cpuAllocatorDebug() {
   std::lock_guard l(globals->mutex);

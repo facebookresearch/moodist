@@ -10,6 +10,11 @@
 
 namespace moodist {
 
+// Forward declarations for C-style API wrappers defined in allocator.cc
+void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
+    uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex);
+void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize);
+
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
 WrapperApi wrapperApi = {};
@@ -43,11 +48,14 @@ static CoreApi coreApi = {
     // CUDA allocator functions
     .createCudaAllocatorImpl = createCudaAllocatorImpl,
     .setCudaAllocatorImpl = setCudaAllocatorImpl,
-    .cudaAllocatorImplAllocate = cudaAllocatorImplAllocate,
-    .cudaAllocatorImplDeallocate = cudaAllocatorImplDeallocate,
+    .cudaAllocatorImplAllocate = cudaAllocatorImplAllocateApi,
     .cudaAllocatorImplFree = cudaAllocatorImplFree,
+    .cudaAllocatorImplRecordStream = cudaAllocatorImplRecordStream,
+    .cudaAllocatorImplGetDevice = cudaAllocatorImplGetDevice,
     .allocatorOwns = allocatorOwns,
-    .allocatorMappedRegion = allocatorMappedRegion,
+    .allocatorMappedRegion = allocatorMappedRegionApi,
+    .allocatorAddFreeCallback = allocatorAddFreeCallback,
+    .allocatorRemoveFreeCallback = allocatorRemoveFreeCallback,
 };
 
 } // namespace moodist

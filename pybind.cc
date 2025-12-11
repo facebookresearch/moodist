@@ -8,6 +8,8 @@
 #include <torch/csrc/utils/pybind.h>
 
 // MINIMAL BUILD: Only store + serialize for now
+#include "allocator.h"
+#include "cpu_allocator.h"
 #include "moodist_loader.h"
 #include "store.h"
 
@@ -26,8 +28,6 @@ torch::Tensor serializeObject(py::object o);
 py::object deserializeObject(torch::Tensor t);
 
 // Commented out - defined in other files:
-// void enableCudaAllocator();
-// void enableCpuAllocator();
 // void cpuAllocatorDebug();
 // void setPreferKernelLess(bool);
 
@@ -53,6 +53,9 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("serialize", &moodist::serializeObject);
   m.def("deserialize", &moodist::deserializeObject);
+
+  m.def("enable_cuda_allocator", &moodist::enableCudaAllocator);
+  m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
 
   // Commented out until we add more components:
   /*

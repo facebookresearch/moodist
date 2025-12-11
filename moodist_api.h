@@ -144,13 +144,15 @@ struct CoreApi {
   // CUDA allocator functions
   CudaAllocatorImpl* (*createCudaAllocatorImpl)();
   void (*setCudaAllocatorImpl)(CudaAllocatorImpl* impl);
-  uintptr_t (*cudaAllocatorImplAllocate)(
-      CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex, void** cleanupCtx);
-  void (*cudaAllocatorImplDeallocate)(
-      CudaAllocatorImpl* impl, uintptr_t ptr, size_t bytes, CUstream* streams, size_t streamCount);
-  void (*cudaAllocatorImplFree)(void* cleanupCtx);
+  void (*cudaAllocatorImplAllocate)(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
+      uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex);
+  void (*cudaAllocatorImplFree)(void* cleanupCtx, CUstream stream);
+  void (*cudaAllocatorImplRecordStream)(CudaAllocatorImpl* impl, uintptr_t ptr, CUstream stream);
+  int (*cudaAllocatorImplGetDevice)(CudaAllocatorImpl* impl);
   bool (*allocatorOwns)(uintptr_t address);
-  std::pair<uintptr_t, size_t> (*allocatorMappedRegion)(uintptr_t address);
+  void (*allocatorMappedRegion)(uintptr_t address, uintptr_t* outBase, size_t* outSize);
+  void* (*allocatorAddFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* callbackFn);
+  void (*allocatorRemoveFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle);
 };
 
 } // namespace moodist
