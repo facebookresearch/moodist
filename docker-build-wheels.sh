@@ -11,9 +11,9 @@ dnf install -y cuda-toolkit-12
 
 versions="cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
 
-torch_versions="2.7 2.8"
+torch_versions="2.7 2.8 2.9"
 
-pre_torch_versions="2.9"
+pre_torch_versions=""
 
 moodist_version=$(cat version.txt)
 

@@ -8,11 +8,13 @@
 
 namespace moodist {
 
-// Static API struct - populated once, returned by moodistGetAPI
+// Static API struct - core functions populated here, wrapper functions set to nullptr
+// (wrapper fills them in after loading via getMoodistAPI())
 static MoodistAPI api = {
     // Magic for build verification
     .magic = kMoodistBuildMagic,
 
+    // ===== Core functions =====
     // Store functions
     .createStoreImpl = createStoreImpl,
     .storeImplAddRef = storeImplAddRef,
@@ -29,6 +31,28 @@ static MoodistAPI api = {
     .serializeBufferAddRef = serializeBufferAddRef,
     .serializeBufferDecRef = serializeBufferDecRef,
     .deserializeObjectImpl = deserializeObjectImpl,
+
+    // ===== Wrapper functions (set to nullptr, filled by _C.so) =====
+    .cudaCurrentDevice = nullptr,
+    .cudaGetCurrentStream = nullptr,
+    .cudaStreamGuardEnter = nullptr,
+    .cudaStreamGuardExit = nullptr,
+    .tensorFromBlob = nullptr,
+    .tensorEmpty = nullptr,
+    .tensorAddRef = nullptr,
+    .tensorDecRef = nullptr,
+    .tensorDataPtr = nullptr,
+    .tensorNumel = nullptr,
+    .tensorNdim = nullptr,
+    .tensorSize = nullptr,
+    .tensorStride = nullptr,
+    .tensorDtype = nullptr,
+    .tensorDevice = nullptr,
+    .tensorIsContiguous = nullptr,
+    .tensorSumOut = nullptr,
+    .tensorAmaxOut = nullptr,
+    .tensorAminOut = nullptr,
+    .dtypeSize = nullptr,
 };
 
 } // namespace moodist
