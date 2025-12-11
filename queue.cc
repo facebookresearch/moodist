@@ -6,14 +6,28 @@
 #include "cuda_copy.h"
 #include "hash_map.h"
 #include "intrusive_list.h"
+#include "moodist_loader.h"
 #include "queue_internal.h"
 #include "simple_vector.h"
 #include "synchronization.h"
-#include "torch_wrappers.h"
 
 #include <mutex>
 
 namespace moodist {
+
+namespace {
+
+// Helper to convert TensorDataPtr to TensorPtr
+TensorPtr tensorFromTensorData(TensorDataPtr data) {
+  if (!data) {
+    return TensorPtr();
+  }
+  int device = data->isCuda ? 0 : -1; // TODO: track actual device
+  return TensorPtr::from_blob(
+      (void*)data->dataPtr, std::span<const int64_t>(data->shape), static_cast<DType>(data->dtype), device);
+}
+
+} // namespace
 
 struct WorkCudaDone {
   uintptr_t address = 0;
@@ -37,12 +51,13 @@ struct QueueWorkImpl {
   uint32_t transactionKey = 0;
   ~QueueWorkImpl() {}
   void wait() {
+    auto* api = getMoodistAPI();
     if (cudaDone != nullptr) {
-      CHECK_CU(
-          cuStreamWaitValue32(cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+      CHECK_CU(cuStreamWaitValue32(
+          api->cudaGetCurrentStream(), cudaDone->address, cudaDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else if (cudaMappedDone != nullptr) {
       CHECK_CU(cuStreamWaitValue32(
-          cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
+          api->cudaGetCurrentStream(), cudaMappedDone->address, cudaMappedDone->value, CU_STREAM_WAIT_VALUE_GEQ));
     } else {
       while (done == 0) {
         futexWait(&done, 0, std::chrono::seconds(1));
@@ -464,7 +479,7 @@ struct QueueImpl {
     qs->multicastRemoteAddresses = multicastRemoteAddresses;
   }
 
-  std::pair<std::optional<TensorWrapper>, size_t> get(bool block, std::optional<float> timeout) {
+  std::pair<TensorPtr, size_t> get(bool block, std::optional<float> timeout) {
     // fixme: this needs to be refactored such that -
     //        local get is fairly queued alongside remote gets
     //        multi-threaded gets (local & remote) on the same object are also fairly queued
@@ -513,9 +528,9 @@ struct QueueImpl {
       CHECK(result.queueSize != -1);
 
       if (result.data != nullptr) {
-        return {tensorFromData(std::move(result.data)), result.queueSize};
+        return {tensorFromTensorData(std::move(result.data)), result.queueSize};
       }
-      return {std::nullopt, result.queueSize};
+      return {TensorPtr(), result.queueSize};
     }
 
     if (isMulticast && !isMulticastLocal) {
@@ -533,7 +548,7 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {tensorFromData(std::move(r)), queueSize};
+        return {tensorFromTensorData(std::move(r)), queueSize};
       }
     }
 
@@ -546,15 +561,15 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {tensorFromData(std::move(r)), 0};
+        return {tensorFromTensorData(std::move(r)), 0};
       }
       if (timeouthelper.expired()) {
-        return {std::nullopt, 0};
+        return {TensorPtr(), 0};
       }
     }
   }
 
-  QueueWork put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy = true) {
+  QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true) {
     // CHECK(location != group->rank);
     // CHECK(qs == nullptr);
 
@@ -565,10 +580,11 @@ struct QueueImpl {
     TensorDataPtr td = TensorDataPtr::make();
 
     td->dtype = static_cast<int>(value.dtype());
-    auto shape = value.sizes();
-    td->shape.resize(shape.size());
-    for (size_t i = 0; i != td->shape.size(); ++i) {
-      td->shape[i] = shape[i];
+    td->itemsize_ = value.itemsize();
+    int ndim = value.ndimension();
+    td->shape.resize(ndim);
+    for (int i = 0; i != ndim; ++i) {
+      td->shape[i] = value.size(i);
     }
 
     int location = this->location;
@@ -581,7 +597,7 @@ struct QueueImpl {
 
     QueueWork r;
 
-    uintptr_t tensorAddress = (uintptr_t)(const void*)value.data_ptr();
+    uintptr_t tensorAddress = (uintptr_t)value.data_ptr();
 
     td->dataPtr = tensorAddress;
     td->dataBytes = td->itemsize() * td->numel();
@@ -592,7 +608,8 @@ struct QueueImpl {
 
     if (value.is_cpu()) {
       if (cpu_allocator::owns(tensorAddress)) {
-        auto handle = cpu_allocator::getCpuBuffer((uintptr_t)value.storage_data());
+        // For contiguous tensors, data_ptr() == storage base
+        auto handle = cpu_allocator::getCpuBuffer(tensorAddress);
         CHECK(handle != nullptr);
         td->buffer = std::move(handle);
       } else {
@@ -637,7 +654,7 @@ struct QueueImpl {
         td->buffer = AllocatedCpuBufferSharedPtr::make();
         *td->buffer = group->allocateCpu(td->dataBytes);
         td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
-        cudaCopy(td->data(), tensorAddress, td->bytes(), cudaGetCurrentStream());
+        cudaCopy(td->data(), tensorAddress, td->bytes(), api->cudaGetCurrentStream());
 
         work->cudaMappedDone = WorkCudaMappedDonePtr::make();
         if (!work->cudaMappedDone->address) {
@@ -684,14 +701,15 @@ struct QueueImpl {
       };
 
       CHECK_CU(cuLaunchHostFunc(
-          cudaGetCurrentStream(),
+          getMoodistAPI()->cudaGetCurrentStream(),
           [](void* ptr) {
             Function<void()>((FunctionPointer)ptr)();
           },
           f.release()));
     }
 
-    r.storage = storageFromTensor(value);
+    // Move tensor into QueueWork to keep it alive during async operation
+    r.tensor = std::move(value);
     r.waitOnDestroy = waitOnDestroy;
     r.impl = std::move(work);
     return r;
@@ -768,17 +786,18 @@ void QueueWork::wait() {
     return;
   }
   impl->wait();
-  storage.reset(); // release the storage
+  // Release the tensor (TensorPtr destructor handles refcount)
+  tensor.reset();
 }
 
 Queue::~Queue() {
   delete (QueueImpl*)impl;
 }
 
-std::pair<std::optional<TensorWrapper>, size_t> Queue::get(bool block, std::optional<float> timeout) {
+std::pair<TensorPtr, size_t> Queue::get(bool block, std::optional<float> timeout) {
   return ((QueueImpl*)impl)->get(block, timeout);
 }
-QueueWork Queue::put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy) {
+QueueWork Queue::put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy) {
   return ((QueueImpl*)impl)->put(std::move(value), transactionKey, waitOnDestroy);
 }
 size_t Queue::qsize() const {

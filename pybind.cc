@@ -8,6 +8,7 @@
 #include <torch/csrc/utils/pybind.h>
 
 // MINIMAL BUILD: Only store + serialize for now
+#include "moodist_loader.h"
 #include "store.h"
 
 // Commented out until we add more components:
@@ -15,6 +16,7 @@
 // #include "common.h"
 // #include "cuda_copy.h"
 // #include "processgroup.h"
+// #include "queue.h"
 
 namespace moodist {
 bool profilingEnabled = false;
@@ -28,8 +30,6 @@ py::object deserializeObject(torch::Tensor t);
 // void enableCpuAllocator();
 // void cpuAllocatorDebug();
 // void setPreferKernelLess(bool);
-// TensorWrapper wrapTensor(torch::Tensor t);
-// torch::Tensor unwrapTensor(TensorWrapper& w);
 
 } // namespace moodist
 
@@ -111,10 +111,10 @@ PYBIND11_MODULE(_C, m) {
       .def(
           "get",
           [](moodist::Queue& q, bool block, std::optional<float> timeout) {
-            auto [tw, size] = q.get(block, timeout);
+            auto [t, size] = q.get(block, timeout);
             std::optional<torch::Tensor> result;
-            if (tw) {
-              result = moodist::unwrapTensor(*tw);
+            if (t) {
+              result = moodist::unwrapTensor(t);
             }
             return std::make_pair(result, size);
           },

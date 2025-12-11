@@ -3,7 +3,7 @@
 #pragma once
 
 #include "commondefs.h"
-#include "tensor_wrapper.h"
+#include "tensor_ptr.h"
 
 #include <memory>
 #include <optional>
@@ -16,12 +16,13 @@ struct QueueWorkImpl;
 
 struct QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
-  StorageWrapper storage; // keeps tensor storage alive during async put (safer than TensorWrapper)
+  TensorPtr tensor; // keeps tensor alive during async put (RAII handles refcount)
   bool waitOnDestroy = true;
   MOODIST_API QueueWork();
   MOODIST_API ~QueueWork();
   QueueWork(const QueueWork&) = delete;
   QueueWork(QueueWork&&) = default;
+  QueueWork& operator=(QueueWork&&) = default;
   MOODIST_API void wait();
 };
 
@@ -32,8 +33,10 @@ struct Queue {
   Queue(Queue&) = delete;
   Queue& operator=(Queue) = delete;
   MOODIST_API ~Queue();
-  MOODIST_API std::pair<std::optional<TensorWrapper>, size_t> get(bool block = true, std::optional<float> timeout = {});
-  MOODIST_API QueueWork put(TensorWrapper value, uint32_t transactionKey, bool waitOnDestroy = true);
+  // Returns (tensor, queue_size). Returns empty TensorPtr if no data.
+  MOODIST_API std::pair<TensorPtr, size_t> get(bool block = true, std::optional<float> timeout = {});
+  // Takes a copy of the TensorPtr (refcount handled automatically).
+  MOODIST_API QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true);
   MOODIST_API size_t qsize() const;
   MOODIST_API bool wait(std::optional<float> timeout) const;
 

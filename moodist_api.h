@@ -21,7 +21,7 @@ namespace moodist {
 // Forward declarations (opaque types)
 struct StoreImpl;
 struct Buffer;
-struct Tensor;  // Opaque wrapper for torch::Tensor
+struct Tensor; // Opaque wrapper for torch::Tensor
 
 // DType enum - matches torch::ScalarType values
 enum class DType : int8_t {
@@ -90,7 +90,7 @@ struct MoodistAPI {
   int (*cudaCurrentDevice)();
   CUstream (*cudaGetCurrentStream)();
   // Note: CUDAStreamGuard handled via enter/exit pattern
-  void* (*cudaStreamGuardEnter)(CUstream stream, int device);  // Returns opaque guard handle
+  void* (*cudaStreamGuardEnter)(CUstream stream, int device); // Returns opaque guard handle
   void (*cudaStreamGuardExit)(void* guard);
 
   // Tensor creation - returns opaque Tensor handle
@@ -110,8 +110,24 @@ struct MoodistAPI {
   DType (*tensorDtype)(Tensor* t);
   int (*tensorDevice)(Tensor* t);
   bool (*tensorIsContiguous)(Tensor* t);
+  bool (*tensorIsCuda)(Tensor* t);
+  bool (*tensorIsCpu)(Tensor* t);
+  int64_t (*tensorItemsize)(Tensor* t);
 
-  // Tensor operations
+  // Tensor view operations - return new Tensor handle (caller must decref)
+  Tensor* (*tensorView)(Tensor* t, const int64_t* sizes, int ndim);
+  Tensor* (*tensorNarrow)(Tensor* t, int dim, int64_t start, int64_t length);
+  Tensor* (*tensorContiguous)(Tensor* t);
+
+  // Tensor arithmetic - return new Tensor handle (caller must decref)
+  Tensor* (*tensorMulScalar)(Tensor* t, double scalar);
+
+  // Tensor in-place operations
+  void (*tensorMulScalar_)(Tensor* t, double scalar);
+  void (*tensorRecordStream)(Tensor* t, CUstream stream);
+  void (*tensorCopy_)(Tensor* dst, Tensor* src);
+
+  // Tensor reduction operations
   void (*tensorSumOut)(Tensor* dst, Tensor* src, int dim);
   void (*tensorAmaxOut)(Tensor* dst, Tensor* src, int dim);
   void (*tensorAminOut)(Tensor* dst, Tensor* src, int dim);

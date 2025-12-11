@@ -3,7 +3,6 @@
 #pragma once
 
 #include "common.h"
-#include "tensor_wrapper.h"
 
 namespace moodist {
 
@@ -11,13 +10,15 @@ struct TensorData {
   AllocatedCpuBufferSharedPtr buffer;
   uintptr_t dataPtr;
   size_t dataBytes;
-  int dtype;
+  int dtype;        // Stores torch::ScalarType value (matches moodist::DType in moodist_api.h)
+  size_t itemsize_; // Element size in bytes (stored to avoid dependency on API)
   std::vector<int64_t> shape;
   bool isCuda;
 
   void clear() {
     buffer = {};
     dtype = -1;
+    itemsize_ = 0;
     shape.clear();
     dataPtr = 0;
     dataBytes = 0;
@@ -31,7 +32,7 @@ struct TensorData {
     return dataBytes;
   }
   size_t itemsize() {
-    return dtypeItemsize(static_cast<DType>(dtype));
+    return itemsize_;
   }
   size_t numel() {
     size_t r = 1;
