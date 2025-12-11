@@ -85,6 +85,18 @@ find_package(Threads REQUIRED)
 
 add_subdirectory(pybind11)
 
+# Generate build magic for API version checking
+# Random value generated at configure time - pass -DMOODIST_BUILD_MAGIC=0x... to override
+set(MOODIST_BUILD_MAGIC "" CACHE STRING "Build magic for API verification (auto-generated if empty)")
+if(NOT MOODIST_BUILD_MAGIC)
+  string(RANDOM LENGTH 16 ALPHABET "0123456789abcdef" RANDOM_HEX)
+  set(MOODIST_BUILD_MAGIC "0x${RANDOM_HEX}ULL" CACHE STRING "" FORCE)
+endif()
+message(STATUS "Build magic: ${MOODIST_BUILD_MAGIC}")
+
+# Pass build magic to both libraries
+add_compile_definitions(MOODIST_BUILD_MAGIC=${MOODIST_BUILD_MAGIC})
+
 set(ENABLE_STATIC ON CACHE BOOL "")
 set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
 set(NO_PYVERBS ON CACHE BOOL "")
@@ -124,6 +136,9 @@ set(rdma_sources
   ${efa_sources}
 )
 
+# Option to use pre-built core library (for multi-PyTorch version builds)
+set(MOODIST_PREBUILT_CORE "" CACHE FILEPATH "Path to pre-built libmoodist.so (skip building core)")
+
 # Core library sources - uses wrapper interfaces, no direct PyTorch
 # MINIMAL BUILD: Just store + dependencies for now
 set(core_sources
@@ -135,6 +150,7 @@ set(core_sources
   internal_allocator.cc  # needed by Global template in common.h
   numa.cc  # needed by internal_allocator.cc
   serialize_object.cc  # serialization core (no torch dependency)
+  moodist_api.cc  # C API struct for _C wrapper
   fmt/src/format.cc
   # Commented out until store works:
   # group.cc  # uses torch - needs migration
@@ -160,28 +176,37 @@ set(core_sources
   # ${rdma_sources}
 )
 
-# Core library - compiled once, shared across PyTorch versions
-add_library(moodist SHARED ${core_sources})
-# MINIMAL BUILD: Keep CUDA includes since commondefs.h includes cuda
-target_link_libraries(moodist PRIVATE
-  CUDA::cuda_driver
-  CUDA::nvml
-  CUDA::nvrtc
-  Threads::Threads
-  anl
-  # kern-abi  # Not needed for store-only (rdma-core)
-)
-target_include_directories(moodist SYSTEM PRIVATE
-  fmt/include
-  # rdma-core  # Not needed for store-only
-  # ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include  # Not needed for store-only
-  ${CUDAToolkit_INCLUDE_DIRS}
-  ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
-  ${Python_INCLUDE_DIRS}  # For serialize_object.cc
-)
-target_compile_definitions(moodist PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
-target_compile_definitions(moodist PRIVATE _STATIC_LIBRARY_BUILD_)
-set_property(TARGET moodist PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+if(MOODIST_PREBUILT_CORE)
+  # Use pre-built core library (for subsequent PyTorch version builds)
+  message(STATUS "Using pre-built core library: ${MOODIST_PREBUILT_CORE}")
+  add_library(moodist SHARED IMPORTED)
+  set_target_properties(moodist PROPERTIES
+    IMPORTED_LOCATION ${MOODIST_PREBUILT_CORE}
+  )
+else()
+  # Build core library from source
+  add_library(moodist SHARED ${core_sources})
+  # MINIMAL BUILD: Keep CUDA includes since commondefs.h includes cuda
+  target_link_libraries(moodist PRIVATE
+    CUDA::cuda_driver
+    CUDA::nvml
+    CUDA::nvrtc
+    Threads::Threads
+    anl
+    # kern-abi  # Not needed for store-only (rdma-core)
+  )
+  target_include_directories(moodist SYSTEM PRIVATE
+    fmt/include
+    # rdma-core  # Not needed for store-only
+    # ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include  # Not needed for store-only
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
+    ${Python_INCLUDE_DIRS}  # For serialize_object.cc
+  )
+  target_compile_definitions(moodist PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
+  target_compile_definitions(moodist PRIVATE _STATIC_LIBRARY_BUILD_)
+  set_property(TARGET moodist PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 # Wrapper library sources - implements PyTorch wrappers and pybind
 # MINIMAL BUILD: Just store wrapper and pybind for now
@@ -190,14 +215,16 @@ set(wrapper_sources
   pybind.cc
   store_wrapper.cc
   serialize_wrapper.cc  # torch::Tensor wrapper for serialize/deserialize
+  moodist_loader.cc  # dlopen loader for libmoodist.so
 )
 
 # Wrapper library - compiled per PyTorch version
+# Does NOT link directly to moodist - uses dlopen instead
 pybind11_add_module(_C ${wrapper_sources})
 target_link_libraries(_C PRIVATE
-  moodist
   ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
+  dl  # For dlopen/dlsym
 )
 target_include_directories(_C SYSTEM PRIVATE
   fmt/include
@@ -210,10 +237,9 @@ target_compile_definitions(_C PRIVATE _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI})
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
-# Set rpath so _C can find libmoodist.so in the same directory
-set_target_properties(_C PROPERTIES
-  SKIP_BUILD_RPATH FALSE
-  BUILD_WITH_INSTALL_RPATH TRUE
-  INSTALL_RPATH "$ORIGIN"
-  INSTALL_RPATH_USE_LINK_PATH FALSE
-)
+# No RPATH needed - we use dlopen with explicit path lookup
+
+# Ensure moodist is built when building _C (even though we don't link directly)
+if(NOT MOODIST_PREBUILT_CORE)
+  add_dependencies(_C moodist)
+endif()

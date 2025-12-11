@@ -1,32 +1,37 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 // TcpStore implementation - wrapper around StoreImpl for PyTorch compatibility.
+// Uses function pointers from getMoodistAPI() to call into libmoodist.so.
 
+#include "moodist_loader.h"
 #include "store.h"
 
 namespace moodist {
 
 TcpStore::TcpStore(StoreImpl* impl) : impl(impl) {
-  storeImplAddRef(impl);
+  // Note: caller is responsible for ensuring impl has correct refcount
 }
 
 TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
-    std::chrono::steady_clock::duration timeout) {
-  impl = createStoreImpl(std::move(hostname), port, std::move(key), worldSize, rank);
-  storeImplAddRef(impl);
+                   std::chrono::steady_clock::duration timeout) {
+  auto* api = getMoodistAPI();
+  impl = api->createStoreImpl(hostname, port, key, worldSize, rank);
   timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
 }
 
 TcpStore::~TcpStore() {
-  storeImplDecRef(impl);
+  auto* api = getMoodistAPI();
+  api->storeImplDecRef(impl);
 }
 
 void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {
-  storeImplSet(impl, timeout_, key, value);
+  auto* api = getMoodistAPI();
+  api->storeImplSet(impl, timeout_, key, value);
 }
 
 std::vector<uint8_t> TcpStore::get(const std::string& key) {
-  return storeImplGet(impl, timeout_, key);
+  auto* api = getMoodistAPI();
+  return api->storeImplGet(impl, timeout_, key);
 }
 
 int64_t TcpStore::add(const std::string& key, int64_t value) {
@@ -39,7 +44,13 @@ bool TcpStore::deleteKey(const std::string& key) {
 }
 
 bool TcpStore::check(const std::vector<std::string>& keys) {
-  return storeImplCheck(impl, timeout_, keys);
+  auto* api = getMoodistAPI();
+  std::vector<std::string_view> keyViews;
+  keyViews.reserve(keys.size());
+  for (const auto& k : keys) {
+    keyViews.push_back(k);
+  }
+  return api->storeImplCheck(impl, timeout_, keyViews);
 }
 
 int64_t TcpStore::getNumKeys() {
@@ -47,11 +58,23 @@ int64_t TcpStore::getNumKeys() {
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys) {
-  storeImplWait(impl, timeout_, keys);
+  auto* api = getMoodistAPI();
+  std::vector<std::string_view> keyViews;
+  keyViews.reserve(keys.size());
+  for (const auto& k : keys) {
+    keyViews.push_back(k);
+  }
+  api->storeImplWait(impl, timeout_, keyViews);
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) {
-  storeImplWait(impl, timeout, keys);
+  auto* api = getMoodistAPI();
+  std::vector<std::string_view> keyViews;
+  keyViews.reserve(keys.size());
+  for (const auto& k : keys) {
+    keyViews.push_back(k);
+  }
+  api->storeImplWait(impl, timeout, keyViews);
 }
 
 } // namespace moodist

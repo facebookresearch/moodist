@@ -2147,14 +2147,11 @@ struct Dtor {
 
 } // namespace
 
-// C-style interface for StoreImpl - used by TcpStore wrapper in _C
+// API for StoreImpl - used by _C wrapper via function pointers
 
-StoreImpl* createStoreImpl(std::string hostname, int port, std::string key, int worldSize, int rank) {
-  return new StoreImpl(std::move(hostname), port, std::move(key), worldSize, rank);
-}
-
-void storeImplAddRef(StoreImpl* impl) {
-  ++impl->refcount;
+StoreImpl* createStoreImpl(std::string_view hostname, int port, std::string_view key,
+                           int worldSize, int rank) {
+  return new StoreImpl(std::string(hostname), port, std::string(key), worldSize, rank);
 }
 
 void storeImplDecRef(StoreImpl* impl) {
@@ -2164,23 +2161,34 @@ void storeImplDecRef(StoreImpl* impl) {
   }
 }
 
-void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, const std::string& key,
-    const std::vector<uint8_t>& value) {
+void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+                  std::string_view key, const std::vector<uint8_t>& value) {
   impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeImplGet(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, const std::string& key) {
+std::vector<uint8_t> storeImplGet(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+                                   std::string_view key) {
   return impl->get(timeout, key);
 }
 
-bool storeImplCheck(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
-  return impl->check(timeout, keys);
+bool storeImplCheck(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+                    std::span<const std::string_view> keys) {
+  std::vector<std::string> keysVec;
+  keysVec.reserve(keys.size());
+  for (auto k : keys) {
+    keysVec.emplace_back(k);
+  }
+  return impl->check(timeout, keysVec);
 }
 
-void storeImplWait(StoreImpl* impl, std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
-  impl->wait(timeout, keys);
+void storeImplWait(StoreImpl* impl, std::chrono::steady_clock::duration timeout,
+                   std::span<const std::string_view> keys) {
+  std::vector<std::string> keysVec;
+  keysVec.reserve(keys.size());
+  for (auto k : keys) {
+    keysVec.emplace_back(k);
+  }
+  impl->wait(timeout, keysVec);
 }
 
 } // namespace moodist

@@ -1197,6 +1197,10 @@ size_t serializeBufferSize(Buffer* buf) {
   return buf->size();
 }
 
+void serializeBufferAddRef(Buffer* buf) {
+  buf->refcount.fetch_add(1, std::memory_order_relaxed);
+}
+
 void serializeBufferDecRef(Buffer* buf) {
   if (buf->refcount.fetch_sub(1) == 1) {
     internalFree(buf);

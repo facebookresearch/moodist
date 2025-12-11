@@ -36,6 +36,11 @@ class Build(build_ext.build_ext):
             os.rename(output_path / "version.py", output_path.parent / "version.py")
             z, fn = zip_files[ext.name]
             open(self.get_ext_fullpath(ext.name), "wb").write(z.open(fn).read())
+            # Extract libmoodist.so to package directory (only once)
+            if "moodist.libmoodist" in zip_files:
+                z_lib, fn_lib = zip_files.pop("moodist.libmoodist")
+                libmoodist_path = output_path.parent / "libmoodist.so"
+                open(libmoodist_path, "wb").write(z_lib.open(fn_lib).read())
             return
 
         cmake_cmd = [
@@ -44,6 +49,14 @@ class Build(build_ext.build_ext):
             "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=%s" % output_path,
         ]
+
+        # Support pre-built core library for multi-PyTorch version builds
+        if "MOODIST_PREBUILT_CORE" in os.environ:
+            cmake_cmd.append("-DMOODIST_PREBUILT_CORE=%s" % os.environ["MOODIST_PREBUILT_CORE"])
+
+        # Support explicit build magic for multi-PyTorch version builds
+        if "MOODIST_BUILD_MAGIC" in os.environ:
+            cmake_cmd.append("-DMOODIST_BUILD_MAGIC=%s" % os.environ["MOODIST_BUILD_MAGIC"])
 
         # if "bdist_wheel" in sys.argv:
         #     cmake_cmd.append("-DIS_BUILDING_WHEEL=1")
@@ -61,6 +74,11 @@ class Build(build_ext.build_ext):
         except subprocess.CalledProcessError:
             # Don't obscure the error with a setuptools backtrace.
             sys.exit(1)
+
+        # If using pre-built core, copy it to output directory
+        if "MOODIST_PREBUILT_CORE" in os.environ:
+            import shutil
+            shutil.copy(os.environ["MOODIST_PREBUILT_CORE"], output_path / "libmoodist.so")
 
 
 def main():
@@ -87,6 +105,9 @@ def main():
         min_version = None
         max_version = None
 
+        # Track libmoodist.so from first wheel (same in all wheels)
+        libmoodist_source = None
+
         for fn in os.environ["MOODIST_WHL_LIST"].split(","):
             z = zipfile.ZipFile(fn)
 
@@ -103,6 +124,9 @@ def main():
                 if n.filename.startswith("moodist/_C."):
                     assert cfn is None
                     cfn = n.filename
+                # Grab libmoodist.so from first wheel
+                if libmoodist_source is None and n.filename == "moodist/libmoodist.so":
+                    libmoodist_source = (z, n.filename)
             assert cfn is not None
 
             tv: str = next(iter(cv.keys()))
@@ -131,6 +155,10 @@ def main():
             ".".join(str(x) for x in max_version),
         )
         moodist_cversions = cversions
+
+        # Store libmoodist.so source for extraction
+        if libmoodist_source is not None:
+            zip_files["moodist.libmoodist"] = libmoodist_source
     else:
         import torch
 

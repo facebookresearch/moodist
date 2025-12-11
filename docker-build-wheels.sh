@@ -17,23 +17,58 @@ pre_torch_versions="2.9"
 
 moodist_version=$(cat version.txt)
 
+# Generate random build magic for API verification (shared across all builds)
+export MOODIST_BUILD_MAGIC="0x$(head -c8 /dev/urandom | xxd -p)ULL"
+echo "Build magic: $MOODIST_BUILD_MAGIC"
+
 orig_path=$PATH
 for ver in $versions; do
     export PATH=/opt/python/$ver/bin:$orig_path
 
+    # Location to save core library (outside of build/ which gets cleaned)
+    core_lib_saved="/tmp/libmoodist_${ver}.so"
+    core_lib=""
+
     for torchver in $torch_versions; do
         pip install torch==$torchver.*
         python setup.py clean --all
-        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+
+        if [[ -z "$core_lib" ]]; then
+            # First PyTorch version: build everything
+            python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+            # Save core library for subsequent builds (copy outside build/)
+            core_lib=$(find build -name "libmoodist.so" | head -1)
+            cp "$core_lib" "$core_lib_saved"
+            core_lib="$core_lib_saved"
+            echo "Saved core library: $core_lib"
+        else
+            # Subsequent versions: use pre-built core
+            MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+        fi
         pip uninstall torch -y
     done
 
     for torchver in $pre_torch_versions; do
         pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch==$torchver.*
         python setup.py clean --all
-        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+
+        if [[ -z "$core_lib" ]]; then
+            # First PyTorch version: build everything
+            python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+            # Save core library for subsequent builds (copy outside build/)
+            core_lib=$(find build -name "libmoodist.so" | head -1)
+            cp "$core_lib" "$core_lib_saved"
+            core_lib="$core_lib_saved"
+            echo "Saved core library: $core_lib"
+        else
+            # Subsequent versions: use pre-built core
+            MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
+        fi
         pip uninstall torch -y
     done
+
+    # Clean up saved core library
+    rm -f "$core_lib_saved"
 
     whl_list=""
     for x in $torch_versions $pre_torch_versions; do

@@ -25,6 +25,7 @@ MOODIST_API void* serializeBufferPtr(Buffer* buf);
 MOODIST_API size_t serializeBufferSize(Buffer* buf);
 
 // Ref counting - prevent destructor issues by using explicit functions
+MOODIST_API void serializeBufferAddRef(Buffer* buf);
 MOODIST_API void serializeBufferDecRef(Buffer* buf);
 
 // Deserialize from raw pointer/size (returns new reference)
