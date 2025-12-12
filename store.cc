@@ -206,7 +206,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   std::string storekey;
   std::string myId;
 
-  std::atomic_bool dead = false;
+  std::atomic_bool closed = false;
   std::atomic_uint32_t anyQueued = 0;
   std::thread thread;
 
@@ -241,6 +241,18 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   bool exited = false;       // Phase 2: we've exited, waits should error
   std::chrono::steady_clock::time_point exitTime;
   std::optional<uint32_t> exitSourceRank; // Rank that initiated the shutdown
+
+  // Async close state machine
+  enum class CloseState {
+    NotStarted,
+    WaitShutdownAck, // Waiting for all peers to acknowledge shutdown (2s)
+    WaitExit,        // Waiting for all peers to exit (1s)
+    WaitExitAck,     // Waiting for all peers to ack exit (50ms)
+    Done
+  };
+  CloseState closeState = CloseState::NotStarted;
+  std::chrono::steady_clock::time_point shutdownDeadline;
+  std::chrono::milliseconds shutdownBackoff{1};
 
   // EdgeInfo: connection/communication state for direct edge peers
   struct EdgeInfo {
@@ -558,7 +570,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
   void connectEdge(uint32_t edge) {
     std::unique_lock l(mutex);
-    if (dead) {
+    if (closed) {
       return;
     }
     CHECK(edge != -1);
@@ -583,7 +595,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
         std::lock_guard l(mutex);
         CHECK(edge != -1);
         auto& ei = getEdge(edge);
-        if (dead || !ei.tcpconnections.empty() || shutdownStates[edge].exited || exited) {
+        if (closed || !ei.tcpconnections.empty() || shutdownStates[edge].exited || exited) {
           return;
         }
         // log.info("connecting to edge %d at %s\n", edge, a);
@@ -780,7 +792,8 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   void threadEntry() {
-    while (!dead) {
+    // Note: The thread lambda holds a shared_ptr to self, keeping us alive.
+    while (!closed) {
       if (callbacks.empty()) {
         futexWait(&anyQueued, 0, std::chrono::seconds(100));
       } else {
@@ -809,11 +822,15 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
         }
       }
     }
+    callbacks.clear();
   }
 
   void addCallback(std::chrono::steady_clock::time_point time, Function<void()> callback) {
     {
       std::lock_guard l(queuedCallbacksMutex);
+      if (closed) {
+        return;
+      }
       queuedCallbacks.emplace_back();
       queuedCallbacks.back().time = time;
       queuedCallbacks.back().callback = std::move(callback);
@@ -846,7 +863,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
               std::lock_guard l(mutex);
               CHECK(msg.sourceRank != -1);
               auto& pi = getEdge(msg.sourceRank);
-              if (dead || !pi.tcpconnections.empty()) {
+              if (closed || !pi.tcpconnections.empty()) {
                 ci->connection->close();
               } else {
                 ci->sourceRank = msg.sourceRank;
@@ -1304,10 +1321,6 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
       }
     }
 
-    thread = std::thread([this]() {
-      threadEntry();
-    });
-
     addCallback(std::chrono::steady_clock::now(), [this]() {
       connect();
     });
@@ -1323,6 +1336,11 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
   // Called after shared_ptr is set up to initialize callbacks that need shared_from_this()
   void init() {
+    // Start the thread with a shared_ptr to self
+    thread = std::thread([self = shared_from_this()]() {
+      self->threadEntry();
+    });
+
     // Set up UDP socket callbacks
     for (auto& socket : udps) {
       socket->setOnRead([self = shared_from_this(), s = socket.get()](Error* e) {
@@ -1337,7 +1355,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
           return;
         }
         std::lock_guard l(self->mutex);
-        if (self->dead) {
+        if (self->closed) {
           return;
         }
         self->addConnection(std::move(connection));
@@ -1361,16 +1379,61 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     }
   }
 
-  // Close all sockets and connections. Called when user refcount drops to 0.
-  // This triggers callbacks to complete and drop their shared_from_this() refs,
-  // eventually allowing ~StoreImpl() to run.
-  void close() {
+  ~StoreImpl() {
     {
-      std::unique_lock l(mutex);
-      dead = true;
-      anyQueued = 1;
-      futexWakeAll(&anyQueued);
+      std::lock_guard l(*activeStoresMutex);
+      // Thread has already exited (threadEntry holds self, so destructor only runs after thread exits).
+      // Just detach to clean up the std::thread object.
+      if (thread.joinable()) {
+        thread.detach();
+      }
+      auto i = std::ranges::find(*activeStores, this);
+      CHECK(i != activeStores->end());
+      activeStores->erase(i);
     }
+  }
+
+  // Helper: check if all peers have signaled shutdown
+  bool allPeersShutdown() {
+    for (uint32_t r : range(worldSize)) {
+      if (r == rank) {
+        continue;
+      }
+      if (!shutdownStates[r].shutdown) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Helper: check if all peers have exited
+  bool allPeersExited() {
+    for (uint32_t r : range(worldSize)) {
+      if (r == rank) {
+        continue;
+      }
+      if (!shutdownStates[r].exited) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Helper: check if all peers have acked exit
+  bool allPeersExitAcked() {
+    for (uint32_t r : range(worldSize)) {
+      if (r == rank) {
+        continue;
+      }
+      if (!shutdownStates[r].exitAck) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Helper: close all resources (sockets, connections)
+  void closeResources() {
     closeAll(listeners);
     closeAll(floatingConnections);
     while (true) {
@@ -1392,113 +1455,96 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     for (auto& v : udps) {
       v->close();
     }
-    // Join the thread here, not in destructor.
-    // After this point, no more callbacks can run on the store's thread,
-    // so dropping shared_ptr refs won't cause destructor to run on our own thread.
-    thread.join();
-  }
-
-  ~StoreImpl() {
-    // close() should have been called already, so thread is already joined.
-    // If not, join it now (shouldn't happen in normal usage).
-    if (thread.joinable()) {
-      thread.join();
-    }
-
     {
-      std::lock_guard l(*activeStoresMutex);
-      auto i = std::ranges::find(*activeStores, this);
-      CHECK(i != activeStores->end());
-      activeStores->erase(i);
+      std::lock_guard l(queuedCallbacksMutex);
+      queuedCallbacks.clear();
     }
   }
 
-  void shutdown() {
+  void runCloseStateMachine() {
     std::unique_lock l(mutex);
-    if (shuttingDown) {
-      return; // Already shutting down, don't run protocol twice
-    }
+    auto now = std::chrono::steady_clock::now();
 
-    shuttingDown = true;
-    if (!exitSourceRank) {
-      exitSourceRank = rank;
-    }
-    broadcastMessage(messageShutdown, rank);
+    while (true) {
+      switch (closeState) {
+      case CloseState::NotStarted:
+        shuttingDown = true;
+        if (!exitSourceRank) {
+          exitSourceRank = rank;
+        }
+        broadcastMessage(messageShutdown, rank);
+        closeState = CloseState::WaitShutdownAck;
+        shutdownDeadline = now + std::chrono::seconds(2);
+        shutdownBackoff = std::chrono::milliseconds(1);
+        continue;
 
-    // Phase 1: wait for all peers to signal shutdown
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (std::chrono::steady_clock::now() < deadline) {
-      bool allShutdown = true;
-      for (uint32_t r : range(worldSize)) {
-        if (r == rank) {
+      case CloseState::WaitShutdownAck:
+        if (allPeersShutdown() || now >= shutdownDeadline) {
+          // Transition to exit phase
+          if (!exited) {
+            exited = true;
+            exitTime = now;
+            for (auto& v : waits) {
+              exitWait(v.second);
+            }
+            broadcastMessage(messageExit, *exitSourceRank);
+          }
+          closeState = CloseState::WaitExit;
+          shutdownDeadline = now + std::chrono::seconds(1);
+          shutdownBackoff = std::chrono::milliseconds(1);
           continue;
         }
-        if (!shutdownStates[r].shutdown) {
-          allShutdown = false;
-          break;
-        }
-      }
-      if (allShutdown) {
         break;
-      }
-      l.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      l.lock();
-    }
 
-    // Phase 2: broadcast exit, wake local waits
-    if (!exited) {
-      exited = true;
-      exitTime = std::chrono::steady_clock::now();
-      for (auto& v : waits) {
-        exitWait(v.second);
-      }
-      broadcastMessage(messageExit, *exitSourceRank);
-    }
-
-    // Wait for all peers to exit
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (std::chrono::steady_clock::now() < deadline) {
-      bool allExited = true;
-      for (uint32_t r : range(worldSize)) {
-        if (r == rank) {
+      case CloseState::WaitExit:
+        if (allPeersExited() || now >= shutdownDeadline) {
+          // Transition to exit ack phase
+          broadcastMessage(messageExitAck);
+          closeState = CloseState::WaitExitAck;
+          shutdownDeadline = now + std::chrono::milliseconds(50);
+          shutdownBackoff = std::chrono::milliseconds(1);
           continue;
         }
-        if (!shutdownStates[r].exited) {
-          allExited = false;
-          break;
-        }
-      }
-      if (allExited) {
         break;
+
+      case CloseState::WaitExitAck:
+        if (allPeersExitAcked() || now >= shutdownDeadline) {
+          closeState = CloseState::Done;
+          closed = true;
+          l.unlock();
+          anyQueued = 1;
+          futexWakeAll(&anyQueued);
+          closeResources();
+          return;
+        }
+        break;
+
+      case CloseState::Done:
+        return;
       }
-      l.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      l.lock();
+
+      break;
     }
 
-    // Phase 3: broadcast ack, wait briefly for peers
-    broadcastMessage(messageExitAck);
+    l.unlock();
+    auto nextTime = now + shutdownBackoff;
+    shutdownBackoff = std::min(shutdownBackoff * 2, std::chrono::milliseconds(64));
+    addCallback(nextTime, [self = shared_from_this()] {
+      self->runCloseStateMachine();
+    });
+  }
 
-    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-    while (std::chrono::steady_clock::now() < deadline) {
-      bool allAcked = true;
-      for (uint32_t r : range(worldSize)) {
-        if (r == rank) {
-          continue;
-        }
-        if (!shutdownStates[r].exitAck) {
-          allAcked = false;
-          break;
-        }
+  void close() {
+    {
+      std::lock_guard l(mutex);
+      if (shuttingDown) {
+        return;
       }
-      if (allAcked) {
-        break;
-      }
-      l.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      l.lock();
+      shuttingDown = true;
     }
+    addCallback(std::chrono::steady_clock::now(), [self = shared_from_this()] {
+      self->runCloseStateMachine();
+    });
   }
 
   void keepalive() {
@@ -1556,7 +1602,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   void addConnection(std::shared_ptr<Connection> connection) {
-    CHECK(!dead);
+    CHECK(!closed);
     auto ci = std::make_shared<ConnectionInfo>();
     ci->connection = connection;
     ci->lastReceive = std::chrono::steady_clock::now();
@@ -2160,12 +2206,20 @@ namespace {
 
 struct Dtor {
   ~Dtor() {
-    // Send exit messages to peers for any stores still alive at process exit.
-    // The stores themselves may not be deleted (if TcpStore objects still exist),
-    // but we notify peers that we're shutting down.
-    std::lock_guard l(*activeStoresMutex);
-    for (auto* x : *activeStores) {
-      x->shutdown();
+    std::vector<std::thread> threads;
+    {
+      std::lock_guard l(*activeStoresMutex);
+      // First pass: initiate async shutdown and move threads out
+      for (auto* x : *activeStores) {
+        x->close();
+        if (x->thread.joinable()) {
+          threads.push_back(std::move(x->thread));
+        }
+      }
+    }
+    // Second pass: wait for each thread to finish (lock released)
+    for (auto& t : threads) {
+      t.join();
     }
   }
 } dtor;
@@ -2192,7 +2246,6 @@ void storeAddRef(StoreHandle* handle) {
 
 void storeDecRef(StoreHandle* handle) {
   if (--handle->refcount == 0) {
-    handle->impl->shutdown();
     handle->impl->close();
     internalDelete(handle);
   }
