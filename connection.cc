@@ -11,7 +11,7 @@
 namespace moodist {
 
 void Listener::accept(Function<void(Error*, std::shared_ptr<Connection>)> callback) {
-  socket.accept([this, callback = std::move(callback)](Error* error, Socket socket) {
+  socket.accept([self = shared_from_this(), callback = std::move(callback)](Error* error, Socket socket) {
     if (error) {
       callback(error, nullptr);
     } else {
@@ -123,7 +123,7 @@ template void Connection::writefd(SharedBufferHandle, int);
 
 namespace {
 struct ReadState {
-  Connection* connection;
+  std::shared_ptr<Connection> connection;
   int state = 0;
   bool recvFd = false;
   int fd = -1;
@@ -132,10 +132,10 @@ struct ReadState {
   BufferHandle buffer;
   CachedReader reader;
   Function<void()> readMoreCallback;
-  ReadState(Connection* connection, Function<void(Error*, BufferHandle)> callback)
-      : connection(connection), reader(&connection->socket), callback(std::move(callback)) {}
-  ReadState(Connection* connection, Function<void(Error*, BufferHandle, int)> fdcallback)
-      : connection(connection), reader(&connection->socket), fdcallback(std::move(fdcallback)) {}
+  ReadState(std::shared_ptr<Connection> connection, Function<void(Error*, BufferHandle)> callback)
+      : connection(std::move(connection)), reader(&this->connection->socket), callback(std::move(callback)) {}
+  ReadState(std::shared_ptr<Connection> connection, Function<void(Error*, BufferHandle, int)> fdcallback)
+      : connection(std::move(connection)), reader(&this->connection->socket), fdcallback(std::move(fdcallback)) {}
   void callError(Error* error) {
     if (fdcallback) {
       fdcallback(error, nullptr, -1);
@@ -230,11 +230,11 @@ bool Connection::closed() const {
 }
 
 void Connection::read(Function<void(Error*, BufferHandle)> callback) {
-  socket.setOnRead(ReadState(this, std::move(callback)));
+  socket.setOnRead(ReadState(shared_from_this(), std::move(callback)));
 }
 
 void Connection::readfd(Function<void(Error*, BufferHandle, int)> callback) {
-  socket.setOnRead(ReadState(this, std::move(callback)));
+  socket.setOnRead(ReadState(shared_from_this(), std::move(callback)));
 }
 
 void Connection::inread_iovec(void* ptr, size_t bytes, Function<void()> callback) {

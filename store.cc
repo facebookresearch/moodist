@@ -145,6 +145,8 @@ struct AddressesAckMessage {
   }
 };
 
+struct StoreImpl;
+
 namespace {
 TcpContext context;
 
@@ -194,7 +196,7 @@ Indestructible<SpinMutex> activeStoresMutex;
 Indestructible<Vector<StoreImpl*>> activeStores;
 } // namespace
 
-struct StoreImpl {
+struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   Vector<std::shared_ptr<Socket>> udps;
 
   std::atomic_size_t refcount = 0;
@@ -774,9 +776,7 @@ struct StoreImpl {
     if (!socket->bind(port)) {
       return false;
     }
-    socket->setOnRead([this, socket = &*socket](Error* e) {
-      this->onreadudp(socket, e);
-    });
+    // Callback will be set up in init() after shared_ptr is ready
     udps.push_back(std::move(socket));
     return true;
   }
@@ -1289,18 +1289,7 @@ struct StoreImpl {
 
       try {
         auto listener = context.listen(addr);
-
-        listener->accept([this](Error* error, std::shared_ptr<Connection> connection) {
-          if (error) {
-            return;
-          }
-          std::lock_guard l(mutex);
-          if (dead) {
-            return;
-          }
-          addConnection(std::move(connection));
-        });
-
+        // Accept callback will be set up in init() after shared_ptr is ready
         listeners.push_back(listener);
 
         // log.info("tcp listening on %s\n", fmt::to_string(fmt::join(listener->localAddresses(), ", ")));
@@ -1334,6 +1323,30 @@ struct StoreImpl {
     }
   }
 
+  // Called after shared_ptr is set up to initialize callbacks that need shared_from_this()
+  void init() {
+    // Set up UDP socket callbacks
+    for (auto& socket : udps) {
+      socket->setOnRead([self = shared_from_this(), s = socket.get()](Error* e) {
+        self->onreadudp(s, e);
+      });
+    }
+
+    // Set up listener accept callbacks
+    for (auto& listener : listeners) {
+      listener->accept([self = shared_from_this()](Error* error, std::shared_ptr<Connection> connection) {
+        if (error) {
+          return;
+        }
+        std::lock_guard l(self->mutex);
+        if (self->dead) {
+          return;
+        }
+        self->addConnection(std::move(connection));
+      });
+    }
+  }
+
   template<typename Container>
   void closeAll(Container& container) {
     while (true) {
@@ -1350,7 +1363,10 @@ struct StoreImpl {
     }
   }
 
-  ~StoreImpl() {
+  // Close all sockets and connections. Called when user refcount drops to 0.
+  // This triggers callbacks to complete and drop their shared_from_this() refs,
+  // eventually allowing ~StoreImpl() to run.
+  void close() {
     {
       std::unique_lock l(mutex);
       dead = true;
@@ -1375,9 +1391,20 @@ struct StoreImpl {
       }
       closeAll(allconnections);
     }
-    thread.join();
     for (auto& v : udps) {
       v->close();
+    }
+    // Join the thread here, not in destructor.
+    // After this point, no more callbacks can run on the store's thread,
+    // so dropping shared_ptr refs won't cause destructor to run on our own thread.
+    thread.join();
+  }
+
+  ~StoreImpl() {
+    // close() should have been called already, so thread is already joined.
+    // If not, join it now (shouldn't happen in normal usage).
+    if (thread.joinable()) {
+      thread.join();
     }
 
     {
@@ -1537,33 +1564,33 @@ struct StoreImpl {
     ci->lastReceive = std::chrono::steady_clock::now();
     floatingConnections.push_back(ci);
     // log.info("add new connection - %d floating connections\n", floatingConnections.size());
-    connection->read([this, ci](Error* e, BufferHandle data) {
+    connection->read([self = shared_from_this(), ci](Error* e, BufferHandle data) {
       if (!e) {
-        addCallback(std::chrono::steady_clock::now(), [this, data = std::move(data), ci]() mutable {
-          onreadtcp(std::move(data), ci);
+        self->addCallback(std::chrono::steady_clock::now(), [self, data = std::move(data), ci]() mutable {
+          self->onreadtcp(std::move(data), ci);
         });
       } else {
         std::string errorMsg = e->what();
         ci->connection->close();
 
-        addCallback(std::chrono::steady_clock::now(), [this, ci, errorMsg = std::move(errorMsg)]() mutable {
-          std::lock_guard l(mutex);
+        self->addCallback(std::chrono::steady_clock::now(), [self, ci, errorMsg = std::move(errorMsg)]() mutable {
+          std::lock_guard l(self->mutex);
           if (ci->sourceRank != -1) {
-            auto& pi = getEdge(ci->sourceRank);
-            reaptcpconnections(pi);
+            auto& pi = self->getEdge(ci->sourceRank);
+            self->reaptcpconnections(pi);
 
             // Send "connection lost" diagnostic for any pending messages (including local)
             for (auto& v : pi.outgoingQueue) {
               if (v.diagnosticSource != (uint32_t)-1) {
-                sendDiagnosticInfo(v.diagnosticSource, ci->sourceRank, DiagnosticKind::Error,
+                self->sendDiagnosticInfo(v.diagnosticSource, ci->sourceRank, DiagnosticKind::Error,
                     fmt::sprintf("TCP connection to rank %d lost: %s", ci->sourceRank, errorMsg));
               }
             }
 
             if (!pi.addresses.empty()) {
-              addCallback(
-                  std::chrono::steady_clock::now() + std::chrono::seconds(1), [this, sourceRank = ci->sourceRank] {
-                    connectEdge(sourceRank);
+              self->addCallback(
+                  std::chrono::steady_clock::now() + std::chrono::seconds(1), [self, sourceRank = ci->sourceRank] {
+                    self->connectEdge(sourceRank);
                   });
             }
           }
@@ -2147,52 +2174,58 @@ struct Dtor {
 
 } // namespace
 
-// API for StoreImpl - used by _C wrapper via function pointers
+// Opaque handle for the API - wraps shared_ptr to allow StoreImpl to outlive user refs
+struct StoreHandle {
+  std::shared_ptr<StoreImpl> impl;
+};
 
-StoreImpl* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
-  auto* impl = new StoreImpl(std::string(hostname), port, std::string(key), worldSize, rank);
-  impl->refcount = 1; // Caller owns one reference
-  return impl;
+StoreHandle* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
+  auto impl = std::make_shared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
+  impl->init();
+  impl->refcount = 1;
+  return new StoreHandle{std::move(impl)};
 }
 
-void storeImplAddRef(StoreImpl* impl) {
-  ++impl->refcount;
+void storeImplAddRef(StoreHandle* handle) {
+  ++handle->impl->refcount;
 }
 
-void storeImplDecRef(StoreImpl* impl) {
-  if (--impl->refcount == 0) {
-    impl->shutdown();
-    delete impl;
+void storeImplDecRef(StoreHandle* handle) {
+  if (--handle->impl->refcount == 0) {
+    handle->impl->shutdown();
+    handle->impl->close();
+    delete handle;
   }
 }
 
-void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+void storeImplSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
     const std::vector<uint8_t>& value) {
-  impl->set(timeout, key, value);
+  handle->impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeImplGet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key) {
-  return impl->get(timeout, key);
+std::vector<uint8_t> storeImplGet(
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key) {
+  return handle->impl->get(timeout, key);
 }
 
 bool storeImplCheck(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {
     keysVec.emplace_back(k);
   }
-  return impl->check(timeout, keysVec);
+  return handle->impl->check(timeout, keysVec);
 }
 
 void storeImplWait(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {
     keysVec.emplace_back(k);
   }
-  impl->wait(timeout, keysVec);
+  handle->impl->wait(timeout, keysVec);
 }
 
 } // namespace moodist

@@ -20,7 +20,7 @@
 namespace moodist {
 
 // Forward declarations (opaque types)
-struct StoreImpl;
+struct StoreHandle;
 struct Buffer;
 struct Tensor;            // Opaque wrapper for torch::Tensor
 struct CudaAllocatorImpl; // CUDA allocator implementation
@@ -115,17 +115,17 @@ struct CoreApi {
   uint64_t magic;
 
   // Store functions
-  StoreImpl* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
-  void (*storeImplAddRef)(StoreImpl* impl);
-  void (*storeImplDecRef)(StoreImpl* impl);
-  void (*storeImplSet)(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+  StoreHandle* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+  void (*storeImplAddRef)(StoreHandle* handle);
+  void (*storeImplDecRef)(StoreHandle* handle);
+  void (*storeImplSet)(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
       const std::vector<uint8_t>& value);
   std::vector<uint8_t> (*storeImplGet)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key);
+      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
   bool (*storeImplCheck)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
   void (*storeImplWait)(
-      StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions
   Buffer* (*serializeObjectImpl)(PyObject* o);

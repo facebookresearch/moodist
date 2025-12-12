@@ -38,7 +38,7 @@ struct TcpContext {
   static std::string getNetworkKey();
 };
 
-struct Listener {
+struct Listener : std::enable_shared_from_this<Listener> {
   Socket socket;
   Listener(Socket socket) : socket(std::move(socket)) {}
 

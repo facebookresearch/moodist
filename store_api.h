@@ -14,29 +14,30 @@
 
 namespace moodist {
 
-// Forward declare StoreImpl (opaque type)
-struct StoreImpl;
+// Forward declare StoreHandle (opaque type)
+struct StoreHandle;
 
-// Factory function to create StoreImpl
-StoreImpl* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+// Factory function to create StoreHandle
+StoreHandle* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
 
 // Ref counting
-void storeImplAddRef(StoreImpl* impl);
-void storeImplDecRef(StoreImpl* impl);
+void storeImplAddRef(StoreHandle* handle);
+void storeImplDecRef(StoreHandle* handle);
 
 // Set a key-value pair
-void storeImplSet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key,
+void storeImplSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
     const std::vector<uint8_t>& value);
 
 // Get a value by key
-std::vector<uint8_t> storeImplGet(StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::string_view key);
+std::vector<uint8_t> storeImplGet(
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
 
 // Check if keys exist
 bool storeImplCheck(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
 // Wait for keys to exist
 void storeImplWait(
-    StoreImpl* impl, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
 } // namespace moodist

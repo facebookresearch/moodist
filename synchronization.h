@@ -76,36 +76,42 @@ using SpinMutex = std::mutex;
 inline std::atomic_int mutexThreadIdCounter = 0;
 inline thread_local int mutexThreadId = mutexThreadIdCounter++;
 class SpinMutex {
-  int magic = 0x42;
+  int magic = 0;
   std::atomic<bool> locked_{false};
-  std::atomic<int*> owner = nullptr;
-  std::atomic<void*> ownerAddress = nullptr;
+  std::atomic<int*> owner{nullptr};
+  std::atomic<void*> ownerAddress{nullptr};
 
 public:
   void lock() {
-    if (owner == &mutexThreadId) {
-      printf("recursive lock\n");
+    if (magic != 0) {
+      fprintf(stderr, "BAD MUTEX MAGIC %d\n", magic);
       std::abort();
     }
-    if (magic != 0x42) {
-      printf("BAD MUTEX MAGIC\n");
+    if (owner == &mutexThreadId) {
+      fprintf(stderr, "recursive lock\n");
       std::abort();
     }
     auto start = std::chrono::steady_clock::now();
+    int deadlockCount = 0;
     do {
       while (locked_.load(std::memory_order_acquire)) {
         _mm_pause();
-        if (magic != 0x42) {
-          printf("BAD MUTEX MAGIC\n");
+        if (magic != 0) {
+          fprintf(stderr, "BAD MUTEX MAGIC %d\n", magic);
           std::abort();
         }
         if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(100)) {
           int* p = owner.load();
-          printf("deadlock detected in thread %d! held by thread %d (my return address %p, owner return address %p, "
-                 "&mutexThreadIdCounter is %p)\n",
+          fprintf(stderr,
+              "deadlock detected in thread %d! held by thread %d (my return address %p, owner return address %p, "
+              "&mutexThreadIdCounter is %p)\n",
               mutexThreadId, p ? *p : -1, __builtin_return_address(0), ownerAddress.load(),
               (void*)&mutexThreadIdCounter);
           start = std::chrono::steady_clock::now();
+          if (++deadlockCount >= 50) {
+            fprintf(stderr, "deadlock timeout - aborting\n");
+            std::abort();
+          }
         }
       }
     } while (locked_.exchange(true, std::memory_order_acq_rel));
@@ -113,17 +119,20 @@ public:
     ownerAddress = __builtin_return_address(0);
   }
   void unlock() {
-    if (magic != 0x42) {
-      printf("BAD MUTEX MAGIC\n");
+    if (magic != 0) {
+      fprintf(stderr, "BAD MUTEX MAGIC %d\n", magic);
       std::abort();
     }
     owner = nullptr;
     locked_.store(false);
   }
   bool try_lock() {
-    if (owner == &mutexThreadId) {
-      printf("recursive try_lock\n");
+    if (magic != 0) {
+      fprintf(stderr, "BAD MUTEX MAGIC %d\n", magic);
       std::abort();
+    }
+    if (owner == &mutexThreadId) {
+      return false;
     }
     if (locked_.load(std::memory_order_acquire)) {
       return false;

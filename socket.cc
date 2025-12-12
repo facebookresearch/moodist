@@ -137,13 +137,10 @@ std::pair<std::string_view, int> decodeIpAddress(std::string_view address) {
 
 uint32_t writeFdFlag = 0x413ffc3f;
 
-thread_local SocketImpl* inReadLoop = nullptr;
-
 struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   int af = -1;
   int fd = -1;
   std::atomic_bool closed = false;
-  bool readLoopClose = false;
   uint32_t resolveCounter = 0;
   HashMap<uint32_t, std::shared_ptr<ResolveHandle>> resolveHandles;
   bool addedInPoll = false;
@@ -168,35 +165,46 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
   Function<void(Error*)> onRead;
   std::vector<int> receivedFds;
 
-  void closeImpl() {
-    if (inReadLoop == this) {
-      readLoopClose = true;
-      return;
-    }
-    std::unique_lock l(readMutex);
-    onRead = nullptr;
-    std::lock_guard l2(writeMutex);
-    std::unique_lock l3(writeQueueMutex);
-    queuedWrites.clear();
-    queuedWriteCallbacks.clear();
-    resolveHandles.clear();
-    CHECK(newWriteCallbacks.empty());
-    CHECK(activeWriteCallbacks.empty());
-    if (fd != -1) {
-      ::close(fd);
-      fd = -1;
-    }
-    for (auto v : receivedFds) {
-      ::close(v);
-    }
-  }
-
   void close() {
     if (closed.exchange(true)) {
       return;
     }
 
-    closeImpl();
+    // Clean up resources under write lock
+    {
+      std::lock_guard l2(writeMutex);
+      std::unique_lock l3(writeQueueMutex);
+      // Close fd under writeMutex to synchronize with connect/listen callbacks
+      if (fd != -1) {
+        ::close(fd);
+        fd = -1;
+      }
+      queuedWrites.clear();
+      queuedWriteCallbacks.clear();
+      resolveHandles.clear();
+      CHECK(newWriteCallbacks.empty());
+      CHECK(activeWriteCallbacks.empty());
+    }
+
+    // Clean up onRead and receivedFds under readMutex.
+    // If we can't get the lock, schedule async cleanup.
+    std::unique_lock l(readMutex, std::try_to_lock);
+    if (l.owns_lock()) {
+      onRead = nullptr;
+      for (auto v : receivedFds) {
+        ::close(v);
+      }
+      receivedFds.clear();
+    } else {
+      scheduler.run([me = shared_from_this()] {
+        std::unique_lock l(me->readMutex);
+        me->onRead = nullptr;
+        for (auto v : me->receivedFds) {
+          ::close(v);
+        }
+        me->receivedFds.clear();
+      });
+    }
   }
 
   ~SocketImpl() {
@@ -417,23 +425,20 @@ struct SocketImpl : std::enable_shared_from_this<SocketImpl> {
       if (closed.load(std::memory_order_relaxed)) {
         return;
       }
-      inReadLoop = this;
       while (true) {
         readTriggerCount.store(-0xffff, std::memory_order_relaxed);
         wantsRead = true;
         while (onRead && wantsRead) {
           wantsRead = false;
           onRead(nullptr);
+          if (closed.load(std::memory_order_relaxed)) {
+            return;
+          }
         }
         int v = -0xffff;
         if (readTriggerCount.compare_exchange_strong(v, 0)) {
           break;
         }
-      }
-      inReadLoop = nullptr;
-      l.unlock();
-      if (readLoopClose) {
-        closeImpl();
       }
     });
   }
