@@ -9,6 +9,7 @@
 #include "async.h"
 #include "cpu_allocator.h"
 #include "function.h"
+#include "hash_map.h"
 #include "logging.h"
 #include "vector.h"
 
@@ -585,26 +586,12 @@ struct PairHash {
   }
 };
 
-template<class T>
-struct InternalAllocator {
-  typedef T value_type;
-  InternalAllocator() = default;
-  template<class U>
-  constexpr InternalAllocator(const InternalAllocator<U>&) noexcept {}
-  T* allocate(size_t n) {
-    void* r = internalAlloc(sizeof(T) * n);
-    if (!r) {
-      throw std::bad_alloc();
-    }
-    return (T*)r;
-  }
-  void deallocate(T* p, std::size_t n) noexcept {
-    internalFree(p);
-  }
-};
-
+// IVector/IHashMap are now just aliases since Vector/HashMap default to InternalAllocator
 template<typename T>
-using IVector = Vector<T, InternalAllocator<T>>;
+using IVector = Vector<T>;
+
+template<typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>>
+using IHashMap = HashMap<Key, Value, Hash, Equal>;
 
 template<size_t size, size_t alignment>
 struct AlignedStorage {

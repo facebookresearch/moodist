@@ -1415,89 +1415,89 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
   void shutdown() {
     std::unique_lock l(mutex);
-    if (!shuttingDown) {
-      shuttingDown = true;
-      if (!exitSourceRank) {
-        exitSourceRank = rank;
-      }
-      broadcastMessage(messageShutdown, rank);
+    if (shuttingDown) {
+      return; // Already shutting down, don't run protocol twice
     }
 
-    if (refcount == 0) {
-      // Phase 1: wait for all peers to signal shutdown
-      auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      while (std::chrono::steady_clock::now() < deadline) {
-        bool allShutdown = true;
-        for (uint32_t r : range(worldSize)) {
-          if (r == rank) {
-            continue;
-          }
-          if (!shutdownStates[r].shutdown) {
-            allShutdown = false;
-            break;
-          }
+    shuttingDown = true;
+    if (!exitSourceRank) {
+      exitSourceRank = rank;
+    }
+    broadcastMessage(messageShutdown, rank);
+
+    // Phase 1: wait for all peers to signal shutdown
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      bool allShutdown = true;
+      for (uint32_t r : range(worldSize)) {
+        if (r == rank) {
+          continue;
         }
-        if (allShutdown) {
+        if (!shutdownStates[r].shutdown) {
+          allShutdown = false;
           break;
         }
-        l.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        l.lock();
       }
-
-      // Phase 2: broadcast exit, wake local waits
-      if (!exited) {
-        exited = true;
-        exitTime = std::chrono::steady_clock::now();
-        for (auto& v : waits) {
-          exitWait(v.second);
-        }
-        broadcastMessage(messageExit, *exitSourceRank);
+      if (allShutdown) {
+        break;
       }
+      l.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      l.lock();
+    }
 
-      // Wait for all peers to exit
-      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-      while (std::chrono::steady_clock::now() < deadline) {
-        bool allExited = true;
-        for (uint32_t r : range(worldSize)) {
-          if (r == rank) {
-            continue;
-          }
-          if (!shutdownStates[r].exited) {
-            allExited = false;
-            break;
-          }
+    // Phase 2: broadcast exit, wake local waits
+    if (!exited) {
+      exited = true;
+      exitTime = std::chrono::steady_clock::now();
+      for (auto& v : waits) {
+        exitWait(v.second);
+      }
+      broadcastMessage(messageExit, *exitSourceRank);
+    }
+
+    // Wait for all peers to exit
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < deadline) {
+      bool allExited = true;
+      for (uint32_t r : range(worldSize)) {
+        if (r == rank) {
+          continue;
         }
-        if (allExited) {
+        if (!shutdownStates[r].exited) {
+          allExited = false;
           break;
         }
-        l.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        l.lock();
       }
+      if (allExited) {
+        break;
+      }
+      l.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      l.lock();
+    }
 
-      // Phase 3: broadcast ack, wait briefly for peers
-      broadcastMessage(messageExitAck);
+    // Phase 3: broadcast ack, wait briefly for peers
+    broadcastMessage(messageExitAck);
 
-      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-      while (std::chrono::steady_clock::now() < deadline) {
-        bool allAcked = true;
-        for (uint32_t r : range(worldSize)) {
-          if (r == rank) {
-            continue;
-          }
-          if (!shutdownStates[r].exitAck) {
-            allAcked = false;
-            break;
-          }
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (std::chrono::steady_clock::now() < deadline) {
+      bool allAcked = true;
+      for (uint32_t r : range(worldSize)) {
+        if (r == rank) {
+          continue;
         }
-        if (allAcked) {
+        if (!shutdownStates[r].exitAck) {
+          allAcked = false;
           break;
         }
-        l.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        l.lock();
       }
+      if (allAcked) {
+        break;
+      }
+      l.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      l.lock();
     }
   }
 
@@ -2181,7 +2181,7 @@ struct StoreHandle {
 StoreHandle* createStore(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
   auto impl = std::make_shared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
   impl->init();
-  auto* handle = new StoreHandle{std::move(impl)};
+  auto* handle = internalNew<StoreHandle>(std::move(impl));
   handle->refcount = 1;
   return handle;
 }
@@ -2194,7 +2194,7 @@ void storeDecRef(StoreHandle* handle) {
   if (--handle->refcount == 0) {
     handle->impl->shutdown();
     handle->impl->close();
-    delete handle;
+    internalDelete(handle);
   }
 }
 
@@ -2203,8 +2203,7 @@ void storeSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, 
   handle->impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeGet(
-    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key) {
+std::vector<uint8_t> storeGet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key) {
   return handle->impl->get(timeout, key);
 }
 

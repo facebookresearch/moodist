@@ -104,7 +104,7 @@ struct Waiting {
 Waiting* allocWaiting(uint32_t source, uint32_t key, uintptr_t remoteQueueAddress) {
   Waiting* w = FreeList<Waiting>::pop();
   if (!w) {
-    w = new Waiting();
+    w = internalNew<Waiting>();
   }
   w->remoteQueueAddress = remoteQueueAddress;
   w->key = key;
@@ -220,12 +220,12 @@ void create(Group* group, int location, QueueStorage*& qs, uintptr_t& remoteAddr
     if (location == group->rank) {
       qs = (QueueStorage*)remoteAddress;
     } else {
-      qs = new QueueStorage();
+      qs = internalNew<QueueStorage>();
       qs->location = location;
       qs->streaming = streaming;
     }
   } else {
-    qs = new QueueStorage();
+    qs = internalNew<QueueStorage>();
     qs->location = location;
     qs->streaming = streaming;
 
@@ -257,7 +257,7 @@ void create(Group* group, const SimpleVector<int>& locations, QueueStorage*& qs,
       remoteAddress[i] = a;
     }
   } else {
-    qs = new QueueStorage();
+    qs = internalNew<QueueStorage>();
 
     remoteAddress.resize(locations.size());
     for (size_t i = 0; i != locations.size(); ++i) {
@@ -790,7 +790,7 @@ void QueueWork::wait() {
 }
 
 Queue::~Queue() {
-  delete (QueueImpl*)impl;
+  internalDelete((QueueImpl*)impl);
 }
 
 std::pair<TensorPtr, size_t> Queue::get(bool block, std::optional<float> timeout) {
@@ -832,7 +832,7 @@ Queue::Queue(void* p) {
 std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
-  r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
+  r->impl = (void*)internalNew<QueueImpl>(group, location, streaming, nameOpt);
   return r;
 }
 
@@ -840,7 +840,7 @@ std::shared_ptr<Queue> makeQueue(
     std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
   auto r = std::make_shared<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
-  r->impl = (void*)new QueueImpl(group, location, streaming, nameOpt);
+  r->impl = (void*)internalNew<QueueImpl>(group, location, streaming, nameOpt);
   return r;
 }
 
@@ -1112,7 +1112,7 @@ QueueInfo queueGetOrCreate(std::string_view name, int location, bool streaming) 
   std::string nameStr(name); // Convert once for map operations
   auto i = namedQueues.find(nameStr);
   if (i == namedQueues.end()) {
-    QueueStorage* qs = new QueueStorage();
+    QueueStorage* qs = internalNew<QueueStorage>();
     qs->location = location;
     qs->streaming = streaming;
     i = namedQueues.emplace(std::move(nameStr), qs).first;

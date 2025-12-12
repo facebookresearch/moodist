@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "commondefs.h"
 #include "synchronization.h"
 
 #include <utility>
@@ -22,12 +23,13 @@ struct FreeListTlsStorage {
 template<typename T>
 struct FreeListGlobalStorage {
   SpinMutex mutex;
-  std::vector<std::pair<T*, size_t>> lists;
+  std::vector<std::pair<T*, size_t>, InternalAllocator<std::pair<T*, size_t>>> lists;
   static FreeListGlobalStorage& get() {
-    static FreeListGlobalStorage* storage = new FreeListGlobalStorage();
+    static FreeListGlobalStorage* storage = internalNew<FreeListGlobalStorage>();
     return *storage;
   }
 };
+
 template<typename T>
 struct FreeList {
   template<typename S>

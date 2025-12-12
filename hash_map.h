@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "commondefs.h"
+
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -24,7 +26,7 @@
 namespace moodist {
 
 template<typename Key, typename Value, typename Hash = std::hash<Key>, typename Equal = std::equal_to<Key>,
-    typename Allocator = std::allocator<void>>
+    typename Allocator = InternalAllocator<void>>
 struct HashMap {
 private:
   struct PrimaryItem {

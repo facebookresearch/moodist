@@ -506,6 +506,107 @@ size_t moo_alloc_size(void* p) {
 
 } // namespace
 
+#ifdef MOODIST_USE_STDLIB_ALLOCATOR
+// Use stdlib malloc for ASan compatibility
+#include <malloc.h>
+[[gnu::malloc]]
+void* internalAlloc(size_t bytes) {
+  return std::malloc(bytes);
+}
+void internalFree(void* ptr) {
+  std::free(ptr);
+}
+size_t internalAllocSize(void* ptr) {
+  return malloc_usable_size(ptr);
+}
+void internalAllocatorSetNode(int) {
+  // No-op with stdlib malloc
+}
+#elif defined(MOODIST_ALLOCATOR_GUARDS)
+// Add guard bytes to detect buffer overflows
+static constexpr uint64_t GUARD_MAGIC = 0xDEADBEEFCAFEBABEULL;
+static constexpr size_t GUARD_SIZE = 64; // bytes of guard region
+
+struct alignas(std::max_align_t) GuardHeader {
+  size_t requestedSize;
+  uint64_t magic;
+};
+
+[[gnu::malloc]]
+void* internalAlloc(size_t bytes) {
+  size_t totalSize = sizeof(GuardHeader) + bytes + GUARD_SIZE;
+  void* raw;
+  {
+    std::lock_guard l(globals.mutex);
+    raw = moo_alloc(totalSize);
+  }
+  if (!raw) {
+    return nullptr;
+  }
+
+  GuardHeader* hdr = (GuardHeader*)raw;
+  hdr->requestedSize = bytes;
+  hdr->magic = GUARD_MAGIC;
+
+  // Fill trailing guard with magic pattern
+  char* userPtr = (char*)(hdr + 1);
+  uint64_t* guard = (uint64_t*)(userPtr + bytes);
+  for (size_t i = 0; i < GUARD_SIZE / sizeof(uint64_t); ++i) {
+    guard[i] = GUARD_MAGIC;
+  }
+
+  return userPtr;
+}
+
+void internalFree(void* ptr) {
+  if (!ptr) {
+    return;
+  }
+
+  GuardHeader* hdr = (GuardHeader*)ptr - 1;
+
+  // Check header magic
+  if (hdr->magic != GUARD_MAGIC) {
+    log.error("HEAP CORRUPTION: header magic corrupted! ptr=%p expected=%llx got=%llx\n", ptr,
+        (unsigned long long)GUARD_MAGIC, (unsigned long long)hdr->magic);
+    std::abort();
+  }
+
+  // Check trailing guard
+  char* userPtr = (char*)ptr;
+  uint64_t* guard = (uint64_t*)(userPtr + hdr->requestedSize);
+  for (size_t i = 0; i < GUARD_SIZE / sizeof(uint64_t); ++i) {
+    if (guard[i] != GUARD_MAGIC) {
+      log.error("HEAP CORRUPTION: buffer overflow detected! ptr=%p size=%zu guard[%zu]=%llx\n", ptr, hdr->requestedSize,
+          i, (unsigned long long)guard[i]);
+      std::abort();
+    }
+  }
+
+  std::lock_guard l(globals.mutex);
+  moo_free(hdr);
+}
+
+size_t internalAllocSize(void* ptr) {
+  if (!ptr) {
+    return 0;
+  }
+  GuardHeader* hdr = (GuardHeader*)ptr - 1;
+  size_t rawSize = moo_alloc_size(hdr);
+  // Return usable size minus our overhead
+  return rawSize - sizeof(GuardHeader) - GUARD_SIZE;
+}
+
+void internalAllocatorSetNode(int node) {
+  std::lock_guard l(globals.mutex);
+  if (internalAllocatorNode == node) {
+    return;
+  }
+  log.debug("allocator node changed from %d to %d\n", internalAllocatorNode, node);
+  internalAllocatorNode = node;
+  move_pages();
+}
+#else
 [[gnu::malloc]]
 void* internalAlloc(size_t bytes) {
   std::lock_guard l(globals.mutex);
@@ -528,5 +629,6 @@ void internalAllocatorSetNode(int node) {
   internalAllocatorNode = node;
   move_pages();
 }
+#endif
 
 } // namespace moodist

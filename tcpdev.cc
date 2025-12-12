@@ -320,7 +320,7 @@ struct TcpDevImpl {
 static_assert(std::is_standard_layout_v<TcpDevImpl>);
 
 void TcpDev::destroy() {
-  delete (TcpDevImpl*)impl;
+  internalDelete((TcpDevImpl*)impl);
 }
 
 void TcpDev::send(
@@ -342,7 +342,7 @@ void TcpDev::close() {
 
 UniqueImpl<TcpDev> makeTcpDev(Group* group, void* onReadHandle) {
   UniqueImpl<TcpDev> r;
-  r.u.impl = new TcpDevImpl(group, onReadHandle);
+  r.u.impl = internalNew<TcpDevImpl>(group, onReadHandle);
   return r;
 }
 

@@ -1099,7 +1099,7 @@ CudaAllocatorImpl* globalCudaAllocatorImpl = nullptr;
 
 // CoreApi function implementations
 CudaAllocatorImpl* createCudaAllocatorImpl() {
-  return new CudaAllocatorImpl();
+  return internalNew<CudaAllocatorImpl>();
 }
 
 void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
@@ -1156,7 +1156,7 @@ CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, 
   uintptr_t ptr = impl->allocate(alignedBytes, stream, impl->deviceIndex);
 
   // Create cleanup context
-  auto* ctx = new CudaAllocCleanupCtx{impl, ptr, alignedBytes, stream};
+  auto* ctx = internalNew<CudaAllocCleanupCtx>(impl, ptr, alignedBytes, stream);
 
   return CudaAllocation{ptr, ctx, impl->deviceIndex};
 }
@@ -1209,7 +1209,7 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
     impl->deallocate<false>(ctx->ptr, ctx->bytes, StreamArrayView{streams, 1});
   }
 
-  delete ctx;
+  internalDelete(ctx);
 }
 
 void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstream stream) {

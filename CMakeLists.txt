@@ -1,11 +1,16 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 
-project(moodist)
-
 project(moodist LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_C_STANDARD 23)
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_ALLOCATOR_GUARDS "Enable allocator guard bytes" OFF)
 set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3 -mtls-dialect=gnu2 -U_FORTIFY_SOURCE -fno-stack-protector")
+if(ENABLE_ASAN)
+  set(COMPILE_FLAGS "${COMPILE_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+endif()
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -ftemplate-backtrace-limit=0 ${COMPILE_FLAGS}")
 set(CMAKE_C_FLAGS
@@ -18,7 +23,7 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
-# set(CMAKE_SKIP_RPATH TRUE)  # Disabled to allow _C to find libmoodist.so via rpath
+set(CMAKE_SKIP_RPATH TRUE)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
@@ -72,14 +77,9 @@ message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
 # Core library uses system default ABI, wrapper matches PyTorch's ABI
 
 find_package(CUDAToolkit REQUIRED)
-
-message(STATUS "CUDA includes are ${CUDAToolkit_INCLUDE_DIRS}")
-
-message(STATUS "CUDAToolkit_LIBRARY_DIR is ${CUDAToolkit_LIBRARY_DIR}")
+message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
 
 find_library(CUDADEVRT libcudadevrt.a HINTS ${CUDAToolkit_LIBRARY_DIR})
-
-message(STATUS "CUDADEVRT is ${CUDADEVRT}")
 
 find_package(Threads REQUIRED)
 
@@ -141,35 +141,32 @@ set(MOODIST_PREBUILT_CORE "" CACHE FILEPATH "Path to pre-built libmoodist.so (sk
 
 # Core library sources - uses wrapper interfaces, no direct PyTorch
 set(core_sources
-  # Store and basic infrastructure:
-  store.cc
-  socket.cc
+  allgather.cc
+  allocator.cc
+  alltoall.cc
   async.cc
   connection.cc
-  internal_allocator.cc  # needed by Global template in common.h
-  numa.cc  # needed by internal_allocator.cc
-  serialize_object.cc  # serialization core (no torch dependency)
-  moodist_api.cc  # C API struct for _C wrapper
-  fmt/src/format.cc
-  # Group and collectives (torch dependency removed via wrapperAPI):
-  group.cc
-  setup_comms.cc
-  ipc_mapper.cc
+  cpu_allocator.cc
   cputhread.cc
+  group.cc
   ib_common.cc
-  allgather.cc
+  internal_allocator.cc
+  ipc_mapper.cc
   kernels.cc
+  moodist_api.cc
+  numa.cc
+  rdma_ib.cc
+  rdma_tcp.cc
   reduce_scatter.cc
   reduce_scatter_direct.cc
-  alltoall.cc
-  rdma_ib.cc
+  serialize_object.cc
+  setup_comms.cc
+  socket.cc
+  store.cc
   tcpdev.cc
-  rdma_tcp.cc
+  # Third-party:
+  fmt/src/format.cc
   ${rdma_sources}
-  cpu_allocator.cc  # Core allocation logic (torch parts ifdef'd out)
-  allocator.cc  # CUDA allocator core logic (torch parts ifdef'd out)
-  # queue.cc  # needs testing after group.cc works
-  # processgroup.cc  # uses torch - needs migration
 )
 
 if(MOODIST_PREBUILT_CORE)
@@ -198,25 +195,24 @@ else()
     ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
     ${Python_INCLUDE_DIRS}  # For serialize_object.cc
   )
-  target_compile_definitions(moodist PRIVATE CUDADEVRT_PATH="${CUDADEVRT}")
-  target_compile_definitions(moodist PRIVATE _STATIC_LIBRARY_BUILD_)
+  target_compile_definitions(moodist PRIVATE
+    CUDADEVRT_PATH="${CUDADEVRT}"
+    _STATIC_LIBRARY_BUILD_
+    $<$<BOOL:${ENABLE_ALLOCATOR_GUARDS}>:MOODIST_ALLOCATOR_GUARDS>
+  )
   set_property(TARGET moodist PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# Wrapper library sources - implements PyTorch wrappers and pybind
-# MINIMAL BUILD: Just store wrapper and pybind for now
+# Wrapper library - compiled per PyTorch version, uses dlopen for core
 set(wrapper_sources
-  # torch_wrappers.cc  # Not needed for store-only build
   pybind.cc
   store_wrapper.cc
-  serialize_wrapper.cc  # torch::Tensor wrapper for serialize/deserialize
-  moodist_loader.cc  # dlopen loader for libmoodist.so
-  allocator_wrapper.cc  # CUDA allocator wrapper (CUDAAllocator class)
-  cpu_allocator_wrapper.cc  # CPU allocator wrapper (CpuAllocator class)
+  serialize_wrapper.cc
+  moodist_loader.cc
+  allocator_wrapper.cc
+  cpu_allocator_wrapper.cc
 )
 
-# Wrapper library - compiled per PyTorch version
-# Does NOT link directly to moodist - uses dlopen instead
 pybind11_add_module(_C ${wrapper_sources})
 target_link_libraries(_C PRIVATE
   ${TorchPath}/lib/libtorch_python.so
@@ -236,8 +232,6 @@ target_compile_definitions(_C PRIVATE
 )
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-
-# No RPATH needed - we use dlopen with explicit path lookup
 
 # Ensure moodist is built when building _C (even though we don't link directly)
 if(NOT MOODIST_PREBUILT_CORE)

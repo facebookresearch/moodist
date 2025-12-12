@@ -19,7 +19,7 @@
 
 namespace moodist {
 
-template<typename T, typename Allocator = std::allocator<T>>
+template<typename T, typename Allocator = InternalAllocator<T>>
 struct SimpleVector {
   T* beginptr = nullptr;
   size_t msize = 0;

@@ -1036,7 +1036,7 @@ struct PollThread {
     return impl->addedInPoll;
   }
 };
-PollThread* pollThread = new PollThread();
+PollThread* pollThread = internalNew<PollThread>();
 
 void add(std::shared_ptr<SocketImpl> impl) {
   pollThread->add(impl);

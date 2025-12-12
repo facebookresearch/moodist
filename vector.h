@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "commondefs.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +19,7 @@
 
 namespace moodist {
 
-template<typename T, typename Allocator = std::allocator<T>>
+template<typename T, typename Allocator = InternalAllocator<T>>
 struct Vector {
   T* storagebegin = nullptr;
   T* storageend = nullptr;

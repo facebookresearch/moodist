@@ -408,7 +408,7 @@ struct PollThread {
     callbacksContainer.erase(i);
   }
 };
-PollThread* pollThread = new PollThread();
+PollThread* pollThread = internalNew<PollThread>();
 
 void add(int fd, Function<void()> callback) {
   pollThread->add(fd, std::move(callback));

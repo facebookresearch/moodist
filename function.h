@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "commondefs.h"
 #include "freelist.h"
 
 #include <atomic>
@@ -58,7 +59,7 @@ struct TemplatedStorage : TemplatedStorageObject<F> {
       return r;
     } else {
       [[unlikely]];
-      r = new TemplatedStorage();
+      r = internalNew<TemplatedStorage>();
       auto* ops = &OpsConstructor<F, R, Args...>::value;
       r->ops = ops;
       r->callPtr = (void*)ops->call;

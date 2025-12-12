@@ -32,6 +32,41 @@ void internalFree(void* ptr);
 void internalAllocatorSetNode(int node);
 size_t internalAllocSize(void* ptr);
 
+template<typename T, typename... Args>
+T* internalNew(Args&&... args) {
+  void* mem = internalAlloc(sizeof(T));
+  if (!mem) {
+    throw std::bad_alloc();
+  }
+  return new (mem) T(std::forward<Args>(args)...);
+}
+
+template<typename T>
+void internalDelete(T* ptr) {
+  if (ptr) {
+    ptr->~T();
+    internalFree(ptr);
+  }
+}
+
+template<typename T>
+struct InternalAllocator {
+  typedef T value_type;
+  InternalAllocator() = default;
+  template<class U>
+  constexpr InternalAllocator(const InternalAllocator<U>&) noexcept {}
+  T* allocate(size_t n) {
+    void* r = internalAlloc(sizeof(T) * n);
+    if (!r) {
+      throw std::bad_alloc();
+    }
+    return (T*)r;
+  }
+  void deallocate(T* p, std::size_t) noexcept {
+    internalFree(p);
+  }
+};
+
 struct CudaError : std::runtime_error {
   CUresult error;
   CudaError(CUresult error, const std::string& message) : error(error), std::runtime_error(message) {}

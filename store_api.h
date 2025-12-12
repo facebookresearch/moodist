@@ -29,8 +29,7 @@ void storeSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, 
     const std::vector<uint8_t>& value);
 
 // Get a value by key
-std::vector<uint8_t> storeGet(
-    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
+std::vector<uint8_t> storeGet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
 
 // Check if keys exist
 bool storeCheck(
