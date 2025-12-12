@@ -25,13 +25,13 @@ static CoreApi coreApi = {
     .magic = kMoodistBuildMagic,
 
     // Store functions
-    .createStoreImpl = createStoreImpl,
-    .storeImplAddRef = storeImplAddRef,
-    .storeImplDecRef = storeImplDecRef,
-    .storeImplSet = storeImplSet,
-    .storeImplGet = storeImplGet,
-    .storeImplCheck = storeImplCheck,
-    .storeImplWait = storeImplWait,
+    .createStore = createStore,
+    .storeAddRef = storeAddRef,
+    .storeDecRef = storeDecRef,
+    .storeSet = storeSet,
+    .storeGet = storeGet,
+    .storeCheck = storeCheck,
+    .storeWait = storeWait,
 
     // Serialize functions
     .serializeObjectImpl = serializeObjectImpl,

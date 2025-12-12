@@ -115,16 +115,16 @@ struct CoreApi {
   uint64_t magic;
 
   // Store functions
-  StoreHandle* (*createStoreImpl)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
-  void (*storeImplAddRef)(StoreHandle* handle);
-  void (*storeImplDecRef)(StoreHandle* handle);
-  void (*storeImplSet)(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
+  StoreHandle* (*createStore)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+  void (*storeAddRef)(StoreHandle* handle);
+  void (*storeDecRef)(StoreHandle* handle);
+  void (*storeSet)(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
       const std::vector<uint8_t>& value);
-  std::vector<uint8_t> (*storeImplGet)(
+  std::vector<uint8_t> (*storeGet)(
       StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
-  bool (*storeImplCheck)(
+  bool (*storeCheck)(
       StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
-  void (*storeImplWait)(
+  void (*storeWait)(
       StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions

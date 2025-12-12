@@ -14,27 +14,27 @@ TcpStore::TcpStore(StoreHandle* handle) : handle(handle) {
 
 TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
     std::chrono::steady_clock::duration timeout) {
-  handle = coreApi.createStoreImpl(hostname, port, key, worldSize, rank);
+  handle = coreApi.createStore(hostname, port, key, worldSize, rank);
   timeout_ = std::chrono::ceil<std::chrono::milliseconds>(timeout);
 }
 
 TcpStore::~TcpStore() {
-  coreApi.storeImplDecRef(handle);
+  coreApi.storeDecRef(handle);
 }
 
 c10::intrusive_ptr<c10d::Store> TcpStore::clone() {
-  coreApi.storeImplAddRef(handle);
+  coreApi.storeAddRef(handle);
   auto cloned = c10::make_intrusive<TcpStore>(handle);
   cloned->timeout_ = timeout_;
   return cloned;
 }
 
 void TcpStore::set(const std::string& key, const std::vector<uint8_t>& value) {
-  coreApi.storeImplSet(handle, timeout_, key, value);
+  coreApi.storeSet(handle, timeout_, key, value);
 }
 
 std::vector<uint8_t> TcpStore::get(const std::string& key) {
-  return coreApi.storeImplGet(handle, timeout_, key);
+  return coreApi.storeGet(handle, timeout_, key);
 }
 
 int64_t TcpStore::add(const std::string& key, int64_t value) {
@@ -52,7 +52,7 @@ bool TcpStore::check(const std::vector<std::string>& keys) {
   for (const auto& k : keys) {
     keyViews.push_back(k);
   }
-  return coreApi.storeImplCheck(handle, timeout_, keyViews);
+  return coreApi.storeCheck(handle, timeout_, keyViews);
 }
 
 int64_t TcpStore::getNumKeys() {
@@ -65,7 +65,7 @@ void TcpStore::wait(const std::vector<std::string>& keys) {
   for (const auto& k : keys) {
     keyViews.push_back(k);
   }
-  coreApi.storeImplWait(handle, timeout_, keyViews);
+  coreApi.storeWait(handle, timeout_, keyViews);
 }
 
 void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) {
@@ -74,7 +74,7 @@ void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::mil
   for (const auto& k : keys) {
     keyViews.push_back(k);
   }
-  coreApi.storeImplWait(handle, timeout, keyViews);
+  coreApi.storeWait(handle, timeout, keyViews);
 }
 
 } // namespace moodist

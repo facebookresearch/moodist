@@ -199,8 +199,6 @@ Indestructible<Vector<StoreImpl*>> activeStores;
 struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   Vector<std::shared_ptr<Socket>> udps;
 
-  std::atomic_size_t refcount = 0;
-
   std::string hostname;
   int port;
   uint32_t worldSize;
@@ -2177,38 +2175,40 @@ struct Dtor {
 // Opaque handle for the API - wraps shared_ptr to allow StoreImpl to outlive user refs
 struct StoreHandle {
   std::shared_ptr<StoreImpl> impl;
+  std::atomic_size_t refcount = 0;
 };
 
-StoreHandle* createStoreImpl(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
+StoreHandle* createStore(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
   auto impl = std::make_shared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
   impl->init();
-  impl->refcount = 1;
-  return new StoreHandle{std::move(impl)};
+  auto* handle = new StoreHandle{std::move(impl)};
+  handle->refcount = 1;
+  return handle;
 }
 
-void storeImplAddRef(StoreHandle* handle) {
-  ++handle->impl->refcount;
+void storeAddRef(StoreHandle* handle) {
+  ++handle->refcount;
 }
 
-void storeImplDecRef(StoreHandle* handle) {
-  if (--handle->impl->refcount == 0) {
+void storeDecRef(StoreHandle* handle) {
+  if (--handle->refcount == 0) {
     handle->impl->shutdown();
     handle->impl->close();
     delete handle;
   }
 }
 
-void storeImplSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
+void storeSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
     const std::vector<uint8_t>& value) {
   handle->impl->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeImplGet(
+std::vector<uint8_t> storeGet(
     StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key) {
   return handle->impl->get(timeout, key);
 }
 
-bool storeImplCheck(
+bool storeCheck(
     StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
@@ -2218,7 +2218,7 @@ bool storeImplCheck(
   return handle->impl->check(timeout, keysVec);
 }
 
-void storeImplWait(
+void storeWait(
     StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
