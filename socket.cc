@@ -17,6 +17,7 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -945,31 +946,62 @@ namespace poll {
 struct PollThread {
   ~PollThread() {
     terminate = true;
+    wake();
     if (thread.joinable()) {
       thread.join();
     }
   }
   std::atomic_bool terminate = false;
+  std::atomic_bool terminateWhenEmpty = false;
   std::once_flag flag;
   std::thread thread;
   int fd = -1;
+  int wakefd = -1;
   std::atomic_bool anyDead = false;
   std::mutex mutex;
   std::vector<std::shared_ptr<SocketImpl>> activeList;
   std::vector<std::shared_ptr<SocketImpl>> deadList;
 
+  void wake() {
+    if (wakefd != -1) {
+      uint64_t val = 1;
+      ::write(wakefd, &val, sizeof(val));
+    }
+  }
+
+  void tryTerminate() {
+    // Called under mutex - check if we should terminate
+    if (terminateWhenEmpty && activeList.empty()) {
+      terminate = true;
+      wake();
+    }
+  }
+
   void entry() {
     std::array<epoll_event, 1024> events;
+    int timeout = 250;
 
-    while (!terminate.load(std::memory_order_relaxed)) {
-      int n = epoll_wait(fd, events.data(), events.size(), 250);
+    while (true) {
+      int n = epoll_wait(fd, events.data(), events.size(), timeout);
       if (n < 0) {
         if (errno == EINTR) {
           continue;
         }
         throw std::system_error(errno, std::generic_category(), "epoll_wait");
       }
+
+      // Use zero timeout after full batch to quickly drain pending events.
+      // This matters because we only clear deadList when n < events.size()
+      // (to guarantee no more events for removed sockets), so if an eventfd
+      // wake coincides with exactly 1024 events, we'd otherwise wait 250ms.
+      timeout = ((size_t)n == events.size()) ? 0 : 250;
+
       for (int i = 0; i != n; ++i) {
+        if (events[i].data.ptr == nullptr) {
+          uint64_t val;
+          ::read(wakefd, &val, sizeof(val));
+          continue;
+        }
         if (events[i].events & (EPOLLIN | EPOLLERR)) {
           SocketImpl* impl = (SocketImpl*)events[i].data.ptr;
           if (++impl->readTriggerCount == 1) {
@@ -984,22 +1016,41 @@ struct PollThread {
         }
       }
 
-      if (n < events.size() && anyDead.load(std::memory_order_relaxed)) {
-        anyDead = false;
-        std::lock_guard l(mutex);
-        deadList.clear();
+      if ((size_t)n < events.size()) {
+        if (anyDead.load(std::memory_order_relaxed)) {
+          anyDead = false;
+          std::lock_guard l(mutex);
+          deadList.clear();
+        }
+        if (terminate.load(std::memory_order_relaxed)) {
+          break;
+        }
       }
     }
 
-    close(fd);
+    ::close(wakefd);
+    ::close(fd);
   }
 
   void add(std::shared_ptr<SocketImpl> impl) {
     std::lock_guard l(mutex);
+    if (terminate) {
+      return;
+    }
     std::call_once(flag, [&] {
       fd = epoll_create1(EPOLL_CLOEXEC);
       if (fd == -1) {
         throw std::system_error(errno, std::generic_category(), "epoll_create1");
+      }
+      wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+      if (wakefd == -1) {
+        throw std::system_error(errno, std::generic_category(), "eventfd");
+      }
+      epoll_event we;
+      we.data.ptr = nullptr;
+      we.events = EPOLLIN;
+      if (epoll_ctl(fd, EPOLL_CTL_ADD, wakefd, &we)) {
+        throw std::system_error(errno, std::generic_category(), "epoll_ctl wakefd");
       }
       thread = std::thread([&] {
         async::setCurrentThreadName("moo/socket epoll");
@@ -1026,7 +1077,9 @@ struct PollThread {
         anyDead = true;
         deadList.push_back(std::move(*i));
         activeList.erase(i);
-        break;
+        wake();
+        tryTerminate();
+        return;
       }
     }
   }
@@ -1037,6 +1090,14 @@ struct PollThread {
   }
 };
 PollThread* pollThread = internalNew<PollThread>();
+
+struct Dtor {
+  ~Dtor() {
+    std::lock_guard l(pollThread->mutex);
+    pollThread->terminateWhenEmpty = true;
+    pollThread->tryTerminate();
+  }
+} dtor;
 
 void add(std::shared_ptr<SocketImpl> impl) {
   pollThread->add(impl);
