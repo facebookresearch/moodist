@@ -325,11 +325,16 @@ def main():
         sys.exit(exit_code)
 
     # No timeout - run tests directly
-    ctx = create_context_from_env()
     log_file = None
 
+    # Set up per-rank logging BEFORE creating context (which creates barrier store)
     if per_rank_logs:
-        log_file = setup_per_rank_logging(ctx.rank, "test_logs")
+        rank = get_rank_from_env()
+        log_file = setup_per_rank_logging(rank, "test_logs")
+
+    ctx = create_context_from_env()
+
+    if per_rank_logs:
         ctx.per_rank_logs = True
 
     if ctx.rank == 0 or per_rank_logs:
