@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "function.h"
+#include "shared_ptr.h"
 #include "vector.h"
 
 #include "fmt/printf.h"
@@ -36,7 +37,7 @@ struct CachedReader;
 
 struct SocketImpl;
 struct Socket {
-  std::shared_ptr<SocketImpl> impl;
+  SharedPtr<SocketImpl> impl;
   Socket();
   Socket(const Socket&) = delete;
   Socket(Socket&& n) noexcept;

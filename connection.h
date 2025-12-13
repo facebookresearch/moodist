@@ -3,12 +3,12 @@
 #pragma once
 
 #include "buffer.h"
+#include "shared_ptr.h"
 #include "socket.h"
 #include "synchronization.h"
 
 #include "fmt/printf.h"
 
-#include <memory>
 #include <string_view>
 
 namespace moodist {
@@ -22,8 +22,8 @@ struct UnixContext {
   bool valid() {
     return true;
   }
-  std::shared_ptr<Listener> listen(std::string_view addr);
-  std::shared_ptr<Connection> connect(std::string_view addr);
+  SharedPtr<Listener> listen(std::string_view addr);
+  SharedPtr<Connection> connect(std::string_view addr);
   static bool isReachable(std::string_view networkKey, std::string_view address);
   static std::string getNetworkKey();
 };
@@ -32,13 +32,14 @@ struct TcpContext {
   bool valid() {
     return true;
   }
-  std::shared_ptr<Listener> listen(std::string_view addr);
-  std::shared_ptr<Connection> connect(std::string_view addr);
+  SharedPtr<Listener> listen(std::string_view addr);
+  SharedPtr<Connection> connect(std::string_view addr);
   static bool isReachable(std::string_view networkKey, std::string_view address);
   static std::string getNetworkKey();
 };
 
-struct Listener : std::enable_shared_from_this<Listener> {
+struct Listener {
+  std::atomic_size_t refcount = 0;
   Socket socket;
   Listener(Socket socket) : socket(std::move(socket)) {}
 
@@ -46,15 +47,17 @@ struct Listener : std::enable_shared_from_this<Listener> {
     socket.close();
   }
 
-  void accept(Function<void(Error*, std::shared_ptr<Connection>)> callback);
+  void accept(Function<void(Error*, SharedPtr<Connection>)> callback);
 
   std::vector<std::string> localAddresses() const;
 };
 
-struct Connection : std::enable_shared_from_this<Connection> {
+struct Connection {
+  std::atomic_size_t refcount = 0;
+  uint64_t id;
   Socket socket;
 
-  Connection(Socket socket) : socket(std::move(socket)) {}
+  Connection(Socket socket);
   ~Connection();
 
   void close();

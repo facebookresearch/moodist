@@ -196,8 +196,12 @@ Indestructible<SpinMutex> activeStoresMutex;
 Indestructible<Vector<StoreImpl*>> activeStores;
 } // namespace
 
-struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
-  Vector<std::shared_ptr<Socket>> udps;
+static std::atomic<uint64_t> nextStoreId{1};
+
+struct StoreImpl {
+  std::atomic_size_t refcount = 0;
+  uint64_t id = nextStoreId++;
+  Vector<Socket> udps;
 
   std::string hostname;
   int port;
@@ -221,7 +225,8 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   Vector<Callback> queuedCallbacks;
 
   struct ConnectionInfo {
-    std::shared_ptr<Connection> connection;
+    std::atomic_size_t refcount = 0;
+    SharedPtr<Connection> connection;
     std::chrono::steady_clock::time_point lastReceive;
     uint32_t sourceRank = -1;
 
@@ -230,8 +235,8 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     }
   };
 
-  Vector<std::shared_ptr<Listener>> listeners;
-  Vector<std::shared_ptr<ConnectionInfo>> floatingConnections;
+  Vector<SharedPtr<Listener>> listeners;
+  Vector<SharedPtr<ConnectionInfo>> floatingConnections;
 
   std::atomic_bool connectAcked = false;
   int connectCounter = 0;
@@ -265,7 +270,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
     std::chrono::steady_clock::time_point lastConnectEdge;
 
-    Vector<std::shared_ptr<ConnectionInfo>> tcpconnections;
+    Vector<SharedPtr<ConnectionInfo>> tcpconnections;
     uint32_t incomingSeq = 0;
     uint32_t outgoingSeq = 0;
 
@@ -639,7 +644,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
                                                          .networkKey = ri->networkKey,
                                                          .addresses = std::move(addresses),
                                                      });
-    auto* sock = ri2->udpSocket ? ri2->udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
+    auto* sock = ri2->udpSocket ? ri2->udpSocket : &udps.at(random<size_t>(0, udps.size() - 1));
     int r = ::sendto(
         sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)ri2->udpaddr.data(), ri2->udpaddr.size());
     auto t = std::chrono::milliseconds(2000);
@@ -680,7 +685,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
                                                                .key = storekey,
                                                                .sourceRank = rank,
                                                            });
-    ::sendto(udps.at(random<size_t>(0, udps.size() - 1))->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+    ::sendto(udps.at(random<size_t>(0, udps.size() - 1)).nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
         (sockaddr*)addr.data(), addr.size());
 
     // Schedule retry if not verified after some attempts
@@ -729,7 +734,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     }
 
     if (!sock) {
-      sock = udps.at(random<size_t>(0, udps.size() - 1)).get();
+      sock = &udps.at(random<size_t>(0, udps.size() - 1));
     }
 
     auto buf = serializeToBuffer(signatureDiagnosticInfo, DiagnosticInfoMessage{
@@ -782,11 +787,11 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   bool listen(int port, bool ipv6) {
-    auto socket = std::make_shared<Socket>(Socket::Udp(ipv6));
-    if (!socket->bind(port)) {
+    Socket socket = Socket::Udp(ipv6);
+    if (!socket.bind(port)) {
       return false;
     }
-    // Callback will be set up in init() after shared_ptr is ready
+    // Callback will be set up in init() after construction is complete
     udps.push_back(std::move(socket));
     return true;
   }
@@ -839,7 +844,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     futexWakeAll(&anyQueued);
   }
 
-  void onreadtcp(BufferHandle data, const std::shared_ptr<ConnectionInfo>& ci) {
+  void onreadtcp(BufferHandle data, const SharedPtr<ConnectionInfo>& ci) {
     size_t n = data->size();
     const char* buf = (const char*)data->data();
 
@@ -887,7 +892,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
                                                                         .sourceRank = rank,
                                                                         .edge = msg.sourceRank,
                                                                     });
-                auto* sock = pi.udpSocket ? pi.udpSocket : udps.at(random<size_t>(0, udps.size() - 1)).get();
+                auto* sock = pi.udpSocket ? pi.udpSocket : &udps.at(random<size_t>(0, udps.size() - 1));
                 ::sendto(sock->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL, (sockaddr*)pi.udpaddr.data(),
                     pi.udpaddr.size());
 
@@ -1295,7 +1300,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
     // Collect our own UDP addresses for diagnostic purposes
     for (auto& udp : udps) {
-      for (auto& addr : udp->localAddresses()) {
+      for (auto& addr : udp.localAddresses()) {
         myUdpAddresses.push_back(addr);
       }
     }
@@ -1332,25 +1337,26 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
       std::lock_guard l(*activeStoresMutex);
       activeStores->push_back(this);
     }
+    log.debug("Store #%lu created (rank=%d, worldSize=%d)\n", id, rank, worldSize);
   }
 
-  // Called after shared_ptr is set up to initialize callbacks that need shared_from_this()
+  // Called after SharedPtr is set up to initialize callbacks that need share(this)
   void init() {
     // Start the thread with a shared_ptr to self
-    thread = std::thread([self = shared_from_this()]() {
+    thread = std::thread([self = share(this)]() {
       self->threadEntry();
     });
 
     // Set up UDP socket callbacks
     for (auto& socket : udps) {
-      socket->setOnRead([self = shared_from_this(), s = socket.get()](Error* e) {
+      socket.setOnRead([self = share(this), s = &socket](Error* e) {
         self->onreadudp(s, e);
       });
     }
 
     // Set up listener accept callbacks
     for (auto& listener : listeners) {
-      listener->accept([self = shared_from_this()](Error* error, std::shared_ptr<Connection> connection) {
+      listener->accept([self = share(this)](Error* error, SharedPtr<Connection> connection) {
         if (error) {
           return;
         }
@@ -1380,6 +1386,8 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   ~StoreImpl() {
+    log.debug("Store #%lu destroyed (rank=%d, worldSize=%d)\n", id, rank, worldSize);
+
     {
       std::lock_guard l(*activeStoresMutex);
       // Thread has already exited (threadEntry holds self, so destructor only runs after thread exits).
@@ -1437,7 +1445,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     closeAll(listeners);
     closeAll(floatingConnections);
     while (true) {
-      Vector<std::shared_ptr<ConnectionInfo>> allconnections;
+      Vector<SharedPtr<ConnectionInfo>> allconnections;
       std::unique_lock l(mutex);
       for (size_t i : range(edgePeerCount)) {
         auto& pi = edgePeers[i].info;
@@ -1453,8 +1461,9 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
       closeAll(allconnections);
     }
     for (auto& v : udps) {
-      v->close();
+      v.close();
     }
+    log.debug("Store #%lu close: udps.size()=%zu after closing\n", id, udps.size());
     {
       std::lock_guard l(queuedCallbacksMutex);
       queuedCallbacks.clear();
@@ -1468,6 +1477,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     while (true) {
       switch (closeState) {
       case CloseState::NotStarted:
+        log.debug("Store #%lu shutdown starting (rank=%d)\n", id, rank);
         shuttingDown = true;
         if (!exitSourceRank) {
           exitSourceRank = rank;
@@ -1509,12 +1519,14 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
       case CloseState::WaitExitAck:
         if (allPeersExitAcked() || now >= shutdownDeadline) {
+          log.debug("Store #%lu shutdown completed (rank=%d)\n", id, rank);
           closeState = CloseState::Done;
           closed = true;
           l.unlock();
           anyQueued = 1;
           futexWakeAll(&anyQueued);
           closeResources();
+          log.debug("Store #%lu close completed (rank=%d)\n", id, rank);
           return;
         }
         break;
@@ -1529,7 +1541,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     l.unlock();
     auto nextTime = now + shutdownBackoff;
     shutdownBackoff = std::min(shutdownBackoff * 2, std::chrono::milliseconds(64));
-    addCallback(nextTime, [self = shared_from_this()] {
+    addCallback(nextTime, [self = share(this)] {
       self->runCloseStateMachine();
     });
   }
@@ -1542,7 +1554,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
       }
       shuttingDown = true;
     }
-    addCallback(std::chrono::steady_clock::now(), [self = shared_from_this()] {
+    addCallback(std::chrono::steady_clock::now(), [self = share(this)] {
       self->runCloseStateMachine();
     });
   }
@@ -1601,14 +1613,14 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     });
   }
 
-  void addConnection(std::shared_ptr<Connection> connection) {
+  void addConnection(SharedPtr<Connection> connection) {
     CHECK(!closed);
-    auto ci = std::make_shared<ConnectionInfo>();
+    auto ci = makeShared<ConnectionInfo>();
     ci->connection = connection;
     ci->lastReceive = std::chrono::steady_clock::now();
     floatingConnections.push_back(ci);
     // log.info("add new connection - %d floating connections\n", floatingConnections.size());
-    connection->read([self = shared_from_this(), ci](Error* e, BufferHandle data) {
+    connection->read([self = share(this), ci](Error* e, BufferHandle data) {
       if (!e) {
         self->addCallback(std::chrono::steady_clock::now(), [self, data = std::move(data), ci]() mutable {
           self->onreadtcp(std::move(data), ci);
@@ -1654,7 +1666,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
       if (connectAcked) {
         return;
       }
-      udps.at(random<size_t>(0, udps.size() - 1))->resolve(hostname, port, [this](void* addr, size_t addrlen) {
+      udps.at(random<size_t>(0, udps.size() - 1)).resolve(hostname, port, [this](void* addr, size_t addrlen) {
         Vector<char> addrbuf;
         addrbuf.resize(addrlen);
         std::memcpy(addrbuf.data(), addr, addrlen);
@@ -1693,7 +1705,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
 
               // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
 
-              ::sendto(udps[random<size_t>(0, udps.size() - 1)]->nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+              ::sendto(udps[random<size_t>(0, udps.size() - 1)].nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
                   (sockaddr*)addrbuf.data(), addrbuf.size());
             });
           }
@@ -1731,6 +1743,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   std::atomic_uint32_t nextId = 1;
 
   struct Wait {
+    std::atomic_size_t refcount = 0;
     bool b = false;
     std::vector<uint8_t> data;
     std::atomic_uint32_t futex = 0;
@@ -1776,7 +1789,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     }
   };
 
-  HashMap<uint32_t, std::shared_ptr<Wait>> waits;
+  HashMap<uint32_t, SharedPtr<Wait>> waits;
 
   HashMap<std::string, std::vector<uint8_t>> store;
   HashMap<std::string, Vector<Function<void(const std::vector<uint8_t>&)>>> storeWaiters;
@@ -2097,7 +2110,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     }
   }
 
-  void exitWait(std::shared_ptr<Wait>& w) {
+  void exitWait(SharedPtr<Wait>& w) {
     std::lock_guard l(w->mutex);
     w->error = true;
     if (exitSourceRank && exitSourceRank != rank) {
@@ -2110,7 +2123,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   template<typename... Args>
-  std::shared_ptr<Wait> doWaitOp(
+  SharedPtr<Wait> doWaitOp(
       std::chrono::steady_clock::duration timeout, uint8_t messageType, std::string_view key, const Args&... args) {
     uint32_t id = nextId.fetch_add(1);
     uint32_t r = storeRank(key);
@@ -2119,7 +2132,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     CHECK(edge != worldSize);
     CHECK(edge != -1);
 
-    auto w = std::make_shared<Wait>();
+    auto w = makeShared<Wait>();
     // Set diagnostic info for better timeout error messages
     w->store = this;
     w->targetRank = r;
@@ -2173,7 +2186,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
     return w->b;
   }
   bool check(std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
-    Vector<std::shared_ptr<Wait>> v;
+    Vector<SharedPtr<Wait>> v;
     for (auto& k : keys) {
       v.push_back(doWaitOp(timeout, messageCheck, k));
     }
@@ -2189,7 +2202,7 @@ struct StoreImpl : std::enable_shared_from_this<StoreImpl> {
   }
 
   void wait(std::chrono::steady_clock::duration timeout, const std::vector<std::string>& keys) {
-    Vector<std::shared_ptr<Wait>> v;
+    Vector<SharedPtr<Wait>> v;
     for (auto& k : keys) {
       v.push_back(doWaitOp(timeout, messageWait, k));
     }
@@ -2226,14 +2239,14 @@ struct Dtor {
 
 } // namespace
 
-// Opaque handle for the API - wraps shared_ptr to allow StoreImpl to outlive user refs
+// Opaque handle for the API - wraps SharedPtr to allow StoreImpl to outlive user refs
 struct StoreHandle {
-  std::shared_ptr<StoreImpl> impl;
+  SharedPtr<StoreImpl> impl;
   std::atomic_size_t refcount = 0;
 };
 
 StoreHandle* createStore(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
-  auto impl = std::make_shared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
+  auto impl = makeShared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
   impl->init();
   auto* handle = internalNew<StoreHandle>(std::move(impl));
   handle->refcount = 1;
@@ -2247,6 +2260,7 @@ void storeAddRef(StoreHandle* handle) {
 void storeDecRef(StoreHandle* handle) {
   if (--handle->refcount == 0) {
     handle->impl->close();
+    log.debug("Store #%lu storeDecRef: refcount=%zu before delete\n", handle->impl->id, handle->impl->refcount.load());
     internalDelete(handle);
   }
 }

@@ -11,6 +11,7 @@
 #include <nvrtc.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 // Marks functions that are exported across the core/wrapper library boundary.
@@ -34,9 +35,25 @@ size_t internalAllocSize(void* ptr);
 
 template<typename T, typename... Args>
 T* internalNew(Args&&... args) {
-  void* mem = internalAlloc(sizeof(T));
-  if (!mem) {
-    throw std::bad_alloc();
+  void* mem;
+  if constexpr (alignof(T) > alignof(std::max_align_t)) {
+    // Over-allocate to ensure alignment and store original pointer
+    size_t extra = alignof(T) + sizeof(void*);
+    void* raw = internalAlloc(sizeof(T) + extra);
+    if (!raw) {
+      throw std::bad_alloc();
+    }
+    // Calculate aligned address after reserving space for the raw pointer
+    uintptr_t rawAddr = (uintptr_t)raw + sizeof(void*);
+    uintptr_t alignedAddr = (rawAddr + alignof(T) - 1) & ~(alignof(T) - 1);
+    mem = (void*)alignedAddr;
+    // Store original pointer just before the aligned pointer
+    ((void**)mem)[-1] = raw;
+  } else {
+    mem = internalAlloc(sizeof(T));
+    if (!mem) {
+      throw std::bad_alloc();
+    }
   }
   return new (mem) T(std::forward<Args>(args)...);
 }
@@ -44,8 +61,19 @@ T* internalNew(Args&&... args) {
 template<typename T>
 void internalDelete(T* ptr) {
   if (ptr) {
+    void* toFree;
+    if constexpr (alignof(T) > alignof(std::max_align_t)) {
+      toFree = ((void**)ptr)[-1];
+    } else {
+      toFree = ptr;
+    }
+    struct Guard {
+      void* p;
+      ~Guard() {
+        internalFree(p);
+      }
+    } guard{toFree};
     ptr->~T();
-    internalFree(ptr);
   }
 }
 

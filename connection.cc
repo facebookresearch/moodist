@@ -3,6 +3,7 @@
 #include "connection.h"
 #include "serialization.h"
 
+#include <atomic>
 #include <cstdio>
 #include <limits.h>
 #include <sys/uio.h>
@@ -10,12 +11,16 @@
 
 namespace moodist {
 
-void Listener::accept(Function<void(Error*, std::shared_ptr<Connection>)> callback) {
-  socket.accept([self = shared_from_this(), callback = std::move(callback)](Error* error, Socket socket) {
+static std::atomic<uint64_t> nextConnectionId{1};
+
+Connection::Connection(Socket socket) : id(nextConnectionId++), socket(std::move(socket)) {}
+
+void Listener::accept(Function<void(Error*, SharedPtr<Connection>)> callback) {
+  socket.accept([self = share(this), callback = std::move(callback)](Error* error, Socket socket) {
     if (error) {
       callback(error, nullptr);
     } else {
-      auto connection = std::make_shared<Connection>(std::move(socket));
+      auto connection = makeShared<Connection>(std::move(socket));
       callback(nullptr, std::move(connection));
     }
   });
@@ -123,7 +128,7 @@ template void Connection::writefd(SharedBufferHandle, int);
 
 namespace {
 struct ReadState {
-  std::shared_ptr<Connection> connection;
+  SharedPtr<Connection> connection;
   int state = 0;
   bool recvFd = false;
   int fd = -1;
@@ -132,9 +137,9 @@ struct ReadState {
   BufferHandle buffer;
   CachedReader reader;
   Function<void()> readMoreCallback;
-  ReadState(std::shared_ptr<Connection> connection, Function<void(Error*, BufferHandle)> callback)
+  ReadState(SharedPtr<Connection> connection, Function<void(Error*, BufferHandle)> callback)
       : connection(std::move(connection)), reader(&this->connection->socket), callback(std::move(callback)) {}
-  ReadState(std::shared_ptr<Connection> connection, Function<void(Error*, BufferHandle, int)> fdcallback)
+  ReadState(SharedPtr<Connection> connection, Function<void(Error*, BufferHandle, int)> fdcallback)
       : connection(std::move(connection)), reader(&this->connection->socket), fdcallback(std::move(fdcallback)) {}
   void callError(Error* error) {
     if (fdcallback) {
@@ -230,11 +235,11 @@ bool Connection::closed() const {
 }
 
 void Connection::read(Function<void(Error*, BufferHandle)> callback) {
-  socket.setOnRead(ReadState(shared_from_this(), std::move(callback)));
+  socket.setOnRead(ReadState(share(this), std::move(callback)));
 }
 
 void Connection::readfd(Function<void(Error*, BufferHandle, int)> callback) {
-  socket.setOnRead(ReadState(shared_from_this(), std::move(callback)));
+  socket.setOnRead(ReadState(share(this), std::move(callback)));
 }
 
 void Connection::inread_iovec(void* ptr, size_t bytes, Function<void()> callback) {
@@ -255,28 +260,30 @@ std::string Connection::remoteAddress() const {
   return socket.remoteAddress();
 }
 
-Connection::~Connection() {}
+Connection::~Connection() {
+  log.debug("Connection #%lu destroyed\n", id);
+}
 
-std::shared_ptr<Listener> UnixContext::listen(std::string_view addr) {
-  auto listener = std::make_shared<Listener>(Socket::Unix());
+SharedPtr<Listener> UnixContext::listen(std::string_view addr) {
+  auto listener = makeShared<Listener>(Socket::Unix());
   listener->socket.listen(addr);
   return listener;
 }
 
-std::shared_ptr<Connection> UnixContext::connect(std::string_view addr) {
-  auto connection = std::make_shared<Connection>(Socket::Unix());
+SharedPtr<Connection> UnixContext::connect(std::string_view addr) {
+  auto connection = makeShared<Connection>(Socket::Unix());
   connection->socket.connect(addr, [](Error* e) {});
   return connection;
 }
 
-std::shared_ptr<Listener> TcpContext::listen(std::string_view addr) {
-  auto listener = std::make_shared<Listener>(Socket::Tcp());
+SharedPtr<Listener> TcpContext::listen(std::string_view addr) {
+  auto listener = makeShared<Listener>(Socket::Tcp());
   listener->socket.listen(addr);
   return listener;
 }
 
-std::shared_ptr<Connection> TcpContext::connect(std::string_view addr) {
-  auto connection = std::make_shared<Connection>(Socket::Tcp());
+SharedPtr<Connection> TcpContext::connect(std::string_view addr) {
+  auto connection = makeShared<Connection>(Socket::Tcp());
   connection->socket.connect(addr, [connection](Error* e) {});
   return connection;
 }

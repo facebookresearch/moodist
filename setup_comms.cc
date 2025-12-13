@@ -22,10 +22,10 @@ struct SetupCommsImpl : SetupComms {
   std::atomic_uint32_t incomingDataCount = 0;
 
   TcpContext context;
-  Vector<std::shared_ptr<Listener>> listeners;
-  std::shared_ptr<Connection> prev;
-  std::shared_ptr<Connection> next;
-  Vector<std::shared_ptr<Connection>> floatingConnections;
+  Vector<SharedPtr<Listener>> listeners;
+  SharedPtr<Connection> prev;
+  SharedPtr<Connection> next;
+  Vector<SharedPtr<Connection>> floatingConnections;
 
   std::atomic_bool dying = false;
   std::atomic_bool dead = false;
@@ -42,7 +42,7 @@ struct SetupCommsImpl : SetupComms {
       try {
         auto listener = context.listen(addr);
 
-        listener->accept([this](Error* error, std::shared_ptr<Connection> connection) {
+        listener->accept([this](Error* error, SharedPtr<Connection> connection) {
           if (error) {
             return;
           }
@@ -88,7 +88,7 @@ struct SetupCommsImpl : SetupComms {
     dying = true;
     closeAll(listeners);
     closeAll(floatingConnections);
-    std::vector<std::shared_ptr<Connection>> tmp;
+    Vector<SharedPtr<Connection>> tmp;
     {
       std::lock_guard l(mutex);
       if (prev) {
@@ -145,7 +145,7 @@ struct SetupCommsImpl : SetupComms {
     });
   }
 
-  void onRead(BufferHandle data, const std::shared_ptr<Connection>& connection) {
+  void onRead(BufferHandle data, const SharedPtr<Connection>& connection) {
     std::unique_lock l(mutex);
     CHECK(!dead);
     if (data->size() < 28 || dying) {

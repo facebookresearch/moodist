@@ -17,7 +17,7 @@ static constexpr uint64_t signatureConnect = 0x5a59123966da2598;
 struct TcpDevImpl {
   Group* group = nullptr;
 
-  std::vector<std::shared_ptr<Listener>> listeners;
+  std::vector<SharedPtr<Listener>> listeners;
 
   SpinMutex mutex;
   std::atomic_bool dead = false;
@@ -32,8 +32,9 @@ struct TcpDevImpl {
   HashMap<uint32_t, Vector<QueuedSend>> queuedSends;
 
   struct ConnectionInfo {
+    std::atomic_size_t refcount = 0;
     uint32_t rank = unconnected;
-    std::shared_ptr<Connection> connection;
+    SharedPtr<Connection> connection;
 
     void close() {
       if (connection) {
@@ -42,8 +43,8 @@ struct TcpDevImpl {
     }
   };
 
-  std::vector<std::shared_ptr<ConnectionInfo>> connections;
-  std::vector<std::shared_ptr<ConnectionInfo>> floatingConnections;
+  std::vector<SharedPtr<ConnectionInfo>> connections;
+  std::vector<SharedPtr<ConnectionInfo>> floatingConnections;
 
   void* onReadHandle = nullptr;
   std::atomic_size_t refcount = 0;
@@ -62,7 +63,7 @@ struct TcpDevImpl {
       try {
         auto listener = context.listen(addr);
 
-        listener->accept([this](Error* error, std::shared_ptr<Connection> connection) {
+        listener->accept([this](Error* error, SharedPtr<Connection> connection) {
           if (error) {
             return;
           }
@@ -155,9 +156,9 @@ struct TcpDevImpl {
     }
   }
 
-  void addConnection(std::shared_ptr<Connection> connection) {
+  void addConnection(SharedPtr<Connection> connection) {
     CHECK(!dead);
-    auto ci = std::make_shared<ConnectionInfo>();
+    auto ci = makeShared<ConnectionInfo>();
     ci->connection = connection;
     floatingConnections.push_back(ci);
     // log.info("add new connection - %d floating connections\n", floatingConnections.size());
@@ -177,7 +178,7 @@ struct TcpDevImpl {
     });
   }
 
-  void onRead(BufferHandle data, const std::shared_ptr<ConnectionInfo>& ci) {
+  void onRead(BufferHandle data, const SharedPtr<ConnectionInfo>& ci) {
     std::unique_lock l(mutex);
     if (dead) {
       return;
