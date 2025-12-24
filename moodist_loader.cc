@@ -48,6 +48,18 @@ void cudaStreamGuardExit(void* guard) {
   delete static_cast<c10::cuda::CUDAStreamGuard*>(guard);
 }
 
+void* cudaCachingAllocatorAlloc(size_t bytes, void** cleanupCtx) {
+  auto dataPtr = c10::cuda::CUDACachingAllocator::get()->allocate(bytes);
+  void* ptr = dataPtr.get();
+  // Store the DataPtr on heap so it lives until free is called
+  *cleanupCtx = new c10::DataPtr(std::move(dataPtr));
+  return ptr;
+}
+
+void cudaCachingAllocatorFree(void* cleanupCtx) {
+  delete static_cast<c10::DataPtr*>(cleanupCtx);
+}
+
 // Tensor creation
 Tensor* tensorFromBlob(void* data, const int64_t* sizes, int ndim, DType dtype, int device) {
   auto options =
@@ -87,15 +99,15 @@ int64_t tensorNumel(Tensor* t) {
   return t->tensor.numel();
 }
 
-int tensorNdim(Tensor* t) {
-  return t->tensor.ndimension();
+int64_t tensorNdim(Tensor* t) {
+  return t->tensor.dim();
 }
 
-int64_t tensorSize(Tensor* t, int dim) {
+int64_t tensorSize(Tensor* t, int64_t dim) {
   return t->tensor.size(dim);
 }
 
-int64_t tensorStride(Tensor* t, int dim) {
+int64_t tensorStride(Tensor* t, int64_t dim) {
   return t->tensor.stride(dim);
 }
 
@@ -181,6 +193,23 @@ size_t dtypeSize(DType dtype) {
   return torch::elementSize(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
 }
 
+// c10d::Store wrapper functions
+void c10dStoreSet(void* store, std::string_view key, const std::vector<uint8_t>& value) {
+  auto* c10dStore = static_cast<c10d::Store*>(store);
+  c10dStore->set(std::string(key), value);
+}
+
+std::vector<uint8_t> c10dStoreGet(void* store, std::string_view key) {
+  auto* c10dStore = static_cast<c10d::Store*>(store);
+  return c10dStore->get(std::string(key));
+}
+
+void c10dStoreWait(void* store, std::span<const std::string> keys) {
+  auto* c10dStore = static_cast<c10d::Store*>(store);
+  std::vector<std::string> keyVec(keys.begin(), keys.end());
+  c10dStore->wait(keyVec);
+}
+
 } // namespace wrappers
 
 namespace {
@@ -237,6 +266,8 @@ void initMoodistApi() {
       .cudaGetCurrentStream = wrappers::cudaGetCurrentStream,
       .cudaStreamGuardEnter = wrappers::cudaStreamGuardEnter,
       .cudaStreamGuardExit = wrappers::cudaStreamGuardExit,
+      .cudaCachingAllocatorAlloc = wrappers::cudaCachingAllocatorAlloc,
+      .cudaCachingAllocatorFree = wrappers::cudaCachingAllocatorFree,
       .tensorFromBlob = wrappers::tensorFromBlob,
       .tensorEmpty = wrappers::tensorEmpty,
       .tensorAddRef = wrappers::tensorAddRef,
@@ -263,6 +294,9 @@ void initMoodistApi() {
       .tensorAmaxOut = wrappers::tensorAmaxOut,
       .tensorAminOut = wrappers::tensorAminOut,
       .dtypeSize = wrappers::dtypeSize,
+      .c10dStoreSet = wrappers::c10dStoreSet,
+      .c10dStoreGet = wrappers::c10dStoreGet,
+      .c10dStoreWait = wrappers::c10dStoreWait,
   };
 
   std::string libPath = getLibraryPath();

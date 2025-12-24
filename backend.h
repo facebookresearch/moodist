@@ -4,7 +4,7 @@
 
 #include <memory>
 
-#include "processgroup.h"
+#include "processgroup_wrapper.h"
 
 namespace moodist {
 

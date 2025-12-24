@@ -211,6 +211,7 @@ set(wrapper_sources
   moodist_loader.cc
   allocator_wrapper.cc
   cpu_allocator_wrapper.cc
+  processgroup_wrapper.cc
 )
 
 pybind11_add_module(_C ${wrapper_sources})

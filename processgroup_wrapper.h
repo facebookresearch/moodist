@@ -1,43 +1,32 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+// ProcessGroup wrapper header - minimal header for _C.so
+// Only includes what's needed for the c10d::ProcessGroup wrapper.
+// Does NOT include core headers (common.h, queue.h, etc.)
+
 #pragma once
 
-#include "common.h"
-#include "queue.h"
-#include "tensor_types.h"
 #include "torch_includes.h"
 
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace moodist {
 
-struct ProcessGroupImpl;
+struct ProcessGroupImpl;  // Opaque - managed via coreApi
+class Queue;  // Forward declare for stub methods
 
-struct Future {
-  FutureImplSharedPtr impl;
-  std::vector<torch::Tensor> tensors;
-  std::optional<torch::Tensor> out;
-  Function<void()> waitDoneCallback;
-  Future();
-  ~Future() noexcept(false);
-  Future(const Future&) = delete;
-  Future(Future&&) = default;
-  void wait();
-  torch::Tensor result();
-};
-
-struct CustomOp {
-  Function<Future(const std::vector<torch::Tensor>&, const std::vector<torch::Tensor>&)> op;
-  Future operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs) {
-    return op(inputs, outputs);
-  }
-};
+// Stub types for unimplemented methods
+struct Future;
+struct CustomOp;
 
 using Work = c10d::Work;
 
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
-  ProcessGroupImpl* impl = nullptr; // Managed via coreApi refcounting
+  ProcessGroupImpl* impl = nullptr;  // Managed via coreApi refcounting
 
   ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
   ~ProcessGroup();
@@ -48,6 +37,7 @@ public:
 
   std::string moodist_name() const;
 
+  // Standard c10d collectives
   c10::intrusive_ptr<Work> broadcast(
       std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;
 
@@ -70,7 +60,8 @@ public:
       std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
     throw std::runtime_error("allgather_coalesced not supported");
   }
-  virtual c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
+
+  c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
       std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
 
   c10::intrusive_ptr<Work> reduce_scatter(std::vector<at::Tensor>& outputTensors,
@@ -82,7 +73,7 @@ public:
   c10::intrusive_ptr<Work> _reduce_scatter_base(at::Tensor& outputTensor, at::Tensor& inputTensor,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
 
-  virtual c10::intrusive_ptr<Work> reduce_scatter_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
+  c10::intrusive_ptr<Work> reduce_scatter_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
       std::vector<at::Tensor>& inputTensors, const c10d::ReduceScatterOptions& opts) override;
 
   c10::intrusive_ptr<Work> barrier(const c10d::BarrierOptions& opts = c10d::BarrierOptions()) override;
@@ -113,22 +104,20 @@ public:
     throw std::runtime_error("recvAnysource not supported");
   }
 
-  std::shared_ptr<Queue> makeQueue(
-      int location, bool streaming = false, std::optional<std::string> name = std::nullopt);
-  std::shared_ptr<Queue> makeQueue(
-      std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
+  void cudaBarrier();
+  void shutdown();
 
+  // Stubs for unimplemented features - these use core types that don't cross the API boundary
+  std::shared_ptr<Queue> makeQueue(int location, bool streaming = false, std::optional<std::string> name = std::nullopt);
+  std::shared_ptr<Queue> makeQueue(std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out = std::nullopt);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
-
   std::vector<torch::Tensor> share(const torch::Tensor& input);
-  void cudaBarrier();
-
-  virtual void shutdown();
-
   CustomOp compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs);
 };
+
+void registerFreeMemoryCallback();
 
 } // namespace moodist

@@ -30,15 +30,17 @@ int cudaCurrentDevice();
 CUstream cudaGetCurrentStream();
 void* cudaStreamGuardEnter(CUstream stream, int device);
 void cudaStreamGuardExit(void* guard);
+void* cudaCachingAllocatorAlloc(size_t bytes, void** cleanupCtx);
+void cudaCachingAllocatorFree(void* cleanupCtx);
 Tensor* tensorFromBlob(void* data, const int64_t* sizes, int ndim, DType dtype, int device);
 Tensor* tensorEmpty(const int64_t* sizes, int ndim, DType dtype, int device);
 void tensorAddRef(Tensor* t);
 void tensorDecRef(Tensor* t);
 void* tensorDataPtr(Tensor* t);
 int64_t tensorNumel(Tensor* t);
-int tensorNdim(Tensor* t);
-int64_t tensorSize(Tensor* t, int dim);
-int64_t tensorStride(Tensor* t, int dim);
+int64_t tensorNdim(Tensor* t);
+int64_t tensorSize(Tensor* t, int64_t dim);
+int64_t tensorStride(Tensor* t, int64_t dim);
 DType tensorDtype(Tensor* t);
 int tensorDevice(Tensor* t);
 bool tensorIsContiguous(Tensor* t);
@@ -175,35 +177,35 @@ public:
     return W tensorNumel(ptr_);
   }
 
-  int ndimension() const {
+  int64_t dim() const {
     return W tensorNdim(ptr_);
   }
 
-  int dim() const {
-    return ndimension();
+  int64_t ndimension() const {
+    return dim();
   }
 
-  int64_t size(int dim) const {
-    return W tensorSize(ptr_, dim);
+  int64_t size(int64_t d) const {
+    return W tensorSize(ptr_, d);
   }
 
-  int64_t stride(int dim) const {
-    return W tensorStride(ptr_, dim);
+  int64_t stride(int64_t d) const {
+    return W tensorStride(ptr_, d);
   }
 
   std::vector<int64_t> sizes() const {
-    int n = ndimension();
+    int64_t n = dim();
     std::vector<int64_t> result(n);
-    for (int i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < n; ++i) {
       result[i] = size(i);
     }
     return result;
   }
 
   std::vector<int64_t> strides() const {
-    int n = ndimension();
+    int64_t n = dim();
     std::vector<int64_t> result(n);
-    for (int i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < n; ++i) {
       result[i] = stride(i);
     }
     return result;
@@ -327,6 +329,26 @@ inline void amin_out(TensorPtr& dst, const TensorPtr& src, int dim) {
 inline size_t dtype_size(DType dtype) {
   return W dtypeSize(dtype);
 }
+
+// =============================================================================
+// StreamGuard RAII class
+// =============================================================================
+
+class StreamGuard {
+  void* guard_;
+
+public:
+  StreamGuard(CUstream stream, int device) : guard_(W cudaStreamGuardEnter(stream, device)) {}
+
+  ~StreamGuard() {
+    W cudaStreamGuardExit(guard_);
+  }
+
+  StreamGuard(const StreamGuard&) = delete;
+  StreamGuard& operator=(const StreamGuard&) = delete;
+  StreamGuard(StreamGuard&&) = delete;
+  StreamGuard& operator=(StreamGuard&&) = delete;
+};
 
 #undef W
 

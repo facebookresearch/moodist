@@ -14,7 +14,7 @@
 #include "serialization.h"
 #include "setup_comms.h"
 #include "synchronization.h"
-#include "tensor_factory.h"
+#include "tensor_ptr.h"
 #include "torch_includes.h"
 #include "vector.h"
 
@@ -24,6 +24,59 @@
 #include <stdexcept>
 
 namespace moodist {
+
+// Conversion from API DType to internal Dtype
+inline Dtype toInternalDtype(DType dt) {
+  switch (dt) {
+  case DType::Float32:
+    return Dtype::float32;
+  case DType::Float64:
+    return Dtype::float64;
+  case DType::Int32:
+    return Dtype::int32;
+  case DType::Int64:
+    return Dtype::int64;
+  case DType::BFloat16:
+    return Dtype::bfloat16;
+  default:
+    throw std::runtime_error("Unsupported dtype for internal conversion");
+  }
+}
+
+// Helper functions for c10d::Store operations via wrapperApi
+namespace c10dstore {
+
+inline void set(void* store, std::string_view key, std::string_view value) {
+  std::vector<uint8_t> valueVec(value.begin(), value.end());
+  wrapperApi.c10dStoreSet(store, key, valueVec);
+}
+
+inline std::string get(void* store, std::string_view key) {
+  std::vector<uint8_t> value = wrapperApi.c10dStoreGet(store, key);
+  return std::string(value.begin(), value.end());
+}
+
+inline void wait(void* store, const std::vector<std::string>& keys) {
+  wrapperApi.c10dStoreWait(store, keys);
+}
+
+} // namespace c10dstore
+
+// Conversion from API ReduceOp to internal Reduction
+inline Reduction toInternalReduction(ReduceOp op) {
+  switch (op) {
+  case ReduceOp::SUM:
+    return Reduction::sum;
+  case ReduceOp::MIN:
+    return Reduction::min;
+  case ReduceOp::MAX:
+    return Reduction::max;
+  case ReduceOp::AVG:
+    return Reduction::avg;
+  default:
+    throw std::runtime_error("Unsupported reduce op for internal conversion");
+  }
+}
 
 extern bool profilingEnabled;
 
@@ -250,14 +303,18 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
 
   uint32_t activeId = 0;
 
-  ProcessGroupImpl(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size) : rank(rank), size(size) {
+  void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
+
+  std::atomic<int> refcount{1}; // Reference counting for API
+
+  ProcessGroupImpl(void* c10dStore, int rank, int size) : rank(rank), size(size), c10dStore_(c10dStore) {
     CHECK(rank >= 0 && size > 0 && rank < size);
 
     log.init();
 
     group = std::make_shared<Group>(rank, size);
 
-    init(store);
+    init();
 
     for (auto& v : concurrencyEvents) {
       v = Event::create();
@@ -449,7 +506,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     }
   }
 
-  void init(const c10::intrusive_ptr<::c10d::Store>& store) {
+  void init() {
 
     log.verbose("%d/%d: init\n", rank, size);
 
@@ -460,18 +517,11 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
     auto f = [&]() {
       std::string key = randomName();
 
-      auto tovec = [&](std::string str) {
-        return std::vector<uint8_t>(str.begin(), str.end());
+      auto set = [&](std::string_view k, std::string_view value) {
+        c10dstore::set(c10dStore_, k, value);
       };
-      auto fromvec = [&](std::vector<uint8_t> vec) {
-        return std::string(vec.begin(), vec.end());
-      };
-
-      auto set = [&](std::string key, std::string value) {
-        store->set(key, tovec(value));
-      };
-      auto get = [&](std::string key) {
-        return fromvec(store->get(key));
+      auto get = [&](std::string_view k) {
+        return c10dstore::get(c10dStore_, k);
       };
 
       // Phase 1: Verify all ranks have started (no dependencies between ranks)
@@ -481,7 +531,7 @@ struct ProcessGroupImpl : std::enable_shared_from_this<ProcessGroupImpl> {
         for (size_t i = 0; i != size; ++i) {
           startedKeys.push_back(fmt::sprintf("moodist_rank%d_started", i));
         }
-        store->wait(startedKeys);
+        c10dstore::wait(c10dStore_, startedKeys);
       }
 
       // Phase 2: Exchange addresses
@@ -3685,7 +3735,7 @@ void registerFreeMemoryCallback() {
 
 ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
     : c10d::ProcessGroup(rank, size) {
-  impl = std::make_shared<ProcessGroupImpl>(store, rank, size);
+  impl = std::make_shared<ProcessGroupImpl>(store.get(), rank, size);
 
   setBackend(torch::DeviceType::CPU, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
   setBackend(torch::DeviceType::CUDA, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
@@ -4128,6 +4178,90 @@ torch::Tensor Future::result() {
 
 void setPreferKernelLess(bool value) {
   globalPreferKernelLess = value;
+}
+
+// ============================================================================
+// C-style API functions for ProcessGroupImpl - called via CoreApi
+// ============================================================================
+
+ProcessGroupImpl* createProcessGroupImpl(void* c10dStore, int rank, int size) {
+  return new ProcessGroupImpl(c10dStore, rank, size);
+}
+
+void processGroupImplAddRef(ProcessGroupImpl* impl) {
+  impl->refcount.fetch_add(1);
+}
+
+void processGroupImplDecRef(ProcessGroupImpl* impl) {
+  if (impl->refcount.fetch_sub(1) == 1) {
+    delete impl;
+  }
+}
+
+int processGroupImplRank(ProcessGroupImpl* impl) {
+  return static_cast<int>(impl->rank);
+}
+
+int processGroupImplSize(ProcessGroupImpl* impl) {
+  return static_cast<int>(impl->size);
+}
+
+void processGroupImplAllGather(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream) {
+  // TODO: Convert impl->all_gather to use TensorPtr internally
+  throw std::runtime_error("processGroupImplAllGather: not yet implemented for library split");
+}
+
+void processGroupImplReduceScatter(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
+    CUstream stream, float premulValue) {
+  // TODO: Convert impl->reduce_scatter to use TensorPtr internally
+  throw std::runtime_error("processGroupImplReduceScatter: not yet implemented for library split");
+}
+
+void processGroupImplAllreduce(
+    ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
+  // TODO: Convert impl->allreduce to use TensorPtr internally
+  throw std::runtime_error("processGroupImplAllreduce: not yet implemented for library split");
+}
+
+void processGroupImplBroadcast(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream) {
+  // TODO: Convert impl->broadcast to use TensorPtr internally
+  throw std::runtime_error("processGroupImplBroadcast: not yet implemented for library split");
+}
+
+void processGroupImplReduce(
+    ProcessGroupImpl* impl, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream) {
+  // TODO: Convert impl->reduce to use TensorPtr internally
+  throw std::runtime_error("processGroupImplReduce: not yet implemented for library split");
+}
+
+void processGroupImplBarrier(ProcessGroupImpl* impl) {
+  impl->barrier();
+}
+
+void processGroupImplScatter(
+    ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
+  // TODO: Convert impl->scatter to use TensorPtr internally
+  throw std::runtime_error("processGroupImplScatter: not yet implemented for library split");
+}
+
+void processGroupImplGather(
+    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
+  // TODO: Convert impl->gather to use TensorPtr internally
+  throw std::runtime_error("processGroupImplGather: not yet implemented for library split");
+}
+
+void processGroupImplAllToAll(
+    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream) {
+  // TODO: Convert impl->alltoall to use TensorPtr internally
+  throw std::runtime_error("processGroupImplAllToAll: not yet implemented for library split");
+}
+
+void processGroupImplCudaBarrier(ProcessGroupImpl* impl, CUstream stream) {
+  impl->cudaBarrier(stream);
+}
+
+void processGroupImplShutdown(ProcessGroupImpl* impl) {
+  impl->shutdown();
 }
 
 } // namespace moodist

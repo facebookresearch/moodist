@@ -5,6 +5,7 @@
 #include "moodist_api.h"
 #include "allocator_api.h"
 #include "cpu_allocator.h"
+#include "processgroup_api.h"
 #include "serialize_api.h"
 #include "store_api.h"
 
@@ -56,6 +57,24 @@ static CoreApi coreApi = {
     .allocatorMappedRegion = allocatorMappedRegionApi,
     .allocatorAddFreeCallback = allocatorAddFreeCallback,
     .allocatorRemoveFreeCallback = allocatorRemoveFreeCallback,
+
+    // ProcessGroupImpl functions
+    .createProcessGroupImpl = createProcessGroupImpl,
+    .processGroupImplAddRef = processGroupImplAddRef,
+    .processGroupImplDecRef = processGroupImplDecRef,
+    .processGroupImplRank = processGroupImplRank,
+    .processGroupImplSize = processGroupImplSize,
+    .processGroupImplAllGather = processGroupImplAllGather,
+    .processGroupImplReduceScatter = processGroupImplReduceScatter,
+    .processGroupImplAllreduce = processGroupImplAllreduce,
+    .processGroupImplBroadcast = processGroupImplBroadcast,
+    .processGroupImplReduce = processGroupImplReduce,
+    .processGroupImplBarrier = processGroupImplBarrier,
+    .processGroupImplScatter = processGroupImplScatter,
+    .processGroupImplGather = processGroupImplGather,
+    .processGroupImplAllToAll = processGroupImplAllToAll,
+    .processGroupImplCudaBarrier = processGroupImplCudaBarrier,
+    .processGroupImplShutdown = processGroupImplShutdown,
 };
 
 } // namespace moodist

@@ -23,7 +23,9 @@ namespace moodist {
 struct StoreHandle;
 struct Buffer;
 struct Tensor;            // Opaque wrapper for torch::Tensor
+class TensorPtr;          // RAII smart pointer for Tensor* (defined in tensor_ptr.h)
 struct CudaAllocatorImpl; // CUDA allocator implementation
+struct ProcessGroupImpl;  // Process group implementation
 
 // DType enum - matches torch::ScalarType values
 enum class DType : int8_t {
@@ -64,6 +66,11 @@ struct WrapperApi {
   void* (*cudaStreamGuardEnter)(CUstream stream, int device);
   void (*cudaStreamGuardExit)(void* guard);
 
+  // CUDA memory allocation via PyTorch's caching allocator
+  // Returns pointer; sets *cleanupCtx for use with cudaCachingAllocatorFree
+  void* (*cudaCachingAllocatorAlloc)(size_t bytes, void** cleanupCtx);
+  void (*cudaCachingAllocatorFree)(void* cleanupCtx);
+
   // Tensor creation - returns opaque Tensor handle
   Tensor* (*tensorFromBlob)(void* data, const int64_t* sizes, int ndim, DType dtype, int device);
   Tensor* (*tensorEmpty)(const int64_t* sizes, int ndim, DType dtype, int device);
@@ -75,9 +82,9 @@ struct WrapperApi {
   // Tensor accessors
   void* (*tensorDataPtr)(Tensor* t);
   int64_t (*tensorNumel)(Tensor* t);
-  int (*tensorNdim)(Tensor* t);
-  int64_t (*tensorSize)(Tensor* t, int dim);
-  int64_t (*tensorStride)(Tensor* t, int dim);
+  int64_t (*tensorNdim)(Tensor* t);
+  int64_t (*tensorSize)(Tensor* t, int64_t dim);
+  int64_t (*tensorStride)(Tensor* t, int64_t dim);
   DType (*tensorDtype)(Tensor* t);
   int (*tensorDevice)(Tensor* t);
   bool (*tensorIsContiguous)(Tensor* t);
@@ -105,6 +112,12 @@ struct WrapperApi {
 
   // Dtype utilities
   size_t (*dtypeSize)(DType dtype);
+
+  // c10d::Store operations - for ProcessGroup to call back into PyTorch's store
+  // store is opaque pointer to c10d::Store passed from ProcessGroup constructor
+  void (*c10dStoreSet)(void* store, std::string_view key, const std::vector<uint8_t>& value);
+  std::vector<uint8_t> (*c10dStoreGet)(void* store, std::string_view key);
+  void (*c10dStoreWait)(void* store, std::span<const std::string> keys);
 };
 
 // =============================================================================
@@ -153,6 +166,32 @@ struct CoreApi {
   void (*allocatorMappedRegion)(uintptr_t address, uintptr_t* outBase, size_t* outSize);
   void* (*allocatorAddFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* callbackFn);
   void (*allocatorRemoveFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle);
+
+  // ProcessGroupImpl functions
+  ProcessGroupImpl* (*createProcessGroupImpl)(void* c10dStore, int rank, int size);
+  void (*processGroupImplAddRef)(ProcessGroupImpl* impl);
+  void (*processGroupImplDecRef)(ProcessGroupImpl* impl);
+  int (*processGroupImplRank)(ProcessGroupImpl* impl);
+  int (*processGroupImplSize)(ProcessGroupImpl* impl);
+
+  // Collective operations - core handles all logic
+  void (*processGroupImplAllGather)(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream);
+  void (*processGroupImplReduceScatter)(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input,
+      ReduceOp reduceOp, CUstream stream, float premulValue);
+  void (*processGroupImplAllreduce)(
+      ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
+  void (*processGroupImplBroadcast)(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream);
+  void (*processGroupImplReduce)(
+      ProcessGroupImpl* impl, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+  void (*processGroupImplBarrier)(ProcessGroupImpl* impl);
+  void (*processGroupImplScatter)(
+      ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
+  void (*processGroupImplGather)(
+      ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
+  void (*processGroupImplAllToAll)(
+      ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
+  void (*processGroupImplCudaBarrier)(ProcessGroupImpl* impl, CUstream stream);
+  void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
 };
 
 } // namespace moodist
