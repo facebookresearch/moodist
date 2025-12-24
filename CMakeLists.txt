@@ -141,29 +141,29 @@ set(MOODIST_PREBUILT_CORE "" CACHE FILEPATH "Path to pre-built libmoodist.so (sk
 
 # Core library sources - uses wrapper interfaces, no direct PyTorch
 set(core_sources
-  allgather.cc
-  allocator.cc
-  alltoall.cc
-  async.cc
-  connection.cc
-  cpu_allocator.cc
-  cputhread.cc
-  group.cc
-  ib_common.cc
-  internal_allocator.cc
-  ipc_mapper.cc
-  kernels.cc
-  moodist_api.cc
-  numa.cc
-  rdma_ib.cc
-  rdma_tcp.cc
-  reduce_scatter.cc
-  reduce_scatter_direct.cc
-  serialize_object.cc
-  setup_comms.cc
-  socket.cc
-  store.cc
-  tcpdev.cc
+  core/allgather.cc
+  core/allocator.cc
+  core/alltoall.cc
+  core/async.cc
+  core/connection.cc
+  core/cpu_allocator.cc
+  core/cputhread.cc
+  core/group.cc
+  core/ib_common.cc
+  core/internal_allocator.cc
+  core/ipc_mapper.cc
+  core/kernels.cc
+  core/moodist_api.cc
+  core/numa.cc
+  core/rdma_ib.cc
+  core/rdma_tcp.cc
+  core/reduce_scatter.cc
+  core/reduce_scatter_direct.cc
+  core/serialize_object.cc
+  core/setup_comms.cc
+  core/socket.cc
+  core/store.cc
+  core/tcpdev.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}
@@ -195,6 +195,10 @@ else()
     ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
     ${Python_INCLUDE_DIRS}  # For serialize_object.cc
   )
+  target_include_directories(moodist PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/api
+  )
   target_compile_definitions(moodist PRIVATE
     CUDADEVRT_PATH="${CUDADEVRT}"
     _STATIC_LIBRARY_BUILD_
@@ -205,13 +209,13 @@ endif()
 
 # Wrapper library - compiled per PyTorch version, uses dlopen for core
 set(wrapper_sources
-  pybind.cc
-  store_wrapper.cc
-  serialize_wrapper.cc
-  moodist_loader.cc
-  allocator_wrapper.cc
-  cpu_allocator_wrapper.cc
-  processgroup_wrapper.cc
+  wrapper/pybind.cc
+  wrapper/store_wrapper.cc
+  wrapper/serialize_wrapper.cc
+  wrapper/moodist_loader.cc
+  wrapper/allocator_wrapper.cc
+  wrapper/cpu_allocator_wrapper.cc
+  wrapper/processgroup_wrapper.cc
 )
 
 pybind11_add_module(_C ${wrapper_sources})
@@ -225,6 +229,10 @@ target_include_directories(_C SYSTEM PRIVATE
   ${TorchPath}/include
   ${TorchPath}/include/torch/csrc/api/include
   ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_include_directories(_C PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/wrapper
+  ${CMAKE_CURRENT_SOURCE_DIR}/api
 )
 target_compile_options(_C PRIVATE -fabi-version=${ABI_VERSION})
 target_compile_definitions(_C PRIVATE
