@@ -18,9 +18,17 @@ namespace moodist {
 struct ProcessGroupImpl;  // Opaque - managed via coreApi
 class Queue;  // Forward declare for stub methods
 
-// Stub types for unimplemented methods
-struct Future;
-struct CustomOp;
+// Stub types for unimplemented methods - minimal definitions
+struct Future {
+  void wait() { throw std::runtime_error("Future: not implemented"); }
+  torch::Tensor result() { throw std::runtime_error("Future: not implemented"); }
+};
+
+struct CustomOp {
+  Future operator()(const std::vector<torch::Tensor>&, const std::vector<torch::Tensor>&) {
+    throw std::runtime_error("CustomOp: not implemented");
+  }
+};
 
 using Work = c10d::Work;
 

@@ -109,9 +109,7 @@ ProcessGroup::~ProcessGroup() {
 
 c10::intrusive_ptr<Work> ProcessGroup::allgather(std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions&) {
-  CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
-  CHECK(outputTensors[0].size() == static_cast<size_t>(getSize()));
-
+  TORCH_CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
   // Flatten output list to contiguous buffer for core
   auto& input = inputTensors[0];
   auto output = torch::empty({static_cast<int64_t>(getSize()), input.numel()}, input.options());
@@ -138,7 +136,7 @@ c10::intrusive_ptr<Work> ProcessGroup::_allgather_base(
 
 c10::intrusive_ptr<Work> ProcessGroup::allgather_into_tensor_coalesced(
     std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllgatherOptions&) {
-  CHECK(outputs.size() == inputs.size());
+  TORCH_CHECK(outputs.size() == inputs.size());
   for (size_t i = 0; i < inputs.size(); ++i) {
     TensorPtr inPtr = wrapTensor(inputs[i]);
     TensorPtr outPtr = wrapTensor(outputs[i]);
@@ -158,7 +156,7 @@ c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
     std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::ReduceScatterOptions& opts) {
-  CHECK(outputs.size() == inputs.size());
+  TORCH_CHECK(outputs.size() == inputs.size());
   ReduceOp op = toReduceOp(opts.reduceOp);
   for (size_t i = 0; i < inputs.size(); ++i) {
     TensorPtr inPtr = wrapTensor(inputs[i]);
@@ -170,7 +168,7 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
-  CHECK(tensors.size() == 1);
+  TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupImplAllreduce(
@@ -189,7 +187,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce_coalesced(
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
-  CHECK(tensors.size() == 1);
+  TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupImplBroadcast(impl, tPtr, opts.rootRank, getStream(t));
@@ -197,7 +195,7 @@ c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensor
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
-  CHECK(tensors.size() == 1);
+  TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupImplReduce(impl, tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t));
@@ -211,7 +209,7 @@ c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions&) {
 
 c10::intrusive_ptr<Work> ProcessGroup::scatter(
     std::vector<at::Tensor>& outputs, std::vector<std::vector<at::Tensor>>& inputs, const c10d::ScatterOptions& opts) {
-  CHECK(outputs.size() == 1);
+  TORCH_CHECK(!outputs.empty());
   auto& output = outputs[0];
 
   std::vector<TensorPtr> inPtrs;
@@ -229,7 +227,7 @@ c10::intrusive_ptr<Work> ProcessGroup::scatter(
 
 c10::intrusive_ptr<Work> ProcessGroup::gather(
     std::vector<std::vector<at::Tensor>>& outputs, std::vector<at::Tensor>& inputs, const c10d::GatherOptions& opts) {
-  CHECK(inputs.size() == 1);
+  TORCH_CHECK(!inputs.empty());
   auto& input = inputs[0];
 
   std::vector<TensorPtr> outPtrs;
