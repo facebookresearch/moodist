@@ -421,7 +421,7 @@ struct TimeoutHelper {
 
 struct QueueImpl {
 
-  std::shared_ptr<Group> group;
+  SharedPtr<Group> group;
   int location = -1;
 
   QueueStorage* qs = nullptr;
@@ -434,16 +434,16 @@ struct QueueImpl {
 
   std::optional<std::string> name;
 
-  QueueImpl(std::shared_ptr<Group> group, int location, bool streaming, std::optional<std::string> name)
-      : group(group), location(location), name(name) {
-    create(&*group, location, qs, remoteAddress, streaming, name);
+  QueueImpl(SharedPtr<Group> group, int location, bool streaming, std::optional<std::string> name)
+      : group(std::move(group)), location(location), name(name) {
+    create(this->group.get(), location, qs, remoteAddress, streaming, name);
     CHECK(qs != nullptr);
     CHECK(remoteAddress != 0);
     CHECK(qs->streaming == streaming);
   }
 
-  QueueImpl(std::shared_ptr<Group> group, std::vector<int> locations, bool streaming, std::optional<std::string> name)
-      : group(group) {
+  QueueImpl(SharedPtr<Group> group, std::vector<int> locations, bool streaming, std::optional<std::string> name)
+      : group(std::move(group)) {
     if (locations.empty()) {
       throw std::runtime_error("Queue cannot be constructed with an empty location list");
     }
@@ -452,12 +452,12 @@ struct QueueImpl {
     }
     isMulticast = true;
     location = locations[0];
-    isMulticastLocal = std::find(locations.begin(), locations.end(), group->rank) != locations.end();
+    isMulticastLocal = std::find(locations.begin(), locations.end(), this->group->rank) != locations.end();
     HashMap<int, bool> duplicate;
     multicastLocations.resize(locations.size());
     for (size_t i = 0; i != locations.size(); ++i) {
       int r = locations[i];
-      if (r < 0 || r >= group->size) {
+      if (r < 0 || r >= static_cast<int>(this->group->size)) {
         throw std::runtime_error(fmt::sprintf("Queue: invalid location rank %d", r));
       }
       if (duplicate[r]) {
@@ -467,7 +467,7 @@ struct QueueImpl {
 
       multicastLocations[i] = r;
     }
-    create(&*group, multicastLocations, qs, multicastRemoteAddresses, name);
+    create(this->group.get(), multicastLocations, qs, multicastRemoteAddresses, name);
     CHECK(qs != nullptr);
     CHECK(remoteAddress == 0);
     CHECK(multicastRemoteAddresses.size() == multicastLocations.size());
@@ -653,7 +653,7 @@ struct QueueImpl {
         td->buffer = AllocatedCpuBufferSharedPtr::make();
         *td->buffer = group->allocateCpu(td->dataBytes);
         td->dataPtr = (uintptr_t)td->buffer->cpuPointer;
-        cudaCopy(td->data(), tensorAddress, td->bytes(), api->cudaGetCurrentStream());
+        cudaCopy(td->data(), tensorAddress, td->bytes(), wrapperApi.cudaGetCurrentStream());
 
         work->cudaMappedDone = WorkCudaMappedDonePtr::make();
         if (!work->cudaMappedDone->address) {
@@ -829,19 +829,20 @@ Queue::Queue(void* p) {
   CHECK(p == &foo);
 }
 
-std::shared_ptr<Queue> makeQueue(std::shared_ptr<Group> group, int location, bool streaming, std::string_view name) {
-  auto r = std::make_shared<Queue>(&foo);
+SharedPtr<Queue> makeQueue(SharedPtr<Group> group, int location, bool streaming, std::string_view name) {
+  auto* q = internalNew<Queue>(&foo);
+  q->refcount = 1;
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
-  r->impl = (void*)internalNew<QueueImpl>(group, location, streaming, nameOpt);
-  return r;
+  q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
+  return SharedPtr<Queue>(q);
 }
 
-std::shared_ptr<Queue> makeQueue(
-    std::shared_ptr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
-  auto r = std::make_shared<Queue>(&foo);
+SharedPtr<Queue> makeQueue(SharedPtr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
+  auto* q = internalNew<Queue>(&foo);
+  q->refcount = 1;
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
-  r->impl = (void*)internalNew<QueueImpl>(group, location, streaming, nameOpt);
-  return r;
+  q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
+  return SharedPtr<Queue>(q);
 }
 
 static std::atomic_uint32_t nextIncomingKey = getRng()();

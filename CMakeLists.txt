@@ -155,6 +155,7 @@ set(core_sources
   core/kernels.cc
   core/moodist_api.cc
   core/numa.cc
+  core/queue.cc
   core/rdma_ib.cc
   core/rdma_tcp.cc
   core/reduce_scatter.cc
@@ -164,6 +165,7 @@ set(core_sources
   core/socket.cc
   core/store.cc
   core/tcpdev.cc
+  core/processgroup_stubs.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}

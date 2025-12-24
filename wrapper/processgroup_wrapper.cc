@@ -6,9 +6,9 @@
 // This file should be minimal - just convert types and call core.
 // All collective operation logic belongs in ProcessGroupImpl (core).
 
+#include "processgroup_wrapper.h"
 #include "backend.h"
 #include "moodist_loader.h"
-#include "processgroup_wrapper.h"
 #include "tensor_ptr.h"
 #include "torch_includes.h"
 

@@ -4,6 +4,7 @@
 
 #include "moodist_loader.h"
 #include "moodist_api.h"
+#include "processgroup_wrapper.h"
 #include "torch_includes.h"
 
 #include <atomic>
@@ -193,6 +194,11 @@ size_t dtypeSize(DType dtype) {
   return torch::elementSize(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
 }
 
+// Free memory callback - delegates to moodist::registerFreeMemoryCallback from processgroup_wrapper.cc
+void registerFreeMemoryCallback() {
+  ::moodist::registerFreeMemoryCallback();
+}
+
 // c10d::Store wrapper functions
 void c10dStoreSet(void* store, std::string_view key, const std::vector<uint8_t>& value) {
   auto* c10dStore = static_cast<c10d::Store*>(store);
@@ -294,6 +300,7 @@ void initMoodistApi() {
       .tensorAmaxOut = wrappers::tensorAmaxOut,
       .tensorAminOut = wrappers::tensorAminOut,
       .dtypeSize = wrappers::dtypeSize,
+      .registerFreeMemoryCallback = wrappers::registerFreeMemoryCallback,
       .c10dStoreSet = wrappers::c10dStoreSet,
       .c10dStoreGet = wrappers::c10dStoreGet,
       .c10dStoreWait = wrappers::c10dStoreWait,

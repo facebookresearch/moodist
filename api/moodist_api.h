@@ -113,6 +113,9 @@ struct WrapperApi {
   // Dtype utilities
   size_t (*dtypeSize)(DType dtype);
 
+  // Free memory callback registration
+  void (*registerFreeMemoryCallback)();
+
   // c10d::Store operations - for ProcessGroup to call back into PyTorch's store
   // store is opaque pointer to c10d::Store passed from ProcessGroup constructor
   void (*c10dStoreSet)(void* store, std::string_view key, const std::vector<uint8_t>& value);

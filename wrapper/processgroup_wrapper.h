@@ -15,13 +15,17 @@
 
 namespace moodist {
 
-struct ProcessGroupImpl;  // Opaque - managed via coreApi
-class Queue;  // Forward declare for stub methods
+struct ProcessGroupImpl; // Opaque - managed via coreApi
+class Queue;             // Forward declare for stub methods
 
 // Stub types for unimplemented methods - minimal definitions
 struct Future {
-  void wait() { throw std::runtime_error("Future: not implemented"); }
-  torch::Tensor result() { throw std::runtime_error("Future: not implemented"); }
+  void wait() {
+    throw std::runtime_error("Future: not implemented");
+  }
+  torch::Tensor result() {
+    throw std::runtime_error("Future: not implemented");
+  }
 };
 
 struct CustomOp {
@@ -34,7 +38,7 @@ using Work = c10d::Work;
 
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
-  ProcessGroupImpl* impl = nullptr;  // Managed via coreApi refcounting
+  ProcessGroupImpl* impl = nullptr; // Managed via coreApi refcounting
 
   ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
   ~ProcessGroup();
@@ -116,8 +120,10 @@ public:
   void shutdown();
 
   // Stubs for unimplemented features - these use core types that don't cross the API boundary
-  std::shared_ptr<Queue> makeQueue(int location, bool streaming = false, std::optional<std::string> name = std::nullopt);
-  std::shared_ptr<Queue> makeQueue(std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
+  std::shared_ptr<Queue> makeQueue(
+      int location, bool streaming = false, std::optional<std::string> name = std::nullopt);
+  std::shared_ptr<Queue> makeQueue(
+      std::vector<int> location, bool streaming = false, std::optional<std::string> name = std::nullopt);
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out = std::nullopt);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
   std::vector<torch::Tensor> share(const torch::Tensor& input);

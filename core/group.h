@@ -6,6 +6,7 @@
 #include "hash_map.h"
 #include "logging.h"
 #include "rdma.h"
+#include "shared_ptr.h"
 #include "simple_vector.h"
 #include "vector.h"
 
@@ -149,6 +150,8 @@ struct Group {
   std::array<std::unique_ptr<StreamData>, maxConcurrency> cpuStreamData;
 
   std::string name;
+
+  std::atomic<int> refcount; // For SharedPtr
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {

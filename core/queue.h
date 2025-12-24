@@ -3,6 +3,7 @@
 #pragma once
 
 #include "commondefs.h"
+#include "shared_ptr.h"
 #include "tensor_ptr.h"
 
 #include <memory>
@@ -18,38 +19,37 @@ struct QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
   TensorPtr tensor; // keeps tensor alive during async put (RAII handles refcount)
   bool waitOnDestroy = true;
-  MOODIST_API QueueWork();
-  MOODIST_API ~QueueWork();
+  QueueWork();
+  ~QueueWork();
   QueueWork(const QueueWork&) = delete;
   QueueWork(QueueWork&&) = default;
   QueueWork& operator=(QueueWork&&) = default;
-  MOODIST_API void wait();
+  void wait();
 };
 
 struct Queue {
   void* impl = nullptr;
+  std::atomic<int> refcount; // For SharedPtr
   Queue() = delete;
-  MOODIST_API Queue(void*);
+  Queue(void*);
   Queue(Queue&) = delete;
   Queue& operator=(Queue) = delete;
-  MOODIST_API ~Queue();
+  ~Queue();
   // Returns (tensor, queue_size). Returns empty TensorPtr if no data.
-  MOODIST_API std::pair<TensorPtr, size_t> get(bool block = true, std::optional<float> timeout = {});
+  std::pair<TensorPtr, size_t> get(bool block = true, std::optional<float> timeout = {});
   // Takes a copy of the TensorPtr (refcount handled automatically).
-  MOODIST_API QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true);
-  MOODIST_API size_t qsize() const;
-  MOODIST_API bool wait(std::optional<float> timeout) const;
+  QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true);
+  size_t qsize() const;
+  bool wait(std::optional<float> timeout) const;
 
-  MOODIST_API uint32_t transactionBegin();
-  MOODIST_API void transactionCancel(uint32_t id);
-  MOODIST_API void transactionCommit(uint32_t id);
+  uint32_t transactionBegin();
+  void transactionCancel(uint32_t id);
+  void transactionCommit(uint32_t id);
 
-  MOODIST_API std::string_view name() const;
+  std::string_view name() const;
 };
 
-MOODIST_API std::shared_ptr<Queue> makeQueue(
-    std::shared_ptr<Group>, int location, bool streaming, std::string_view name = {});
-MOODIST_API std::shared_ptr<Queue> makeQueue(
-    std::shared_ptr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
+SharedPtr<Queue> makeQueue(SharedPtr<Group>, int location, bool streaming, std::string_view name = {});
+SharedPtr<Queue> makeQueue(SharedPtr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
 
 } // namespace moodist
