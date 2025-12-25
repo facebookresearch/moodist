@@ -4,9 +4,12 @@
 // This file implements ProcessGroupImpl and the API functions.
 // Collective operations are stubs until migration is complete.
 
+#include "allgather.h"
 #include "common.h"
 #include "cputhread.h"
 #include "group.h"
+#include "ipc_mapper.h"
+#include "kernels.h"
 #include "moodist_api.h"
 #include "processgroup_api.h"
 #include "queue.h"
@@ -14,6 +17,7 @@
 #include "setup_comms.h"
 #include "shared_ptr.h"
 #include "synchronization.h"
+#include "tensor_ptr.h"
 
 #include <atomic>
 #include <memory>
@@ -56,9 +60,24 @@ std::atomic_bool globalPreferKernelLess = false;
 
 std::once_flag freeMemoryCallbackOnceFlag;
 
+SharedSpinMutex unmapMemoryMutex;
+
+bool profilingEnabled = false;
+
 // ============================================================================
 // Helper types
 // ============================================================================
+
+struct EventSerializer {
+  Event event;
+  CUstream stream;
+  EventSerializer(CUevent event, CUstream stream) : event(Event::reference(event)), stream(stream) {
+    this->event.wait(stream);
+  }
+  ~EventSerializer() {
+    event.record(stream);
+  }
+};
 
 // Work objects can outlive ProcessGroupImpl and hold a pointer to WorkStream.
 // A proper solution would be to hold a SharedPtr to WorkStreams in Work.
@@ -225,6 +244,9 @@ struct ProcessGroupImpl {
 
   int streamPriority = -1;
 
+  // Memory operations batching for CUDA stream memory ops
+  std::vector<CUstreamBatchMemOpParams> memops;
+
   uint32_t activeId = 0;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
@@ -365,6 +387,91 @@ struct ProcessGroupImpl {
     nextStepValue = 0x1000;
     return 1;
   }
+
+  AllocatedBuffer alloccuda(size_t size, CUstream stream) {
+    if (size == 0) {
+      return {};
+    }
+    if (size < 16) {
+      size = 16;
+    }
+    StreamGuard sg(stream, group->deviceIndex);
+    AllocatedBuffer buffer;
+    void* cleanupCtx = nullptr;
+    void* ptr = wrapperApi.cudaCachingAllocatorAlloc(size, &cleanupCtx);
+    buffer.cudaPointer = (uintptr_t)ptr;
+    buffer.bytes = size;
+    // Capture cleanupCtx in the cleanup function
+    buffer.externalAlloc = DeferredCleanup(Function<void()>([cleanupCtx]() {
+      wrapperApi.cudaCachingAllocatorFree(cleanupCtx);
+    }));
+    CHECK(buffer.cudaPointer != 0);
+    return buffer;
+  }
+
+  void sync(uint32_t stepValue) {
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+    const auto& peerIndices = group->peerIndices;
+
+    if (!peerIndices.empty()) {
+      ipcMapper->wait();
+    }
+    ipcMapper->setStepValue(stepValue);
+  }
+
+  ReusableHandle<IpcEvent> getIpcEvent() {
+    return ipcEvents.pop(&pendingIpcEvents);
+  }
+
+  void freePendingIpcEvents() {
+    for (auto& v : pendingIpcEvents.free) {
+      ipcEvents.free.push_back(std::move(v));
+    }
+    pendingIpcEvents.free.clear();
+  }
+
+  void syncPeers(CUstream stream) {
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+    const auto& peerIndices = group->peerIndices;
+    if (peerIndices.empty()) {
+      return;
+    }
+    auto event = getIpcEvent();
+    event->record(stream);
+    for (size_t peerIndex : peerIndices) {
+      ipcMapper->pushEvent(peerIndex, *event);
+    }
+    for (size_t peerIndex : peerIndices) {
+      Event::reference(ipcMapper->popEvent(peerIndex)).wait(stream);
+    }
+  }
+
+  void memWaitEq(uintptr_t address, uint32_t value) {
+    CUstreamBatchMemOpParams op;
+    std::memset(&op, 0, sizeof(op));
+    op.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    op.waitValue.address = address;
+    op.waitValue.value = value;
+    memops.push_back(op);
+  }
+
+  void memWrite(uintptr_t address, uint32_t value) {
+    CUstreamBatchMemOpParams op;
+    std::memset(&op, 0, sizeof(op));
+    op.operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
+    op.writeValue.address = address;
+    op.writeValue.value = value;
+    memops.push_back(op);
+  }
+
+  void memFlush(CUstream stream) {
+    if (!memops.empty()) {
+      CHECK_CU(cuStreamBatchMemOp(stream, memops.size(), memops.data(), 0));
+      memops.clear();
+    }
+  }
+
+  void all_gather(TensorPtr& output, const TensorPtr& input, CUstream stream);
 };
 
 // ============================================================================
@@ -453,7 +560,236 @@ void ProcessGroupImpl::init() {
     log.verbose("init took %gs\n", seconds(std::chrono::steady_clock::now() - start));
   };
 
-  f();
+  group->init(f);
+}
+
+// ============================================================================
+// ProcessGroupImpl::all_gather() - AllGather collective
+// ============================================================================
+
+void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUstream stream) {
+  std::unique_lock l(threadUnsafe);
+
+  CHECK(input.is_contiguous());
+  CHECK(output.is_contiguous());
+
+  bool isCuda = input.is_cuda();
+
+  if (isCuda) {
+    CHECK(input.is_cuda());
+    CHECK(input.device_index() == group->deviceIndex);
+    CHECK(output.is_cuda());
+    CHECK(output.device_index() == group->deviceIndex);
+  }
+
+  size_t bytes = input.numel() * input.itemsize();
+  size_t outputBytes = bytes * size;
+  size_t pitch = bytes;
+
+  CHECK(bytes > 0);
+  CHECK(static_cast<size_t>(output.numel() * output.itemsize()) == outputBytes);
+
+  uint32_t stepValue = getNextStepValue();
+  uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+  CHECK(stepValue < 0x80000000);
+
+  uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+  uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+
+  if (!isCuda) {
+    StreamData& sd = group->getStreamData(nullptr);
+    std::atomic_uint32_t cpuDone = 0;
+
+    QueueEntryAllGatherCpu* e = group->cpuThread->freelistAllGatherCpu.pop();
+    e->task = taskAllGatherCpu;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->inputAddress = inputAddress;
+    e->outputAddress = outputAddress;
+    e->bytes = bytes;
+    e->pitch = pitch;
+    e->cpuDone = &cpuDone;
+    group->cpuThread->enqueue(e);
+    l.unlock();
+    while (cpuDone == 0) {
+      futexWait(&cpuDone, 0, std::chrono::seconds(10));
+    }
+    return;
+  }
+
+  StreamData& sd = group->getStreamData(stream);
+  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
+  StreamGuard sg(stream, group->deviceIndex);
+
+  Group* group = &*this->group;
+
+  AllGather& allGather = *group->allGather;
+
+  const auto& ipcRanks = group->ipcRanks;
+  const auto& peerIndices = group->peerIndices;
+
+  bool isLocalOnly = allGather.recvRanks.empty();
+  bool isNoLocal = !isLocalOnly && peerIndices.empty();
+
+  AllocatedBuffer alignedBuffer;
+  AllocatedBuffer alignedBuffer2;
+
+  bool kernelLess = !isLocalOnly && (isNoLocal || preferKernelLess);
+
+  if (!isNoLocal && !kernelLess) {
+    if (bytes % 16 != 0 || outputAddress % 16 != 0) {
+      pitch = (bytes + 127u) / 128u * 128u;
+      alignedBuffer = alloccuda(pitch * size, stream);
+      outputAddress = alignedBuffer.cudaPointer;
+      outputBytes = pitch * size;
+    }
+
+    if (inputAddress % 16 != 0) {
+      alignedBuffer2 = alloccuda(bytes, stream);
+      CHECK_CU(cuMemcpyDtoDAsync(alignedBuffer2.cudaPointer, inputAddress, bytes, stream));
+      inputAddress = alignedBuffer2.cudaPointer;
+    }
+  }
+
+  IpcMapper* ipcMapper = &*group->ipcMapper;
+
+  std::shared_lock unmapLock(unmapMemoryMutex);
+  sync(stepValue);
+
+  std::array<uintptr_t, 8> peerInputAddresses;
+  std::array<uintptr_t, 8> peerOutputAddresses;
+
+  for (size_t i : peerIndices) {
+    ipcMapper->requestAddress(
+        i, inputAddress, bytes,
+        [ptr = &peerInputAddresses[i]](uintptr_t address) {
+          *ptr = address;
+        },
+        true);
+
+    ipcMapper->requestAddress(
+        i, outputAddress, outputBytes,
+        [ptr = &peerOutputAddresses[i]](uintptr_t address) {
+          *ptr = address;
+        },
+        true);
+  }
+
+  ipcMapper->wait();
+
+  size_t numChunks = 0;
+  size_t chunkSize = 0;
+
+  bool kernelLess_ring = kernelLess && false;
+
+  bool direct = !isLocalOnly && kernelLess && !kernelLess_ring;
+
+  if (!isLocalOnly) {
+    QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
+    e->task = direct ? taskAllGatherDirect : taskAllGather;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->inputAddress = inputAddress;
+    e->outputAddress = outputAddress;
+    e->bytes = bytes;
+    e->pitch = pitch;
+
+    e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
+    e->numChunks = std::min(bytes / 131072, (size_t)maxChunks);
+    if (direct) {
+      e->numDevices = 4;
+    }
+    e->numParallel = 1;
+    e->numDevices = std::min(e->numDevices, group->rdmaDevs.size());
+    e->numDevices = std::max(e->numDevices, (size_t)1);
+    e->numChunks = std::max(e->numChunks, (size_t)1);
+    chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
+    e->numChunks = (bytes + chunkSize - 1) / chunkSize;
+    numChunks = e->numChunks;
+    group->cpuThread->enqueue(e);
+  }
+
+  if (kernelLess_ring) {
+    // kernelLess_all_gather_ring_copies not yet ported
+    throw std::runtime_error("kernelLess_ring all_gather path not yet implemented");
+  }
+
+  if (kernelLess && (!isNoLocal || direct)) {
+    CHECK(pitch == bytes);
+    // kernelLess_all_gather_impl not yet ported
+    throw std::runtime_error("kernelLess all_gather path not yet implemented");
+  }
+  CHECK(!direct);
+
+  if (!group->kernels->cuAllGather) {
+    group->kernels->compile(CompileAllGather);
+    CHECK(group->kernels->cuAllGather != nullptr);
+    CHECK(group->kernels->cuAllGatherLocal != nullptr);
+    CHECK(group->kernels->cuAllGatherNoLocal != nullptr);
+  }
+
+  AllGatherParameters parameters;
+  parameters.stepValue = stepValue;
+  parameters.concurrencyIndex = concurrencyIndex;
+  parameters.bytes = bytes;
+  parameters.pitch = pitch;
+  parameters.chunkSize = chunkSize;
+  parameters.inputAddress = inputAddress;
+  parameters.outputAddress = outputAddress;
+  parameters.peerInputAddresses = peerInputAddresses;
+  parameters.peerOutputAddresses = peerOutputAddresses;
+
+  std::array<void*, 1> params = {&parameters};
+
+  size_t gridSize = group->kernels->gridSize;
+  size_t blockSize = group->kernels->blockSize;
+
+  if (isLocalOnly) {
+    CHECK_CU(cuLaunchKernel(
+        group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+  } else if (isNoLocal) {
+
+    bool copyOutput = outputAddress + pitch * rank != inputAddress;
+
+    if (copyOutput) {
+      localEvent.record(stream);
+    }
+
+    if (kernelLess) {
+      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
+      memWaitEq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+      memFlush(stream);
+    } else {
+      CHECK_CU(cuLaunchKernel(group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
+    }
+
+    if (copyOutput) {
+      auto copyStream = getCopyStream(stream);
+      localEvent.wait(copyStream);
+      CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, copyStream));
+      localEvent.record(copyStream);
+      localEvent.wait(stream);
+    }
+
+  } else {
+    CHECK(chunkSize != 0);
+    CHECK_CU(cuLaunchKernel(
+        group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
+  }
+
+  if (!isNoLocal && outputAddress != (uintptr_t)output.data_ptr()) {
+    CUDA_MEMCPY2D copyArgs = {0};
+    copyArgs.srcDevice = alignedBuffer.cudaPointer;
+    copyArgs.srcPitch = pitch;
+    copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyArgs.dstDevice = (uintptr_t)output.data_ptr();
+    copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyArgs.WidthInBytes = bytes;
+    copyArgs.Height = size;
+    CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
+  }
 }
 
 // ============================================================================
@@ -488,9 +824,8 @@ int processGroupImplSize(ProcessGroupImpl* impl) {
 // Collective operations - stubs until migration is complete
 // ============================================================================
 
-void processGroupImplAllGather(
-    ProcessGroupImpl* /*impl*/, TensorPtr& /*output*/, const TensorPtr& /*input*/, CUstream /*stream*/) {
-  throw std::runtime_error("processGroupImplAllGather: not yet implemented");
+void processGroupImplAllGather(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream) {
+  impl->all_gather(output, input, stream);
 }
 
 void processGroupImplReduceScatter(ProcessGroupImpl* /*impl*/, TensorPtr& /*output*/, const TensorPtr& /*input*/,
@@ -540,6 +875,14 @@ void processGroupImplShutdown(ProcessGroupImpl* impl) {
   if (impl && impl->group && impl->group->cpuThread) {
     impl->group->cpuThread->kill(false);
   }
+}
+
+void setProfilingEnabled(bool enabled) {
+  profilingEnabled = enabled;
+}
+
+bool getProfilingEnabled() {
+  return profilingEnabled;
 }
 
 } // namespace moodist

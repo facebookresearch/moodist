@@ -75,6 +75,10 @@ static CoreApi coreApi = {
     .processGroupImplAllToAll = processGroupImplAllToAll,
     .processGroupImplCudaBarrier = processGroupImplCudaBarrier,
     .processGroupImplShutdown = processGroupImplShutdown,
+
+    // Profiling
+    .setProfilingEnabled = setProfilingEnabled,
+    .getProfilingEnabled = getProfilingEnabled,
 };
 
 } // namespace moodist

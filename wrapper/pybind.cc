@@ -15,7 +15,6 @@
 #include "store.h"
 
 namespace moodist {
-bool profilingEnabled = false;
 
 // Serialize/deserialize - defined in serialize_wrapper.cc
 torch::Tensor serializeObject(py::object o);

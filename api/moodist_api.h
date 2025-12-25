@@ -195,6 +195,10 @@ struct CoreApi {
       ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
   void (*processGroupImplCudaBarrier)(ProcessGroupImpl* impl, CUstream stream);
   void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
+
+  // Profiling
+  void (*setProfilingEnabled)(bool enabled);
+  bool (*getProfilingEnabled)();
 };
 
 } // namespace moodist
