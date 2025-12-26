@@ -301,8 +301,16 @@ public:
     return TensorPtr(W tensorFromBlob(data, sizes.data(), static_cast<int>(sizes.size()), dtype, device));
   }
 
+  static TensorPtr from_blob(void* data, std::initializer_list<int64_t> sizes, DType dtype, int device) {
+    return from_blob(data, std::span<const int64_t>(sizes.begin(), sizes.size()), dtype, device);
+  }
+
   static TensorPtr empty(std::span<const int64_t> sizes, DType dtype, int device) {
     return TensorPtr(W tensorEmpty(sizes.data(), static_cast<int>(sizes.size()), dtype, device));
+  }
+
+  static TensorPtr empty(std::initializer_list<int64_t> sizes, DType dtype, int device) {
+    return empty(std::span<const int64_t>(sizes.begin(), sizes.size()), dtype, device);
   }
 };
 
