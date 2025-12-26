@@ -501,7 +501,6 @@ static void reclaimEmptyRegions(Thread* thread) {
     for (size_t i = 0; i < toReclaim.size(); ++i) {
       Region* r = toReclaim.data()[i];
       add_span(spans, (uintptr_t)r, r->end);
-      log.verbose("reclaimed region at %#lx (%zu bytes)\n", (uintptr_t)r, r->end - (uintptr_t)r);
     }
 
     if (threadEmpty) {
@@ -540,9 +539,6 @@ static void markRegionEmpty(Thread* thread, Region* r) {
   }
   r->empty = true;
 
-  log.verbose("markRegionEmpty: region %#lx, index %d, count now %d\n", (uintptr_t)r, r->index,
-      thread->numEmptyRegions[r->index] + 1);
-
   thread->emptyRegions[r->index].push_back(*r);
   ++thread->numEmptyRegions[r->index];
 }
@@ -567,7 +563,6 @@ static void markRegionNonEmpty(Thread* thread, Region* r) {
 static void reclaimSingleRegion(Region* r) {
   PthreadLock lock(globals.slowPathMutex);
   add_span(spans, (uintptr_t)r, r->end);
-  log.verbose("reclaimed live region at %#lx (%zu bytes)\n", (uintptr_t)r, r->end - (uintptr_t)r);
 }
 
 // Called when a bin transitions from fully-freed (remainingFrees==0) to non-empty

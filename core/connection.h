@@ -54,7 +54,6 @@ struct Listener {
 
 struct Connection {
   std::atomic_size_t refcount = 0;
-  uint64_t id;
   Socket socket;
 
   Connection(Socket socket);

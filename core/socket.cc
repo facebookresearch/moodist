@@ -139,11 +139,8 @@ std::pair<std::string_view, int> decodeIpAddress(std::string_view address) {
 
 uint32_t writeFdFlag = 0x413ffc3f;
 
-static std::atomic<uint64_t> nextSocketId{1};
-
 struct SocketImpl {
   std::atomic_size_t refcount = 0;
-  uint64_t id = nextSocketId++;
   int af = -1;
   int fd = -1;
   std::atomic_bool closed = false;
@@ -175,7 +172,6 @@ struct SocketImpl {
     if (closed.exchange(true)) {
       return;
     }
-    log.debug("Socket #%lu close (fd=%d)\n", id, fd);
 
     // Clean up resources under write lock
     {
@@ -197,29 +193,24 @@ struct SocketImpl {
     // If we can't get the lock, schedule async cleanup.
     std::unique_lock l(readMutex, std::try_to_lock);
     if (l.owns_lock()) {
-      log.debug("Socket #%lu close: onRead cleared sync\n", id);
       onRead = nullptr;
       for (auto v : receivedFds) {
         ::close(v);
       }
       receivedFds.clear();
     } else {
-      log.debug("Socket #%lu close: deferring onRead cleanup\n", id);
       scheduler.run([me = share(this)] {
-        log.debug("Socket #%lu close: deferred cleanup running\n", me->id);
         std::unique_lock l(me->readMutex);
         me->onRead = nullptr;
         for (auto v : me->receivedFds) {
           ::close(v);
         }
         me->receivedFds.clear();
-        log.debug("Socket #%lu close: deferred cleanup done\n", me->id);
       });
     }
   }
 
   ~SocketImpl() {
-    log.debug("Socket #%lu destroyed\n", id);
     close();
   }
 
@@ -265,7 +256,6 @@ struct SocketImpl {
                       errors += fmt::sprintf("socket: %s", std::strerror(errno));
                       continue;
                     }
-                    log.debug("Socket #%lu Tcp listen (fd=%d)\n", id, fd);
                   }
 
                   int reuseaddr = 1;
@@ -356,7 +346,6 @@ struct SocketImpl {
           s.impl->af = af;
           s.impl->fd = r;
           s.impl->setTcpSockOpts();
-          log.debug("Socket #%lu created accept (fd=%d)\n", s.impl->id, r);
           poll::add(s.impl);
           scheduler.run([s = std::move(s), sharedCallback]() mutable {
             (*sharedCallback)(nullptr, std::move(s));
@@ -409,7 +398,6 @@ struct SocketImpl {
                     if (fd == -1) {
                       continue;
                     }
-                    log.debug("Socket #%lu Tcp connect (fd=%d)\n", id, fd);
                   }
 
                   if (::connect(fd, i->ai_addr, i->ai_addrlen) == 0 || errno == EAGAIN || errno == EINPROGRESS) {
@@ -436,10 +424,8 @@ struct SocketImpl {
 
   void triggerRead() {
     scheduler.run([me = share(this), this] {
-      log.debug("Socket #%lu triggerRead task starting\n", id);
       std::unique_lock l(readMutex);
       if (closed.load(std::memory_order_relaxed)) {
-        log.debug("Socket #%lu triggerRead task: already closed\n", id);
         return;
       }
       while (true) {
@@ -449,7 +435,6 @@ struct SocketImpl {
           wantsRead = false;
           onRead(nullptr);
           if (closed.load(std::memory_order_relaxed)) {
-            log.debug("Socket #%lu triggerRead task: closed during callback\n", id);
             return;
           }
         }
@@ -458,7 +443,6 @@ struct SocketImpl {
           break;
         }
       }
-      log.debug("Socket #%lu triggerRead task done\n", id);
     });
   }
 
@@ -1039,12 +1023,10 @@ struct PollThread {
           anyDead = false;
           std::lock_guard l(mutex);
           if (!deadList.empty()) {
-            log.debug("poll: clearing deadList (size=%zu)\n", deadList.size());
           }
           deadList.clear();
         }
         if (terminate.load(std::memory_order_relaxed)) {
-          log.debug("poll: terminating\n");
           break;
         }
       }
@@ -1089,7 +1071,6 @@ struct PollThread {
     activeList.push_back(std::move(impl));
   }
   void remove(SocketImpl* impl) {
-    log.debug("Socket #%lu poll::remove called\n", impl->id);
     std::lock_guard l(mutex);
     impl->addedInPoll = false;
     epoll_event e;
@@ -1100,13 +1081,11 @@ struct PollThread {
         anyDead = true;
         deadList.push_back(std::move(*i));
         activeList.erase(i);
-        log.debug("Socket #%lu moved to deadList (deadList size=%zu)\n", impl->id, deadList.size());
         wake();
         tryTerminate();
         return;
       }
     }
-    log.debug("Socket #%lu not found in activeList!\n", impl->id);
   }
 
   bool isAdded(SocketImpl* impl) {
@@ -1146,7 +1125,6 @@ Socket Socket::Unix() {
   if (r.impl->fd == -1) {
     throw std::system_error(errno, std::generic_category(), "socket");
   }
-  log.debug("Socket #%lu created Unix (fd=%d)\n", r.impl->id, r.impl->fd);
   poll::add(r.impl);
   return r;
 }
@@ -1156,7 +1134,6 @@ Socket Socket::Tcp() {
   r.impl = makeShared<SocketImpl>();
   r.impl->af = AF_INET;
   r.impl->fd = -1;
-  log.debug("Socket #%lu created Tcp (pending)\n", r.impl->id);
   return r;
 }
 
@@ -1169,7 +1146,6 @@ Socket Socket::Udp(bool ipv6) {
   if (r.impl->fd == -1) {
     throw std::system_error(errno, std::generic_category(), "socket");
   }
-  log.debug("Socket #%lu created Udp (fd=%d, ipv6=%d)\n", r.impl->id, r.impl->fd, ipv6);
   return r;
 }
 
@@ -1191,7 +1167,6 @@ void Socket::close() {
     if (poll::isAdded(&*impl)) {
       poll::remove(&*impl);
     } else {
-      log.debug("Socket #%lu close: not in poll\n", impl->id);
     }
     impl->close();
   }

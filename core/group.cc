@@ -585,6 +585,11 @@ void Group::init(Function<void()> f) {
         }
       }
       ipcRanks = newIpcRanks;
+      // Regenerate peerIndices to match the new ipcRanks
+      peerIndices.clear();
+      for (size_t i = 0; i < ipcRanks.size(); ++i) {
+        peerIndices.push_back(i);
+      }
       peerIpcRanks = setupComms->allgather(ipcRanks);
 
       log.debug("rank %d ipc ranks is %s\n", rank, fmt::to_string(fmt::join(ipcRanks, ", ")));

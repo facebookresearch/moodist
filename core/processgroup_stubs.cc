@@ -552,8 +552,7 @@ struct ProcessGroupImpl {
   }
 
   void all_gather(TensorPtr& output, const TensorPtr& input, CUstream stream);
-  void reduce_scatter(
-      TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, float premulValue);
+  void reduce_scatter(TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, float premulValue);
   void allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
   void broadcast(TensorPtr& tensor, int sourceRank, CUstream stream);
   void reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
@@ -1118,8 +1117,8 @@ void ProcessGroupImpl::reduce_scatter(
     CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
         blockSize, 1, 1, 0, stream, params.data(), nullptr));
   } else {
-    CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
-        blockSize, 1, 1, 0, stream, params.data(), nullptr));
+    CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1, blockSize,
+        1, 1, 0, stream, params.data(), nullptr));
   }
 
   if (outputAddress != (uintptr_t)output.data_ptr()) {
@@ -1158,7 +1157,8 @@ void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream 
     all_gather(t, o, stream);
   } else {
     // Tensor not evenly divisible - need temporary
-    int64_t newsize = (numel + static_cast<int64_t>(size) - 1) / static_cast<int64_t>(size) * static_cast<int64_t>(size);
+    int64_t newsize =
+        (numel + static_cast<int64_t>(size) - 1) / static_cast<int64_t>(size) * static_cast<int64_t>(size);
     size_t bytes = static_cast<size_t>(numel) * static_cast<size_t>(tensor.itemsize());
 
     int device = isCuda ? tensor.device_index() : -1;
@@ -1326,8 +1326,8 @@ void ProcessGroupImpl::broadcast(TensorPtr& tensor, int sourceRank, CUstream str
       CHECK(peerAddress == 0);
       if (static_cast<size_t>(sourceRank) != rank) {
         CHECK(networked);
-        memWaitGeq(
-            group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + static_cast<size_t>(sourceRank)),
+        memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) +
+                       sizeof(uint32_t) * (16 + size * chunkIndex + static_cast<size_t>(sourceRank)),
             stepValue);
         memFlush(stream);
       }
@@ -1557,15 +1557,16 @@ void ProcessGroupImpl::reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp
       ipcMapper->streamRecord(peerIndex, *peerMemcpyStream);
     }
 
-    CHECK_CU(cuMemcpyDtoDAsync(
-        reduceBuffer.cudaPointer + bytes * peerIndices.size(), tensorAddress, bytes, *reduceStream));
+    CHECK_CU(
+        cuMemcpyDtoDAsync(reduceBuffer.cudaPointer + bytes * peerIndices.size(), tensorAddress, bytes, *reduceStream));
 
     localEvent.record(*peerMemcpyStream);
     localEvent.wait(*reduceStream);
 
     // Create TensorPtr for buffer and use sum_out
     std::array<int64_t, 2> bufferShape = {static_cast<int64_t>(bufferSize), static_cast<int64_t>(numel)};
-    TensorPtr buffer = TensorPtr::from_blob((void*)reduceBuffer.cudaPointer, bufferShape, tensor.dtype(), tensor.device_index());
+    TensorPtr buffer =
+        TensorPtr::from_blob((void*)reduceBuffer.cudaPointer, bufferShape, tensor.dtype(), tensor.device_index());
 
     CHECK(static_cast<size_t>(buffer.numel() * buffer.itemsize()) == bytes * bufferSize);
 
@@ -1853,7 +1854,8 @@ void ProcessGroupImpl::alltoall(std::span<TensorPtr> outputs, std::span<TensorPt
   if (outputs[rank].data_ptr() != inputs[rank].data_ptr()) {
     auto copyStream = getCopyStream(stream);
     localEvent.wait(copyStream);
-    CHECK_CU(cuMemcpyDtoDAsync((uintptr_t)outputs[rank].data_ptr(), (uintptr_t)inputs[rank].data_ptr(), bytes, copyStream));
+    CHECK_CU(
+        cuMemcpyDtoDAsync((uintptr_t)outputs[rank].data_ptr(), (uintptr_t)inputs[rank].data_ptr(), bytes, copyStream));
     localEvent.record(copyStream);
     localEvent.wait(stream);
   }
@@ -1915,18 +1917,17 @@ void processGroupImplAllGather(ProcessGroupImpl* impl, TensorPtr& output, const 
   impl->all_gather(output, input, stream);
 }
 
-void processGroupImplReduceScatter(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input,
-    ReduceOp reduceOp, CUstream stream, float premulValue) {
+void processGroupImplReduceScatter(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
+    CUstream stream, float premulValue) {
   impl->reduce_scatter(output, input, reduceOp, stream, premulValue);
 }
 
-void processGroupImplAllreduce(ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp,
-    CUstream stream, float premulValue) {
+void processGroupImplAllreduce(
+    ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
   impl->allreduce(tensor, reduceOp, stream, premulValue);
 }
 
-void processGroupImplBroadcast(
-    ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream) {
+void processGroupImplBroadcast(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream) {
   impl->broadcast(tensor, sourceRank, stream);
 }
 
@@ -1939,18 +1940,18 @@ void processGroupImplBarrier(ProcessGroupImpl* impl) {
   impl->barrier();
 }
 
-void processGroupImplScatter(ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output,
-    int sourceRank, CUstream stream) {
+void processGroupImplScatter(
+    ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
   impl->scatter(inputs, output, sourceRank, stream);
 }
 
-void processGroupImplGather(ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input,
-    int destRank, CUstream stream) {
+void processGroupImplGather(
+    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
   impl->gather(outputs, input, destRank, stream);
 }
 
-void processGroupImplAllToAll(ProcessGroupImpl* impl, std::span<TensorPtr> outputs,
-    std::span<TensorPtr> inputs, CUstream stream) {
+void processGroupImplAllToAll(
+    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream) {
   impl->alltoall(outputs, inputs, stream);
 }
 

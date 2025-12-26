@@ -11,9 +11,7 @@
 
 namespace moodist {
 
-static std::atomic<uint64_t> nextConnectionId{1};
-
-Connection::Connection(Socket socket) : id(nextConnectionId++), socket(std::move(socket)) {}
+Connection::Connection(Socket socket) : socket(std::move(socket)) {}
 
 void Listener::accept(Function<void(Error*, SharedPtr<Connection>)> callback) {
   socket.accept([self = share(this), callback = std::move(callback)](Error* error, Socket socket) {
@@ -261,7 +259,6 @@ std::string Connection::remoteAddress() const {
 }
 
 Connection::~Connection() {
-  log.debug("Connection #%lu destroyed\n", id);
 }
 
 SharedPtr<Listener> UnixContext::listen(std::string_view addr) {

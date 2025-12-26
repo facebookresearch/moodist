@@ -196,11 +196,8 @@ Indestructible<SpinMutex> activeStoresMutex;
 Indestructible<Vector<StoreImpl*>> activeStores;
 } // namespace
 
-static std::atomic<uint64_t> nextStoreId{1};
-
 struct StoreImpl {
   std::atomic_size_t refcount = 0;
-  uint64_t id = nextStoreId++;
   Vector<Socket> udps;
 
   std::string hostname;
@@ -1337,7 +1334,6 @@ struct StoreImpl {
       std::lock_guard l(*activeStoresMutex);
       activeStores->push_back(this);
     }
-    log.debug("Store #%lu created (rank=%d, worldSize=%d)\n", id, rank, worldSize);
   }
 
   // Called after SharedPtr is set up to initialize callbacks that need share(this)
@@ -1386,7 +1382,6 @@ struct StoreImpl {
   }
 
   ~StoreImpl() {
-    log.debug("Store #%lu destroyed (rank=%d, worldSize=%d)\n", id, rank, worldSize);
 
     {
       std::lock_guard l(*activeStoresMutex);
@@ -1463,7 +1458,6 @@ struct StoreImpl {
     for (auto& v : udps) {
       v.close();
     }
-    log.debug("Store #%lu close: udps.size()=%zu after closing\n", id, udps.size());
     {
       std::lock_guard l(queuedCallbacksMutex);
       queuedCallbacks.clear();
@@ -1477,7 +1471,6 @@ struct StoreImpl {
     while (true) {
       switch (closeState) {
       case CloseState::NotStarted:
-        log.debug("Store #%lu shutdown starting (rank=%d)\n", id, rank);
         shuttingDown = true;
         if (!exitSourceRank) {
           exitSourceRank = rank;
@@ -1519,14 +1512,12 @@ struct StoreImpl {
 
       case CloseState::WaitExitAck:
         if (allPeersExitAcked() || now >= shutdownDeadline) {
-          log.debug("Store #%lu shutdown completed (rank=%d)\n", id, rank);
           closeState = CloseState::Done;
           closed = true;
           l.unlock();
           anyQueued = 1;
           futexWakeAll(&anyQueued);
           closeResources();
-          log.debug("Store #%lu close completed (rank=%d)\n", id, rank);
           return;
         }
         break;
@@ -2260,7 +2251,6 @@ void storeAddRef(StoreHandle* handle) {
 void storeDecRef(StoreHandle* handle) {
   if (--handle->refcount == 0) {
     handle->impl->close();
-    log.debug("Store #%lu storeDecRef: refcount=%zu before delete\n", handle->impl->id, handle->impl->refcount.load());
     internalDelete(handle);
   }
 }
