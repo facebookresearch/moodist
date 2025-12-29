@@ -2,7 +2,7 @@
 
 // ProcessGroup wrapper header - minimal header for _C.so
 // Only includes what's needed for the c10d::ProcessGroup wrapper.
-// Does NOT include core headers (common.h, queue.h, etc.)
+// Does NOT include core headers (common.h, etc.)
 
 #pragma once
 
@@ -16,7 +16,43 @@
 namespace moodist {
 
 struct ProcessGroupImpl; // Opaque - managed via coreApi
-class Queue;             // Forward declare for stub methods
+
+// Forward declarations
+class Queue;
+struct QueueWork;
+
+// QueueWork - wrapper around opaque void* from core
+struct QueueWork {
+  void* impl = nullptr; // Opaque pointer to core QueueWork
+
+  QueueWork(void* impl_ = nullptr) : impl(impl_) {}
+  ~QueueWork();
+  QueueWork(const QueueWork&) = delete;
+  QueueWork(QueueWork&& other) noexcept : impl(other.impl) {
+    other.impl = nullptr;
+  }
+  QueueWork& operator=(QueueWork&& other) noexcept;
+  void wait();
+};
+
+// Queue - wrapper around opaque void* from core
+class Queue {
+public:
+  void* impl = nullptr; // Opaque pointer to core Queue
+
+  Queue(void* impl_ = nullptr) : impl(impl_) {}
+  ~Queue();
+
+  // Wrapper methods that call CoreApi functions
+  std::pair<std::optional<torch::Tensor>, size_t> get(bool block = true, std::optional<float> timeout = {});
+  QueueWork put(torch::Tensor tensor, uint32_t transaction, bool waitOnDestroy = true);
+  size_t qsize() const;
+  bool wait(std::optional<float> timeout) const;
+  uint32_t transactionBegin();
+  void transactionCancel(uint32_t id);
+  void transactionCommit(uint32_t id);
+  std::string_view name() const;
+};
 
 // Stub types for unimplemented methods - minimal definitions
 struct Future {

@@ -63,8 +63,12 @@ void cudaCachingAllocatorFree(void* cleanupCtx) {
 
 // Tensor creation
 Tensor* tensorFromBlob(void* data, const int64_t* sizes, int ndim, DType dtype, int device) {
-  auto options =
-      at::TensorOptions().dtype(static_cast<torch::ScalarType>(static_cast<int>(dtype))).device(torch::kCUDA, device);
+  auto options = at::TensorOptions().dtype(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
+  if (device < 0) {
+    options = options.device(torch::kCPU);
+  } else {
+    options = options.device(torch::kCUDA, device);
+  }
   std::vector<int64_t> sizeVec(sizes, sizes + ndim);
   auto* t = new Tensor();
   t->tensor = torch::from_blob(data, sizeVec, options);
@@ -72,11 +76,36 @@ Tensor* tensorFromBlob(void* data, const int64_t* sizes, int ndim, DType dtype, 
 }
 
 Tensor* tensorEmpty(const int64_t* sizes, int ndim, DType dtype, int device) {
-  auto options =
-      at::TensorOptions().dtype(static_cast<torch::ScalarType>(static_cast<int>(dtype))).device(torch::kCUDA, device);
+  auto options = at::TensorOptions().dtype(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
+  if (device < 0) {
+    options = options.device(torch::kCPU);
+  } else {
+    options = options.device(torch::kCUDA, device);
+  }
   std::vector<int64_t> sizeVec(sizes, sizes + ndim);
   auto* t = new Tensor();
   t->tensor = torch::empty(sizeVec, options);
+  return t;
+}
+
+Tensor* tensorFromBlobWithDeleter(
+    void* data, const int64_t* sizes, int ndim, DType dtype, int device, void (*deleter)(void* ctx), void* deleterCtx) {
+  auto options = at::TensorOptions().dtype(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
+  if (device < 0) {
+    options = options.device(torch::kCPU);
+  } else {
+    options = options.device(torch::kCUDA, device);
+  }
+  std::vector<int64_t> sizeVec(sizes, sizes + ndim);
+  auto* t = new Tensor();
+  // Capture deleter and context in a lambda - PyTorch's from_blob passes data ptr to deleter,
+  // but we ignore it and use our context instead
+  t->tensor = torch::from_blob(
+      data, sizeVec,
+      [deleter, deleterCtx](void*) {
+        deleter(deleterCtx);
+      },
+      options);
   return t;
 }
 
@@ -276,6 +305,7 @@ void initMoodistApi() {
       .cudaCachingAllocatorFree = wrappers::cudaCachingAllocatorFree,
       .tensorFromBlob = wrappers::tensorFromBlob,
       .tensorEmpty = wrappers::tensorEmpty,
+      .tensorFromBlobWithDeleter = wrappers::tensorFromBlobWithDeleter,
       .tensorAddRef = wrappers::tensorAddRef,
       .tensorDecRef = wrappers::tensorDecRef,
       .tensorDataPtr = wrappers::tensorDataPtr,

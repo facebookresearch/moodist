@@ -16,6 +16,23 @@ void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstrea
     uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex);
 void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize);
 
+// Forward declarations for Queue API functions defined in processgroup.cc
+void* processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+void* processGroupImplMakeQueueMulti(
+    ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
+void queueAddRef(void* queue);
+void queueDecRef(void* queue);
+bool queueGet(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
+void* queuePut(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+size_t queueQsize(void* queue);
+bool queueWait(void* queue, const float* timeout);
+uint32_t queueTransactionBegin(void* queue);
+void queueTransactionCancel(void* queue, uint32_t id);
+void queueTransactionCommit(void* queue, uint32_t id);
+const char* queueName(void* queue);
+void queueWorkWait(void* work);
+void queueWorkDecRef(void* work);
+
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
 WrapperApi wrapperApi = {};
@@ -75,6 +92,26 @@ static CoreApi coreApi = {
     .processGroupImplAllToAll = processGroupImplAllToAll,
     .processGroupImplCudaBarrier = processGroupImplCudaBarrier,
     .processGroupImplShutdown = processGroupImplShutdown,
+
+    // Queue factory functions
+    .processGroupImplMakeQueue = processGroupImplMakeQueue,
+    .processGroupImplMakeQueueMulti = processGroupImplMakeQueueMulti,
+
+    // Queue operations
+    .queueAddRef = queueAddRef,
+    .queueDecRef = queueDecRef,
+    .queueGet = queueGet,
+    .queuePut = queuePut,
+    .queueQsize = queueQsize,
+    .queueWait = queueWait,
+    .queueTransactionBegin = queueTransactionBegin,
+    .queueTransactionCancel = queueTransactionCancel,
+    .queueTransactionCommit = queueTransactionCommit,
+    .queueName = queueName,
+
+    // QueueWork operations
+    .queueWorkWait = queueWorkWait,
+    .queueWorkDecRef = queueWorkDecRef,
 
     // Profiling
     .setProfilingEnabled = setProfilingEnabled,

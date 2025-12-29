@@ -74,6 +74,9 @@ struct WrapperApi {
   // Tensor creation - returns opaque Tensor handle
   Tensor* (*tensorFromBlob)(void* data, const int64_t* sizes, int ndim, DType dtype, int device);
   Tensor* (*tensorEmpty)(const int64_t* sizes, int ndim, DType dtype, int device);
+  // Like tensorFromBlob but with a deleter called when tensor is destroyed
+  Tensor* (*tensorFromBlobWithDeleter)(void* data, const int64_t* sizes, int ndim, DType dtype, int device,
+      void (*deleter)(void* ctx), void* deleterCtx);
 
   // Tensor ref counting
   void (*tensorAddRef)(Tensor* t);
@@ -195,6 +198,27 @@ struct CoreApi {
       ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
   void (*processGroupImplCudaBarrier)(ProcessGroupImpl* impl, CUstream stream);
   void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
+
+  // Queue factory functions - return opaque Queue*
+  void* (*processGroupImplMakeQueue)(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+  void* (*processGroupImplMakeQueueMulti)(
+      ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
+
+  // Queue operations - operate on opaque Queue* pointers
+  void (*queueAddRef)(void* queue);
+  void (*queueDecRef)(void* queue);
+  bool (*queueGet)(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
+  void* (*queuePut)(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+  size_t (*queueQsize)(void* queue);
+  bool (*queueWait)(void* queue, const float* timeout);
+  uint32_t (*queueTransactionBegin)(void* queue);
+  void (*queueTransactionCancel)(void* queue, uint32_t id);
+  void (*queueTransactionCommit)(void* queue, uint32_t id);
+  const char* (*queueName)(void* queue);
+
+  // QueueWork operations - operate on opaque QueueWork* pointers
+  void (*queueWorkWait)(void* work);
+  void (*queueWorkDecRef)(void* work);
 
   // Profiling
   void (*setProfilingEnabled)(bool enabled);

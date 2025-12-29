@@ -165,7 +165,7 @@ set(core_sources
   core/socket.cc
   core/store.cc
   core/tcpdev.cc
-  core/processgroup_stubs.cc
+  core/processgroup.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}
@@ -218,6 +218,7 @@ set(wrapper_sources
   wrapper/allocator_wrapper.cc
   wrapper/cpu_allocator_wrapper.cc
   wrapper/processgroup_wrapper.cc
+  wrapper/queue_wrapper.cc
 )
 
 pybind11_add_module(_C ${wrapper_sources})

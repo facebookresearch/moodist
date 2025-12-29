@@ -46,8 +46,6 @@ struct TensorData {
 using TensorDataPtr = FLPtr<TensorData>;
 using TensorDataSharedPtr = FLSharedPtr<TensorData>;
 
-// makeTensor() is declared in tensor_factory.h (wrapper library)
-
 struct FutureImpl {
   TensorDataPtr result;
   std::atomic_uint32_t done = 0;

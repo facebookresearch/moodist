@@ -51,7 +51,10 @@ PYBIND11_MODULE(_C, m) {
   )d")
       .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
       .def("moodist_name", &MoodistProcessGroup::moodist_name)
-      .def("cuda_barrier", &MoodistProcessGroup::cudaBarrier, py::call_guard<py::gil_scoped_release>());
+      .def("cuda_barrier", &MoodistProcessGroup::cudaBarrier, py::call_guard<py::gil_scoped_release>())
+      .def("Queue", py::overload_cast<int, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
+          py::arg("location"), py::arg("streaming") = false, py::arg("name") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>());
 
   py::class_<MoodistBackend, c10::intrusive_ptr<MoodistBackend>, c10d::Backend>(m, "MoodistBackend", R"d(
     A moodist backend :D
@@ -65,38 +68,18 @@ PYBIND11_MODULE(_C, m) {
   py::class_<moodist::CustomOp>(m, "CustomOp")
       .def("__call__", &moodist::CustomOp::operator(), py::call_guard<py::gil_scoped_release>());
 
-  // Commented out until we add more components:
-  /*
-  m.def("cpu_allocator_debug", &moodist::cpuAllocatorDebug);
-  m.def("set_prefer_kernel_less", &moodist::setPreferKernelLess);
-  m.def("cuda_copy", &moodist::cudaCopyTensor, py::call_guard<py::gil_scoped_release>());
-
   py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
-      .def(
-          "put",
-          [](moodist::Queue& q, torch::Tensor tensor, uint32_t transaction, bool wait_on_destroy) {
-            return q.put(moodist::wrapTensor(std::move(tensor)), transaction, wait_on_destroy);
-          },
-          py::arg("tensor"), py::arg("transaction"), py::arg("wait_on_destroy") = true,
+      .def("put", &moodist::Queue::put, py::arg("tensor"), py::arg("transaction"), py::arg("wait_on_destroy") = true,
           py::call_guard<py::gil_scoped_release>())
-      .def(
-          "get",
-          [](moodist::Queue& q, bool block, std::optional<float> timeout) {
-            auto [t, size] = q.get(block, timeout);
-            std::optional<torch::Tensor> result;
-            if (t) {
-              result = moodist::unwrapTensor(t);
-            }
-            return std::make_pair(result, size);
-          },
-          py::arg("block"), py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
+      .def("get", &moodist::Queue::get, py::arg("block") = true, py::arg("timeout") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
       .def("qsize", &moodist::Queue::qsize, py::call_guard<py::gil_scoped_release>())
       .def("wait", &moodist::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
       .def("transaction_begin", &moodist::Queue::transactionBegin, py::call_guard<py::gil_scoped_release>())
       .def("transaction_cancel", &moodist::Queue::transactionCancel, py::call_guard<py::gil_scoped_release>())
       .def("transaction_commit", &moodist::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>())
       .def("name", &moodist::Queue::name);
+
   py::class_<moodist::QueueWork>(m, "QueueWork")
       .def("wait", &moodist::QueueWork::wait, py::call_guard<py::gil_scoped_release>());
-  */
 }

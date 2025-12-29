@@ -258,8 +258,7 @@ std::string Connection::remoteAddress() const {
   return socket.remoteAddress();
 }
 
-Connection::~Connection() {
-}
+Connection::~Connection() {}
 
 SharedPtr<Listener> UnixContext::listen(std::string_view addr) {
   auto listener = makeShared<Listener>(Socket::Unix());
