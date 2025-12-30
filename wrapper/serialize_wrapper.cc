@@ -13,17 +13,28 @@ namespace moodist {
 
 namespace py = pybind11;
 
-// destroy() implementation for api::Buffer - called by ApiHandle destructor
+// ApiProxy method implementations for Buffer
 namespace api {
+
+void* ApiProxy<Buffer>::data() const {
+  return coreApi.serializeBufferPtr(ptr);
+}
+
+size_t ApiProxy<Buffer>::size() const {
+  return coreApi.serializeBufferSize(ptr);
+}
+
+// destroy() implementation for api::Buffer - called by ApiHandle destructor
 void destroy(Buffer* buffer) {
   coreApi.bufferDestroy(buffer);
 }
+
 } // namespace api
 
 torch::Tensor serializeObject(py::object o) {
-  auto handle = api::ApiHandle<api::Buffer>::adopt(coreApi.serializeObjectImpl(o.ptr()));
-  void* ptr = coreApi.serializeBufferPtr(handle.get());
-  size_t size = coreApi.serializeBufferSize(handle.get());
+  auto handle = coreApi.serializeObjectImpl(o.ptr());
+  void* ptr = handle->data();
+  size_t size = handle->size();
 
   // Capture handle by value - copy increments refcount
   // Handle destructor will decref when the tensor's deleter is called

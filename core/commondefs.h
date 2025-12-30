@@ -14,11 +14,6 @@
 #include <cstdint>
 #include <stdexcept>
 
-// Marks functions that are exported across the core/wrapper library boundary.
-// Both libmoodist.so (core) and _C.so (wrapper) need to call each other,
-// so these symbols have default visibility while everything else is hidden.
-#define MOODIST_API __attribute__((visibility("default")))
-
 namespace moodist {
 
 void* numa_alloc_onnode(size_t bytes, int node);

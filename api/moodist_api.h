@@ -149,7 +149,7 @@ struct CoreApi {
   // Serialize functions
   // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
   // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
-  api::Buffer* (*serializeObjectImpl)(PyObject* o);
+  api::ApiHandle<api::Buffer> (*serializeObjectImpl)(PyObject* o);
   void* (*serializeBufferPtr)(api::Buffer* buf);
   size_t (*serializeBufferSize)(api::Buffer* buf);
   void (*bufferDestroy)(api::Buffer* buf);

@@ -1180,14 +1180,20 @@ template<typename... T>
   }
 }
 
-// Core implementation - returns api::Buffer* with refcount=1
-api::Buffer* serializeObjectImpl(PyObject* o) {
+// Core implementation - returns ApiHandle<api::Buffer> with refcount=1
+api::ApiHandle<api::Buffer> serializeObjectImpl(PyObject* o) {
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>(o));
   Buffer* buf = buffer.release();
-  buf->refcount.fetch_add(1, std::memory_order_acquire); // set refcount to 1
-  return buf;
+  return api::ApiHandle<api::Buffer>::create(buf);
 }
+
+// destroy() implementation for core - needed because ApiHandle destructor references it
+namespace api {
+void destroy(Buffer* buffer) {
+  moodist::Buffer::deallocate(static_cast<moodist::Buffer*>(buffer));
+}
+} // namespace api
 
 void* serializeBufferPtr(api::Buffer* buf) {
   return static_cast<Buffer*>(buf)->data();

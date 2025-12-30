@@ -13,6 +13,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -37,6 +38,30 @@ struct Future;
 struct CustomOp;
 struct ProcessGroup;
 struct Buffer;
+
+// ApiProxy - provides member function syntax for API types.
+// operator-> returns this proxy, which has methods that call coreApi functions.
+// Methods are declared here but defined in wrapper (where coreApi exists).
+// Core doesn't call these methods - it has direct access to internals.
+template<typename T>
+struct ApiProxy {
+  T* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+};
+
+// Specialization for Buffer with data() and size() accessors
+template<>
+struct ApiProxy<Buffer> {
+  Buffer* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+
+  void* data() const;  // Defined in wrapper
+  size_t size() const; // Defined in wrapper
+};
 
 // destroy() declarations - implementations provided by wrapper only.
 // Core never calls these (ApiHandle is always returned to wrapper via RVO).
@@ -144,8 +169,9 @@ public:
     return ptr_;
   }
 
-  T* operator->() const {
-    return ptr_;
+  // Returns proxy for member function syntax (e.g., handle->data())
+  ApiProxy<T> operator->() const {
+    return ApiProxy<T>{ptr_};
   }
 
   T& operator*() const {
@@ -163,5 +189,8 @@ public:
     return p;
   }
 };
+
+// Convenience typedefs for common handle types
+using BufferHandle = ApiHandle<Buffer>;
 
 } // namespace moodist::api
