@@ -5,12 +5,12 @@
 //
 // Example:
 //   // In core:
-//   struct StoreImpl : api::Store { ... };
-//   api::Store* createStore() { return new StoreImpl(); }
+//   struct QueueImpl : api::Queue { ... };
+//   ApiHandle<api::Queue> createQueue() { return ApiHandle<api::Queue>(new QueueImpl()); }
 //
 //   // In wrapper:
-//   using StoreHandle = ApiHandle<&CoreApi::storeDestroy>;
-//   auto store = StoreHandle::adopt(coreApi.createStore());
+//   auto queue = coreApi.createQueue();  // RVO, wrapper owns directly
+//   // queue destructor calls destroy(api::Queue*) which is defined in wrapper
 
 #pragma once
 
@@ -19,8 +19,8 @@
 namespace moodist::api {
 
 // Base types for API boundary.
-// Most inherit from ApiRefCounted for refcounting.
-// These are intentionally minimal - they exist for type safety
+// These inherit from ApiRefCounted for refcounting.
+// They are intentionally minimal - they exist for type safety
 // and to provide a common base for safe upcasting.
 
 struct Store : ApiRefCounted {};
@@ -30,8 +30,9 @@ struct CustomOp : ApiRefCounted {};
 struct ProcessGroup : ApiRefCounted {};
 struct Buffer : ApiRefCounted {};
 
-// QueueWork uses unique ownership (no refcounting), but we still
-// define it here for type safety and safe casting.
+// QueueWork uses unique ownership (no refcounting)
+// It doesn't inherit from ApiRefCounted, so ApiHandle won't work with it.
+// Use a simple unique_ptr-like pattern instead.
 struct QueueWork {};
 
 } // namespace moodist::api

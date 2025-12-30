@@ -5,13 +5,16 @@
 // Core objects inherit from ApiRefCounted to expose their refcount.
 // This allows the wrapper to do addRef via direct atomic increment (no API call),
 // and only destruction requires crossing the API boundary.
+//
+// The destroy() function is found via ADL - core and wrapper provide different
+// implementations. Since ApiHandle is always returned by value (RVO), the
+// destructor only ever runs in the wrapper, so only wrapper's destroy() is called.
 
 #pragma once
 
-#include "moodist_api.h"
-
 #include <atomic>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 namespace moodist {
@@ -23,44 +26,69 @@ struct ApiRefCounted {
   std::atomic_size_t refcount;
 };
 
-#ifdef MOODIST_WRAPPER
+} // namespace moodist
 
-// The coreApi global - defined in wrapper, declared here for ApiHandle
-extern CoreApi coreApi;
+namespace moodist::api {
+
+// Forward declarations of API types (defined in types.h)
+struct Store;
+struct Queue;
+struct Future;
+struct CustomOp;
+struct ProcessGroup;
+struct Buffer;
+
+// destroy() declarations - implementations provided by wrapper only.
+// Core never calls these (ApiHandle is always returned to wrapper via RVO).
+// If core somehow tried to destroy an ApiHandle, linker error = good.
+void destroy(Store*);
+void destroy(Queue*);
+void destroy(Future*);
+void destroy(CustomOp*);
+void destroy(ProcessGroup*);
+void destroy(Buffer*);
 
 // Smart pointer for managing ApiRefCounted objects across the API boundary.
 //
-// Template parameter is a pointer-to-member for the destroy function in CoreApi.
-// The member pointer is a compile-time constant (just an offset), even though
-// the actual function pointer is set at runtime via dlsym.
+// Template parameter is the API type (e.g., api::Queue).
+// The type must inherit from ApiRefCounted.
 //
 // Usage:
-//   using QueueHandle = ApiHandle<&CoreApi::queueDestroy>;
-//   using FutureHandle = ApiHandle<&CoreApi::futureDestroy>;
+//   // Core returns:
+//   ApiHandle<api::Queue> processGroupImplMakeQueue(...);
 //
-template<void (*CoreApi::*Destroy)(void*)>
+//   // Wrapper receives directly (RVO), manages lifetime automatically.
+//
+template<typename T>
 class ApiHandle {
-  ApiRefCounted* ptr_ = nullptr;
+  static_assert(std::is_base_of_v<ApiRefCounted, T>, "ApiHandle requires type to inherit from ApiRefCounted");
 
-  // Private constructor - use adopt() or addRef() instead
-  struct AdoptTag {};
-  ApiHandle(void* p, AdoptTag) : ptr_(static_cast<ApiRefCounted*>(p)) {}
+  T* ptr_ = nullptr;
 
 public:
   ApiHandle() = default;
 
-  // Adopt ownership from API call (refcount already set by core's SharedPtr.release())
-  static ApiHandle adopt(void* p) {
+  // Construct with initial refcount (for core creating new objects)
+  explicit ApiHandle(T* p) : ptr_(p) {
+    if (ptr_) {
+      ptr_->refcount.store(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Adopt ownership from raw pointer (assumes refcount already set)
+  struct AdoptTag {};
+  ApiHandle(T* p, AdoptTag) : ptr_(p) {}
+
+  static ApiHandle adopt(T* p) {
     return ApiHandle(p, AdoptTag{});
   }
 
   // Add a reference to an existing object (increments refcount)
-  static ApiHandle addRef(void* p) {
-    auto handle = ApiHandle(p, AdoptTag{});
-    if (handle.ptr_) {
-      handle.ptr_->refcount.fetch_add(1, std::memory_order_relaxed);
+  static ApiHandle addRef(T* p) {
+    if (p) {
+      p->refcount.fetch_add(1, std::memory_order_relaxed);
     }
-    return handle;
+    return ApiHandle(p, AdoptTag{});
   }
 
   ~ApiHandle() {
@@ -103,20 +131,23 @@ public:
   void reset() {
     if (ptr_) {
       if (ptr_->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        (coreApi.*Destroy)(ptr_);
+        destroy(ptr_); // ADL finds moodist::api::destroy
       }
       ptr_ = nullptr;
     }
   }
 
-  // Get raw pointer (as void* for API calls)
-  void* get() const {
+  // Get typed pointer
+  T* get() const {
     return ptr_;
   }
 
-  // Get typed pointer (for direct refcount access if needed)
-  ApiRefCounted* ptr() const {
+  T* operator->() const {
     return ptr_;
+  }
+
+  T& operator*() const {
+    return *ptr_;
   }
 
   explicit operator bool() const {
@@ -124,13 +155,11 @@ public:
   }
 
   // Release ownership without decrementing refcount
-  void* release() {
-    void* p = ptr_;
+  T* release() {
+    T* p = ptr_;
     ptr_ = nullptr;
     return p;
   }
 };
 
-#endif // MOODIST_WRAPPER
-
-} // namespace moodist
+} // namespace moodist::api

@@ -3,7 +3,7 @@
 // Wrapper for serialize/deserialize that uses torch::Tensor.
 // Uses function pointers from coreApi to call into libmoodist.so.
 
-#include "api/api_handle.h"
+#include "api/types.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 
@@ -13,13 +13,17 @@ namespace moodist {
 
 namespace py = pybind11;
 
-// Buffer handle using ApiHandle for refcount management
-using BufferHandle = ApiHandle<&CoreApi::bufferDestroy>;
+// destroy() implementation for api::Buffer - called by ApiHandle destructor
+namespace api {
+void destroy(Buffer* buffer) {
+  coreApi.bufferDestroy(buffer);
+}
+} // namespace api
 
 torch::Tensor serializeObject(py::object o) {
-  BufferHandle handle = BufferHandle::adopt(coreApi.serializeObjectImpl(o.ptr()));
-  void* ptr = coreApi.serializeBufferPtr(static_cast<Buffer*>(handle.get()));
-  size_t size = coreApi.serializeBufferSize(static_cast<Buffer*>(handle.get()));
+  auto handle = api::ApiHandle<api::Buffer>::adopt(coreApi.serializeObjectImpl(o.ptr()));
+  void* ptr = coreApi.serializeBufferPtr(handle.get());
+  size_t size = coreApi.serializeBufferSize(handle.get());
 
   // Capture handle by value - copy increments refcount
   // Handle destructor will decref when the tensor's deleter is called

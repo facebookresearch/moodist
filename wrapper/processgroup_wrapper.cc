@@ -307,19 +307,16 @@ std::vector<torch::Tensor> ProcessGroup::share(const torch::Tensor&) {
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  void* queuePtr = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
-  return std::shared_ptr<Queue>(new Queue(queuePtr), [](Queue* q) {
-    delete q; // Queue destructor will call queueDestroy
-  });
+  api::ApiHandle<api::Queue> handle = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
+  return std::make_shared<Queue>(std::move(handle));
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(
     std::vector<int> locations, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  void* queuePtr = coreApi.processGroupImplMakeQueueMulti(impl, locations.data(), locations.size(), streaming, namePtr);
-  return std::shared_ptr<Queue>(new Queue(queuePtr), [](Queue* q) {
-    delete q; // Queue destructor will call queueDestroy
-  });
+  api::ApiHandle<api::Queue> handle =
+      coreApi.processGroupImplMakeQueueMulti(impl, locations.data(), locations.size(), streaming, namePtr);
+  return std::make_shared<Queue>(std::move(handle));
 }
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>&, std::optional<torch::Tensor>) {

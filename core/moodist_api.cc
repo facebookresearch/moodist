@@ -17,18 +17,19 @@ void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstrea
 void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize);
 
 // Forward declarations for Queue API functions defined in processgroup.cc
-void* processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-void* processGroupImplMakeQueueMulti(
+api::ApiHandle<api::Queue> processGroupImplMakeQueue(
+    ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+api::ApiHandle<api::Queue> processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
-void queueDestroy(void* queue);
-bool queueGet(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-void* queuePut(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
-size_t queueQsize(void* queue);
-bool queueWait(void* queue, const float* timeout);
-uint32_t queueTransactionBegin(void* queue);
-void queueTransactionCancel(void* queue, uint32_t id);
-void queueTransactionCommit(void* queue, uint32_t id);
-const char* queueName(void* queue);
+void queueDestroy(api::Queue* queue);
+bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
+void* queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+size_t queueQsize(api::Queue* queue);
+bool queueWait(api::Queue* queue, const float* timeout);
+uint32_t queueTransactionBegin(api::Queue* queue);
+void queueTransactionCancel(api::Queue* queue, uint32_t id);
+void queueTransactionCommit(api::Queue* queue, uint32_t id);
+const char* queueName(api::Queue* queue);
 void queueWorkDestroy(void* work);
 void queueWorkWait(void* work);
 
@@ -44,7 +45,7 @@ void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType
     const int* outputShapes, size_t nOutputs);
 
 // Forward declaration for bufferDestroy defined in serialize_object.cc
-void bufferDestroy(void* buf);
+void bufferDestroy(api::Buffer* buf);
 
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this

@@ -2,10 +2,18 @@
 
 #include "processgroup_wrapper.h"
 
+#include "api/api_handle.h"
 #include "api/tensor_ptr.h"
 #include "moodist_loader.h"
 
 namespace moodist {
+
+// destroy() implementation for api::Queue - called by ApiHandle destructor
+namespace api {
+void destroy(Queue* queue) {
+  coreApi.queueDestroy(queue);
+}
+} // namespace api
 
 // QueueWork implementation
 
@@ -32,20 +40,14 @@ void QueueWork::wait() {
   }
 }
 
-// Queue implementation
-
-Queue::~Queue() {
-  if (impl) {
-    coreApi.queueDestroy(impl);
-  }
-}
+// Queue implementation - ApiHandle manages lifetime, destructor is default
 
 std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::optional<float> timeout) {
   TensorPtr tensor;
   size_t size = 0;
   const float* timeoutPtr = timeout ? &(*timeout) : nullptr;
 
-  bool hasData = coreApi.queueGet(impl, block, timeoutPtr, &tensor, &size);
+  bool hasData = coreApi.queueGet(handle.get(), block, timeoutPtr, &tensor, &size);
   if (hasData) {
     return {unwrapTensor(tensor), size};
   }
@@ -54,33 +56,33 @@ std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::opti
 
 QueueWork Queue::put(torch::Tensor torchTensor, uint32_t transaction, bool waitOnDestroy) {
   TensorPtr tensor = wrapTensor(std::move(torchTensor));
-  void* workPtr = coreApi.queuePut(impl, tensor, transaction, waitOnDestroy);
+  void* workPtr = coreApi.queuePut(handle.get(), tensor, transaction, waitOnDestroy);
   return QueueWork(workPtr);
 }
 
 size_t Queue::qsize() const {
-  return coreApi.queueQsize(impl);
+  return coreApi.queueQsize(handle.get());
 }
 
 bool Queue::wait(std::optional<float> timeout) const {
   const float* timeoutPtr = timeout ? &(*timeout) : nullptr;
-  return coreApi.queueWait(impl, timeoutPtr);
+  return coreApi.queueWait(handle.get(), timeoutPtr);
 }
 
 uint32_t Queue::transactionBegin() {
-  return coreApi.queueTransactionBegin(impl);
+  return coreApi.queueTransactionBegin(handle.get());
 }
 
 void Queue::transactionCancel(uint32_t id) {
-  coreApi.queueTransactionCancel(impl, id);
+  coreApi.queueTransactionCancel(handle.get(), id);
 }
 
 void Queue::transactionCommit(uint32_t id) {
-  coreApi.queueTransactionCommit(impl, id);
+  coreApi.queueTransactionCommit(handle.get(), id);
 }
 
 std::string_view Queue::name() const {
-  return coreApi.queueName(impl);
+  return coreApi.queueName(handle.get());
 }
 
 } // namespace moodist

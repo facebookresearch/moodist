@@ -7,6 +7,7 @@
 #pragma once
 
 #include "moodist_version.h"
+#include "types.h" // For ApiHandle, api::Queue, etc.
 
 #include <Python.h>
 #include <chrono>
@@ -21,7 +22,6 @@ namespace moodist {
 
 // Forward declarations (opaque types)
 struct StoreHandle;
-struct Buffer;
 struct Tensor;            // Opaque wrapper for torch::Tensor
 class TensorPtr;          // RAII smart pointer for Tensor* (defined in tensor_ptr.h)
 struct CudaAllocatorImpl; // CUDA allocator implementation
@@ -147,11 +147,12 @@ struct CoreApi {
       StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions
-  // Buffer inherits from ApiRefCounted - wrapper manages refcount directly
-  Buffer* (*serializeObjectImpl)(PyObject* o);
-  void* (*serializeBufferPtr)(Buffer* buf);
-  size_t (*serializeBufferSize)(Buffer* buf);
-  void (*bufferDestroy)(void* buf);
+  // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
+  // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
+  api::Buffer* (*serializeObjectImpl)(PyObject* o);
+  void* (*serializeBufferPtr)(api::Buffer* buf);
+  size_t (*serializeBufferSize)(api::Buffer* buf);
+  void (*bufferDestroy)(api::Buffer* buf);
   PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
 
   // CPU allocator functions
@@ -199,22 +200,24 @@ struct CoreApi {
   void (*processGroupImplCudaBarrier)(ProcessGroupImpl* impl, CUstream stream);
   void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
 
-  // Queue factory functions - return opaque Queue*
-  void* (*processGroupImplMakeQueue)(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-  void* (*processGroupImplMakeQueueMulti)(
+  // Queue factory functions - return ApiHandle (ownership via RVO)
+  api::ApiHandle<api::Queue> (*processGroupImplMakeQueue)(
+      ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+  api::ApiHandle<api::Queue> (*processGroupImplMakeQueueMulti)(
       ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
 
-  // Queue operations - operate on opaque Queue* pointers
-  // Queue inherits from ApiRefCounted - wrapper manages refcount directly
-  void (*queueDestroy)(void* queue);
-  bool (*queueGet)(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-  void* (*queuePut)(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
-  size_t (*queueQsize)(void* queue);
-  bool (*queueWait)(void* queue, const float* timeout);
-  uint32_t (*queueTransactionBegin)(void* queue);
-  void (*queueTransactionCancel)(void* queue, uint32_t id);
-  void (*queueTransactionCommit)(void* queue, uint32_t id);
-  const char* (*queueName)(void* queue);
+  // Queue operations - operate on api::Queue* pointers
+  // Queue inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
+  // Wrapper's destroy(api::Queue*) calls queueDestroy to delete the object
+  void (*queueDestroy)(api::Queue* queue);
+  bool (*queueGet)(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
+  void* (*queuePut)(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+  size_t (*queueQsize)(api::Queue* queue);
+  bool (*queueWait)(api::Queue* queue, const float* timeout);
+  uint32_t (*queueTransactionBegin)(api::Queue* queue);
+  void (*queueTransactionCancel)(api::Queue* queue, uint32_t id);
+  void (*queueTransactionCommit)(api::Queue* queue, uint32_t id);
+  const char* (*queueName)(api::Queue* queue);
 
   // QueueWork operations - operate on opaque QueueWork* pointers
   // QueueWork inherits from ApiRefCounted - wrapper manages refcount directly

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "api/types.h"
 #include "torch_includes.h"
 
 #include <memory>
@@ -35,13 +36,13 @@ struct QueueWork {
   void wait();
 };
 
-// Queue - wrapper around opaque void* from core
+// Queue - wrapper around api::Queue managed via ApiHandle
 class Queue {
 public:
-  void* impl = nullptr; // Opaque pointer to core Queue
+  api::ApiHandle<api::Queue> handle; // Manages refcount automatically
 
-  Queue(void* impl_ = nullptr) : impl(impl_) {}
-  ~Queue();
+  Queue(api::ApiHandle<api::Queue> h) : handle(std::move(h)) {}
+  ~Queue() = default; // ApiHandle destructor handles cleanup
 
   // Wrapper methods that call CoreApi functions
   std::pair<std::optional<torch::Tensor>, size_t> get(bool block = true, std::optional<float> timeout = {});

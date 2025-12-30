@@ -1180,8 +1180,8 @@ template<typename... T>
   }
 }
 
-// Core implementation - returns Buffer* with refcount=1
-Buffer* serializeObjectImpl(PyObject* o) {
+// Core implementation - returns api::Buffer* with refcount=1
+api::Buffer* serializeObjectImpl(PyObject* o) {
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>(o));
   Buffer* buf = buffer.release();
@@ -1189,15 +1189,15 @@ Buffer* serializeObjectImpl(PyObject* o) {
   return buf;
 }
 
-void* serializeBufferPtr(Buffer* buf) {
-  return buf->data();
+void* serializeBufferPtr(api::Buffer* buf) {
+  return static_cast<Buffer*>(buf)->data();
 }
 
-size_t serializeBufferSize(Buffer* buf) {
-  return buf->size();
+size_t serializeBufferSize(api::Buffer* buf) {
+  return static_cast<Buffer*>(buf)->size();
 }
 
-void bufferDestroy(void* buf) {
+void bufferDestroy(api::Buffer* buf) {
   Buffer::deallocate(static_cast<Buffer*>(buf));
 }
 

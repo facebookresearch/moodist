@@ -3,6 +3,7 @@
 #pragma once
 
 #include "api/tensor_ptr.h"
+#include "api/types.h"
 #include "commondefs.h"
 #include "shared_ptr.h"
 
@@ -27,9 +28,11 @@ struct QueueWork {
   void wait();
 };
 
-struct Queue {
+// Queue inherits from api::Queue (which inherits from ApiRefCounted).
+// This allows safe upcasting to api::Queue* for the API boundary.
+// The refcount is inherited from ApiRefCounted.
+struct Queue : api::Queue {
   void* impl = nullptr;
-  std::atomic<int> refcount; // For SharedPtr
   Queue() = delete;
   Queue(void*);
   Queue(Queue&) = delete;
@@ -49,7 +52,8 @@ struct Queue {
   std::string_view name() const;
 };
 
-SharedPtr<Queue> makeQueue(SharedPtr<Group>, int location, bool streaming, std::string_view name = {});
-SharedPtr<Queue> makeQueue(SharedPtr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
+api::ApiHandle<api::Queue> makeQueue(SharedPtr<Group>, int location, bool streaming, std::string_view name = {});
+api::ApiHandle<api::Queue> makeQueue(
+    SharedPtr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
 
 } // namespace moodist

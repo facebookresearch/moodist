@@ -817,20 +817,27 @@ Queue::Queue(void* p) {
   CHECK(p == &foo);
 }
 
-SharedPtr<Queue> makeQueue(SharedPtr<Group> group, int location, bool streaming, std::string_view name) {
+// destroy() implementation for core - needed because ApiHandle destructor references it
+// even though RVO means it's never actually called from core
+namespace api {
+void destroy(Queue* queue) {
+  internalDelete(static_cast<moodist::Queue*>(queue));
+}
+} // namespace api
+
+api::ApiHandle<api::Queue> makeQueue(SharedPtr<Group> group, int location, bool streaming, std::string_view name) {
   auto* q = internalNew<Queue>(&foo);
-  q->refcount = 1;
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return SharedPtr<Queue>(q);
+  return api::ApiHandle<api::Queue>(q); // Sets refcount to 1
 }
 
-SharedPtr<Queue> makeQueue(SharedPtr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
+api::ApiHandle<api::Queue> makeQueue(
+    SharedPtr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
   auto* q = internalNew<Queue>(&foo);
-  q->refcount = 1;
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return SharedPtr<Queue>(q);
+  return api::ApiHandle<api::Queue>(q); // Sets refcount to 1
 }
 
 static std::atomic_uint32_t nextIncomingKey = getRng()();

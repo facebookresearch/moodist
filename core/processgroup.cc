@@ -2023,32 +2023,26 @@ void processGroupImplShutdown(ProcessGroupImpl* impl) {
   }
 }
 
-void* processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name) {
+api::ApiHandle<api::Queue> processGroupImplMakeQueue(
+    ProcessGroupImpl* impl, int location, bool streaming, const char* name) {
   std::string_view nameView = name ? name : "";
-  auto queue = makeQueue(impl->group, location, streaming, nameView);
-  queue->refcount++; // Initial refcount for wrapper
-  return queue.get();
+  return makeQueue(impl->group, location, streaming, nameView);
 }
 
-void* processGroupImplMakeQueueMulti(
+api::ApiHandle<api::Queue> processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name) {
   std::vector<int> locationVec(locations, locations + numLocations);
   std::string_view nameView = name ? name : "";
-  auto queue = makeQueue(impl->group, locationVec, streaming, nameView);
-  queue->refcount++; // Initial refcount for wrapper
-  return queue.get();
+  return makeQueue(impl->group, locationVec, streaming, nameView);
 }
 
-void queueDestroy(void* queue) {
+void queueDestroy(api::Queue* queue) {
   if (queue) {
-    auto* q = static_cast<Queue*>(queue);
-    if (--q->refcount == 0) {
-      internalDelete(q);
-    }
+    internalDelete(static_cast<Queue*>(queue));
   }
 }
 
-bool queueGet(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize) {
+bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize) {
   auto* q = static_cast<Queue*>(queue);
   std::optional<float> timeoutOpt;
   if (timeout) {
@@ -2063,7 +2057,7 @@ bool queueGet(void* queue, bool block, const float* timeout, TensorPtr* outTenso
   return false;
 }
 
-void* queuePut(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
+void* queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
   auto* q = static_cast<Queue*>(queue);
   QueueWork work = q->put(tensor, transaction, waitOnDestroy);
   // Transfer ownership to heap
@@ -2071,11 +2065,11 @@ void* queuePut(void* queue, const TensorPtr& tensor, uint32_t transaction, bool 
   return workPtr;
 }
 
-size_t queueQsize(void* queue) {
+size_t queueQsize(api::Queue* queue) {
   return static_cast<Queue*>(queue)->qsize();
 }
 
-bool queueWait(void* queue, const float* timeout) {
+bool queueWait(api::Queue* queue, const float* timeout) {
   auto* q = static_cast<Queue*>(queue);
   std::optional<float> timeoutOpt;
   if (timeout) {
@@ -2084,19 +2078,19 @@ bool queueWait(void* queue, const float* timeout) {
   return q->wait(timeoutOpt);
 }
 
-uint32_t queueTransactionBegin(void* queue) {
+uint32_t queueTransactionBegin(api::Queue* queue) {
   return static_cast<Queue*>(queue)->transactionBegin();
 }
 
-void queueTransactionCancel(void* queue, uint32_t id) {
+void queueTransactionCancel(api::Queue* queue, uint32_t id) {
   static_cast<Queue*>(queue)->transactionCancel(id);
 }
 
-void queueTransactionCommit(void* queue, uint32_t id) {
+void queueTransactionCommit(api::Queue* queue, uint32_t id) {
   static_cast<Queue*>(queue)->transactionCommit(id);
 }
 
-const char* queueName(void* queue) {
+const char* queueName(api::Queue* queue) {
   auto name = static_cast<Queue*>(queue)->name();
   // Return pointer to internal string data - safe as long as Queue lives
   return name.data();
@@ -2481,10 +2475,12 @@ CustomOpImpl* ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_
   // Create internal queues for compileOpFull communication
   if (queues.empty()) {
     for (size_t i = 0; i < size; ++i) {
-      auto q = makeQueue(group, i, false, {});
-      CHECK(q.get() != nullptr);
+      auto handle = makeQueue(group, i, false, {});
+      CHECK(handle.get() != nullptr);
+      // Transfer ownership from ApiHandle to SharedPtr
+      Queue* q = static_cast<Queue*>(handle.release());
       CHECK(q->impl != nullptr);
-      queues.push_back(std::move(q));
+      queues.push_back(SharedPtr<Queue>(q));
     }
   }
   CHECK(queues.size() == size);
