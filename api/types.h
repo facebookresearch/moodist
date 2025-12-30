@@ -6,7 +6,7 @@
 // Example:
 //   // In core:
 //   struct QueueImpl : api::Queue { ... };
-//   ApiHandle<api::Queue> createQueue() { return ApiHandle<api::Queue>(new QueueImpl()); }
+//   ApiHandle<api::Queue> createQueue() { return ApiHandle<api::Queue>::create(new QueueImpl()); }
 //
 //   // In wrapper:
 //   auto queue = coreApi.createQueue();  // RVO, wrapper owns directly

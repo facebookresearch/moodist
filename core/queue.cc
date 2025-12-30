@@ -829,7 +829,7 @@ api::ApiHandle<api::Queue> makeQueue(SharedPtr<Group> group, int location, bool 
   auto* q = internalNew<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return api::ApiHandle<api::Queue>(q); // Sets refcount to 1
+  return api::ApiHandle<api::Queue>::create(q);
 }
 
 api::ApiHandle<api::Queue> makeQueue(
@@ -837,7 +837,7 @@ api::ApiHandle<api::Queue> makeQueue(
   auto* q = internalNew<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return api::ApiHandle<api::Queue>(q); // Sets refcount to 1
+  return api::ApiHandle<api::Queue>::create(q);
 }
 
 static std::atomic_uint32_t nextIncomingKey = getRng()();

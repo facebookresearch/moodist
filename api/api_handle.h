@@ -54,8 +54,8 @@ void destroy(Buffer*);
 // The type must inherit from ApiRefCounted.
 //
 // Usage:
-//   // Core returns:
-//   ApiHandle<api::Queue> processGroupImplMakeQueue(...);
+//   // Core creates new object:
+//   ApiHandle<api::Queue> createQueue() { return ApiHandle<api::Queue>::create(new QueueImpl()); }
 //
 //   // Wrapper receives directly (RVO), manages lifetime automatically.
 //
@@ -65,20 +65,22 @@ class ApiHandle {
 
   T* ptr_ = nullptr;
 
-public:
-  ApiHandle() = default;
-
-  // Construct with initial refcount (for core creating new objects)
-  explicit ApiHandle(T* p) : ptr_(p) {
-    if (ptr_) {
-      ptr_->refcount.store(1, std::memory_order_relaxed);
-    }
-  }
-
-  // Adopt ownership from raw pointer (assumes refcount already set)
+  // Private: use static factory methods instead
   struct AdoptTag {};
   ApiHandle(T* p, AdoptTag) : ptr_(p) {}
 
+public:
+  ApiHandle() = default;
+
+  // Create new handle, setting refcount to 1 (for core creating new objects)
+  static ApiHandle create(T* p) {
+    if (p) {
+      p->refcount.store(1, std::memory_order_relaxed);
+    }
+    return ApiHandle(p, AdoptTag{});
+  }
+
+  // Adopt ownership from raw pointer (assumes refcount already set)
   static ApiHandle adopt(T* p) {
     return ApiHandle(p, AdoptTag{});
   }
