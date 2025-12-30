@@ -56,18 +56,31 @@ public:
 
 // Stub types for unimplemented methods - minimal definitions
 struct Future {
-  void wait() {
-    throw std::runtime_error("Future: not implemented");
-  }
-  torch::Tensor result() {
-    throw std::runtime_error("Future: not implemented");
-  }
+  void* impl = nullptr;                   // Opaque pointer to core ApiFuture
+  std::vector<torch::Tensor> holdTensors; // Keep tensors alive in wrapper
+
+  Future() = default;
+  Future(void* impl_) : impl(impl_) {}
+  ~Future();
+  Future(const Future&) = delete;
+  Future(Future&& other) noexcept;
+  Future& operator=(Future&& other) noexcept;
+
+  void wait();
+  torch::Tensor result();
 };
 
 struct CustomOp {
-  Future operator()(const std::vector<torch::Tensor>&, const std::vector<torch::Tensor>&) {
-    throw std::runtime_error("CustomOp: not implemented");
-  }
+  void* impl = nullptr; // Opaque pointer to core CustomOpImpl
+
+  CustomOp() = default;
+  CustomOp(void* impl_) : impl(impl_) {}
+  ~CustomOp();
+  CustomOp(const CustomOp&) = delete;
+  CustomOp(CustomOp&& other) noexcept;
+  CustomOp& operator=(CustomOp&& other) noexcept;
+
+  Future operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs);
 };
 
 using Work = c10d::Work;

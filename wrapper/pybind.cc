@@ -54,7 +54,13 @@ PYBIND11_MODULE(_C, m) {
       .def("cuda_barrier", &MoodistProcessGroup::cudaBarrier, py::call_guard<py::gil_scoped_release>())
       .def("Queue", py::overload_cast<int, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
           py::arg("location"), py::arg("streaming") = false, py::arg("name") = std::nullopt,
-          py::call_guard<py::gil_scoped_release>());
+          py::call_guard<py::gil_scoped_release>())
+      .def("Queue",
+          py::overload_cast<std::vector<int>, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
+          py::arg("location"), py::arg("streaming") = false, py::arg("name") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
+      .def("compile_op_full", &MoodistProcessGroup::compileOpFull, py::arg("shape"), py::arg("dtype"),
+          py::arg("inputs"), py::arg("outputs"), py::call_guard<py::gil_scoped_release>());
 
   py::class_<MoodistBackend, c10::intrusive_ptr<MoodistBackend>, c10d::Backend>(m, "MoodistBackend", R"d(
     A moodist backend :D

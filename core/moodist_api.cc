@@ -33,6 +33,18 @@ const char* queueName(void* queue);
 void queueWorkWait(void* work);
 void queueWorkDecRef(void* work);
 
+// Forward declarations for FutureImpl, CustomOpImpl, compileOpFull defined in processgroup.cc
+void futureImplAddRef(void* future);
+void futureImplDecRef(void* future);
+void futureImplWait(void* future, CUstream stream);
+bool futureImplGetResult(void* future, TensorPtr* outTensor);
+void customOpImplDecRef(void* op);
+void* customOpImplCall(
+    void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
+void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype, const int* inputRanks,
+    const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks, const int* outputOffsets,
+    const int* outputShapes, size_t nOutputs);
+
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
 WrapperApi wrapperApi = {};
@@ -112,6 +124,19 @@ static CoreApi coreApi = {
     // QueueWork operations
     .queueWorkWait = queueWorkWait,
     .queueWorkDecRef = queueWorkDecRef,
+
+    // FutureImpl operations
+    .futureImplAddRef = futureImplAddRef,
+    .futureImplDecRef = futureImplDecRef,
+    .futureImplWait = futureImplWait,
+    .futureImplGetResult = futureImplGetResult,
+
+    // CustomOpImpl operations
+    .customOpImplDecRef = customOpImplDecRef,
+    .customOpImplCall = customOpImplCall,
+
+    // compileOpFull
+    .compileOpFull = compileOpFull,
 
     // Profiling
     .setProfilingEnabled = setProfilingEnabled,

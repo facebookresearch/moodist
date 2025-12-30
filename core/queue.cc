@@ -15,37 +15,7 @@
 
 namespace moodist {
 
-namespace {
-
-// Deleter function for TensorDataPtr - called when tensor is destroyed
-void tensorDataDeleter(void* ctx) {
-  // ctx is Storage* (from FLPtr::release()), FLPtr constructor handles the cast
-  TensorDataPtr ptr(ctx);
-  // ptr destructor releases the buffer
-}
-
-// Helper to convert TensorDataPtr to TensorPtr
-TensorPtr tensorFromTensorData(TensorDataPtr data) {
-  if (!data) {
-    return TensorPtr();
-  }
-  if (!data->isCuda) {
-    // For CPU tensors, use tensorFromBlobWithDeleter to manage buffer lifetime
-    // Extract all data BEFORE releasing, since release() returns Storage*, not TensorData*
-    void* dataPtr = (void*)data->dataPtr;
-    DType dtype = static_cast<DType>(data->dtype);
-    const int64_t* shapePtr = data->shape.data();
-    int ndim = static_cast<int>(data->shape.size());
-    void* ctx = data.release(); // This is actually Storage*, but deleter reconstructs FLPtr from it
-    return TensorPtr(wrapperApi.tensorFromBlobWithDeleter(dataPtr, shapePtr, ndim, dtype, -1, tensorDataDeleter, ctx));
-  }
-  // For CUDA tensors, use from_blob (TODO: may need similar treatment)
-  int device = 0; // TODO: track actual device
-  return TensorPtr::from_blob(
-      (void*)data->dataPtr, std::span<const int64_t>(data->shape), static_cast<DType>(data->dtype), device);
-}
-
-} // namespace
+TensorPtr tensorFromTensorData(TensorDataPtr data);
 
 struct WorkCudaDone {
   uintptr_t address = 0;

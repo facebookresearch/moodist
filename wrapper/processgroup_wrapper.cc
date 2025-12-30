@@ -330,10 +330,145 @@ Future ProcessGroup::copy(torch::Tensor&, const torch::Tensor&) {
   throw std::runtime_error("copy: not yet implemented");
 }
 
-CustomOp ProcessGroup::compileOpFull(const std::vector<int>&, torch::Dtype,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>&,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>&) {
-  throw std::runtime_error("compileOpFull: not yet implemented");
+CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
+    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
+    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
+  // Convert torch::Dtype to DType
+  DType dType = static_cast<DType>(static_cast<int>(c10::typeMetaToScalarType(c10::scalarTypeToTypeMeta(dtype))));
+
+  // Flatten input/output tuples to arrays
+  std::vector<int> inputRanks, inputOffsets, inputShapes;
+  for (const auto& [rank, offset, shape] : inputs) {
+    inputRanks.push_back(rank);
+    for (int v : offset) {
+      inputOffsets.push_back(v);
+    }
+    for (int v : shape) {
+      inputShapes.push_back(v);
+    }
+  }
+
+  std::vector<int> outputRanks, outputOffsets, outputShapes;
+  for (const auto& [rank, offset, shape] : outputs) {
+    outputRanks.push_back(rank);
+    for (int v : offset) {
+      outputOffsets.push_back(v);
+    }
+    for (int v : shape) {
+      outputShapes.push_back(v);
+    }
+  }
+
+  void* opPtr = coreApi.compileOpFull(impl, shape.data(), shape.size(), dType, inputRanks.data(), inputOffsets.data(),
+      inputShapes.data(), inputs.size(), outputRanks.data(), outputOffsets.data(), outputShapes.data(), outputs.size());
+
+  return CustomOp(opPtr);
+}
+
+// ============================================================================
+// Future implementation
+// ============================================================================
+
+Future::~Future() {
+  if (impl) {
+    coreApi.futureImplDecRef(impl);
+    impl = nullptr;
+  }
+}
+
+Future::Future(Future&& other) noexcept : impl(other.impl), holdTensors(std::move(other.holdTensors)) {
+  other.impl = nullptr;
+}
+
+Future& Future::operator=(Future&& other) noexcept {
+  if (this != &other) {
+    if (impl) {
+      coreApi.futureImplDecRef(impl);
+    }
+    impl = other.impl;
+    holdTensors = std::move(other.holdTensors);
+    other.impl = nullptr;
+  }
+  return *this;
+}
+
+void Future::wait() {
+  if (impl) {
+    CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
+    coreApi.futureImplWait(impl, stream);
+  }
+}
+
+torch::Tensor Future::result() {
+  wait();
+  if (impl) {
+    TensorPtr resultPtr;
+    if (coreApi.futureImplGetResult(impl, &resultPtr)) {
+      return unwrapTensor(resultPtr);
+    }
+  }
+  return torch::Tensor();
+}
+
+// ============================================================================
+// CustomOp implementation
+// ============================================================================
+
+CustomOp::~CustomOp() {
+  if (impl) {
+    coreApi.customOpImplDecRef(impl);
+    impl = nullptr;
+  }
+}
+
+CustomOp::CustomOp(CustomOp&& other) noexcept : impl(other.impl) {
+  other.impl = nullptr;
+}
+
+CustomOp& CustomOp::operator=(CustomOp&& other) noexcept {
+  if (this != &other) {
+    if (impl) {
+      coreApi.customOpImplDecRef(impl);
+    }
+    impl = other.impl;
+    other.impl = nullptr;
+  }
+  return *this;
+}
+
+Future CustomOp::operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs) {
+  if (!impl) {
+    throw std::runtime_error("CustomOp::operator(): op is null");
+  }
+
+  // Convert inputs to TensorPtr array
+  std::vector<TensorPtr> inputPtrs;
+  inputPtrs.reserve(inputs.size());
+  for (const auto& t : inputs) {
+    inputPtrs.push_back(wrapTensor(t));
+  }
+
+  // Convert outputs to TensorPtr array
+  std::vector<TensorPtr> outputPtrs;
+  outputPtrs.reserve(outputs.size());
+  for (const auto& t : outputs) {
+    outputPtrs.push_back(wrapTensor(t));
+  }
+
+  CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  void* futurePtr =
+      coreApi.customOpImplCall(impl, inputPtrs.data(), inputPtrs.size(), outputPtrs.data(), outputPtrs.size(), stream);
+
+  Future f(futurePtr);
+  // Hold the original tensors alive in the Future
+  for (const auto& t : inputs) {
+    f.holdTensors.push_back(t);
+  }
+  for (const auto& t : outputs) {
+    f.holdTensors.push_back(t);
+  }
+  return f;
 }
 
 // ============================================================================
