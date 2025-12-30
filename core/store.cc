@@ -1,11 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "api/store_api.h"
 #include "buffer.h"
 #include "common.h"
 #include "connection.h"
 #include "serialization.h"
 #include "socket.h"
-#include "api/store_api.h"
 #include "synchronization.h"
 
 #include <netdb.h>

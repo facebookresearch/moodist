@@ -8,8 +8,8 @@
 #include <torch/csrc/utils/pybind.h>
 
 #include "api/allocator.h"
-#include "backend.h"
 #include "api/cpu_allocator.h"
+#include "backend.h"
 #include "moodist_loader.h"
 #include "processgroup_wrapper.h"
 #include "store.h"

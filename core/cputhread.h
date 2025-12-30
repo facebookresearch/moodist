@@ -2,9 +2,9 @@
 
 #pragma once
 
+#include "api/moodist_api.h"
 #include "group.h"
 #include "intrusive_list.h"
-#include "api/moodist_api.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "tensor_types.h"

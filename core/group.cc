@@ -2,6 +2,7 @@
 
 #include "group.h"
 #include "allgather.h"
+#include "api/tensor_ptr.h"
 #include "common.h"
 #include "connection.h"
 #include "cputhread.h"
@@ -11,7 +12,6 @@
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
-#include "api/tensor_ptr.h"
 
 #include <algorithm>
 #include <cstring>

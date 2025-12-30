@@ -5,20 +5,20 @@
 // Collective operations are stubs until migration is complete.
 
 #include "allgather.h"
+#include "api/moodist_api.h"
+#include "api/processgroup_api.h"
+#include "api/tensor_ptr.h"
 #include "common.h"
 #include "cputhread.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "api/moodist_api.h"
-#include "api/processgroup_api.h"
 #include "queue.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
 #include "shared_ptr.h"
 #include "synchronization.h"
-#include "api/tensor_ptr.h"
 #include "tensor_types.h"
 
 #include <atomic>
@@ -2126,16 +2126,10 @@ struct ApiFuture {
   FutureImplSharedPtr impl;
   std::vector<TensorPtr> holdTensors; // Keep tensors alive until complete
   Function<void(CUstream)> waitDoneCallback;
-  std::atomic<int> refcount{1};
 };
 
 void futureImplDestroy(void* future) {
-  if (future) {
-    auto* f = static_cast<ApiFuture*>(future);
-    if (--f->refcount == 0) {
-      delete f;
-    }
-  }
+  delete static_cast<ApiFuture*>(future);
 }
 
 void futureImplWait(void* future, CUstream stream) {
@@ -2168,16 +2162,10 @@ struct CustomOpImpl {
   // The actual custom op function - takes process group impl pointer and descriptor
   // Returns ApiFuture*
   Function<void*(TensorPtr*, size_t, TensorPtr*, size_t, CUstream)> call;
-  std::atomic<int> refcount{1};
 };
 
 void customOpImplDestroy(void* op) {
-  if (op) {
-    auto* o = static_cast<CustomOpImpl*>(op);
-    if (--o->refcount == 0) {
-      delete o;
-    }
-  }
+  delete static_cast<CustomOpImpl*>(op);
 }
 
 void* customOpImplCall(

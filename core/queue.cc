@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "queue.h"
+#include "api/tensor_ptr.h"
 #include "common.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
@@ -9,7 +10,6 @@
 #include "queue_internal.h"
 #include "simple_vector.h"
 #include "synchronization.h"
-#include "api/tensor_ptr.h"
 
 #include <mutex>
 
