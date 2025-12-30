@@ -1,7 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "allocator.h"
-#include "allocator_api.h"
+#include "api/allocator.h"
+#include "api/allocator_api.h"
 #include "common.h"
 #include "function.h"
 #include "group.h"

@@ -9,7 +9,7 @@
 #include "queue_internal.h"
 #include "simple_vector.h"
 #include "synchronization.h"
-#include "tensor_ptr.h"
+#include "api/tensor_ptr.h"
 
 #include <mutex>
 

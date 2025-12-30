@@ -4,7 +4,7 @@
 
 #include "group.h"
 #include "intrusive_list.h"
-#include "moodist_api.h"
+#include "api/moodist_api.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "tensor_types.h"

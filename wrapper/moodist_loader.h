@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "tensor_ptr.h"
+#include "api/tensor_ptr.h"
 
 // Forward declare torch::Tensor (avoid including torch headers here)
 namespace at {

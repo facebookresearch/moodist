@@ -11,7 +11,7 @@
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
-#include "tensor_ptr.h"
+#include "api/tensor_ptr.h"
 
 #include <algorithm>
 #include <cstring>

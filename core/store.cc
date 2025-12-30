@@ -5,7 +5,7 @@
 #include "connection.h"
 #include "serialization.h"
 #include "socket.h"
-#include "store_api.h"
+#include "api/store_api.h"
 #include "synchronization.h"
 
 #include <netdb.h>

@@ -2,12 +2,12 @@
 
 // Implementation of moodistGetApi() - returns CoreApi, receives WrapperApi
 
-#include "moodist_api.h"
-#include "allocator_api.h"
-#include "cpu_allocator.h"
-#include "processgroup_api.h"
-#include "serialize_api.h"
-#include "store_api.h"
+#include "api/moodist_api.h"
+#include "api/allocator_api.h"
+#include "api/cpu_allocator.h"
+#include "api/processgroup_api.h"
+#include "api/serialize_api.h"
+#include "api/store_api.h"
 
 namespace moodist {
 
@@ -20,8 +20,7 @@ void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* out
 void* processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
 void* processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
-void queueAddRef(void* queue);
-void queueDecRef(void* queue);
+void queueDestroy(void* queue);
 bool queueGet(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
 void* queuePut(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
 size_t queueQsize(void* queue);
@@ -30,20 +29,22 @@ uint32_t queueTransactionBegin(void* queue);
 void queueTransactionCancel(void* queue, uint32_t id);
 void queueTransactionCommit(void* queue, uint32_t id);
 const char* queueName(void* queue);
+void queueWorkDestroy(void* work);
 void queueWorkWait(void* work);
-void queueWorkDecRef(void* work);
 
 // Forward declarations for FutureImpl, CustomOpImpl, compileOpFull defined in processgroup.cc
-void futureImplAddRef(void* future);
-void futureImplDecRef(void* future);
+void futureImplDestroy(void* future);
 void futureImplWait(void* future, CUstream stream);
 bool futureImplGetResult(void* future, TensorPtr* outTensor);
-void customOpImplDecRef(void* op);
+void customOpImplDestroy(void* op);
 void* customOpImplCall(
     void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype, const int* inputRanks,
     const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks, const int* outputOffsets,
     const int* outputShapes, size_t nOutputs);
+
+// Forward declaration for bufferDestroy defined in serialize_object.cc
+void bufferDestroy(void* buf);
 
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
@@ -67,8 +68,7 @@ static CoreApi coreApi = {
     .serializeObjectImpl = serializeObjectImpl,
     .serializeBufferPtr = serializeBufferPtr,
     .serializeBufferSize = serializeBufferSize,
-    .serializeBufferAddRef = serializeBufferAddRef,
-    .serializeBufferDecRef = serializeBufferDecRef,
+    .bufferDestroy = bufferDestroy,
     .deserializeObjectImpl = deserializeObjectImpl,
 
     // CPU allocator functions
@@ -110,8 +110,7 @@ static CoreApi coreApi = {
     .processGroupImplMakeQueueMulti = processGroupImplMakeQueueMulti,
 
     // Queue operations
-    .queueAddRef = queueAddRef,
-    .queueDecRef = queueDecRef,
+    .queueDestroy = queueDestroy,
     .queueGet = queueGet,
     .queuePut = queuePut,
     .queueQsize = queueQsize,
@@ -122,17 +121,16 @@ static CoreApi coreApi = {
     .queueName = queueName,
 
     // QueueWork operations
+    .queueWorkDestroy = queueWorkDestroy,
     .queueWorkWait = queueWorkWait,
-    .queueWorkDecRef = queueWorkDecRef,
 
     // FutureImpl operations
-    .futureImplAddRef = futureImplAddRef,
-    .futureImplDecRef = futureImplDecRef,
+    .futureImplDestroy = futureImplDestroy,
     .futureImplWait = futureImplWait,
     .futureImplGetResult = futureImplGetResult,
 
     // CustomOpImpl operations
-    .customOpImplDecRef = customOpImplDecRef,
+    .customOpImplDestroy = customOpImplDestroy,
     .customOpImplCall = customOpImplCall,
 
     // compileOpFull

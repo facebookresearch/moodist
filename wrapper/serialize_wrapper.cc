@@ -3,6 +3,7 @@
 // Wrapper for serialize/deserialize that uses torch::Tensor.
 // Uses function pointers from coreApi to call into libmoodist.so.
 
+#include "api/api_handle.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 
@@ -12,73 +13,20 @@ namespace moodist {
 
 namespace py = pybind11;
 
-// RAII wrapper for Buffer* - copyable via refcount
-class BufferGuard {
-  Buffer* buf_;
-
-public:
-  explicit BufferGuard(Buffer* buf) : buf_(buf) {}
-  ~BufferGuard() {
-    if (buf_) {
-      coreApi.serializeBufferDecRef(buf_);
-    }
-  }
-
-  BufferGuard(const BufferGuard& other) : buf_(other.buf_) {
-    if (buf_) {
-      coreApi.serializeBufferAddRef(buf_);
-    }
-  }
-  BufferGuard& operator=(const BufferGuard& other) {
-    if (this != &other) {
-      if (buf_) {
-        coreApi.serializeBufferDecRef(buf_);
-      }
-      buf_ = other.buf_;
-      if (buf_) {
-        coreApi.serializeBufferAddRef(buf_);
-      }
-    }
-    return *this;
-  }
-
-  BufferGuard(BufferGuard&& other) noexcept : buf_(other.buf_) {
-    other.buf_ = nullptr;
-  }
-  BufferGuard& operator=(BufferGuard&& other) noexcept {
-    if (this != &other) {
-      if (buf_) {
-        coreApi.serializeBufferDecRef(buf_);
-      }
-      buf_ = other.buf_;
-      other.buf_ = nullptr;
-    }
-    return *this;
-  }
-
-  Buffer* get() const {
-    return buf_;
-  }
-
-  void reset() {
-    if (buf_) {
-      coreApi.serializeBufferDecRef(buf_);
-      buf_ = nullptr;
-    }
-  }
-};
+// Buffer handle using ApiHandle for refcount management
+using BufferHandle = ApiHandle<&CoreApi::bufferDestroy>;
 
 torch::Tensor serializeObject(py::object o) {
-  BufferGuard guard(coreApi.serializeObjectImpl(o.ptr()));
-  void* ptr = coreApi.serializeBufferPtr(guard.get());
-  size_t size = coreApi.serializeBufferSize(guard.get());
+  BufferHandle handle = BufferHandle::adopt(coreApi.serializeObjectImpl(o.ptr()));
+  void* ptr = coreApi.serializeBufferPtr(static_cast<Buffer*>(handle.get()));
+  size_t size = coreApi.serializeBufferSize(static_cast<Buffer*>(handle.get()));
 
-  // Capture guard by value - copy increments refcount
-  // Explicitly reset in callback to free exactly when deleter is called
+  // Capture handle by value - copy increments refcount
+  // Handle destructor will decref when the tensor's deleter is called
   return torch::from_blob(
       ptr, {static_cast<int64_t>(size)},
-      [guard](void*) mutable {
-        guard.reset();
+      [handle](void*) mutable {
+        handle.reset();
       },
       torch::TensorOptions().dtype(torch::kUInt8));
 }

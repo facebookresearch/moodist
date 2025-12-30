@@ -10,15 +10,15 @@
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
-#include "moodist_api.h"
-#include "processgroup_api.h"
+#include "api/moodist_api.h"
+#include "api/processgroup_api.h"
 #include "queue.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
 #include "setup_comms.h"
 #include "shared_ptr.h"
 #include "synchronization.h"
-#include "tensor_ptr.h"
+#include "api/tensor_ptr.h"
 #include "tensor_types.h"
 
 #include <atomic>
@@ -2039,13 +2039,7 @@ void* processGroupImplMakeQueueMulti(
   return queue.get();
 }
 
-void queueAddRef(void* queue) {
-  if (queue) {
-    static_cast<Queue*>(queue)->refcount++;
-  }
-}
-
-void queueDecRef(void* queue) {
+void queueDestroy(void* queue) {
   if (queue) {
     auto* q = static_cast<Queue*>(queue);
     if (--q->refcount == 0) {
@@ -2112,7 +2106,7 @@ void queueWorkWait(void* work) {
   static_cast<QueueWork*>(work)->wait();
 }
 
-void queueWorkDecRef(void* work) {
+void queueWorkDestroy(void* work) {
   delete static_cast<QueueWork*>(work);
 }
 
@@ -2135,13 +2129,7 @@ struct ApiFuture {
   std::atomic<int> refcount{1};
 };
 
-void futureImplAddRef(void* future) {
-  if (future) {
-    static_cast<ApiFuture*>(future)->refcount++;
-  }
-}
-
-void futureImplDecRef(void* future) {
+void futureImplDestroy(void* future) {
   if (future) {
     auto* f = static_cast<ApiFuture*>(future);
     if (--f->refcount == 0) {
@@ -2183,7 +2171,7 @@ struct CustomOpImpl {
   std::atomic<int> refcount{1};
 };
 
-void customOpImplDecRef(void* op) {
+void customOpImplDestroy(void* op) {
   if (op) {
     auto* o = static_cast<CustomOpImpl*>(op);
     if (--o->refcount == 0) {

@@ -9,7 +9,7 @@
 #include "processgroup_wrapper.h"
 #include "backend.h"
 #include "moodist_loader.h"
-#include "tensor_ptr.h"
+#include "api/tensor_ptr.h"
 #include "torch_includes.h"
 
 namespace moodist {
@@ -309,7 +309,7 @@ std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std
   const char* namePtr = name ? name->c_str() : nullptr;
   void* queuePtr = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
   return std::shared_ptr<Queue>(new Queue(queuePtr), [](Queue* q) {
-    delete q; // Queue destructor will call queueDecRef
+    delete q; // Queue destructor will call queueDestroy
   });
 }
 
@@ -318,7 +318,7 @@ std::shared_ptr<Queue> ProcessGroup::makeQueue(
   const char* namePtr = name ? name->c_str() : nullptr;
   void* queuePtr = coreApi.processGroupImplMakeQueueMulti(impl, locations.data(), locations.size(), streaming, namePtr);
   return std::shared_ptr<Queue>(new Queue(queuePtr), [](Queue* q) {
-    delete q; // Queue destructor will call queueDecRef
+    delete q; // Queue destructor will call queueDestroy
   });
 }
 
@@ -371,7 +371,7 @@ CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype
 
 Future::~Future() {
   if (impl) {
-    coreApi.futureImplDecRef(impl);
+    coreApi.futureImplDestroy(impl);
     impl = nullptr;
   }
 }
@@ -383,7 +383,7 @@ Future::Future(Future&& other) noexcept : impl(other.impl), holdTensors(std::mov
 Future& Future::operator=(Future&& other) noexcept {
   if (this != &other) {
     if (impl) {
-      coreApi.futureImplDecRef(impl);
+      coreApi.futureImplDestroy(impl);
     }
     impl = other.impl;
     holdTensors = std::move(other.holdTensors);
@@ -416,7 +416,7 @@ torch::Tensor Future::result() {
 
 CustomOp::~CustomOp() {
   if (impl) {
-    coreApi.customOpImplDecRef(impl);
+    coreApi.customOpImplDestroy(impl);
     impl = nullptr;
   }
 }
@@ -428,7 +428,7 @@ CustomOp::CustomOp(CustomOp&& other) noexcept : impl(other.impl) {
 CustomOp& CustomOp::operator=(CustomOp&& other) noexcept {
   if (this != &other) {
     if (impl) {
-      coreApi.customOpImplDecRef(impl);
+      coreApi.customOpImplDestroy(impl);
     }
     impl = other.impl;
     other.impl = nullptr;

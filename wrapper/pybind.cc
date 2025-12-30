@@ -7,9 +7,9 @@
 #include <pybind11/pytypes.h>
 #include <torch/csrc/utils/pybind.h>
 
-#include "allocator.h"
+#include "api/allocator.h"
 #include "backend.h"
-#include "cpu_allocator.h"
+#include "api/cpu_allocator.h"
 #include "moodist_loader.h"
 #include "processgroup_wrapper.h"
 #include "store.h"

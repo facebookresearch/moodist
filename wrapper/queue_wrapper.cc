@@ -2,7 +2,7 @@
 
 #include "processgroup_wrapper.h"
 
-#include "../api/tensor_ptr.h"
+#include "api/tensor_ptr.h"
 #include "moodist_loader.h"
 
 namespace moodist {
@@ -11,14 +11,14 @@ namespace moodist {
 
 QueueWork::~QueueWork() {
   if (impl) {
-    coreApi.queueWorkDecRef(impl);
+    coreApi.queueWorkDestroy(impl);
   }
 }
 
 QueueWork& QueueWork::operator=(QueueWork&& other) noexcept {
   if (this != &other) {
     if (impl) {
-      coreApi.queueWorkDecRef(impl);
+      coreApi.queueWorkDestroy(impl);
     }
     impl = other.impl;
     other.impl = nullptr;
@@ -36,7 +36,7 @@ void QueueWork::wait() {
 
 Queue::~Queue() {
   if (impl) {
-    coreApi.queueDecRef(impl);
+    coreApi.queueDestroy(impl);
   }
 }
 

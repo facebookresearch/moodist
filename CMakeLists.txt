@@ -199,7 +199,7 @@ else()
   )
   target_include_directories(moodist PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
-    ${CMAKE_CURRENT_SOURCE_DIR}/api
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For api/ includes (e.g., #include "api/types.h")
   )
   target_compile_definitions(moodist PRIVATE
     CUDADEVRT_PATH="${CUDADEVRT}"
@@ -235,7 +235,7 @@ target_include_directories(_C SYSTEM PRIVATE
 )
 target_include_directories(_C PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/wrapper
-  ${CMAKE_CURRENT_SOURCE_DIR}/api
+  ${CMAKE_CURRENT_SOURCE_DIR}  # For api/ includes (e.g., #include "api/types.h")
 )
 target_compile_options(_C PRIVATE -fabi-version=${ABI_VERSION})
 target_compile_definitions(_C PRIVATE

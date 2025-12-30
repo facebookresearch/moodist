@@ -3,7 +3,8 @@
 // Loads libmoodist.so via dlopen and provides wrapper functions for PyTorch APIs
 
 #include "moodist_loader.h"
-#include "moodist_api.h"
+#include "api/api_handle.h"
+#include "api/moodist_api.h"
 #include "processgroup_wrapper.h"
 #include "torch_includes.h"
 
@@ -19,9 +20,13 @@ namespace moodist {
 // Tensor - opaque type that holds a torch::Tensor
 // ============================================================================
 
-struct Tensor {
+struct Tensor : ApiRefCounted {
   torch::Tensor tensor;
-  std::atomic<int> refcount{1};
+
+  // Tensor uses "starts at 1" convention (unlike SharedPtr which starts at 0)
+  Tensor() {
+    refcount.store(1, std::memory_order_relaxed);
+  }
 };
 
 // ============================================================================

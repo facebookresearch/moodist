@@ -2,10 +2,10 @@
 
 #include "cputhread.h"
 #include "allgather.h"
-#include "allocator.h"
+#include "api/allocator.h"
 #include "async.h"
 #include "common.h"
-#include "cpu_allocator.h"
+#include "api/cpu_allocator.h"
 #include "fmt/printf.h"
 #include "freelist.h"
 #include "group.h"

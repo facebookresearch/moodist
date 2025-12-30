@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "api/types.h"
 #include "common.h"
 #include "commondefs.h"
 
@@ -10,12 +11,11 @@
 
 namespace moodist {
 
-struct alignas(std::max_align_t) Buffer {
+struct alignas(std::max_align_t) Buffer : api::Buffer {
   union {
     Buffer* next;
     size_t msize;
   };
-  std::atomic_uint32_t refcount;
   std::byte* data() {
     return (std::byte*)(this + 1);
   }

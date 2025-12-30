@@ -3,7 +3,7 @@
 // CPU Allocator wrapper - contains CpuAllocator class and torch-dependent code.
 // This file is compiled into _C.so (wrapper library).
 
-#include "cpu_allocator.h"
+#include "api/cpu_allocator.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 

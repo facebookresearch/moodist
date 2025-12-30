@@ -147,11 +147,11 @@ struct CoreApi {
       StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions
+  // Buffer inherits from ApiRefCounted - wrapper manages refcount directly
   Buffer* (*serializeObjectImpl)(PyObject* o);
   void* (*serializeBufferPtr)(Buffer* buf);
   size_t (*serializeBufferSize)(Buffer* buf);
-  void (*serializeBufferAddRef)(Buffer* buf);
-  void (*serializeBufferDecRef)(Buffer* buf);
+  void (*bufferDestroy)(void* buf);
   PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
 
   // CPU allocator functions
@@ -205,8 +205,8 @@ struct CoreApi {
       ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
 
   // Queue operations - operate on opaque Queue* pointers
-  void (*queueAddRef)(void* queue);
-  void (*queueDecRef)(void* queue);
+  // Queue inherits from ApiRefCounted - wrapper manages refcount directly
+  void (*queueDestroy)(void* queue);
   bool (*queueGet)(void* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
   void* (*queuePut)(void* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
   size_t (*queueQsize)(void* queue);
@@ -217,19 +217,21 @@ struct CoreApi {
   const char* (*queueName)(void* queue);
 
   // QueueWork operations - operate on opaque QueueWork* pointers
+  // QueueWork inherits from ApiRefCounted - wrapper manages refcount directly
+  void (*queueWorkDestroy)(void* work);
   void (*queueWorkWait)(void* work);
-  void (*queueWorkDecRef)(void* work);
 
   // FutureImpl operations - operate on opaque FutureImpl* pointers
   // FutureImpl is created by customOpCall and holds async result
-  void (*futureImplAddRef)(void* future);
-  void (*futureImplDecRef)(void* future);
+  // FutureImpl inherits from ApiRefCounted - wrapper manages refcount directly
+  void (*futureImplDestroy)(void* future);
   void (*futureImplWait)(void* future, CUstream stream);
   bool (*futureImplGetResult)(void* future, TensorPtr* outTensor);
 
   // CustomOpImpl operations - operate on opaque CustomOpImpl* pointers
   // CustomOpImpl wraps a compiled custom op that can be called repeatedly
-  void (*customOpImplDecRef)(void* op);
+  // CustomOpImpl inherits from ApiRefCounted - wrapper manages refcount directly
+  void (*customOpImplDestroy)(void* op);
   // Calls the custom op with input/output tensors, returns FutureImpl* (caller must decref)
   void* (*customOpImplCall)(
       void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);

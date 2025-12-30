@@ -3,7 +3,7 @@
 // CUDA Allocator wrapper - thin shim around CoreApi.
 // This file is compiled into _C.so (wrapper library).
 
-#include "allocator.h"
+#include "api/allocator.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 

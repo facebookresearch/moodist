@@ -7,7 +7,7 @@
 #pragma push_macro("CHECK")
 
 #include "async.h"
-#include "cpu_allocator.h"
+#include "api/cpu_allocator.h"
 #include "function.h"
 #include "hash_map.h"
 #include "logging.h"

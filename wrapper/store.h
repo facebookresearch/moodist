@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "moodist_api.h"
+#include "api/moodist_api.h"
 #include "torch_includes.h"
 
 namespace moodist {

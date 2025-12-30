@@ -1,4 +1,4 @@
-#include "serialize_api.h"
+#include "api/serialize_api.h"
 
 #include "buffer.h"
 #include "pybind11/numpy.h"
@@ -1197,14 +1197,8 @@ size_t serializeBufferSize(Buffer* buf) {
   return buf->size();
 }
 
-void serializeBufferAddRef(Buffer* buf) {
-  buf->refcount.fetch_add(1, std::memory_order_relaxed);
-}
-
-void serializeBufferDecRef(Buffer* buf) {
-  if (buf->refcount.fetch_sub(1) == 1) {
-    internalFree(buf);
-  }
+void bufferDestroy(void* buf) {
+  Buffer::deallocate(static_cast<Buffer*>(buf));
 }
 
 // Core implementation - takes raw pointer/size, returns new reference

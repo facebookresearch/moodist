@@ -1,6 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "cpu_allocator.h"
+#include "api/cpu_allocator.h"
 #include "common.h"
 #include "hash_map.h"
 #include "vector.h"
