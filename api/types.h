@@ -31,8 +31,7 @@ struct ProcessGroup : ApiRefCounted {};
 struct Buffer : ApiRefCounted {};
 
 // QueueWork uses unique ownership (no refcounting)
-// It doesn't inherit from ApiRefCounted, so ApiHandle won't work with it.
-// Use a simple unique_ptr-like pattern instead.
+// It doesn't inherit from ApiRefCounted, so ApiHandle uses move-only semantics.
 struct QueueWork {};
 
 } // namespace moodist::api

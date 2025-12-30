@@ -23,15 +23,16 @@ api::ApiHandle<api::Queue> processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
 void queueDestroy(api::Queue* queue);
 bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-void* queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+api::ApiHandle<api::QueueWork> queuePut(
+    api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
 size_t queueQsize(api::Queue* queue);
 bool queueWait(api::Queue* queue, const float* timeout);
 uint32_t queueTransactionBegin(api::Queue* queue);
 void queueTransactionCancel(api::Queue* queue, uint32_t id);
 void queueTransactionCommit(api::Queue* queue, uint32_t id);
 const char* queueName(api::Queue* queue);
-void queueWorkDestroy(void* work);
-void queueWorkWait(void* work);
+void queueWorkDestroy(api::QueueWork* work);
+void queueWorkWait(api::QueueWork* work);
 
 // Forward declarations for FutureImpl, CustomOpImpl, compileOpFull defined in processgroup.cc
 void futureImplDestroy(void* future);

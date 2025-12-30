@@ -211,7 +211,8 @@ struct CoreApi {
   // Wrapper's destroy(api::Queue*) calls queueDestroy to delete the object
   void (*queueDestroy)(api::Queue* queue);
   bool (*queueGet)(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-  void* (*queuePut)(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+  api::ApiHandle<api::QueueWork> (*queuePut)(
+      api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
   size_t (*queueQsize)(api::Queue* queue);
   bool (*queueWait)(api::Queue* queue, const float* timeout);
   uint32_t (*queueTransactionBegin)(api::Queue* queue);
@@ -219,10 +220,10 @@ struct CoreApi {
   void (*queueTransactionCommit)(api::Queue* queue, uint32_t id);
   const char* (*queueName)(api::Queue* queue);
 
-  // QueueWork operations - operate on opaque QueueWork* pointers
-  // QueueWork inherits from ApiRefCounted - wrapper manages refcount directly
-  void (*queueWorkDestroy)(void* work);
-  void (*queueWorkWait)(void* work);
+  // QueueWork operations - unique ownership (not refcounted)
+  // ApiHandle<api::QueueWork> uses move-only semantics
+  void (*queueWorkDestroy)(api::QueueWork* work);
+  void (*queueWorkWait)(api::QueueWork* work);
 
   // FutureImpl operations - operate on opaque FutureImpl* pointers
   // FutureImpl is created by customOpCall and holds async result

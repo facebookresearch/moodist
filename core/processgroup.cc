@@ -2057,12 +2057,13 @@ bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* ou
   return false;
 }
 
-void* queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
+api::ApiHandle<api::QueueWork> queuePut(
+    api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
   auto* q = static_cast<Queue*>(queue);
   QueueWork work = q->put(tensor, transaction, waitOnDestroy);
-  // Transfer ownership to heap
-  auto* workPtr = new QueueWork(std::move(work));
-  return workPtr;
+  // Transfer ownership to heap and wrap in ApiHandle
+  auto* workPtr = internalNew<QueueWork>(std::move(work));
+  return api::ApiHandle<api::QueueWork>::create(workPtr);
 }
 
 size_t queueQsize(api::Queue* queue) {
@@ -2096,13 +2097,20 @@ const char* queueName(api::Queue* queue) {
   return name.data();
 }
 
-void queueWorkWait(void* work) {
+void queueWorkWait(api::QueueWork* work) {
   static_cast<QueueWork*>(work)->wait();
 }
 
-void queueWorkDestroy(void* work) {
-  delete static_cast<QueueWork*>(work);
+void queueWorkDestroy(api::QueueWork* work) {
+  internalDelete(static_cast<QueueWork*>(work));
 }
+
+// destroy() for api::QueueWork - needed by ApiHandle destructor in core
+namespace api {
+void destroy(QueueWork* work) {
+  queueWorkDestroy(work);
+}
+} // namespace api
 
 void setProfilingEnabled(bool enabled) {
   profilingEnabled = enabled;

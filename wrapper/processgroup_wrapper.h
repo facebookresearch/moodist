@@ -20,19 +20,20 @@ struct ProcessGroupImpl; // Opaque - managed via coreApi
 
 // Forward declarations
 class Queue;
-struct QueueWork;
 
-// QueueWork - wrapper around opaque void* from core
+// QueueWork - wraps api::QueueWork via ApiHandle (unique ownership)
 struct QueueWork {
-  void* impl = nullptr; // Opaque pointer to core QueueWork
+  api::ApiHandle<api::QueueWork> handle;
 
-  QueueWork(void* impl_ = nullptr) : impl(impl_) {}
-  ~QueueWork();
+  QueueWork() = default;
+  QueueWork(api::ApiHandle<api::QueueWork> h) : handle(std::move(h)) {}
+  ~QueueWork() = default; // ApiHandle destructor handles cleanup
+
   QueueWork(const QueueWork&) = delete;
-  QueueWork(QueueWork&& other) noexcept : impl(other.impl) {
-    other.impl = nullptr;
-  }
-  QueueWork& operator=(QueueWork&& other) noexcept;
+  QueueWork(QueueWork&&) noexcept = default;
+  QueueWork& operator=(const QueueWork&) = delete;
+  QueueWork& operator=(QueueWork&&) noexcept = default;
+
   void wait();
 };
 

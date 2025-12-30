@@ -16,7 +16,9 @@ namespace moodist {
 struct Group; // forward declaration
 struct QueueWorkImpl;
 
-struct QueueWork {
+// QueueWork inherits from api::QueueWork for type safety at the API boundary.
+// Does NOT inherit from ApiRefCounted - uses unique ownership semantics.
+struct QueueWork : api::QueueWork {
   std::shared_ptr<QueueWorkImpl> impl;
   TensorPtr tensor; // keeps tensor alive during async put (RAII handles refcount)
   bool waitOnDestroy = true;
