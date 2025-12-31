@@ -17,10 +17,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 // Forward declare CUDA types
 struct CUstream_st;
@@ -65,6 +69,22 @@ struct ApiProxy {
   ApiProxy* operator->() {
     return this;
   }
+};
+
+// Specialization for Store with set/get/check/wait methods
+template<>
+struct ApiProxy<Store> {
+  Store* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+
+  // Store operations - defined in wrapper
+  void close(); // Optional: explicitly trigger shutdown (called automatically on last ref drop)
+  void set(std::chrono::steady_clock::duration timeout, std::string_view key, const std::vector<uint8_t>& value);
+  std::vector<uint8_t> get(std::chrono::steady_clock::duration timeout, std::string_view key);
+  bool check(std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+  void wait(std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 };
 
 // Specialization for Buffer with data() and size() accessors
@@ -293,6 +313,7 @@ public:
 };
 
 // Convenience typedefs for common handle types
+using StoreHandle = ApiHandle<Store>;
 using BufferHandle = ApiHandle<Buffer>;
 using QueueHandle = ApiHandle<Queue>;
 using QueueWorkHandle = ApiHandle<QueueWork>;

@@ -55,10 +55,10 @@ static CoreApi coreApi = {
     // Magic for build verification
     .magic = kMoodistBuildMagic,
 
-    // Store functions
+    // Store functions - refcounted via ApiHandle
     .createStore = createStore,
-    .storeAddRef = storeAddRef,
-    .storeDecRef = storeDecRef,
+    .storeDestroy = storeDestroy,
+    .storeClose = storeClose,
     .storeSet = storeSet,
     .storeGet = storeGet,
     .storeCheck = storeCheck,

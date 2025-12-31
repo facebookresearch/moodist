@@ -15,14 +15,14 @@ extern CoreApi coreApi;
 
 class TORCH_API TcpStore final : public c10d::Store {
 public:
-  TcpStore(StoreHandle* handle);
+  TcpStore(api::StoreHandle handle);
   TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
       std::chrono::steady_clock::duration timeout);
-  ~TcpStore();
+  ~TcpStore() = default; // close() called automatically in storeDestroy() when last ref dropped
   TcpStore(const TcpStore&) = delete;
   TcpStore& operator=(const TcpStore&) = delete;
 
-  StoreHandle* handle = nullptr;
+  api::StoreHandle handle;
 
   virtual c10::intrusive_ptr<Store> clone() override;
 

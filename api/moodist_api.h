@@ -21,7 +21,6 @@
 namespace moodist {
 
 // Forward declarations (opaque types)
-struct StoreHandle;
 struct Tensor;            // Opaque wrapper for torch::Tensor
 class TensorPtr;          // RAII smart pointer for Tensor* (defined in tensor_ptr.h)
 struct CudaAllocatorImpl; // CUDA allocator implementation
@@ -133,18 +132,18 @@ struct CoreApi {
   // Magic value for runtime verification (changes per build)
   uint64_t magic;
 
-  // Store functions
-  StoreHandle* (*createStore)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
-  void (*storeAddRef)(StoreHandle* handle);
-  void (*storeDecRef)(StoreHandle* handle);
-  void (*storeSet)(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
+  // Store functions - refcounted via ApiHandle
+  api::StoreHandle (*createStore)(std::string_view hostname, int port, std::string_view key, int worldSize, int rank);
+  void (*storeDestroy)(api::Store* store);
+  void (*storeClose)(api::Store* store); // Optional: explicitly trigger shutdown
+  void (*storeSet)(api::Store* store, std::chrono::steady_clock::duration timeout, std::string_view key,
       const std::vector<uint8_t>& value);
   std::vector<uint8_t> (*storeGet)(
-      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key);
+      api::Store* store, std::chrono::steady_clock::duration timeout, std::string_view key);
   bool (*storeCheck)(
-      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+      api::Store* store, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
   void (*storeWait)(
-      StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
+      api::Store* store, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
   // Serialize functions
   // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle

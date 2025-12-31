@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "api/store_api.h"
+#include "api/types.h"
 #include "buffer.h"
 #include "common.h"
 #include "connection.h"
@@ -196,8 +197,14 @@ Indestructible<SpinMutex> activeStoresMutex;
 Indestructible<Vector<StoreImpl*>> activeStores;
 } // namespace
 
-struct StoreImpl {
+struct StoreImpl : api::Store {
+  // Shadows api::Store::refcount. This internal refcount is used by SharedPtr
+  // for the background thread. api::Store::refcount is used by ApiHandle for
+  // external references. When api::Store::refcount hits 0, destroy() is called
+  // which calls close() and decrements this refcount. When this refcount hits 0
+  // (after thread exits), the object is deleted.
   std::atomic_size_t refcount = 0;
+
   Vector<Socket> udps;
 
   std::string hostname;
@@ -2230,58 +2237,53 @@ struct Dtor {
 
 } // namespace
 
-// Opaque handle for the API - wraps SharedPtr to allow StoreImpl to outlive user refs
-struct StoreHandle {
-  SharedPtr<StoreImpl> impl;
-  std::atomic_size_t refcount = 0;
-};
-
-StoreHandle* createStore(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
+api::StoreHandle createStore(std::string_view hostname, int port, std::string_view key, int worldSize, int rank) {
   auto impl = makeShared<StoreImpl>(std::string(hostname), port, std::string(key), worldSize, rank);
   impl->init();
-  auto* handle = internalNew<StoreHandle>(std::move(impl));
-  handle->refcount = 1;
-  return handle;
+  // release() transfers the internal refcount ownership to us.
+  // create() sets api::Store::refcount = 1 for external ApiHandle tracking.
+  return api::StoreHandle::create(impl.release());
 }
 
-void storeAddRef(StoreHandle* handle) {
-  ++handle->refcount;
+void storeDestroy(api::Store* store) {
+  auto* impl = static_cast<StoreImpl*>(store);
+  impl->close();
+  // Wrap in SharedPtr and let its destructor handle decref/delete.
+  // SharedPtr(T*) takes ownership without incrementing refcount (adopt semantics).
+  // This mirrors createStore where we use impl.release() to transfer ownership out.
+  SharedPtr<StoreImpl>{impl};
 }
 
-void storeDecRef(StoreHandle* handle) {
-  if (--handle->refcount == 0) {
-    handle->impl->close();
-    internalDelete(handle);
-  }
+void storeClose(api::Store* store) {
+  static_cast<StoreImpl*>(store)->close();
 }
 
-void storeSet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key,
+void storeSet(api::Store* store, std::chrono::steady_clock::duration timeout, std::string_view key,
     const std::vector<uint8_t>& value) {
-  handle->impl->set(timeout, key, value);
+  static_cast<StoreImpl*>(store)->set(timeout, key, value);
 }
 
-std::vector<uint8_t> storeGet(StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::string_view key) {
-  return handle->impl->get(timeout, key);
+std::vector<uint8_t> storeGet(api::Store* store, std::chrono::steady_clock::duration timeout, std::string_view key) {
+  return static_cast<StoreImpl*>(store)->get(timeout, key);
 }
 
 bool storeCheck(
-    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
+    api::Store* store, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {
     keysVec.emplace_back(k);
   }
-  return handle->impl->check(timeout, keysVec);
+  return static_cast<StoreImpl*>(store)->check(timeout, keysVec);
 }
 
-void storeWait(
-    StoreHandle* handle, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
+void storeWait(api::Store* store, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys) {
   std::vector<std::string> keysVec;
   keysVec.reserve(keys.size());
   for (auto k : keys) {
     keysVec.emplace_back(k);
   }
-  handle->impl->wait(timeout, keysVec);
+  static_cast<StoreImpl*>(store)->wait(timeout, keysVec);
 }
 
 } // namespace moodist
