@@ -2023,13 +2023,12 @@ void processGroupImplShutdown(ProcessGroupImpl* impl) {
   }
 }
 
-api::ApiHandle<api::Queue> processGroupImplMakeQueue(
-    ProcessGroupImpl* impl, int location, bool streaming, const char* name) {
+api::QueueHandle processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name) {
   std::string_view nameView = name ? name : "";
   return makeQueue(impl->group, location, streaming, nameView);
 }
 
-api::ApiHandle<api::Queue> processGroupImplMakeQueueMulti(
+api::QueueHandle processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name) {
   std::vector<int> locationVec(locations, locations + numLocations);
   std::string_view nameView = name ? name : "";
@@ -2057,13 +2056,12 @@ bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* ou
   return false;
 }
 
-api::ApiHandle<api::QueueWork> queuePut(
-    api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
+api::QueueWorkHandle queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
   auto* q = static_cast<Queue*>(queue);
   QueueWork work = q->put(tensor, transaction, waitOnDestroy);
   // Transfer ownership to heap and wrap in ApiHandle
   auto* workPtr = internalNew<QueueWork>(std::move(work));
-  return api::ApiHandle<api::QueueWork>::create(workPtr);
+  return api::QueueWorkHandle::create(workPtr);
 }
 
 size_t queueQsize(api::Queue* queue) {

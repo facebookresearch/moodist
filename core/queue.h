@@ -54,8 +54,7 @@ struct Queue : api::Queue {
   std::string_view name() const;
 };
 
-api::ApiHandle<api::Queue> makeQueue(SharedPtr<Group>, int location, bool streaming, std::string_view name = {});
-api::ApiHandle<api::Queue> makeQueue(
-    SharedPtr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
+api::QueueHandle makeQueue(SharedPtr<Group>, int location, bool streaming, std::string_view name = {});
+api::QueueHandle makeQueue(SharedPtr<Group>, std::vector<int> location, bool streaming, std::string_view name = {});
 
 } // namespace moodist

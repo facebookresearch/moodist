@@ -14,7 +14,7 @@
 namespace moodist {
 
 // Serialize object, returns ApiHandle<api::Buffer> with refcount=1
-api::ApiHandle<api::Buffer> serializeObjectImpl(PyObject* o);
+api::BufferHandle serializeObjectImpl(PyObject* o);
 
 // Access buffer data
 void* serializeBufferPtr(api::Buffer* buf);

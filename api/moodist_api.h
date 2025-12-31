@@ -149,7 +149,7 @@ struct CoreApi {
   // Serialize functions
   // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
   // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
-  api::ApiHandle<api::Buffer> (*serializeObjectImpl)(PyObject* o);
+  api::BufferHandle (*serializeObjectImpl)(PyObject* o);
   void* (*serializeBufferPtr)(api::Buffer* buf);
   size_t (*serializeBufferSize)(api::Buffer* buf);
   void (*bufferDestroy)(api::Buffer* buf);
@@ -201,9 +201,8 @@ struct CoreApi {
   void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
 
   // Queue factory functions - return ApiHandle (ownership via RVO)
-  api::ApiHandle<api::Queue> (*processGroupImplMakeQueue)(
-      ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-  api::ApiHandle<api::Queue> (*processGroupImplMakeQueueMulti)(
+  api::QueueHandle (*processGroupImplMakeQueue)(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+  api::QueueHandle (*processGroupImplMakeQueueMulti)(
       ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
 
   // Queue operations - operate on api::Queue* pointers
@@ -211,7 +210,7 @@ struct CoreApi {
   // Wrapper's destroy(api::Queue*) calls queueDestroy to delete the object
   void (*queueDestroy)(api::Queue* queue);
   bool (*queueGet)(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-  api::ApiHandle<api::QueueWork> (*queuePut)(
+  api::QueueWorkHandle (*queuePut)(
       api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
   size_t (*queueQsize)(api::Queue* queue);
   bool (*queueWait)(api::Queue* queue, const float* timeout);

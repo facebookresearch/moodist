@@ -825,19 +825,18 @@ void destroy(Queue* queue) {
 }
 } // namespace api
 
-api::ApiHandle<api::Queue> makeQueue(SharedPtr<Group> group, int location, bool streaming, std::string_view name) {
+api::QueueHandle makeQueue(SharedPtr<Group> group, int location, bool streaming, std::string_view name) {
   auto* q = internalNew<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return api::ApiHandle<api::Queue>::create(q);
+  return api::QueueHandle::create(q);
 }
 
-api::ApiHandle<api::Queue> makeQueue(
-    SharedPtr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
+api::QueueHandle makeQueue(SharedPtr<Group> group, std::vector<int> location, bool streaming, std::string_view name) {
   auto* q = internalNew<Queue>(&foo);
   std::optional<std::string> nameOpt = name.empty() ? std::nullopt : std::optional<std::string>(std::string(name));
   q->impl = (void*)internalNew<QueueImpl>(std::move(group), location, streaming, nameOpt);
-  return api::ApiHandle<api::Queue>::create(q);
+  return api::QueueHandle::create(q);
 }
 
 static std::atomic_uint32_t nextIncomingKey = getRng()();

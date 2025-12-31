@@ -23,10 +23,10 @@ class Queue;
 
 // QueueWork - wraps api::QueueWork via ApiHandle (unique ownership)
 struct QueueWork {
-  api::ApiHandle<api::QueueWork> handle;
+  api::QueueWorkHandle handle;
 
   QueueWork() = default;
-  QueueWork(api::ApiHandle<api::QueueWork> h) : handle(std::move(h)) {}
+  QueueWork(api::QueueWorkHandle h) : handle(std::move(h)) {}
   ~QueueWork() = default; // ApiHandle destructor handles cleanup
 
   QueueWork(const QueueWork&) = delete;
@@ -40,9 +40,9 @@ struct QueueWork {
 // Queue - wrapper around api::Queue managed via ApiHandle
 class Queue {
 public:
-  api::ApiHandle<api::Queue> handle; // Manages refcount automatically
+  api::QueueHandle handle; // Manages refcount automatically
 
-  Queue(api::ApiHandle<api::Queue> h) : handle(std::move(h)) {}
+  Queue(api::QueueHandle h) : handle(std::move(h)) {}
   ~Queue() = default; // ApiHandle destructor handles cleanup
 
   // Wrapper methods that call CoreApi functions

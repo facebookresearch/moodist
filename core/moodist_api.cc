@@ -17,14 +17,12 @@ void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstrea
 void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize);
 
 // Forward declarations for Queue API functions defined in processgroup.cc
-api::ApiHandle<api::Queue> processGroupImplMakeQueue(
-    ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-api::ApiHandle<api::Queue> processGroupImplMakeQueueMulti(
+api::QueueHandle processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
+api::QueueHandle processGroupImplMakeQueueMulti(
     ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
 void queueDestroy(api::Queue* queue);
 bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
-api::ApiHandle<api::QueueWork> queuePut(
-    api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
+api::QueueWorkHandle queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
 size_t queueQsize(api::Queue* queue);
 bool queueWait(api::Queue* queue, const float* timeout);
 uint32_t queueTransactionBegin(api::Queue* queue);

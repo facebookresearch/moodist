@@ -1181,11 +1181,11 @@ template<typename... T>
 }
 
 // Core implementation - returns ApiHandle<api::Buffer> with refcount=1
-api::ApiHandle<api::Buffer> serializeObjectImpl(PyObject* o) {
+api::BufferHandle serializeObjectImpl(PyObject* o) {
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>(o));
   Buffer* buf = buffer.release();
-  return api::ApiHandle<api::Buffer>::create(buf);
+  return api::BufferHandle::create(buf);
 }
 
 // destroy() implementation for core - needed because ApiHandle destructor references it

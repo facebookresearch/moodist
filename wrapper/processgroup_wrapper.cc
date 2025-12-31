@@ -307,14 +307,14 @@ std::vector<torch::Tensor> ProcessGroup::share(const torch::Tensor&) {
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  api::ApiHandle<api::Queue> handle = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
+  api::QueueHandle handle = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
   return std::make_shared<Queue>(std::move(handle));
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(
     std::vector<int> locations, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  api::ApiHandle<api::Queue> handle =
+  api::QueueHandle handle =
       coreApi.processGroupImplMakeQueueMulti(impl, locations.data(), locations.size(), streaming, namePtr);
   return std::make_shared<Queue>(std::move(handle));
 }
