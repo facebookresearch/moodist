@@ -1,58 +1,58 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 // ProcessGroup API for moodist.
+// Uses ApiHandle pattern for refcounted ownership across the API boundary.
 // Uses TensorPtr for tensor operations - works in both wrapper and core.
 
 #pragma once
 
 #include "tensor_ptr.h"
+#include "types.h"
 
 #include <cuda.h>
 #include <span>
 
 namespace moodist {
 
-// Forward declarations
-struct ProcessGroupImpl;
-
-// ProcessGroupImpl creation/destruction
+// Factory function - returns ApiHandle (ownership via RVO)
 // c10dStore is opaque pointer to c10d::Store - core calls back via WrapperApi for store ops
-ProcessGroupImpl* createProcessGroupImpl(void* c10dStore, int rank, int size);
-void processGroupImplAddRef(ProcessGroupImpl* impl);
-void processGroupImplDecRef(ProcessGroupImpl* impl);
+api::ProcessGroupHandle createProcessGroup(void* c10dStore, int rank, int size);
+
+// Destroy function - called by ApiHandle when refcount reaches 0
+void processGroupDestroy(api::ProcessGroup* pg);
+
+// Optional: explicitly trigger shutdown before last reference is dropped
+void processGroupShutdown(api::ProcessGroup* pg);
 
 // Accessors
-int processGroupImplRank(ProcessGroupImpl* impl);
-int processGroupImplSize(ProcessGroupImpl* impl);
+int processGroupRank(api::ProcessGroup* pg);
+int processGroupSize(api::ProcessGroup* pg);
 
 // Collective operations - all logic handled in core
-void processGroupImplAllGather(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream);
+void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
 
-void processGroupImplReduceScatter(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
+void processGroupReduceScatter(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
     CUstream stream, float premulValue);
 
-void processGroupImplAllreduce(
-    ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
+void processGroupAllreduce(
+    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
 
-void processGroupImplBroadcast(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream);
+void processGroupBroadcast(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream);
 
-void processGroupImplReduce(
-    ProcessGroupImpl* impl, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+void processGroupReduce(api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
 
-void processGroupImplBarrier(ProcessGroupImpl* impl);
+void processGroupBarrier(api::ProcessGroup* pg);
 
-void processGroupImplScatter(
-    ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
+void processGroupScatter(
+    api::ProcessGroup* pg, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
 
-void processGroupImplGather(
-    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
+void processGroupGather(
+    api::ProcessGroup* pg, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
 
-void processGroupImplAllToAll(
-    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
+void processGroupAllToAll(
+    api::ProcessGroup* pg, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
 
-void processGroupImplCudaBarrier(ProcessGroupImpl* impl, CUstream stream);
-
-void processGroupImplShutdown(ProcessGroupImpl* impl);
+void processGroupCudaBarrier(api::ProcessGroup* pg, CUstream stream);
 
 // Profiling
 void setProfilingEnabled(bool enabled);

@@ -294,7 +294,7 @@ Reduction toInternalReduction(ReduceOp op) {
 struct CustomOpImpl;
 struct ApiFuture;
 
-struct ProcessGroupImpl {
+struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
   size_t size = 0;
 
@@ -336,8 +336,6 @@ struct ProcessGroupImpl {
   uint32_t nextCustomOpId = 1;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
-
-  std::atomic<int> refcount; // Reference counting - initialized by SharedPtrDefaultPolicy::create
 
   ProcessGroupImpl(void* c10dStore, int rank_, int size_) : rank(rank_), size(size_), c10dStore_(c10dStore) {
     CHECK(rank_ >= 0 && size_ > 0 && rank_ < size_);
@@ -1944,93 +1942,87 @@ void ProcessGroupImpl::cudaBarrier(CUstream stream) {
 // API Functions
 // ============================================================================
 
-ProcessGroupImpl* createProcessGroupImpl(void* c10dStore, int rank, int size) {
-  // Create with refcount=1, return raw pointer
-  // Caller is responsible for calling decRef when done
-  return SharedPtrDefaultPolicy::create<ProcessGroupImpl>(c10dStore, rank, size);
+api::ProcessGroupHandle createProcessGroup(void* c10dStore, int rank, int size) {
+  return api::ProcessGroupHandle::create(internalNew<ProcessGroupImpl>(c10dStore, rank, size));
 }
 
-void processGroupImplAddRef(ProcessGroupImpl* impl) {
-  SharedPtrDefaultPolicy::inc(impl);
+void processGroupDestroy(api::ProcessGroup* pg) {
+  internalDelete(static_cast<ProcessGroupImpl*>(pg));
 }
 
-void processGroupImplDecRef(ProcessGroupImpl* impl) {
-  if (SharedPtrDefaultPolicy::dec(impl)) {
-    SharedPtrDefaultPolicy::destroy(impl);
-  }
-}
-
-int processGroupImplRank(ProcessGroupImpl* impl) {
-  return static_cast<int>(impl->rank);
-}
-
-int processGroupImplSize(ProcessGroupImpl* impl) {
-  return static_cast<int>(impl->size);
-}
-
-// ============================================================================
-// Collective operations - stubs until migration is complete
-// ============================================================================
-
-void processGroupImplAllGather(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream) {
-  impl->all_gather(output, input, stream);
-}
-
-void processGroupImplReduceScatter(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
-    CUstream stream, float premulValue) {
-  impl->reduce_scatter(output, input, reduceOp, stream, premulValue);
-}
-
-void processGroupImplAllreduce(
-    ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
-  impl->allreduce(tensor, reduceOp, stream, premulValue);
-}
-
-void processGroupImplBroadcast(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream) {
-  impl->broadcast(tensor, sourceRank, stream);
-}
-
-void processGroupImplReduce(
-    ProcessGroupImpl* impl, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream) {
-  impl->reduce(tensor, destRank, reduceOp, stream);
-}
-
-void processGroupImplBarrier(ProcessGroupImpl* impl) {
-  impl->barrier();
-}
-
-void processGroupImplScatter(
-    ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
-  impl->scatter(inputs, output, sourceRank, stream);
-}
-
-void processGroupImplGather(
-    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
-  impl->gather(outputs, input, destRank, stream);
-}
-
-void processGroupImplAllToAll(
-    ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream) {
-  impl->alltoall(outputs, inputs, stream);
-}
-
-void processGroupImplCudaBarrier(ProcessGroupImpl* impl, CUstream stream) {
-  impl->cudaBarrier(stream);
-}
-
-void processGroupImplShutdown(ProcessGroupImpl* impl) {
+void processGroupShutdown(api::ProcessGroup* pg) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
   if (impl && impl->group && impl->group->cpuThread) {
     impl->group->cpuThread->kill(false);
   }
 }
 
-api::QueueHandle processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name) {
+int processGroupRank(api::ProcessGroup* pg) {
+  return static_cast<int>(static_cast<ProcessGroupImpl*>(pg)->rank);
+}
+
+int processGroupSize(api::ProcessGroup* pg) {
+  return static_cast<int>(static_cast<ProcessGroupImpl*>(pg)->size);
+}
+
+// ============================================================================
+// Collective operations
+// ============================================================================
+
+void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->all_gather(output, input, stream);
+}
+
+void processGroupReduceScatter(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
+    CUstream stream, float premulValue) {
+  static_cast<ProcessGroupImpl*>(pg)->reduce_scatter(output, input, reduceOp, stream, premulValue);
+}
+
+void processGroupAllreduce(
+    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
+  static_cast<ProcessGroupImpl*>(pg)->allreduce(tensor, reduceOp, stream, premulValue);
+}
+
+void processGroupBroadcast(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->broadcast(tensor, sourceRank, stream);
+}
+
+void processGroupReduce(api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->reduce(tensor, destRank, reduceOp, stream);
+}
+
+void processGroupBarrier(api::ProcessGroup* pg) {
+  static_cast<ProcessGroupImpl*>(pg)->barrier();
+}
+
+void processGroupScatter(
+    api::ProcessGroup* pg, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->scatter(inputs, output, sourceRank, stream);
+}
+
+void processGroupGather(
+    api::ProcessGroup* pg, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->gather(outputs, input, destRank, stream);
+}
+
+void processGroupAllToAll(
+    api::ProcessGroup* pg, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->alltoall(outputs, inputs, stream);
+}
+
+void processGroupCudaBarrier(api::ProcessGroup* pg, CUstream stream) {
+  static_cast<ProcessGroupImpl*>(pg)->cudaBarrier(stream);
+}
+
+api::QueueHandle processGroupMakeQueue(api::ProcessGroup* pg, int location, bool streaming, const char* name) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
   std::string_view nameView = name ? name : "";
   return makeQueue(impl->group, location, streaming, nameView);
 }
 
-api::QueueHandle processGroupImplMakeQueueMulti(
-    ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name) {
+api::QueueHandle processGroupMakeQueueMulti(
+    api::ProcessGroup* pg, const int* locations, size_t numLocations, bool streaming, const char* name) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
   std::vector<int> locationVec(locations, locations + numLocations);
   std::string_view nameView = name ? name : "";
   return makeQueue(impl->group, locationVec, streaming, nameView);
@@ -2742,9 +2734,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 }
 
 // API function that calls the member method
-api::CustomOpHandle compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, const int* shape, size_t ndim, DType dtype,
     const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
     const int* outputOffsets, const int* outputShapes, size_t nOutputs) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
   // Reconstruct vectors from flat arrays
   std::vector<int> shapeVec(shape, shape + ndim);
 

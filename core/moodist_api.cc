@@ -17,9 +17,9 @@ void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstrea
 void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* outSize);
 
 // Forward declarations for Queue API functions defined in processgroup.cc
-api::QueueHandle processGroupImplMakeQueue(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-api::QueueHandle processGroupImplMakeQueueMulti(
-    ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
+api::QueueHandle processGroupMakeQueue(api::ProcessGroup* pg, int location, bool streaming, const char* name);
+api::QueueHandle processGroupMakeQueueMulti(
+    api::ProcessGroup* pg, const int* locations, size_t numLocations, bool streaming, const char* name);
 void queueDestroy(api::Queue* queue);
 bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* outTensor, size_t* outSize);
 api::QueueWorkHandle queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy);
@@ -39,7 +39,7 @@ bool futureGetResult(api::Future* future, TensorPtr* outTensor);
 void customOpDestroy(api::CustomOp* op);
 api::FutureHandle customOpCall(
     api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
-api::CustomOpHandle compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, const int* shape, size_t ndim, DType dtype,
     const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
     const int* outputOffsets, const int* outputShapes, size_t nOutputs);
 
@@ -87,27 +87,26 @@ static CoreApi coreApi = {
     .allocatorAddFreeCallback = allocatorAddFreeCallback,
     .allocatorRemoveFreeCallback = allocatorRemoveFreeCallback,
 
-    // ProcessGroupImpl functions
-    .createProcessGroupImpl = createProcessGroupImpl,
-    .processGroupImplAddRef = processGroupImplAddRef,
-    .processGroupImplDecRef = processGroupImplDecRef,
-    .processGroupImplRank = processGroupImplRank,
-    .processGroupImplSize = processGroupImplSize,
-    .processGroupImplAllGather = processGroupImplAllGather,
-    .processGroupImplReduceScatter = processGroupImplReduceScatter,
-    .processGroupImplAllreduce = processGroupImplAllreduce,
-    .processGroupImplBroadcast = processGroupImplBroadcast,
-    .processGroupImplReduce = processGroupImplReduce,
-    .processGroupImplBarrier = processGroupImplBarrier,
-    .processGroupImplScatter = processGroupImplScatter,
-    .processGroupImplGather = processGroupImplGather,
-    .processGroupImplAllToAll = processGroupImplAllToAll,
-    .processGroupImplCudaBarrier = processGroupImplCudaBarrier,
-    .processGroupImplShutdown = processGroupImplShutdown,
+    // ProcessGroup functions - refcounted via ApiHandle
+    .createProcessGroup = createProcessGroup,
+    .processGroupDestroy = processGroupDestroy,
+    .processGroupShutdown = processGroupShutdown,
+    .processGroupRank = processGroupRank,
+    .processGroupSize = processGroupSize,
+    .processGroupAllGather = processGroupAllGather,
+    .processGroupReduceScatter = processGroupReduceScatter,
+    .processGroupAllreduce = processGroupAllreduce,
+    .processGroupBroadcast = processGroupBroadcast,
+    .processGroupReduce = processGroupReduce,
+    .processGroupBarrier = processGroupBarrier,
+    .processGroupScatter = processGroupScatter,
+    .processGroupGather = processGroupGather,
+    .processGroupAllToAll = processGroupAllToAll,
+    .processGroupCudaBarrier = processGroupCudaBarrier,
 
     // Queue factory functions
-    .processGroupImplMakeQueue = processGroupImplMakeQueue,
-    .processGroupImplMakeQueueMulti = processGroupImplMakeQueueMulti,
+    .processGroupMakeQueue = processGroupMakeQueue,
+    .processGroupMakeQueueMulti = processGroupMakeQueueMulti,
 
     // Queue operations
     .queueDestroy = queueDestroy,

@@ -16,8 +16,6 @@
 
 namespace moodist {
 
-struct ProcessGroupImpl; // Opaque - managed via coreApi
-
 // Forward declarations
 class Queue;
 
@@ -93,10 +91,10 @@ using Work = c10d::Work;
 
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
-  ProcessGroupImpl* impl = nullptr; // Managed via coreApi refcounting
+  api::ProcessGroupHandle handle; // Manages refcount automatically
 
   ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
-  ~ProcessGroup();
+  ~ProcessGroup() = default; // ApiHandle destructor handles cleanup
 
   const std::string getBackendName() const override {
     return "moodist";

@@ -24,7 +24,6 @@ namespace moodist {
 struct Tensor;            // Opaque wrapper for torch::Tensor
 class TensorPtr;          // RAII smart pointer for Tensor* (defined in tensor_ptr.h)
 struct CudaAllocatorImpl; // CUDA allocator implementation
-struct ProcessGroupImpl;  // Process group implementation
 
 // DType enum - matches torch::ScalarType values
 enum class DType : int8_t {
@@ -173,36 +172,35 @@ struct CoreApi {
   void* (*allocatorAddFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* callbackFn);
   void (*allocatorRemoveFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle);
 
-  // ProcessGroupImpl functions
-  ProcessGroupImpl* (*createProcessGroupImpl)(void* c10dStore, int rank, int size);
-  void (*processGroupImplAddRef)(ProcessGroupImpl* impl);
-  void (*processGroupImplDecRef)(ProcessGroupImpl* impl);
-  int (*processGroupImplRank)(ProcessGroupImpl* impl);
-  int (*processGroupImplSize)(ProcessGroupImpl* impl);
+  // ProcessGroup functions - refcounted via ApiHandle
+  api::ProcessGroupHandle (*createProcessGroup)(void* c10dStore, int rank, int size);
+  void (*processGroupDestroy)(api::ProcessGroup* pg);
+  void (*processGroupShutdown)(api::ProcessGroup* pg); // Optional: explicitly trigger shutdown
+  int (*processGroupRank)(api::ProcessGroup* pg);
+  int (*processGroupSize)(api::ProcessGroup* pg);
 
   // Collective operations - core handles all logic
-  void (*processGroupImplAllGather)(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input, CUstream stream);
-  void (*processGroupImplReduceScatter)(ProcessGroupImpl* impl, TensorPtr& output, const TensorPtr& input,
-      ReduceOp reduceOp, CUstream stream, float premulValue);
-  void (*processGroupImplAllreduce)(
-      ProcessGroupImpl* impl, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
-  void (*processGroupImplBroadcast)(ProcessGroupImpl* impl, TensorPtr& tensor, int sourceRank, CUstream stream);
-  void (*processGroupImplReduce)(
-      ProcessGroupImpl* impl, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
-  void (*processGroupImplBarrier)(ProcessGroupImpl* impl);
-  void (*processGroupImplScatter)(
-      ProcessGroupImpl* impl, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
-  void (*processGroupImplGather)(
-      ProcessGroupImpl* impl, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
-  void (*processGroupImplAllToAll)(
-      ProcessGroupImpl* impl, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
-  void (*processGroupImplCudaBarrier)(ProcessGroupImpl* impl, CUstream stream);
-  void (*processGroupImplShutdown)(ProcessGroupImpl* impl);
+  void (*processGroupAllGather)(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
+  void (*processGroupReduceScatter)(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
+      CUstream stream, float premulValue);
+  void (*processGroupAllreduce)(
+      api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
+  void (*processGroupBroadcast)(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream);
+  void (*processGroupReduce)(
+      api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+  void (*processGroupBarrier)(api::ProcessGroup* pg);
+  void (*processGroupScatter)(
+      api::ProcessGroup* pg, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
+  void (*processGroupGather)(
+      api::ProcessGroup* pg, std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
+  void (*processGroupAllToAll)(
+      api::ProcessGroup* pg, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
+  void (*processGroupCudaBarrier)(api::ProcessGroup* pg, CUstream stream);
 
   // Queue factory functions - return ApiHandle (ownership via RVO)
-  api::QueueHandle (*processGroupImplMakeQueue)(ProcessGroupImpl* impl, int location, bool streaming, const char* name);
-  api::QueueHandle (*processGroupImplMakeQueueMulti)(
-      ProcessGroupImpl* impl, const int* locations, size_t numLocations, bool streaming, const char* name);
+  api::QueueHandle (*processGroupMakeQueue)(api::ProcessGroup* pg, int location, bool streaming, const char* name);
+  api::QueueHandle (*processGroupMakeQueueMulti)(
+      api::ProcessGroup* pg, const int* locations, size_t numLocations, bool streaming, const char* name);
 
   // Queue operations - operate on api::Queue* pointers
   // Queue inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
@@ -234,7 +232,7 @@ struct CoreApi {
       api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
   // compileOpFull - compiles a distributed tensor operation
-  api::CustomOpHandle (*compileOpFull)(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+  api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, const int* shape, size_t ndim, DType dtype,
       const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
       const int* outputOffsets, const int* outputShapes, size_t nOutputs);
 

@@ -84,24 +84,21 @@ struct WorkImpl : c10d::Work {
 };
 
 // ============================================================================
-// Construction / Destruction
+// Construction
 // ============================================================================
 
 ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
-    : c10d::ProcessGroup(rank, size) {
-  // Pass c10d::Store as opaque pointer - core will call back via WrapperApi for store operations
-  impl = coreApi.createProcessGroupImpl(store.get(), rank, size);
-
+    : c10d::ProcessGroup(rank, size), handle(coreApi.createProcessGroup(store.get(), rank, size)) {
   setBackend(torch::DeviceType::CPU, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
   setBackend(torch::DeviceType::CUDA, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
 }
 
-ProcessGroup::~ProcessGroup() {
-  if (impl) {
-    coreApi.processGroupImplDecRef(impl);
-    impl = nullptr;
-  }
+// destroy() for ApiHandle - calls CoreApi to delete the object
+namespace api {
+void destroy(ProcessGroup* pg) {
+  coreApi.processGroupDestroy(pg);
 }
+} // namespace api
 
 // ============================================================================
 // Collectives - thin wrappers that convert types and call core
@@ -116,7 +113,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(std::vector<std::vector<at::Ten
 
   TensorPtr inPtr = wrapTensor(input);
   TensorPtr outPtr = wrapTensor(output);
-  coreApi.processGroupImplAllGather(impl, outPtr, inPtr, getStream(input));
+  coreApi.processGroupAllGather(handle.get(), outPtr, inPtr, getStream(input));
 
   // Copy back to output list
   for (int i = 0; i < getSize(); ++i) {
@@ -130,7 +127,7 @@ c10::intrusive_ptr<Work> ProcessGroup::_allgather_base(
     at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions&) {
   TensorPtr inPtr = wrapTensor(input);
   TensorPtr outPtr = wrapTensor(output);
-  coreApi.processGroupImplAllGather(impl, outPtr, inPtr, getStream(input));
+  coreApi.processGroupAllGather(handle.get(), outPtr, inPtr, getStream(input));
   return c10::make_intrusive<WorkImpl>(output);
 }
 
@@ -140,7 +137,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather_into_tensor_coalesced(
   for (size_t i = 0; i < inputs.size(); ++i) {
     TensorPtr inPtr = wrapTensor(inputs[i]);
     TensorPtr outPtr = wrapTensor(outputs[i]);
-    coreApi.processGroupImplAllGather(impl, outPtr, inPtr, getStream(inputs[i]));
+    coreApi.processGroupAllGather(handle.get(), outPtr, inPtr, getStream(inputs[i]));
   }
   return c10::make_intrusive<WorkImpl>(outputs);
 }
@@ -149,7 +146,7 @@ c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
     at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
   TensorPtr inPtr = wrapTensor(input);
   TensorPtr outPtr = wrapTensor(output);
-  coreApi.processGroupImplReduceScatter(impl, outPtr, inPtr, toReduceOp(opts.reduceOp), getStream(input),
+  coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, toReduceOp(opts.reduceOp), getStream(input),
       extractPremulValue(opts.reduceOp, input.scalar_type()));
   return c10::make_intrusive<WorkImpl>(output);
 }
@@ -161,8 +158,8 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
   for (size_t i = 0; i < inputs.size(); ++i) {
     TensorPtr inPtr = wrapTensor(inputs[i]);
     TensorPtr outPtr = wrapTensor(outputs[i]);
-    coreApi.processGroupImplReduceScatter(
-        impl, outPtr, inPtr, op, getStream(inputs[i]), extractPremulValue(opts.reduceOp, inputs[i].scalar_type()));
+    coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, op, getStream(inputs[i]),
+        extractPremulValue(opts.reduceOp, inputs[i].scalar_type()));
   }
   return c10::make_intrusive<WorkImpl>(outputs);
 }
@@ -171,8 +168,8 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
-  coreApi.processGroupImplAllreduce(
-      impl, tPtr, toReduceOp(opts.reduceOp), getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
+  coreApi.processGroupAllreduce(
+      handle.get(), tPtr, toReduceOp(opts.reduceOp), getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
   return c10::make_intrusive<WorkImpl>(t);
 }
 
@@ -181,7 +178,8 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce_coalesced(
   ReduceOp op = toReduceOp(opts.reduceOp);
   for (auto& t : tensors) {
     TensorPtr tPtr = wrapTensor(t);
-    coreApi.processGroupImplAllreduce(impl, tPtr, op, getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
+    coreApi.processGroupAllreduce(
+        handle.get(), tPtr, op, getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
   }
   return c10::make_intrusive<WorkImpl>(tensors);
 }
@@ -190,7 +188,7 @@ c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensor
   TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
-  coreApi.processGroupImplBroadcast(impl, tPtr, opts.rootRank, getStream(t));
+  coreApi.processGroupBroadcast(handle.get(), tPtr, opts.rootRank, getStream(t));
   return c10::make_intrusive<WorkImpl>(t);
 }
 
@@ -198,12 +196,12 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
   TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
-  coreApi.processGroupImplReduce(impl, tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t));
+  coreApi.processGroupReduce(handle.get(), tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t));
   return c10::make_intrusive<WorkImpl>(t);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions&) {
-  coreApi.processGroupImplBarrier(impl);
+  coreApi.processGroupBarrier(handle.get());
   return c10::make_intrusive<WorkImpl>();
 }
 
@@ -220,7 +218,7 @@ c10::intrusive_ptr<Work> ProcessGroup::scatter(
   }
 
   TensorPtr outPtr = wrapTensor(output);
-  coreApi.processGroupImplScatter(impl, inPtrs, outPtr, opts.rootRank, getStream(output));
+  coreApi.processGroupScatter(handle.get(), inPtrs, outPtr, opts.rootRank, getStream(output));
 
   return c10::make_intrusive<WorkImpl>(output);
 }
@@ -238,7 +236,7 @@ c10::intrusive_ptr<Work> ProcessGroup::gather(
   }
 
   TensorPtr inPtr = wrapTensor(input);
-  coreApi.processGroupImplGather(impl, outPtrs, inPtr, opts.rootRank, getStream(input));
+  coreApi.processGroupGather(handle.get(), outPtrs, inPtr, opts.rootRank, getStream(input));
 
   return c10::make_intrusive<WorkImpl>(outputs.empty() ? std::vector<torch::Tensor>{} : outputs[0]);
 }
@@ -254,7 +252,7 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
     inPtrs.push_back(wrapTensor(t));
   }
 
-  coreApi.processGroupImplAllToAll(impl, outPtrs, inPtrs, getStream(inputs[0]));
+  coreApi.processGroupAllToAll(handle.get(), outPtrs, inPtrs, getStream(inputs[0]));
 
   return c10::make_intrusive<WorkImpl>(outputs);
 }
@@ -274,7 +272,7 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
     inPtrs.push_back(wrapTensor(t));
   }
 
-  coreApi.processGroupImplAllToAll(impl, outPtrs, inPtrs, getStream(input));
+  coreApi.processGroupAllToAll(handle.get(), outPtrs, inPtrs, getStream(input));
 
   return c10::make_intrusive<WorkImpl>(output);
 }
@@ -284,12 +282,12 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
 // ============================================================================
 
 void ProcessGroup::cudaBarrier() {
-  coreApi.processGroupImplCudaBarrier(impl, c10::cuda::getCurrentCUDAStream().stream());
+  coreApi.processGroupCudaBarrier(handle.get(), c10::cuda::getCurrentCUDAStream().stream());
 }
 
 void ProcessGroup::shutdown() {
-  if (impl) {
-    coreApi.processGroupImplShutdown(impl);
+  if (handle) {
+    coreApi.processGroupShutdown(handle.get());
   }
 }
 
@@ -307,16 +305,16 @@ std::vector<torch::Tensor> ProcessGroup::share(const torch::Tensor&) {
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(int location, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  api::QueueHandle handle = coreApi.processGroupImplMakeQueue(impl, location, streaming, namePtr);
-  return std::make_shared<Queue>(std::move(handle));
+  api::QueueHandle queueHandle = coreApi.processGroupMakeQueue(handle.get(), location, streaming, namePtr);
+  return std::make_shared<Queue>(std::move(queueHandle));
 }
 
 std::shared_ptr<Queue> ProcessGroup::makeQueue(
     std::vector<int> locations, bool streaming, std::optional<std::string> name) {
   const char* namePtr = name ? name->c_str() : nullptr;
-  api::QueueHandle handle =
-      coreApi.processGroupImplMakeQueueMulti(impl, locations.data(), locations.size(), streaming, namePtr);
-  return std::make_shared<Queue>(std::move(handle));
+  api::QueueHandle queueHandle =
+      coreApi.processGroupMakeQueueMulti(handle.get(), locations.data(), locations.size(), streaming, namePtr);
+  return std::make_shared<Queue>(std::move(queueHandle));
 }
 
 Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>&, std::optional<torch::Tensor>) {
@@ -356,9 +354,9 @@ CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype
     }
   }
 
-  api::CustomOpHandle opHandle = coreApi.compileOpFull(impl, shape.data(), shape.size(), dType, inputRanks.data(),
-      inputOffsets.data(), inputShapes.data(), inputs.size(), outputRanks.data(), outputOffsets.data(),
-      outputShapes.data(), outputs.size());
+  api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), shape.data(), shape.size(), dType,
+      inputRanks.data(), inputOffsets.data(), inputShapes.data(), inputs.size(), outputRanks.data(),
+      outputOffsets.data(), outputShapes.data(), outputs.size());
 
   return CustomOp(std::move(opHandle));
 }

@@ -8,8 +8,6 @@
 
 namespace moodist {
 
-struct ProcessGroupImpl;
-
 using Work = c10d::Work;
 
 class TORCH_API Backend final : public c10d::Backend {

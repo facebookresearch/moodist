@@ -319,5 +319,6 @@ using QueueHandle = ApiHandle<Queue>;
 using QueueWorkHandle = ApiHandle<QueueWork>;
 using FutureHandle = ApiHandle<Future>;
 using CustomOpHandle = ApiHandle<CustomOp>;
+using ProcessGroupHandle = ApiHandle<ProcessGroup>;
 
 } // namespace moodist::api
