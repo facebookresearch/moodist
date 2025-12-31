@@ -31,6 +31,8 @@ void destroy(Buffer* buffer) {
 
 } // namespace api
 
+namespace wrapper {
+
 torch::Tensor serializeObject(py::object o) {
   auto handle = coreApi.serializeObjectImpl(o.ptr());
   void* ptr = handle->data();
@@ -52,4 +54,5 @@ py::object deserializeObject(torch::Tensor t) {
   return py::reinterpret_steal<py::object>(result);
 }
 
+} // namespace wrapper
 } // namespace moodist

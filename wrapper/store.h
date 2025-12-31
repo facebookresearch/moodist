@@ -13,6 +13,8 @@ namespace moodist {
 // Global CoreApi object - defined in moodist_loader.cc
 extern CoreApi coreApi;
 
+namespace wrapper {
+
 class TORCH_API TcpStore final : public c10d::Store {
 public:
   TcpStore(api::StoreHandle handle);
@@ -36,4 +38,5 @@ public:
   virtual void wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) override;
 };
 
+} // namespace wrapper
 } // namespace moodist

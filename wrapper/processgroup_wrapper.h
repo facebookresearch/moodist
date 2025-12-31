@@ -16,6 +16,8 @@
 
 namespace moodist {
 
+namespace wrapper {
+
 // Forward declarations
 class Queue;
 
@@ -54,7 +56,7 @@ public:
   std::string_view name() const;
 };
 
-// Stub types for unimplemented methods - minimal definitions
+// Future - wraps api::Future via ApiHandle
 struct Future {
   api::FutureHandle handle;
   std::vector<torch::Tensor> holdTensors; // Keep tensors alive in wrapper
@@ -72,6 +74,7 @@ struct Future {
   torch::Tensor result();
 };
 
+// CustomOp - wraps api::CustomOp via ApiHandle
 struct CustomOp {
   api::CustomOpHandle handle;
 
@@ -87,7 +90,11 @@ struct CustomOp {
   Future operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs);
 };
 
+} // namespace wrapper
+
 using Work = c10d::Work;
+
+namespace wrapper {
 
 class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
@@ -187,4 +194,5 @@ public:
 
 void registerFreeMemoryCallback();
 
+} // namespace wrapper
 } // namespace moodist

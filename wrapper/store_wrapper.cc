@@ -38,6 +38,8 @@ void destroy(Store* store) {
 
 } // namespace api
 
+namespace wrapper {
+
 TcpStore::TcpStore(api::StoreHandle h) : handle(std::move(h)) {}
 
 TcpStore::TcpStore(std::string hostname, int port, std::string key, int worldSize, int rank,
@@ -101,4 +103,5 @@ void TcpStore::wait(const std::vector<std::string>& keys, const std::chrono::mil
   handle->wait(timeout, keyViews);
 }
 
+} // namespace wrapper
 } // namespace moodist

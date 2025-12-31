@@ -59,15 +59,16 @@ void destroy(QueueWork* work) {
 
 } // namespace api
 
-// QueueWork implementation - ApiHandle manages lifetime
+// ============================================================================
+// wrapper:: types - QueueWork and Queue implementations
+// ============================================================================
+namespace wrapper {
 
 void QueueWork::wait() {
   if (handle) {
     handle->wait();
   }
 }
-
-// Queue implementation - ApiHandle manages lifetime, destructor is default
 
 std::pair<std::optional<torch::Tensor>, size_t> Queue::get(bool block, std::optional<float> timeout) {
   TensorPtr tensor;
@@ -110,5 +111,7 @@ void Queue::transactionCommit(uint32_t id) {
 std::string_view Queue::name() const {
   return handle->name();
 }
+
+} // namespace wrapper
 
 } // namespace moodist

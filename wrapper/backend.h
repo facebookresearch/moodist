@@ -7,6 +7,7 @@
 #include "processgroup_wrapper.h"
 
 namespace moodist {
+namespace wrapper {
 
 using Work = c10d::Work;
 
@@ -123,4 +124,5 @@ public:
   }
 };
 
+} // namespace wrapper
 } // namespace moodist

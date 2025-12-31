@@ -14,33 +14,34 @@
 #include "processgroup_wrapper.h"
 #include "store.h"
 
-namespace moodist {
+namespace moodist::wrapper {
 
 // Serialize/deserialize - defined in serialize_wrapper.cc
 torch::Tensor serializeObject(py::object o);
 py::object deserializeObject(torch::Tensor t);
 
-} // namespace moodist
+} // namespace moodist::wrapper
 
 namespace py = pybind11;
 
-using MoodistProcessGroup = moodist::ProcessGroup;
-using MoodistBackend = moodist::Backend;
+using MoodistProcessGroup = moodist::wrapper::ProcessGroup;
+using MoodistBackend = moodist::wrapper::Backend;
 
 PYBIND11_MODULE(_C, m) {
   // Initialize the moodist Api (loads libmoodist.so)
   moodist::initMoodistApi();
 
   // MINIMAL BUILD: TcpStore + serialize/deserialize
-  py::class_<moodist::TcpStore, c10::intrusive_ptr<moodist::TcpStore>, c10d::Store>(m, "TcpStore", R"d(
+  py::class_<moodist::wrapper::TcpStore, c10::intrusive_ptr<moodist::wrapper::TcpStore>, c10d::Store>(
+      m, "TcpStore", R"d(
     A moodist tcp store.
   )d")
       .def(py::init<std::string, int, std::string, int, int, std::chrono::steady_clock::duration>(),
           py::arg("hostname"), py::arg("port"), py::arg("key"), py::arg("world_size"), py::arg("rank"),
           py::arg("timeout"), py::call_guard<py::gil_scoped_release>());
 
-  m.def("serialize", &moodist::serializeObject);
-  m.def("deserialize", &moodist::deserializeObject);
+  m.def("serialize", &moodist::wrapper::serializeObject);
+  m.def("deserialize", &moodist::wrapper::deserializeObject);
 
   m.def("enable_cuda_allocator", &moodist::enableCudaAllocator);
   m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
@@ -67,25 +68,25 @@ PYBIND11_MODULE(_C, m) {
   )d")
       .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>());
 
-  py::class_<moodist::Future>(m, "Future")
-      .def("wait", &moodist::Future::wait, py::call_guard<py::gil_scoped_release>())
-      .def("result", &moodist::Future::result, py::call_guard<py::gil_scoped_release>());
+  py::class_<moodist::wrapper::Future>(m, "Future")
+      .def("wait", &moodist::wrapper::Future::wait, py::call_guard<py::gil_scoped_release>())
+      .def("result", &moodist::wrapper::Future::result, py::call_guard<py::gil_scoped_release>());
 
-  py::class_<moodist::CustomOp>(m, "CustomOp")
-      .def("__call__", &moodist::CustomOp::operator(), py::call_guard<py::gil_scoped_release>());
+  py::class_<moodist::wrapper::CustomOp>(m, "CustomOp")
+      .def("__call__", &moodist::wrapper::CustomOp::operator(), py::call_guard<py::gil_scoped_release>());
 
-  py::class_<moodist::Queue, std::shared_ptr<moodist::Queue>>(m, "Queue")
-      .def("put", &moodist::Queue::put, py::arg("tensor"), py::arg("transaction"), py::arg("wait_on_destroy") = true,
+  py::class_<moodist::wrapper::Queue, std::shared_ptr<moodist::wrapper::Queue>>(m, "Queue")
+      .def("put", &moodist::wrapper::Queue::put, py::arg("tensor"), py::arg("transaction"),
+          py::arg("wait_on_destroy") = true, py::call_guard<py::gil_scoped_release>())
+      .def("get", &moodist::wrapper::Queue::get, py::arg("block") = true, py::arg("timeout") = std::nullopt,
           py::call_guard<py::gil_scoped_release>())
-      .def("get", &moodist::Queue::get, py::arg("block") = true, py::arg("timeout") = std::nullopt,
-          py::call_guard<py::gil_scoped_release>())
-      .def("qsize", &moodist::Queue::qsize, py::call_guard<py::gil_scoped_release>())
-      .def("wait", &moodist::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
-      .def("transaction_begin", &moodist::Queue::transactionBegin, py::call_guard<py::gil_scoped_release>())
-      .def("transaction_cancel", &moodist::Queue::transactionCancel, py::call_guard<py::gil_scoped_release>())
-      .def("transaction_commit", &moodist::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>())
-      .def("name", &moodist::Queue::name);
+      .def("qsize", &moodist::wrapper::Queue::qsize, py::call_guard<py::gil_scoped_release>())
+      .def("wait", &moodist::wrapper::Queue::wait, py::arg("timeout"), py::call_guard<py::gil_scoped_release>())
+      .def("transaction_begin", &moodist::wrapper::Queue::transactionBegin, py::call_guard<py::gil_scoped_release>())
+      .def("transaction_cancel", &moodist::wrapper::Queue::transactionCancel, py::call_guard<py::gil_scoped_release>())
+      .def("transaction_commit", &moodist::wrapper::Queue::transactionCommit, py::call_guard<py::gil_scoped_release>())
+      .def("name", &moodist::wrapper::Queue::name);
 
-  py::class_<moodist::QueueWork>(m, "QueueWork")
-      .def("wait", &moodist::QueueWork::wait, py::call_guard<py::gil_scoped_release>());
+  py::class_<moodist::wrapper::QueueWork>(m, "QueueWork")
+      .def("wait", &moodist::wrapper::QueueWork::wait, py::call_guard<py::gil_scoped_release>());
 }

@@ -13,6 +13,7 @@
 #include "torch_includes.h"
 
 namespace moodist {
+namespace wrapper {
 
 // ============================================================================
 // Helpers
@@ -93,12 +94,16 @@ ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int r
   setBackend(torch::DeviceType::CUDA, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
 }
 
+} // namespace wrapper
+
 // destroy() for ApiHandle - calls CoreApi to delete the object
 namespace api {
 void destroy(ProcessGroup* pg) {
   coreApi.processGroupDestroy(pg);
 }
 } // namespace api
+
+namespace wrapper {
 
 // ============================================================================
 // Collectives - thin wrappers that convert types and call core
@@ -362,22 +367,8 @@ CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype
 }
 
 // ============================================================================
-// Future implementation
+// Future wrapper implementation
 // ============================================================================
-
-namespace api {
-void ApiProxy<Future>::wait(CUstream stream) {
-  coreApi.futureWait(ptr, stream);
-}
-
-bool ApiProxy<Future>::getResult(TensorPtr* outTensor) {
-  return coreApi.futureGetResult(ptr, outTensor);
-}
-
-void destroy(Future* future) {
-  coreApi.futureDestroy(future);
-}
-} // namespace api
 
 void Future::wait() {
   if (handle) {
@@ -398,19 +389,8 @@ torch::Tensor Future::result() {
 }
 
 // ============================================================================
-// CustomOp implementation
+// CustomOp wrapper implementation
 // ============================================================================
-
-namespace api {
-api::FutureHandle ApiProxy<CustomOp>::call(
-    TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
-  return coreApi.customOpCall(ptr, inputs, nInputs, outputs, nOutputs, stream);
-}
-
-void destroy(CustomOp* op) {
-  coreApi.customOpDestroy(op);
-}
-} // namespace api
 
 Future CustomOp::operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs) {
   if (!handle) {
@@ -463,5 +443,36 @@ void registerFreeMemoryCallback() {
     return std::make_unique<FreeMemoryCallbackImpl>();
   });
 }
+
+} // namespace wrapper
+
+// ============================================================================
+// ApiProxy implementations for api:: types (in moodist::api::)
+// ============================================================================
+
+namespace api {
+
+void ApiProxy<Future>::wait(CUstream stream) {
+  coreApi.futureWait(ptr, stream);
+}
+
+bool ApiProxy<Future>::getResult(TensorPtr* outTensor) {
+  return coreApi.futureGetResult(ptr, outTensor);
+}
+
+void destroy(Future* future) {
+  coreApi.futureDestroy(future);
+}
+
+api::FutureHandle ApiProxy<CustomOp>::call(
+    TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
+  return coreApi.customOpCall(ptr, inputs, nInputs, outputs, nOutputs, stream);
+}
+
+void destroy(CustomOp* op) {
+  coreApi.customOpDestroy(op);
+}
+
+} // namespace api
 
 } // namespace moodist

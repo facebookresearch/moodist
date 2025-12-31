@@ -228,9 +228,9 @@ size_t dtypeSize(DType dtype) {
   return torch::elementSize(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
 }
 
-// Free memory callback - delegates to moodist::registerFreeMemoryCallback from processgroup_wrapper.cc
+// Free memory callback - delegates to moodist::wrapper::registerFreeMemoryCallback from processgroup_wrapper.cc
 void registerFreeMemoryCallback() {
-  ::moodist::registerFreeMemoryCallback();
+  ::moodist::wrapper::registerFreeMemoryCallback();
 }
 
 // c10d::Store wrapper functions
