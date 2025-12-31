@@ -22,6 +22,10 @@
 #include <type_traits>
 #include <utility>
 
+// Forward declare CUDA types
+struct CUstream_st;
+using CUstream = CUstream_st*;
+
 namespace moodist {
 
 // Base class for refcounted objects passed across the API boundary.
@@ -105,6 +109,29 @@ struct ApiProxy<QueueWork> {
   }
 
   void wait(); // Defined in wrapper
+};
+
+// Specialization for Future
+template<>
+struct ApiProxy<Future> {
+  Future* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+
+  void wait(CUstream stream);           // Defined in wrapper
+  bool getResult(TensorPtr* outTensor); // Defined in wrapper
+};
+
+// Specialization for CustomOp
+template<>
+struct ApiProxy<CustomOp> {
+  CustomOp* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+
+  ApiHandle<Future> call(TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 };
 
 // destroy() declarations - implementations provided by wrapper only.
@@ -269,5 +296,7 @@ public:
 using BufferHandle = ApiHandle<Buffer>;
 using QueueHandle = ApiHandle<Queue>;
 using QueueWorkHandle = ApiHandle<QueueWork>;
+using FutureHandle = ApiHandle<Future>;
+using CustomOpHandle = ApiHandle<CustomOp>;
 
 } // namespace moodist::api

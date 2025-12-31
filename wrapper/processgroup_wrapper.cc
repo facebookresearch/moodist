@@ -356,51 +356,43 @@ CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype
     }
   }
 
-  void* opPtr = coreApi.compileOpFull(impl, shape.data(), shape.size(), dType, inputRanks.data(), inputOffsets.data(),
-      inputShapes.data(), inputs.size(), outputRanks.data(), outputOffsets.data(), outputShapes.data(), outputs.size());
+  api::CustomOpHandle opHandle = coreApi.compileOpFull(impl, shape.data(), shape.size(), dType, inputRanks.data(),
+      inputOffsets.data(), inputShapes.data(), inputs.size(), outputRanks.data(), outputOffsets.data(),
+      outputShapes.data(), outputs.size());
 
-  return CustomOp(opPtr);
+  return CustomOp(std::move(opHandle));
 }
 
 // ============================================================================
 // Future implementation
 // ============================================================================
 
-Future::~Future() {
-  if (impl) {
-    coreApi.futureImplDestroy(impl);
-    impl = nullptr;
-  }
+namespace api {
+void ApiProxy<Future>::wait(CUstream stream) {
+  coreApi.futureWait(ptr, stream);
 }
 
-Future::Future(Future&& other) noexcept : impl(other.impl), holdTensors(std::move(other.holdTensors)) {
-  other.impl = nullptr;
+bool ApiProxy<Future>::getResult(TensorPtr* outTensor) {
+  return coreApi.futureGetResult(ptr, outTensor);
 }
 
-Future& Future::operator=(Future&& other) noexcept {
-  if (this != &other) {
-    if (impl) {
-      coreApi.futureImplDestroy(impl);
-    }
-    impl = other.impl;
-    holdTensors = std::move(other.holdTensors);
-    other.impl = nullptr;
-  }
-  return *this;
+void destroy(Future* future) {
+  coreApi.futureDestroy(future);
 }
+} // namespace api
 
 void Future::wait() {
-  if (impl) {
+  if (handle) {
     CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
-    coreApi.futureImplWait(impl, stream);
+    handle->wait(stream);
   }
 }
 
 torch::Tensor Future::result() {
   wait();
-  if (impl) {
+  if (handle) {
     TensorPtr resultPtr;
-    if (coreApi.futureImplGetResult(impl, &resultPtr)) {
+    if (handle->getResult(&resultPtr)) {
       return unwrapTensor(resultPtr);
     }
   }
@@ -411,30 +403,19 @@ torch::Tensor Future::result() {
 // CustomOp implementation
 // ============================================================================
 
-CustomOp::~CustomOp() {
-  if (impl) {
-    coreApi.customOpImplDestroy(impl);
-    impl = nullptr;
-  }
+namespace api {
+api::FutureHandle ApiProxy<CustomOp>::call(
+    TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
+  return coreApi.customOpCall(ptr, inputs, nInputs, outputs, nOutputs, stream);
 }
 
-CustomOp::CustomOp(CustomOp&& other) noexcept : impl(other.impl) {
-  other.impl = nullptr;
+void destroy(CustomOp* op) {
+  coreApi.customOpDestroy(op);
 }
-
-CustomOp& CustomOp::operator=(CustomOp&& other) noexcept {
-  if (this != &other) {
-    if (impl) {
-      coreApi.customOpImplDestroy(impl);
-    }
-    impl = other.impl;
-    other.impl = nullptr;
-  }
-  return *this;
-}
+} // namespace api
 
 Future CustomOp::operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs) {
-  if (!impl) {
+  if (!handle) {
     throw std::runtime_error("CustomOp::operator(): op is null");
   }
 
@@ -454,10 +435,10 @@ Future CustomOp::operator()(const std::vector<torch::Tensor>& inputs, const std:
 
   CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
 
-  void* futurePtr =
-      coreApi.customOpImplCall(impl, inputPtrs.data(), inputPtrs.size(), outputPtrs.data(), outputPtrs.size(), stream);
+  api::FutureHandle futureHandle =
+      handle->call(inputPtrs.data(), inputPtrs.size(), outputPtrs.data(), outputPtrs.size(), stream);
 
-  Future f(futurePtr);
+  Future f(std::move(futureHandle));
   // Hold the original tensors alive in the Future
   for (const auto& t : inputs) {
     f.holdTensors.push_back(t);

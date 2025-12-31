@@ -58,29 +58,33 @@ public:
 
 // Stub types for unimplemented methods - minimal definitions
 struct Future {
-  void* impl = nullptr;                   // Opaque pointer to core ApiFuture
+  api::FutureHandle handle;
   std::vector<torch::Tensor> holdTensors; // Keep tensors alive in wrapper
 
   Future() = default;
-  Future(void* impl_) : impl(impl_) {}
-  ~Future();
+  Future(api::FutureHandle h) : handle(std::move(h)) {}
+  ~Future() = default; // ApiHandle destructor handles cleanup
+
   Future(const Future&) = delete;
-  Future(Future&& other) noexcept;
-  Future& operator=(Future&& other) noexcept;
+  Future(Future&&) noexcept = default;
+  Future& operator=(const Future&) = delete;
+  Future& operator=(Future&&) noexcept = default;
 
   void wait();
   torch::Tensor result();
 };
 
 struct CustomOp {
-  void* impl = nullptr; // Opaque pointer to core CustomOpImpl
+  api::CustomOpHandle handle;
 
   CustomOp() = default;
-  CustomOp(void* impl_) : impl(impl_) {}
-  ~CustomOp();
+  CustomOp(api::CustomOpHandle h) : handle(std::move(h)) {}
+  ~CustomOp() = default; // ApiHandle destructor handles cleanup
+
   CustomOp(const CustomOp&) = delete;
-  CustomOp(CustomOp&& other) noexcept;
-  CustomOp& operator=(CustomOp&& other) noexcept;
+  CustomOp(CustomOp&&) noexcept = default;
+  CustomOp& operator=(const CustomOp&) = delete;
+  CustomOp& operator=(CustomOp&&) noexcept = default;
 
   Future operator()(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs);
 };

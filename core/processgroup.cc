@@ -290,8 +290,9 @@ Reduction toInternalReduction(ReduceOp op) {
 // ProcessGroupImpl
 // ============================================================================
 
-// Forward declaration for compileOpFullImpl return type
+// Forward declarations for return types used in ProcessGroupImpl
 struct CustomOpImpl;
+struct ApiFuture;
 
 struct ProcessGroupImpl {
   size_t rank = 0;
@@ -606,19 +607,19 @@ struct ProcessGroupImpl {
   void cudaBarrier(CUstream stream);
 
   // compileOpFull - compile a distributed tensor operation
-  void* compileOpFull(const std::vector<int>& shape, DType dtype,
+  SharedPtr<CustomOpImpl> compileOpFull(const std::vector<int>& shape, DType dtype,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs);
 
   // Template implementation for compileOpFull - parameterized by ndim
   template<int ndim>
-  CustomOpImpl* compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
+  SharedPtr<CustomOpImpl> compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
       const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg);
 
   // customOp - execute a compiled custom operation
-  void* customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs,
-      size_t nOutputs, CUstream stream);
+  SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
+      TensorPtr* outputs, size_t nOutputs, CUstream stream);
 };
 
 // ============================================================================
@@ -2122,17 +2123,17 @@ bool getProfilingEnabled() {
 // ApiFuture - API boundary wrapper for async operations
 // ============================================================================
 
-struct ApiFuture {
+struct ApiFuture : api::Future {
   FutureImplSharedPtr impl;
   std::vector<TensorPtr> holdTensors; // Keep tensors alive until complete
   Function<void(CUstream)> waitDoneCallback;
 };
 
-void futureImplDestroy(void* future) {
-  delete static_cast<ApiFuture*>(future);
+void futureDestroy(api::Future* future) {
+  internalDelete(static_cast<ApiFuture*>(future));
 }
 
-void futureImplWait(void* future, CUstream stream) {
+void futureWait(api::Future* future, CUstream stream) {
   auto* f = static_cast<ApiFuture*>(future);
   if (f->impl) {
     while (f->impl->done == 0) {
@@ -2145,7 +2146,7 @@ void futureImplWait(void* future, CUstream stream) {
   }
 }
 
-bool futureImplGetResult(void* future, TensorPtr* outTensor) {
+bool futureGetResult(api::Future* future, TensorPtr* outTensor) {
   auto* f = static_cast<ApiFuture*>(future);
   if (f->impl && f->impl->result) {
     *outTensor = tensorFromTensorData(std::move(f->impl->result));
@@ -2154,25 +2155,37 @@ bool futureImplGetResult(void* future, TensorPtr* outTensor) {
   return false;
 }
 
+namespace api {
+void destroy(Future* future) {
+  futureDestroy(future);
+}
+} // namespace api
+
 // ============================================================================
 // CustomOpImpl - API boundary wrapper for compiled custom operations
 // ============================================================================
 
-struct CustomOpImpl {
-  // The actual custom op function - takes process group impl pointer and descriptor
-  // Returns ApiFuture*
-  Function<void*(TensorPtr*, size_t, TensorPtr*, size_t, CUstream)> call;
+struct CustomOpImpl : api::CustomOp {
+  // The actual custom op function - returns SharedPtr<ApiFuture>
+  Function<SharedPtr<ApiFuture>(TensorPtr*, size_t, TensorPtr*, size_t, CUstream)> call;
 };
 
-void customOpImplDestroy(void* op) {
-  delete static_cast<CustomOpImpl*>(op);
+void customOpDestroy(api::CustomOp* op) {
+  internalDelete(static_cast<CustomOpImpl*>(op));
 }
 
-void* customOpImplCall(
-    void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
+api::FutureHandle customOpCall(
+    api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
   auto* o = static_cast<CustomOpImpl*>(op);
-  return o->call(inputs, nInputs, outputs, nOutputs, stream);
+  SharedPtr<ApiFuture> future = o->call(inputs, nInputs, outputs, nOutputs, stream);
+  return api::FutureHandle::adopt(future.release());
 }
+
+namespace api {
+void destroy(CustomOp* op) {
+  customOpDestroy(op);
+}
+} // namespace api
 
 // ============================================================================
 // compileOpFull - implementation
@@ -2232,7 +2245,7 @@ struct TInput {
 // ============================================================================
 
 template<int ndim>
-CustomOpImpl* ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg) {
   using T = std::array<int, ndim>;
@@ -2566,10 +2579,10 @@ CustomOpImpl* ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_
   }
 
   // Create the CustomOpImpl with a closure that calls customOp
-  auto* result = new CustomOpImpl();
+  auto result = makeShared<CustomOpImpl>();
   auto selfPtr = share(this);
-  result->call = [op, selfPtr](
-                     TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) -> void* {
+  result->call = [op, selfPtr](TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs,
+                     CUstream stream) -> SharedPtr<ApiFuture> {
     return selfPtr->customOp(op, inputs, nInputs, outputs, nOutputs, stream);
   };
 
@@ -2580,7 +2593,7 @@ CustomOpImpl* ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_
 // ProcessGroupImpl::compileOpFull - compile a distributed tensor operation
 // ============================================================================
 
-void* ProcessGroupImpl::compileOpFull(const std::vector<int>& shapeVec, DType dtype,
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(const std::vector<int>& shapeVec, DType dtype,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputsVec,
     const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputsVec) {
   size_t ndim = shapeVec.size();
@@ -2642,8 +2655,8 @@ TensorDataPtr getTensorDataFromPtr(const TensorPtr& tensor) {
 
 } // namespace
 
-void* ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
-    TensorPtr* outputs, size_t nOutputs, CUstream stream) {
+SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs,
+    size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
@@ -2707,7 +2720,7 @@ void* ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorP
   group->cpuThread->enqueue(e);
 
   // Create and return ApiFuture
-  auto* result = new ApiFuture();
+  auto result = makeShared<ApiFuture>();
   result->impl = std::move(future);
   // Hold tensors alive - store them in holdTensors
   for (size_t i = 0; i < nInputs; ++i) {
@@ -2729,9 +2742,9 @@ void* ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorP
 }
 
 // API function that calls the member method
-void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype, const int* inputRanks,
-    const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks, const int* outputOffsets,
-    const int* outputShapes, size_t nOutputs) {
+api::CustomOpHandle compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+    const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
+    const int* outputOffsets, const int* outputShapes, size_t nOutputs) {
   // Reconstruct vectors from flat arrays
   std::vector<int> shapeVec(shape, shape + ndim);
 
@@ -2757,7 +2770,8 @@ void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType
     outputShapeIdx += ndim;
   }
 
-  return impl->compileOpFull(shapeVec, dtype, inputsVec, outputsVec);
+  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shapeVec, dtype, inputsVec, outputsVec);
+  return api::CustomOpHandle::adopt(op.release());
 }
 
 } // namespace moodist

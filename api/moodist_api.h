@@ -224,25 +224,20 @@ struct CoreApi {
   void (*queueWorkDestroy)(api::QueueWork* work);
   void (*queueWorkWait)(api::QueueWork* work);
 
-  // FutureImpl operations - operate on opaque FutureImpl* pointers
-  // FutureImpl is created by customOpCall and holds async result
-  // FutureImpl inherits from ApiRefCounted - wrapper manages refcount directly
-  void (*futureImplDestroy)(void* future);
-  void (*futureImplWait)(void* future, CUstream stream);
-  bool (*futureImplGetResult)(void* future, TensorPtr* outTensor);
+  // Future operations - refcounted via ApiHandle
+  void (*futureDestroy)(api::Future* future);
+  void (*futureWait)(api::Future* future, CUstream stream);
+  bool (*futureGetResult)(api::Future* future, TensorPtr* outTensor);
 
-  // CustomOpImpl operations - operate on opaque CustomOpImpl* pointers
-  // CustomOpImpl wraps a compiled custom op that can be called repeatedly
-  // CustomOpImpl inherits from ApiRefCounted - wrapper manages refcount directly
-  void (*customOpImplDestroy)(void* op);
-  // Calls the custom op with input/output tensors, returns FutureImpl* (caller must decref)
-  void* (*customOpImplCall)(
-      void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
+  // CustomOp operations - refcounted via ApiHandle
+  void (*customOpDestroy)(api::CustomOp* op);
+  api::FutureHandle (*customOpCall)(
+      api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
-  // compileOpFull - compiles a distributed tensor operation, returns CustomOpImpl* (caller must decref)
-  void* (*compileOpFull)(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype, const int* inputRanks,
-      const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks, const int* outputOffsets,
-      const int* outputShapes, size_t nOutputs);
+  // compileOpFull - compiles a distributed tensor operation
+  api::CustomOpHandle (*compileOpFull)(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+      const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
+      const int* outputOffsets, const int* outputShapes, size_t nOutputs);
 
   // Profiling
   void (*setProfilingEnabled)(bool enabled);

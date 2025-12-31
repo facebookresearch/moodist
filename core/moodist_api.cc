@@ -32,16 +32,16 @@ const char* queueName(api::Queue* queue);
 void queueWorkDestroy(api::QueueWork* work);
 void queueWorkWait(api::QueueWork* work);
 
-// Forward declarations for FutureImpl, CustomOpImpl, compileOpFull defined in processgroup.cc
-void futureImplDestroy(void* future);
-void futureImplWait(void* future, CUstream stream);
-bool futureImplGetResult(void* future, TensorPtr* outTensor);
-void customOpImplDestroy(void* op);
-void* customOpImplCall(
-    void* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
-void* compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype, const int* inputRanks,
-    const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks, const int* outputOffsets,
-    const int* outputShapes, size_t nOutputs);
+// Forward declarations for Future, CustomOp, compileOpFull defined in processgroup.cc
+void futureDestroy(api::Future* future);
+void futureWait(api::Future* future, CUstream stream);
+bool futureGetResult(api::Future* future, TensorPtr* outTensor);
+void customOpDestroy(api::CustomOp* op);
+api::FutureHandle customOpCall(
+    api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
+api::CustomOpHandle compileOpFull(ProcessGroupImpl* impl, const int* shape, size_t ndim, DType dtype,
+    const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
+    const int* outputOffsets, const int* outputShapes, size_t nOutputs);
 
 // Forward declaration for bufferDestroy defined in serialize_object.cc
 void bufferDestroy(api::Buffer* buf);
@@ -124,14 +124,14 @@ static CoreApi coreApi = {
     .queueWorkDestroy = queueWorkDestroy,
     .queueWorkWait = queueWorkWait,
 
-    // FutureImpl operations
-    .futureImplDestroy = futureImplDestroy,
-    .futureImplWait = futureImplWait,
-    .futureImplGetResult = futureImplGetResult,
+    // Future operations
+    .futureDestroy = futureDestroy,
+    .futureWait = futureWait,
+    .futureGetResult = futureGetResult,
 
-    // CustomOpImpl operations
-    .customOpImplDestroy = customOpImplDestroy,
-    .customOpImplCall = customOpImplCall,
+    // CustomOp operations
+    .customOpDestroy = customOpDestroy,
+    .customOpCall = customOpCall,
 
     // compileOpFull
     .compileOpFull = compileOpFull,
