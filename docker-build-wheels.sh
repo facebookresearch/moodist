@@ -18,7 +18,8 @@ pre_torch_versions=""
 moodist_version=$(cat version.txt)
 
 # Generate random build magic for API verification (shared across all builds)
-export MOODIST_BUILD_MAGIC="0x$(head -c8 /dev/urandom | xxd -p)ULL"
+# Use od instead of xxd for portability (xxd may not be installed)
+export MOODIST_BUILD_MAGIC="0x$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')ULL"
 echo "Build magic: $MOODIST_BUILD_MAGIC"
 
 orig_path=$PATH

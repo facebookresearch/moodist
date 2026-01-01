@@ -26,7 +26,7 @@ public:
 
   api::StoreHandle handle;
 
-  virtual c10::intrusive_ptr<Store> clone() override;
+  virtual c10::intrusive_ptr<Store> clone();
 
   virtual void set(const std::string& key, const std::vector<uint8_t>& value) override;
   virtual std::vector<uint8_t> get(const std::string& key) override;
