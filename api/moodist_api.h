@@ -178,6 +178,10 @@ struct CoreApi {
   void (*processGroupShutdown)(api::ProcessGroup* pg); // Optional: explicitly trigger shutdown
   int (*processGroupRank)(api::ProcessGroup* pg);
   int (*processGroupSize)(api::ProcessGroup* pg);
+  bool (*processGroupGetPreferKernelLess)(api::ProcessGroup* pg);
+  void (*processGroupSetPreferKernelLess)(api::ProcessGroup* pg, bool value);
+  int64_t (*processGroupGetOption)(api::ProcessGroup* pg, const char* name);
+  void (*processGroupSetOption)(api::ProcessGroup* pg, const char* name, int64_t value);
 
   // Collective operations - core handles all logic
   void (*processGroupAllGather)(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);

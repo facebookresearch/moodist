@@ -9,9 +9,59 @@ import torch
 import torch.distributed
 
 from ._core import MoodistProcessGroup, TcpStore
+from .options import MoodistOptions, MoodistOptionsContext
 
 
 _name_to_group = weakref.WeakValueDictionary()
+
+
+class PreferKernelLessContext:
+    """Context manager for temporarily setting prefer_kernel_less on a ProcessGroup.
+
+    Usage:
+        pg = moodist.MoodistProcessGroup(store, rank, size)
+
+        # As context manager (auto-restores after):
+        with pg.prefer_kernel_less(True):
+            pg.allgather(...)
+
+        # Or just call to set directly (returns context manager you can ignore):
+        pg.prefer_kernel_less(True)
+    """
+
+    def __init__(self, pg, value: bool):
+        self.pg = pg
+        self.new_value = value
+        self.old_value = pg.get_prefer_kernel_less()
+        pg.set_prefer_kernel_less(value)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.pg.set_prefer_kernel_less(self.old_value)
+        return False
+
+
+def prefer_kernel_less(pg, value: bool):
+    """Set prefer_kernel_less on a ProcessGroup, returning a context manager.
+
+    Can be used either as a direct setter or as a context manager:
+
+        # Direct set (ignoring the return value):
+        prefer_kernel_less(pg, True)
+
+        # As context manager (restores after):
+        with prefer_kernel_less(pg, True):
+            ...
+    """
+    return PreferKernelLessContext(pg, value)
+
+
+# Monkey-patch prefer_kernel_less onto MoodistProcessGroup if available
+# Note: options() method is defined in pybind.cc
+if MoodistProcessGroup is not None:
+    MoodistProcessGroup.prefer_kernel_less = lambda self, value: PreferKernelLessContext(self, value)
 
 
 def find_process_group(name: str):

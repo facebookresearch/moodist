@@ -300,6 +300,22 @@ std::string ProcessGroup::moodist_name() const {
   return "moodist"; // TODO: get from impl if needed
 }
 
+bool ProcessGroup::getPreferKernelLess() const {
+  return coreApi.processGroupGetPreferKernelLess(handle.get());
+}
+
+void ProcessGroup::setPreferKernelLess(bool value) {
+  coreApi.processGroupSetPreferKernelLess(handle.get(), value);
+}
+
+int64_t ProcessGroup::getOption(const std::string& name) const {
+  return coreApi.processGroupGetOption(handle.get(), name.c_str());
+}
+
+void ProcessGroup::setOption(const std::string& name, int64_t value) {
+  coreApi.processGroupSetOption(handle.get(), name.c_str(), value);
+}
+
 // ============================================================================
 // Stubs - need additional CoreApi functions
 // ============================================================================

@@ -7,7 +7,7 @@ to avoid side effects and allow per-test isolation.
 """
 
 import torch
-from framework import TestContext, test, test_cpu_cuda, create_process_group
+from framework import TestContext, test, test_cpu_cuda, test_cpu_cuda_kernel_modes, create_process_group
 
 
 @test
@@ -18,35 +18,34 @@ def test_pg_creation(ctx: TestContext):
     ctx.assert_equal(pg.size(), ctx.world_size)
 
 
-@test_cpu_cuda
-def test_pg_allgather_base(ctx: TestContext, device: str):
+@test_cpu_cuda_kernel_modes
+def test_pg_allgather_base(ctx: TestContext, device: str, kernel_less: bool):
     """Test _allgather_base: each rank contributes a chunk, gather all chunks."""
-    pg = create_process_group(ctx)
+    with create_process_group(ctx, force_kernel_less=kernel_less) as pg:
+        # Each rank has a small tensor with its rank value
+        chunk_size = 4
+        input_tensor = torch.full(
+            (chunk_size,), float(ctx.rank), device=device, dtype=torch.float32
+        )
 
-    # Each rank has a small tensor with its rank value
-    chunk_size = 4
-    input_tensor = torch.full(
-        (chunk_size,), float(ctx.rank), device=device, dtype=torch.float32
-    )
+        # Output tensor to hold all chunks
+        output_tensor = torch.zeros(
+            (chunk_size * ctx.world_size,), device=device, dtype=torch.float32
+        )
 
-    # Output tensor to hold all chunks
-    output_tensor = torch.zeros(
-        (chunk_size * ctx.world_size,), device=device, dtype=torch.float32
-    )
+        # Run allgather
+        work = pg._allgather_base(output_tensor, input_tensor)
+        work.wait()
 
-    # Run allgather
-    work = pg._allgather_base(output_tensor, input_tensor)
-    work.wait()
-
-    # Verify: output should be [0,0,0,0, 1,1,1,1, 2,2,2,2, ...]
-    expected = torch.cat([
-        torch.full((chunk_size,), float(r), device=device, dtype=torch.float32)
-        for r in range(ctx.world_size)
-    ])
-    ctx.assert_true(
-        torch.equal(output_tensor, expected),
-        f"allgather result mismatch: got {output_tensor}, expected {expected}"
-    )
+        # Verify: output should be [0,0,0,0, 1,1,1,1, 2,2,2,2, ...]
+        expected = torch.cat([
+            torch.full((chunk_size,), float(r), device=device, dtype=torch.float32)
+            for r in range(ctx.world_size)
+        ])
+        ctx.assert_true(
+            torch.equal(output_tensor, expected),
+            f"allgather result mismatch: got {output_tensor}, expected {expected}"
+        )
 
 
 @test_cpu_cuda

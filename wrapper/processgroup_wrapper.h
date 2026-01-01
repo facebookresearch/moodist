@@ -109,6 +109,14 @@ public:
 
   std::string moodist_name() const;
 
+  // Prefer kernelless path for collectives (per-PG setting)
+  bool getPreferKernelLess() const;
+  void setPreferKernelLess(bool value);
+
+  // Generic option get/set by name
+  int64_t getOption(const std::string& name) const;
+  void setOption(const std::string& name, int64_t value);
+
   // Standard c10d collectives
   c10::intrusive_ptr<Work> broadcast(
       std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;

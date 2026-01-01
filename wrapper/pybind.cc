@@ -47,11 +47,48 @@ PYBIND11_MODULE(_C, m) {
   m.def("enable_cpu_allocator", &moodist::enableCpuAllocator);
 
   py::class_<MoodistProcessGroup, c10::intrusive_ptr<MoodistProcessGroup>, c10d::ProcessGroup>(
-      m, "MoodistProcessGroup", R"d(
+      m, "MoodistProcessGroup", py::dynamic_attr(), R"d(
     A moodist process group :D
   )d")
       .def(py::init<const c10::intrusive_ptr<::c10d::Store>&, int, int>(), py::call_guard<py::gil_scoped_release>())
       .def("moodist_name", &MoodistProcessGroup::moodist_name)
+      .def("get_prefer_kernel_less", &MoodistProcessGroup::getPreferKernelLess)
+      .def("set_prefer_kernel_less", &MoodistProcessGroup::setPreferKernelLess, py::arg("value"))
+      .def("_get_option", &MoodistProcessGroup::getOption, py::arg("name"))
+      .def("_set_option", &MoodistProcessGroup::setOption, py::arg("name"), py::arg("value"))
+      .def(
+          "options",
+          [](py::object self, py::kwargs kwargs) {
+            // Import the Python options module (separate file to avoid circular imports)
+            py::module_ options_mod = py::module_::import("moodist.options");
+            py::object MoodistOptions = options_mod.attr("MoodistOptions");
+
+            // Get or create the cached options object
+            py::object opts;
+            if (py::hasattr(self, "_moodist_options_cache")) {
+              opts = self.attr("_moodist_options_cache");
+            } else {
+              opts = MoodistOptions(self);
+              self.attr("_moodist_options_cache") = opts;
+            }
+
+            // If kwargs provided, return context manager; otherwise return options object
+            if (kwargs.size() > 0) {
+              return opts.attr("__call__")(**kwargs);
+            }
+            return opts;
+          },
+          R"d(
+    Get options object or create context manager for temporary option overrides.
+
+    Usage:
+        # Get options object for direct access:
+        pg.options().prefer_kernel_less = True
+
+        # Create context manager with kwargs:
+        with pg.options(prefer_kernel_less=True) as pg:
+            pg.allgather(...)
+  )d")
       .def("cuda_barrier", &MoodistProcessGroup::cudaBarrier, py::call_guard<py::gil_scoped_release>())
       .def("Queue", py::overload_cast<int, bool, std::optional<std::string>>(&MoodistProcessGroup::makeQueue),
           py::arg("location"), py::arg("streaming") = false, py::arg("name") = std::nullopt,

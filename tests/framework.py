@@ -149,6 +149,76 @@ def test_cpu_cuda(fn: Callable[[TestContext, str], None]):
     return test_devices("cpu", "cuda")(fn)
 
 
+def test_kernel_modes(*modes: bool):
+    """Decorator to run a test with different prefer_kernel_less settings.
+
+    Usage:
+        @test_kernel_modes(False, True)
+        def test_something(ctx: TestContext, kernel_less: bool):
+            pg = create_process_group(ctx)
+            pg.options.prefer_kernel_less = kernel_less
+            ...
+
+    This registers test_something_kernel and test_something_kernelless.
+    """
+    def decorator(fn: Callable[[TestContext, bool], None]):
+        for mode in modes:
+            def make_wrapper(m):
+                def wrapper(ctx: TestContext):
+                    return fn(ctx, m)
+                return wrapper
+            wrapper = make_wrapper(mode)
+            suffix = "kernelless" if mode else "kernel"
+            wrapper.__name__ = f"{fn.__name__}_{suffix}"
+            _tests.append((wrapper.__name__, wrapper))
+        return fn
+    return decorator
+
+
+def test_all_kernel_modes(fn: Callable[[TestContext, bool], None]):
+    """Shortcut for @test_kernel_modes(False, True)."""
+    return test_kernel_modes(False, True)(fn)
+
+
+def test_cpu_cuda_kernel_modes(fn: Callable[[TestContext, str, bool], None]):
+    """Decorator to run a test with device and kernel mode combinations.
+
+    Usage:
+        @test_cpu_cuda_kernel_modes
+        def test_something(ctx: TestContext, device: str, kernel_less: bool):
+            pg = create_process_group(ctx)
+            pg.options.prefer_kernel_less = kernel_less
+            tensor = torch.tensor([1.0], device=device)
+            ...
+
+    This registers 3 tests:
+        test_something_cpu (kernel_less=False, since it's irrelevant for CPU),
+        test_something_cuda_kernel, test_something_cuda_kernelless
+
+    Note: kernel_less only affects CUDA paths, so we only vary it for CUDA.
+    """
+    # CPU: run once with kernel_less=False (it's ignored for CPU anyway)
+    def make_cpu_wrapper():
+        def wrapper(ctx: TestContext):
+            return fn(ctx, "cpu", False)
+        return wrapper
+    cpu_wrapper = make_cpu_wrapper()
+    cpu_wrapper.__name__ = f"{fn.__name__}_cpu"
+    _tests.append((cpu_wrapper.__name__, cpu_wrapper))
+
+    # CUDA: run both kernel modes
+    for mode in (False, True):
+        def make_cuda_wrapper(m):
+            def wrapper(ctx: TestContext):
+                return fn(ctx, "cuda", m)
+            return wrapper
+        wrapper = make_cuda_wrapper(mode)
+        suffix = "kernelless" if mode else "kernel"
+        wrapper.__name__ = f"{fn.__name__}_cuda_{suffix}"
+        _tests.append((wrapper.__name__, wrapper))
+    return fn
+
+
 def get_tests() -> list[tuple[str, Callable[[TestContext], None]]]:
     """Return list of (name, function) for all registered tests."""
     return _tests.copy()
@@ -309,7 +379,7 @@ def clear_process_group_cache():
     _cached_pg_store = None
 
 
-def create_process_group(ctx: TestContext, fresh: bool = False):
+def create_process_group(ctx: TestContext, fresh: bool = False, **options):
     """Helper to create or reuse a ProcessGroup for testing.
 
     By default, returns a cached ProcessGroup shared across tests in the same
@@ -318,9 +388,18 @@ def create_process_group(ctx: TestContext, fresh: bool = False):
     Args:
         ctx: Test context
         fresh: If True, create a new ProcessGroup instead of using cache
+        **options: Options to set on the ProcessGroup (e.g., prefer_kernel_less=True)
 
     Returns:
-        MoodistProcessGroup instance
+        MoodistProcessGroup instance (or context manager if options are provided)
+
+    Usage:
+        # Without options - returns PG directly:
+        pg = create_process_group(ctx)
+
+        # With options - use as context manager (options restored after):
+        with create_process_group(ctx, prefer_kernel_less=True) as pg:
+            pg.allgather(...)
     """
     global _cached_pg, _cached_pg_store
     from datetime import timedelta
@@ -335,4 +414,9 @@ def create_process_group(ctx: TestContext, fresh: bool = False):
         _cached_pg = pg
         _cached_pg_store = store
 
-    return _cached_pg
+    pg = _cached_pg
+
+    if options:
+        # Return context manager that sets options and restores after
+        return pg.options(**options)
+    return pg

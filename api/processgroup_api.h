@@ -27,6 +27,15 @@ void processGroupShutdown(api::ProcessGroup* pg);
 // Accessors
 int processGroupRank(api::ProcessGroup* pg);
 int processGroupSize(api::ProcessGroup* pg);
+bool processGroupGetPreferKernelLess(api::ProcessGroup* pg);
+void processGroupSetPreferKernelLess(api::ProcessGroup* pg, bool value);
+
+// Generic option get/set by name
+// Throws std::runtime_error for unknown options
+// Bool options: returns/accepts 0 or 1
+// Int options: -1 = auto, >=0 = value
+int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name);
+void processGroupSetOption(api::ProcessGroup* pg, const char* name, int64_t value);
 
 // Collective operations - all logic handled in core
 void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);

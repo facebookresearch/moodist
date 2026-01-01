@@ -26,7 +26,10 @@ from ._core import (
 )
 
 # Backend (importing triggers registration with torch.distributed)
-from .backend import find_process_group, create_moodist_backend
+from .backend import find_process_group, create_moodist_backend, PreferKernelLessContext
+
+# Options (separate module to avoid circular imports)
+from .options import MoodistOptions, MoodistOptionsContext
 
 # Queue
 from .queue import Queue, TransactionContextManager
@@ -78,6 +81,9 @@ __all__ = [
     # Backend
     "find_process_group",
     "create_moodist_backend",
+    "PreferKernelLessContext",
+    "MoodistOptions",
+    "MoodistOptionsContext",
     # Compile
     "compile_op",
 ]
