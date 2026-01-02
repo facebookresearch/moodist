@@ -39,34 +39,41 @@ message(STATUS "PyTorch is at ${TorchPath}")
 set(ABI_VERSION "auto" CACHE STRING "The ABI version that pytorch was built with")
 set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
 
-if (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto")
-  message(STATUS "Auto-detecting pytorch abi")
+# Detect CXX11 ABI directly from PyTorch (instant, no compilation needed)
+if (USE_CXX1_ABI STREQUAL "auto")
+  execute_process(
+    COMMAND python -c "import torch; print(1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0, end='')"
+    OUTPUT_VARIABLE USE_CXX1_ABI
+    RESULT_VARIABLE cxx_abi_result
+  )
+  if (NOT cxx_abi_result EQUAL 0)
+    message(FATAL_ERROR "Failed to detect _GLIBCXX_USE_CXX11_ABI from PyTorch")
+  endif()
+  set(USE_CXX1_ABI ${USE_CXX1_ABI} CACHE STRING "" FORCE)
+  message(STATUS "Detected _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI} from PyTorch")
+endif()
+
+# Detect fabi-version by trying common values
+if (ABI_VERSION STREQUAL "auto")
+  message(STATUS "Auto-detecting fabi-version")
   foreach(abi IN ITEMS 19 18 16 11 13 20 17 15 14 12)
-    foreach (cxx IN ITEMS 1 0)
-      set(dir ${CMAKE_CURRENT_BINARY_DIR}/detect_abi_${abi}_${cxx})
-      try_compile(success PROJECT detect_abi SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/detect_abi BINARY_DIR ${dir} CMAKE_FLAGS -DABI_VERSION=${abi} -DUSE_CXX1_ABI=${cxx} -DTorchPath=${TorchPath} OUTPUT_VARIABLE stdout)
-      #message(STATUS "${stdout}")
-      if (success)
-        execute_process(
-          COMMAND python -c "import torch, moodist_detect_abi"
-          WORKING_DIRECTORY ${dir}
-          RESULT_VARIABLE exitcode
-        )
-        #message(STATUS "exitcode for ${dir} is ${exitcode}")
-        if (exitcode EQUAL 0)
-          set(ABI_VERSION ${abi} CACHE STRING "" FORCE)
-          set(USE_CXX1_ABI ${cxx} CACHE STRING "" FORCE)
-          break()
-        endif()
+    set(dir ${CMAKE_CURRENT_BINARY_DIR}/detect_abi_${abi}_${USE_CXX1_ABI})
+    try_compile(success PROJECT detect_abi SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/detect_abi BINARY_DIR ${dir} CMAKE_FLAGS -DABI_VERSION=${abi} -DUSE_CXX1_ABI=${USE_CXX1_ABI} -DTorchPath=${TorchPath} OUTPUT_VARIABLE stdout)
+    if (success)
+      execute_process(
+        COMMAND python -c "import torch, moodist_detect_abi"
+        WORKING_DIRECTORY ${dir}
+        RESULT_VARIABLE exitcode
+      )
+      if (exitcode EQUAL 0)
+        set(ABI_VERSION ${abi} CACHE STRING "" FORCE)
+        break()
       endif()
-    endforeach()
-    if (NOT (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto"))
-      break()
     endif()
   endforeach()
 
-  if (ABI_VERSION STREQUAL "auto" OR USE_CXX1_ABI STREQUAL "auto")
-    message(FATAL_ERROR "Failed to auto-detect abi version for pytorch. Set ABI_VERSION and USE_CXX1_ABI to the appropriate values.")
+  if (ABI_VERSION STREQUAL "auto")
+    message(FATAL_ERROR "Failed to auto-detect fabi-version for PyTorch. Set ABI_VERSION manually.")
   endif()
 endif()
 
