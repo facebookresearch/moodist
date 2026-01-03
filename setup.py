@@ -58,8 +58,9 @@ class Build(build_ext.build_ext):
         if "MOODIST_BUILD_MAGIC" in os.environ:
             cmake_cmd.append("-DMOODIST_BUILD_MAGIC=%s" % os.environ["MOODIST_BUILD_MAGIC"])
 
-        # if "bdist_wheel" in sys.argv:
-        #     cmake_cmd.append("-DIS_BUILDING_WHEEL=1")
+        # Use minimal debug info for wheel builds (smaller binaries)
+        if "MOODIST_MINIMAL_DEBUG" in os.environ or "bdist_wheel" in sys.argv:
+            cmake_cmd.append("-DMINIMAL_DEBUG=ON")
 
         build_cmd = ["cmake", "--build", ".", "--parallel"]
 
