@@ -456,7 +456,7 @@ public:
     }
     size_t bs = ksize;
     size_t mask = bs - 1;
-    size_t ki = Hash()(key) & mask;
+    size_t ki = (Hash()(key) * 0x9E3779B97F4A7C15ul) & mask;
 
     auto* primary = this->primary;
     auto* secondary = this->secondary;
