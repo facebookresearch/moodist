@@ -5,11 +5,14 @@
 #include "async.h"
 #include "function.h"
 #include "hash_map.h"
+#include "logging.h"
 #include "shared_ptr.h"
 #include "vector.h"
 
 #include "fmt/printf.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <net/if.h>
@@ -22,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 
@@ -35,74 +39,375 @@ void add(SharedPtr<SocketImpl> impl);
 }
 
 struct ResolveHandle {
-  gaicb req;
-  sigevent sevp;
   std::string address;
-  std::string service;
+  int port;
+  addrinfo* result = nullptr;
   Function<void(Error*, addrinfo*)> callback;
+  std::chrono::steady_clock::time_point startTime;
 
   ResolveHandle() = default;
   ResolveHandle(const ResolveHandle&) = delete;
   ResolveHandle& operator=(const ResolveHandle&) = delete;
   ~ResolveHandle() {
-    gai_cancel(&req);
+    if (result) {
+      freeaddrinfo(result);
+    }
   }
 };
+
+// Cached DNS entry - stores copies of sockaddr data
+// We cache both successful resolutions and errors to avoid spamming DNS
+struct DnsCacheEntry {
+  struct Address {
+    int family;
+    int socktype;
+    int protocol;
+    socklen_t addrlen;
+    sockaddr_storage addr;
+  };
+  Vector<Address> addresses;
+  std::chrono::steady_clock::time_point expiry;
+  int errorCode = 0; // 0 = success, non-zero = getaddrinfo error
+};
+
+// Helper to set port in a sockaddr_storage
+inline void setPort(sockaddr_storage& addr, uint16_t port) {
+  if (addr.ss_family == AF_INET) {
+    reinterpret_cast<sockaddr_in&>(addr).sin_port = htons(port);
+  } else if (addr.ss_family == AF_INET6) {
+    reinterpret_cast<sockaddr_in6&>(addr).sin6_port = htons(port);
+  }
+}
+
+// Builds addrinfo chain from cached addresses and invokes callback
+static void invokeResolveCallback(
+    const std::shared_ptr<ResolveHandle>& h, const Vector<DnsCacheEntry::Address>& addresses, int errorCode) {
+  if (errorCode != 0) {
+    Error e(errorCode == EAI_SYSTEM ? "system error" : gai_strerror(errorCode));
+    h->callback(&e, nullptr);
+    return;
+  }
+  Vector<addrinfo> infos(addresses.size());
+  for (size_t i : indices(addresses)) {
+    auto& addr = addresses[i];
+    auto& info = infos[i];
+    info.ai_flags = 0;
+    info.ai_family = addr.family;
+    info.ai_socktype = addr.socktype;
+    info.ai_protocol = addr.protocol;
+    info.ai_addrlen = addr.addrlen;
+    info.ai_addr = reinterpret_cast<sockaddr*>(const_cast<sockaddr_storage*>(&addr.addr));
+    info.ai_canonname = nullptr;
+    info.ai_next = (i + 1 < addresses.size()) ? &infos[i + 1] : nullptr;
+  }
+  h->callback(nullptr, infos.empty() ? nullptr : &infos[0]);
+}
+
+// DNS resolver with lazy thread pool, caching, and queue limits
+struct DnsResolver {
+  static constexpr size_t kMaxWorkers = 4;
+  static constexpr size_t kMaxQueueSize = 24;
+  static constexpr auto kIdleTimeout = std::chrono::seconds(5);
+  static constexpr auto kCacheTtl = std::chrono::seconds(10);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  Vector<std::string> queue;                                           // Keys waiting to be resolved
+  HashMap<std::string, Vector<std::weak_ptr<ResolveHandle>>> inFlight; // Key -> waiting handles
+  HashMap<std::string, DnsCacheEntry> cache;
+  std::atomic<size_t> numWorkers{0};
+  size_t idleWorkers = 0; // protected by mutex
+  bool shutdown = false;  // protected by mutex
+  std::atomic<size_t> nextWorkerId{0};
+
+  DnsResolver() = default;
+
+  ~DnsResolver() {
+    {
+      std::lock_guard lock(mutex);
+      shutdown = true;
+    }
+    cv.notify_all();
+    // Wait for all workers to exit
+    while (numWorkers.load() > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  // Returns true if found in cache and callback was invoked/scheduled
+  // For async=true, schedules callback via scheduler. For async=false, invokes directly.
+  bool tryCache(const std::string& key, const std::shared_ptr<ResolveHandle>& h, bool async) {
+    Vector<DnsCacheEntry::Address> addresses;
+    int errorCode;
+    int port = h->port;
+    {
+      std::lock_guard lock(mutex);
+      auto it = cache.find(key);
+      if (it == cache.end()) {
+        return false;
+      }
+      auto& entry = it->second;
+      if (std::chrono::steady_clock::now() >= entry.expiry) {
+        cache.erase(it);
+        return false;
+      }
+      // Copy the cached data so we can release the lock before invoking callback
+      addresses = entry.addresses;
+      errorCode = entry.errorCode;
+    }
+
+    // Set the port in all cached addresses
+    for (auto& addr : addresses) {
+      setPort(addr.addr, port);
+    }
+
+    if (async) {
+      // Schedule callback asynchronously to avoid deadlock (caller may hold mutexes)
+      std::weak_ptr<ResolveHandle> wh = h;
+      scheduler.run([wh, addresses = std::move(addresses), errorCode]() {
+        if (auto h = wh.lock()) {
+          invokeResolveCallback(h, addresses, errorCode);
+        }
+      });
+    } else {
+      invokeResolveCallback(h, addresses, errorCode);
+    }
+    return true;
+  }
+
+  void addToCache(const std::string& key, addrinfo* result, int errorCode) {
+    // Cache both successful resolutions and errors to avoid spamming DNS
+    std::lock_guard lock(mutex);
+    DnsCacheEntry entry;
+    entry.expiry = std::chrono::steady_clock::now() + kCacheTtl;
+    entry.errorCode = errorCode;
+    if (errorCode == 0 && result) {
+      for (auto* i = result; i; i = i->ai_next) {
+        if (i->ai_addrlen <= sizeof(sockaddr_storage)) {
+          DnsCacheEntry::Address addr;
+          addr.family = i->ai_family;
+          addr.socktype = i->ai_socktype;
+          addr.protocol = i->ai_protocol;
+          addr.addrlen = i->ai_addrlen;
+          std::memcpy(&addr.addr, i->ai_addr, i->ai_addrlen);
+          entry.addresses.push_back(std::move(addr));
+        }
+      }
+    }
+    cache[key] = std::move(entry);
+  }
+
+  // Enqueues a request. Coalesces with in-flight requests for the same key.
+  // If queue is full, randomly evicts an existing element.
+  void enqueue(const std::string& key, std::weak_ptr<ResolveHandle> wh) {
+    bool needWorker = false;
+    {
+      std::lock_guard lock(mutex);
+      if (shutdown) {
+        return;
+      }
+      // Check if this key is already being resolved
+      auto it = inFlight.find(key);
+      if (it != inFlight.end()) {
+        // Coalesce: add to existing waiters
+        it->second.push_back(std::move(wh));
+        return;
+      }
+      // New key - add to inFlight and queue
+      if (queue.size() >= kMaxQueueSize) {
+        // Random eviction: drop a random key and its waiters
+        size_t idx = random<size_t>(0, queue.size() - 1);
+        inFlight.erase(queue[idx]);
+        queue.erase(queue.begin() + idx);
+      }
+      inFlight[key].push_back(std::move(wh));
+      queue.push_back(key);
+      if (idleWorkers == 0 && numWorkers.load() < kMaxWorkers) {
+        needWorker = true;
+        ++numWorkers;
+      }
+    }
+    if (needWorker) {
+      size_t id = nextWorkerId++;
+      std::thread([this, id]() {
+        workerLoop(id);
+      }).detach();
+    }
+    cv.notify_one();
+  }
+
+  void workerLoop(size_t id) {
+    pthread_setname_np(pthread_self(), fmt::sprintf("moo/dns-%zu", id).c_str());
+
+    while (true) {
+      std::string key;
+      std::string address;
+      int port = 0;
+      {
+        std::unique_lock lock(mutex);
+        ++idleWorkers;
+        bool gotWork = cv.wait_for(lock, kIdleTimeout, [this] {
+          return shutdown || !queue.empty();
+        });
+        --idleWorkers;
+
+        if (shutdown) {
+          --numWorkers;
+          return;
+        }
+        if (!gotWork) {
+          // Timed out with no work - exit this thread
+          log.debug("[DNS] worker %zu exiting after idle timeout", id);
+          --numWorkers;
+          return;
+        }
+        key = std::move(queue.front());
+        queue.pop_front();
+
+        // Get address/port from one of the waiting handles
+        auto it = inFlight.find(key);
+        if (it == inFlight.end() || it->second.empty()) {
+          // All waiters cancelled - skip this key
+          continue;
+        }
+        // Find a valid handle to get address/port
+        bool foundHandle = false;
+        for (auto& wh : it->second) {
+          if (auto h = wh.lock()) {
+            address = h->address;
+            port = h->port;
+            foundHandle = true;
+            break;
+          }
+        }
+        if (!foundHandle) {
+          // All handles cancelled
+          inFlight.erase(it);
+          continue;
+        }
+      }
+
+      auto workerStartTime = std::chrono::steady_clock::now();
+      log.debug("[DNS] worker %zu started for %s:%d", id, address.c_str(), port);
+
+      addrinfo* result = nullptr;
+      int r = getaddrinfo(address.c_str(), std::to_string(port).c_str(), nullptr, &result);
+      int savedErrno = errno;
+
+      auto resolveMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - workerStartTime)
+              .count();
+      log.debug("[DNS] getaddrinfo(%s:%d) returned %d in %ldms", address.c_str(), port, r, resolveMs);
+      if (r != 0) {
+        log.info("[DNS] resolution failed for %s: %s", address.c_str(),
+            r == EAI_SYSTEM ? std::strerror(savedErrno) : gai_strerror(r));
+      }
+
+      // Add to cache
+      addToCache(key, result, r);
+
+      // Free result now - callbacks will use cached data
+      if (result) {
+        freeaddrinfo(result);
+      }
+
+      // Get all waiters and notify them
+      Vector<std::weak_ptr<ResolveHandle>> waiters;
+      Vector<DnsCacheEntry::Address> cachedAddresses;
+      {
+        std::lock_guard lock(mutex);
+        auto it = inFlight.find(key);
+        if (it != inFlight.end()) {
+          waiters = std::move(it->second);
+          inFlight.erase(it);
+        }
+        // Get cached addresses for successful resolutions
+        if (r == 0) {
+          auto cacheIt = cache.find(key);
+          if (cacheIt != cache.end()) {
+            cachedAddresses = cacheIt->second.addresses;
+          }
+        }
+      }
+
+      // Schedule callbacks for all waiters
+      for (auto& wh : waiters) {
+        // Each waiter may have a different port - copy addresses and set port
+        auto h = wh.lock();
+        if (!h) {
+          continue;
+        }
+        int port = h->port;
+        Vector<DnsCacheEntry::Address> addrCopy = cachedAddresses;
+        for (auto& addr : addrCopy) {
+          setPort(addr.addr, port);
+        }
+        scheduler.run([wh, r, addrCopy = std::move(addrCopy)]() {
+          auto h = wh.lock();
+          if (!h) {
+            return;
+          }
+          auto totalMs =
+              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - h->startTime)
+                  .count();
+          log.debug("[DNS] invoking callback for %s:%d (total %ldms)", h->address.c_str(), h->port, totalMs);
+          invokeResolveCallback(h, addrCopy, r);
+        });
+      }
+    }
+  }
+};
+
+DnsResolver& getDnsResolver() {
+  // Intentionally leaked to avoid static destruction order issues
+  static DnsResolver* resolver = new DnsResolver();
+  return *resolver;
+}
 
 template<typename F>
 std::shared_ptr<ResolveHandle> resolveIpAddress(std::string_view address, int port, bool asynchronous, F&& callback) {
   auto h = std::make_shared<ResolveHandle>();
   h->address = address;
-  h->service = std::to_string(port);
-  h->req.ar_name = h->address.c_str();
-  h->req.ar_service = h->service.c_str();
-  h->req.ar_request = nullptr;
-
+  h->port = port;
   h->callback = std::move(callback);
+  h->startTime = std::chrono::steady_clock::now();
 
-  Function<void()> f = [asynchronous, wh = std::weak_ptr<ResolveHandle>(h)]() {
-    auto h = wh.lock();
-    if (h) {
-      int e = gai_error(&h->req);
-      if (e == 0) {
-        h->callback(nullptr, h->req.ar_result);
-      } else {
-        if (!asynchronous && e == EAI_ADDRFAMILY) {
-          throw std::system_error(EAFNOSUPPORT, std::generic_category(), "getaddrinfo_a");
-        }
-        std::string str = e == EAI_SYSTEM ? std::strerror(errno) : gai_strerror(e);
-        Error e(std::move(str));
-        h->callback(&e, nullptr);
-      }
+  std::string key = h->address;
+  auto& resolver = getDnsResolver();
+
+  if (asynchronous) {
+    // Check cache first
+    if (resolver.tryCache(key, h, true)) {
+      log.debug("[DNS] cache hit for %s:%d", h->address.c_str(), port);
+      return h;
     }
-  };
-
-  memset(&h->sevp, 0, sizeof(h->sevp));
-  h->sevp.sigev_notify = asynchronous ? SIGEV_THREAD : SIGEV_NONE;
-  h->sevp.sigev_value.sival_ptr = f.release();
-  h->sevp.sigev_notify_function = [](sigval v) {
-    Function<void()>((FunctionPointer)v.sival_ptr)();
-  };
-  gaicb* ptr = &h->req;
-  int r;
-  do {
-    r = getaddrinfo_a(asynchronous ? GAI_NOWAIT : GAI_WAIT, &ptr, 1, &h->sevp);
-  } while (r == EAI_INTR);
-  if (r) {
-    Function<void()>{(FunctionPointer)h->sevp.sigev_value.sival_ptr};
-    std::string str = r == EAI_SYSTEM ? std::strerror(errno) : gai_strerror(r);
-    Error e(std::move(str));
-    if (asynchronous) {
-      scheduler.run([e = std::move(e), h]() mutable {
-        h->callback(&e, nullptr);
-      });
+    log.debug("[DNS] resolveIpAddress(%s:%d) async started", h->address.c_str(), port);
+    resolver.enqueue(key, h);
+  } else {
+    // Check cache first for sync too
+    if (resolver.tryCache(key, h, false)) {
+      log.debug("[DNS] cache hit for %s:%d (sync)", h->address.c_str(), port);
+      return h;
+    }
+    log.debug("[DNS] resolveIpAddress(%s:%d) sync started", h->address.c_str(), port);
+    int r = getaddrinfo(h->address.c_str(), std::to_string(port).c_str(), nullptr, &h->result);
+    int savedErrno = errno;
+    auto resolveMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - h->startTime).count();
+    log.debug("[DNS] getaddrinfo(%s:%d) returned %d in %ldms", h->address.c_str(), port, r, resolveMs);
+    if (r != 0) {
+      log.info("[DNS] resolution failed for %s: %s", h->address.c_str(),
+          r == EAI_SYSTEM ? std::strerror(savedErrno) : gai_strerror(r));
+    }
+    // Cache sync results too
+    resolver.addToCache(key, h->result, r);
+    if (r == 0) {
+      h->callback(nullptr, h->result);
     } else {
+      std::string str = r == EAI_SYSTEM ? std::strerror(savedErrno) : gai_strerror(r);
+      Error e(std::move(str));
       h->callback(&e, nullptr);
     }
-    return nullptr;
-  }
-  if (!asynchronous) {
-    Function<void()>{(FunctionPointer)h->sevp.sigev_value.sival_ptr}();
   }
   return h;
 }

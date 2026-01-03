@@ -1667,51 +1667,52 @@ struct StoreImpl : api::Store {
       if (connectAcked) {
         return;
       }
-      udps.at(random<size_t>(0, udps.size() - 1)).resolve(hostname, port, [this](void* addr, size_t addrlen) {
-        Vector<char> addrbuf;
-        addrbuf.resize(addrlen);
-        std::memcpy(addrbuf.data(), addr, addrlen);
+      udps.at(random<size_t>(0, udps.size() - 1))
+          .resolve(hostname, port, [this, self = share(this)](void* addr, size_t addrlen) {
+            Vector<char> addrbuf;
+            addrbuf.resize(addrlen);
+            std::memcpy(addrbuf.data(), addr, addrlen);
 
-        addCallback(std::chrono::steady_clock::now(), [this, addrbuf] {
-          std::lock_guard l(mutex);
-
-          for (size_t i : indices(udps)) {
-            auto now = std::chrono::steady_clock::now();
-            auto t = std::min(
-                std::max(prevConnectTime + std::chrono::milliseconds(250), now), now + std::chrono::seconds(2));
-            prevConnectTime = t;
-            addCallback(t, [this, i, addrbuf]() {
-              if (connectAcked) {
-                return;
-              }
-
+            addCallback(std::chrono::steady_clock::now(), [this, addrbuf] {
               std::lock_guard l(mutex);
 
-              Vector<std::pair<uint32_t, std::string>> tcpaddresses;
-              for (auto& v : unackedAddresses) {
-                tcpaddresses.push_back(v);
+              for (size_t i : indices(udps)) {
+                auto now = std::chrono::steady_clock::now();
+                auto t = std::min(
+                    std::max(prevConnectTime + std::chrono::milliseconds(250), now), now + std::chrono::seconds(2));
+                prevConnectTime = t;
+                addCallback(t, [this, i, addrbuf]() {
+                  if (connectAcked) {
+                    return;
+                  }
+
+                  std::lock_guard l(mutex);
+
+                  Vector<std::pair<uint32_t, std::string>> tcpaddresses;
+                  for (auto& v : unackedAddresses) {
+                    tcpaddresses.push_back(v);
+                  }
+                  if (tcpaddresses.size() > 8) {
+                    std::ranges::shuffle(tcpaddresses, getRng());
+                    tcpaddresses.resize(8);
+                  }
+
+                  auto buf = serializeToBuffer(signatureConnect, UdpConnectMessage{
+                                                                     .key = storekey,
+                                                                     .sourceRank = rank,
+                                                                     .uid = myId,
+                                                                     .networkKey = context.getNetworkKey(),
+                                                                     .addresses = tcpaddresses,
+                                                                 });
+
+                  // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
+
+                  ::sendto(udps[random<size_t>(0, udps.size() - 1)].nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
+                      (sockaddr*)addrbuf.data(), addrbuf.size());
+                });
               }
-              if (tcpaddresses.size() > 8) {
-                std::ranges::shuffle(tcpaddresses, getRng());
-                tcpaddresses.resize(8);
-              }
-
-              auto buf = serializeToBuffer(signatureConnect, UdpConnectMessage{
-                                                                 .key = storekey,
-                                                                 .sourceRank = rank,
-                                                                 .uid = myId,
-                                                                 .networkKey = context.getNetworkKey(),
-                                                                 .addresses = tcpaddresses,
-                                                             });
-
-              // log.info("Sending udp connect to %s\n", Socket::ipAndPort(addrbuf.data(), addrbuf.size()));
-
-              ::sendto(udps[random<size_t>(0, udps.size() - 1)].nativeFd(), buf->data(), buf->size(), MSG_NOSIGNAL,
-                  (sockaddr*)addrbuf.data(), addrbuf.size());
             });
-          }
-        });
-      });
+          });
     };
 
     t(port);

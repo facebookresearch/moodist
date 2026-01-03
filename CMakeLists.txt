@@ -200,7 +200,6 @@ else()
     CUDA::nvml
     CUDA::nvrtc
     Threads::Threads
-    anl
     kern-abi  # rdma-core kernel ABI
   )
   target_include_directories(moodist SYSTEM PRIVATE
