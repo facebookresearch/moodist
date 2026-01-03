@@ -122,6 +122,9 @@ struct WrapperApi {
   void (*c10dStoreSet)(void* store, std::string_view key, const std::vector<uint8_t>& value);
   std::vector<uint8_t> (*c10dStoreGet)(void* store, std::string_view key);
   void (*c10dStoreWait)(void* store, std::span<const std::string> keys);
+
+  // Signal checking - throws if interrupted (e.g., Ctrl+C)
+  void (*checkSignals)();
 };
 
 // =============================================================================

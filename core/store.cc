@@ -1,5 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "api/moodist_api.h"
 #include "api/store_api.h"
 #include "api/types.h"
 #include "buffer.h"
@@ -13,6 +14,8 @@
 #include <sys/socket.h>
 
 namespace moodist {
+
+extern WrapperApi wrapperApi;
 
 static constexpr uint64_t signatureConnect = 0x120a63c0941561a4;
 static constexpr uint64_t signatureConnectAck = 0x120a63c0941561a5;
@@ -1766,6 +1769,8 @@ struct StoreImpl : api::Store {
         if (futex) {
           break;
         }
+        // Check for Ctrl+C / signals after each wait iteration
+        wrapperApi.checkSignals();
         now = std::chrono::steady_clock::now();
         if (now >= end) {
           std::lock_guard l(mutex);

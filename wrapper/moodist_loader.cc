@@ -8,11 +8,15 @@
 #include "processgroup_wrapper.h"
 #include "torch_includes.h"
 
+#include <pybind11/pybind11.h>
+
 #include <atomic>
 #include <dlfcn.h>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+
+namespace py = pybind11;
 
 namespace moodist {
 
@@ -250,6 +254,13 @@ void c10dStoreWait(void* store, std::span<const std::string> keys) {
   c10dStore->wait(keyVec);
 }
 
+void checkSignals() {
+  py::gil_scoped_acquire gil;
+  if (PyErr_CheckSignals() == -1) {
+    throw py::error_already_set();
+  }
+}
+
 } // namespace wrappers
 
 namespace {
@@ -339,6 +350,7 @@ void initMoodistApi() {
       .c10dStoreSet = wrappers::c10dStoreSet,
       .c10dStoreGet = wrappers::c10dStoreGet,
       .c10dStoreWait = wrappers::c10dStoreWait,
+      .checkSignals = wrappers::checkSignals,
   };
 
   std::string libPath = getLibraryPath();
