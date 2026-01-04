@@ -1,20 +1,29 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Wrapper for serialize/deserialize that uses torch::Tensor.
+// Serialize/deserialize wrapper and Buffer API implementations.
 // Uses function pointers from coreApi to call into libmoodist.so.
+
+#include "serialize_wrapper.h"
 
 #include "api/types.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 
-#include <pybind11/pybind11.h>
 #include <stdexcept>
+
+// THPVariable_Wrap from libtorch_python.so
+extern "C" PyObject* THPVariable_Wrap(const at::Tensor& tensor);
+
+// THPVariable helpers defined in module.cc
+bool THPVariable_Check(PyObject* obj);
+const at::Tensor& THPVariable_Unpack(PyObject* obj);
 
 namespace moodist {
 
-namespace py = pybind11;
+// =============================================================================
+// Buffer API proxy implementations
+// =============================================================================
 
-// ApiProxy method implementations for Buffer
 namespace api {
 
 void* ApiProxy<Buffer>::data() const {
@@ -40,33 +49,72 @@ void destroy(Buffer* buffer) {
 
 } // namespace api
 
+// =============================================================================
+// Serialize/Deserialize Python functions
+// =============================================================================
+
 namespace wrapper {
 
-torch::Tensor serializeObject(py::object o) {
-  if (!coreApi.serializeObjectImpl) {
-    throw std::runtime_error("Serialization not available (libserialize not loaded)");
+PyObject* serialize(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* obj;
+  if (!PyArg_ParseTuple(args, "O", &obj)) {
+    return nullptr;
   }
-  auto handle = coreApi.serializeObjectImpl(o.ptr());
-  void* ptr = handle->data();
-  size_t size = handle->size();
 
-  // Capture handle by value - copy increments refcount
-  // Handle destructor will decref when the tensor's deleter is called
-  return torch::from_blob(
-      ptr, {static_cast<int64_t>(size)},
-      [handle](void*) mutable {
-        handle.reset();
-      },
-      torch::TensorOptions().dtype(torch::kUInt8));
+  if (!coreApi.serializeObjectImpl) {
+    PyErr_SetString(PyExc_RuntimeError, "Serialization not available (moodist serialize component not loaded)");
+    return nullptr;
+  }
+
+  try {
+    auto handle = coreApi.serializeObjectImpl(obj);
+    void* ptr = coreApi.serializeBufferPtr(handle.get());
+    size_t size = coreApi.serializeBufferSize(handle.get());
+
+    // Create tensor from buffer data
+    // Use at::from_blob with a custom deleter that releases the handle
+    auto* handlePtr = new api::BufferHandle(std::move(handle));
+    auto tensor = at::from_blob(
+        ptr, {static_cast<int64_t>(size)},
+        [handlePtr](void*) {
+          delete handlePtr;
+        },
+        at::TensorOptions().dtype(at::kByte));
+
+    return THPVariable_Wrap(tensor);
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
 }
 
-py::object deserializeObject(torch::Tensor t) {
-  if (!coreApi.deserializeObjectImpl) {
-    throw std::runtime_error("Deserialization not available (libserialize not loaded)");
+PyObject* deserialize(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* tensor_obj;
+  if (!PyArg_ParseTuple(args, "O", &tensor_obj)) {
+    return nullptr;
   }
-  void* result = coreApi.deserializeObjectImpl(t.data_ptr(), t.itemsize() * t.numel());
-  // reinterpret_steal takes ownership of the new reference
-  return py::reinterpret_steal<py::object>(reinterpret_cast<PyObject*>(result));
+
+  if (!THPVariable_Check(tensor_obj)) {
+    PyErr_SetString(PyExc_TypeError, "Expected a torch.Tensor");
+    return nullptr;
+  }
+
+  if (!coreApi.deserializeObjectImpl) {
+    PyErr_SetString(PyExc_RuntimeError, "Deserialization not available (moodist serialize component not loaded)");
+    return nullptr;
+  }
+
+  try {
+    const at::Tensor& tensor = THPVariable_Unpack(tensor_obj);
+    void* result = coreApi.deserializeObjectImpl(tensor.data_ptr(), tensor.itemsize() * tensor.numel());
+    // deserializeObjectImpl returns a new reference
+    return reinterpret_cast<PyObject*>(result);
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
 }
 
 } // namespace wrapper

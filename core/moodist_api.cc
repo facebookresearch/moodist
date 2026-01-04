@@ -6,10 +6,21 @@
 #include "api/allocator_api.h"
 #include "api/cpu_allocator.h"
 #include "api/processgroup_api.h"
-// #include "api/serialize_api.h"  // Temporarily disabled
 #include "api/store_api.h"
 
 namespace moodist {
+
+// Forward declarations for buffer API functions defined in buffer_api.cc
+api::Buffer* bufferAllocate(size_t nbytes);
+void* serializeBufferPtr(api::Buffer* buf);
+size_t serializeBufferSize(api::Buffer* buf);
+void bufferSetSize(api::Buffer* buf, size_t size);
+void bufferDestroy(api::Buffer* buf);
+
+// Forward declarations for internal allocator functions defined in internal_allocator.cc
+void* internalAlloc(size_t bytes);
+void internalFree(void* ptr);
+size_t internalAllocSize(void* ptr);
 
 // Forward declarations for C-style API wrappers defined in allocator.cc
 void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
@@ -65,12 +76,20 @@ static CoreApi coreApi = {
     .storeCheck = storeCheck,
     .storeWait = storeWait,
 
-    // Serialize functions - temporarily disabled, will be moved to separate library
-    .serializeObjectImpl = nullptr,
-    .serializeBufferPtr = nullptr,
-    .serializeBufferSize = nullptr,
-    .bufferDestroy = nullptr,
-    .deserializeObjectImpl = nullptr,
+    // Internal allocator functions
+    .internalAlloc = internalAlloc,
+    .internalFree = internalFree,
+    .internalAllocSize = internalAllocSize,
+
+    // Buffer functions - implemented in core (buffer_api.cc)
+    // Serialize implementation functions are nullptr - will be set by loading serialize library
+    .bufferAllocate = bufferAllocate,
+    .serializeBufferPtr = serializeBufferPtr,
+    .serializeBufferSize = serializeBufferSize,
+    .bufferSetSize = bufferSetSize,
+    .bufferDestroy = bufferDestroy,
+    .serializeObjectImpl = nullptr,   // Set when serialize library is loaded
+    .deserializeObjectImpl = nullptr, // Set when serialize library is loaded
 
     // CPU allocator functions
     .cpuAllocatorAlloc = cpuAllocatorAlloc,

@@ -13,10 +13,18 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cuda.h>
 #include <span>
 #include <string_view>
 #include <vector>
+
+// CUDA types - use forward declarations if cuda.h not available
+#ifdef __CUDA_API_VERSION
+// cuda.h already included
+#else
+// Forward declare CUDA types for headers that don't need full CUDA
+struct CUstream_st;
+typedef CUstream_st* CUstream;
+#endif
 
 namespace moodist {
 
@@ -147,14 +155,23 @@ struct CoreApi {
   void (*storeWait)(
       api::Store* store, std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
 
+  // Internal allocator functions - for serialize library to allocate buffers
+  void* (*internalAlloc)(size_t bytes);
+  void (*internalFree)(void* ptr);
+  size_t (*internalAllocSize)(void* ptr);
+
   // Serialize functions
   // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
   // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
   // Note: PyObject* is void* here to avoid Python dependency in core
-  api::BufferHandle (*serializeObjectImpl)(void* pyObject);
+  api::Buffer* (*bufferAllocate)(size_t nbytes); // Create buffer with core's allocator
   void* (*serializeBufferPtr)(api::Buffer* buf);
   size_t (*serializeBufferSize)(api::Buffer* buf);
+  void (*bufferSetSize)(api::Buffer* buf, size_t size); // Set actual used size
   void (*bufferDestroy)(api::Buffer* buf);
+
+  // Serialize implementation functions - populated by loading serialize library
+  api::BufferHandle (*serializeObjectImpl)(void* pyObject);
   void* (*deserializeObjectImpl)(const void* ptr, size_t len);
 
   // CPU allocator functions

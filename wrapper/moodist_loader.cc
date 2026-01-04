@@ -385,7 +385,38 @@ void initMoodistApi() {
     throw std::runtime_error("moodist build magic mismatch: _C.so and libmoodist.so are from different builds");
   }
 
-  // Copy the CoreApi to our global
+  // Load serialize library (compiled per Python version) BEFORE copying CoreApi
+  // The serialize library will fill in serializeObjectImpl and deserializeObjectImpl
+  // Detect Python version at runtime and load the matching library
+  // e.g., lib_serialize.cpython-311.so for Python 3.11
+  // Use Py_GetVersion() for runtime detection (stable API compatible)
+  const char* pyVersion = Py_GetVersion(); // Returns e.g., "3.11.0 (main, ...)"
+  int pyMajor = 0, pyMinor = 0;
+  if (pyVersion && std::sscanf(pyVersion, "%d.%d", &pyMajor, &pyMinor) == 2) {
+    std::string serializeLibName = "lib_serialize.cpython-" + std::to_string(pyMajor) + std::to_string(pyMinor) + ".so";
+
+    std::string serializeLibPath = libPath;
+    size_t lastSlash = serializeLibPath.rfind('/');
+    if (lastSlash != std::string::npos) {
+      serializeLibPath = serializeLibPath.substr(0, lastSlash + 1) + serializeLibName;
+    } else {
+      serializeLibPath = serializeLibName;
+    }
+
+    void* serializeHandle = dlopen(serializeLibPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (serializeHandle != nullptr) {
+      // Get the init function and call it to populate serialize functions in CoreApi
+      auto initFunc = reinterpret_cast<void (*)(CoreApi*)>(dlsym(serializeHandle, "moodistSerializeInit"));
+
+      if (initFunc) {
+        initFunc(api); // This fills in serializeObjectImpl and deserializeObjectImpl
+      }
+      // Note: we don't close serializeHandle - keep it loaded
+    }
+  }
+  // If serialize library not found, serialize functions remain nullptr (optional feature)
+
+  // Copy the CoreApi to our global (now fully populated with serialize functions)
   coreApi = *api;
 }
 

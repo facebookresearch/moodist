@@ -4,6 +4,7 @@
 #
 # Builds a single wheel that works across Python versions (stable API).
 # The wheel contains multiple _C.so files, one per supported PyTorch version.
+# Also builds serialize libraries for multiple Python versions.
 
 set -e -u -x
 
@@ -14,6 +15,9 @@ dnf install -y cuda-toolkit-12
 # Use lowest supported Python version for building (stable API)
 # abi3 wheels built with 3.10 work with 3.10+
 build_python="cp310-cp310"
+
+# Python versions for serialize library (needs to match Python minor versions)
+serialize_python_versions="cp310-cp310 cp311-cp311 cp312-cp312 cp314-cp314"
 
 torch_versions="2.7 2.8 2.9"
 
@@ -97,6 +101,37 @@ build_wheel() {
     deactivate
 }
 
+# Build serialize library for a specific Python version
+# Only builds _serialize target (no core or wrapper)
+build_serialize() {
+    local pyver=$1
+    local build_dir=$2
+    local output_dir=$3
+
+    echo "Building serialize library for Python $pyver"
+
+    # Get Python executable
+    local python_exe="/opt/python/$pyver/bin/python"
+
+    # Run cmake to configure for this Python version
+    # Disable core and wrapper - only build serialize library
+    cmake "$PWD" \
+        -B "$build_dir/serialize_$pyver" \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$output_dir" \
+        -DMOODIST_BUILD_CORE=OFF \
+        -DMOODIST_BUILD_WRAPPER=OFF \
+        -DMOODIST_BUILD_SERIALIZE=ON \
+        -DMOODIST_BUILD_MAGIC="$MOODIST_BUILD_MAGIC" \
+        -DMINIMAL_DEBUG=ON \
+        -DPython_EXECUTABLE="$python_exe"
+
+    cmake --build "$build_dir/serialize_$pyver" --target _serialize --parallel
+
+    # The output will be named lib_serialize.cpython-3XX.so
+    echo "Built serialize lib: $(ls -lh "$output_dir"/lib_serialize.cpython-*.so 2>/dev/null | tail -1)"
+}
+
 # Location to save core library (outside of build/ which gets cleaned)
 core_lib_saved="/tmp/libmoodist.so"
 core_lib=""
@@ -116,6 +151,24 @@ for torchver in $pre_torch_versions; do
     build_wheel "$build_python" "$torchver" "pre" "$core_lib_saved" "$staging"
 done
 
+# Build serialize libraries for each Python version
+# These need the pre-built core library, so we do this after the first torch build
+serialize_output="/tmp/serialize_libs"
+rm -rf "$serialize_output"
+mkdir -p "$serialize_output"
+
+serialize_build_dir="/tmp/serialize_build"
+rm -rf "$serialize_build_dir"
+mkdir -p "$serialize_build_dir"
+
+for pyver in $serialize_python_versions; do
+    build_serialize "$pyver" "$serialize_build_dir" "$serialize_output"
+done
+
+# Collect serialize library paths for setup.py
+serialize_lib_list=$(ls "$serialize_output"/lib_serialize.cpython-*.so | tr '\n' ',' | sed 's/,$//')
+echo "Serialize libraries: $serialize_lib_list"
+
 # Clean up saved core library
 rm -f "$core_lib_saved"
 
@@ -125,14 +178,17 @@ venv_dir="$venv_base/${build_python}_torch${first_torchver}"
 source "$venv_dir/bin/activate"
 
 echo "Building combined wheel from: $whl_list"
-MOODIST_WHL_LIST=$whl_list python setup.py clean --all
+echo "With serialize libraries: $serialize_lib_list"
+MOODIST_WHL_LIST=$whl_list MOODIST_SERIALIZE_LIBS=$serialize_lib_list python setup.py clean --all
 # Use --py-limited-api to produce an abi3 wheel (works with Python 3.10+)
-MOODIST_WHL_LIST=$whl_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310
+MOODIST_WHL_LIST=$whl_list MOODIST_SERIALIZE_LIBS=$serialize_lib_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310
 
 deactivate
 
 # Keep staging directory for inspection (contains intermediate wheels)
 # rm -rf "$staging"
+
+set +x
 
 echo ""
 echo "=== Built wheel ==="

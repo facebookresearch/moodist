@@ -13,8 +13,9 @@
 #include <Python.h>
 
 // PyTorch headers (C++ - not affected by Py_LIMITED_API)
-#include <c10/util/intrusive_ptr.h>
+#include <ATen/ATen.h> // For at::Tensor, torch::from_blob, etc.
 #include <c10/util/MaybeOwned.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 
 // THPVariable_Wrap from libtorch_python.so
@@ -24,8 +25,7 @@ PyObject* THPVariable_Wrap(const at::TensorBase& tensor);
 // PyTorch tensor object layout (from torch/csrc/autograd/python_variable.h)
 // We define this ourselves to avoid pulling in pybind11 headers
 struct THPVariable {
-  PyObject_HEAD
-  c10::MaybeOwned<at::Tensor> cdata;
+  PyObject_HEAD c10::MaybeOwned<at::Tensor> cdata;
   PyObject* backward_hooks;
   PyObject* post_accumulate_grad_hooks;
 };
@@ -44,28 +44,23 @@ static PyTypeObject* get_tensor_type() {
 }
 
 // Check if object is a torch.Tensor
-static inline bool THPVariable_Check(PyObject* obj) {
+bool THPVariable_Check(PyObject* obj) {
   PyTypeObject* tensor_type = get_tensor_type();
   return tensor_type && PyObject_IsInstance(obj, (PyObject*)tensor_type);
 }
 
-// Get type name (stable API compatible) - returns new reference, caller must decref
-static PyObject* get_type_name(PyObject* obj) {
-  PyObject* type = (PyObject*)Py_TYPE(obj);
-  return PyObject_GetAttrString(type, "__name__");
-}
-
-static inline const at::Tensor& THPVariable_Unpack(PyObject* obj) {
+const at::Tensor& THPVariable_Unpack(PyObject* obj) {
   return *reinterpret_cast<THPVariable*>(obj)->cdata;
 }
 
 // Moodist headers
-#include "moodist_loader.h"
-#include "store.h"
-#include "processgroup_wrapper.h"
+#include "api/allocator.h"
+#include "api/cpu_allocator.h"
 #include "backend.h"
-// Note: allocator headers not included - allocator_wrapper.cc/cpu_allocator_wrapper.cc
-// are commented out in CMakeLists.txt and need to be added back for allocator support
+#include "moodist_loader.h"
+#include "processgroup_wrapper.h"
+#include "serialize_wrapper.h"
+#include "store.h"
 
 #include <memory>
 #include <string>
@@ -77,16 +72,21 @@ static inline const at::Tensor& THPVariable_Unpack(PyObject* obj) {
 
 class PyRef {
   PyObject* obj_;
+
 public:
   explicit PyRef(PyObject* obj = nullptr) noexcept : obj_(obj) {}
-  ~PyRef() { Py_XDECREF(obj_); }
+  ~PyRef() {
+    Py_XDECREF(obj_);
+  }
 
   // No copying
   PyRef(const PyRef&) = delete;
   PyRef& operator=(const PyRef&) = delete;
 
   // Move support
-  PyRef(PyRef&& other) noexcept : obj_(other.obj_) { other.obj_ = nullptr; }
+  PyRef(PyRef&& other) noexcept : obj_(other.obj_) {
+    other.obj_ = nullptr;
+  }
   PyRef& operator=(PyRef&& other) noexcept {
     if (this != &other) {
       Py_XDECREF(obj_);
@@ -96,11 +96,27 @@ public:
     return *this;
   }
 
-  PyObject* get() const noexcept { return obj_; }
-  PyObject* release() noexcept { PyObject* tmp = obj_; obj_ = nullptr; return tmp; }
-  explicit operator bool() const noexcept { return obj_ != nullptr; }
-  PyObject* operator->() const noexcept { return obj_; }
+  PyObject* get() const noexcept {
+    return obj_;
+  }
+  PyObject* release() noexcept {
+    PyObject* tmp = obj_;
+    obj_ = nullptr;
+    return tmp;
+  }
+  explicit operator bool() const noexcept {
+    return obj_ != nullptr;
+  }
+  PyObject* operator->() const noexcept {
+    return obj_;
+  }
 };
+
+// Get type name (stable API compatible)
+static PyRef get_type_name(PyObject* obj) {
+  PyObject* type = (PyObject*)Py_TYPE(obj);
+  return PyRef(PyObject_GetAttrString(type, "__name__"));
+}
 
 // =============================================================================
 // pybind11-compatible instance layout
@@ -108,8 +124,7 @@ public:
 // =============================================================================
 
 struct pybind11_instance {
-  PyObject_HEAD
-  void* simple_value_holder[3];  // [0]=ptr, [1..2]=holder (e.g. intrusive_ptr)
+  PyObject_HEAD void* simple_value_holder[3]; // [0]=ptr, [1..2]=holder (e.g. intrusive_ptr)
   PyObject* weakrefs;
   bool owned : 1;
   bool simple_layout : 1;
@@ -127,7 +142,9 @@ static PyTypeObject* get_torch_store_type() {
   static PyTypeObject* store_type = nullptr;
   if (!store_type) {
     PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
-    if (!torch_dist) return nullptr;
+    if (!torch_dist) {
+      return nullptr;
+    }
     store_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "Store");
     Py_DECREF(torch_dist);
   }
@@ -138,7 +155,9 @@ static PyTypeObject* get_torch_processgroup_type() {
   static PyTypeObject* pg_type = nullptr;
   if (!pg_type) {
     PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
-    if (!torch_dist) return nullptr;
+    if (!torch_dist) {
+      return nullptr;
+    }
     pg_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "ProcessGroup");
     Py_DECREF(torch_dist);
   }
@@ -149,7 +168,9 @@ static PyTypeObject* get_torch_backend_type() {
   static PyTypeObject* backend_type = nullptr;
   if (!backend_type) {
     PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
-    if (!torch_dist) return nullptr;
+    if (!torch_dist) {
+      return nullptr;
+    }
     backend_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "Backend");
     Py_DECREF(torch_dist);
   }
@@ -169,24 +190,19 @@ struct TypeBuilder {
   PyMethodDef* methods;
 
   PyObject* build() {
-    PyType_Slot slots[] = {
-        {Py_tp_init, (void*)tp_init},
-        {Py_tp_dealloc, (void*)tp_dealloc},
-        {Py_tp_methods, methods},
-        {Py_tp_doc, (void*)doc},
-        {0, nullptr}
-    };
+    PyType_Slot slots[] = {{Py_tp_init, (void*)tp_init}, {Py_tp_dealloc, (void*)tp_dealloc}, {Py_tp_methods, methods},
+        {Py_tp_doc, (void*)doc}, {0, nullptr}};
 
-    PyType_Spec spec = {
-        .name = name,
-        .basicsize = 0,  // Inherit from base
+    PyType_Spec spec = {.name = name,
+        .basicsize = 0, // Inherit from base
         .itemsize = 0,
         .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-        .slots = slots
-    };
+        .slots = slots};
 
     PyObject* bases = PyTuple_Pack(1, base);
-    if (!bases) return nullptr;
+    if (!bases) {
+      return nullptr;
+    }
 
     PyObject* type = PyType_FromSpecWithBases(&spec, bases);
     Py_DECREF(bases);
@@ -238,14 +254,14 @@ static int init_holder(PyObject* self, c10::intrusive_ptr<T> holder) {
 }
 
 // Helper macro to wrap init in try-catch
-#define INIT_TRY(expr) \
-  try { \
-    return expr; \
-  } catch (const moodist::PythonErrorAlreadySet&) { \
-    return -1; /* Python error already set */ \
-  } catch (const std::exception& e) { \
-    PyErr_SetString(PyExc_RuntimeError, e.what()); \
-    return -1; \
+#define INIT_TRY(expr)                                                                                                 \
+  try {                                                                                                                \
+    return expr;                                                                                                       \
+  } catch (const moodist::PythonErrorAlreadySet&) {                                                                    \
+    return -1; /* Python error already set */                                                                          \
+  } catch (const std::exception& e) {                                                                                  \
+    PyErr_SetString(PyExc_RuntimeError, e.what());                                                                     \
+    return -1;                                                                                                         \
   }
 
 // =============================================================================
@@ -254,9 +270,12 @@ static int init_holder(PyObject* self, c10::intrusive_ptr<T> holder) {
 
 class GilRelease {
   PyThreadState* state_;
+
 public:
   GilRelease() : state_(PyEval_SaveThread()) {}
-  ~GilRelease() { PyEval_RestoreThread(state_); }
+  ~GilRelease() {
+    PyEval_RestoreThread(state_);
+  }
   GilRelease(const GilRelease&) = delete;
   GilRelease& operator=(const GilRelease&) = delete;
 };
@@ -311,8 +330,7 @@ static PyObject* method_impl_nogil(PyObject* self, Func&& func) {
 // Note: weak references not supported due to limited API restrictions
 template<typename T>
 struct PyWrapper {
-  PyObject_HEAD
-  T holder;
+  PyObject_HEAD T holder;
 };
 
 // Get pointer to the wrapped object (works with raw, unique_ptr, shared_ptr)
@@ -322,9 +340,9 @@ static auto* wrapper_get(PyObject* self) {
   if constexpr (std::is_pointer_v<T>) {
     return obj->holder;
   } else if constexpr (requires { obj->holder.get(); }) {
-    return obj->holder.get();  // shared_ptr, unique_ptr
+    return obj->holder.get(); // shared_ptr, unique_ptr
   } else {
-    return &obj->holder;  // direct object
+    return &obj->holder; // direct object
   }
 }
 
@@ -335,14 +353,16 @@ static void wrapper_dealloc(PyObject* self) {
   obj->holder.~T();
   PyTypeObject* tp = Py_TYPE(self);
   freefunc free_func = (freefunc)PyType_GetSlot(tp, Py_tp_free);
-  if (free_func) free_func(self);
+  if (free_func) {
+    free_func(self);
+  }
   Py_DECREF(tp);
 }
 
 // Create a standalone type (no weakref support due to limited API)
 template<typename T>
-static PyObject* create_wrapper_type(const char* name, const char* doc,
-                                      PyMethodDef* methods, ternaryfunc tp_call = nullptr) {
+static PyObject* create_wrapper_type(
+    const char* name, const char* doc, PyMethodDef* methods, ternaryfunc tp_call = nullptr) {
   std::vector<PyType_Slot> slots = {
       {Py_tp_dealloc, (void*)wrapper_dealloc<T>},
       {Py_tp_methods, methods},
@@ -353,13 +373,11 @@ static PyObject* create_wrapper_type(const char* name, const char* doc,
   }
   slots.push_back({0, nullptr});
 
-  PyType_Spec spec = {
-      .name = name,
+  PyType_Spec spec = {.name = name,
       .basicsize = (int)sizeof(PyWrapper<T>),
       .itemsize = 0,
       .flags = Py_TPFLAGS_DEFAULT,
-      .slots = slots.data()
-  };
+      .slots = slots.data()};
 
   return PyType_FromSpec(&spec);
 }
@@ -373,7 +391,9 @@ static PyWrapper<T>* alloc_wrapper(PyTypeObject* type) {
     return nullptr;
   }
   PyObject* obj = alloc(type, 0);
-  if (!obj) return nullptr;
+  if (!obj) {
+    return nullptr;
+  }
   return reinterpret_cast<PyWrapper<T>*>(obj);
 }
 
@@ -393,7 +413,7 @@ static bool parse_tensor_list(PyObject* list, std::vector<torch::Tensor>& out) {
   for (Py_ssize_t i = 0; i < len; ++i) {
     PyObject* item = PyList_GetItem(list, i);
     if (!THPVariable_Check(item)) {
-      PyRef type_name(get_type_name(item));
+      auto type_name = get_type_name(item);
       if (type_name) {
         PyErr_Format(PyExc_TypeError, "Expected tensor at index %zd, got %S", i, type_name.get());
       } else {
@@ -432,7 +452,7 @@ static bool parse_int_list(PyObject* list, std::vector<int>& out) {
 // Helper to convert Python object to seconds (handles float, int, timedelta)
 static bool parse_timeout(PyObject* obj, double* out_seconds) {
   if (obj == nullptr || obj == Py_None) {
-    *out_seconds = 300.0;  // Default 5 minutes
+    *out_seconds = 300.0; // Default 5 minutes
     return true;
   }
 
@@ -469,8 +489,8 @@ static int tcpstore_init(PyObject* self, PyObject* args, PyObject* kwds) {
   int rank = 0;
   PyObject* timeout_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "sisii|O", const_cast<char**>(kwlist),
-          &hostname, &port, &key, &world_size, &rank, &timeout_obj)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "sisii|O", const_cast<char**>(kwlist), &hostname, &port, &key,
+          &world_size, &rank, &timeout_obj)) {
     return -1;
   }
 
@@ -479,30 +499,28 @@ static int tcpstore_init(PyObject* self, PyObject* args, PyObject* kwds) {
     return -1;
   }
 
-  auto timeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-      std::chrono::duration<double>(timeout_seconds));
+  auto timeout =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_seconds));
 
-  INIT_TRY(init_holder(self, c10::make_intrusive<moodist::wrapper::TcpStore>(
-      hostname, port, key, world_size, rank, timeout)));
+  INIT_TRY(init_holder(
+      self, c10::make_intrusive<moodist::wrapper::TcpStore>(hostname, port, key, world_size, rank, timeout)));
 }
 
-static PyMethodDef tcpstore_methods[] = {
-    {nullptr, nullptr, 0, nullptr}
-};
+static PyMethodDef tcpstore_methods[] = {{nullptr, nullptr, 0, nullptr}};
 
 // Create TcpStore type
 static PyObject* create_tcpstore_type() {
   PyTypeObject* base = get_torch_store_type();
-  if (!base) return nullptr;
+  if (!base) {
+    return nullptr;
+  }
 
-  TypeBuilder builder = {
-      .name = "moodist._C.TcpStore",
+  TypeBuilder builder = {.name = "moodist._C.TcpStore",
       .doc = "A moodist TCP store",
       .base = base,
       .tp_init = tcpstore_init,
       .tp_dealloc = intrusive_ptr_dealloc<moodist::wrapper::TcpStore>,
-      .methods = tcpstore_methods
-  };
+      .methods = tcpstore_methods};
 
   return builder.build();
 }
@@ -540,8 +558,7 @@ static int processgroup_init(PyObject* self, PyObject* args, PyObject* kwds) {
   int rank = 0;
   int size = 0;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist),
-          &store_obj, &rank, &size)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist), &store_obj, &rank, &size)) {
     return -1;
   }
 
@@ -619,8 +636,7 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
   int streaming = 0;
   const char* name = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|pz", const_cast<char**>(kwlist),
-          &location_obj, &streaming, &name)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|pz", const_cast<char**>(kwlist), &location_obj, &streaming, &name)) {
     return nullptr;
   }
 
@@ -632,7 +648,9 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
     if (PyLong_Check(location_obj)) {
       // Single int location
       int location = PyLong_AsLong(location_obj);
-      if (PyErr_Occurred()) return nullptr;
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
       {
         GilRelease gil;
         queue = pg->makeQueue(location, streaming != 0, opt_name);
@@ -640,15 +658,21 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
     } else {
       // Try to convert to a sequence (list, tuple, range, etc.)
       PyRef seq(PySequence_Fast(location_obj, "location must be an int or sequence of ints"));
-      if (!seq) return nullptr;
+      if (!seq) {
+        return nullptr;
+      }
 
       std::vector<int> locations;
       Py_ssize_t len = PySequence_Size(seq.get());
-      if (len < 0) return nullptr;
+      if (len < 0) {
+        return nullptr;
+      }
       locations.reserve(len);
       for (Py_ssize_t i = 0; i < len; ++i) {
         PyRef item(PySequence_GetItem(seq.get(), i));
-        if (!item) return nullptr;
+        if (!item) {
+          return nullptr;
+        }
         if (!PyLong_Check(item.get())) {
           PyErr_SetString(PyExc_TypeError, "location must be an int or sequence of ints");
           return nullptr;
@@ -677,8 +701,8 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
   PyObject* inputs_obj = nullptr;
   PyObject* outputs_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OOOO", const_cast<char**>(kwlist),
-          &shape_obj, &dtype_obj, &inputs_obj, &outputs_obj)) {
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwds, "OOOO", const_cast<char**>(kwlist), &shape_obj, &dtype_obj, &inputs_obj, &outputs_obj)) {
     return nullptr;
   }
 
@@ -700,7 +724,9 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     // The dtype is a torch.dtype enum value
     // We need to extract the underlying ScalarType
     PyObject* torch_mod = PyImport_ImportModule("torch");
-    if (!torch_mod) return nullptr;
+    if (!torch_mod) {
+      return nullptr;
+    }
 
     // Get the dtype's value - torch.dtype objects have a private _dtype attribute
     // Actually, we can compare with known dtypes or use at::python::detail::py_scalar_type
@@ -759,7 +785,9 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 
         auto parse_int_list = [](PyObject* obj) -> std::vector<int> {
           std::vector<int> vec;
-          if (!PyList_Check(obj)) return vec;
+          if (!PyList_Check(obj)) {
+            return vec;
+          }
           Py_ssize_t len = PyList_Size(obj);
           vec.reserve(len);
           for (Py_ssize_t i = 0; i < len; ++i) {
@@ -776,9 +804,13 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     };
 
     auto inputs = parse_transfer_list(inputs_obj);
-    if (PyErr_Occurred()) return nullptr;
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
     auto outputs = parse_transfer_list(outputs_obj);
-    if (PyErr_Occurred()) return nullptr;
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
 
     moodist::wrapper::CustomOp op;
     {
@@ -797,18 +829,24 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 static PyObject* processgroup_options(PyObject* self, PyObject* args, PyObject* kwds) {
   // Import the Python options module
   PyObject* options_mod = PyImport_ImportModule("moodist.options");
-  if (!options_mod) return nullptr;
+  if (!options_mod) {
+    return nullptr;
+  }
 
   PyObject* MoodistOptions = PyObject_GetAttrString(options_mod, "MoodistOptions");
   Py_DECREF(options_mod);
-  if (!MoodistOptions) return nullptr;
+  if (!MoodistOptions) {
+    return nullptr;
+  }
 
   // Create options object: MoodistOptions(self)
   // Note: We don't cache because our type doesn't support dynamic attrs.
   // This is fine - MoodistOptions is just a lightweight wrapper.
   PyObject* opts = PyObject_CallFunctionObjArgs(MoodistOptions, self, nullptr);
   Py_DECREF(MoodistOptions);
-  if (!opts) return nullptr;
+  if (!opts) {
+    return nullptr;
+  }
 
   // If kwargs provided, call opts(**kwargs) to get context manager
   if (kwds && PyDict_Size(kwds) > 0) {
@@ -831,24 +869,25 @@ static PyMethodDef processgroup_methods[] = {
     {"_set_option", processgroup_set_option, METH_VARARGS, "Set option by name"},
     {"cuda_barrier", processgroup_cuda_barrier, METH_NOARGS, "CUDA barrier synchronization"},
     {"Queue", (PyCFunction)processgroup_make_queue, METH_VARARGS | METH_KEYWORDS, "Create a message queue"},
-    {"compile_op_full", (PyCFunction)processgroup_compile_op_full, METH_VARARGS | METH_KEYWORDS, "Compile a custom collective operation"},
-    {"options", (PyCFunction)processgroup_options, METH_VARARGS | METH_KEYWORDS, "Get options object or create context manager for temporary option overrides"},
-    {nullptr, nullptr, 0, nullptr}
-};
+    {"compile_op_full", (PyCFunction)processgroup_compile_op_full, METH_VARARGS | METH_KEYWORDS,
+        "Compile a custom collective operation"},
+    {"options", (PyCFunction)processgroup_options, METH_VARARGS | METH_KEYWORDS,
+        "Get options object or create context manager for temporary option overrides"},
+    {nullptr, nullptr, 0, nullptr}};
 
 // Create ProcessGroup type
 static PyObject* create_processgroup_type() {
   PyTypeObject* base = get_torch_processgroup_type();
-  if (!base) return nullptr;
+  if (!base) {
+    return nullptr;
+  }
 
-  TypeBuilder builder = {
-      .name = "moodist._C.MoodistProcessGroup",
+  TypeBuilder builder = {.name = "moodist._C.MoodistProcessGroup",
       .doc = "A moodist process group",
       .base = base,
       .tp_init = processgroup_init,
       .tp_dealloc = intrusive_ptr_dealloc<MoodistProcessGroup>,
-      .methods = processgroup_methods
-  };
+      .methods = processgroup_methods};
 
   return builder.build();
 }
@@ -866,8 +905,7 @@ static int backend_init(PyObject* self, PyObject* args, PyObject* kwds) {
   int rank = 0;
   int size = 0;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist),
-          &store_obj, &rank, &size)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist), &store_obj, &rank, &size)) {
     return -1;
   }
 
@@ -882,23 +920,21 @@ static int backend_init(PyObject* self, PyObject* args, PyObject* kwds) {
   }
 }
 
-static PyMethodDef backend_methods[] = {
-    {nullptr, nullptr, 0, nullptr}
-};
+static PyMethodDef backend_methods[] = {{nullptr, nullptr, 0, nullptr}};
 
 // Create Backend type
 static PyObject* create_backend_type() {
   PyTypeObject* base = get_torch_backend_type();
-  if (!base) return nullptr;
+  if (!base) {
+    return nullptr;
+  }
 
-  TypeBuilder builder = {
-      .name = "moodist._C.MoodistBackend",
+  TypeBuilder builder = {.name = "moodist._C.MoodistBackend",
       .doc = "A moodist backend",
       .base = base,
       .tp_init = backend_init,
       .tp_dealloc = intrusive_ptr_dealloc<MoodistBackend>,
-      .methods = backend_methods
-  };
+      .methods = backend_methods};
 
   return builder.build();
 }
@@ -927,9 +963,7 @@ static PyObject* queuework_wait(PyObject* self, PyObject*) {
 }
 
 static PyMethodDef queuework_methods[] = {
-    {"wait", queuework_wait, METH_NOARGS, "Wait for the queue operation to complete"},
-    {nullptr, nullptr, 0, nullptr}
-};
+    {"wait", queuework_wait, METH_NOARGS, "Wait for the queue operation to complete"}, {nullptr, nullptr, 0, nullptr}};
 
 static PyObject* create_queuework_type() {
   return create_wrapper_type<QueueWorkHolder>(
@@ -943,7 +977,9 @@ static PyObject* wrap_queuework(MoodistQueueWork&& work) {
     return nullptr;
   }
   auto* wrapper = alloc_wrapper<QueueWorkHolder>(QueueWorkType);
-  if (!wrapper) return nullptr;
+  if (!wrapper) {
+    return nullptr;
+  }
   new (&wrapper->holder) QueueWorkHolder(std::make_unique<MoodistQueueWork>(std::move(work)));
   return reinterpret_cast<PyObject*>(wrapper);
 }
@@ -963,8 +999,8 @@ static PyObject* queue_put(PyObject* self, PyObject* args, PyObject* kwds) {
   unsigned int transaction = 0;
   int wait_on_destroy = 1;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OI|p", const_cast<char**>(kwlist),
-          &tensor_obj, &transaction, &wait_on_destroy)) {
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwds, "OI|p", const_cast<char**>(kwlist), &tensor_obj, &transaction, &wait_on_destroy)) {
     return nullptr;
   }
 
@@ -974,7 +1010,7 @@ static PyObject* queue_put(PyObject* self, PyObject* args, PyObject* kwds) {
     return nullptr;
   }
   if (!THPVariable_Check(tensor_obj)) {
-    PyRef type_name(get_type_name(tensor_obj));
+    auto type_name = get_type_name(tensor_obj);
     if (type_name) {
       PyErr_Format(PyExc_TypeError, "Expected tensor, got %S", type_name.get());
     } else {
@@ -1003,8 +1039,7 @@ static PyObject* queue_get(PyObject* self, PyObject* args, PyObject* kwds) {
   int block = 1;
   PyObject* timeout_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|pO", const_cast<char**>(kwlist),
-          &block, &timeout_obj)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|pO", const_cast<char**>(kwlist), &block, &timeout_obj)) {
     return nullptr;
   }
 
@@ -1013,7 +1048,9 @@ static PyObject* queue_get(PyObject* self, PyObject* args, PyObject* kwds) {
     std::optional<float> timeout;
     if (timeout_obj && timeout_obj != Py_None) {
       timeout = static_cast<float>(PyFloat_AsDouble(timeout_obj));
-      if (PyErr_Occurred()) return nullptr;
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
     }
 
     std::pair<std::optional<torch::Tensor>, size_t> result;
@@ -1026,7 +1063,9 @@ static PyObject* queue_get(PyObject* self, PyObject* args, PyObject* kwds) {
     PyObject* tensor_py;
     if (result.first) {
       tensor_py = THPVariable_Wrap(*result.first);
-      if (!tensor_py) return nullptr;
+      if (!tensor_py) {
+        return nullptr;
+      }
     } else {
       Py_INCREF(Py_None);
       tensor_py = Py_None;
@@ -1076,7 +1115,9 @@ static PyObject* queue_wait(PyObject* self, PyObject* args) {
     std::optional<float> timeout;
     if (timeout_obj && timeout_obj != Py_None) {
       timeout = static_cast<float>(PyFloat_AsDouble(timeout_obj));
-      if (PyErr_Occurred()) return nullptr;
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
     }
 
     bool result;
@@ -1159,9 +1200,7 @@ static PyMethodDef queue_methods[] = {
     {"transaction_begin", queue_transaction_begin, METH_NOARGS, "Begin a transaction"},
     {"transaction_cancel", queue_transaction_cancel, METH_VARARGS, "Cancel a transaction"},
     {"transaction_commit", queue_transaction_commit, METH_VARARGS, "Commit a transaction"},
-    {"name", queue_name, METH_NOARGS, "Get the queue name"},
-    {nullptr, nullptr, 0, nullptr}
-};
+    {"name", queue_name, METH_NOARGS, "Get the queue name"}, {nullptr, nullptr, 0, nullptr}};
 
 static PyObject* create_queue_type() {
   return create_wrapper_type<QueueHolder>(
@@ -1179,7 +1218,9 @@ static PyObject* wrap_queue(std::shared_ptr<MoodistQueue> queue) {
     return nullptr;
   }
   auto* wrapper = alloc_wrapper<QueueHolder>(QueueType);
-  if (!wrapper) return nullptr;
+  if (!wrapper) {
+    return nullptr;
+  }
   new (&wrapper->holder) QueueHolder(std::move(queue));
   if (!wrapper->holder) {
     PyErr_SetString(PyExc_RuntimeError, "wrap_queue: holder is null after construction");
@@ -1228,15 +1269,11 @@ static PyObject* future_result(PyObject* self, PyObject*) {
   }
 }
 
-static PyMethodDef future_methods[] = {
-    {"wait", future_wait, METH_NOARGS, "Wait for the future to complete"},
-    {"result", future_result, METH_NOARGS, "Get the result tensor"},
-    {nullptr, nullptr, 0, nullptr}
-};
+static PyMethodDef future_methods[] = {{"wait", future_wait, METH_NOARGS, "Wait for the future to complete"},
+    {"result", future_result, METH_NOARGS, "Get the result tensor"}, {nullptr, nullptr, 0, nullptr}};
 
 static PyObject* create_future_type() {
-  return create_wrapper_type<FutureHolder>(
-      "moodist._C.Future", "Async operation result", future_methods);
+  return create_wrapper_type<FutureHolder>("moodist._C.Future", "Async operation result", future_methods);
 }
 
 // Helper to create Future Python object from C++ object
@@ -1246,7 +1283,9 @@ static PyObject* wrap_future(MoodistFuture&& future) {
     return nullptr;
   }
   auto* wrapper = alloc_wrapper<FutureHolder>(FutureType);
-  if (!wrapper) return nullptr;
+  if (!wrapper) {
+    return nullptr;
+  }
   new (&wrapper->holder) FutureHolder(std::make_unique<MoodistFuture>(std::move(future)));
   return reinterpret_cast<PyObject*>(wrapper);
 }
@@ -1265,8 +1304,7 @@ static PyObject* customop_call(PyObject* self, PyObject* args, PyObject* kwds) {
   PyObject* inputs_obj = nullptr;
   PyObject* outputs_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO", const_cast<char**>(kwlist),
-          &inputs_obj, &outputs_obj)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO", const_cast<char**>(kwlist), &inputs_obj, &outputs_obj)) {
     return nullptr;
   }
 
@@ -1291,9 +1329,7 @@ static PyObject* customop_call(PyObject* self, PyObject* args, PyObject* kwds) {
   }
 }
 
-static PyMethodDef customop_methods[] = {
-    {nullptr, nullptr, 0, nullptr}
-};
+static PyMethodDef customop_methods[] = {{nullptr, nullptr, 0, nullptr}};
 
 static PyObject* create_customop_type() {
   return create_wrapper_type<CustomOpHolder>(
@@ -1307,7 +1343,9 @@ static PyObject* wrap_customop(MoodistCustomOp&& op) {
     return nullptr;
   }
   auto* wrapper = alloc_wrapper<CustomOpHolder>(CustomOpType);
-  if (!wrapper) return nullptr;
+  if (!wrapper) {
+    return nullptr;
+  }
   new (&wrapper->holder) CustomOpHolder(std::make_unique<MoodistCustomOp>(std::move(op)));
   return reinterpret_cast<PyObject*>(wrapper);
 }
@@ -1322,29 +1360,43 @@ static PyObject* hello_world(PyObject* self, PyObject* args) {
   return PyUnicode_FromString("Hello from stable API!");
 }
 
-// TODO: Add enable_cuda_allocator and enable_cpu_allocator once
-// allocator_wrapper.cc and cpu_allocator_wrapper.cc are added back to CMakeLists.txt
+static PyObject* py_enable_cuda_allocator(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  try {
+    moodist::enableCudaAllocator();
+    Py_RETURN_NONE;
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
+}
 
-static PyMethodDef module_methods[] = {
-    {"hello", hello_world, METH_NOARGS, "Returns a greeting"},
-    {nullptr, nullptr, 0, nullptr}
-};
+static PyObject* py_enable_cpu_allocator(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  try {
+    moodist::enableCpuAllocator();
+    Py_RETURN_NONE;
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
+}
+
+static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Returns a greeting"},
+    {"enable_cuda_allocator", py_enable_cuda_allocator, METH_NOARGS, "Enable moodist CUDA allocator"},
+    {"enable_cpu_allocator", py_enable_cpu_allocator, METH_NOARGS, "Enable moodist CPU allocator"},
+    {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
+    {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},
+    {nullptr, nullptr, 0, nullptr}};
 
 // =============================================================================
 // Module definition
 // =============================================================================
 
-static struct PyModuleDef module_def = {
-    PyModuleDef_HEAD_INIT,
-    "_C",
-    "Moodist Python bindings (stable API)",
-    -1,
-    module_methods,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr
-};
+static struct PyModuleDef module_def = {PyModuleDef_HEAD_INIT, "_C", "Moodist Python bindings (stable API)", -1,
+    module_methods, nullptr, nullptr, nullptr, nullptr};
 
 PyMODINIT_FUNC PyInit__C(void) {
   PyObject* m = PyModule_Create(&module_def);

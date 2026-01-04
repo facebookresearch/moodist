@@ -7,6 +7,11 @@ option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(ENABLE_ALLOCATOR_GUARDS "Enable allocator guard bytes" OFF)
 option(ENABLE_STDLIB_ALLOCATOR "Use stdlib malloc instead of custom allocator" OFF)
+
+# Build component options - allows building subsets of the project
+option(MOODIST_BUILD_CORE "Build libmoodist.so core library (requires CUDA)" ON)
+option(MOODIST_BUILD_WRAPPER "Build _C.so PyTorch wrapper (requires Python + PyTorch)" ON)
+option(MOODIST_BUILD_SERIALIZE "Build _serialize.so library (requires Python)" ON)
 set(COMPILE_FLAGS "-Wfatal-errors -Wno-unused-result -Bsymbolic -march=x86-64-v3 -U_FORTIFY_SOURCE -fno-stack-protector")
 if(ENABLE_ASAN)
   set(COMPILE_FLAGS "${COMPILE_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
@@ -38,43 +43,55 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_SKIP_RPATH TRUE)
 
-find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
-
-execute_process(
-    COMMAND python -c "import os, torch; print(os.path.dirname(torch.__file__), end='')"
-    OUTPUT_VARIABLE TorchPath
-)
-message(STATUS "PyTorch is at ${TorchPath}")
-
-# Detect _GLIBCXX_USE_CXX11_ABI from PyTorch (affects std::string layout)
-set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
-
-if (USE_CXX1_ABI STREQUAL "auto")
-  execute_process(
-    COMMAND python -c "import torch; print(1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0, end='')"
-    OUTPUT_VARIABLE USE_CXX1_ABI
-    RESULT_VARIABLE cxx_abi_result
-  )
-  if (NOT cxx_abi_result EQUAL 0)
-    message(FATAL_ERROR "Failed to detect _GLIBCXX_USE_CXX11_ABI from PyTorch")
-  endif()
-  set(USE_CXX1_ABI ${USE_CXX1_ABI} CACHE STRING "" FORCE)
-  message(STATUS "Detected _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI} from PyTorch")
+# Python is required for wrapper and serialize
+if(MOODIST_BUILD_WRAPPER OR MOODIST_BUILD_SERIALIZE)
+  find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 endif()
 
-# Note: -fabi-version detection removed - not needed for stable API bindings
-# (ABI version only affects name mangling for templates/lambdas, not layout of types we use)
+# PyTorch is only required for wrapper
+if(MOODIST_BUILD_WRAPPER)
+  execute_process(
+      COMMAND python -c "import os, torch; print(os.path.dirname(torch.__file__), end='')"
+      OUTPUT_VARIABLE TorchPath
+  )
+  message(STATUS "PyTorch is at ${TorchPath}")
 
-message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
+  # Detect _GLIBCXX_USE_CXX11_ABI from PyTorch (affects std::string layout)
+  set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
 
-find_package(CUDAToolkit REQUIRED)
-message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
+  if (USE_CXX1_ABI STREQUAL "auto")
+    execute_process(
+      COMMAND python -c "import torch; print(1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0, end='')"
+      OUTPUT_VARIABLE USE_CXX1_ABI
+      RESULT_VARIABLE cxx_abi_result
+    )
+    if (NOT cxx_abi_result EQUAL 0)
+      message(FATAL_ERROR "Failed to detect _GLIBCXX_USE_CXX11_ABI from PyTorch")
+    endif()
+    set(USE_CXX1_ABI ${USE_CXX1_ABI} CACHE STRING "" FORCE)
+    message(STATUS "Detected _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI} from PyTorch")
+  endif()
 
-find_library(CUDADEVRT libcudadevrt.a HINTS ${CUDAToolkit_LIBRARY_DIR})
+  # Note: -fabi-version detection removed - not needed for stable API bindings
+  # (ABI version only affects name mangling for templates/lambdas, not layout of types we use)
+
+  message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
+endif()
+
+# CUDA is required for core and wrapper (not serialize)
+if(MOODIST_BUILD_CORE OR MOODIST_BUILD_WRAPPER)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
+
+  find_library(CUDADEVRT libcudadevrt.a HINTS ${CUDAToolkit_LIBRARY_DIR})
+endif()
 
 find_package(Threads REQUIRED)
 
-add_subdirectory(pybind11)
+# pybind11 is only needed for serialize library
+if(MOODIST_BUILD_SERIALIZE)
+  add_subdirectory(pybind11)
+endif()
 
 # Generate build magic for API version checking
 # Random value generated at configure time - pass -DMOODIST_BUILD_MAGIC=0x... to override
@@ -88,13 +105,16 @@ message(STATUS "Build magic: ${MOODIST_BUILD_MAGIC}")
 # Pass build magic to both libraries
 add_compile_definitions(MOODIST_BUILD_MAGIC=${MOODIST_BUILD_MAGIC})
 
-set(ENABLE_STATIC ON CACHE BOOL "")
-set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
-set(NO_PYVERBS ON CACHE BOOL "")
-set(NO_MAN_PAGES ON CACHE BOOL "")
-set(NO_COMPAT_SYMS ON CACHE BOOL "")
-set(HAVE_FUNC_ATTRIBUTE_SYMVER "0" CACHE STRING "" FORCE)
-add_subdirectory(rdma-core EXCLUDE_FROM_ALL)
+# rdma-core is only needed for core library
+if(MOODIST_BUILD_CORE AND NOT MOODIST_PREBUILT_CORE)
+  set(ENABLE_STATIC ON CACHE BOOL "")
+  set(ENABLE_RESOLVE_NEIGH OFF CACHE BOOL "")
+  set(NO_PYVERBS ON CACHE BOOL "")
+  set(NO_MAN_PAGES ON CACHE BOOL "")
+  set(NO_COMPAT_SYMS ON CACHE BOOL "")
+  set(HAVE_FUNC_ATTRIBUTE_SYMVER "0" CACHE STRING "" FORCE)
+  add_subdirectory(rdma-core EXCLUDE_FROM_ALL)
+endif()
 
 set(ibverbs_sources
   cmd.c cmd_ah.c cmd_counters.c cmd_cq.c cmd_device.c cmd_dm.c cmd_fallback.c cmd_flow.c
@@ -130,12 +150,16 @@ set(rdma_sources
 # Option to use pre-built core library (for multi-PyTorch version builds)
 set(MOODIST_PREBUILT_CORE "" CACHE FILEPATH "Path to pre-built libmoodist.so (skip building core)")
 
+# Core library - only build if requested
+if(MOODIST_BUILD_CORE OR MOODIST_BUILD_WRAPPER)
+
 # Core library sources - uses wrapper interfaces, no direct PyTorch
 set(core_sources
   core/allgather.cc
   core/allocator.cc
   core/alltoall.cc
   core/async.cc
+  core/buffer_api.cc
   core/connection.cc
   core/cpu_allocator.cc
   core/cputhread.cc
@@ -151,7 +175,7 @@ set(core_sources
   core/rdma_tcp.cc
   core/reduce_scatter.cc
   core/reduce_scatter_direct.cc
-  # core/serialize_object.cc  # Temporarily disabled - will be moved to separate library
+  # core/serialize_object.cc  # Moved to separate library (uses pybind11)
   core/setup_comms.cc
   core/socket.cc
   core/store.cc
@@ -200,18 +224,21 @@ else()
   set_property(TARGET moodist PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
+endif() # MOODIST_BUILD_CORE OR MOODIST_BUILD_WRAPPER
+
 # Wrapper library - compiled per PyTorch version, uses dlopen for core
 # Using stable API (Py_LIMITED_API) - no pybind11
+if(MOODIST_BUILD_WRAPPER)
 set(wrapper_sources
   wrapper/module.cc
   wrapper/store_wrapper.cc
   wrapper/moodist_loader.cc
   wrapper/processgroup_wrapper.cc
   wrapper/queue_wrapper.cc
+  wrapper/allocator_wrapper.cc
+  wrapper/cpu_allocator_wrapper.cc
+  wrapper/serialize_wrapper.cc
   # wrapper/pybind.cc  # Replaced by module.cc (stable API)
-  # wrapper/serialize_wrapper.cc  # Will be in separate library
-  # wrapper/allocator_wrapper.cc  # TODO: Add back
-  # wrapper/cpu_allocator_wrapper.cc  # TODO: Add back
 )
 
 # Use Python's extension module instead of pybind11
@@ -243,3 +270,35 @@ set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 if(NOT MOODIST_PREBUILT_CORE)
   add_dependencies(_C moodist)
 endif()
+
+endif() # MOODIST_BUILD_WRAPPER
+
+# Serialize library - compiled per Python version (uses pybind11 internally)
+# NOT a Python module - exports C functions that _C loads via dlsym
+# Does NOT link against libmoodist.so - uses CoreApi function pointers instead
+# Named with Python version suffix (e.g., lib_serialize.cpython-311.so)
+if(MOODIST_BUILD_SERIALIZE)
+add_library(_serialize SHARED
+  wrapper/serialize/serialize_object.cc
+)
+# Set output name to include Python version (e.g., _serialize.cpython-311)
+set_target_properties(_serialize PROPERTIES
+  OUTPUT_NAME "_serialize.cpython-${Python_VERSION_MAJOR}${Python_VERSION_MINOR}"
+)
+target_link_libraries(_serialize PRIVATE
+  pybind11::module  # For pybind11 headers only (not module init)
+)
+target_include_directories(_serialize SYSTEM PRIVATE
+  fmt/include
+  ${Python_INCLUDE_DIRS}
+)
+target_include_directories(_serialize PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/wrapper/serialize
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(_serialize PRIVATE
+  FMT_HEADER_ONLY
+)
+set_property(TARGET _serialize PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+endif() # MOODIST_BUILD_SERIALIZE

@@ -38,5 +38,7 @@ cpu_allocator_debug = getattr(_C, "cpu_allocator_debug", None)
 cuda_copy = getattr(_C, "cuda_copy", None)
 set_prefer_kernel_less = getattr(_C, "set_prefer_kernel_less", None)
 TcpStore = getattr(_C, "TcpStore", None)
+
+# Serialize functions - exposed through _C which loads libserialize at runtime
 serialize = getattr(_C, "serialize", None)
 deserialize = getattr(_C, "deserialize", None)

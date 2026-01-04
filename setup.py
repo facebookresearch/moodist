@@ -41,6 +41,14 @@ class Build(build_ext.build_ext):
                 z_lib, fn_lib = zip_files.pop("moodist.libmoodist")
                 libmoodist_path = output_path.parent / "libmoodist.so"
                 open(libmoodist_path, "wb").write(z_lib.open(fn_lib).read())
+            # Copy serialize libraries to package directory (only once)
+            if "moodist.serialize_libs" in zip_files:
+                serialize_libs = zip_files.pop("moodist.serialize_libs")
+                for lib_path in serialize_libs:
+                    import shutil
+                    dest_path = output_path.parent / os.path.basename(lib_path)
+                    shutil.copy(lib_path, dest_path)
+                    print(f"Copied serialize lib: {dest_path}")
             return
 
         cmake_cmd = [
@@ -160,6 +168,11 @@ def main():
         # Store libmoodist.so source for extraction
         if libmoodist_source is not None:
             zip_files["moodist.libmoodist"] = libmoodist_source
+
+        # Store serialize library paths for extraction
+        if "MOODIST_SERIALIZE_LIBS" in os.environ:
+            serialize_libs = os.environ["MOODIST_SERIALIZE_LIBS"].split(",")
+            zip_files["moodist.serialize_libs"] = serialize_libs
     else:
         import torch
 
