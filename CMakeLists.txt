@@ -206,12 +206,12 @@ set(wrapper_sources
   wrapper/module.cc
   wrapper/store_wrapper.cc
   wrapper/moodist_loader.cc
+  wrapper/processgroup_wrapper.cc
+  wrapper/queue_wrapper.cc
   # wrapper/pybind.cc  # Replaced by module.cc (stable API)
   # wrapper/serialize_wrapper.cc  # Will be in separate library
   # wrapper/allocator_wrapper.cc  # TODO: Add back
   # wrapper/cpu_allocator_wrapper.cc  # TODO: Add back
-  # wrapper/processgroup_wrapper.cc  # TODO: Add back
-  # wrapper/queue_wrapper.cc  # TODO: Add back
 )
 
 # Use Python's extension module instead of pybind11

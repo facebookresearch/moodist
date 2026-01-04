@@ -199,8 +199,9 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
 
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
     if name not in weak_group:
+        queue = Queue(group, range(group.size()), name=name)
+        weak_queue[name] = queue
         weak_group[name] = group
-        weak_queue[name] = Queue(group, range(group.size()), name=name)
     queue = weak_queue.get(name)
     assert isinstance(queue, Queue)
 
