@@ -12,7 +12,7 @@
 #include <stdexcept>
 
 // THPVariable_Wrap from libtorch_python.so
-extern "C" PyObject* THPVariable_Wrap(const at::Tensor& tensor);
+PyObject* THPVariable_Wrap(const at::TensorBase& tensor);
 
 // THPVariable helpers defined in module.cc
 bool THPVariable_Check(PyObject* obj);

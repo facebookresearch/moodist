@@ -1770,8 +1770,6 @@ struct StoreImpl : api::Store {
         if (futex) {
           break;
         }
-        // Check for Ctrl+C / signals after each wait iteration
-        wrapperApi.checkSignals();
         now = std::chrono::steady_clock::now();
         if (now >= end) {
           std::lock_guard l(mutex);

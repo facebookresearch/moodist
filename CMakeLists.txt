@@ -175,7 +175,6 @@ set(core_sources
   core/rdma_tcp.cc
   core/reduce_scatter.cc
   core/reduce_scatter_direct.cc
-  # core/serialize_object.cc  # Moved to separate library (uses pybind11)
   core/setup_comms.cc
   core/socket.cc
   core/store.cc
@@ -208,8 +207,6 @@ else()
     rdma-core
     ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
     ${CUDAToolkit_INCLUDE_DIRS}
-    # ${pybind11_INCLUDE_DIRS}  # Was for serialize_object.cc
-    # ${Python_INCLUDE_DIRS}  # Was for serialize_object.cc
   )
   target_include_directories(moodist PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
@@ -238,7 +235,6 @@ set(wrapper_sources
   wrapper/allocator_wrapper.cc
   wrapper/cpu_allocator_wrapper.cc
   wrapper/serialize_wrapper.cc
-  # wrapper/pybind.cc  # Replaced by module.cc (stable API)
 )
 
 # Use Python's extension module instead of pybind11
@@ -265,11 +261,6 @@ target_compile_definitions(_C PRIVATE
 )
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-
-# Ensure moodist is built when building _C (even though we don't link directly)
-if(NOT MOODIST_PREBUILT_CORE)
-  add_dependencies(_C moodist)
-endif()
 
 endif() # MOODIST_BUILD_WRAPPER
 
