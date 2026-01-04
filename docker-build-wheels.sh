@@ -57,36 +57,32 @@ build_wheel() {
     local torchver=$2
     local pre=$3
     local core_lib_saved=$4
+    local staging=$5
 
     venv_dir=$(setup_venv "$pyver" "$torchver" "$pre")
     source "$venv_dir/bin/activate"
 
     python setup.py clean --all
 
-    # Build wheel to temp dir to get exact path
-    rm -rf dist_tmp
     if [[ -z "$core_lib" ]]; then
         # First PyTorch version: build everything
-        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir dist_tmp
-        whl=$(ls dist_tmp/*.whl)
+        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir "$staging"
+        whl=$(ls "$staging"/*.whl)
         # Extract core library from the wheel
         unzip -p "$whl" "moodist/libmoodist.so" > "$core_lib_saved"
         core_lib="$core_lib_saved"
         echo "Saved core library from $whl: $(ls -lh "$core_lib" | awk '{print $5}')"
     else
         # Subsequent versions: use pre-built core
-        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir dist_tmp
-        whl=$(ls dist_tmp/*.whl)
+        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir "$staging"
+        whl=$(ls -t "$staging"/*.whl | head -1)  # Most recent wheel
     fi
 
-    # Move wheel to dist/ and add to list
-    mv "$whl" dist/
-    rmdir dist_tmp
-    whl_name=$(basename "$whl")
+    # Add to list
     if [[ -z "$whl_list" ]]; then
-        whl_list="dist/$whl_name"
+        whl_list="$whl"
     else
-        whl_list="$whl_list,dist/$whl_name"
+        whl_list="$whl_list,$whl"
     fi
 
     deactivate
@@ -98,13 +94,18 @@ for ver in $versions; do
     core_lib=""
     whl_list=""
 
+    # Staging directory for intermediate wheels (not distributed)
+    staging="/tmp/staging_${ver}"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+
     # Build wheels for each torch version
     for torchver in $torch_versions; do
-        build_wheel "$ver" "$torchver" "" "$core_lib_saved"
+        build_wheel "$ver" "$torchver" "" "$core_lib_saved" "$staging"
     done
 
     for torchver in $pre_torch_versions; do
-        build_wheel "$ver" "$torchver" "pre" "$core_lib_saved"
+        build_wheel "$ver" "$torchver" "pre" "$core_lib_saved" "$staging"
     done
 
     # Clean up saved core library
@@ -120,4 +121,7 @@ for ver in $versions; do
     MOODIST_WHL_LIST=$whl_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
 
     deactivate
+
+    # Clean up staging directory
+    rm -rf "$staging"
 done
