@@ -6,7 +6,7 @@
 #include "api/allocator_api.h"
 #include "api/cpu_allocator.h"
 #include "api/processgroup_api.h"
-#include "api/serialize_api.h"
+// #include "api/serialize_api.h"  // Temporarily disabled
 #include "api/store_api.h"
 
 namespace moodist {
@@ -43,8 +43,9 @@ api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, const int* shape, size_
     const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
     const int* outputOffsets, const int* outputShapes, size_t nOutputs);
 
+// Serialization is temporarily disabled - will be moved to separate library
 // Forward declaration for bufferDestroy defined in serialize_object.cc
-void bufferDestroy(api::Buffer* buf);
+// void bufferDestroy(api::Buffer* buf);
 
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
@@ -64,12 +65,12 @@ static CoreApi coreApi = {
     .storeCheck = storeCheck,
     .storeWait = storeWait,
 
-    // Serialize functions
-    .serializeObjectImpl = serializeObjectImpl,
-    .serializeBufferPtr = serializeBufferPtr,
-    .serializeBufferSize = serializeBufferSize,
-    .bufferDestroy = bufferDestroy,
-    .deserializeObjectImpl = deserializeObjectImpl,
+    // Serialize functions - temporarily disabled, will be moved to separate library
+    .serializeObjectImpl = nullptr,
+    .serializeBufferPtr = nullptr,
+    .serializeBufferSize = nullptr,
+    .bufferDestroy = nullptr,
+    .deserializeObjectImpl = nullptr,
 
     // CPU allocator functions
     .cpuAllocatorAlloc = cpuAllocatorAlloc,

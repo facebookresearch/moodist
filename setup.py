@@ -137,7 +137,7 @@ def main():
 
             modname = "moodist.%s._C" % foldername
 
-            ext_modules.append(setuptools.Extension(modname, sources=[]))
+            ext_modules.append(setuptools.Extension(modname, sources=[], py_limited_api=True))
 
             zip_files[modname] = (z, cfn)
 

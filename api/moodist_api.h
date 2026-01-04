@@ -9,7 +9,7 @@
 #include "moodist_version.h"
 #include "types.h" // For ApiHandle, api::Queue, etc.
 
-#include <Python.h>
+// #include <Python.h>  // Removed - serialization uses void* now
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -150,11 +150,12 @@ struct CoreApi {
   // Serialize functions
   // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
   // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
-  api::BufferHandle (*serializeObjectImpl)(PyObject* o);
+  // Note: PyObject* is void* here to avoid Python dependency in core
+  api::BufferHandle (*serializeObjectImpl)(void* pyObject);
   void* (*serializeBufferPtr)(api::Buffer* buf);
   size_t (*serializeBufferSize)(api::Buffer* buf);
   void (*bufferDestroy)(api::Buffer* buf);
-  PyObject* (*deserializeObjectImpl)(const void* ptr, size_t len);
+  void* (*deserializeObjectImpl)(const void* ptr, size_t len);
 
   // CPU allocator functions
   // cpuAllocatorAlloc: allocates bytes, returns ptr and sets *cleanupCtx for deleter

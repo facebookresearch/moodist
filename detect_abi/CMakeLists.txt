@@ -6,14 +6,11 @@ set(TorchPath "not-set" CACHE STRING "")
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-add_subdirectory(../pybind11 pybind11)
-
 set(ABI_VERSION "auto" CACHE STRING "The ABI version that pytorch was built with")
 set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
 
-pybind11_add_module(moodist_detect_abi
-  pybind.cc
-)
+# Use Python stable API instead of pybind11 for faster compilation
+Python_add_library(moodist_detect_abi MODULE detect.cc)
 
 target_link_libraries(moodist_detect_abi PUBLIC
   ${TorchPath}/lib/libtorch_python.so

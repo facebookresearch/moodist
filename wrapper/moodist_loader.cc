@@ -5,18 +5,18 @@
 #include "moodist_loader.h"
 #include "api/api_handle.h"
 #include "api/moodist_api.h"
-#include "processgroup_wrapper.h"
+// #include "processgroup_wrapper.h"  // Not compiling yet - stub registerFreeMemoryCallback below
 #include "torch_includes.h"
 
-#include <pybind11/pybind11.h>
+// For stable API signal checking (Py_LIMITED_API defined by CMake via USE_SABI)
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
 
 #include <atomic>
 #include <dlfcn.h>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
-
-namespace py = pybind11;
 
 namespace moodist {
 
@@ -232,9 +232,9 @@ size_t dtypeSize(DType dtype) {
   return torch::elementSize(static_cast<torch::ScalarType>(static_cast<int>(dtype)));
 }
 
-// Free memory callback - delegates to moodist::wrapper::registerFreeMemoryCallback from processgroup_wrapper.cc
+// Free memory callback - TODO: implement when processgroup_wrapper is added
 void registerFreeMemoryCallback() {
-  ::moodist::wrapper::registerFreeMemoryCallback();
+  // Stub - will be implemented when we add processgroup_wrapper.cc
 }
 
 // c10d::Store wrapper functions
@@ -255,9 +255,14 @@ void c10dStoreWait(void* store, std::span<const std::string> keys) {
 }
 
 void checkSignals() {
-  py::gil_scoped_acquire gil;
-  if (PyErr_CheckSignals() == -1) {
-    throw py::error_already_set();
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  int result = PyErr_CheckSignals();
+  PyGILState_Release(gstate);
+
+  if (result == -1) {
+    // Python exception is already set (e.g., KeyboardInterrupt)
+    // Throw special exception that callers catch and return -1/nullptr
+    throw moodist::PythonErrorAlreadySet();
   }
 }
 

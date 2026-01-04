@@ -2,6 +2,8 @@
 #
 # docker run --rm -it -v .:/moodist -w /moodist quay.io/pypa/manylinux_2_28_x86_64 bash docker-build-wheels.sh
 #
+# Builds a single wheel that works across Python versions (stable API).
+# The wheel contains multiple _C.so files, one per supported PyTorch version.
 
 set -e -u -x
 
@@ -9,7 +11,9 @@ dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda
 
 dnf install -y cuda-toolkit-12
 
-versions="cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313"
+# Use lowest supported Python version for building (stable API)
+# abi3 wheels built with 3.10 work with 3.10+
+build_python="cp310-cp310"
 
 torch_versions="2.7 2.8 2.9"
 
@@ -23,7 +27,7 @@ export MOODIST_BUILD_MAGIC="0x$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')ULL"
 echo "Build magic: $MOODIST_BUILD_MAGIC"
 
 # Clean any leftover prebuilt cores from previous runs
-rm -f /tmp/libmoodist_*.so
+rm -f /tmp/libmoodist.so
 
 mkdir -p dist
 
@@ -57,7 +61,12 @@ build_wheel() {
     local torchver=$2
     local pre=$3
     local core_lib_saved=$4
-    local staging=$5
+    local staging_base=$5
+
+    # Use per-version staging folder to avoid timestamp dependencies
+    local staging="$staging_base/${pyver}_torch${torchver}${pre:+_pre}"
+    rm -rf "$staging"
+    mkdir -p "$staging"
 
     venv_dir=$(setup_venv "$pyver" "$torchver" "$pre")
     source "$venv_dir/bin/activate"
@@ -66,7 +75,7 @@ build_wheel() {
 
     if [[ -z "$core_lib" ]]; then
         # First PyTorch version: build everything
-        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir "$staging"
+        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310 --dist-dir "$staging"
         whl=$(ls "$staging"/*.whl)
         # Extract core library from the wheel
         unzip -p "$whl" "moodist/libmoodist.so" > "$core_lib_saved"
@@ -74,8 +83,8 @@ build_wheel() {
         echo "Saved core library from $whl: $(ls -lh "$core_lib" | awk '{print $5}')"
     else
         # Subsequent versions: use pre-built core
-        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --dist-dir "$staging"
-        whl=$(ls -t "$staging"/*.whl | head -1)  # Most recent wheel
+        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310 --dist-dir "$staging"
+        whl=$(ls "$staging"/*.whl)
     fi
 
     # Add to list
@@ -88,40 +97,47 @@ build_wheel() {
     deactivate
 }
 
-for ver in $versions; do
-    # Location to save core library (outside of build/ which gets cleaned)
-    core_lib_saved="/tmp/libmoodist_${ver}.so"
-    core_lib=""
-    whl_list=""
+# Location to save core library (outside of build/ which gets cleaned)
+core_lib_saved="/tmp/libmoodist.so"
+core_lib=""
+whl_list=""
 
-    # Staging directory for intermediate wheels (not distributed)
-    staging="/tmp/staging_${ver}"
-    rm -rf "$staging"
-    mkdir -p "$staging"
+# Base staging directory for intermediate wheels
+staging="/tmp/staging"
+rm -rf "$staging"
+mkdir -p "$staging"
 
-    # Build wheels for each torch version
-    for torchver in $torch_versions; do
-        build_wheel "$ver" "$torchver" "" "$core_lib_saved" "$staging"
-    done
-
-    for torchver in $pre_torch_versions; do
-        build_wheel "$ver" "$torchver" "pre" "$core_lib_saved" "$staging"
-    done
-
-    # Clean up saved core library
-    rm -f "$core_lib_saved"
-
-    # Build combined multi-version wheel (use first venv, doesn't matter which)
-    first_torchver=$(echo $torch_versions $pre_torch_versions | awk '{print $1}')
-    venv_dir="$venv_base/${ver}_torch${first_torchver}"
-    source "$venv_dir/bin/activate"
-
-    echo "Building combined wheel from: $whl_list"
-    MOODIST_WHL_LIST=$whl_list python setup.py clean --all
-    MOODIST_WHL_LIST=$whl_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64
-
-    deactivate
-
-    # Clean up staging directory
-    rm -rf "$staging"
+# Build wheels for each torch version (using single Python version)
+for torchver in $torch_versions; do
+    build_wheel "$build_python" "$torchver" "" "$core_lib_saved" "$staging"
 done
+
+for torchver in $pre_torch_versions; do
+    build_wheel "$build_python" "$torchver" "pre" "$core_lib_saved" "$staging"
+done
+
+# Clean up saved core library
+rm -f "$core_lib_saved"
+
+# Build combined multi-version wheel with abi3 tag
+first_torchver=$(echo $torch_versions $pre_torch_versions | awk '{print $1}')
+venv_dir="$venv_base/${build_python}_torch${first_torchver}"
+source "$venv_dir/bin/activate"
+
+echo "Building combined wheel from: $whl_list"
+MOODIST_WHL_LIST=$whl_list python setup.py clean --all
+# Use --py-limited-api to produce an abi3 wheel (works with Python 3.10+)
+MOODIST_WHL_LIST=$whl_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310
+
+deactivate
+
+# Keep staging directory for inspection (contains intermediate wheels)
+# rm -rf "$staging"
+
+echo ""
+echo "=== Built wheel ==="
+ls -lht dist/*.whl | head -1
+
+echo ""
+echo "=== Staging wheels (intermediate) ==="
+ls -lh "$staging"/*/*.whl 2>/dev/null || echo "(none)"

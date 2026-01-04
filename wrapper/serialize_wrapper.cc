@@ -8,6 +8,7 @@
 #include "torch_includes.h"
 
 #include <pybind11/pybind11.h>
+#include <stdexcept>
 
 namespace moodist {
 
@@ -17,16 +18,24 @@ namespace py = pybind11;
 namespace api {
 
 void* ApiProxy<Buffer>::data() const {
+  if (!coreApi.serializeBufferPtr) {
+    throw std::runtime_error("Serialization not available");
+  }
   return coreApi.serializeBufferPtr(ptr);
 }
 
 size_t ApiProxy<Buffer>::size() const {
+  if (!coreApi.serializeBufferSize) {
+    throw std::runtime_error("Serialization not available");
+  }
   return coreApi.serializeBufferSize(ptr);
 }
 
 // destroy() implementation for api::Buffer - called by ApiHandle destructor
 void destroy(Buffer* buffer) {
-  coreApi.bufferDestroy(buffer);
+  if (coreApi.bufferDestroy) {
+    coreApi.bufferDestroy(buffer);
+  }
 }
 
 } // namespace api
@@ -34,6 +43,9 @@ void destroy(Buffer* buffer) {
 namespace wrapper {
 
 torch::Tensor serializeObject(py::object o) {
+  if (!coreApi.serializeObjectImpl) {
+    throw std::runtime_error("Serialization not available (libserialize not loaded)");
+  }
   auto handle = coreApi.serializeObjectImpl(o.ptr());
   void* ptr = handle->data();
   size_t size = handle->size();
@@ -49,9 +61,12 @@ torch::Tensor serializeObject(py::object o) {
 }
 
 py::object deserializeObject(torch::Tensor t) {
-  PyObject* result = coreApi.deserializeObjectImpl(t.data_ptr(), t.itemsize() * t.numel());
+  if (!coreApi.deserializeObjectImpl) {
+    throw std::runtime_error("Deserialization not available (libserialize not loaded)");
+  }
+  void* result = coreApi.deserializeObjectImpl(t.data_ptr(), t.itemsize() * t.numel());
   // reinterpret_steal takes ownership of the new reference
-  return py::reinterpret_steal<py::object>(result);
+  return py::reinterpret_steal<py::object>(reinterpret_cast<PyObject*>(result));
 }
 
 } // namespace wrapper

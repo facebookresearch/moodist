@@ -38,7 +38,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_SKIP_RPATH TRUE)
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 
 execute_process(
     COMMAND python -c "import os, torch; print(os.path.dirname(torch.__file__), end='')"
@@ -46,13 +46,9 @@ execute_process(
 )
 message(STATUS "PyTorch is at ${TorchPath}")
 
-# We're forced to inherit from a class defined in pytorch, whose pybind code is also in pytorch.
-# pybind then requires the abi of our class and the parent class to be the same.
-# (pybind enforces this by a string lookup, where the string is composed of compiler, abi version etc)
-set(ABI_VERSION "auto" CACHE STRING "The ABI version that pytorch was built with")
+# Detect _GLIBCXX_USE_CXX11_ABI from PyTorch (affects std::string layout)
 set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
 
-# Detect CXX11 ABI directly from PyTorch (instant, no compilation needed)
 if (USE_CXX1_ABI STREQUAL "auto")
   execute_process(
     COMMAND python -c "import torch; print(1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0, end='')"
@@ -66,35 +62,10 @@ if (USE_CXX1_ABI STREQUAL "auto")
   message(STATUS "Detected _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI} from PyTorch")
 endif()
 
-# Detect fabi-version by trying common values
-if (ABI_VERSION STREQUAL "auto")
-  message(STATUS "Auto-detecting fabi-version")
-  foreach(abi IN ITEMS 19 18 16 11 13 20 17 15 14 12)
-    set(dir ${CMAKE_CURRENT_BINARY_DIR}/detect_abi_${abi}_${USE_CXX1_ABI})
-    try_compile(success PROJECT detect_abi SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/detect_abi BINARY_DIR ${dir} CMAKE_FLAGS -DABI_VERSION=${abi} -DUSE_CXX1_ABI=${USE_CXX1_ABI} -DTorchPath=${TorchPath} OUTPUT_VARIABLE stdout)
-    if (success)
-      execute_process(
-        COMMAND python -c "import torch, moodist_detect_abi"
-        WORKING_DIRECTORY ${dir}
-        RESULT_VARIABLE exitcode
-      )
-      if (exitcode EQUAL 0)
-        set(ABI_VERSION ${abi} CACHE STRING "" FORCE)
-        break()
-      endif()
-    endif()
-  endforeach()
+# Note: -fabi-version detection removed - not needed for stable API bindings
+# (ABI version only affects name mangling for templates/lambdas, not layout of types we use)
 
-  if (ABI_VERSION STREQUAL "auto")
-    message(FATAL_ERROR "Failed to auto-detect fabi-version for PyTorch. Set ABI_VERSION manually.")
-  endif()
-endif()
-
-message(STATUS "Using -fabi-version=${ABI_VERSION}")
 message(STATUS "Using -D_GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}")
-
-# Note: -fabi-version and _GLIBCXX_USE_CXX11_ABI are set per-target, not globally
-# Core library uses system default ABI, wrapper matches PyTorch's ABI
 
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
@@ -180,7 +151,7 @@ set(core_sources
   core/rdma_tcp.cc
   core/reduce_scatter.cc
   core/reduce_scatter_direct.cc
-  core/serialize_object.cc
+  # core/serialize_object.cc  # Temporarily disabled - will be moved to separate library
   core/setup_comms.cc
   core/socket.cc
   core/store.cc
@@ -213,8 +184,8 @@ else()
     rdma-core
     ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
     ${CUDAToolkit_INCLUDE_DIRS}
-    ${pybind11_INCLUDE_DIRS}  # For serialize_object.cc
-    ${Python_INCLUDE_DIRS}  # For serialize_object.cc
+    # ${pybind11_INCLUDE_DIRS}  # Was for serialize_object.cc
+    # ${Python_INCLUDE_DIRS}  # Was for serialize_object.cc
   )
   target_include_directories(moodist PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
@@ -230,18 +201,22 @@ else()
 endif()
 
 # Wrapper library - compiled per PyTorch version, uses dlopen for core
+# Using stable API (Py_LIMITED_API) - no pybind11
 set(wrapper_sources
-  wrapper/pybind.cc
+  wrapper/module.cc
   wrapper/store_wrapper.cc
-  wrapper/serialize_wrapper.cc
   wrapper/moodist_loader.cc
-  wrapper/allocator_wrapper.cc
-  wrapper/cpu_allocator_wrapper.cc
-  wrapper/processgroup_wrapper.cc
-  wrapper/queue_wrapper.cc
+  # wrapper/pybind.cc  # Replaced by module.cc (stable API)
+  # wrapper/serialize_wrapper.cc  # Will be in separate library
+  # wrapper/allocator_wrapper.cc  # TODO: Add back
+  # wrapper/cpu_allocator_wrapper.cc  # TODO: Add back
+  # wrapper/processgroup_wrapper.cc  # TODO: Add back
+  # wrapper/queue_wrapper.cc  # TODO: Add back
 )
 
-pybind11_add_module(_C ${wrapper_sources})
+# Use Python's extension module instead of pybind11
+# USE_SABI 3.10 enables stable ABI and sets correct .abi3.so suffix
+Python_add_library(_C MODULE USE_SABI 3.10 ${wrapper_sources})
 target_link_libraries(_C PRIVATE
   ${TorchPath}/lib/libtorch_python.so
   Threads::Threads
@@ -257,7 +232,6 @@ target_include_directories(_C PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/wrapper
   ${CMAKE_CURRENT_SOURCE_DIR}  # For api/ includes (e.g., #include "api/types.h")
 )
-target_compile_options(_C PRIVATE -fabi-version=${ABI_VERSION})
 target_compile_definitions(_C PRIVATE
   _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}
   MOODIST_WRAPPER  # Enable direct wrapper function calls in _C.so

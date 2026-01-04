@@ -6,6 +6,8 @@
 
 #include "api/tensor_ptr.h"
 
+#include <exception>
+
 // Forward declare torch::Tensor (avoid including torch headers here)
 namespace at {
 class Tensor;
@@ -15,6 +17,14 @@ using Tensor = at::Tensor;
 }
 
 namespace moodist {
+
+// Exception type to indicate a Python error is already set
+// Callers should catch this and return -1/nullptr without setting another error
+struct PythonErrorAlreadySet : std::exception {
+  const char* what() const noexcept override {
+    return "Python error already set";
+  }
+};
 
 // Global CoreApi object - initialized by initMoodistApi(), then accessed directly
 // Using an object (not pointer) means function pointer reads are single memory ops
