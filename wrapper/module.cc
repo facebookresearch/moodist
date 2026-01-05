@@ -30,42 +30,6 @@ struct THPVariable {
   PyObject* post_accumulate_grad_hooks;
 };
 
-// Cache the torch.Tensor type for fast isinstance checks
-static PyTypeObject* get_tensor_type() {
-  static PyTypeObject* tensor_type = nullptr;
-  if (!tensor_type) {
-    PyObject* torch_mod = PyImport_ImportModule("torch");
-    if (torch_mod) {
-      tensor_type = (PyTypeObject*)PyObject_GetAttrString(torch_mod, "Tensor");
-      Py_DECREF(torch_mod);
-    }
-  }
-  return tensor_type;
-}
-
-// Check if object is a torch.Tensor
-bool THPVariable_Check(PyObject* obj) {
-  PyTypeObject* tensor_type = get_tensor_type();
-  return tensor_type && PyObject_IsInstance(obj, (PyObject*)tensor_type);
-}
-
-const at::Tensor& THPVariable_Unpack(PyObject* obj) {
-  return *reinterpret_cast<THPVariable*>(obj)->cdata;
-}
-
-// Moodist headers
-#include "api/allocator.h"
-#include "api/cpu_allocator.h"
-#include "backend.h"
-#include "moodist_loader.h"
-#include "processgroup_wrapper.h"
-#include "serialize_wrapper.h"
-#include "store.h"
-
-#include <memory>
-#include <string>
-#include <vector>
-
 // =============================================================================
 // RAII wrapper for Python objects (like std::unique_ptr for PyObject*)
 // =============================================================================
@@ -112,6 +76,41 @@ public:
   }
 };
 
+// Cache the torch.Tensor type for fast isinstance checks
+static PyTypeObject* get_tensor_type() {
+  static PyTypeObject* tensor_type = nullptr;
+  if (!tensor_type) {
+    PyRef torch_mod(PyImport_ImportModule("torch"));
+    if (torch_mod) {
+      tensor_type = (PyTypeObject*)PyObject_GetAttrString(torch_mod.get(), "Tensor");
+    }
+  }
+  return tensor_type;
+}
+
+// Check if object is a torch.Tensor
+bool THPVariable_Check(PyObject* obj) {
+  PyTypeObject* tensor_type = get_tensor_type();
+  return tensor_type && PyObject_IsInstance(obj, (PyObject*)tensor_type);
+}
+
+const at::Tensor& THPVariable_Unpack(PyObject* obj) {
+  return *reinterpret_cast<THPVariable*>(obj)->cdata;
+}
+
+// Moodist headers
+#include "api/allocator.h"
+#include "api/cpu_allocator.h"
+#include "backend.h"
+#include "moodist_loader.h"
+#include "processgroup_wrapper.h"
+#include "serialize_wrapper.h"
+#include "store.h"
+
+#include <memory>
+#include <string>
+#include <vector>
+
 // Get type name (stable API compatible)
 static PyRef get_type_name(PyObject* obj) {
   PyObject* type = (PyObject*)Py_TYPE(obj);
@@ -141,12 +140,11 @@ struct pybind11_instance {
 static PyTypeObject* get_torch_store_type() {
   static PyTypeObject* store_type = nullptr;
   if (!store_type) {
-    PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
+    PyRef torch_dist(PyImport_ImportModule("torch.distributed"));
     if (!torch_dist) {
       return nullptr;
     }
-    store_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "Store");
-    Py_DECREF(torch_dist);
+    store_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist.get(), "Store");
   }
   return store_type;
 }
@@ -154,12 +152,11 @@ static PyTypeObject* get_torch_store_type() {
 static PyTypeObject* get_torch_processgroup_type() {
   static PyTypeObject* pg_type = nullptr;
   if (!pg_type) {
-    PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
+    PyRef torch_dist(PyImport_ImportModule("torch.distributed"));
     if (!torch_dist) {
       return nullptr;
     }
-    pg_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "ProcessGroup");
-    Py_DECREF(torch_dist);
+    pg_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist.get(), "ProcessGroup");
   }
   return pg_type;
 }
@@ -167,12 +164,11 @@ static PyTypeObject* get_torch_processgroup_type() {
 static PyTypeObject* get_torch_backend_type() {
   static PyTypeObject* backend_type = nullptr;
   if (!backend_type) {
-    PyObject* torch_dist = PyImport_ImportModule("torch.distributed");
+    PyRef torch_dist(PyImport_ImportModule("torch.distributed"));
     if (!torch_dist) {
       return nullptr;
     }
-    backend_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist, "Backend");
-    Py_DECREF(torch_dist);
+    backend_type = (PyTypeObject*)PyObject_GetAttrString(torch_dist.get(), "Backend");
   }
   return backend_type;
 }
@@ -199,15 +195,12 @@ struct TypeBuilder {
         .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
         .slots = slots};
 
-    PyObject* bases = PyTuple_Pack(1, base);
+    PyRef bases(PyTuple_Pack(1, base));
     if (!bases) {
       return nullptr;
     }
 
-    PyObject* type = PyType_FromSpecWithBases(&spec, bases);
-    Py_DECREF(bases);
-
-    return type;
+    return PyType_FromSpecWithBases(&spec, bases.get());
   }
 };
 
@@ -467,10 +460,9 @@ static bool parse_timeout(PyObject* obj, double* out_seconds) {
   }
 
   // Check for timedelta
-  PyObject* total_seconds = PyObject_CallMethod(obj, "total_seconds", nullptr);
+  PyRef total_seconds(PyObject_CallMethod(obj, "total_seconds", nullptr));
   if (total_seconds) {
-    *out_seconds = PyFloat_AsDouble(total_seconds);
-    Py_DECREF(total_seconds);
+    *out_seconds = PyFloat_AsDouble(total_seconds.get());
     return true;
   }
   PyErr_Clear();
@@ -717,35 +709,21 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     Py_ssize_t shape_len = PySequence_Size(shape_obj);
     shape.reserve(shape_len);
     for (Py_ssize_t i = 0; i < shape_len; ++i) {
-      PyObject* item = PySequence_GetItem(shape_obj, i);
-      shape.push_back(PyLong_AsLong(item));
-      Py_DECREF(item);
+      PyRef item(PySequence_GetItem(shape_obj, i));
+      shape.push_back(PyLong_AsLong(item.get()));
     }
 
     // Parse dtype - get torch.dtype from the Python object
-    // The dtype is a torch.dtype enum value
-    // We need to extract the underlying ScalarType
-    PyObject* torch_mod = PyImport_ImportModule("torch");
-    if (!torch_mod) {
-      return nullptr;
-    }
-
-    // Get the dtype's value - torch.dtype objects have a private _dtype attribute
-    // Actually, we can compare with known dtypes or use at::python::detail::py_scalar_type
-    // For now, let's get the string name and parse it
-    PyObject* dtype_name = PyObject_Str(dtype_obj);
+    PyRef dtype_name(PyObject_Str(dtype_obj));
     if (!dtype_name) {
-      Py_DECREF(torch_mod);
       return nullptr;
     }
     // PyUnicode_AsUTF8 is not in limited API, use PyUnicode_AsEncodedString
-    PyObject* dtype_bytes = PyUnicode_AsEncodedString(dtype_name, "utf-8", "strict");
-    Py_DECREF(dtype_name);
+    PyRef dtype_bytes(PyUnicode_AsEncodedString(dtype_name.get(), "utf-8", "strict"));
     if (!dtype_bytes) {
-      Py_DECREF(torch_mod);
       return nullptr;
     }
-    const char* dtype_str = PyBytes_AsString(dtype_bytes);
+    const char* dtype_str = PyBytes_AsString(dtype_bytes.get());
     torch::Dtype dtype;
     if (strcmp(dtype_str, "torch.float32") == 0 || strcmp(dtype_str, "torch.float") == 0) {
       dtype = torch::kFloat32;
@@ -761,12 +739,8 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
       dtype = torch::kInt64;
     } else {
       PyErr_Format(PyExc_ValueError, "Unsupported dtype: %s", dtype_str);
-      Py_DECREF(dtype_bytes);
-      Py_DECREF(torch_mod);
       return nullptr;
     }
-    Py_DECREF(dtype_bytes);
-    Py_DECREF(torch_mod);
 
     // Parse inputs and outputs: list of tuples (rank, src_offsets, dst_offsets)
     auto parse_transfer_list = [](PyObject* list) -> std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> {
@@ -778,7 +752,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
       Py_ssize_t len = PyList_Size(list);
       result.reserve(len);
       for (Py_ssize_t i = 0; i < len; ++i) {
-        PyObject* item = PyList_GetItem(list, i);
+        PyObject* item = PyList_GetItem(list, i);  // Borrowed reference
         if (!PyTuple_Check(item) || PyTuple_Size(item) != 3) {
           PyErr_SetString(PyExc_TypeError, "Each item must be a tuple of (rank, src_offsets, dst_offsets)");
           return {};
@@ -793,9 +767,8 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
           Py_ssize_t len = PySequence_Size(obj);
           vec.reserve(len);
           for (Py_ssize_t i = 0; i < len; ++i) {
-            PyObject* item = PySequence_GetItem(obj, i);
-            vec.push_back(PyLong_AsLong(item));
-            Py_DECREF(item);
+            PyRef item(PySequence_GetItem(obj, i));
+            vec.push_back(PyLong_AsLong(item.get()));
           }
           return vec;
         };
@@ -832,13 +805,12 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 
 static PyObject* processgroup_options(PyObject* self, PyObject* args, PyObject* kwds) {
   // Import the Python options module
-  PyObject* options_mod = PyImport_ImportModule("moodist.options");
+  PyRef options_mod(PyImport_ImportModule("moodist.options"));
   if (!options_mod) {
     return nullptr;
   }
 
-  PyObject* MoodistOptions = PyObject_GetAttrString(options_mod, "MoodistOptions");
-  Py_DECREF(options_mod);
+  PyRef MoodistOptions(PyObject_GetAttrString(options_mod.get(), "MoodistOptions"));
   if (!MoodistOptions) {
     return nullptr;
   }
@@ -846,23 +818,19 @@ static PyObject* processgroup_options(PyObject* self, PyObject* args, PyObject* 
   // Create options object: MoodistOptions(self)
   // Note: We don't cache because our type doesn't support dynamic attrs.
   // This is fine - MoodistOptions is just a lightweight wrapper.
-  PyObject* opts = PyObject_CallFunctionObjArgs(MoodistOptions, self, nullptr);
-  Py_DECREF(MoodistOptions);
+  PyRef opts(PyObject_CallFunctionObjArgs(MoodistOptions.get(), self, nullptr));
   if (!opts) {
     return nullptr;
   }
 
   // If kwargs provided, call opts(**kwargs) to get context manager
   if (kwds && PyDict_Size(kwds) > 0) {
-    PyObject* empty_tuple = PyTuple_New(0);
-    PyObject* result = PyObject_Call(opts, empty_tuple, kwds);
-    Py_DECREF(empty_tuple);
-    Py_DECREF(opts);
-    return result;
+    PyRef empty_tuple(PyTuple_New(0));
+    return PyObject_Call(opts.get(), empty_tuple.get(), kwds);
   }
 
   // Otherwise return the options object
-  return opts;
+  return opts.release();
 }
 
 static PyMethodDef processgroup_methods[] = {
@@ -1064,27 +1032,23 @@ static PyObject* queue_get(PyObject* self, PyObject* args, PyObject* kwds) {
     }
 
     // Return (tensor_or_None, size) tuple
-    PyObject* tensor_py;
+    PyRef tensor_py;
     if (result.first) {
-      tensor_py = THPVariable_Wrap(*result.first);
+      tensor_py = PyRef(THPVariable_Wrap(*result.first));
       if (!tensor_py) {
         return nullptr;
       }
     } else {
       Py_INCREF(Py_None);
-      tensor_py = Py_None;
+      tensor_py = PyRef(Py_None);
     }
 
-    PyObject* size_py = PyLong_FromSize_t(result.second);
+    PyRef size_py(PyLong_FromSize_t(result.second));
     if (!size_py) {
-      Py_DECREF(tensor_py);
       return nullptr;
     }
 
-    PyObject* tuple = PyTuple_Pack(2, tensor_py, size_py);
-    Py_DECREF(tensor_py);
-    Py_DECREF(size_py);
-    return tuple;
+    return PyTuple_Pack(2, tensor_py.get(), size_py.get());
   } catch (const moodist::PythonErrorAlreadySet&) {
     return nullptr;
   } catch (const std::exception& e) {
