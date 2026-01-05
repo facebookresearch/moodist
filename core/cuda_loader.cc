@@ -30,19 +30,31 @@ void* loadSymOptional(void* lib, const char* name) {
 }
 
 // Helper: find library handle - check RTLD_DEFAULT first, then try dlopen
+// Prefers already-loaded libraries over loading new ones
 void* findLibrary(const char* testSymbol, const char* const* libNames) {
   if (dlsym(RTLD_DEFAULT, testSymbol)) {
+    log.verbose("found %s in RTLD_DEFAULT\n", testSymbol);
     return RTLD_DEFAULT;
   }
+  log.debug("%s not in RTLD_DEFAULT\n", testSymbol);
+  // First pass: check for already-loaded libraries
   for (const char* const* l = libNames; *l; ++l) {
     void* lib = dlopen(*l, RTLD_NOW | RTLD_NOLOAD);
-    if (!lib) {
-      lib = dlopen(*l, RTLD_NOW);
-    }
     if (lib) {
+      log.verbose("found %s already loaded\n", *l);
       return lib;
     }
   }
+  // Second pass: try to load
+  for (const char* const* l = libNames; *l; ++l) {
+    void* lib = dlopen(*l, RTLD_NOW);
+    if (lib) {
+      log.verbose("loaded %s\n", *l);
+      return lib;
+    }
+    log.debug("%s not available: %s\n", *l, dlerror());
+  }
+  log.debug("no library found for %s\n", testSymbol);
   return nullptr;
 }
 
@@ -191,7 +203,7 @@ bool loadNvrtc() {
     return nvrtcApi.available();
   }
 
-  const char* libs[] = {"libnvrtc.so.12", "libnvrtc.so.11", "libnvrtc.so", nullptr};
+  const char* libs[] = {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11", "libnvrtc.so", nullptr};
   void* lib = findLibrary("nvrtcVersion", libs);
 
   if (lib) {
