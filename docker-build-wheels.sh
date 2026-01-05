@@ -30,6 +30,9 @@ venv_base="/tmp/moodist_venvs"
 export MOODIST_BUILD_MAGIC="0x$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')ULL"
 echo "Build magic: $MOODIST_BUILD_MAGIC"
 
+# Mark as release build (no -dev suffix in version)
+export MOODIST_RELEASE=1
+
 # Clean any leftover prebuilt cores from previous runs
 rm -f /tmp/libmoodist.so
 

@@ -93,7 +93,7 @@ class Build(build_ext.build_ext):
 def main():
 
     extra_version = ""
-    if "bdist_wheel" not in sys.argv:
+    if "MOODIST_RELEASE" not in os.environ:
         extra_version = "-dev"
 
     global moodist_version
@@ -174,7 +174,14 @@ def main():
             serialize_libs = os.environ["MOODIST_SERIALIZE_LIBS"].split(",")
             zip_files["moodist.serialize_libs"] = serialize_libs
     else:
-        import torch
+        try:
+            import torch
+        except ImportError:
+            sys.exit(
+                "Error: PyTorch not found.\n"
+                "Install PyTorch first, then build with:\n"
+                "  pip install --no-build-isolation ."
+            )
 
         torch_version = torch.__version__
         if "+" in torch_version:
