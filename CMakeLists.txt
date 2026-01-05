@@ -170,6 +170,7 @@ set(core_sources
   core/kernels.cc
   core/moodist_api.cc
   core/numa.cc
+  core/cuda_loader.cc
   core/queue.cc
   core/rdma_ib.cc
   core/rdma_tcp.cc
@@ -196,17 +197,14 @@ else()
   # Build core library from source
   add_library(moodist SHARED ${core_sources})
   target_link_libraries(moodist PRIVATE
-    CUDA::cuda_driver
-    CUDA::nvml
-    CUDA::nvrtc
     Threads::Threads
     kern-abi  # rdma-core kernel ABI
+    dl  # For dlsym (CUDA/NVML/NVRTC dynamic loading)
   )
   target_include_directories(moodist SYSTEM PRIVATE
     fmt/include
     rdma-core
     ${CMAKE_CURRENT_BINARY_DIR}/rdma-core/include
-    ${CUDAToolkit_INCLUDE_DIRS}
   )
   target_include_directories(moodist PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core

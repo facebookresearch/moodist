@@ -26,11 +26,17 @@
 #include <utility>
 #include <vector>
 
-// Forward declare CUDA types
+// Forward declare CUstream in global namespace for cuda.h compatibility
 struct CUstream_st;
-using CUstream = CUstream_st*;
+typedef CUstream_st* CUstream;
+
+namespace moodist::cuda {
+using CUstream = ::CUstream;
+} // namespace moodist::cuda
 
 namespace moodist {
+
+using namespace cuda;
 
 // Base class for refcounted objects passed across the API boundary.
 // Objects inheriting from this get shared ownership semantics in ApiHandle.
@@ -45,6 +51,8 @@ class TensorPtr;
 } // namespace moodist
 
 namespace moodist::api {
+
+using namespace moodist::cuda;
 
 // Forward declarations of API types (defined in types.h)
 struct Store;

@@ -422,7 +422,10 @@ void Kernels::compile(int flags, std::string compileType, std::string compileRed
 
   int major = 6;
   int minor = 0;
-  CHECK_NVRTC(nvrtcVersion(&major, &minor));
+  if (!loadNvrtc()) {
+    throw std::runtime_error("NVRTC not available");
+  }
+  CHECK_NVRTC(nvrtcApi.version(&major, &minor));
   log.verbose("nvrtc version is %d %d\n", major, minor);
 
   int driverVersion = 5000;
@@ -803,7 +806,7 @@ extern "C" __global__ void dummy_signal() {
   }
 
   nvrtcProgram program;
-  CHECK_NVRTC(nvrtcCreateProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
+  CHECK_NVRTC(nvrtcApi.createProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
 
   std::vector<std::pair<int, std::string>> archOptions;
   archOptions.emplace_back(9000, "--gpu-architecture=sm_90");
@@ -839,7 +842,7 @@ extern "C" __global__ void dummy_signal() {
     for (auto& v : options) {
       options2.push_back(v.c_str());
     }
-    error = nvrtcCompileProgram(program, options2.size(), options2.data());
+    error = nvrtcApi.compileProgram(program, options2.size(), options2.data());
     if (error == NVRTC_SUCCESS) {
       log.verbose("success with %s\n", archOptions[i].second);
     }
@@ -848,18 +851,18 @@ extern "C" __global__ void dummy_signal() {
     log.error("Failed to compile--\n%s\n", source.c_str());
     size_t logSize = 0;
     std::string logstr;
-    CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
+    CHECK_NVRTC(nvrtcApi.getProgramLogSize(program, &logSize));
     logstr.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, logstr.data()));
+    CHECK_NVRTC(nvrtcApi.getProgramLog(program, logstr.data()));
     log.error("%s\n", logstr);
 
     CHECK_NVRTC(error);
   } else {
     size_t logSize = 0;
     std::string logstr;
-    CHECK_NVRTC(nvrtcGetProgramLogSize(program, &logSize));
+    CHECK_NVRTC(nvrtcApi.getProgramLogSize(program, &logSize));
     logstr.resize(logSize);
-    CHECK_NVRTC(nvrtcGetProgramLog(program, logstr.data()));
+    CHECK_NVRTC(nvrtcApi.getProgramLog(program, logstr.data()));
     for (char& c : logstr) {
       if (c < 32 || c >= 127) {
         if (c != 10 && c != 13) {
@@ -871,10 +874,10 @@ extern "C" __global__ void dummy_signal() {
   }
 
   size_t ptxSize = 0;
-  CHECK_NVRTC(nvrtcGetPTXSize(program, &ptxSize));
+  CHECK_NVRTC(nvrtcApi.getPTXSize(program, &ptxSize));
   std::vector<char> ptx;
   ptx.resize(ptxSize);
-  CHECK_NVRTC(nvrtcGetPTX(program, ptx.data()));
+  CHECK_NVRTC(nvrtcApi.getPTX(program, ptx.data()));
 
   if (boolenv("MOODIST_DUMP_KERNELS")) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d-ptx.s", rank);
@@ -886,16 +889,16 @@ extern "C" __global__ void dummy_signal() {
     }
   }
 
-  // CHECK_NVRTC(nvrtcDestroyProgram(&program));
+  // CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
 
   // CHECK_CU(cuModuleLoadDataEx(&op.cuModule, ptx.data(), 0, nullptr, nullptr));
 
   size_t cubinSize = 0;
-  CHECK_NVRTC(nvrtcGetCUBINSize(program, &cubinSize));
+  CHECK_NVRTC(nvrtcApi.getCUBINSize(program, &cubinSize));
   std::vector<char> cubin;
   cubin.resize(cubinSize);
   log.debug("cubin size is %d\n", cubin.size());
-  CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
+  CHECK_NVRTC(nvrtcApi.getCUBIN(program, cubin.data()));
 
   if (boolenv("MOODIST_DUMP_KERNELS")) {
     std::string fn = fmt::sprintf("moodist-kernels-rank%d.o", rank);
@@ -907,7 +910,7 @@ extern "C" __global__ void dummy_signal() {
     }
   }
 
-  CHECK_NVRTC(nvrtcDestroyProgram(&program));
+  CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
 
   if (false) {
     auto exists = [&](std::string fn) {

@@ -53,7 +53,7 @@ static float extractPremulValue(c10d::ReduceOp reduceOp, at::ScalarType dtype) {
 }
 
 static CUstream getStream(const at::Tensor& t) {
-  return t.is_cuda() ? c10::cuda::getCurrentCUDAStream(t.device().index()).stream() : nullptr;
+  return t.is_cuda() ? (CUstream)c10::cuda::getCurrentCUDAStream(t.device().index()).stream() : nullptr;
 }
 
 // ============================================================================

@@ -2,19 +2,18 @@
 
 #pragma once
 
+#include "cuda_loader.h"
 #include "logging.h"
 
 #include "fmt/printf.h"
-
-#include <cuda.h>
-#include <nvml.h>
-#include <nvrtc.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
 namespace moodist {
+
+using namespace cuda;
 
 void* numa_alloc_onnode(size_t bytes, int node);
 void* numa_alloc_local(size_t bytes);
@@ -74,16 +73,24 @@ struct CudaError : std::runtime_error {
 };
 
 [[noreturn]] [[gnu::cold]] inline void throwNvrtc(nvrtcResult error, const char* file, int line) {
-  throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, nvrtcGetErrorString(error)));
+  const char* str = "unknown nvrtc error";
+  if (nvrtcApi.getErrorString) {
+    str = nvrtcApi.getErrorString(error);
+  }
+  throw std::runtime_error(fmt::sprintf("%s:%d: nvrtc error %d %s", file, line, error, str));
 }
 [[noreturn]] [[gnu::cold]] inline void throwCu(CUresult error, const char* file, int line) {
   const char* str = "unknown cuda error";
-  cuGetErrorString(error, &str);
+  if (cudaApi.getErrorString) {
+    cudaApi.getErrorString(error, &str);
+  }
   throw CudaError(error, fmt::sprintf("%s:%d: cuda error %d: %s", file, line, error, str));
 }
 [[noreturn]] [[gnu::cold]] inline void throwNvml(nvmlReturn_t error, const char* file, int line) {
   const char* str = "unknown nvml error";
-  str = nvmlErrorString(error);
+  if (nvmlApi.errorString) {
+    str = nvmlApi.errorString(error);
+  }
   throw std::runtime_error(fmt::sprintf("%s:%d: nvml error %d: %s", file, line, error, str));
 }
 

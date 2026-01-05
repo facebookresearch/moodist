@@ -65,6 +65,10 @@ void Group::init(Function<void()> f) {
 
   auto start = std::chrono::steady_clock::now();
 
+  if (!loadCuda()) {
+    throw std::runtime_error("CUDA driver not available");
+  }
+
   deviceIndex = wrapperApi.cudaCurrentDevice();
   pid = ::getpid();
 
@@ -95,7 +99,10 @@ void Group::init(Function<void()> f) {
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   log.verbose("device async engines: %d\n", asyncEngines);
 
-  CHECK_NVML(nvmlInit_v2());
+  if (!loadNvml()) {
+    throw std::runtime_error("NVML not available");
+  }
+  CHECK_NVML(nvmlApi.init());
 
   std::array<char, 0x400> cudaPciBus;
   CHECK_CU(cuDeviceGetPCIBusId(cudaPciBus.data(), cudaPciBus.size(), cuDevice));
@@ -118,19 +125,19 @@ void Group::init(Function<void()> f) {
   log.debug("cuda path is %s\n", cudaPath);
 
   nvmlDevice_t nvmlDevice;
-  CHECK_NVML(nvmlDeviceGetHandleByPciBusId_v2(cudaPciBus.data(), &nvmlDevice));
+  CHECK_NVML(nvmlApi.deviceGetHandleByPciBusId(cudaPciBus.data(), &nvmlDevice));
 
   std::vector<std::string> allCudaPaths;
 
   bool localCudaDeviceFound = false;
   size_t localAllCudaPathsIndex = 0;
   unsigned int deviceCount = 0;
-  CHECK_NVML(nvmlDeviceGetCount(&deviceCount));
+  CHECK_NVML(nvmlApi.deviceGetCount(&deviceCount));
   for (unsigned int i = 0; i != deviceCount; ++i) {
     nvmlDevice_t device;
-    CHECK_NVML(nvmlDeviceGetHandleByIndex_v2(i, &device));
+    CHECK_NVML(nvmlApi.deviceGetHandleByIndex(i, &device));
     nvmlPciInfo_t pciInfo;
-    CHECK_NVML(nvmlDeviceGetPciInfo_v3(device, &pciInfo));
+    CHECK_NVML(nvmlApi.deviceGetPciInfo(device, &pciInfo));
     std::string path = getDevicePath(pciInfo.busIdLegacy);
     allCudaPaths.push_back(path);
     if (path == cudaPath) {
@@ -144,7 +151,7 @@ void Group::init(Function<void()> f) {
   }
 
   unsigned long nodeSet = 0;
-  CHECK_NVML(nvmlDeviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
+  CHECK_NVML(nvmlApi.deviceGetMemoryAffinity(nvmlDevice, 1, &nodeSet, NVML_AFFINITY_SCOPE_NODE));
 
   for (unsigned int i = 0; i != 64; ++i) {
     if (nodeSet & (1ull << i)) {
@@ -203,9 +210,9 @@ void Group::init(Function<void()> f) {
             fmt::sprintf("Rank %d and %d share the same CUDA device! (%s)", rank, i, std::string(cudaPciBus.data())));
       }
       nvmlDevice_t peerDevice;
-      if (nvmlDeviceGetHandleByPciBusId_v2(allRanksCudaPciBus.at(i).c_str(), &peerDevice) == NVML_SUCCESS) {
+      if (nvmlApi.deviceGetHandleByPciBusId(allRanksCudaPciBus.at(i).c_str(), &peerDevice) == NVML_SUCCESS) {
         nvmlGpuP2PStatus_t status = NVML_P2P_STATUS_UNKNOWN;
-        CHECK_NVML(nvmlDeviceGetP2PStatus(nvmlDevice, peerDevice, NVML_P2P_CAPS_INDEX_NVLINK, &status));
+        CHECK_NVML(nvmlApi.deviceGetP2PStatus(nvmlDevice, peerDevice, NVML_P2P_CAPS_INDEX_NVLINK, &status));
         if (status == NVML_P2P_STATUS_OK) {
           log.debug("rank %d: connected to local rank %d through nvlink\n", rank, i);
           localNvlink[i] = 1;

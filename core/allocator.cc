@@ -1109,6 +1109,10 @@ void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
 CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
   std::lock_guard l(impl->mutex);
 
+  if (!loadCuda()) {
+    throw std::runtime_error("CUDA driver not available");
+  }
+
   // Initialize CUDA context on first allocation
   if (impl->deviceIndex == -1) {
     if (deviceIndex == -1) {

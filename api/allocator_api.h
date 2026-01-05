@@ -7,10 +7,19 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cuda.h>
 #include <utility>
 
+// Forward declare CUstream in global namespace for cuda.h compatibility
+struct CUstream_st;
+typedef CUstream_st* CUstream;
+
+namespace moodist::cuda {
+using CUstream = ::CUstream;
+} // namespace moodist::cuda
+
 namespace moodist {
+
+using namespace cuda;
 
 // Forward declare CudaAllocatorImpl (opaque type in core)
 struct CudaAllocatorImpl;

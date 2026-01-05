@@ -15,10 +15,6 @@
 
 #include "fmt/printf.h"
 
-#include <cuda.h>
-#include <nvml.h>
-#include <nvrtc.h>
-
 #include <deque>
 #include <functional>
 #include <map>

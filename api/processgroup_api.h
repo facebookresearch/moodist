@@ -9,10 +9,11 @@
 #include "tensor_ptr.h"
 #include "types.h"
 
-#include <cuda.h>
 #include <span>
 
 namespace moodist {
+
+using namespace cuda;
 
 // Factory function - returns ApiHandle (ownership via RVO)
 // c10dStore is opaque pointer to c10d::Store - core calls back via WrapperApi for store ops

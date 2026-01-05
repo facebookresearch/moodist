@@ -17,16 +17,9 @@
 #include <string_view>
 #include <vector>
 
-// CUDA types - use forward declarations if cuda.h not available
-#ifdef __CUDA_API_VERSION
-// cuda.h already included
-#else
-// Forward declare CUDA types for headers that don't need full CUDA
-struct CUstream_st;
-typedef CUstream_st* CUstream;
-#endif
-
 namespace moodist {
+
+using namespace cuda;
 
 // Forward declarations (opaque types)
 struct Tensor;            // Opaque wrapper for torch::Tensor
