@@ -708,16 +708,18 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 
   auto* pg = get_ptr<MoodistProcessGroup>(self);
   try {
-    // Parse shape (list of ints)
+    // Parse shape (list or tuple of ints)
     std::vector<int> shape;
-    if (!PyList_Check(shape_obj)) {
-      PyErr_SetString(PyExc_TypeError, "shape must be a list of ints");
+    if (!PyList_Check(shape_obj) && !PyTuple_Check(shape_obj)) {
+      PyErr_SetString(PyExc_TypeError, "shape must be a list or tuple of ints");
       return nullptr;
     }
-    Py_ssize_t shape_len = PyList_Size(shape_obj);
+    Py_ssize_t shape_len = PySequence_Size(shape_obj);
     shape.reserve(shape_len);
     for (Py_ssize_t i = 0; i < shape_len; ++i) {
-      shape.push_back(PyLong_AsLong(PyList_GetItem(shape_obj, i)));
+      PyObject* item = PySequence_GetItem(shape_obj, i);
+      shape.push_back(PyLong_AsLong(item));
+      Py_DECREF(item);
     }
 
     // Parse dtype - get torch.dtype from the Python object
@@ -785,13 +787,15 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 
         auto parse_int_list = [](PyObject* obj) -> std::vector<int> {
           std::vector<int> vec;
-          if (!PyList_Check(obj)) {
+          if (!PyList_Check(obj) && !PyTuple_Check(obj)) {
             return vec;
           }
-          Py_ssize_t len = PyList_Size(obj);
+          Py_ssize_t len = PySequence_Size(obj);
           vec.reserve(len);
           for (Py_ssize_t i = 0; i < len; ++i) {
-            vec.push_back(PyLong_AsLong(PyList_GetItem(obj, i)));
+            PyObject* item = PySequence_GetItem(obj, i);
+            vec.push_back(PyLong_AsLong(item));
+            Py_DECREF(item);
           }
           return vec;
         };
