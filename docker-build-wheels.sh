@@ -17,7 +17,7 @@ dnf install -y cuda-toolkit-12
 build_python="cp310-cp310"
 
 # Python versions for serialize library (needs to match Python minor versions)
-serialize_python_versions="cp310-cp310 cp311-cp311 cp312-cp312 cp314-cp314"
+serialize_python_versions="cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314"
 
 torch_versions="2.7 2.8 2.9"
 
