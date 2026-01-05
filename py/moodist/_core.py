@@ -10,18 +10,17 @@ from .version import __version__, cversions
 
 _torchversion = torch.__version__
 
-_found = False
 _C = None
 for _k, _v in cversions.items():
-    if _torchversion.startswith(_k):
-        assert not _found, "Moodist matched multiple pytorch versions? %s %s" % (
-            _torchversion,
-            list(cversions.keys()),
-        )
+    if _torchversion.startswith(_k + ".") or _torchversion == _k:
+        if _C is not None:
+            raise RuntimeError(
+                "Moodist matched multiple pytorch versions: %s matches %s"
+                % (_torchversion, list(cversions.keys()))
+            )
         _C = importlib.import_module(_v, "moodist")
-        _found = True
 
-if not _found:
+if _C is None:
     raise RuntimeError(
         "Moodist was not built for the currently installed pytorch version."
         " Found pytorch %s. Moodist was built for: %s"
