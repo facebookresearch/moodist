@@ -258,6 +258,9 @@ struct CoreApi {
   // Profiling
   void (*setProfilingEnabled)(bool enabled);
   bool (*getProfilingEnabled)();
+
+  // CUDA copy with host memory registration
+  void (*cudaCopy)(uintptr_t dst, uintptr_t src, size_t bytes, CUstream stream);
 };
 
 } // namespace moodist

@@ -7,6 +7,7 @@
 #include "api/cpu_allocator.h"
 #include "api/processgroup_api.h"
 #include "api/store_api.h"
+#include "cuda_copy.h"
 
 namespace moodist {
 
@@ -163,6 +164,9 @@ static CoreApi coreApi = {
     // Profiling
     .setProfilingEnabled = setProfilingEnabled,
     .getProfilingEnabled = getProfilingEnabled,
+
+    // CUDA copy
+    .cudaCopy = cudaCopy,
 };
 
 } // namespace moodist

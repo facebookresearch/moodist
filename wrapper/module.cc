@@ -14,6 +14,7 @@
 
 // PyTorch headers (C++ - not affected by Py_LIMITED_API)
 #include <ATen/ATen.h> // For at::Tensor, torch::from_blob, etc.
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/MaybeOwned.h>
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -752,7 +753,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
       Py_ssize_t len = PyList_Size(list);
       result.reserve(len);
       for (Py_ssize_t i = 0; i < len; ++i) {
-        PyObject* item = PyList_GetItem(list, i);  // Borrowed reference
+        PyObject* item = PyList_GetItem(list, i); // Borrowed reference
         if (!PyTuple_Check(item) || PyTuple_Size(item) != 3) {
           PyErr_SetString(PyExc_TypeError, "Each item must be a tuple of (rank, src_offsets, dst_offsets)");
           return {};
@@ -1352,9 +1353,74 @@ static PyObject* py_enable_cpu_allocator(PyObject* self, PyObject* args) {
   }
 }
 
+static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* dst_obj = nullptr;
+  PyObject* src_obj = nullptr;
+
+  if (!PyArg_ParseTuple(args, "OO", &dst_obj, &src_obj)) {
+    return nullptr;
+  }
+
+  if (!THPVariable_Check(dst_obj)) {
+    auto type_name = get_type_name(dst_obj);
+    if (type_name) {
+      PyErr_Format(PyExc_TypeError, "cuda_copy: expected tensor for dst, got %S", type_name.get());
+    } else {
+      PyErr_SetString(PyExc_TypeError, "cuda_copy: expected tensor for dst");
+    }
+    return nullptr;
+  }
+  if (!THPVariable_Check(src_obj)) {
+    auto type_name = get_type_name(src_obj);
+    if (type_name) {
+      PyErr_Format(PyExc_TypeError, "cuda_copy: expected tensor for src, got %S", type_name.get());
+    } else {
+      PyErr_SetString(PyExc_TypeError, "cuda_copy: expected tensor for src");
+    }
+    return nullptr;
+  }
+
+  try {
+    const auto& dst = THPVariable_Unpack(dst_obj);
+    const auto& src = THPVariable_Unpack(src_obj);
+
+    if (!dst.is_contiguous()) {
+      throw std::runtime_error("cuda_copy: dst tensor must be contiguous");
+    }
+    if (!src.is_contiguous()) {
+      throw std::runtime_error("cuda_copy: src tensor must be contiguous");
+    }
+
+    size_t dst_bytes = dst.element_size() * dst.numel();
+    size_t src_bytes = src.element_size() * src.numel();
+    if (dst_bytes != src_bytes) {
+      throw std::runtime_error(
+          "cuda_copy: dst is " + std::to_string(dst_bytes) + " bytes, but src is " + std::to_string(src_bytes) + " bytes");
+    }
+
+    uintptr_t dst_addr = (uintptr_t)dst.mutable_data_ptr();
+    uintptr_t src_addr = (uintptr_t)src.const_data_ptr();
+    CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    {
+      GilRelease gil;
+      moodist::coreApi.cudaCopy(dst_addr, src_addr, dst_bytes, stream);
+    }
+
+    Py_RETURN_NONE;
+  } catch (const moodist::PythonErrorAlreadySet&) {
+    return nullptr;
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
+}
+
 static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Returns a greeting"},
     {"enable_cuda_allocator", py_enable_cuda_allocator, METH_NOARGS, "Enable moodist CUDA allocator"},
     {"enable_cpu_allocator", py_enable_cpu_allocator, METH_NOARGS, "Enable moodist CPU allocator"},
+    {"cuda_copy", py_cuda_copy, METH_VARARGS, "Copy tensor using moodist memory registration"},
     {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
     {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},
     {nullptr, nullptr, 0, nullptr}};

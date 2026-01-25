@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.h"
+#include "cuda_loader.h"
 #include "hash_map.h"
 
 namespace moodist {
@@ -43,6 +44,7 @@ inline void copy(uintptr_t dstAddress, uintptr_t srcAddress, size_t bytes, CUstr
 } // namespace cuda_copy
 
 inline void cudaCopy(uintptr_t dstAddress, uintptr_t srcAddress, size_t bytes, CUstream stream) {
+  cuda::loadCuda();
   cuda_copy::copy(dstAddress, srcAddress, bytes, stream);
 }
 
