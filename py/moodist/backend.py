@@ -72,12 +72,55 @@ def find_process_group(name: str):
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    """Create a MoodistProcessGroup and register it by name."""
+    """Create a MoodistProcessGroup and register it by name.
+
+    Returns the MoodistProcessGroup directly (with custom methods available).
+    Also pre-registers the pybind11 wrapper in PyTorch's _world so that
+    DeviceMesh lookups via _resolve_process_group succeed.
+    """
     if MoodistProcessGroup is None:
         raise RuntimeError("MoodistProcessGroup not available in this build")
-    obj = MoodistProcessGroup(store, rank, size)
-    _name_to_group[obj.moodist_name()] = obj
-    return obj
+
+    from torch._C._distributed_c10d import (
+        _register_process_group,
+        _resolve_process_group,
+        _unregister_process_group,
+    )
+    from torch.distributed import distributed_c10d as c10d
+
+    # Create the moodist ProcessGroup
+    moodist_obj = MoodistProcessGroup(store, rank, size)
+    temp_name = f"__moodist_temp_{id(moodist_obj)}"
+
+    # Register temporarily to cache pybind11 wrapper in PyTorch's instance registry.
+    # This ensures future _resolve_process_group calls return a consistent wrapper.
+    _register_process_group(temp_name, moodist_obj)
+    wrapper = _resolve_process_group(temp_name)
+    _unregister_process_group(temp_name)
+
+    # Pre-register the wrapper in key _world dicts.
+    # This ensures that get_backend(), get_rank(), functional collectives, etc. work.
+    # Note: We use a temp group_name here - PyTorch will overwrite it later with the real one.
+    rank_mapping = {i: i for i in range(size)}  # Identity mapping for default/new groups
+    temp_group_name = f"__temp_moodist_{id(wrapper)}"
+
+    c10d._world.pg_map[wrapper] = ("moodist", store)
+    c10d._world.pg_names[wrapper] = temp_group_name
+    c10d._world.pg_group_ranks[wrapper] = rank_mapping
+    c10d._world.pg_backend_config[wrapper] = "moodist"
+
+    # Register cleanup callback to remove wrapper when moodist_obj is destroyed.
+    def cleanup_wrapper():
+        c10d._world.pg_map.pop(wrapper, None)
+        c10d._world.pg_names.pop(wrapper, None)
+        c10d._world.pg_group_ranks.pop(wrapper, None)
+        c10d._world.pg_backend_config.pop(wrapper, None)
+        # Tags are managed by PyTorch, skip for wrapper
+
+    weakref.finalize(moodist_obj, cleanup_wrapper)
+
+    _name_to_group[moodist_obj.moodist_name()] = moodist_obj
+    return moodist_obj
 
 
 def rendezvous_handler(
