@@ -337,3 +337,80 @@ def test_pg_scatter_non_zero_root(ctx: TestContext, device: str):
         f"scatter with root={root_rank} mismatch: got {output_tensor}, expected {expected}"
     )
 
+
+@test_cpu_cuda
+def test_pg_gather(ctx: TestContext, device: str):
+    """Test gather: all ranks send to root rank which collects all chunks."""
+    pg = create_process_group(ctx)
+
+    chunk_size = 4
+    root_rank = 0
+
+    # Each rank prepares its input tensor with rank-specific data
+    input_tensor = torch.full((chunk_size,), float(ctx.rank * 10), device=device, dtype=torch.float32)
+
+    # Root rank prepares output list
+    if ctx.rank == root_rank:
+        gather_list = [
+            torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+            for _ in range(ctx.world_size)
+        ]
+    else:
+        gather_list = None
+
+    # Run gather
+    from torch.distributed import GatherOptions
+    opts = GatherOptions()
+    opts.rootRank = root_rank
+    work = pg.gather([gather_list] if gather_list else [], [input_tensor], opts)
+    work.wait()
+
+    # Root rank should have all chunks
+    if ctx.rank == root_rank:
+        for r in range(ctx.world_size):
+            expected = torch.full((chunk_size,), float(r * 10), device=device, dtype=torch.float32)
+            ctx.assert_true(
+                torch.equal(gather_list[r], expected),
+                f"gather result mismatch at rank {r}: got {gather_list[r]}, expected {expected}"
+            )
+
+
+@test_cpu_cuda
+def test_pg_gather_non_zero_root(ctx: TestContext, device: str):
+    """Test gather with a non-zero root rank."""
+    if ctx.world_size < 2:
+        return  # Need at least 2 ranks
+
+    pg = create_process_group(ctx)
+
+    chunk_size = 4
+    root_rank = ctx.world_size - 1  # Use last rank as root
+
+    # Each rank prepares its input tensor with rank-specific data
+    input_tensor = torch.full((chunk_size,), float(ctx.rank * 100 + 7), device=device, dtype=torch.float32)
+
+    # Root rank prepares output list
+    if ctx.rank == root_rank:
+        gather_list = [
+            torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+            for _ in range(ctx.world_size)
+        ]
+    else:
+        gather_list = None
+
+    # Run gather
+    from torch.distributed import GatherOptions
+    opts = GatherOptions()
+    opts.rootRank = root_rank
+    work = pg.gather([gather_list] if gather_list else [], [input_tensor], opts)
+    work.wait()
+
+    # Root rank should have all chunks
+    if ctx.rank == root_rank:
+        for r in range(ctx.world_size):
+            expected = torch.full((chunk_size,), float(r * 100 + 7), device=device, dtype=torch.float32)
+            ctx.assert_true(
+                torch.equal(gather_list[r], expected),
+                f"gather with root={root_rank} mismatch at rank {r}: got {gather_list[r]}, expected {expected}"
+            )
+

@@ -138,6 +138,26 @@ struct ScatterCacheKeyHash {
   }
 };
 
+// Cache key for gather collective (used with compile_op)
+struct GatherCacheKey {
+  size_t numel;
+  DType dtype;
+  int destRank;
+
+  bool operator==(const GatherCacheKey& other) const {
+    return numel == other.numel && dtype == other.dtype && destRank == other.destRank;
+  }
+};
+
+struct GatherCacheKeyHash {
+  size_t operator()(const GatherCacheKey& k) const noexcept {
+    size_t h = std::hash<size_t>{}(k.numel);
+    h ^= std::hash<int>{}(static_cast<int>(k.dtype)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.destRank) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
 struct EventSerializer {
   Event event;
   CUstream stream;
@@ -388,6 +408,9 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
   // Cache for scatter collective compiled ops
   HashMap<ScatterCacheKey, SharedPtr<CustomOpImpl>, ScatterCacheKeyHash> scatterCache;
+
+  // Cache for gather collective compiled ops
+  HashMap<GatherCacheKey, SharedPtr<CustomOpImpl>, GatherCacheKeyHash> gatherCache;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
 
@@ -2287,69 +2310,67 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
 // ============================================================================
 
 void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
-  std::unique_lock l(threadUnsafe);
-
-  uint32_t stepValue = getNextStepValue();
-  uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-  CHECK(stepValue < 0x80000000);
-
   CHECK(destRank >= 0 && static_cast<size_t>(destRank) < size);
+
+  // Validate outputs
   if (static_cast<size_t>(destRank) == rank) {
     CHECK(outputs.size() == size);
+    for (auto& output : outputs) {
+      CHECK(output.is_contiguous());
+    }
   } else {
     CHECK(outputs.empty());
   }
 
   CHECK(input.is_contiguous());
-  for (auto& output : outputs) {
-    CHECK(output.is_contiguous());
-  }
 
-  bool isCuda = input.is_cuda();
+  size_t numel = static_cast<size_t>(input.numel());
+  DType dtype = input.dtype();
 
-  if (isCuda) {
-    CHECK(input.device_index() == group->deviceIndex);
+  // Validate all outputs have the same numel and dtype as input (on dest rank)
+  if (static_cast<size_t>(destRank) == rank) {
     for (auto& output : outputs) {
-      CHECK(output.is_cuda());
-      CHECK(output.device_index() == group->deviceIndex);
+      CHECK(static_cast<size_t>(output.numel()) == numel);
+      CHECK(output.dtype() == dtype);
     }
   }
 
-  size_t bytes = static_cast<size_t>(input.numel() * input.itemsize());
+  GatherCacheKey key{numel, dtype, destRank};
 
-  CHECK(bytes > 0);
+  auto it = gatherCache.find(key);
+  if (it == gatherCache.end()) {
+    // Build the compile_op spec
+    // Global shape: 1D with size = world_size * numel
+    std::vector<int> shape = {static_cast<int>(size * numel)};
 
-  uintptr_t inputAddress = (uintptr_t)input.data_ptr();
-
-  if (!isCuda) {
-    StreamData& sd = group->getStreamData(nullptr);
-    std::atomic_uint32_t cpuDone = 0;
-
-    QueueEntryGatherCpu* e = group->cpuThread->freelistGatherCpu.pop();
-    e->task = taskGatherCpu;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->inputAddress = inputAddress;
-
-    e->outputList.resize(outputs.size());
-    for (size_t i = 0; i < outputs.size(); ++i) {
-      auto& output = outputs[i];
-      e->outputList[i] = {(uintptr_t)output.data_ptr(), static_cast<size_t>(output.itemsize() * output.numel())};
+    // Inputs: each rank provides one input at offset [rank * numel] with shape [numel]
+    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> inputSpecs;
+    for (size_t i = 0; i < size; ++i) {
+      inputSpecs.emplace_back(static_cast<int>(i), std::vector<int>{static_cast<int>(i * numel)},
+          std::vector<int>{static_cast<int>(numel)});
     }
 
-    e->bytes = bytes;
-    e->destinationRank = static_cast<uint32_t>(destRank);
-    e->cpuDone = &cpuDone;
-    group->cpuThread->enqueue(e);
-    l.unlock();
-    while (cpuDone == 0) {
-      futexWait(&cpuDone, 0, std::chrono::seconds(10));
+    // Outputs: dest rank receives world_size outputs, each at offset [i * numel] with shape [numel]
+    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> outputSpecs;
+    for (size_t i = 0; i < size; ++i) {
+      outputSpecs.emplace_back(
+          destRank, std::vector<int>{static_cast<int>(i * numel)}, std::vector<int>{static_cast<int>(numel)});
     }
-    return;
+
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
+    it = gatherCache.insert({key, std::move(compiled)}).first;
   }
 
-  throw std::runtime_error("CUDA gather is not yet supported :(");
+  CustomOpImpl* op = it->second.get();
+
+  // Execute the compiled op
+  // inputs: each rank passes 1 tensor (as a const, need to cast)
+  // outputs: dest rank passes world_size tensors, others pass empty
+  TensorPtr inputCopy = input; // Need non-const for the call
+  SharedPtr<ApiFuture> future = op->call(&inputCopy, 1, outputs.data(), outputs.size(), stream);
+
+  // Wait for completion
+  futureWait(future.get(), stream);
 }
 
 // ============================================================================
