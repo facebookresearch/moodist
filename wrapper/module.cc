@@ -1395,8 +1395,8 @@ static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
     size_t dst_bytes = dst.element_size() * dst.numel();
     size_t src_bytes = src.element_size() * src.numel();
     if (dst_bytes != src_bytes) {
-      throw std::runtime_error(
-          "cuda_copy: dst is " + std::to_string(dst_bytes) + " bytes, but src is " + std::to_string(src_bytes) + " bytes");
+      throw std::runtime_error("cuda_copy: dst is " + std::to_string(dst_bytes) + " bytes, but src is " +
+                               std::to_string(src_bytes) + " bytes");
     }
 
     uintptr_t dst_addr = (uintptr_t)dst.mutable_data_ptr();

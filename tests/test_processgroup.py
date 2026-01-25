@@ -262,3 +262,78 @@ def test_pg_barrier(ctx: TestContext):
         work = pg.barrier()
         work.wait()
 
+
+@test_cpu_cuda
+def test_pg_scatter(ctx: TestContext, device: str):
+    """Test scatter: root rank distributes different chunks to each rank."""
+    pg = create_process_group(ctx)
+
+    chunk_size = 4
+    root_rank = 0
+
+    # Root rank prepares scatter_list with different data for each rank
+    if ctx.rank == root_rank:
+        scatter_list = [
+            torch.full((chunk_size,), float(r * 10), device=device, dtype=torch.float32)
+            for r in range(ctx.world_size)
+        ]
+    else:
+        scatter_list = None
+
+    # Output tensor for this rank
+    output_tensor = torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+
+    # Run scatter
+    from torch.distributed import ScatterOptions
+    opts = ScatterOptions()
+    opts.rootRank = root_rank
+    work = pg.scatter([output_tensor], [scatter_list] if scatter_list else [], opts)
+    work.wait()
+
+    # Each rank should receive its designated chunk
+    expected = torch.full((chunk_size,), float(ctx.rank * 10), device=device, dtype=torch.float32)
+
+    ctx.assert_true(
+        torch.equal(output_tensor, expected),
+        f"scatter result mismatch: got {output_tensor}, expected {expected}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_scatter_non_zero_root(ctx: TestContext, device: str):
+    """Test scatter with a non-zero root rank."""
+    if ctx.world_size < 2:
+        return  # Need at least 2 ranks
+
+    pg = create_process_group(ctx)
+
+    chunk_size = 4
+    root_rank = ctx.world_size - 1  # Use last rank as root
+
+    # Root rank prepares scatter_list with different data for each rank
+    if ctx.rank == root_rank:
+        scatter_list = [
+            torch.full((chunk_size,), float(r * 100 + 7), device=device, dtype=torch.float32)
+            for r in range(ctx.world_size)
+        ]
+    else:
+        scatter_list = None
+
+    # Output tensor for this rank
+    output_tensor = torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+
+    # Run scatter
+    from torch.distributed import ScatterOptions
+    opts = ScatterOptions()
+    opts.rootRank = root_rank
+    work = pg.scatter([output_tensor], [scatter_list] if scatter_list else [], opts)
+    work.wait()
+
+    # Each rank should receive its designated chunk
+    expected = torch.full((chunk_size,), float(ctx.rank * 100 + 7), device=device, dtype=torch.float32)
+
+    ctx.assert_true(
+        torch.equal(output_tensor, expected),
+        f"scatter with root={root_rank} mismatch: got {output_tensor}, expected {expected}"
+    )
+

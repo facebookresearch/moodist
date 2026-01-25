@@ -325,8 +325,8 @@ struct CustomOpDescriptor {
   };
 
   struct LocalCopy {
-    uint32_t gatewayRank;         // global rank of gateway
-    uint32_t gatewayOutputIndex;  // gateway's output tensor
+    uint32_t gatewayRank;        // global rank of gateway
+    uint32_t gatewayOutputIndex; // gateway's output tensor
     size_t gatewayOutputOffset;
     size_t bytes;
     uint32_t myOutputIndex;
@@ -335,8 +335,8 @@ struct CustomOpDescriptor {
 
   // Copy directly from a local rank's input tensor (no IB)
   struct LocalInputCopy {
-    uint32_t sourceRank;          // source rank (must be local)
-    uint32_t sourceInputIndex;    // source's input tensor index
+    uint32_t sourceRank;       // source rank (must be local)
+    uint32_t sourceInputIndex; // source's input tensor index
     size_t sourceInputOffset;
     size_t bytes;
     uint32_t myOutputIndex;
@@ -344,10 +344,10 @@ struct CustomOpDescriptor {
   };
 
   IVector<Read> reads;
-  IVector<Read> directReads;              // IB reads with no local sharing
-  IVector<GatewayRead> gatewayReads;      // I fetch via IB for local group
-  IVector<LocalCopy> localCopies;         // I copy from gateway's output via NVLink
-  IVector<LocalInputCopy> localInputCopies;  // I copy from local rank's input via NVLink
+  IVector<Read> directReads;                // IB reads with no local sharing
+  IVector<GatewayRead> gatewayReads;        // I fetch via IB for local group
+  IVector<LocalCopy> localCopies;           // I copy from gateway's output via NVLink
+  IVector<LocalInputCopy> localInputCopies; // I copy from local rank's input via NVLink
   IVector<Copy> inputCopies;
   IVector<Copy> outputCopies;
 

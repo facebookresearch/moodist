@@ -118,6 +118,26 @@ struct Copy2d {
   size_t num;
 };
 
+// Cache key for scatter collective (used with compile_op)
+struct ScatterCacheKey {
+  size_t numel;
+  DType dtype;
+  int sourceRank;
+
+  bool operator==(const ScatterCacheKey& other) const {
+    return numel == other.numel && dtype == other.dtype && sourceRank == other.sourceRank;
+  }
+};
+
+struct ScatterCacheKeyHash {
+  size_t operator()(const ScatterCacheKey& k) const noexcept {
+    size_t h = std::hash<size_t>{}(k.numel);
+    h ^= std::hash<int>{}(static_cast<int>(k.dtype)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.sourceRank) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
 struct EventSerializer {
   Event event;
   CUstream stream;
@@ -299,9 +319,21 @@ Reduction toInternalReduction(ReduceOp op) {
 // ProcessGroupImpl
 // ============================================================================
 
-// Forward declarations for return types used in ProcessGroupImpl
-struct CustomOpImpl;
-struct ApiFuture;
+// ApiFuture - API boundary wrapper for async operations
+struct ApiFuture : api::Future {
+  FutureImplSharedPtr impl;
+  std::vector<TensorPtr> holdTensors; // Keep tensors alive until complete
+  Function<void(CUstream)> waitDoneCallback;
+};
+
+// CustomOpImpl - API boundary wrapper for compiled custom operations
+struct CustomOpImpl : api::CustomOp {
+  // The actual custom op function - returns SharedPtr<ApiFuture>
+  Function<SharedPtr<ApiFuture>(TensorPtr*, size_t, TensorPtr*, size_t, CUstream)> call;
+};
+
+// Forward declaration for futureWait (defined later, used by scatter)
+void futureWait(api::Future* future, CUstream stream);
 
 struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
@@ -353,6 +385,9 @@ struct ProcessGroupImpl : api::ProcessGroup {
   uint32_t activeId = 0;
 
   uint32_t nextCustomOpId = 1;
+
+  // Cache for scatter collective compiled ops
+  HashMap<ScatterCacheKey, SharedPtr<CustomOpImpl>, ScatterCacheKeyHash> scatterCache;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
 
@@ -2187,8 +2222,64 @@ void ProcessGroupImpl::barrier() {
 // ============================================================================
 
 void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
-  // Scatter is not yet implemented in core
-  throw std::runtime_error("scatter is not yet supported :(");
+  CHECK(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size);
+
+  // Validate inputs
+  if (static_cast<size_t>(sourceRank) == rank) {
+    CHECK(inputs.size() == size);
+    for (auto& input : inputs) {
+      CHECK(input.is_contiguous());
+    }
+  } else {
+    CHECK(inputs.empty());
+  }
+
+  CHECK(output.is_contiguous());
+
+  size_t numel = static_cast<size_t>(output.numel());
+  DType dtype = output.dtype();
+
+  // Validate all inputs have the same numel and dtype as output (on source rank)
+  if (static_cast<size_t>(sourceRank) == rank) {
+    for (auto& input : inputs) {
+      CHECK(static_cast<size_t>(input.numel()) == numel);
+      CHECK(input.dtype() == dtype);
+    }
+  }
+
+  ScatterCacheKey key{numel, dtype, sourceRank};
+
+  auto it = scatterCache.find(key);
+  if (it == scatterCache.end()) {
+    // Build the compile_op spec
+    // Global shape: 1D with size = world_size * numel
+    std::vector<int> shape = {static_cast<int>(size * numel)};
+
+    // Inputs: source rank provides world_size inputs, each at offset [i * numel] with shape [numel]
+    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> inputSpecs;
+    for (size_t i = 0; i < size; ++i) {
+      inputSpecs.emplace_back(
+          sourceRank, std::vector<int>{static_cast<int>(i * numel)}, std::vector<int>{static_cast<int>(numel)});
+    }
+
+    // Outputs: each rank receives one output at offset [rank * numel] with shape [numel]
+    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> outputSpecs;
+    for (size_t i = 0; i < size; ++i) {
+      outputSpecs.emplace_back(static_cast<int>(i), std::vector<int>{static_cast<int>(i * numel)},
+          std::vector<int>{static_cast<int>(numel)});
+    }
+
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
+    it = scatterCache.insert({key, std::move(compiled)}).first;
+  }
+
+  CustomOpImpl* op = it->second.get();
+
+  // Execute the compiled op
+  SharedPtr<ApiFuture> future = op->call(inputs.data(), inputs.size(), &output, 1, stream);
+
+  // Wait for completion
+  futureWait(future.get(), stream);
 }
 
 // ============================================================================
@@ -2640,14 +2731,8 @@ bool getProfilingEnabled() {
 }
 
 // ============================================================================
-// ApiFuture - API boundary wrapper for async operations
+// ApiFuture functions
 // ============================================================================
-
-struct ApiFuture : api::Future {
-  FutureImplSharedPtr impl;
-  std::vector<TensorPtr> holdTensors; // Keep tensors alive until complete
-  Function<void(CUstream)> waitDoneCallback;
-};
 
 void futureDestroy(api::Future* future) {
   internalDelete(static_cast<ApiFuture*>(future));
@@ -2682,13 +2767,8 @@ void destroy(Future* future) {
 } // namespace api
 
 // ============================================================================
-// CustomOpImpl - API boundary wrapper for compiled custom operations
+// CustomOpImpl functions
 // ============================================================================
-
-struct CustomOpImpl : api::CustomOp {
-  // The actual custom op function - returns SharedPtr<ApiFuture>
-  Function<SharedPtr<ApiFuture>(TensorPtr*, size_t, TensorPtr*, size_t, CUstream)> call;
-};
 
 void customOpDestroy(api::CustomOp* op) {
   internalDelete(static_cast<CustomOpImpl*>(op));
@@ -2771,21 +2851,19 @@ struct LocalReadsPacket {
 
 // Compute NVLink-optimized read plan by splitting overlapping reads
 // into sub-regions for maximum local sharing
-void computeNvlinkPlan(
-    CustomOpDescriptor* op,
-    const IVector<IVector<CustomOpDescriptor::Read>>& allLocalReads,
-    const Vector<size_t>& nodeRanks,      // global ranks on my node
-    size_t myLocalRank,
-    size_t numLocalRanks,
-    const Vector<size_t>& rankLocalRank,  // maps global rank -> local rank index
-    size_t myGlobalRank)
-{
+void computeNvlinkPlan(CustomOpDescriptor* op, const IVector<IVector<CustomOpDescriptor::Read>>& allLocalReads,
+    const Vector<size_t>& nodeRanks, // global ranks on my node
+    size_t myLocalRank, size_t numLocalRanks,
+    const Vector<size_t>& rankLocalRank, // maps global rank -> local rank index
+    size_t myGlobalRank) {
   using Read = CustomOpDescriptor::Read;
 
   // Helper to check if a rank is local
   auto isLocalRank = [&](size_t r) {
     for (size_t lr : nodeRanks) {
-      if (lr == r) return true;
+      if (lr == r) {
+        return true;
+      }
     }
     return false;
   };
@@ -2829,7 +2907,9 @@ void computeNvlinkPlan(
       size_t intervalEnd = boundaries[i + 1];
       size_t intervalBytes = intervalEnd - intervalStart;
 
-      if (intervalBytes == 0) continue;
+      if (intervalBytes == 0) {
+        continue;
+      }
 
       // Find reads that contain this interval
       IVector<ReadRef> containingRefs;
@@ -2841,7 +2921,9 @@ void computeNvlinkPlan(
         }
       }
 
-      if (containingRefs.empty()) continue;
+      if (containingRefs.empty()) {
+        continue;
+      }
 
       // Check if I have a read in this interval
       const ReadRef* myRef = nullptr;
@@ -2852,11 +2934,12 @@ void computeNvlinkPlan(
         }
       }
 
-      if (!myRef) continue;  // I don't need this interval
+      if (!myRef) {
+        continue; // I don't need this interval
+      }
 
       // Compute my sub-read's output offset
-      size_t myOutputOffset = myRef->read->outputOffset +
-                              (intervalStart - myRef->read->inputOffset);
+      size_t myOutputOffset = myRef->read->outputOffset + (intervalStart - myRef->read->inputOffset);
 
       if (sourceIsLocal) {
         // Source is on same node - copy directly from source's input via NVLink
@@ -2918,8 +3001,7 @@ void computeNvlinkPlan(
           }
           CHECK(gatewayRef != nullptr);
 
-          size_t gatewayOutputOffset = gatewayRef->read->outputOffset +
-                                       (intervalStart - gatewayRef->read->inputOffset);
+          size_t gatewayOutputOffset = gatewayRef->read->outputOffset + (intervalStart - gatewayRef->read->inputOffset);
 
           CustomOpDescriptor::LocalCopy lc;
           lc.gatewayRank = static_cast<uint32_t>(gatewayGlobalRank);
@@ -3297,29 +3379,27 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<in
     computeNvlinkPlan(op.get(), allLocalReads, myNode, myLocalRank, numLocalRanks, group->rankLocalRank, rank);
   } else {
     // Single rank on node - all reads are direct
-    op->directReads = op->reads;  // copy, don't move - execution still uses op->reads
+    op->directReads = op->reads; // copy, don't move - execution still uses op->reads
   }
 
   // Log the NVLink plan
   log.info("compile_op plan: rank %zu, directReads=%zu, gatewayReads=%zu, localCopies=%zu, localInputCopies=%zu\n",
-           rank, op->directReads.size(), op->gatewayReads.size(), op->localCopies.size(), op->localInputCopies.size());
+      rank, op->directReads.size(), op->gatewayReads.size(), op->localCopies.size(), op->localInputCopies.size());
   for (const auto& r : op->directReads) {
-    log.info("  directRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n",
-             r.rank, r.inputIndex, r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
+    log.info("  directRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.rank, r.inputIndex,
+        r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
   }
   for (const auto& r : op->gatewayReads) {
-    log.info("  gatewayRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n",
-             r.sourceRank, r.inputIndex, r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
+    log.info("  gatewayRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.sourceRank,
+        r.inputIndex, r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
   }
   for (const auto& lc : op->localCopies) {
-    log.info("  localCopy: gateway=%u gatewayOut=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n",
-             lc.gatewayRank, lc.gatewayOutputIndex, lc.gatewayOutputOffset, lc.bytes,
-             lc.myOutputIndex, lc.myOutputOffset);
+    log.info("  localCopy: gateway=%u gatewayOut=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lc.gatewayRank,
+        lc.gatewayOutputIndex, lc.gatewayOutputOffset, lc.bytes, lc.myOutputIndex, lc.myOutputOffset);
   }
   for (const auto& lic : op->localInputCopies) {
-    log.info("  localInputCopy: src=%u srcInput=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n",
-             lic.sourceRank, lic.sourceInputIndex, lic.sourceInputOffset, lic.bytes,
-             lic.myOutputIndex, lic.myOutputOffset);
+    log.info("  localInputCopy: src=%u srcInput=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lic.sourceRank,
+        lic.sourceInputIndex, lic.sourceInputOffset, lic.bytes, lic.myOutputIndex, lic.myOutputOffset);
   }
 
   // Barrier after queue operations
@@ -3482,7 +3562,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   }
 
   // Handle outputCopies: create temporary tensors that will be copied back after completion
-  Vector<std::pair<TensorPtr, size_t>> outputCopyTensors;  // (temp tensor, original output index)
+  Vector<std::pair<TensorPtr, size_t>> outputCopyTensors; // (temp tensor, original output index)
   for (const auto& x : op->outputCopies) {
     CHECK(x.index < nOutputs);
     // Create empty tensor with the slice shape on the same device as the output
@@ -3526,8 +3606,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     std::vector<TensorPtr> outputsCopy(outputs, outputs + nOutputs);
     auto selfPtr = share(this);
     result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue, anyCuda,
-                                 copyTensors = std::move(outputCopyTensors),
-                                 op, outputsCopy = std::move(outputsCopy)](CUstream stream) {
+                                   copyTensors = std::move(outputCopyTensors), op,
+                                   outputsCopy = std::move(outputsCopy)](CUstream stream) {
       if (anyCuda) {
         selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
         selfPtr->memFlush(stream);
