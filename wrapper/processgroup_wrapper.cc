@@ -297,7 +297,7 @@ void ProcessGroup::shutdown() {
 }
 
 std::string ProcessGroup::moodist_name() const {
-  return "moodist"; // TODO: get from impl if needed
+  return coreApi.processGroupGetName(handle.get());
 }
 
 bool ProcessGroup::getPreferKernelLess() const {

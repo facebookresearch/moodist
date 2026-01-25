@@ -38,6 +38,9 @@ void processGroupSetPreferKernelLess(api::ProcessGroup* pg, bool value);
 int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name);
 void processGroupSetOption(api::ProcessGroup* pg, const char* name, int64_t value);
 
+// Get unique group name
+const char* processGroupGetName(api::ProcessGroup* pg);
+
 // Collective operations - all logic handled in core
 void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
 

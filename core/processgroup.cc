@@ -2487,6 +2487,12 @@ void processGroupSetOption(api::ProcessGroup* pg, const char* name, int64_t valu
   }
 }
 
+const char* processGroupGetName(api::ProcessGroup* pg) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
+  // Return pointer to internal string data - safe as long as ProcessGroup lives
+  return impl->group->name.c_str();
+}
+
 // ============================================================================
 // Collective operations
 // ============================================================================

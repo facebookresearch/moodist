@@ -117,6 +117,7 @@ static CoreApi coreApi = {
     .processGroupSetPreferKernelLess = processGroupSetPreferKernelLess,
     .processGroupGetOption = processGroupGetOption,
     .processGroupSetOption = processGroupSetOption,
+    .processGroupGetName = processGroupGetName,
     .processGroupAllGather = processGroupAllGather,
     .processGroupReduceScatter = processGroupReduceScatter,
     .processGroupAllreduce = processGroupAllreduce,

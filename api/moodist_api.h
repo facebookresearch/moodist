@@ -196,6 +196,7 @@ struct CoreApi {
   void (*processGroupSetPreferKernelLess)(api::ProcessGroup* pg, bool value);
   int64_t (*processGroupGetOption)(api::ProcessGroup* pg, const char* name);
   void (*processGroupSetOption)(api::ProcessGroup* pg, const char* name, int64_t value);
+  const char* (*processGroupGetName)(api::ProcessGroup* pg);
 
   // Collective operations - core handles all logic
   void (*processGroupAllGather)(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
