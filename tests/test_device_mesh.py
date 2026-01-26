@@ -31,6 +31,8 @@ def test_device_mesh_basic(ctx: TestContext):
     errors.
     """
     try:
+        torch.cuda.set_device(ctx.local_rank)
+
         # Initialize via PyTorch's API (not direct MoodistProcessGroup creation)
         store = ctx.create_store(key="device_mesh_basic")
         dist.init_process_group(
@@ -69,6 +71,8 @@ def test_device_mesh_wrapper_registered(ctx: TestContext):
     returns a pybind11 wrapper. Both should be usable for lookups.
     """
     try:
+        torch.cuda.set_device(ctx.local_rank)
+
         store = ctx.create_store(key="device_mesh_identity")
         dist.init_process_group(
             backend="moodist",
@@ -111,6 +115,8 @@ def test_device_mesh_custom_methods(ctx: TestContext):
     custom moodist methods. Use the default_pg directly for moodist-specific APIs.
     """
     try:
+        torch.cuda.set_device(ctx.local_rank)
+
         store = ctx.create_store(key="device_mesh_custom")
         dist.init_process_group(
             backend="moodist",
@@ -162,6 +168,8 @@ def test_device_mesh_custom_methods(ctx: TestContext):
 def test_device_mesh_collective(ctx: TestContext):
     """Test that collectives work through DeviceMesh groups."""
     try:
+        torch.cuda.set_device(ctx.local_rank)
+
         store = ctx.create_store(key="device_mesh_collective")
         dist.init_process_group(
             backend="moodist",
@@ -169,8 +177,6 @@ def test_device_mesh_collective(ctx: TestContext):
             rank=ctx.rank,
             world_size=ctx.world_size,
         )
-
-        torch.cuda.set_device(ctx.local_rank)
 
         device_mesh = dist.device_mesh.init_device_mesh(
             "cuda",
@@ -202,6 +208,8 @@ def test_wrapper_cleanup_on_destroy(ctx: TestContext):
     destroy_process_group is called.
     """
     import gc
+
+    torch.cuda.set_device(ctx.local_rank)
 
     store = ctx.create_store(key="wrapper_cleanup")
     dist.init_process_group(
@@ -263,6 +271,8 @@ def test_single_group_destroy_cleanup(ctx: TestContext):
     """
     import gc
 
+    torch.cuda.set_device(ctx.local_rank)
+
     store = ctx.create_store(key="single_destroy")
     dist.init_process_group(
         backend="moodist",
@@ -305,3 +315,285 @@ def test_single_group_destroy_cleanup(ctx: TestContext):
 
     # Clean up the rest
     dist.destroy_process_group()
+
+
+@test
+def test_dist_scatter_via_init(ctx: TestContext):
+    """Test scatter using torch.distributed.scatter API with proper init."""
+    try:
+        torch.cuda.set_device(ctx.local_rank)
+        device = "cuda"
+
+        store = ctx.create_store(key="dist_scatter")
+        dist.init_process_group(
+            backend="moodist",
+            store=store,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+        )
+
+        chunk_size = 4
+        src_rank = 0
+
+        # Output tensor for this rank
+        output_tensor = torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+
+        # Source rank prepares scatter_list
+        if ctx.rank == src_rank:
+            scatter_list = [
+                torch.full((chunk_size,), float(r * 10), device=device, dtype=torch.float32)
+                for r in range(ctx.world_size)
+            ]
+        else:
+            scatter_list = None
+
+        # Use torch.distributed.scatter
+        dist.scatter(output_tensor, scatter_list, src=src_rank)
+
+        # Verify result
+        expected = torch.full((chunk_size,), float(ctx.rank * 10), device=device, dtype=torch.float32)
+        ctx.assert_true(
+            torch.equal(output_tensor, expected),
+            f"dist.scatter mismatch: got {output_tensor}, expected {expected}"
+        )
+
+    finally:
+        _cleanup_distributed()
+
+
+@test
+def test_dist_gather_via_init(ctx: TestContext):
+    """Test gather using torch.distributed.gather API with proper init."""
+    try:
+        torch.cuda.set_device(ctx.local_rank)
+        device = "cuda"
+
+        store = ctx.create_store(key="dist_gather")
+        dist.init_process_group(
+            backend="moodist",
+            store=store,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+        )
+
+        chunk_size = 4
+        dst_rank = 0
+
+        # Input tensor for this rank
+        input_tensor = torch.full((chunk_size,), float(ctx.rank * 10), device=device, dtype=torch.float32)
+
+        # Dest rank prepares gather_list
+        if ctx.rank == dst_rank:
+            gather_list = [
+                torch.zeros((chunk_size,), device=device, dtype=torch.float32)
+                for _ in range(ctx.world_size)
+            ]
+        else:
+            gather_list = None
+
+        # Use torch.distributed.gather
+        dist.gather(input_tensor, gather_list, dst=dst_rank)
+
+        # Verify result on dest rank
+        if ctx.rank == dst_rank:
+            for r in range(ctx.world_size):
+                expected = torch.full((chunk_size,), float(r * 10), device=device, dtype=torch.float32)
+                ctx.assert_true(
+                    torch.equal(gather_list[r], expected),
+                    f"dist.gather mismatch at rank {r}: got {gather_list[r]}, expected {expected}"
+                )
+
+    finally:
+        _cleanup_distributed()
+
+
+@test
+def test_dtensor_distribute_shard(ctx: TestContext):
+    """Test DTensor distribute_tensor with Shard placement."""
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    try:
+        torch.cuda.set_device(ctx.local_rank)
+        device = "cuda"
+
+        store = ctx.create_store(key="dtensor_shard")
+        dist.init_process_group(
+            backend="moodist",
+            store=store,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+        )
+
+        # Create a 1D device mesh
+        mesh = dist.device_mesh.init_device_mesh(
+            device,
+            (ctx.world_size,),
+            mesh_dim_names=("dp",),
+        )
+
+        # Create a global tensor - rank 0 has the data, others have zeros
+        # (distribute_tensor will scatter from rank 0)
+        global_size = ctx.world_size * 4
+        if ctx.rank == 0:
+            global_tensor = torch.arange(global_size, device=device, dtype=torch.float32)
+        else:
+            global_tensor = torch.zeros(global_size, device=device, dtype=torch.float32)
+
+        # Distribute with Shard(0) placement - this uses scatter internally
+        dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
+
+        # Verify local tensor
+        local_tensor = dtensor.to_local()
+        chunk_size = global_size // ctx.world_size
+        expected_start = ctx.rank * chunk_size
+        expected = torch.arange(expected_start, expected_start + chunk_size, device=device, dtype=torch.float32)
+
+        ctx.assert_true(
+            torch.equal(local_tensor, expected),
+            f"DTensor shard mismatch: got {local_tensor}, expected {expected}"
+        )
+
+    finally:
+        _cleanup_distributed()
+
+
+@test
+def test_dtensor_redistribute(ctx: TestContext):
+    """Test DTensor redistribute from Replicate to Shard."""
+    from torch.distributed.tensor import Shard, Replicate, distribute_tensor
+
+    try:
+        torch.cuda.set_device(ctx.local_rank)
+        device = "cuda"
+
+        store = ctx.create_store(key="dtensor_redistribute")
+        dist.init_process_group(
+            backend="moodist",
+            store=store,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+        )
+
+        mesh = dist.device_mesh.init_device_mesh(
+            device,
+            (ctx.world_size,),
+            mesh_dim_names=("dp",),
+        )
+
+        # Create the same tensor on all ranks
+        tensor_size = ctx.world_size * 4
+        global_tensor = torch.arange(tensor_size, device=device, dtype=torch.float32)
+
+        # First distribute as replicated (no communication needed)
+        dtensor_replicated = distribute_tensor(global_tensor, mesh, [Replicate()])
+
+        # Verify all ranks have the full tensor
+        local_replicated = dtensor_replicated.to_local()
+        ctx.assert_true(
+            torch.equal(local_replicated, global_tensor),
+            f"Replicated DTensor mismatch: got {local_replicated}"
+        )
+
+        # Now redistribute to sharded - this tests the redistribution path
+        dtensor_sharded = dtensor_replicated.redistribute(mesh, [Shard(0)])
+
+        # Verify local shard
+        local_sharded = dtensor_sharded.to_local()
+        chunk_size = tensor_size // ctx.world_size
+        expected_start = ctx.rank * chunk_size
+        expected = torch.arange(expected_start, expected_start + chunk_size, device=device, dtype=torch.float32)
+
+        ctx.assert_true(
+            torch.equal(local_sharded, expected),
+            f"Sharded DTensor mismatch: got {local_sharded}, expected {expected}"
+        )
+
+    finally:
+        _cleanup_distributed()
+
+
+@test
+def test_dtensor_2d_mesh_shard(ctx: TestContext):
+    """Test DTensor distribute_tensor with a 2D mesh and Shard placements.
+
+    This tests the case where the device mesh creates subgroups that are
+    strict subsets of the world. The 1D mesh tests don't catch this because
+    the mesh subgroup equals the default process group.
+
+    With a 2D mesh (e.g., 2x2), init_device_mesh creates row and column
+    subgroups. When distribute_tensor uses Shard placement, it calls
+    mesh_scatter which internally uses get_rank(dim_group). This can fail
+    if the subgroup isn't properly registered with the correct global ranks.
+    """
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    # This test requires exactly 4 ranks for a 2x2 mesh
+    if ctx.world_size != 4:
+        ctx.log(f"Skipping: test requires exactly 4 ranks, got {ctx.world_size}")
+        return
+
+    try:
+        torch.cuda.set_device(ctx.local_rank)
+        device = "cuda"
+
+        store = ctx.create_store(key="dtensor_2d_mesh")
+        dist.init_process_group(
+            backend="moodist",
+            store=store,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+        )
+
+        # Create a 2D device mesh (2x2)
+        # This creates subgroups:
+        # - "a" dimension: 2 groups of 2 (e.g., [0,1] and [2,3] or [0,2] and [1,3])
+        # - "b" dimension: 2 groups of 2 (the other split)
+        mesh = dist.device_mesh.init_device_mesh(
+            device,
+            (2, 2),
+            mesh_dim_names=("a", "b"),
+        )
+
+        # Create a tensor that will be sharded along both dimensions
+        # Shape (4, 8) with Shard(0), Shard(1) on a 2x2 mesh means:
+        # - Each rank gets a (2, 4) local tensor
+        if ctx.rank == 0:
+            global_tensor = torch.arange(4 * 8, device=device, dtype=torch.float32).view(4, 8)
+        else:
+            global_tensor = torch.zeros(4, 8, device=device, dtype=torch.float32)
+
+        # Distribute with sharding on both dimensions
+        # This triggers mesh_scatter on both mesh dimensions
+        placements = [Shard(0), Shard(1)]
+        dtensor = distribute_tensor(global_tensor, mesh, placements)
+
+        # Verify local tensor shape
+        local_tensor = dtensor.to_local()
+        ctx.assert_equal(
+            list(local_tensor.shape), [2, 4],
+            f"Expected local shape [2, 4], got {list(local_tensor.shape)}"
+        )
+
+        # Verify content based on mesh coordinates
+        # The mesh coordinates determine which shard this rank owns
+        mesh_coord = mesh.get_coordinate()
+        ctx.assert_true(
+            mesh_coord is not None,
+            "mesh.get_coordinate() returned None"
+        )
+
+        row, col = mesh_coord
+        # Expected values: row determines which rows (0-1 or 2-3), col determines which cols (0-3 or 4-7)
+        expected_row_start = row * 2
+        expected_col_start = col * 4
+        expected = torch.arange(4 * 8, device=device, dtype=torch.float32).view(4, 8)
+        expected = expected[expected_row_start:expected_row_start + 2, expected_col_start:expected_col_start + 4]
+
+        ctx.assert_true(
+            torch.equal(local_tensor, expected),
+            f"Rank {ctx.rank} (coord {mesh_coord}): got {local_tensor}, expected {expected}"
+        )
+
+    finally:
+        _cleanup_distributed()
+

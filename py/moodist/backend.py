@@ -72,11 +72,38 @@ def find_process_group(name: str):
 def create_moodist_backend(
     store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
 ):
-    """Create a MoodistProcessGroup and register it by name.
+    """Create a MoodistProcessGroup directly.
 
-    Returns the MoodistProcessGroup directly (with custom methods available).
-    Also pre-registers the pybind11 wrapper in PyTorch's _world so that
-    DeviceMesh lookups via _resolve_process_group succeed.
+    This is the public API for creating standalone MoodistProcessGroups that
+    are not managed by PyTorch's distributed module. These groups do not need
+    to be registered in torch.distributed's _world state.
+
+    Args:
+        store: A torch.distributed.Store for coordination
+        rank: This process's rank within the group
+        size: Total number of processes in the group
+        timeout: Timeout for operations
+
+    Returns:
+        A MoodistProcessGroup instance with custom moodist methods available.
+    """
+    if MoodistProcessGroup is None:
+        raise RuntimeError("MoodistProcessGroup not available in this build")
+
+    moodist_obj = MoodistProcessGroup(store, rank, size)
+    _name_to_group[moodist_obj.moodist_name()] = moodist_obj
+    return moodist_obj
+
+
+def _create_pytorch_backend(dist_backend_opts, backend_options):
+    """Create a MoodistProcessGroup for PyTorch's distributed module.
+
+    This is an internal function used by torch.distributed.Backend.register_backend.
+    It uses the extended API to receive global_ranks_in_group, which is needed to
+    correctly register subgroups created by new_group() or DeviceMesh.
+
+    This function also pre-registers the pybind11 wrapper in PyTorch's _world
+    so that DeviceMesh lookups via _resolve_process_group succeed.
     """
     if MoodistProcessGroup is None:
         raise RuntimeError("MoodistProcessGroup not available in this build")
@@ -87,6 +114,12 @@ def create_moodist_backend(
         _unregister_process_group,
     )
     from torch.distributed import distributed_c10d as c10d
+
+    # Extract fields from the extended API options
+    store = dist_backend_opts.store
+    rank = dist_backend_opts.group_rank
+    size = dist_backend_opts.group_size
+    global_ranks = list(dist_backend_opts.global_ranks_in_group)
 
     # Create the moodist ProcessGroup
     moodist_obj = MoodistProcessGroup(store, rank, size)
@@ -101,7 +134,15 @@ def create_moodist_backend(
     # Pre-register the wrapper in key _world dicts.
     # This ensures that get_backend(), get_rank(), functional collectives, etc. work.
     # Note: We use a temp group_name here - PyTorch will overwrite it later with the real one.
-    rank_mapping = {i: i for i in range(size)}  # Identity mapping for default/new groups
+    #
+    # For subgroups (new_group, DeviceMesh), global_ranks contains the global ranks
+    # participating in this group. We need to map global_rank -> group_rank.
+    # For the default group (init_process_group), global_ranks is empty and we use
+    # identity mapping.
+    if global_ranks:
+        rank_mapping = {global_rank: group_rank for group_rank, global_rank in enumerate(global_ranks)}
+    else:
+        rank_mapping = {i: i for i in range(size)}
     temp_group_name = f"__temp_moodist_{id(wrapper)}"
 
     c10d._world.pg_map[wrapper] = ("moodist", store)
@@ -156,7 +197,7 @@ def rendezvous_handler(
 # Register backend with PyTorch distributed (only if MoodistProcessGroup is available)
 if MoodistProcessGroup is not None:
     torch.distributed.Backend.register_backend(
-        "moodist", create_moodist_backend, devices=("cpu", "cuda")
+        "moodist", _create_pytorch_backend, extended_api=True, devices=("cpu", "cuda")
     )
 
 if TcpStore is not None:
