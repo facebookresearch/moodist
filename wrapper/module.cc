@@ -1165,7 +1165,7 @@ static PyMethodDef queue_methods[] = {
     {"put", (PyCFunction)queue_put, METH_VARARGS | METH_KEYWORDS, "Put a tensor into the queue"},
     {"get", (PyCFunction)queue_get, METH_VARARGS | METH_KEYWORDS, "Get a tensor from the queue"},
     {"qsize", queue_qsize, METH_NOARGS, "Get the queue size"},
-    {"wait", queue_wait, METH_VARARGS, "Wait for queue to be empty"},
+    {"wait", queue_wait, METH_VARARGS, "Wait for data to be available in the queue"},
     {"transaction_begin", queue_transaction_begin, METH_NOARGS, "Begin a transaction"},
     {"transaction_cancel", queue_transaction_cancel, METH_VARARGS, "Cancel a transaction"},
     {"transaction_commit", queue_transaction_commit, METH_VARARGS, "Commit a transaction"},

@@ -202,3 +202,54 @@ def test_queue_from_all_ranks(ctx: TestContext, device: str):
 
         # All ranks should be present (order may vary)
         ctx.assert_equal(sorted(received), list(range(ctx.world_size)), "missing ranks")
+
+
+@test_cpu_cuda
+def test_queue_wait(ctx: TestContext, device: str):
+    """Test Queue.wait() waits for data to be available in the queue."""
+    pg = create_process_group(ctx)
+
+    queue = moodist.Queue(pg, location=0)
+
+    if ctx.rank == 0:
+        ctx.assert_true(queue.empty(), "queue should be empty initially")
+
+        # Produce items in a separate thread
+        import threading
+
+        def produce():
+            import time
+            time.sleep(0.1)  # Small delay before producing
+            tensor = torch.tensor([42.0], device=device)
+            queue.put_tensor(tensor)
+
+        producer = threading.Thread(target=produce)
+        producer.start()
+
+        # Wait for data to be available
+        result = queue.wait(None)
+        ctx.assert_true(result, "wait should return True when data is available")
+        ctx.assert_false(queue.empty(), "queue should have items after wait")
+
+        producer.join()
+
+        # Clean up
+        queue.get_tensor()
+
+
+@test
+def test_queue_wait_with_timeout(ctx: TestContext):
+    """Test Queue.wait() with timeout returns False if no data arrives."""
+    pg = create_process_group(ctx)
+
+    queue = moodist.Queue(pg, location=0)
+
+    if ctx.rank == 0:
+        ctx.assert_true(queue.empty(), "queue should be empty initially")
+
+        # Wait with short timeout - should return False since nothing is produced
+        result = queue.wait(0.1)  # 100ms timeout
+        ctx.assert_false(result, "wait should return False when timeout expires with no data")
+        ctx.assert_true(queue.empty(), "queue should still be empty")
+
+

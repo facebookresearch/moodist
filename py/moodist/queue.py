@@ -94,7 +94,7 @@ class Queue:
         return self.impl.qsize() == 0
 
     def wait(self, timeout=None):
-        return self.impl.wait(timeout=timeout)
+        return self.impl.wait(timeout)
 
     def transaction(self):
         return TransactionContextManager(self)
