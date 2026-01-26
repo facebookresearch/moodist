@@ -3404,22 +3404,22 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<in
   }
 
   // Log the NVLink plan
-  log.info("compile_op plan: rank %zu, directReads=%zu, gatewayReads=%zu, localCopies=%zu, localInputCopies=%zu\n",
+  log.debug("compile_op plan: rank %zu, directReads=%zu, gatewayReads=%zu, localCopies=%zu, localInputCopies=%zu\n",
       rank, op->directReads.size(), op->gatewayReads.size(), op->localCopies.size(), op->localInputCopies.size());
   for (const auto& r : op->directReads) {
-    log.info("  directRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.rank, r.inputIndex,
+    log.debug("  directRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.rank, r.inputIndex,
         r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
   }
   for (const auto& r : op->gatewayReads) {
-    log.info("  gatewayRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.sourceRank,
+    log.debug("  gatewayRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.sourceRank,
         r.inputIndex, r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
   }
   for (const auto& lc : op->localCopies) {
-    log.info("  localCopy: gateway=%u gatewayOut=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lc.gatewayRank,
+    log.debug("  localCopy: gateway=%u gatewayOut=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lc.gatewayRank,
         lc.gatewayOutputIndex, lc.gatewayOutputOffset, lc.bytes, lc.myOutputIndex, lc.myOutputOffset);
   }
   for (const auto& lic : op->localInputCopies) {
-    log.info("  localInputCopy: src=%u srcInput=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lic.sourceRank,
+    log.debug("  localInputCopy: src=%u srcInput=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lic.sourceRank,
         lic.sourceInputIndex, lic.sourceInputOffset, lic.bytes, lic.myOutputIndex, lic.myOutputOffset);
   }
 
