@@ -28,6 +28,7 @@ Usage:
 """
 
 import importlib.util
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -238,8 +239,81 @@ def run_with_timeout(timeout: float, remaining_args: list[str], per_rank_logs: b
         time.sleep(0.1)
 
 
-def run_tests(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str | None, log_file) -> bool:
-    """Run the actual tests. Returns True if all passed."""
+def run_file_worker(conn, test_file: Path, start_test_id: int, start_barrier_count: int,
+                    per_rank_logs: bool, test_filter: str | None):
+    """Worker process that runs a single test file.
+
+    Creates its own TestContext (fresh barrier_store connection) and runs the tests.
+    Sends results back via the pipe connection.
+    """
+    from framework import TestRunner, create_context_from_env, get_tests, clear_tests, clear_process_group_cache
+
+    # Create fresh context for this process
+    ctx = create_context_from_env()
+    ctx._barrier_count = start_barrier_count
+    if per_rank_logs:
+        ctx.per_rank_logs = True
+
+    results = []
+    final_test_id = start_test_id
+    final_barrier_count = start_barrier_count
+    file_passed = True
+
+    if not test_file.exists():
+        if ctx.rank == 0 or per_rank_logs:
+            print(f"Test file not found: {test_file}")
+        conn.send((results, final_test_id, ctx._barrier_count, False))
+        conn.close()
+        return
+
+    if ctx.rank == 0 or per_rank_logs:
+        print(f"=== {test_file.name} ===")
+
+    # Clear any previously registered tests and cached process groups
+    clear_tests()
+    clear_process_group_cache()
+
+    # Load the test module
+    try:
+        load_test_module(test_file)
+    except Exception as e:
+        if ctx.rank == 0 or per_rank_logs:
+            print(f"  Failed to load: {e}")
+        conn.send((results, final_test_id, ctx._barrier_count, False))
+        conn.close()
+        return
+
+    # Get tests from this module
+    tests = get_tests()
+    if not tests:
+        if ctx.rank == 0 or per_rank_logs:
+            print("  (no tests found)")
+        conn.send((results, final_test_id, ctx._barrier_count, True))
+        conn.close()
+        return
+
+    # Filter tests if a specific test name was requested
+    if test_filter:
+        tests = [(name, fn) for name, fn in tests if name == test_filter]
+        if not tests:
+            if ctx.rank == 0 or per_rank_logs:
+                print(f"  Test '{test_filter}' not found")
+            conn.send((results, final_test_id, ctx._barrier_count, False))
+            conn.close()
+            return
+
+    # Run the tests
+    runner = TestRunner(ctx, start_test_id=start_test_id)
+    runner.run_all(tests)
+
+    # Send results back
+    file_passed = all(r.passed for r in runner.results)
+    conn.send((runner.results, runner._test_counter, ctx._barrier_count, file_passed))
+    conn.close()
+
+
+def run_tests_inline(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str | None, log_file) -> bool:
+    """Run tests in the current process (no forking). Original behavior."""
     all_passed = True
     runner = TestRunner(ctx)
 
@@ -294,17 +368,67 @@ def run_tests(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str
     return all_passed
 
 
+def run_tests(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str | None, log_file) -> bool:
+    """Run the actual tests. Returns True if all passed."""
+    mp = multiprocessing.get_context('spawn')
+
+    all_results = []
+    all_passed = True
+    cumulative_test_id = 0
+    cumulative_barrier_count = 0
+
+    for test_file in test_files:
+        parent_conn, child_conn = mp.Pipe()
+        p = mp.Process(
+            target=run_file_worker,
+            args=(child_conn, test_file, cumulative_test_id, cumulative_barrier_count,
+                  per_rank_logs, test_filter)
+        )
+        p.start()
+
+        # Receive results from child
+        try:
+            results, final_test_id, final_barrier_count, file_passed = parent_conn.recv()
+            all_results.extend(results)
+            cumulative_test_id = final_test_id
+            cumulative_barrier_count = final_barrier_count
+            if not file_passed:
+                all_passed = False
+        except EOFError:
+            # Child crashed without sending results
+            if ctx.rank == 0 or per_rank_logs:
+                print(f"  Child process crashed for {test_file.name}")
+            all_passed = False
+
+        p.join()
+
+    # Print final summary using TestRunner
+    runner = TestRunner(ctx)
+    runner.results = all_results
+    if not runner.summarize():
+        all_passed = False
+
+    if log_file:
+        log_file.close()
+
+    return all_passed
+
+
 def main():
     # Parse options before creating context (so we can fork early for timeout)
     args = sys.argv[1:]
     per_rank_logs = False
     test_timeout = None
+    no_fork = False
     remaining_args = []
     i = 0
     while i < len(args):
         arg = args[i]
         if arg == "--per-rank-logs":
             per_rank_logs = True
+            remaining_args.append(arg)
+        elif arg == "--no-fork":
+            no_fork = True
             remaining_args.append(arg)
         elif arg == "--timeout":
             i += 1
@@ -332,7 +456,9 @@ def main():
         rank = get_rank_from_env()
         log_file = setup_per_rank_logging(rank, "test_logs")
 
-    ctx = create_context_from_env()
+    # With --no-fork, we need barrier_store since tests run in this process
+    # Without --no-fork, children create their own barrier_store
+    ctx = create_context_from_env(create_barrier_store=no_fork)
 
     if per_rank_logs:
         ctx.per_rank_logs = True
@@ -363,7 +489,10 @@ def main():
         print("No test files found!")
         sys.exit(1)
 
-    all_passed = run_tests(ctx, per_rank_logs, test_files, test_filter, log_file)
+    if no_fork:
+        all_passed = run_tests_inline(ctx, per_rank_logs, test_files, test_filter, log_file)
+    else:
+        all_passed = run_tests(ctx, per_rank_logs, test_files, test_filter, log_file)
     sys.exit(0 if all_passed else 1)
 
 

@@ -240,10 +240,10 @@ class TestResult:
 class TestRunner:
     """Runs tests and collects results."""
 
-    def __init__(self, ctx: TestContext):
+    def __init__(self, ctx: TestContext, start_test_id: int = 0):
         self.ctx = ctx
         self.results: list[TestResult] = []
-        self._test_counter: int = 0
+        self._test_counter: int = start_test_id
 
     def run_test(self, name: str, fn: Callable[[TestContext], None]) -> TestResult:
         """Run a single test, return result."""
@@ -321,10 +321,14 @@ class TestRunner:
         return failed == 0
 
 
-def create_context_from_env() -> TestContext:
-    """Create TestContext from environment variables (torchrun or slurm)."""
+def create_context_from_env(create_barrier_store: bool = True) -> TestContext:
+    """Create TestContext from environment variables (torchrun or slurm).
+
+    Args:
+        create_barrier_store: If True, create a barrier store for synchronization.
+            Set to False for parent processes that only aggregate results.
+    """
     import subprocess
-    import moodist
 
     if "WORLD_SIZE" in os.environ:
         # torchrun style
@@ -351,11 +355,14 @@ def create_context_from_env() -> TestContext:
         rank = 0
         world_size = 1
 
-    # Create barrier store at startup - all ranks are synchronized by torchrun/slurm
-    barrier_store = moodist.TcpStore(
-        master_addr, master_port + 999, "barrier", world_size, rank,
-        timedelta(seconds=120)
-    )
+    barrier_store = None
+    if create_barrier_store:
+        import moodist
+        # Create barrier store at startup - all ranks are synchronized by torchrun/slurm
+        barrier_store = moodist.TcpStore(
+            master_addr, master_port + 999, "barrier", world_size, rank,
+            timedelta(seconds=120)
+        )
 
     return TestContext(
         rank=rank,
