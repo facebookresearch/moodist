@@ -7,19 +7,19 @@ Each rank specifies which slices of a global tensor it contributes (inputs) and 
 These tests require distributed execution (multiple ranks).
 
 NOTE: compile_op requires CUDA tensors (or CPU tensors allocated through moodist's allocator).
-All tests use device="cuda".
+Tests run on both CPU and CUDA via @test_cpu_cuda decorator.
 """
 
 import torch
 import moodist
-from framework import TestContext, test, create_process_group
+from framework import TestContext, test, test_cpu_cuda, create_process_group
 
-# All compile_op tests use CUDA - CPU requires moodist's allocator
-DEVICE = "cuda"
+# Enable CPU allocator so compile_op works with CPU tensors
+moodist.enable_cpu_allocator()
 
 
-@test
-def test_compile_op_point_to_point(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_point_to_point(ctx: TestContext, device: str):
     """Test simple point-to-point: rank 0 sends to rank 1."""
     if ctx.world_size < 2:
         return  # Need at least 2 ranks
@@ -43,10 +43,10 @@ def test_compile_op_point_to_point(ctx: TestContext):
 
     # Execute the op
     if ctx.rank == 0:
-        input_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=DEVICE)
+        input_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)
         future = op([input_tensor], [])
     elif ctx.rank == 1:
-        output_tensor = torch.zeros(4, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(4, dtype=dtype, device=device)
         future = op([], [output_tensor])
     else:
         future = op([], [])
@@ -54,15 +54,15 @@ def test_compile_op_point_to_point(ctx: TestContext):
     future.wait()
 
     if ctx.rank == 1:
-        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=DEVICE)
+        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"got {output_tensor}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_broadcast(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_broadcast(ctx: TestContext, device: str):
     """Test broadcast: rank 0 sends to all ranks."""
     if ctx.world_size < 2:
         return
@@ -86,21 +86,21 @@ def test_compile_op_broadcast(ctx: TestContext):
     # Execute
     input_tensors = []
     if ctx.rank == 0:
-        input_tensors = [torch.arange(8, dtype=dtype, device=DEVICE)]
+        input_tensors = [torch.arange(8, dtype=dtype, device=device)]
 
-    output_tensor = torch.zeros(8, dtype=dtype, device=DEVICE)
+    output_tensor = torch.zeros(8, dtype=dtype, device=device)
     future = op(input_tensors, [output_tensor])
     future.wait()
 
-    expected = torch.arange(8, dtype=dtype, device=DEVICE)
+    expected = torch.arange(8, dtype=dtype, device=device)
     ctx.assert_true(
         torch.equal(output_tensor, expected),
         f"rank {ctx.rank}: got {output_tensor}, expected {expected}"
     )
 
 
-@test
-def test_compile_op_gather(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_gather(ctx: TestContext, device: str):
     """Test gather: all ranks send to rank 0."""
     if ctx.world_size < 2:
         return
@@ -123,11 +123,11 @@ def test_compile_op_gather(ctx: TestContext):
     op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Each rank contributes its rank value
-    input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=DEVICE)
+    input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=device)
 
     output_tensors = []
     if ctx.rank == 0:
-        output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=device)
         output_tensors = [output_tensor]
 
     future = op([input_tensor], output_tensors)
@@ -137,15 +137,15 @@ def test_compile_op_gather(ctx: TestContext):
         # Verify each chunk
         for r in range(ctx.world_size):
             chunk = output_tensor[r * chunk_size : (r + 1) * chunk_size]
-            expected = torch.full((chunk_size,), float(r), dtype=dtype, device=DEVICE)
+            expected = torch.full((chunk_size,), float(r), dtype=dtype, device=device)
             ctx.assert_true(
                 torch.equal(chunk, expected),
                 f"chunk {r}: got {chunk}, expected {expected}"
             )
 
 
-@test
-def test_compile_op_scatter(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_scatter(ctx: TestContext, device: str):
     """Test scatter: rank 0 sends different chunks to each rank."""
     if ctx.world_size < 2:
         return
@@ -171,24 +171,24 @@ def test_compile_op_scatter(ctx: TestContext):
     if ctx.rank == 0:
         # Create input where each chunk has rank-specific data
         input_tensor = torch.cat([
-            torch.full((chunk_size,), float(r * 10), dtype=dtype, device=DEVICE)
+            torch.full((chunk_size,), float(r * 10), dtype=dtype, device=device)
             for r in range(ctx.world_size)
         ])
         input_tensors = [input_tensor]
 
-    output_tensor = torch.zeros(chunk_size, dtype=dtype, device=DEVICE)
+    output_tensor = torch.zeros(chunk_size, dtype=dtype, device=device)
     future = op(input_tensors, [output_tensor])
     future.wait()
 
-    expected = torch.full((chunk_size,), float(ctx.rank * 10), dtype=dtype, device=DEVICE)
+    expected = torch.full((chunk_size,), float(ctx.rank * 10), dtype=dtype, device=device)
     ctx.assert_true(
         torch.equal(output_tensor, expected),
         f"rank {ctx.rank}: got {output_tensor}, expected {expected}"
     )
 
 
-@test
-def test_compile_op_allgather(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_allgather(ctx: TestContext, device: str):
     """Test all-gather pattern: all ranks contribute and receive full tensor."""
     if ctx.world_size < 2:
         return
@@ -206,8 +206,8 @@ def test_compile_op_allgather(ctx: TestContext):
 
     op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
 
-    input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=DEVICE)
-    output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=DEVICE)
+    input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=device)
+    output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=device)
 
     future = op([input_tensor], [output_tensor])
     future.wait()
@@ -215,15 +215,15 @@ def test_compile_op_allgather(ctx: TestContext):
     # Verify all chunks
     for r in range(ctx.world_size):
         chunk = output_tensor[r * chunk_size : (r + 1) * chunk_size]
-        expected = torch.full((chunk_size,), float(r), dtype=dtype, device=DEVICE)
+        expected = torch.full((chunk_size,), float(r), dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(chunk, expected),
             f"chunk {r}: got {chunk}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_2d_tensor(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_2d_tensor(ctx: TestContext, device: str):
     """Test with 2D tensor shape."""
     if ctx.world_size < 2:
         return
@@ -242,8 +242,8 @@ def test_compile_op_2d_tensor(ctx: TestContext):
     op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Input: row with rank-specific values
-    input_tensor = torch.full((1, 4), float(ctx.rank * 10), dtype=dtype, device=DEVICE)
-    output_tensor = torch.zeros(ctx.world_size, 4, dtype=dtype, device=DEVICE)
+    input_tensor = torch.full((1, 4), float(ctx.rank * 10), dtype=dtype, device=device)
+    output_tensor = torch.zeros(ctx.world_size, 4, dtype=dtype, device=device)
 
     future = op([input_tensor], [output_tensor])
     future.wait()
@@ -251,15 +251,15 @@ def test_compile_op_2d_tensor(ctx: TestContext):
     # Verify each row
     for r in range(ctx.world_size):
         row = output_tensor[r]
-        expected = torch.full((4,), float(r * 10), dtype=dtype, device=DEVICE)
+        expected = torch.full((4,), float(r * 10), dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(row, expected),
             f"row {r}: got {row}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_multiple_inputs(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
     """Test with multiple input tensors from same rank."""
     if ctx.world_size < 2:
         return
@@ -289,28 +289,28 @@ def test_compile_op_multiple_inputs(ctx: TestContext):
     input_tensors = []
     if ctx.rank == 0:
         input_tensors = [
-            torch.tensor([1.0, 2.0], dtype=dtype, device=DEVICE),
-            torch.tensor([3.0, 4.0], dtype=dtype, device=DEVICE),
+            torch.tensor([1.0, 2.0], dtype=dtype, device=device),
+            torch.tensor([3.0, 4.0], dtype=dtype, device=device),
         ]
 
     output_tensors = []
     if ctx.rank == 1:
-        output_tensor = torch.zeros(4, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(4, dtype=dtype, device=device)
         output_tensors = [output_tensor]
 
     future = op(input_tensors, output_tensors)
     future.wait()
 
     if ctx.rank == 1:
-        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=DEVICE)
+        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"got {output_tensor}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_different_dtypes(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_different_dtypes(ctx: TestContext, device: str):
     """Test compile_op with different dtypes."""
     if ctx.world_size < 2:
         return
@@ -330,21 +330,21 @@ def test_compile_op_different_dtypes(ctx: TestContext):
 
         input_tensors = []
         if ctx.rank == 0:
-            input_tensors = [torch.tensor([1, 2, 3, 4], dtype=dtype, device=DEVICE)]
+            input_tensors = [torch.tensor([1, 2, 3, 4], dtype=dtype, device=device)]
 
-        output_tensor = torch.zeros(4, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(4, dtype=dtype, device=device)
         future = op(input_tensors, [output_tensor])
         future.wait()
 
-        expected = torch.tensor([1, 2, 3, 4], dtype=dtype, device=DEVICE)
+        expected = torch.tensor([1, 2, 3, 4], dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"dtype {dtype}: got {output_tensor}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_reuse(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_reuse(ctx: TestContext, device: str):
     """Test that compiled op can be reused multiple times."""
     if ctx.world_size < 2:
         return
@@ -366,21 +366,21 @@ def test_compile_op_reuse(ctx: TestContext):
     for i in range(3):
         input_tensors = []
         if ctx.rank == 0:
-            input_tensors = [torch.full((4,), float(i * 10), dtype=dtype, device=DEVICE)]
+            input_tensors = [torch.full((4,), float(i * 10), dtype=dtype, device=device)]
 
-        output_tensor = torch.zeros(4, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(4, dtype=dtype, device=device)
         future = op(input_tensors, [output_tensor])
         future.wait()
 
-        expected = torch.full((4,), float(i * 10), dtype=dtype, device=DEVICE)
+        expected = torch.full((4,), float(i * 10), dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"iteration {i}: got {output_tensor}, expected {expected}"
         )
 
 
-@test
-def test_compile_op_no_inputs_no_outputs(ctx: TestContext):
+@test_cpu_cuda
+def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
     """Test that ranks can have neither inputs nor outputs."""
     if ctx.world_size < 3:
         return  # Need 3 ranks: sender, receiver, bystander
@@ -407,16 +407,16 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext):
     output_tensors = []
 
     if ctx.rank == 0:
-        input_tensors = [torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=DEVICE)]
+        input_tensors = [torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)]
     elif ctx.rank == 1:
-        output_tensor = torch.zeros(4, dtype=dtype, device=DEVICE)
+        output_tensor = torch.zeros(4, dtype=dtype, device=device)
         output_tensors = [output_tensor]
 
     future = op(input_tensors, output_tensors)
     future.wait()
 
     if ctx.rank == 1:
-        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=DEVICE)
+        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"got {output_tensor}, expected {expected}"
