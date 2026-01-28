@@ -117,6 +117,20 @@ struct Vector {
   const T& operator[](size_t index) const {
     return beginptr[index];
   }
+  bool operator==(const Vector& other) const {
+    if (msize != other.msize) {
+      return false;
+    }
+    for (size_t i = 0; i < msize; ++i) {
+      if (beginptr[i] != other.beginptr[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+  bool operator!=(const Vector& other) const {
+    return !(*this == other);
+  }
   void clear() {
     for (auto* i = beginptr; i != endptr; ++i) {
       i->~T();

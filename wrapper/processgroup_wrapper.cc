@@ -346,39 +346,11 @@ Future ProcessGroup::copy(torch::Tensor&, const torch::Tensor&) {
   throw std::runtime_error("copy: not yet implemented");
 }
 
-CustomOp ProcessGroup::compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs) {
-  // Convert torch::Dtype to DType
+CustomOp ProcessGroup::compileOpFull(const std::vector<int64_t>& shape, torch::Dtype dtype,
+    const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& inputs,
+    const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs) {
   DType dType = static_cast<DType>(static_cast<int>(c10::typeMetaToScalarType(c10::scalarTypeToTypeMeta(dtype))));
-
-  // Flatten input/output tuples to arrays
-  std::vector<int> inputRanks, inputOffsets, inputShapes;
-  for (const auto& [rank, offset, shape] : inputs) {
-    inputRanks.push_back(rank);
-    for (int v : offset) {
-      inputOffsets.push_back(v);
-    }
-    for (int v : shape) {
-      inputShapes.push_back(v);
-    }
-  }
-
-  std::vector<int> outputRanks, outputOffsets, outputShapes;
-  for (const auto& [rank, offset, shape] : outputs) {
-    outputRanks.push_back(rank);
-    for (int v : offset) {
-      outputOffsets.push_back(v);
-    }
-    for (int v : shape) {
-      outputShapes.push_back(v);
-    }
-  }
-
-  api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), shape.data(), shape.size(), dType,
-      inputRanks.data(), inputOffsets.data(), inputShapes.data(), inputs.size(), outputRanks.data(),
-      outputOffsets.data(), outputShapes.data(), outputs.size());
-
+  api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), shape, dType, inputs, outputs);
   return CustomOp(std::move(opHandle));
 }
 

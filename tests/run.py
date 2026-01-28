@@ -385,6 +385,7 @@ def run_tests(ctx, per_rank_logs: bool, test_files: list[Path], test_filter: str
                   per_rank_logs, test_filter)
         )
         p.start()
+        child_conn.close()
 
         # Receive results from child
         try:

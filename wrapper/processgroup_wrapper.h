@@ -195,9 +195,9 @@ public:
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out = std::nullopt);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
   std::vector<torch::Tensor> share(const torch::Tensor& input);
-  CustomOp compileOpFull(const std::vector<int>& shape, torch::Dtype dtype,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs);
+  CustomOp compileOpFull(const std::vector<int64_t>& shape, torch::Dtype dtype,
+      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& inputs,
+      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs);
 };
 
 void registerFreeMemoryCallback();

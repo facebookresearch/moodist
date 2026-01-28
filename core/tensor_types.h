@@ -12,7 +12,7 @@ struct TensorData {
   size_t dataBytes;
   int dtype;        // Stores torch::ScalarType value (matches moodist::DType in moodist_api.h)
   size_t itemsize_; // Element size in bytes (stored to avoid dependency on API)
-  std::vector<int64_t> shape;
+  IVector<int64_t> shape;
   bool isCuda;
 
   void clear() {

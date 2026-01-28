@@ -255,7 +255,7 @@ struct QueueEntryQueueRead : QueueEntry {
   uint32_t getKey = 0;
   uint32_t transactionKey = 0;
   size_t queueSize = -1;
-  std::vector<int64_t> tensorShape;
+  IVector<int64_t> tensorShape;
 };
 
 struct QueueEntryQueueReadFinished : QueueEntry {

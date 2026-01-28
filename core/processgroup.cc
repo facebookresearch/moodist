@@ -1006,15 +1006,15 @@ struct ProcessGroupImpl : api::ProcessGroup {
   void cudaBarrier(CUstream stream);
 
   // compileOpFull - compile a distributed tensor operation
-  SharedPtr<CustomOpImpl> compileOpFull(const std::vector<int>& shape, DType dtype,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs);
+  SharedPtr<CustomOpImpl> compileOpFull(std::span<const int64_t> shape, DType dtype,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs);
 
   // Template implementation for compileOpFull - parameterized by ndim
   template<int ndim>
-  SharedPtr<CustomOpImpl> compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
-      const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg);
+  SharedPtr<CustomOpImpl> compileOpFullImpl(std::span<const int64_t> shape_arg, DType dtype,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg);
 
   // customOp - execute a compiled custom operation
   SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
@@ -2276,20 +2276,20 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
   if (it == scatterCache.end()) {
     // Build the compile_op spec
     // Global shape: 1D with size = world_size * numel
-    std::vector<int> shape = {static_cast<int>(size * numel)};
+    std::vector<int64_t> shape = {static_cast<int64_t>(size * numel)};
 
     // Inputs: source rank provides world_size inputs, each at offset [i * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> inputSpecs;
+    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      inputSpecs.emplace_back(
-          sourceRank, std::vector<int>{static_cast<int>(i * numel)}, std::vector<int>{static_cast<int>(numel)});
+      inputSpecs.emplace_back(sourceRank, std::vector<int64_t>{static_cast<int64_t>(i * numel)},
+          std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
     // Outputs: each rank receives one output at offset [rank * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> outputSpecs;
+    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      outputSpecs.emplace_back(static_cast<int>(i), std::vector<int>{static_cast<int>(i * numel)},
-          std::vector<int>{static_cast<int>(numel)});
+      outputSpecs.emplace_back(static_cast<int>(i), std::vector<int64_t>{static_cast<int64_t>(i * numel)},
+          std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
@@ -2298,8 +2298,17 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
 
   CustomOpImpl* op = it->second.get();
 
+  // Flatten inputs and output for compile_op
+  Vector<TensorPtr> flatInputs;
+  flatInputs.reserve(inputs.size());
+  for (auto& input : inputs) {
+    flatInputs.push_back(input.view({static_cast<int64_t>(numel)}));
+  }
+
+  TensorPtr flatOutput = output.view({static_cast<int64_t>(numel)});
+
   // Execute the compiled op
-  SharedPtr<ApiFuture> future = op->call(inputs.data(), inputs.size(), &output, 1, stream);
+  SharedPtr<ApiFuture> future = op->call(flatInputs.data(), flatInputs.size(), &flatOutput, 1, stream);
 
   // Wait for completion
   futureWait(future.get(), stream);
@@ -2341,20 +2350,20 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
   if (it == gatherCache.end()) {
     // Build the compile_op spec
     // Global shape: 1D with size = world_size * numel
-    std::vector<int> shape = {static_cast<int>(size * numel)};
+    std::vector<int64_t> shape = {static_cast<int64_t>(size * numel)};
 
     // Inputs: each rank provides one input at offset [rank * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> inputSpecs;
+    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      inputSpecs.emplace_back(static_cast<int>(i), std::vector<int>{static_cast<int>(i * numel)},
-          std::vector<int>{static_cast<int>(numel)});
+      inputSpecs.emplace_back(static_cast<int>(i), std::vector<int64_t>{static_cast<int64_t>(i * numel)},
+          std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
     // Outputs: dest rank receives world_size outputs, each at offset [i * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> outputSpecs;
+    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      outputSpecs.emplace_back(
-          destRank, std::vector<int>{static_cast<int>(i * numel)}, std::vector<int>{static_cast<int>(numel)});
+      outputSpecs.emplace_back(destRank, std::vector<int64_t>{static_cast<int64_t>(i * numel)},
+          std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
@@ -2363,11 +2372,17 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
 
   CustomOpImpl* op = it->second.get();
 
+  // Flatten input and outputs for compile_op
+  TensorPtr flatInput = input.view({static_cast<int64_t>(numel)});
+
+  Vector<TensorPtr> flatOutputs;
+  flatOutputs.reserve(outputs.size());
+  for (auto& output : outputs) {
+    flatOutputs.push_back(output.view({static_cast<int64_t>(numel)}));
+  }
+
   // Execute the compiled op
-  // inputs: each rank passes 1 tensor (as a const, need to cast)
-  // outputs: dest rank passes world_size tensors, others pass empty
-  TensorPtr inputCopy = input; // Need non-const for the call
-  SharedPtr<ApiFuture> future = op->call(&inputCopy, 1, outputs.data(), outputs.size(), stream);
+  SharedPtr<ApiFuture> future = op->call(&flatInput, 1, flatOutputs.data(), flatOutputs.size(), stream);
 
   // Wait for completion
   futureWait(future.get(), stream);
@@ -3045,10 +3060,10 @@ void computeNvlinkPlan(CustomOpDescriptor* op, const IVector<IVector<CustomOpDes
 // ============================================================================
 
 template<int ndim>
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<int>& shape_arg, DType dtype,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputs_arg,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputs_arg) {
-  using T = std::array<int, ndim>;
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int64_t> shape_arg, DType dtype,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg) {
+  using T = std::array<int64_t, ndim>;
   T shape;
   std::ranges::copy(shape_arg, shape.begin());
 
@@ -3065,7 +3080,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<in
 
   constexpr auto numel = [](const T& v) {
     size_t n = 1;
-    for (int x : v) {
+    for (int64_t x : v) {
       n *= x;
     }
     return n;
@@ -3130,9 +3145,6 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<in
   for (size_t i = 0; i < size; ++i) {
     CHECK(outputsPerRank[i].size() == indexCounter[i]);
   }
-
-  std::ranges::stable_sort(inputs, std::greater<size_t>(), &TDescr::numel);
-  std::ranges::stable_sort(outputs, std::greater<size_t>(), &TDescr::numel);
 
   constexpr auto intersecting = [](const auto& a, const auto& b) {
     for (int i = 0; i < ndim; ++i) {
@@ -3450,9 +3462,9 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(const std::vector<in
 // ProcessGroupImpl::compileOpFull - compile a distributed tensor operation
 // ============================================================================
 
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(const std::vector<int>& shapeVec, DType dtype,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& inputsVec,
-    const std::vector<std::tuple<int, std::vector<int>, std::vector<int>>>& outputsVec) {
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(std::span<const int64_t> shapeVec, DType dtype,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputsVec,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputsVec) {
   size_t ndim = shapeVec.size();
   // Dispatch based on ndim
   switch (ndim) {
@@ -3543,10 +3555,51 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   CHECK(e->inputs.empty());
   CHECK(e->outputs.empty());
 
+  auto formatShape = [](const auto& shape) {
+    return fmt::sprintf("[%s]", fmt::to_string(fmt::join(shape, ", ")));
+  };
+
+  auto formatDType = [](int dtype) -> const char* {
+    switch (dtype) {
+    case 0:
+      return "UInt8";
+    case 1:
+      return "Int8";
+    case 2:
+      return "Int16";
+    case 3:
+      return "Int32";
+    case 4:
+      return "Int64";
+    case 5:
+      return "Float16";
+    case 6:
+      return "Float32";
+    case 7:
+      return "Float64";
+    case 11:
+      return "Bool";
+    case 15:
+      return "BFloat16";
+    default:
+      return "Unknown";
+    }
+  };
+
   for (size_t i = 0; i < nInputs; ++i) {
     auto t = getTensorDataFromPtr(inputs[i]);
+    if (t->dtype != static_cast<int>(op->dtype)) {
+      throw std::runtime_error(fmt::sprintf("moodist: custom op input[%zu] has wrong dtype: got %s, expected %s", i,
+          formatDType(t->dtype), formatDType(static_cast<int>(op->dtype))));
+    }
+    if (t->shape != op->inputShapes[i]) {
+      throw std::runtime_error(fmt::sprintf("moodist: custom op input[%zu] has wrong shape: got %s, expected %s", i,
+          formatShape(t->shape), formatShape(op->inputShapes[i])));
+    }
     if (t->bytes() != op->inputs[i]) {
-      throw std::runtime_error("moodist: custom op input has wrong size");
+      throw std::runtime_error(
+          fmt::sprintf("moodist: custom op input[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
+              op->inputs[i]));
     }
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
@@ -3554,8 +3607,18 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   }
   for (size_t i = 0; i < nOutputs; ++i) {
     auto t = getTensorDataFromPtr(outputs[i]);
+    if (t->dtype != static_cast<int>(op->dtype)) {
+      throw std::runtime_error(fmt::sprintf("moodist: custom op output[%zu] has wrong dtype: got %s, expected %s", i,
+          formatDType(t->dtype), formatDType(static_cast<int>(op->dtype))));
+    }
+    if (t->shape != op->outputShapes[i]) {
+      throw std::runtime_error(fmt::sprintf("moodist: custom op output[%zu] has wrong shape: got %s, expected %s", i,
+          formatShape(t->shape), formatShape(op->outputShapes[i])));
+    }
     if (t->bytes() != op->outputs[i]) {
-      throw std::runtime_error("moodist: custom op output has wrong size");
+      throw std::runtime_error(
+          fmt::sprintf("moodist: custom op output[%zu] has wrong size: got %zu bytes, expected %zu bytes", i,
+              t->bytes(), op->outputs[i]));
     }
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
@@ -3658,36 +3721,11 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 }
 
 // API function that calls the member method
-api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, const int* shape, size_t ndim, DType dtype,
-    const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
-    const int* outputOffsets, const int* outputShapes, size_t nOutputs) {
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, std::span<const int64_t> shape, DType dtype,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
-  // Reconstruct vectors from flat arrays
-  std::vector<int> shapeVec(shape, shape + ndim);
-
-  // Reconstruct input tuples - each has (rank, offset[ndim], shape[ndim])
-  std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> inputsVec;
-  size_t inputOffsetIdx = 0, inputShapeIdx = 0;
-  for (size_t i = 0; i < nInputs; ++i) {
-    std::vector<int> off(inputOffsets + inputOffsetIdx, inputOffsets + inputOffsetIdx + ndim);
-    std::vector<int> sh(inputShapes + inputShapeIdx, inputShapes + inputShapeIdx + ndim);
-    inputsVec.emplace_back(inputRanks[i], off, sh);
-    inputOffsetIdx += ndim;
-    inputShapeIdx += ndim;
-  }
-
-  // Reconstruct output tuples
-  std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> outputsVec;
-  size_t outputOffsetIdx = 0, outputShapeIdx = 0;
-  for (size_t i = 0; i < nOutputs; ++i) {
-    std::vector<int> off(outputOffsets + outputOffsetIdx, outputOffsets + outputOffsetIdx + ndim);
-    std::vector<int> sh(outputShapes + outputShapeIdx, outputShapes + outputShapeIdx + ndim);
-    outputsVec.emplace_back(outputRanks[i], off, sh);
-    outputOffsetIdx += ndim;
-    outputShapeIdx += ndim;
-  }
-
-  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shapeVec, dtype, inputsVec, outputsVec);
+  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shape, dtype, inputs, outputs);
   return api::CustomOpHandle::adopt(op.release());
 }
 

@@ -702,7 +702,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
   auto* pg = get_ptr<MoodistProcessGroup>(self);
   try {
     // Parse shape (list or tuple of ints)
-    std::vector<int> shape;
+    std::vector<int64_t> shape;
     if (!PyList_Check(shape_obj) && !PyTuple_Check(shape_obj)) {
       PyErr_SetString(PyExc_TypeError, "shape must be a list or tuple of ints");
       return nullptr;
@@ -711,7 +711,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     shape.reserve(shape_len);
     for (Py_ssize_t i = 0; i < shape_len; ++i) {
       PyRef item(PySequence_GetItem(shape_obj, i));
-      shape.push_back(PyLong_AsLong(item.get()));
+      shape.push_back(PyLong_AsLongLong(item.get()));
     }
 
     // Parse dtype - get torch.dtype from the Python object
@@ -744,8 +744,9 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     }
 
     // Parse inputs and outputs: list of tuples (rank, src_offsets, dst_offsets)
-    auto parse_transfer_list = [](PyObject* list) -> std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> {
-      std::vector<std::tuple<int, std::vector<int>, std::vector<int>>> result;
+    auto parse_transfer_list =
+        [](PyObject* list) -> std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> {
+      std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> result;
       if (!PyList_Check(list)) {
         PyErr_SetString(PyExc_TypeError, "Expected a list of tuples");
         return {};
@@ -760,8 +761,8 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
         }
         int rank = PyLong_AsLong(PyTuple_GetItem(item, 0));
 
-        auto parse_int_list = [](PyObject* obj) -> std::vector<int> {
-          std::vector<int> vec;
+        auto parse_int_list = [](PyObject* obj) -> std::vector<int64_t> {
+          std::vector<int64_t> vec;
           if (!PyList_Check(obj) && !PyTuple_Check(obj)) {
             return vec;
           }
@@ -769,7 +770,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
           vec.reserve(len);
           for (Py_ssize_t i = 0; i < len; ++i) {
             PyRef item(PySequence_GetItem(obj, i));
-            vec.push_back(PyLong_AsLong(item.get()));
+            vec.push_back(PyLong_AsLongLong(item.get()));
           }
           return vec;
         };

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace moodist {
@@ -251,9 +252,9 @@ struct CoreApi {
       api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
   // compileOpFull - compiles a distributed tensor operation
-  api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, const int* shape, size_t ndim, DType dtype,
-      const int* inputRanks, const int* inputOffsets, const int* inputShapes, size_t nInputs, const int* outputRanks,
-      const int* outputOffsets, const int* outputShapes, size_t nOutputs);
+  api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, std::span<const int64_t> shape, DType dtype,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs);
 
   // Profiling
   void (*setProfilingEnabled)(bool enabled);
