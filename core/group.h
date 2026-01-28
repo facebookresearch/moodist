@@ -244,13 +244,7 @@ struct Group {
     return r;
   }
 
-  std::mutex cudaUint32Mutex;
-  std::vector<AllocatedBuffer> cudaUint32List;
-  size_t cudaUint32Offset = 0;
   uintptr_t getNextCudaUint32();
-  std::mutex cudaMappedUint32Mutex;
-  std::vector<AllocatedBuffer> cudaMappedUint32List;
-  size_t cudaMappedUint32Offset = 0;
   uintptr_t getNextCudaMappedUint32();
 };
 

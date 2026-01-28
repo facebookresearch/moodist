@@ -1051,26 +1051,38 @@ void Group::createStreamData(std::unique_ptr<StreamData>& ptr) {
   ptr = std::make_unique<StreamData>();
 }
 
+// Global pools for CUDA completion signaling memory.
+// These are intentionally global (not per-Group) so that WorkCudaDone objects
+// can be safely reused from the FreeList pool across different process groups.
+// The memory is never freed, but the total amount is bounded by reuse.
+static std::mutex globalCudaUint32Mutex;
+static std::vector<AllocatedBuffer> globalCudaUint32List;
+static size_t globalCudaUint32Offset = 0;
+
+static std::mutex globalCudaMappedUint32Mutex;
+static std::vector<AllocatedBuffer> globalCudaMappedUint32List;
+static size_t globalCudaMappedUint32Offset = 0;
+
 uintptr_t Group::getNextCudaUint32() {
-  std::lock_guard l(cudaUint32Mutex);
-  if (cudaUint32List.empty() || cudaUint32Offset == cudaUint32List.back().bytes) {
-    cudaUint32List.push_back(allocateDevice(0x1000));
-    cudaUint32Offset = 0;
+  std::lock_guard l(globalCudaUint32Mutex);
+  if (globalCudaUint32List.empty() || globalCudaUint32Offset == globalCudaUint32List.back().bytes) {
+    globalCudaUint32List.push_back(allocateDevice(0x1000));
+    globalCudaUint32Offset = 0;
   }
-  size_t o = cudaUint32Offset;
-  cudaUint32Offset += 4;
-  return cudaUint32List.back().cudaPointer + o;
+  size_t o = globalCudaUint32Offset;
+  globalCudaUint32Offset += 4;
+  return globalCudaUint32List.back().cudaPointer + o;
 }
 
 uintptr_t Group::getNextCudaMappedUint32() {
-  std::lock_guard l(cudaMappedUint32Mutex);
-  if (cudaMappedUint32List.empty() || cudaMappedUint32Offset == cudaMappedUint32List.back().bytes) {
-    cudaMappedUint32List.push_back(allocateHostMapped(0x1000));
-    cudaMappedUint32Offset = 0;
+  std::lock_guard l(globalCudaMappedUint32Mutex);
+  if (globalCudaMappedUint32List.empty() || globalCudaMappedUint32Offset == globalCudaMappedUint32List.back().bytes) {
+    globalCudaMappedUint32List.push_back(allocateHostMapped(0x1000));
+    globalCudaMappedUint32Offset = 0;
   }
-  size_t o = cudaMappedUint32Offset;
-  cudaMappedUint32Offset += 4;
-  return cudaMappedUint32List.back().cudaPointer + o;
+  size_t o = globalCudaMappedUint32Offset;
+  globalCudaMappedUint32Offset += 4;
+  return globalCudaMappedUint32List.back().cudaPointer + o;
 }
 
 } // namespace moodist
