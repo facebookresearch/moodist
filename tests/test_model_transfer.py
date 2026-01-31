@@ -23,7 +23,7 @@ from framework import TestContext, test
 moodist.enable_cpu_allocator()
 
 # Ratios of trainers to total world_size
-TRAINER_RATIOS = [0.1, 0.25, 0.33, 0.5, 0.75, 0.9]
+TRAINER_RATIOS = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 0.9]
 
 # Seed for deterministic assignment of trainer shards to workers
 ASSIGNMENT_SEED = 42
@@ -125,7 +125,9 @@ def _compute_transfer_assignment(
     return assignment
 
 
-def _create_moodist_group(store, rank: int, world_size: int, ranks: list[int], prefix: str):
+def _create_moodist_group(
+    store, rank: int, world_size: int, ranks: list[int], prefix: str
+):
     """Create a moodist ProcessGroup for a subset of ranks.
 
     Args:
@@ -194,11 +196,16 @@ class ModelTransfer:
         # For workers: count expected chunks
         if not self.is_trainer:
             self.expected_chunks = sum(
-                1 for (name, trainer_rank), dst_worker in self.assignment.items()
+                1
+                for (name, trainer_rank), dst_worker in self.assignment.items()
                 if self.worker_ranks[dst_worker] == rank
             )
-            self.chunk_metadata: list[tuple[str, int, list[int], list[int], torch.dtype]] = []
-            self.compiled_ops: dict[str, tuple] = {}  # name -> (op, input_keys, output_info)
+            self.chunk_metadata: list[
+                tuple[str, int, list[int], list[int], torch.dtype]
+            ] = []
+            self.compiled_ops: dict[str, tuple] = (
+                {}
+            )  # name -> (op, input_keys, output_info)
 
     def initialize(self):
         """Initialize transfer - trainers send metadata to workers."""
@@ -237,7 +244,7 @@ class ModelTransfer:
                 metadata = (name, trainer_rank, offset, local_shape, dtype)
                 queue.put_object(metadata)
 
-            self.log_fn(f"Trainer {trainer_rank}: sent metadata for {len(self.param_names)} parameters")
+            # self.log_fn(f"Trainer {trainer_rank}: sent metadata for {len(self.param_names)} parameters")
 
         else:
             # Worker: receive metadata
@@ -248,12 +255,13 @@ class ModelTransfer:
                 metadata = queue.get_object()
                 name, trainer_rank, offset, shape, dtype = metadata
                 self.chunk_metadata.append((name, trainer_rank, offset, shape, dtype))
-                self.log_fn(f"Worker {worker_global_rank}: will receive {name} from trainer {trainer_rank}, offset={offset}, shape={shape}")
 
-            self.log_fn(f"Worker {worker_global_rank}: received metadata for {len(self.chunk_metadata)} chunks")
+            # self.log_fn(f"Worker {worker_global_rank}: received metadata for {len(self.chunk_metadata)} chunks")
 
             # Group chunks by parameter name
-            chunks_by_param: dict[str, list[tuple[int, list[int], list[int], torch.dtype]]] = {}
+            chunks_by_param: dict[
+                str, list[tuple[int, list[int], list[int], torch.dtype]]
+            ] = {}
             for name, trainer_rank, offset, shape, dtype in self.chunk_metadata:
                 if name not in chunks_by_param:
                     chunks_by_param[name] = []
@@ -303,7 +311,7 @@ class ModelTransfer:
                 # Compile the op
                 op = moodist.compile_op(self.workers_group, **info)
                 self.compiled_ops[name] = (op, input_keys, output_info)
-                self.log_fn(f"Worker {worker_global_rank}: compiled op for {name}, inputs={len(input_keys)}, has_output={output_info is not None}")
+                # self.log_fn(f"Worker {worker_global_rank}: compiled op for {name}, inputs={len(input_keys)}, has_output={output_info is not None}")
 
     def send(self):
         """Trainer sends parameter chunks to assigned workers."""
@@ -334,7 +342,7 @@ class ModelTransfer:
                 t.put_object((name, trainer_rank))
                 t.put_tensor(local_tensor)
 
-        self.log_fn(f"Trainer {trainer_rank}: sent all chunks")
+        # self.log_fn(f"Trainer {trainer_rank}: sent all chunks")
 
     def receive(self) -> dict[str, torch.Tensor]:
         """Worker receives parameter chunks from trainers and redistributes.
@@ -353,12 +361,13 @@ class ModelTransfer:
             name, trainer_rank = queue.get_object()
             tensor = queue.get_tensor()
             received_chunks[(name, trainer_rank)] = tensor
-            self.log_fn(f"Worker {worker_global_rank}: received chunk for {name} from trainer {trainer_rank}, shape {tensor.shape}")
 
-        self.log_fn(f"Worker {worker_global_rank}: received {len(received_chunks)} chunks")
+        # self.log_fn(f"Worker {worker_global_rank}: received {len(received_chunks)} chunks")
 
         # Run compiled ops to redistribute chunks among workers
         output_tensors: dict[str, torch.Tensor] = {}
+
+        handles = []
 
         for name in self.param_names:
             op, input_keys, output_info = self.compiled_ops[name]
@@ -379,10 +388,12 @@ class ModelTransfer:
                 output_tensors[name] = t
 
             # Run the op
-            h = op(inputlist, outputlist)
+            handles.append(op(inputlist, outputlist))
+
+        for h in handles:
             h.wait()
 
-        self.log_fn(f"Worker {worker_global_rank}: redistributed {len(output_tensors)} parameters")
+        # self.log_fn(f"Worker {worker_global_rank}: redistributed {len(output_tensors)} parameters")
 
         return output_tensors
 
@@ -396,8 +407,10 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
     num_trainers, num_workers = _compute_split(ctx.world_size, trainer_ratio)
     is_trainer = ctx.rank < num_trainers
 
-    ctx.log(f"ratio={trainer_ratio}, trainers={num_trainers}, workers={num_workers}, "
-            f"role={'trainer' if is_trainer else 'worker'}")
+    ctx.log(
+        f"ratio={trainer_ratio}, trainers={num_trainers}, workers={num_workers}, "
+        f"role={'trainer' if is_trainer else 'worker'}"
+    )
 
     # Create outer store for coordination
     outer_store = ctx.create_store(key=f"model_transfer_{int(trainer_ratio * 100)}")
@@ -430,8 +443,11 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
 
         # Create all_group for final barrier (all ranks)
         all_group = _create_moodist_group(
-            outer_store, ctx.rank, ctx.world_size,
-            list(range(ctx.world_size)), "all_group"
+            outer_store,
+            ctx.rank,
+            ctx.world_size,
+            list(range(ctx.world_size)),
+            "all_group",
         )
         ctx.assert_true(all_group is not None, "all_group should include this rank")
 
@@ -478,21 +494,27 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
             # Workers: large params sharded, small params replicated
 
             # Large 2D parameter - sharded on workers too
-            t = torch.zeros(1024 * 256, device=device, dtype=torch.float32).view(1024, 256)
+            t = torch.zeros(1024 * 256, device=device, dtype=torch.float32).view(
+                1024, 256
+            )
             t = distribute_tensor(t, mesh, [Shard(0)])
             named_parameters.append(("tok_embeddings.weight", t))
 
             # Layer parameters
             for layer_idx in range(40):
                 # Large 2D weight - sharded
-                t = torch.zeros(512 * 512, device=device, dtype=torch.float32).view(512, 512)
+                t = torch.zeros(512 * 512, device=device, dtype=torch.float32).view(
+                    512, 512
+                )
                 t = distribute_tensor(t, mesh, [Shard(0)])
                 named_parameters.append((f"layers.{layer_idx}.attention.wq.weight", t))
 
                 # Small 1D norm - REPLICATED on workers (they want the full tensor)
                 t = torch.zeros(512, device=device, dtype=torch.float32)
                 # No DTensor wrapping - workers want full tensor
-                named_parameters.append((f"layers.{layer_idx}.attention_norm.weight", t))
+                named_parameters.append(
+                    (f"layers.{layer_idx}.attention_norm.weight", t)
+                )
 
             # Final norm - REPLICATED on workers
             t = torch.zeros(512, device=device, dtype=torch.float32)
@@ -523,39 +545,44 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
 
         model_transfer.initialize()
 
-        all_group.barrier()
+        for iteration in range(8):
+            all_group.barrier()
+            if is_trainer:
+                model_transfer.send()
+                for name, p in named_parameters:
+                    p += 1
+            else:
+                output_tensors = model_transfer.receive()
 
-        if is_trainer:
-            model_transfer.send()
-        else:
-            output_tensors = model_transfer.receive()
+                # Copy received shards into DTensor local storage
+                for name, local_tensor in output_tensors.items():
+                    p = named_parameters_dict[name]
+                    if isinstance(p, DTensor):
+                        moodist.cuda_copy(p.to_local(), local_tensor)
+                    else:
+                        moodist.cuda_copy(p, local_tensor)
 
-            # Copy received shards into DTensor local storage
-            for name, local_tensor in output_tensors.items():
-                p = named_parameters_dict[name]
-                if isinstance(p, DTensor):
-                    moodist.cuda_copy(p.to_local(), local_tensor)
-                else:
-                    moodist.cuda_copy(p, local_tensor)
+                # Allgather to get full tensors
+                full_tensors: dict[str, torch.Tensor] = {}
+                for name, p in named_parameters_dict.items():
+                    if isinstance(p, DTensor):
+                        full_tensors[name] = p.full_tensor()
+                    else:
+                        full_tensors[name] = p
 
-            # Allgather to get full tensors
-            full_tensors: dict[str, torch.Tensor] = {}
-            for name, p in named_parameters_dict.items():
-                if isinstance(p, DTensor):
-                    full_tensors[name] = p.full_tensor()
-                else:
-                    full_tensors[name] = p
-
-            # Verify received tensors match expected values
-            for name, received in full_tensors.items():
-                p = named_parameters_dict[name]
-                shape = tuple(p.shape)
-                expected = _make_deterministic_tensor(name, shape, device, torch.float32)
-                if not torch.equal(received, expected):
-                    raise AssertionError(
-                        f"Tensor mismatch for {name}: "
-                        f"received shape {received.shape}, expected shape {expected.shape}"
+                # Verify received tensors match expected values
+                for name, received in full_tensors.items():
+                    p = named_parameters_dict[name]
+                    shape = tuple(p.shape)
+                    expected = (
+                        _make_deterministic_tensor(name, shape, device, torch.float32)
+                        + iteration
                     )
+                    if not torch.equal(received, expected):
+                        raise AssertionError(
+                            f"Tensor mismatch for {name}: "
+                            f"received shape {received.shape}, expected shape {expected.shape}"
+                        )
 
         # Final barrier
         all_group.barrier()
@@ -568,6 +595,7 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
 
 def _make_test(trainer_ratio: float):
     """Create a test function for a given trainer ratio."""
+
     def test_fn(ctx: TestContext):
         _run_model_transfer_test(ctx, trainer_ratio)
 
