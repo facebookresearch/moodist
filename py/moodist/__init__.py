@@ -37,6 +37,9 @@ from .queue import Queue, TransactionContextManager
 # Compile op
 from .compile import compile_op
 
+# Sharding utilities
+from .sharding import compute_shards, dtensor_shards
+
 
 if TYPE_CHECKING:
 
@@ -86,4 +89,7 @@ __all__ = [
     "MoodistOptionsContext",
     # Compile
     "compile_op",
+    # Sharding
+    "compute_shards",
+    "dtensor_shards",
 ]
