@@ -3330,14 +3330,8 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int6
     queues[i]->put(std::move(tensor), 0);
   }
 
-  size_t totalOutputNumel = 0;
-  for (const auto& x : ref(outputs)) {
-    if (x.rank == rank) {
-      totalOutputNumel += numel(x.shape);
-    }
-  }
-  size_t readNumel = 0;
-
+  // Step 1: Gather inputs that matched our outputs (from all source ranks)
+  IVector<Input> matchedInputs;
   for (size_t i = 0; i < size; ++i) {
     CHECK(rank < queues.size());
     CHECK(queues[rank].get() != nullptr);
@@ -3348,34 +3342,198 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int6
 
     for (const Input& x : n) {
       CHECK(x.outputRank == rank);
-
-      CustomOpDescriptor::Read r;
-      r.rank = x.inputRank;
-      r.inputIndex = x.inputIndex;
-      r.outputIndex = x.outputIndex;
-      r.inputOffset = itemsize * x.inputOffset;
-      r.outputOffset = itemsize * x.outputOffset;
-      size_t num = numel(x.shape);
-      r.bytes = itemsize * num;
-      readNumel += num;
-
-      if (!x.outputContiguous) {
-        CustomOpDescriptor::Copy c;
-        c.index = r.outputIndex;
-        auto off = sub(x.offset, outputsPerRank[rank][x.outputIndex]->offset);
-        c.offset = {off.begin(), off.end()};
-        c.shape = {x.shape.begin(), x.shape.end()};
-        r.outputIndex = op->outputs.size() + op->outputCopies.size();
-        op->outputCopies.push_back(c);
-        r.outputOffset = 0;
-      }
-
-      op->reads.push_back(r);
+      matchedInputs.push_back(x);
     }
   }
 
-  if (readNumel != totalOutputNumel) {
-    throw std::runtime_error("moodist.compile_op_full: could not find input for all output elements");
+  // Debug: print matched inputs and outputs
+  log.debug(
+      "compile_op_full: rank %zu, %zu matched inputs, %zu outputs\n", rank, matchedInputs.size(), op->outputs.size());
+  for (size_t i : indices(matchedInputs)) {
+    const auto& x = matchedInputs[i];
+    log.debug("  input[%zu]: from rank %u, outputIndex=%u, offset=%s, shape=%s, outputOffset=%zu, contiguous=%d\n", i,
+        x.inputRank, x.outputIndex, fmt::to_string(fmt::join(x.offset, ",")).c_str(),
+        fmt::to_string(fmt::join(x.shape, ",")).c_str(), x.outputOffset, x.outputContiguous);
+  }
+  for (size_t i : indices(op->outputs)) {
+    log.debug("  output[%zu]: %zu bytes, shape=%s\n", i, op->outputs[i],
+        fmt::to_string(fmt::join(op->outputShapes[i], ",")).c_str());
+  }
+
+  // Step 2: Validate inputs - check for overlaps using N-dim intersection
+  {
+    // Group inputs by output index
+    IVector<IVector<size_t>> inputsPerOutput(op->outputs.size());
+    for (size_t i : indices(matchedInputs)) {
+      inputsPerOutput[matchedInputs[i].outputIndex].push_back(i);
+    }
+
+    // Check for overlapping inputs within each output
+    std::string overlapDetails;
+    size_t overlapCount = 0;
+    constexpr size_t maxReportedRegions = 5;
+
+    for (size_t outIdx : indices(op->outputs)) {
+      const auto& idxs = inputsPerOutput[outIdx];
+      for (size_t i = 0; i < idxs.size(); ++i) {
+        for (size_t j = i + 1; j < idxs.size(); ++j) {
+          const auto& a = matchedInputs[idxs[i]];
+          const auto& b = matchedInputs[idxs[j]];
+          if (intersecting(a, b)) {
+            overlapCount++;
+            if (overlapCount <= maxReportedRegions) {
+              overlapDetails += fmt::sprintf(
+                  "\n  output[%zu]: overlap between region at [%s] shape [%s] and region at [%s] shape [%s]", outIdx,
+                  fmt::to_string(fmt::join(a.offset, ",")).c_str(), fmt::to_string(fmt::join(a.shape, ",")).c_str(),
+                  fmt::to_string(fmt::join(b.offset, ",")).c_str(), fmt::to_string(fmt::join(b.shape, ",")).c_str());
+            }
+          }
+        }
+      }
+    }
+
+    if (overlapCount > 0) {
+      std::string msg = "moodist.compile_op_full: overlapping inputs detected";
+      if (overlapCount > maxReportedRegions) {
+        msg += fmt::sprintf(" (%zu regions, showing first %zu):", overlapCount, maxReportedRegions);
+      } else {
+        msg += ":";
+      }
+      msg += overlapDetails;
+      throw std::runtime_error(msg);
+    }
+
+    // Gap detection: first do quick numel check, then detailed cell decomposition if needed
+    IVector<size_t> outputsWithGaps;
+    for (size_t outIdx : indices(op->outputs)) {
+      size_t inputNumel = 0;
+      for (size_t i : inputsPerOutput[outIdx]) {
+        inputNumel += numel(matchedInputs[i].shape);
+      }
+      size_t outputNumel = op->outputs[outIdx] / itemsize;
+      if (inputNumel != outputNumel) {
+        outputsWithGaps.push_back(outIdx);
+      }
+    }
+
+    if (!outputsWithGaps.empty()) {
+      // Detailed gap detection using cell decomposition
+      std::string gapDetails;
+      size_t gapCount = 0;
+
+      for (size_t outIdx : outputsWithGaps) {
+        const auto& outDescr = *outputsPerRank[rank][outIdx];
+        const auto& idxs = inputsPerOutput[outIdx];
+
+        // Collect boundaries in each dimension
+        std::array<IVector<int64_t>, ndim> boundaries;
+        for (int d = 0; d < ndim; ++d) {
+          boundaries[d].push_back(outDescr.offset[d]);
+          boundaries[d].push_back(outDescr.offset[d] + outDescr.shape[d]);
+          for (size_t i : idxs) {
+            const auto& inp = matchedInputs[i];
+            boundaries[d].push_back(inp.offset[d]);
+            boundaries[d].push_back(inp.offset[d] + inp.shape[d]);
+          }
+          std::sort(boundaries[d].begin(), boundaries[d].end());
+          boundaries[d].erase(std::unique(boundaries[d].begin(), boundaries[d].end()), boundaries[d].end());
+        }
+
+        // Compute total number of cells
+        std::array<size_t, ndim> numIntervals;
+        size_t totalCells = 1;
+        for (int d = 0; d < ndim; ++d) {
+          numIntervals[d] = boundaries[d].size() - 1;
+          totalCells *= numIntervals[d];
+        }
+
+        // Iterate through all cells
+        for (size_t cellIdx = 0; cellIdx < totalCells; ++cellIdx) {
+          // Convert cellIdx to multi-dimensional index and compute cell offset/shape
+          T cellOffset, cellShape;
+          size_t remaining = cellIdx;
+          for (int d = ndim - 1; d >= 0; --d) {
+            size_t intervalIdx = remaining % numIntervals[d];
+            remaining /= numIntervals[d];
+            cellOffset[d] = boundaries[d][intervalIdx];
+            cellShape[d] = boundaries[d][intervalIdx + 1] - boundaries[d][intervalIdx];
+          }
+
+          // Check if cell is inside output
+          bool insideOutput = true;
+          for (int d = 0; d < ndim; ++d) {
+            if (cellOffset[d] < outDescr.offset[d] ||
+                cellOffset[d] + cellShape[d] > outDescr.offset[d] + outDescr.shape[d]) {
+              insideOutput = false;
+              break;
+            }
+          }
+          if (!insideOutput) {
+            continue;
+          }
+
+          // Check if cell is covered by any input
+          bool covered = false;
+          for (size_t i : idxs) {
+            const auto& inp = matchedInputs[i];
+            bool inputCovers = true;
+            for (int d = 0; d < ndim; ++d) {
+              if (cellOffset[d] < inp.offset[d] || cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
+                inputCovers = false;
+                break;
+              }
+            }
+            if (inputCovers) {
+              covered = true;
+              break;
+            }
+          }
+
+          if (!covered) {
+            gapCount++;
+            if (gapCount <= maxReportedRegions) {
+              gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
+                  fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
+                  fmt::to_string(fmt::join(cellShape, ",")).c_str());
+            }
+          }
+        }
+      }
+
+      std::string msg = "moodist.compile_op_full: missing input coverage";
+      if (gapCount > maxReportedRegions) {
+        msg += fmt::sprintf(" (%zu regions, showing first %zu):", gapCount, maxReportedRegions);
+      } else {
+        msg += ":";
+      }
+      msg += gapDetails;
+      throw std::runtime_error(msg);
+    }
+  }
+
+  // Step 3: Generate Read/Copy from validated inputs
+  for (const Input& x : matchedInputs) {
+    CustomOpDescriptor::Read r;
+    r.rank = x.inputRank;
+    r.inputIndex = x.inputIndex;
+    r.outputIndex = x.outputIndex;
+    r.inputOffset = itemsize * x.inputOffset;
+    r.outputOffset = itemsize * x.outputOffset;
+    size_t num = numel(x.shape);
+    r.bytes = itemsize * num;
+
+    if (!x.outputContiguous) {
+      CustomOpDescriptor::Copy c;
+      c.index = r.outputIndex;
+      auto off = sub(x.offset, outputsPerRank[rank][x.outputIndex]->offset);
+      c.offset = {off.begin(), off.end()};
+      c.shape = {x.shape.begin(), x.shape.end()};
+      r.outputIndex = op->outputs.size() + op->outputCopies.size();
+      op->outputCopies.push_back(c);
+      r.outputOffset = 0;
+    }
+
+    op->reads.push_back(r);
   }
 
   // NVLink optimization: exchange reads among local ranks and compute plan
