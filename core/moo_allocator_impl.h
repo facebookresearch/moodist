@@ -992,8 +992,8 @@ static void allocate_memory(size_t index) {
     log.error("fallback allocation of %zu bytes\n", bytes);
     rv = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (!rv || rv == MAP_FAILED) {
-      fprintf(stderr, "moo: mmap failed: %s\n", strerror(errno));
-      abort();
+      log.error("moo: mmap failed for %zu bytes: %s\n", bytes, strerror(errno));
+      throw std::bad_alloc();
     }
   }
 
