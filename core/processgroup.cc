@@ -9,6 +9,7 @@
 #include "api/processgroup_api.h"
 #include "api/tensor_ptr.h"
 #include "common.h"
+#include "compile_op.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
 #include "group.h"
@@ -1008,11 +1009,13 @@ struct ProcessGroupImpl : api::ProcessGroup {
   // compileOpFull - compile a distributed tensor operation
   SharedPtr<CustomOpImpl> compileOpFull(std::span<const int64_t> shape, DType dtype,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs);
+      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
+      api::ReduceOp reduce);
 
   // Template implementation for compileOpFull - parameterized by ndim
+  // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
   template<int ndim>
-  SharedPtr<CustomOpImpl> compileOpFullImpl(std::span<const int64_t> shape_arg, DType dtype,
+  SharedPtr<CustomOpImpl> compileOpFullImpl_OLD(std::span<const int64_t> shape_arg, DType dtype,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg);
 
@@ -2292,7 +2295,7 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
           std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
     it = scatterCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -2366,7 +2369,7 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
           std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs);
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
     it = gatherCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -3056,11 +3059,12 @@ void computeNvlinkPlan(CustomOpDescriptor* op, const IVector<IVector<CustomOpDes
 } // namespace
 
 // ============================================================================
-// ProcessGroupImpl::compileOpFullImpl - template implementation
+// ProcessGroupImpl::compileOpFullImpl_OLD - template implementation
+// OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
 // ============================================================================
 
 template<int ndim>
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int64_t> shape_arg, DType dtype,
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const int64_t> shape_arg, DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg) {
   using T = std::array<int64_t, ndim>;
@@ -3383,8 +3387,10 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int6
             overlapCount++;
             if (overlapCount <= maxReportedRegions) {
               overlapDetails += fmt::sprintf(
-                  "\n  output[%zu]: overlap between region at [%s] shape [%s] and region at [%s] shape [%s]", outIdx,
+                  "\n  output[%zu]: overlap between input from rank %u at [%s] shape [%s] and input from rank %u at [%s] shape [%s]",
+                  outIdx, a.inputRank,
                   fmt::to_string(fmt::join(a.offset, ",")).c_str(), fmt::to_string(fmt::join(a.shape, ",")).c_str(),
+                  b.inputRank,
                   fmt::to_string(fmt::join(b.offset, ",")).c_str(), fmt::to_string(fmt::join(b.shape, ",")).c_str());
             }
           }
@@ -3622,35 +3628,46 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl(std::span<const int6
 
 SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(std::span<const int64_t> shapeVec, DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputsVec,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputsVec) {
-  size_t ndim = shapeVec.size();
-  // Dispatch based on ndim
-  switch (ndim) {
-  case 0:
-    return compileOpFullImpl<0>(shapeVec, dtype, inputsVec, outputsVec);
-  case 1:
-    return compileOpFullImpl<1>(shapeVec, dtype, inputsVec, outputsVec);
-  case 2:
-    return compileOpFullImpl<2>(shapeVec, dtype, inputsVec, outputsVec);
-  case 3:
-    return compileOpFullImpl<3>(shapeVec, dtype, inputsVec, outputsVec);
-  case 4:
-    return compileOpFullImpl<4>(shapeVec, dtype, inputsVec, outputsVec);
-  case 5:
-    return compileOpFullImpl<5>(shapeVec, dtype, inputsVec, outputsVec);
-  case 6:
-    return compileOpFullImpl<6>(shapeVec, dtype, inputsVec, outputsVec);
-  case 7:
-    return compileOpFullImpl<7>(shapeVec, dtype, inputsVec, outputsVec);
-  case 8:
-    return compileOpFullImpl<8>(shapeVec, dtype, inputsVec, outputsVec);
-  case 9:
-    return compileOpFullImpl<9>(shapeVec, dtype, inputsVec, outputsVec);
-  case 10:
-    return compileOpFullImpl<10>(shapeVec, dtype, inputsVec, outputsVec);
-  default:
-    throw std::runtime_error(fmt::sprintf("moodist.compile_op_full: ndim %zu is too large and not supported!", ndim));
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputsVec,
+    api::ReduceOp reduce) {
+
+  // Ensure queues exist for compile_op communication
+  if (queues.empty()) {
+    for (size_t i = 0; i < size; ++i) {
+      auto handle = makeQueue(group, i, false, {});
+      CHECK(handle.get() != nullptr);
+      Queue* q = static_cast<Queue*>(handle.release());
+      CHECK(q->impl != nullptr);
+      queues.push_back(SharedPtr<Queue>(q));
+    }
   }
+  CHECK(queues.size() == size);
+
+  // Build compile context
+  compile_op::CompileContext ctx;
+  ctx.rank = rank;
+  ctx.size = size;
+  ctx.queues = std::span<SharedPtr<Queue>>(queues.data(), queues.size());
+  ctx.barrier = [this]() { barrier(); };
+  ctx.nodeIndex = group->rankToNodeIndex[rank];
+  ctx.nodeRanks = std::span<const size_t>(group->nodeRanks[ctx.nodeIndex].data(), group->nodeRanks[ctx.nodeIndex].size());
+  ctx.localRank = group->rankLocalRank[rank];
+  ctx.rankLocalRank = std::span<const size_t>(group->rankLocalRank.data(), group->rankLocalRank.size());
+  ctx.nextOpId = &nextCustomOpId;
+
+  // Call compile_op
+  int ndim = static_cast<int>(shapeVec.size());
+  auto op = compile_op::compile(ctx, ndim, shapeVec, dtype, inputsVec, outputsVec, reduce);
+
+  // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
+  auto result = makeShared<CustomOpImpl>();
+  auto selfPtr = share(this);
+  result->call = [op, selfPtr](TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs,
+                     CUstream stream) -> SharedPtr<ApiFuture> {
+    return selfPtr->customOp(op, inputs, nInputs, outputs, nOutputs, stream);
+  };
+
+  return result;
 }
 
 // ============================================================================
@@ -3881,9 +3898,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 // API function that calls the member method
 api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, std::span<const int64_t> shape, DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs) {
+    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
+    api::ReduceOp reduce) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
-  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shape, dtype, inputs, outputs);
+  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shape, dtype, inputs, outputs, reduce);
   return api::CustomOpHandle::adopt(op.release());
 }
 

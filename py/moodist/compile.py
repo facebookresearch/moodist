@@ -101,7 +101,7 @@ def _process_tensor_specs(specs, shape_holder):
     return processed
 
 
-def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
+def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None, reduce=None):
     """Compile a custom collective operation for distributed tensor communication.
 
     This function creates an optimized collective operation that transfers data between
@@ -125,6 +125,9 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
                 If None, this rank contributes no inputs to the operation.
         outputs: Optional list of output tensor specifications. Same format as inputs.
                  If None, this rank receives no outputs from the operation.
+        reduce: How to handle overlapping inputs. Options:
+                - None (default): Error if inputs overlap
+                - "any": Pick any source for overlapping regions (for replicated data)
 
     Returns:
         A compiled custom operation object that can be used to efficiently execute the
@@ -261,4 +264,4 @@ def compile_op(group, shape=None, dtype=None, inputs=None, outputs=None):
     assert queue.empty()
     group.barrier()
 
-    return group.compile_op_full(shape, dtype, all_inputs, all_outputs)
+    return group.compile_op_full(shape, dtype, all_inputs, all_outputs, reduce=reduce)

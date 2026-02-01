@@ -292,6 +292,7 @@ def _verify_compile_op_allgather(
         dtype=global_tensor.dtype,
         inputs=inputs if inputs else None,
         outputs=outputs,
+        reduce="any",
     )
 
     # Build input tensors (the local shard data)
@@ -619,6 +620,160 @@ def test_shard_uneven_split(ctx: TestContext, device: str):
                 all_passed = False
 
         ctx.assert_true(all_passed, "Some uneven split tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_strided_shard_1d_mesh(ctx: TestContext, device: str):
+    """Test _StridedShard placement on 1D mesh."""
+    if not HAS_STRIDED_SHARD:
+        ctx.log("SKIP: _StridedShard not available")
+        return
+
+    _init_torch_distributed(ctx)
+    pg = create_process_group(ctx)
+
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(ctx.world_size))
+        all_passed = True
+
+        # Test StridedShard on various shapes with different split_factors
+        # StridedShard produces non-contiguous chunks (interleaved)
+        test_cases = [
+            # (shape, dim, split_factor)
+            # 1D tensors
+            ((ctx.world_size * 4,), 0, 2),
+            ((ctx.world_size * 4,), 0, 4),
+            ((ctx.world_size * 4 + 1,), 0, 2),  # Uneven
+            ((ctx.world_size * 8,), 0, 2),
+            # 2D tensors - shard different dimensions
+            ((ctx.world_size * 2, 8), 0, 2),
+            ((8, ctx.world_size * 2), 1, 2),
+            # 3D tensors
+            ((ctx.world_size * 2, 4, 4), 0, 2),
+        ]
+
+        for shape, dim, split_factor in test_cases:
+            placement = _StridedShard(dim, split_factor=split_factor)
+            success = _test_configuration(
+                ctx, pg, mesh, [placement], shape,
+                f"StridedShard({dim}, sf={split_factor}) on tensor shape={shape}",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+
+        ctx.assert_true(all_passed, "Some StridedShard tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_2d_mesh(ctx: TestContext, device: str):
+    """Test sharding with 2D mesh."""
+    _init_torch_distributed(ctx)
+    pg = create_process_group(ctx)
+
+    try:
+        # Find a 2D factorization of world_size
+        dp_size, tp_size = 0, 0
+        for dp in range(2, ctx.world_size):
+            if ctx.world_size % dp == 0:
+                tp = ctx.world_size // dp
+                if tp >= 2:
+                    dp_size, tp_size = dp, tp
+                    break
+
+        if dp_size == 0:
+            ctx.log(f"SKIP: No 2D factorization for world_size={ctx.world_size}")
+            return
+
+        mesh = DeviceMesh(
+            "cpu",
+            torch.arange(ctx.world_size).reshape(dp_size, tp_size),
+            mesh_dim_names=("dp", "tp")
+        )
+
+        if ctx.rank == 0:
+            ctx.log(f"Using {dp_size}x{tp_size} mesh")
+
+        all_passed = True
+
+        # [Shard(0), Shard(1)] - shard different tensor dimensions
+        success = _test_configuration(
+            ctx, pg, mesh, [Shard(0), Shard(1)], (32, 64),
+            "[Shard(0), Shard(1)] on shape (32, 64)",
+            device=device,
+        )
+        if not success:
+            all_passed = False
+
+        # [Shard(0), Shard(0)] - both mesh dims shard same tensor dim (composition)
+        success = _test_configuration(
+            ctx, pg, mesh, [Shard(0), Shard(0)], (128,),
+            "[Shard(0), Shard(0)] on shape (128,)",
+            device=device,
+        )
+        if not success:
+            all_passed = False
+
+        # [Shard(0), Replicate()] - shard on one mesh dim, replicate on another
+        success = _test_configuration(
+            ctx, pg, mesh, [Shard(0), Replicate()], (32, 16),
+            "[Shard(0), Replicate()] on shape (32, 16)",
+            device=device,
+        )
+        if not success:
+            all_passed = False
+
+        # [Replicate(), Shard(1)] - replicate on first, shard on second
+        success = _test_configuration(
+            ctx, pg, mesh, [Replicate(), Shard(1)], (16, 32),
+            "[Replicate(), Shard(1)] on shape (16, 32)",
+            device=device,
+        )
+        if not success:
+            all_passed = False
+
+        # StridedShard combinations (if available)
+        if HAS_STRIDED_SHARD:
+            # [_StridedShard, Shard] - FSDP+TP pattern
+            success = _test_configuration(
+                ctx, pg, mesh,
+                [_StridedShard(0, split_factor=tp_size), Shard(0)],
+                (128,),
+                f"[StridedShard(0, sf={tp_size}), Shard(0)] on shape (128,)",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+
+            # [Shard, _StridedShard]
+            success = _test_configuration(
+                ctx, pg, mesh,
+                [Shard(0), _StridedShard(0, split_factor=dp_size)],
+                (128,),
+                f"[Shard(0), StridedShard(0, sf={dp_size})] on shape (128,)",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+
+            # [_StridedShard, Replicate]
+            success = _test_configuration(
+                ctx, pg, mesh,
+                [_StridedShard(0, split_factor=2), Replicate()],
+                (64, 32),
+                "[StridedShard(0, sf=2), Replicate()] on shape (64, 32)",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+
+        ctx.assert_true(all_passed, "Some 2D mesh tests failed")
 
     finally:
         _cleanup_torch_distributed()

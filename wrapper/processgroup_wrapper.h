@@ -197,7 +197,8 @@ public:
   std::vector<torch::Tensor> share(const torch::Tensor& input);
   CustomOp compileOpFull(const std::vector<int64_t>& shape, torch::Dtype dtype,
       const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& inputs,
-      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs);
+      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs,
+      moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None);
 };
 
 void registerFreeMemoryCallback();

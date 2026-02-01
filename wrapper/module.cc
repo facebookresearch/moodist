@@ -688,15 +688,42 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
 }
 
 static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, PyObject* kwds) {
-  static const char* kwlist[] = {"shape", "dtype", "inputs", "outputs", nullptr};
+  static const char* kwlist[] = {"shape", "dtype", "inputs", "outputs", "reduce", nullptr};
   PyObject* shape_obj = nullptr;
   PyObject* dtype_obj = nullptr;
   PyObject* inputs_obj = nullptr;
   PyObject* outputs_obj = nullptr;
+  PyObject* reduce_obj = Py_None;
 
   if (!PyArg_ParseTupleAndKeywords(
-          args, kwds, "OOOO", const_cast<char**>(kwlist), &shape_obj, &dtype_obj, &inputs_obj, &outputs_obj)) {
+          args, kwds, "OOOO|O", const_cast<char**>(kwlist), &shape_obj, &dtype_obj, &inputs_obj, &outputs_obj, &reduce_obj)) {
     return nullptr;
+  }
+
+  // Parse reduce parameter: None -> None, "any" -> Any, "none" -> None
+  moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None;
+  if (reduce_obj != Py_None) {
+    if (PyLong_Check(reduce_obj)) {
+      int reduce_int = PyLong_AsLong(reduce_obj);
+      reduce = static_cast<moodist::api::ReduceOp>(reduce_int);
+    } else if (PyUnicode_Check(reduce_obj)) {
+      PyRef reduce_bytes(PyUnicode_AsEncodedString(reduce_obj, "utf-8", "strict"));
+      if (!reduce_bytes) {
+        return nullptr;
+      }
+      const char* reduce_str = PyBytes_AsString(reduce_bytes.get());
+      if (strcmp(reduce_str, "any") == 0) {
+        reduce = moodist::api::ReduceOp::Any;
+      } else if (strcmp(reduce_str, "none") == 0) {
+        reduce = moodist::api::ReduceOp::None;
+      } else {
+        PyErr_Format(PyExc_ValueError, "reduce must be 'any', 'none', or None, got '%s'", reduce_str);
+        return nullptr;
+      }
+    } else {
+      PyErr_SetString(PyExc_TypeError, "reduce must be a string ('any', 'none') or None");
+      return nullptr;
+    }
   }
 
   auto* pg = get_ptr<MoodistProcessGroup>(self);
@@ -794,7 +821,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     moodist::wrapper::CustomOp op;
     {
       GilRelease gil;
-      op = pg->compileOpFull(shape, dtype, inputs, outputs);
+      op = pg->compileOpFull(shape, dtype, inputs, outputs, reduce);
     }
     return wrap_customop(std::move(op));
   } catch (const moodist::PythonErrorAlreadySet&) {

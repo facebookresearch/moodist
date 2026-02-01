@@ -34,4 +34,11 @@ struct Buffer : ApiRefCounted {};
 // It doesn't inherit from ApiRefCounted, so ApiHandle uses move-only semantics.
 struct QueueWork {};
 
+// Reduce operation for compile_op - how to handle overlapping inputs
+enum class ReduceOp : int {
+  None = 0, // Error on overlap (default)
+  Any = 1,  // Pick any source (all sources have same value)
+  // Future: Sum, Mean, Max, Min (require CUDA kernels)
+};
+
 } // namespace moodist::api
