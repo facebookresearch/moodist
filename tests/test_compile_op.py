@@ -39,7 +39,7 @@ def test_compile_op_point_to_point(ctx: TestContext, device: str):
         inputs = None
         outputs = None
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Execute the op
     if ctx.rank == 0:
@@ -81,7 +81,7 @@ def test_compile_op_broadcast(ctx: TestContext, device: str):
     # All ranks receive
     outputs = [{'offset': [0], 'shape': [8]}]
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Execute
     input_tensors = []
@@ -120,7 +120,7 @@ def test_compile_op_gather(ctx: TestContext, device: str):
     else:
         outputs = None
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Each rank contributes its rank value
     input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=device)
@@ -165,7 +165,7 @@ def test_compile_op_scatter(ctx: TestContext, device: str):
     # Each rank receives its chunk
     outputs = [{'offset': [ctx.rank * chunk_size], 'shape': [chunk_size]}]
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     input_tensors = []
     if ctx.rank == 0:
@@ -204,7 +204,7 @@ def test_compile_op_allgather(ctx: TestContext, device: str):
     # Each rank receives the full tensor
     outputs = [{'offset': [0], 'shape': [chunk_size * ctx.world_size]}]
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     input_tensor = torch.full((chunk_size,), float(ctx.rank), dtype=dtype, device=device)
     output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=device)
@@ -239,7 +239,7 @@ def test_compile_op_2d_tensor(ctx: TestContext, device: str):
     # All ranks receive full tensor
     outputs = [{'offset': [0, 0], 'shape': [ctx.world_size, 4]}]
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Input: row with rank-specific values
     input_tensor = torch.full((1, 4), float(ctx.rank * 10), dtype=dtype, device=device)
@@ -284,7 +284,7 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
     else:
         outputs = None
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     input_tensors = []
     if ctx.rank == 0:
@@ -326,7 +326,7 @@ def test_compile_op_different_dtypes(ctx: TestContext, device: str):
             inputs = None
         outputs = [{'offset': [0], 'shape': [4]}]
 
-        op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+        op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
         input_tensors = []
         if ctx.rank == 0:
@@ -360,7 +360,7 @@ def test_compile_op_reuse(ctx: TestContext, device: str):
         inputs = None
     outputs = [{'offset': [0], 'shape': [4]}]
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Execute multiple times with different data
     for i in range(3):
@@ -401,7 +401,7 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
         inputs = None
         outputs = None
 
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     input_tensors = []
     output_tensors = []

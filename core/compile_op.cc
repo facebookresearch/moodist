@@ -51,8 +51,6 @@ void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
 
 std::shared_ptr<CustomOpDescriptor> compile(
     const CompileContext& ctx,
-    int ndim,
-    std::span<const int64_t> shape,
     DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
@@ -62,24 +60,49 @@ std::shared_ptr<CustomOpDescriptor> compile(
   const size_t size = ctx.size;
   size_t itemsize = wrapperApi.dtypeSize(dtype);
 
-  (void)shape;     // Used later for validation
-  (void)itemsize;  // Used in Phase 5 for byte calculations
+  // Derive ndim from inputs/outputs
+  // If this rank has no inputs/outputs, ndim doesn't matter (no Coords created)
+  int ndim = 0;
+  for (const auto& [r, off, sh] : inputs) {
+    if (!off.empty()) {
+      ndim = static_cast<int>(off.size());
+      break;
+    }
+  }
+  if (ndim == 0) {
+    for (const auto& [r, off, sh] : outputs) {
+      if (!off.empty()) {
+        ndim = static_cast<int>(off.size());
+        break;
+      }
+    }
+  }
 
-  // Validate input/output tuple sizes
+  // Validate input/output dimensions are consistent
   for (size_t i : indices(inputs)) {
     const auto& [r, off, sh] = inputs[i];
-    if (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim)) {
+    if (ndim > 0 && (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim))) {
       throw std::runtime_error(fmt::sprintf(
           "moodist.compile_op: input %zu has wrong dimensions (offset size %zu, shape size %zu, expected %d)",
           i, off.size(), sh.size(), ndim));
     }
+    if (off.size() != sh.size()) {
+      throw std::runtime_error(fmt::sprintf(
+          "moodist.compile_op: input %zu has mismatched offset/shape sizes (%zu vs %zu)",
+          i, off.size(), sh.size()));
+    }
   }
   for (size_t i : indices(outputs)) {
     const auto& [r, off, sh] = outputs[i];
-    if (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim)) {
+    if (ndim > 0 && (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim))) {
       throw std::runtime_error(fmt::sprintf(
           "moodist.compile_op: output %zu has wrong dimensions (offset size %zu, shape size %zu, expected %d)",
           i, off.size(), sh.size(), ndim));
+    }
+    if (off.size() != sh.size()) {
+      throw std::runtime_error(fmt::sprintf(
+          "moodist.compile_op: output %zu has mismatched offset/shape sizes (%zu vs %zu)",
+          i, off.size(), sh.size()));
     }
   }
 

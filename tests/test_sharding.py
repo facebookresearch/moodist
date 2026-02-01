@@ -288,7 +288,6 @@ def _verify_compile_op_allgather(
     # Compile the op
     op = moodist.compile_op(
         pg,
-        shape=list(shape),
         dtype=global_tensor.dtype,
         inputs=inputs if inputs else None,
         outputs=outputs,
@@ -532,7 +531,6 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             try:
                 op = moodist.compile_op(
                     pg,
-                    shape=list(shape),
                     dtype=global_tensor.dtype,
                     inputs=inputs,
                     outputs=outputs,
@@ -565,7 +563,6 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             try:
                 op = moodist.compile_op(
                     pg,
-                    shape=list(shape),
                     dtype=global_tensor.dtype,
                     inputs=inputs,
                     outputs=outputs,

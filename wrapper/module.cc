@@ -688,15 +688,14 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
 }
 
 static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, PyObject* kwds) {
-  static const char* kwlist[] = {"shape", "dtype", "inputs", "outputs", "reduce", nullptr};
-  PyObject* shape_obj = nullptr;
+  static const char* kwlist[] = {"dtype", "inputs", "outputs", "reduce", nullptr};
   PyObject* dtype_obj = nullptr;
   PyObject* inputs_obj = nullptr;
   PyObject* outputs_obj = nullptr;
   PyObject* reduce_obj = Py_None;
 
   if (!PyArg_ParseTupleAndKeywords(
-          args, kwds, "OOOO|O", const_cast<char**>(kwlist), &shape_obj, &dtype_obj, &inputs_obj, &outputs_obj, &reduce_obj)) {
+          args, kwds, "OOO|O", const_cast<char**>(kwlist), &dtype_obj, &inputs_obj, &outputs_obj, &reduce_obj)) {
     return nullptr;
   }
 
@@ -728,19 +727,6 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
 
   auto* pg = get_ptr<MoodistProcessGroup>(self);
   try {
-    // Parse shape (list or tuple of ints)
-    std::vector<int64_t> shape;
-    if (!PyList_Check(shape_obj) && !PyTuple_Check(shape_obj)) {
-      PyErr_SetString(PyExc_TypeError, "shape must be a list or tuple of ints");
-      return nullptr;
-    }
-    Py_ssize_t shape_len = PySequence_Size(shape_obj);
-    shape.reserve(shape_len);
-    for (Py_ssize_t i = 0; i < shape_len; ++i) {
-      PyRef item(PySequence_GetItem(shape_obj, i));
-      shape.push_back(PyLong_AsLongLong(item.get()));
-    }
-
     // Parse dtype - get torch.dtype from the Python object
     PyRef dtype_name(PyObject_Str(dtype_obj));
     if (!dtype_name) {
@@ -821,7 +807,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     moodist::wrapper::CustomOp op;
     {
       GilRelease gil;
-      op = pg->compileOpFull(shape, dtype, inputs, outputs, reduce);
+      op = pg->compileOpFull(dtype, inputs, outputs, reduce);
     }
     return wrap_customop(std::move(op));
   } catch (const moodist::PythonErrorAlreadySet&) {

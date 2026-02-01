@@ -255,10 +255,9 @@ struct ReadResponse {
 
 // Main compile function
 // Returns a compiled CustomOpDescriptor ready for execution
+// ndim is derived from inputs/outputs (validated for consistency)
 std::shared_ptr<CustomOpDescriptor> compile(
     const CompileContext& ctx,
-    int ndim,
-    std::span<const int64_t> shape,
     DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,

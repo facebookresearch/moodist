@@ -252,7 +252,7 @@ struct CoreApi {
       api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
   // compileOpFull - compiles a distributed tensor operation
-  api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, std::span<const int64_t> shape, DType dtype,
+  api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, DType dtype,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
       api::ReduceOp reduce);

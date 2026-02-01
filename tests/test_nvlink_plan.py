@@ -31,7 +31,7 @@ def test_nvlink_plan_allgather(ctx: TestContext):
     outputs = [{'offset': [0, 0], 'shape': [ctx.world_size, 256]}]
 
     ctx.log(f"Compiling all-gather op (shape={shape})")
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Run it
     input_t = torch.full((1, 256), float(ctx.rank), device="cuda", dtype=dtype)
@@ -74,7 +74,7 @@ def test_nvlink_plan_broadcast(ctx: TestContext):
     outputs = [{'offset': [0, 0], 'shape': [1, 1024]}]
 
     ctx.log(f"Compiling broadcast op (shape={shape})")
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Run it
     input_tensors = []
@@ -130,7 +130,7 @@ def test_nvlink_plan_partial_overlap(ctx: TestContext):
     outputs = [{'offset': [0, start], 'shape': [1, end - start]}]
 
     ctx.log(f"Compiling partial overlap op (slice [{start}, {end}))")
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Run it
     input_tensors = []
@@ -187,7 +187,7 @@ def test_nvlink_plan_distributed_inputs(ctx: TestContext):
     outputs = [{'offset': [0, output_start], 'shape': [1, output_end - output_start]}]
 
     ctx.log(f"Compiling distributed inputs op: input=[{my_start}, {my_start + chunk_size}), output=[{output_start}, {output_end})")
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Run it - each rank provides its chunk filled with rank value
     input_t = torch.full((1, chunk_size), float(ctx.rank), device="cuda", dtype=dtype)
@@ -249,7 +249,7 @@ def test_nvlink_plan_subset_reads(ctx: TestContext):
     outputs = [{'offset': [0, my_start], 'shape': [1, slice_size]}]
 
     ctx.log(f"Compiling subset reads op: output=[{my_start}, {my_end})")
-    op = moodist.compile_op(pg, shape=shape, dtype=dtype, inputs=inputs, outputs=outputs)
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
     # Run it - rank 0 provides data where each slice_size chunk has value = chunk_index
     input_tensors = []

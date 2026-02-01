@@ -1007,7 +1007,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
   void cudaBarrier(CUstream stream);
 
   // compileOpFull - compile a distributed tensor operation
-  SharedPtr<CustomOpImpl> compileOpFull(std::span<const int64_t> shape, DType dtype,
+  SharedPtr<CustomOpImpl> compileOpFull(DType dtype,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
       api::ReduceOp reduce);
@@ -2295,7 +2295,7 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
           std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
     it = scatterCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -2369,7 +2369,7 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
           std::vector<int64_t>{static_cast<int64_t>(numel)});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(shape, dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
+    SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
     it = gatherCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -3626,7 +3626,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const 
 // ProcessGroupImpl::compileOpFull - compile a distributed tensor operation
 // ============================================================================
 
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(std::span<const int64_t> shapeVec, DType dtype,
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputsVec,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputsVec,
     api::ReduceOp reduce) {
@@ -3656,8 +3656,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(std::span<const int64_t>
   ctx.nextOpId = &nextCustomOpId;
 
   // Call compile_op
-  int ndim = static_cast<int>(shapeVec.size());
-  auto op = compile_op::compile(ctx, ndim, shapeVec, dtype, inputsVec, outputsVec, reduce);
+  auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce);
 
   // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
   auto result = makeShared<CustomOpImpl>();
@@ -3896,12 +3895,12 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 }
 
 // API function that calls the member method
-api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, std::span<const int64_t> shape, DType dtype,
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
     std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
     api::ReduceOp reduce) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
-  SharedPtr<CustomOpImpl> op = impl->compileOpFull(shape, dtype, inputs, outputs, reduce);
+  SharedPtr<CustomOpImpl> op = impl->compileOpFull(dtype, inputs, outputs, reduce);
   return api::CustomOpHandle::adopt(op.release());
 }
 
