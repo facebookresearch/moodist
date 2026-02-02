@@ -35,10 +35,10 @@ from .options import MoodistOptions, MoodistOptionsContext
 from .queue import Queue, TransactionContextManager
 
 # Compile op
-from .compile import compile_op
+from .compile import compile_op, TensorRegion, specs_from_dtensor
 
 # Sharding utilities
-from .sharding import compute_shards, dtensor_shards
+from .sharding import compute_shards, dtensor_shards, ShardInfo
 
 
 if TYPE_CHECKING:
@@ -89,7 +89,10 @@ __all__ = [
     "MoodistOptionsContext",
     # Compile
     "compile_op",
+    "TensorRegion",
+    "specs_from_dtensor",
     # Sharding
     "compute_shards",
     "dtensor_shards",
+    "ShardInfo",
 ]

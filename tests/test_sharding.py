@@ -17,6 +17,7 @@ from torch.distributed.tensor import DTensor, DeviceMesh, distribute_tensor
 from torch.distributed.tensor.placement_types import Shard, Replicate
 
 import moodist
+from moodist import TensorRegion
 from framework import TestContext, test, test_cpu_cuda, create_process_group
 
 # Check for _StridedShard availability (private API, may not exist)
@@ -70,7 +71,7 @@ def _build_local_from_chunks(chunks, global_tensor):
     Build the expected local tensor from chunks.
 
     Args:
-        chunks: List of (global_offset, local_offset, chunk_shape) tuples
+        chunks: List of ShardInfo objects
         global_tensor: The full global tensor
 
     Returns:
@@ -81,23 +82,23 @@ def _build_local_from_chunks(chunks, global_tensor):
         return torch.zeros([0] * global_tensor.ndim, dtype=global_tensor.dtype)
 
     # Compute local shape from max(local_offset + chunk_shape) per dimension
-    ndim = len(chunks[0][2])
+    ndim = len(chunks[0].shape)
     local_shape = [0] * ndim
-    for global_offset, local_offset, chunk_shape in chunks:
+    for chunk in chunks:
         for d in range(ndim):
-            local_shape[d] = max(local_shape[d], local_offset[d] + chunk_shape[d])
+            local_shape[d] = max(local_shape[d], chunk.local_offset[d] + chunk.shape[d])
 
     # Create local tensor
     local_tensor = torch.zeros(local_shape, dtype=global_tensor.dtype)
 
     # Copy chunks from global to local positions
-    for global_offset, local_offset, chunk_shape in chunks:
+    for chunk in chunks:
         # Build slices for global and local tensors
         global_slices = tuple(
-            slice(go, go + cs) for go, cs in zip(global_offset, chunk_shape)
+            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
         )
         local_slices = tuple(
-            slice(lo, lo + cs) for lo, cs in zip(local_offset, chunk_shape)
+            slice(lo, lo + cs) for lo, cs in zip(chunk.local_offset, chunk.shape)
         )
         local_tensor[local_slices] = global_tensor[global_slices]
 
@@ -279,11 +280,11 @@ def _verify_compile_op_allgather(
 
     # Build input specs from chunks (global offsets)
     inputs = []
-    for global_offset, local_offset, chunk_shape in my_chunks:
-        inputs.append({'offset': global_offset, 'shape': chunk_shape})
+    for chunk in my_chunks:
+        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
 
     # Output: full tensor
-    outputs = [{'offset': [0] * len(shape), 'shape': list(shape)}]
+    outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
 
     # Compile the op
     op = moodist.compile_op(
@@ -296,9 +297,9 @@ def _verify_compile_op_allgather(
 
     # Build input tensors (the local shard data)
     input_tensors = []
-    for global_offset, local_offset, chunk_shape in my_chunks:
+    for chunk in my_chunks:
         global_slices = tuple(
-            slice(go, go + cs) for go, cs in zip(global_offset, chunk_shape)
+            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
         )
         chunk_data = global_tensor[global_slices].to(device=device).contiguous()
         input_tensors.append(chunk_data)
@@ -525,8 +526,8 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
             my_chunks = moodist.compute_shards(shape, [Replicate()], indices_and_sizes)
 
-            inputs = [{'offset': go, 'shape': cs} for go, lo, cs in my_chunks]
-            outputs = [{'offset': [0] * len(shape), 'shape': list(shape)}]
+            inputs = [TensorRegion(offset=c.global_offset, shape=c.shape) for c in my_chunks]
+            outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
 
             try:
                 op = moodist.compile_op(
@@ -555,10 +556,10 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
         if coord is not None:
             # Only rank 0 provides input, and only first half
             if ctx.rank == 0:
-                inputs = [{'offset': [0], 'shape': [8]}]  # Only first half
+                inputs = [TensorRegion(offset=[0], shape=[8])]  # Only first half
             else:
                 inputs = []
-            outputs = [{'offset': [0], 'shape': list(shape)}]  # All ranks want full tensor
+            outputs = [TensorRegion(offset=[0], shape=list(shape))]  # All ranks want full tensor
 
             try:
                 op = moodist.compile_op(

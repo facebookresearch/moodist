@@ -16,6 +16,10 @@
 
 #include "api_handle.h"
 
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
 namespace moodist::api {
 
 // Base types for API boundary.
@@ -39,6 +43,15 @@ enum class ReduceOp : int {
   None = 0, // Error on overlap (default)
   Any = 1,  // Pick any source (all sources have same value)
   // Future: Sum, Mean, Max, Min (require CUDA kernels)
+};
+
+// Input/output specification for compile_op
+// Describes a region of a tensor that a rank contributes or receives
+struct TensorRegion {
+  int32_t rank;
+  std::vector<int64_t> offset;
+  std::vector<int64_t> shape;
+  std::string_view tensorId; // Caller keeps underlying string alive
 };
 
 } // namespace moodist::api

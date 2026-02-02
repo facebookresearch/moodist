@@ -51,10 +51,8 @@ bool futureGetResult(api::Future* future, TensorPtr* outTensor);
 void customOpDestroy(api::CustomOp* op);
 api::FutureHandle customOpCall(
     api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
-api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
-    api::ReduceOp reduce);
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
+    std::span<const api::TensorRegion> outputs, api::ReduceOp reduce);
 
 // Serialization is temporarily disabled - will be moved to separate library
 // Forward declaration for bufferDestroy defined in serialize_object.cc

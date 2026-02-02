@@ -49,61 +49,41 @@ void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
 
 } // namespace
 
-std::shared_ptr<CustomOpDescriptor> compile(
-    const CompileContext& ctx,
-    DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
-    ReduceOp reduce) {
+std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
+    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs, ReduceOp reduce) {
 
   const size_t rank = ctx.rank;
   const size_t size = ctx.size;
   size_t itemsize = wrapperApi.dtypeSize(dtype);
 
-  // Derive ndim from inputs/outputs
-  // If this rank has no inputs/outputs, ndim doesn't matter (no Coords created)
-  int ndim = 0;
-  for (const auto& [r, off, sh] : inputs) {
-    if (!off.empty()) {
-      ndim = static_cast<int>(off.size());
-      break;
-    }
-  }
-  if (ndim == 0) {
-    for (const auto& [r, off, sh] : outputs) {
-      if (!off.empty()) {
-        ndim = static_cast<int>(off.size());
-        break;
-      }
-    }
-  }
+  // Validate per-tensorId ndim consistency
+  // Different tensorIds can have different ndims (e.g., 2D weight vs 1D bias)
+  HashMap<std::string, int> tensorIdNdim;
 
-  // Validate input/output dimensions are consistent
+  auto validateAndRecordNdim = [&](const api::TensorRegion& region, const char* kind, size_t idx) {
+    int ndim = static_cast<int>(region.offset.size());
+    if (region.offset.size() != region.shape.size()) {
+      throw std::runtime_error(fmt::sprintf("moodist.compile_op: %s %zu has mismatched offset/shape sizes (%zu vs %zu)",
+          kind, idx, region.offset.size(), region.shape.size()));
+    }
+    std::string tid(region.tensorId);
+    auto it = tensorIdNdim.find(tid);
+    if (it != tensorIdNdim.end()) {
+      if (it->second != ndim) {
+        throw std::runtime_error(
+            fmt::sprintf("moodist.compile_op: %s %zu has wrong dimensions for tensorId '%s' (got %d, expected %d)",
+                kind, idx, tid.c_str(), ndim, it->second));
+      }
+    } else {
+      tensorIdNdim[tid] = ndim;
+    }
+  };
+
   for (size_t i : indices(inputs)) {
-    const auto& [r, off, sh] = inputs[i];
-    if (ndim > 0 && (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim))) {
-      throw std::runtime_error(fmt::sprintf(
-          "moodist.compile_op: input %zu has wrong dimensions (offset size %zu, shape size %zu, expected %d)",
-          i, off.size(), sh.size(), ndim));
-    }
-    if (off.size() != sh.size()) {
-      throw std::runtime_error(fmt::sprintf(
-          "moodist.compile_op: input %zu has mismatched offset/shape sizes (%zu vs %zu)",
-          i, off.size(), sh.size()));
-    }
+    validateAndRecordNdim(inputs[i], "input", i);
   }
   for (size_t i : indices(outputs)) {
-    const auto& [r, off, sh] = outputs[i];
-    if (ndim > 0 && (off.size() != static_cast<size_t>(ndim) || sh.size() != static_cast<size_t>(ndim))) {
-      throw std::runtime_error(fmt::sprintf(
-          "moodist.compile_op: output %zu has wrong dimensions (offset size %zu, shape size %zu, expected %d)",
-          i, off.size(), sh.size(), ndim));
-    }
-    if (off.size() != sh.size()) {
-      throw std::runtime_error(fmt::sprintf(
-          "moodist.compile_op: output %zu has mismatched offset/shape sizes (%zu vs %zu)",
-          i, off.size(), sh.size()));
-    }
+    validateAndRecordNdim(outputs[i], "output", i);
   }
 
   // Parse inputs and outputs into TensorDescr structs
@@ -112,26 +92,30 @@ std::shared_ptr<CustomOpDescriptor> compile(
   Vector<size_t> inputIndexCounter(size);
   Vector<size_t> outputIndexCounter(size);
 
-  for (const auto& [r, off, sh] : inputs) {
+  for (const auto& region : inputs) {
     TensorDescr d;
-    d.rank = r;
-    d.index = inputIndexCounter[r]++;
+    d.rank = region.rank;
+    d.index = inputIndexCounter[region.rank]++;
+    d.tensorId = std::string(region.tensorId);
+    int ndim = tensorIdNdim.at(d.tensorId);
     d.offset = Coord(ndim);
     d.shape = Coord(ndim);
-    std::ranges::copy(off, d.offset.begin());
-    std::ranges::copy(sh, d.shape.begin());
+    std::ranges::copy(region.offset, d.offset.begin());
+    std::ranges::copy(region.shape, d.shape.begin());
     d.numel = numel(d.shape);
     inputDescrs.push_back(std::move(d));
   }
 
-  for (const auto& [r, off, sh] : outputs) {
+  for (const auto& region : outputs) {
     TensorDescr d;
-    d.rank = r;
-    d.index = outputIndexCounter[r]++;
+    d.rank = region.rank;
+    d.index = outputIndexCounter[region.rank]++;
+    d.tensorId = std::string(region.tensorId);
+    int ndim = tensorIdNdim.at(d.tensorId);
     d.offset = Coord(ndim);
     d.shape = Coord(ndim);
-    std::ranges::copy(off, d.offset.begin());
-    std::ranges::copy(sh, d.shape.begin());
+    std::ranges::copy(region.offset, d.offset.begin());
+    std::ranges::copy(region.shape, d.shape.begin());
     d.numel = numel(d.shape);
     outputDescrs.push_back(std::move(d));
   }
@@ -156,6 +140,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
 
   // For each output (from any rank), find intersecting inputs from myInputs
   // Create LogicalInput entries and group by destination rank
+  // Only inputs and outputs with matching tensorId can intersect
   Vector<Vector<LogicalInput>> logicalInputsToSend(size);
 
   for (size_t outIdx : indices(outputDescrs)) {
@@ -168,11 +153,18 @@ std::shared_ptr<CustomOpDescriptor> compile(
     for (size_t myInpIdx : myInputIndices) {
       const TensorDescr& inp = inputDescrs[myInpIdx];
 
+      // Only intersect if tensorIds match
+      if (inp.tensorId != out.tensorId) {
+        continue;
+      }
+
+      // Get ndim for this tensorId (guaranteed to exist after validation)
+      int ndim = tensorIdNdim.at(inp.tensorId);
+
       // Check intersection
       bool intersects = true;
       for (int d = 0; d < ndim; ++d) {
-        if (inp.offset[d] >= out.offset[d] + out.shape[d] ||
-            out.offset[d] >= inp.offset[d] + inp.shape[d]) {
+        if (inp.offset[d] >= out.offset[d] + out.shape[d] || out.offset[d] >= inp.offset[d] + inp.shape[d]) {
           intersects = false;
           break;
         }
@@ -224,8 +216,8 @@ std::shared_ptr<CustomOpDescriptor> compile(
   }
 
   // Debug logging
-  log.debug("compile_op phase1: rank %zu, sent to %zu ranks, received %zu logical inputs\n",
-      rank, size, receivedInputs.size());
+  log.debug("compile_op phase1: rank %zu, sent to %zu ranks, received %zu logical inputs\n", rank, size,
+      receivedInputs.size());
 
   // ============================================================================
   // Phase 2: Overlap resolution via cell decomposition
@@ -243,7 +235,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
   struct CellSource {
     Coord offset;
     Coord shape;
-    size_t sourceIdx;  // Index into receivedInputs
+    size_t sourceIdx; // Index into receivedInputs
   };
   Vector<Vector<CellSource>> cellsPerOutput(numMyOutputs);
 
@@ -255,6 +247,9 @@ std::shared_ptr<CustomOpDescriptor> compile(
     if (out.numel == 0) {
       continue;
     }
+
+    // Get ndim for this output's tensorId
+    int ndim = tensorIdNdim.at(out.tensorId);
 
     // Collect boundaries in each dimension from output and all covering inputs
     Vector<Vector<int64_t>> boundaries(ndim);
@@ -300,8 +295,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
       // Check if cell is inside output
       bool insideOutput = true;
       for (int d = 0; d < ndim; ++d) {
-        if (cellOffset[d] < out.offset[d] ||
-            cellOffset[d] + cellShape[d] > out.offset[d] + out.shape[d]) {
+        if (cellOffset[d] < out.offset[d] || cellOffset[d] + cellShape[d] > out.offset[d] + out.shape[d]) {
           insideOutput = false;
           break;
         }
@@ -316,8 +310,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
         const LogicalInput& inp = receivedInputs[i];
         bool covers = true;
         for (int d = 0; d < ndim; ++d) {
-          if (cellOffset[d] < inp.offset[d] ||
-              cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
+          if (cellOffset[d] < inp.offset[d] || cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
             covers = false;
             break;
           }
@@ -332,8 +325,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
         gapCount++;
         if (gapCount <= maxReportedRegions) {
           gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
-              fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
-              fmt::to_string(fmt::join(cellShape, ",")).c_str());
+              fmt::to_string(fmt::join(cellOffset, ",")).c_str(), fmt::to_string(fmt::join(cellShape, ",")).c_str());
         }
       } else if (coveringInputs.size() > 1) {
         // Overlap detected
@@ -342,12 +334,9 @@ std::shared_ptr<CustomOpDescriptor> compile(
           if (overlapCount <= maxReportedRegions) {
             const LogicalInput& a = receivedInputs[coveringInputs[0]];
             const LogicalInput& b = receivedInputs[coveringInputs[1]];
-            overlapDetails += fmt::sprintf(
-                "\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
-                outIdx,
-                fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
-                fmt::to_string(fmt::join(cellShape, ",")).c_str(),
-                a.inputRank, b.inputRank);
+            overlapDetails += fmt::sprintf("\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
+                outIdx, fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
+                fmt::to_string(fmt::join(cellShape, ",")).c_str(), a.inputRank, b.inputRank);
           }
         } else {
           // reduce == Any: pick one randomly
@@ -445,9 +434,9 @@ std::shared_ptr<CustomOpDescriptor> compile(
 
   // Track copies needed for non-contiguous reads from my inputs
   struct InputCopy {
-    uint32_t inputIndex;  // Which of my inputs
-    Coord offset;         // Offset within that input
-    Coord shape;          // Shape of the region
+    uint32_t inputIndex; // Which of my inputs
+    Coord offset;        // Offset within that input
+    Coord shape;         // Shape of the region
   };
   Vector<InputCopy> inputCopies;
 
@@ -490,8 +479,8 @@ std::shared_ptr<CustomOpDescriptor> compile(
       inputCopies.push_back(std::move(copy));
 
       resp.tensorIndex = copyIndex;
-      resp.inputOffset = 0;  // Copy is contiguous, starts at 0
-      resp.tensorShape = req.shape;  // Copy has same shape as request
+      resp.inputOffset = 0;         // Copy is contiguous, starts at 0
+      resp.tensorShape = req.shape; // Copy has same shape as request
       resp.isCopy = true;
     }
 
@@ -519,8 +508,8 @@ std::shared_ptr<CustomOpDescriptor> compile(
     }
   }
 
-  log.debug("compile_op phase4: rank %zu, %zu input copies, received %zu responses\n",
-      rank, inputCopies.size(), receivedResponses.size());
+  log.debug("compile_op phase4: rank %zu, %zu input copies, received %zu responses\n", rank, inputCopies.size(),
+      receivedResponses.size());
 
   // ============================================================================
   // Phase 5: Finalize and build CustomOpDescriptor (receiver)
@@ -556,7 +545,7 @@ std::shared_ptr<CustomOpDescriptor> compile(
   // Track output copies needed for non-contiguous writes
   struct OutputCopy {
     uint32_t outputIndex;
-    Coord offset;  // Relative to output
+    Coord offset; // Relative to output
     Coord shape;
   };
   Vector<OutputCopy> outputCopyList;
@@ -585,11 +574,11 @@ std::shared_ptr<CustomOpDescriptor> compile(
     read.rank = resp.senderRank;
     read.inputIndex = resp.tensorIndex;
     read.outputIndex = resp.outputIndex;
-    read.inputOffset = itemsize * resp.inputOffset;  // Convert to bytes
+    read.inputOffset = itemsize * resp.inputOffset; // Convert to bytes
     read.bytes = bytes;
 
     if (outputContiguous) {
-      read.outputOffset = itemsize * outputOffset;  // Convert to bytes
+      read.outputOffset = itemsize * outputOffset; // Convert to bytes
     } else {
       // Need to copy to a contiguous region, then write to output
       uint32_t copyIdx = static_cast<uint32_t>(outputsPerRank[rank].size() + outputCopyList.size());
@@ -624,8 +613,8 @@ std::shared_ptr<CustomOpDescriptor> compile(
   // Final barrier
   ctx.barrier();
 
-  log.debug("compile_op phase5: rank %zu, %zu reads, %zu output copies\n",
-      rank, op->reads.size(), op->outputCopies.size());
+  log.debug(
+      "compile_op phase5: rank %zu, %zu reads, %zu output copies\n", rank, op->reads.size(), op->outputCopies.size());
 
   return op;
 }

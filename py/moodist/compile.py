@@ -1,8 +1,11 @@
 import weakref
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import torch
 
 from .queue import Queue
+from .sharding import dtensor_shards, ShardInfo
 
 
 weak_group = weakref.WeakValueDictionary()
@@ -13,91 +16,91 @@ class Name(str):
     pass
 
 
+@dataclass
+class TensorRegion:
+    """Specification for an input or output tensor region in compile_op.
+
+    Attributes:
+        offset: Position in the global tensor (list of ints, one per dimension).
+        shape: Shape of this region (list of ints, one per dimension).
+        tensor_id: Identifier for grouping regions. Regions with different tensor_ids
+            are treated as separate logical tensors and can have different ndims.
+            Defaults to "0".
+    """
+    offset: List[int]
+    shape: List[int]
+    tensor_id: str = "0"
+
+
+def specs_from_dtensor(dtensor, tensor_id: str = "0") -> List[TensorRegion]:
+    """Convert a DTensor's shards to TensorRegions for compile_op.
+
+    Uses dtensor_shards() to compute the chunks this rank owns, then wraps
+    them as TensorRegion objects with the specified tensor_id.
+
+    Args:
+        dtensor: A PyTorch DTensor.
+        tensor_id: Identifier for this tensor (default "0").
+
+    Returns:
+        List of TensorRegion objects for this rank's chunks.
+    """
+    shards = dtensor_shards(dtensor)
+    return [TensorRegion(s.global_offset, s.shape, tensor_id) for s in shards]
+
+
 def _is_dtensor(x):
     """Check if x is a DTensor without hard dependency on torch.distributed.tensor."""
     return hasattr(x, 'placements') and hasattr(x, 'device_mesh') and hasattr(x, 'to_local')
 
 
-def _get_shard_metadata(dtensor):
-    """Extract offset and local shape for this rank's shard of the DTensor.
-
-    Matches PyTorch's Shard.local_shard_size_and_offset logic for consistency.
-    """
-    from torch.distributed.tensor import Shard
-
-    device_mesh = dtensor.device_mesh
-    placements = dtensor.placements
-    global_shape = list(dtensor.shape)
-    offsets = [0] * len(global_shape)
-    local_shape = list(global_shape)
-
-    coord = device_mesh.get_coordinate()
-    if coord is None:
-        # This rank is not part of this mesh - return empty shard
-        return {'offset': offsets, 'shape': [0] * len(global_shape)}
-
-    for mesh_dim, placement in enumerate(placements):
-        if isinstance(placement, Shard):
-            shard_dim = placement.dim
-            global_size = global_shape[shard_dim]
-            num_chunks = device_mesh.size(mesh_dim)
-            rank = coord[mesh_dim]
-
-            chunk_size = (global_size + num_chunks - 1) // num_chunks
-            shard_start = chunk_size * rank
-
-            if global_size < shard_start:
-                # Empty shard - past the end
-                offsets[shard_dim] = global_size
-                local_shape[shard_dim] = 0
-            else:
-                offsets[shard_dim] = shard_start
-                local_shape[shard_dim] = (
-                    min(global_size, shard_start + chunk_size) - shard_start
-                )
-
-    return {'offset': offsets, 'shape': local_shape}
-
-
 def _process_tensor_specs(specs, holder):
     """
-    Process a list of tensor specifications (dicts or DTensors).
+    Process a list of tensor specifications (TensorSpec, dict, or DTensor).
 
     Args:
-        specs: List of dicts or DTensors
-        holder: Dict to store/validate ndim and dtype
+        specs: List of TensorSpec, dicts, or DTensors
+        holder: Dict to store/validate dtype (from DTensors)
 
     Returns:
-        List of dicts with 'offset' and 'shape' keys
+        List of TensorSpec objects, or None if specs is None
     """
     if specs is None:
         return None
 
     processed = []
     for x in specs:
-        if _is_dtensor(x):
-            # Extract and validate dtype
+        if isinstance(x, TensorRegion):
+            processed.append(x)
+        elif _is_dtensor(x):
+            # Extract and validate dtype from DTensor
             x_dtype = x.dtype
-            x_ndim = len(x.shape)
 
             if holder.get('dtype') is None:
                 holder['dtype'] = x_dtype
-                holder['ndim'] = x_ndim
-            else:
-                if holder['dtype'] != x_dtype:
-                    raise ValueError(
-                        f"All DTensors must have the same dtype, got {holder['dtype']} and {x_dtype}"
-                    )
-                if holder.get('ndim') is not None and holder['ndim'] != x_ndim:
-                    raise ValueError(
-                        f"All DTensors must have the same ndim, got {holder['ndim']} and {x_ndim}"
-                    )
-                holder['ndim'] = x_ndim
+            elif holder['dtype'] != x_dtype:
+                raise ValueError(
+                    f"All DTensors must have the same dtype, got {holder['dtype']} and {x_dtype}"
+                )
 
-            processed.append(_get_shard_metadata(x))
+            # Convert DTensor to TensorRegions (may produce multiple regions)
+            # Use default tensor_id "0" for DTensors passed directly
+            dtensor_regions = specs_from_dtensor(x, tensor_id="0")
+            processed.extend(dtensor_regions)
+        elif isinstance(x, dict):
+            # Convert dict to TensorRegion
+            offset = x.get('offset')
+            shape = x.get('shape')
+            tensor_id = x.get('tensor_id', "0")
+            # Convert tensor_id to string if it's an int
+            if isinstance(tensor_id, int):
+                tensor_id = str(tensor_id)
+            processed.append(TensorRegion(offset=offset, shape=shape, tensor_id=tensor_id))
         else:
-            # Assume it's a dict
-            processed.append(x)
+            raise TypeError(
+                f"each input/output spec must be a TensorRegion, dict, or DTensor, "
+                f"got {type(x).__name__}"
+            )
 
     return processed
 
@@ -119,8 +122,9 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         dtype: The PyTorch data type (torch.dtype) for the operation (e.g., torch.float32).
                All ranks must specify the same dtype. Can be omitted if using DTensors.
         inputs: Optional list of input tensor specifications. Each element can be either:
-                - A dict with 'offset' and 'shape' keys specifying the slice in global coordinates
-                - A DTensor, from which the offset and shape are derived automatically
+                - A TensorRegion object
+                - A dict with 'offset', 'shape', and optionally 'tensor_id' keys
+                - A DTensor, from which specs are derived automatically
                 If None, this rank contributes no inputs to the operation.
         outputs: Optional list of output tensor specifications. Same format as inputs.
                  If None, this rank receives no outputs from the operation.
@@ -135,14 +139,12 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
     Raises:
         ValueError: If dtype is not provided (and not derivable from DTensors),
                    input/output specifications are malformed, or ranks specify inconsistent
-                   dtypes.
+                   dtypes or ndims within a tensor_id group.
         TypeError: If dtype is not a torch.dtype, or input/output specifications have
                    wrong types.
 
     Example:
         >>> # Using dict specifications:
-        >>> # Rank 0 sends data at offset [0, 0] with shape [2, 4]
-        >>> # Rank 1 receives data at offset [0, 0] with shape [2, 4]
         >>> import torch
         >>> import moodist
         >>> group = moodist.find_process_group("my_group")
@@ -161,6 +163,13 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         >>>     outputs=outputs
         >>> )
         >>>
+        >>> # Using TensorRegion with tensor_id for batching multiple tensors:
+        >>> from moodist import TensorRegion
+        >>> inputs = [
+        >>>     TensorRegion(offset=[0, 0], shape=[10, 10], tensor_id="weight"),
+        >>>     TensorRegion(offset=[0], shape=[128], tensor_id="bias"),
+        >>> ]
+        >>>
         >>> # Using DTensors (dtype derived automatically):
         >>> op = moodist.compile_op(
         >>>     group,
@@ -173,34 +182,21 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
           and must be called by all ranks in the group.
         - Input/output regions can overlap, enabling operations like scatter, gather,
           all-gather, reduce-scatter, and custom patterns.
+        - Different tensor_ids can have different ndims (e.g., 2D weight vs 1D bias).
         - The function uses an internal queue for coordination, which is cached per group.
     """
-    # Process DTensors and extract dtype if not provided
-    holder = {'ndim': None, 'dtype': dtype}
+    # Process specs and extract dtype if not provided
+    holder = {'dtype': dtype}
 
     inputs = _process_tensor_specs(inputs, holder)
     outputs = _process_tensor_specs(outputs, holder)
 
-    ndim = holder['ndim']
     dtype = holder['dtype']
 
     if dtype is None:
         raise ValueError("dtype must be provided or derivable from DTensors")
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
-
-    # Derive ndim from inputs/outputs if not derived from DTensors
-    if ndim is None:
-        if inputs:
-            for x in inputs:
-                if 'offset' in x and x['offset']:
-                    ndim = len(x['offset'])
-                    break
-        if ndim is None and outputs:
-            for x in outputs:
-                if 'offset' in x and x['offset']:
-                    ndim = len(x['offset'])
-                    break
 
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
     if name not in weak_group:
@@ -210,30 +206,28 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
     queue = weak_queue.get(name)
     assert isinstance(queue, Queue)
 
-    def check(l):
-        nonlocal ndim
-        if not isinstance(l, (tuple, list)):
-            raise TypeError(f"inputs/outputs must be a tuple or list, got {type(l).__name__}")
-        for x in l:
-            if not isinstance(x, dict):
-                raise TypeError(f"each input/output spec must be a dict, got {type(x).__name__}")
-            for n in ("offset", "shape"):
-                if n not in x:
-                    raise ValueError(f"'{n}' is missing for an input or output")
-                v = x[n]
-                if not isinstance(v, (tuple, list)):
-                    raise TypeError(f"'{n}' must be a tuple or list, got {type(v).__name__}")
-                # Set or validate ndim
-                if ndim is None:
-                    ndim = len(v)
-                elif len(v) != ndim:
-                    raise ValueError(
-                        f"expected '{n}' with {ndim} dimensions, but got {len(v)}"
-                    )
-                for i, z in enumerate(v):
+    def check(specs):
+        """Validate TensorRegions and convert to tuples for serialization."""
+        if not isinstance(specs, (tuple, list)):
+            raise TypeError(f"inputs/outputs must be a tuple or list, got {type(specs).__name__}")
+        result = []
+        for spec in specs:
+            if not isinstance(spec, TensorRegion):
+                raise TypeError(f"each input/output spec must be a TensorRegion, got {type(spec).__name__}")
+            for name, value in [("offset", spec.offset), ("shape", spec.shape)]:
+                if value is None:
+                    raise ValueError(f"'{name}' is missing for an input or output")
+                if not isinstance(value, (tuple, list)):
+                    raise TypeError(f"'{name}' must be a tuple or list, got {type(value).__name__}")
+                for i, z in enumerate(value):
                     if not isinstance(z, int):
-                        raise TypeError(f"{n}[{i}] must be an int, got {type(z).__name__}")
-        return tuple((tuple(x["offset"]), tuple(x["shape"])) for x in l)
+                        raise TypeError(f"{name}[{i}] must be an int, got {type(z).__name__}")
+            if len(spec.offset) != len(spec.shape):
+                raise ValueError(
+                    f"offset and shape must have same length, got {len(spec.offset)} and {len(spec.shape)}"
+                )
+            result.append((tuple(spec.offset), tuple(spec.shape), spec.tensor_id))
+        return tuple(result)
 
     if inputs is not None:
         inputs = check(inputs)
@@ -243,30 +237,39 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
     assert queue.empty()
     group.barrier()
 
-    info = (group.rank(), ndim, dtype, inputs, outputs)
+    info = (group.rank(), dtype, inputs, outputs)
     queue.put_object(info)
 
     all_inputs = []
     all_outputs = []
 
     for _ in range(group.size()):
-        source_rank, n_ndim, ndtype, ninput, noutput = queue.get_object()
-        # Validate ndim consistency (only if both ranks have data)
-        if n_ndim is not None and ndim is not None and n_ndim != ndim:
-            raise ValueError(
-                f"moodist.compile_op: Ranks specified different ndim: {ndim} vs {n_ndim}"
-            )
+        source_rank, ndtype, ninput, noutput = queue.get_object()
         if ndtype != dtype:
             raise ValueError(
                 f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype}"
             )
 
         if ninput is not None:
-            for o, s in ninput:
-                all_inputs.append((source_rank, o, s))
+            for offset, shape, tensor_id in ninput:
+                all_inputs.append((source_rank, offset, shape, tensor_id))
         if noutput is not None:
-            for o, s in noutput:
-                all_outputs.append((source_rank, o, s))
+            for offset, shape, tensor_id in noutput:
+                all_outputs.append((source_rank, offset, shape, tensor_id))
+
+    # Validate per-tensor_id ndim consistency
+    tensor_id_ndim = {}
+    for items, kind in [(all_inputs, "input"), (all_outputs, "output")]:
+        for rank, offset, shape, tensor_id in items:
+            ndim = len(offset)
+            if tensor_id in tensor_id_ndim:
+                if tensor_id_ndim[tensor_id] != ndim:
+                    raise ValueError(
+                        f"moodist.compile_op: Inconsistent ndim for tensor_id '{tensor_id}': "
+                        f"expected {tensor_id_ndim[tensor_id]}, got {ndim} (in {kind} from rank {rank})"
+                    )
+            else:
+                tensor_id_ndim[tensor_id] = ndim
 
     assert queue.empty()
     group.barrier()

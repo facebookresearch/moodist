@@ -119,6 +119,49 @@ static PyRef get_type_name(PyObject* obj) {
 }
 
 // =============================================================================
+// Python -> C++ conversion helpers
+// =============================================================================
+
+// Convert Python sequence (list/tuple) of ints to vector<int64_t>
+static std::vector<int64_t> pyToIntList(PyObject* obj) {
+  std::vector<int64_t> vec;
+  if (!PySequence_Check(obj)) {
+    PyErr_SetString(PyExc_TypeError, "Expected a sequence");
+    return vec;
+  }
+  Py_ssize_t len = PySequence_Size(obj);
+  vec.reserve(len);
+  for (Py_ssize_t i = 0; i < len; ++i) {
+    PyRef item(PySequence_GetItem(obj, i));
+    vec.push_back(PyLong_AsLongLong(item.get()));
+  }
+  return vec;
+}
+
+// Convert Python str or int to std::string
+// Returns empty string and sets error on failure
+static std::string pyToString(PyObject* obj) {
+  if (PyUnicode_Check(obj)) {
+    // Use stable API: encode to UTF-8 bytes, then extract
+    PyRef utf8(PyUnicode_AsEncodedString(obj, "utf-8", "strict"));
+    if (!utf8) {
+      return "";
+    }
+    char* buffer = nullptr;
+    Py_ssize_t length = 0;
+    if (PyBytes_AsStringAndSize(utf8.get(), &buffer, &length) < 0) {
+      return "";
+    }
+    return std::string(buffer, static_cast<size_t>(length));
+  } else if (PyLong_Check(obj)) {
+    return std::to_string(PyLong_AsLong(obj));
+  } else {
+    PyErr_SetString(PyExc_TypeError, "Expected string or int");
+    return "";
+  }
+}
+
+// =============================================================================
 // pybind11-compatible instance layout
 // This struct must match pybind11::detail::instance exactly
 // =============================================================================
@@ -756,50 +799,65 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
       return nullptr;
     }
 
-    // Parse inputs and outputs: list of tuples (rank, src_offsets, dst_offsets)
+    // Storage for tensor_id strings - kept alive while TensorRegions are in use
+    // (TensorRegion.tensorId is a string_view pointing into these)
+    std::vector<std::string> inputTensorIds;
+    std::vector<std::string> outputTensorIds;
+
+    // Default tensor_id for items without explicit tensor_id
+    static const std::string defaultTensorId = "0";
+
+    // Parse inputs and outputs: list of tuples (rank, offset, shape) or (rank, offset, shape, tensor_id)
     auto parse_transfer_list =
-        [](PyObject* list) -> std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> {
-      std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> result;
+        [&](PyObject* list, std::vector<std::string>& tensorIdStorage) -> std::vector<moodist::api::TensorRegion> {
+      std::vector<moodist::api::TensorRegion> result;
       if (!PyList_Check(list)) {
         PyErr_SetString(PyExc_TypeError, "Expected a list of tuples");
         return {};
       }
       Py_ssize_t len = PyList_Size(list);
       result.reserve(len);
+      tensorIdStorage.reserve(len);
+
       for (Py_ssize_t i = 0; i < len; ++i) {
         PyObject* item = PyList_GetItem(list, i); // Borrowed reference
-        if (!PyTuple_Check(item) || PyTuple_Size(item) != 3) {
-          PyErr_SetString(PyExc_TypeError, "Each item must be a tuple of (rank, src_offsets, dst_offsets)");
+        Py_ssize_t tuple_size = PyTuple_Check(item) ? PyTuple_Size(item) : 0;
+        if (tuple_size < 3 || tuple_size > 4) {
+          PyErr_SetString(PyExc_TypeError,
+              "Each item must be a tuple of (rank, offset, shape) or (rank, offset, shape, tensor_id)");
           return {};
         }
-        int rank = PyLong_AsLong(PyTuple_GetItem(item, 0));
 
-        auto parse_int_list = [](PyObject* obj) -> std::vector<int64_t> {
-          std::vector<int64_t> vec;
-          if (!PyList_Check(obj) && !PyTuple_Check(obj)) {
-            return vec;
-          }
-          Py_ssize_t len = PySequence_Size(obj);
-          vec.reserve(len);
-          for (Py_ssize_t i = 0; i < len; ++i) {
-            PyRef item(PySequence_GetItem(obj, i));
-            vec.push_back(PyLong_AsLongLong(item.get()));
-          }
-          return vec;
-        };
+        int32_t rank = static_cast<int32_t>(PyLong_AsLong(PyTuple_GetItem(item, 0)));
+        auto offset = pyToIntList(PyTuple_GetItem(item, 1));
+        auto shape = pyToIntList(PyTuple_GetItem(item, 2));
+        if (PyErr_Occurred()) {
+          return {};
+        }
 
-        auto src_offsets = parse_int_list(PyTuple_GetItem(item, 1));
-        auto dst_offsets = parse_int_list(PyTuple_GetItem(item, 2));
-        result.emplace_back(rank, std::move(src_offsets), std::move(dst_offsets));
+        // Parse tensor_id (default "0")
+        std::string_view tensorId;
+        if (tuple_size == 4) {
+          std::string tid = pyToString(PyTuple_GetItem(item, 3));
+          if (PyErr_Occurred()) {
+            return {};
+          }
+          tensorIdStorage.push_back(std::move(tid));
+          tensorId = tensorIdStorage.back();
+        } else {
+          tensorId = defaultTensorId;
+        }
+
+        result.push_back(moodist::api::TensorRegion{rank, std::move(offset), std::move(shape), tensorId});
       }
       return result;
     };
 
-    auto inputs = parse_transfer_list(inputs_obj);
+    auto inputs = parse_transfer_list(inputs_obj, inputTensorIds);
     if (PyErr_Occurred()) {
       return nullptr;
     }
-    auto outputs = parse_transfer_list(outputs_obj);
+    auto outputs = parse_transfer_list(outputs_obj, outputTensorIds);
     if (PyErr_Occurred()) {
       return nullptr;
     }

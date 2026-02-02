@@ -1007,10 +1007,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
   void cudaBarrier(CUstream stream);
 
   // compileOpFull - compile a distributed tensor operation
-  SharedPtr<CustomOpImpl> compileOpFull(DType dtype,
-      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-      std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
-      api::ReduceOp reduce);
+  SharedPtr<CustomOpImpl> compileOpFull(DType dtype, std::span<const api::TensorRegion> inputs,
+      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -2282,17 +2280,21 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
     std::vector<int64_t> shape = {static_cast<int64_t>(size * numel)};
 
     // Inputs: source rank provides world_size inputs, each at offset [i * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputSpecs;
+    std::vector<api::TensorRegion> inputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      inputSpecs.emplace_back(sourceRank, std::vector<int64_t>{static_cast<int64_t>(i * numel)},
-          std::vector<int64_t>{static_cast<int64_t>(numel)});
+      inputSpecs.push_back(api::TensorRegion{.rank = sourceRank,
+          .offset = {static_cast<int64_t>(i * numel)},
+          .shape = {static_cast<int64_t>(numel)},
+          .tensorId = "0"});
     }
 
     // Outputs: each rank receives one output at offset [rank * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputSpecs;
+    std::vector<api::TensorRegion> outputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      outputSpecs.emplace_back(static_cast<int>(i), std::vector<int64_t>{static_cast<int64_t>(i * numel)},
-          std::vector<int64_t>{static_cast<int64_t>(numel)});
+      outputSpecs.push_back(api::TensorRegion{.rank = static_cast<int32_t>(i),
+          .offset = {static_cast<int64_t>(i * numel)},
+          .shape = {static_cast<int64_t>(numel)},
+          .tensorId = "0"});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
@@ -2356,17 +2358,21 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
     std::vector<int64_t> shape = {static_cast<int64_t>(size * numel)};
 
     // Inputs: each rank provides one input at offset [rank * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputSpecs;
+    std::vector<api::TensorRegion> inputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      inputSpecs.emplace_back(static_cast<int>(i), std::vector<int64_t>{static_cast<int64_t>(i * numel)},
-          std::vector<int64_t>{static_cast<int64_t>(numel)});
+      inputSpecs.push_back(api::TensorRegion{.rank = static_cast<int32_t>(i),
+          .offset = {static_cast<int64_t>(i * numel)},
+          .shape = {static_cast<int64_t>(numel)},
+          .tensorId = "0"});
     }
 
     // Outputs: dest rank receives world_size outputs, each at offset [i * numel] with shape [numel]
-    std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputSpecs;
+    std::vector<api::TensorRegion> outputSpecs;
     for (size_t i = 0; i < size; ++i) {
-      outputSpecs.emplace_back(destRank, std::vector<int64_t>{static_cast<int64_t>(i * numel)},
-          std::vector<int64_t>{static_cast<int64_t>(numel)});
+      outputSpecs.push_back(api::TensorRegion{.rank = destRank,
+          .offset = {static_cast<int64_t>(i * numel)},
+          .shape = {static_cast<int64_t>(numel)},
+          .tensorId = "0"});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
@@ -3386,11 +3392,10 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const 
           if (intersecting(a, b)) {
             overlapCount++;
             if (overlapCount <= maxReportedRegions) {
-              overlapDetails += fmt::sprintf(
-                  "\n  output[%zu]: overlap between input from rank %u at [%s] shape [%s] and input from rank %u at [%s] shape [%s]",
-                  outIdx, a.inputRank,
-                  fmt::to_string(fmt::join(a.offset, ",")).c_str(), fmt::to_string(fmt::join(a.shape, ",")).c_str(),
-                  b.inputRank,
+              overlapDetails += fmt::sprintf("\n  output[%zu]: overlap between input from rank %u at [%s] shape [%s] "
+                                             "and input from rank %u at [%s] shape [%s]",
+                  outIdx, a.inputRank, fmt::to_string(fmt::join(a.offset, ",")).c_str(),
+                  fmt::to_string(fmt::join(a.shape, ",")).c_str(), b.inputRank,
                   fmt::to_string(fmt::join(b.offset, ",")).c_str(), fmt::to_string(fmt::join(b.shape, ",")).c_str());
             }
           }
@@ -3626,10 +3631,8 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const 
 // ProcessGroupImpl::compileOpFull - compile a distributed tensor operation
 // ============================================================================
 
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputsVec,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputsVec,
-    api::ReduceOp reduce) {
+SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<const api::TensorRegion> inputsVec,
+    std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce) {
 
   // Ensure queues exist for compile_op communication
   if (queues.empty()) {
@@ -3648,9 +3651,12 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype,
   ctx.rank = rank;
   ctx.size = size;
   ctx.queues = std::span<SharedPtr<Queue>>(queues.data(), queues.size());
-  ctx.barrier = [this]() { barrier(); };
+  ctx.barrier = [this]() {
+    barrier();
+  };
   ctx.nodeIndex = group->rankToNodeIndex[rank];
-  ctx.nodeRanks = std::span<const size_t>(group->nodeRanks[ctx.nodeIndex].data(), group->nodeRanks[ctx.nodeIndex].size());
+  ctx.nodeRanks =
+      std::span<const size_t>(group->nodeRanks[ctx.nodeIndex].data(), group->nodeRanks[ctx.nodeIndex].size());
   ctx.localRank = group->rankLocalRank[rank];
   ctx.rankLocalRank = std::span<const size_t>(group->rankLocalRank.data(), group->rankLocalRank.size());
   ctx.nextOpId = &nextCustomOpId;
@@ -3895,10 +3901,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 }
 
 // API function that calls the member method
-api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
-    api::ReduceOp reduce) {
+api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
+    std::span<const api::TensorRegion> outputs, api::ReduceOp reduce) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
   SharedPtr<CustomOpImpl> op = impl->compileOpFull(dtype, inputs, outputs, reduce);
   return api::CustomOpHandle::adopt(op.release());

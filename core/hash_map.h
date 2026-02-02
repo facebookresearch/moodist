@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <type_traits>
 
 #pragma push_macro("likely")
@@ -229,6 +230,24 @@ public:
   template<typename KeyT>
   Value& operator[](KeyT&& index) {
     return try_emplace(std::forward<KeyT>(index)).first->second;
+  }
+
+  template<typename KeyT>
+  Value& at(KeyT&& key) {
+    auto it = find(std::forward<KeyT>(key));
+    if (it == end()) {
+      throw std::out_of_range("HashMap::at: key not found");
+    }
+    return it->second;
+  }
+
+  template<typename KeyT>
+  const Value& at(KeyT&& key) const {
+    auto it = find(std::forward<KeyT>(key));
+    if (it == end()) {
+      throw std::out_of_range("HashMap::at: key not found");
+    }
+    return it->second;
   }
 
   iterator erase(iterator i) noexcept {

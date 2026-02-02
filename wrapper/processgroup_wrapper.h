@@ -195,10 +195,8 @@ public:
   Future cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out = std::nullopt);
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
   std::vector<torch::Tensor> share(const torch::Tensor& input);
-  CustomOp compileOpFull(torch::Dtype dtype,
-      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& inputs,
-      const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs,
-      moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None);
+  CustomOp compileOpFull(torch::Dtype dtype, const std::vector<api::TensorRegion>& inputs,
+      const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None);
 };
 
 void registerFreeMemoryCallback();

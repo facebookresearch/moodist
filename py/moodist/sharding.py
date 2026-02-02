@@ -8,9 +8,25 @@ a given owner (identified by mesh coordinates) owns, based on the
 tensor's placement strategy.
 """
 
+from dataclasses import dataclass
 from itertools import product
+from typing import List, Tuple
 
 from torch.distributed.tensor.placement_types import Shard, Replicate
+
+
+@dataclass
+class ShardInfo:
+    """Information about a single shard/chunk of a tensor.
+
+    Attributes:
+        global_offset: Position in the global tensor (list of ints, one per dimension).
+        local_offset: Position in the local tensor (list of ints, one per dimension).
+        shape: Shape of this chunk (list of ints, one per dimension).
+    """
+    global_offset: List[int]
+    local_offset: List[int]
+    shape: List[int]
 
 
 def _compose_ranges(existing_ranges, local_start, local_size):
@@ -78,7 +94,7 @@ def _regular_shard_ranges(dim_size, group_size, rank_index):
     return []
 
 
-def compute_shards(shape, placements, indices_and_sizes):
+def compute_shards(shape, placements, indices_and_sizes) -> List[ShardInfo]:
     """
     Compute the chunks an owner has given the tensor shape and placements.
 
@@ -93,10 +109,10 @@ def compute_shards(shape, placements, indices_and_sizes):
             - group_size: The size of this mesh dimension
 
     Returns:
-        List of (global_offset, local_offset, chunk_shape) tuples where:
-            - global_offset: List of ints, position in global tensor
-            - local_offset: List of ints, position in local tensor
-            - chunk_shape: List of ints, shape of this chunk
+        List of ShardInfo objects, each containing:
+            - global_offset: Position in global tensor
+            - local_offset: Position in local tensor
+            - shape: Shape of this chunk
 
     Example:
         >>> from torch.distributed.tensor.placement_types import Shard
@@ -182,12 +198,12 @@ def compute_shards(shape, placements, indices_and_sizes):
         local_offset = [dim_local_offsets[d][r[0]] for d, r in enumerate(combo)]
         chunk_shape = [r[1][1] for r in combo]
         if all(s > 0 for s in chunk_shape):
-            chunks.append((global_offset, local_offset, chunk_shape))
+            chunks.append(ShardInfo(global_offset, local_offset, chunk_shape))
 
     return chunks
 
 
-def dtensor_shards(dtensor, coord=None):
+def dtensor_shards(dtensor, coord=None) -> List[ShardInfo]:
     """
     Compute chunks for a coordinate in a DTensor's mesh.
 
@@ -199,8 +215,8 @@ def dtensor_shards(dtensor, coord=None):
             If None, uses the current process's coordinate in this mesh.
 
     Returns:
-        List of (global_offset, local_offset, chunk_shape) tuples.
-        Returns empty list if coord is None and current process is not in mesh.
+        List of ShardInfo objects. Returns empty list if coord is None
+        and current process is not in mesh.
 
     Example:
         >>> # Get chunks for current process

@@ -346,10 +346,8 @@ Future ProcessGroup::copy(torch::Tensor&, const torch::Tensor&) {
   throw std::runtime_error("copy: not yet implemented");
 }
 
-CustomOp ProcessGroup::compileOpFull(torch::Dtype dtype,
-    const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& inputs,
-    const std::vector<std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>>& outputs,
-    moodist::api::ReduceOp reduce) {
+CustomOp ProcessGroup::compileOpFull(torch::Dtype dtype, const std::vector<api::TensorRegion>& inputs,
+    const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce) {
   DType dType = static_cast<DType>(static_cast<int>(c10::typeMetaToScalarType(c10::scalarTypeToTypeMeta(dtype))));
   api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), dType, inputs, outputs, reduce);
   return CustomOp(std::move(opHandle));

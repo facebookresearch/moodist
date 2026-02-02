@@ -12,6 +12,7 @@ Tests run on both CPU and CUDA via @test_cpu_cuda decorator.
 
 import torch
 import moodist
+from moodist import TensorRegion
 from framework import TestContext, test, test_cpu_cuda, create_process_group
 
 # Enable CPU allocator so compile_op works with CPU tensors
@@ -30,11 +31,11 @@ def test_compile_op_point_to_point(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [{'offset': [0], 'shape': [4]}]
+        inputs = [TensorRegion(offset=[0], shape=[4])]
         outputs = None
     elif ctx.rank == 1:
         inputs = None
-        outputs = [{'offset': [0], 'shape': [4]}]
+        outputs = [TensorRegion(offset=[0], shape=[4])]
     else:
         inputs = None
         outputs = None
@@ -74,12 +75,12 @@ def test_compile_op_broadcast(ctx: TestContext, device: str):
 
     # Rank 0 is the source, all ranks receive
     if ctx.rank == 0:
-        inputs = [{'offset': [0], 'shape': [8]}]
+        inputs = [TensorRegion(offset=[0], shape=[8])]
     else:
         inputs = None
 
     # All ranks receive
-    outputs = [{'offset': [0], 'shape': [8]}]
+    outputs = [TensorRegion(offset=[0], shape=[8])]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -112,11 +113,11 @@ def test_compile_op_gather(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its chunk
-    inputs = [{'offset': [ctx.rank * chunk_size], 'shape': [chunk_size]}]
+    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
 
     # Only rank 0 receives
     if ctx.rank == 0:
-        outputs = [{'offset': [0], 'shape': [chunk_size * ctx.world_size]}]
+        outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
     else:
         outputs = None
 
@@ -158,12 +159,12 @@ def test_compile_op_scatter(ctx: TestContext, device: str):
 
     # Only rank 0 provides input (full tensor)
     if ctx.rank == 0:
-        inputs = [{'offset': [0], 'shape': [chunk_size * ctx.world_size]}]
+        inputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
     else:
         inputs = None
 
     # Each rank receives its chunk
-    outputs = [{'offset': [ctx.rank * chunk_size], 'shape': [chunk_size]}]
+    outputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -200,9 +201,9 @@ def test_compile_op_allgather(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its chunk
-    inputs = [{'offset': [ctx.rank * chunk_size], 'shape': [chunk_size]}]
+    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
     # Each rank receives the full tensor
-    outputs = [{'offset': [0], 'shape': [chunk_size * ctx.world_size]}]
+    outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -235,9 +236,9 @@ def test_compile_op_2d_tensor(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its row
-    inputs = [{'offset': [ctx.rank, 0], 'shape': [1, 4]}]
+    inputs = [TensorRegion(offset=[ctx.rank, 0], shape=[1, 4])]
     # All ranks receive full tensor
-    outputs = [{'offset': [0, 0], 'shape': [ctx.world_size, 4]}]
+    outputs = [TensorRegion(offset=[0, 0], shape=[ctx.world_size, 4])]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -272,15 +273,15 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
     # Rank 0 provides two separate input tensors that together cover the full output
     if ctx.rank == 0:
         inputs = [
-            {'offset': [0], 'shape': [2]},
-            {'offset': [2], 'shape': [2]},
+            TensorRegion(offset=[0], shape=[2]),
+            TensorRegion(offset=[2], shape=[2]),
         ]
     else:
         inputs = None
 
     # Rank 1 receives the full tensor
     if ctx.rank == 1:
-        outputs = [{'offset': [0], 'shape': [4]}]
+        outputs = [TensorRegion(offset=[0], shape=[4])]
     else:
         outputs = None
 
@@ -321,10 +322,10 @@ def test_compile_op_different_dtypes(ctx: TestContext, device: str):
         shape = [4]
 
         if ctx.rank == 0:
-            inputs = [{'offset': [0], 'shape': [4]}]
+            inputs = [TensorRegion(offset=[0], shape=[4])]
         else:
             inputs = None
-        outputs = [{'offset': [0], 'shape': [4]}]
+        outputs = [TensorRegion(offset=[0], shape=[4])]
 
         op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -355,10 +356,10 @@ def test_compile_op_reuse(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [{'offset': [0], 'shape': [4]}]
+        inputs = [TensorRegion(offset=[0], shape=[4])]
     else:
         inputs = None
-    outputs = [{'offset': [0], 'shape': [4]}]
+    outputs = [TensorRegion(offset=[0], shape=[4])]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -391,11 +392,11 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [{'offset': [0], 'shape': [4]}]
+        inputs = [TensorRegion(offset=[0], shape=[4])]
         outputs = None
     elif ctx.rank == 1:
         inputs = None
-        outputs = [{'offset': [0], 'shape': [4]}]
+        outputs = [TensorRegion(offset=[0], shape=[4])]
     else:
         # Rank 2+ are bystanders
         inputs = None
@@ -421,3 +422,106 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
             torch.equal(output_tensor, expected),
             f"got {output_tensor}, expected {expected}"
         )
+
+
+@test_cpu_cuda
+def test_compile_op_tensor_id_multi_tensor(ctx: TestContext, device: str):
+    """Test tensor_id feature: batch multiple tensors with different ndims in one compile_op.
+
+    This test transfers multiple tensors in a single compiled operation:
+    - weight: 2D [world_size, 4], sharded on dim 0 (each rank provides 1 row)
+    - weight2: 2D [world_size, 2], sharded on dim 0 (same ndim as weight, different tensor_id)
+    - bias: 1D [4], replicated from rank 0
+    - scale: 1D [2], replicated from rank 1 (same ndim as bias, different tensor_id)
+    """
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+
+    dtype = torch.float32
+
+    # Tensor dimensions
+    weight_rows = ctx.world_size  # One row per rank
+    weight_cols = 4
+    weight2_cols = 2
+    bias_size = 4
+    scale_size = 2
+
+    # Inputs: each rank provides its row of weight and weight2
+    # Rank 0 provides bias, rank 1 provides scale
+    inputs = [
+        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight_cols], tensor_id="weight"),
+        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight2_cols], tensor_id="weight2"),
+    ]
+    if ctx.rank == 0:
+        inputs.append(TensorRegion(offset=[0], shape=[bias_size], tensor_id="bias"))
+    if ctx.rank == 1:
+        inputs.append(TensorRegion(offset=[0], shape=[scale_size], tensor_id="scale"))
+
+    # Outputs: all ranks receive all tensors
+    outputs = [
+        TensorRegion(offset=[0, 0], shape=[weight_rows, weight_cols], tensor_id="weight"),
+        TensorRegion(offset=[0, 0], shape=[weight_rows, weight2_cols], tensor_id="weight2"),
+        TensorRegion(offset=[0], shape=[bias_size], tensor_id="bias"),
+        TensorRegion(offset=[0], shape=[scale_size], tensor_id="scale"),
+    ]
+
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs, reduce="any")
+
+    # Create input tensors
+    # Weight: each rank has 1 row, filled with rank value
+    weight_input = torch.full((1, weight_cols), float(ctx.rank), dtype=dtype, device=device)
+    # Weight2: each rank has 1 row, filled with rank + 100
+    weight2_input = torch.full((1, weight2_cols), float(ctx.rank + 100), dtype=dtype, device=device)
+    input_tensors = [weight_input, weight2_input]
+
+    if ctx.rank == 0:
+        # Bias: filled with -1.0
+        bias_input = torch.full((bias_size,), -1.0, dtype=dtype, device=device)
+        input_tensors.append(bias_input)
+    if ctx.rank == 1:
+        # Scale: filled with -2.0
+        scale_input = torch.full((scale_size,), -2.0, dtype=dtype, device=device)
+        input_tensors.append(scale_input)
+
+    # Output tensors
+    weight_output = torch.zeros(weight_rows, weight_cols, dtype=dtype, device=device)
+    weight2_output = torch.zeros(weight_rows, weight2_cols, dtype=dtype, device=device)
+    bias_output = torch.zeros(bias_size, dtype=dtype, device=device)
+    scale_output = torch.zeros(scale_size, dtype=dtype, device=device)
+
+    future = op(input_tensors, [weight_output, weight2_output, bias_output, scale_output])
+    future.wait()
+
+    # Verify weight: each row should contain the rank that provided it
+    for r in range(ctx.world_size):
+        expected_row = torch.full((1, weight_cols), float(r), dtype=dtype, device=device)
+        actual_row = weight_output[r:r+1]
+        ctx.assert_true(
+            torch.equal(actual_row, expected_row),
+            f"weight row {r}: got {actual_row}, expected {expected_row}"
+        )
+
+    # Verify weight2: each row should contain rank + 100
+    for r in range(ctx.world_size):
+        expected_row = torch.full((1, weight2_cols), float(r + 100), dtype=dtype, device=device)
+        actual_row = weight2_output[r:r+1]
+        ctx.assert_true(
+            torch.equal(actual_row, expected_row),
+            f"weight2 row {r}: got {actual_row}, expected {expected_row}"
+        )
+
+    # Verify bias: should be -1.0 (from rank 0)
+    expected_bias = torch.full((bias_size,), -1.0, dtype=dtype, device=device)
+    ctx.assert_true(
+        torch.equal(bias_output, expected_bias),
+        f"bias: got {bias_output}, expected {expected_bias}"
+    )
+
+    # Verify scale: should be -2.0 (from rank 1)
+    expected_scale = torch.full((scale_size,), -2.0, dtype=dtype, device=device)
+    ctx.assert_true(
+        torch.equal(scale_output, expected_scale),
+        f"scale: got {scale_output}, expected {expected_scale}"
+    )

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "api/types.h"
 #include "common.h"
 #include "cputhread.h"
 #include "shared_ptr.h"
@@ -13,7 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
-#include <tuple>
+#include <string>
 #include <vector>
 
 namespace moodist {
@@ -34,9 +35,7 @@ struct Coord {
 
   Coord() = default;
 
-  explicit Coord(int n)
-      : data_(n > 0 ? static_cast<int64_t*>(internalAlloc(n * sizeof(int64_t))) : nullptr),
-        ndim_(n) {
+  explicit Coord(int n) : data_(n > 0 ? static_cast<int64_t*>(internalAlloc(n * sizeof(int64_t))) : nullptr), ndim_(n) {
     if (data_) {
       std::memset(data_, 0, n * sizeof(int64_t));
     }
@@ -83,14 +82,28 @@ struct Coord {
     return *this;
   }
 
-  int64_t& operator[](size_t i) { return data_[i]; }
-  int64_t operator[](size_t i) const { return data_[i]; }
+  int64_t& operator[](size_t i) {
+    return data_[i];
+  }
+  int64_t operator[](size_t i) const {
+    return data_[i];
+  }
 
-  int64_t* begin() { return data_; }
-  int64_t* end() { return data_ + ndim_; }
-  const int64_t* begin() const { return data_; }
-  const int64_t* end() const { return data_ + ndim_; }
-  size_t size() const { return static_cast<size_t>(ndim_); }
+  int64_t* begin() {
+    return data_;
+  }
+  int64_t* end() {
+    return data_ + ndim_;
+  }
+  const int64_t* begin() const {
+    return data_;
+  }
+  const int64_t* end() const {
+    return data_ + ndim_;
+  }
+  size_t size() const {
+    return static_cast<size_t>(ndim_);
+  }
 
   // Serialize (const = writing)
   template<typename X>
@@ -131,9 +144,13 @@ inline Coord operator+(const Coord& a, const Coord& b) {
 }
 
 inline bool operator==(const Coord& a, const Coord& b) {
-  if (a.ndim_ != b.ndim_) return false;
+  if (a.ndim_ != b.ndim_) {
+    return false;
+  }
   for (size_t i : range(a.size())) {
-    if (a[i] != b[i]) return false;
+    if (a[i] != b[i]) {
+      return false;
+    }
   }
   return true;
 }
@@ -177,8 +194,8 @@ struct CompileContext {
   // Topology info for NVLink optimization
   size_t nodeIndex;
   std::span<const size_t> nodeRanks;     // Ranks on this node
-  size_t localRank;                       // My index within nodeRanks
-  std::span<const size_t> rankLocalRank;  // Global rank -> local rank mapping
+  size_t localRank;                      // My index within nodeRanks
+  std::span<const size_t> rankLocalRank; // Global rank -> local rank mapping
 
   // For generating unique op IDs
   uint32_t* nextOpId;
@@ -191,6 +208,7 @@ struct TensorDescr {
   Coord offset;
   Coord shape;
   size_t numel;
+  std::string tensorId; // Groups related tensor regions together
 };
 
 // Phase 1: Logical mapping exchanged between ranks (sender → receiver)
@@ -232,35 +250,34 @@ struct ReadRequest {
 // Phase 4: Read response (sender → receiver)
 // Contains resolved offset and tensor info
 struct ReadResponse {
-  uint32_t requesterRank;  // Who requested (for response routing)
-  uint32_t outputIndex;    // Correlation with request
-  Coord requestOffset;     // Original request offset (for output offset computation)
-  Coord requestShape;      // Original request shape (for output contiguity check)
-  uint32_t senderRank;     // Who is sending (for CustomOpDescriptor)
-  uint32_t tensorIndex;    // Input index or copy index
-  size_t inputOffset;      // Linear offset within tensor
-  Coord tensorShape;       // For stride computation at receiver
-  bool isCopy;             // True if tensorIndex refers to a copy
+  uint32_t requesterRank; // Who requested (for response routing)
+  uint32_t outputIndex;   // Correlation with request
+  Coord requestOffset;    // Original request offset (for output offset computation)
+  Coord requestShape;     // Original request shape (for output contiguity check)
+  uint32_t senderRank;    // Who is sending (for CustomOpDescriptor)
+  uint32_t tensorIndex;   // Input index or copy index
+  size_t inputOffset;     // Linear offset within tensor
+  Coord tensorShape;      // For stride computation at receiver
+  bool isCopy;            // True if tensorIndex refers to a copy
 
   template<typename X>
   void serialize(X& x) const {
-    x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape, isCopy);
+    x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
+        isCopy);
   }
 
   template<typename X>
   void serialize(X& x) {
-    x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape, isCopy);
+    x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
+        isCopy);
   }
 };
 
 // Main compile function
 // Returns a compiled CustomOpDescriptor ready for execution
-// ndim is derived from inputs/outputs (validated for consistency)
-std::shared_ptr<CustomOpDescriptor> compile(
-    const CompileContext& ctx,
-    DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs,
+// ndim is validated per-tensorId (different tensorIds can have different ndims)
+std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
+    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs,
     ReduceOp reduce = ReduceOp::None);
 
 } // namespace compile_op
