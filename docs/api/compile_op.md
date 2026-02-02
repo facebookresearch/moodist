@@ -7,15 +7,20 @@ Compile a custom collective operation for distributed tensor communication.
 ```python
 def compile_op(
     group: MoodistProcessGroup,
-    shape: tuple | list | None = None,
     dtype: torch.dtype | None = None,
-    inputs: list[dict | DTensor] | None = None,
-    outputs: list[dict | DTensor] | None = None,
-    reduction: str | None = None
+    inputs: list[TensorRegion | DTensor] | None = None,
+    outputs: list[TensorRegion | DTensor] | None = None,
+    reduce: str | None = None
 ) -> CustomOp
 ```
 
-> **Note:** The `reduction` parameter is not yet implemented but is documented here for completeness.
+```python
+@dataclass
+class TensorRegion:
+    offset: list[int]
+    shape: list[int]
+    tensor_id: str = "0"
+```
 
 ## Overview
 
@@ -27,14 +32,16 @@ def compile_op(
 - Automatic optimization of data transfers
 - Support for both contiguous and non-contiguous memory patterns
 - Works with both CPU and CUDA tensors
-- Reduction operations for overlapping inputs (sum, max, min, etc.)
+- Multi-tensor batching via `tensor_id` (batch tensors with different dimensionalities)
+- Overlap handling with `reduce="any"` (additional reduction ops planned)
 
 **When to use `compile_op` vs standard collectives:**
 - Use standard collectives (`all_gather`, `reduce_scatter`, etc.) when your pattern matches exactly
 - Use `compile_op` when you need:
   - Custom slice distributions that don't match standard patterns
   - Multiple different slices per rank
-  - Overlapping send/receive regions with reduction
+  - Overlapping inputs with `reduce="any"` (picks one source)
+  - Batching multiple tensors with different dimensionalities (`tensor_id`)
   - Complex multi-rank communication patterns
 
 **DTensor Support:**
@@ -62,15 +69,6 @@ This is useful for tensor redistribution operations where you want to change the
 
 The distributed process group that will participate in this collective operation. All ranks in this group must call `compile_op` collectively.
 
-### `shape`
-**Type:** `tuple` or `list` of `int`, or `None`
-
-The global tensor shape that defines the logical address space for the operation. All input and output slices are defined relative to this global shape. All ranks must specify the same shape.
-
-Can be omitted if using DTensors for inputs/outputs, in which case the shape is derived automatically from the DTensor's global shape.
-
-**Example:** `[8, 16]` defines a 2D global tensor of size 8×16
-
 ### `dtype`
 **Type:** `torch.dtype` or `None`
 
@@ -79,24 +77,35 @@ The PyTorch data type for the operation (e.g., `torch.float32`, `torch.int64`). 
 Can be omitted if using DTensors for inputs/outputs, in which case the dtype is derived automatically.
 
 ### `inputs`
-**Type:** `list[dict | DTensor]` or `None` (default: `None`)
+**Type:** `list[TensorRegion | DTensor]` or `None` (default: `None`)
 
 Optional list of input tensor specifications that this rank will contribute. Each element can be either:
 
-**Dict format:**
-- `'offset'`: `tuple` or `list` of `int` - Starting position in the global tensor
-- `'shape'`: `tuple` or `list` of `int` - Size of this input slice
+**TensorRegion format:**
+- `offset`: `list[int]` - Starting position in the global tensor
+- `shape`: `list[int]` - Size of this input slice
+- `tensor_id`: `str` (default: `"0"`) - Identifier for multi-tensor batching
 
 **DTensor format:**
 - A `torch.distributed.tensor.DTensor` instance. The offset and shape are derived automatically from the DTensor's placements and device mesh.
 
-The `offset` and `shape` must have the same number of dimensions as the global `shape`. If `None`, this rank contributes no inputs to the operation.
+All regions with the same `tensor_id` must have the same number of dimensions. Different `tensor_id` values can have different dimensionalities, enabling batching of tensors like 2D weights and 1D biases in a single call.
 
-**Example (dict):**
+If `None`, this rank contributes no inputs to the operation.
+
+**Example (TensorRegion):**
 ```python
+from moodist import TensorRegion
+
 inputs = [
-    {'offset': [0, 0], 'shape': [2, 4]},  # First slice at position [0,0]
-    {'offset': [2, 0], 'shape': [2, 4]},  # Second slice at position [2,0]
+    TensorRegion(offset=[0, 0], shape=[2, 4]),  # First slice at position [0,0]
+    TensorRegion(offset=[2, 0], shape=[2, 4]),  # Second slice at position [2,0]
+]
+
+# Multi-tensor batching with different dimensionalities:
+inputs = [
+    TensorRegion(offset=[0, 0], shape=[4, 4], tensor_id="weight"),  # 2D
+    TensorRegion(offset=[0], shape=[4], tensor_id="bias"),          # 1D
 ]
 ```
 
@@ -106,40 +115,45 @@ inputs = [input_dtensor]  # Offset and shape derived from sharding
 ```
 
 ### `outputs`
-**Type:** `list[dict | DTensor]` or `None` (default: `None`)
+**Type:** `list[TensorRegion | DTensor]` or `None` (default: `None`)
 
-Optional list of output tensor specifications that this rank will receive. Format is identical to `inputs` (supports both dict and DTensor). If `None`, this rank receives no outputs from the operation.
+Optional list of output tensor specifications that this rank will receive. Format is identical to `inputs` (supports both TensorRegion and DTensor). If `None`, this rank receives no outputs from the operation.
 
-### `reduction`
+### `reduce`
 **Type:** `str` or `None` (default: `None`)
 
-Specifies the reduction operation to apply when multiple input slices overlap in the global tensor space. When inputs from different ranks (or the same rank) specify overlapping regions, the reduction operator determines how values are combined.
+Specifies how to handle overlapping input regions. When multiple inputs (from the same or different ranks) cover the same output cell, this parameter determines the behavior.
 
-**Supported reduction operations:**
-- `'sum'` - Add overlapping values
-- `'prod'` - Multiply overlapping values
-- `'min'` - Take minimum of overlapping values
-- `'max'` - Take maximum of overlapping values
-- `'avg'` or `'mean'` - Average overlapping values
-- `None` (default) - No reduction; overlapping inputs will use the last written value
+**Currently supported:**
+- `None` (default) - Error if any output cell is covered by multiple inputs
+- `"any"` - Arbitrarily pick one input source for overlapping cells (no actual reduction)
+
+**Planned (not yet implemented):**
+- `"sum"` - Add overlapping values
+- `"mean"` - Average overlapping values
+- `"max"` - Take maximum of overlapping values
+- `"min"` - Take minimum of overlapping values
 
 **Behavior with overlapping inputs:**
 
-When multiple ranks contribute data to the same region of the global tensor, the reduction operation is applied:
+When multiple ranks contribute data to the same region of the global tensor:
 
 ```python
+from moodist import TensorRegion
+
 # Example: Two ranks both write to offset [0, 0]
 # Rank 0:
-inputs = [{'offset': [0, 0], 'shape': [2, 4]}]  # Contains values [1, 2, 3, ...]
+inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [1, 2, 3, ...]
 
 # Rank 1:
-inputs = [{'offset': [0, 0], 'shape': [2, 4]}]  # Contains values [10, 20, 30, ...]
+inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [10, 20, 30, ...]
 
-# With reduction='sum', output at [0, 0] would be [11, 22, 33, ...]
-# With reduction='max', output at [0, 0] would be [10, 20, 30, ...]
+# With reduce=None (default): raises an error due to overlap
+# With reduce="any": output contains values from either rank (arbitrary choice)
+# With reduce="sum" (planned): output would be [11, 22, 33, ...]
 ```
 
-This enables true reduce-scatter and all-reduce patterns where data is combined across ranks.
+The `reduce="any"` option is useful for replicated data patterns (e.g., `Replicate` placement in DTensor) where all sources have identical data and any one can be used.
 
 ## Return Value
 
@@ -186,22 +200,22 @@ Simple transfer from rank 0 to rank 1.
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 
 if group.rank() == 0:
     # Rank 0 sends a 2×4 tensor
-    inputs = [{'offset': [0, 0], 'shape': [2, 4]}]
+    inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]
     outputs = None
 else:
     # Rank 1 receives a 2×4 tensor
     inputs = None
-    outputs = [{'offset': [0, 0], 'shape': [2, 4]}]
+    outputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]
 
 # Compile the operation (collective call - all ranks must participate)
 op = moodist.compile_op(
     group,
-    shape=[2, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs
@@ -230,22 +244,22 @@ Rank 0 distributes different slices to multiple ranks.
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
 
 if rank == 0:
     # Rank 0 sends from a single contiguous tensor
-    inputs = [{'offset': [0, 0], 'shape': [6, 4]}]
+    inputs = [TensorRegion(offset=[0, 0], shape=[6, 4])]
     outputs = None
 else:
     # Ranks 1, 2, 3 each receive their slice
     inputs = None
-    outputs = [{'offset': [(rank-1)*2, 0], 'shape': [2, 4]}]
+    outputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4])]
 
 op = moodist.compile_op(
     group,
-    shape=[6, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs
@@ -274,6 +288,7 @@ Multiple ranks send slices to rank 0.
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
@@ -281,15 +296,14 @@ rank = group.rank()
 if rank == 0:
     # Rank 0 receives all slices into a single contiguous tensor
     inputs = None
-    outputs = [{'offset': [0, 0], 'shape': [6, 4]}]
+    outputs = [TensorRegion(offset=[0, 0], shape=[6, 4])]
 else:
     # Ranks 1, 2, 3 each send their slice
-    inputs = [{'offset': [(rank-1)*2, 0], 'shape': [2, 4]}]
+    inputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4])]
     outputs = None
 
 op = moodist.compile_op(
     group,
-    shape=[6, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs
@@ -319,18 +333,18 @@ Every rank receives slices from all ranks.
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
 size = group.size()
 
 # Each rank contributes one slice and receives all slices
-inputs = [{'offset': [rank*2, 0], 'shape': [2, 4]}]
-outputs = [{'offset': [0, 0], 'shape': [size*2, 4]}]
+inputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4])]
+outputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4])]
 
 op = moodist.compile_op(
     group,
-    shape=[size*2, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs
@@ -350,31 +364,33 @@ Rank 3: [data_3]   →   Rank 3: [data_0][data_1][data_2][data_3]
 All ranks exchange their slices with all other ranks.
 ```
 
-### Example 5: Reduce-Scatter Pattern
+### Example 5: Reduce-Scatter Pattern (Planned)
 
 Each rank sends the full tensor and receives a different slice. With reduction, overlapping inputs are combined.
+
+> **Note:** This example requires `reduce="sum"` which is not yet implemented. Once available, the pattern will work as shown.
 
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
 size = group.size()
 
 # Each rank contributes the full tensor
-inputs = [{'offset': [0, 0], 'shape': [size*2, 4]}]
+inputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4])]
 
 # Each rank receives a different slice
-outputs = [{'offset': [rank*2, 0], 'shape': [2, 4]}]
+outputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4])]
 
 op = moodist.compile_op(
     group,
-    shape=[size*2, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs,
-    reduction='sum'  # Combine overlapping inputs
+    reduce='sum'  # Combine overlapping inputs (planned, not yet implemented)
 )
 ```
 
@@ -396,18 +412,18 @@ Each rank sends to the next rank in a ring topology.
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
 size = group.size()
 
 # Send to next rank (rank+1 % size), receive from previous (rank-1 % size)
-inputs = [{'offset': [(rank+1) % size * 2, 0], 'shape': [2, 4]}]
-outputs = [{'offset': [rank * 2, 0], 'shape': [2, 4]}]
+inputs = [TensorRegion(offset=[(rank+1) % size * 2, 0], shape=[2, 4])]
+outputs = [TensorRegion(offset=[rank * 2, 0], shape=[2, 4])]
 
 op = moodist.compile_op(
     group,
-    shape=[size*2, 4],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs
@@ -426,30 +442,32 @@ Ring topology - each rank sends to next, receives from previous:
 (Rank 0→1, Rank 1→2, Rank 2→3, Rank 3→0)
 ```
 
-### Example 7: All-Reduce Pattern
+### Example 7: All-Reduce Pattern (Planned)
 
 All ranks contribute overlapping data that gets combined and distributed to all ranks.
+
+> **Note:** This example requires `reduce="sum"` which is not yet implemented. Once available, the pattern will work as shown.
 
 ```python
 import torch
 import moodist
+from moodist import TensorRegion
 
 group = moodist.find_process_group("my_group")
 rank = group.rank()
 
 # All ranks contribute data to the same global location
-inputs = [{'offset': [0, 0], 'shape': [4, 8]}]
+inputs = [TensorRegion(offset=[0, 0], shape=[4, 8])]
 
 # All ranks receive the reduced result
-outputs = [{'offset': [0, 0], 'shape': [4, 8]}]
+outputs = [TensorRegion(offset=[0, 0], shape=[4, 8])]
 
 op = moodist.compile_op(
     group,
-    shape=[4, 8],
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs,
-    reduction='sum'  # Sum all inputs across ranks
+    reduce='sum'  # Sum all inputs across ranks (planned, not yet implemented)
 )
 ```
 
@@ -457,7 +475,7 @@ op = moodist.compile_op(
 ```
 All ranks contribute overlapping data, which gets summed and returned to all:
 
-Before:                          After (with reduction='sum'):
+Before:                          After (with reduce='sum'):
 Rank 0: tensor_0 ──┐           Rank 0: sum(tensor_0 + tensor_1 +
 Rank 1: tensor_1 ──┼─→ SUM  →  Rank 1:     tensor_2 + tensor_3)
 Rank 2: tensor_2 ──┤           Rank 2:
