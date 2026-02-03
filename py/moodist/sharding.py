@@ -203,6 +203,120 @@ def compute_shards(shape, placements, indices_and_sizes) -> List[ShardInfo]:
     return chunks
 
 
+def compute_reshard_slices(
+    local_shape,
+    current_placements,
+    target_placements,
+    indices_and_sizes,
+) -> Tuple[slice, ...]:
+    """
+    Compute slices to locally reshard a tensor from one placement to another.
+
+    This function only supports local resharding (no communication). Specifically:
+    - Replicate -> Shard: Each rank takes a unique portion of replicated data.
+
+    It will raise an error if the resharding would require communication
+    (e.g., Shard -> different Shard).
+
+    Args:
+        local_shape: Shape of the local tensor to slice.
+        current_placements: Current placement objects (Shard, Replicate, etc.).
+        target_placements: Desired placement objects.
+        indices_and_sizes: List of (index, group_size) tuples, one per placement.
+
+    Returns:
+        Tuple of slice objects to apply to the local tensor.
+
+    Example:
+        >>> # DTensor with [Shard(0), Replicate()] on 2x2 mesh
+        >>> # Rank (0, 1) wants to convert Replicate -> Shard(0)
+        >>> local_shape = (50, 50)
+        >>> current = [Shard(0), Replicate()]
+        >>> target = [Shard(0), Shard(0)]
+        >>> indices_and_sizes = [(0, 2), (1, 2)]
+        >>> slices = compute_reshard_slices(local_shape, current, target, indices_and_sizes)
+        >>> # slices = (slice(25, 50), slice(0, 50))  # second half of dim 0
+    """
+    if len(current_placements) != len(target_placements):
+        raise ValueError(
+            f"current_placements and target_placements must have same length, "
+            f"got {len(current_placements)} and {len(target_placements)}"
+        )
+    if len(current_placements) != len(indices_and_sizes):
+        raise ValueError(
+            f"placements and indices_and_sizes must have same length, "
+            f"got {len(current_placements)} and {len(indices_and_sizes)}"
+        )
+
+    # Validate conversions and collect Replicate -> Shard conversions
+    reshard_placements = []
+    reshard_indices = []
+
+    def is_shard_like(p):
+        """Check if placement is Shard or _StridedShard (has dim attribute)."""
+        return isinstance(p, Shard) or hasattr(p, 'split_factor')
+
+    def get_shard_key(p):
+        """Get a key for comparing shard-like placements."""
+        if hasattr(p, 'split_factor'):
+            return ('strided', p.dim, p.split_factor)
+        elif isinstance(p, Shard):
+            return ('shard', p.dim)
+        return None
+
+    for curr, tgt, idx_size in zip(current_placements, target_placements, indices_and_sizes):
+        if type(curr) == type(tgt):
+            # Same type - must be identical
+            if is_shard_like(curr) and get_shard_key(curr) != get_shard_key(tgt):
+                raise ValueError(
+                    f"Cannot locally reshard {curr} -> {tgt}, "
+                    f"requires communication"
+                )
+            continue
+        if isinstance(curr, Replicate) and is_shard_like(tgt):
+            # Valid: Replicate -> Shard or Replicate -> _StridedShard
+            reshard_placements.append(tgt)
+            reshard_indices.append(idx_size)
+            continue
+        raise ValueError(
+            f"Cannot locally reshard {type(curr).__name__} -> {type(tgt).__name__}, "
+            f"requires communication"
+        )
+
+    # If no Replicate -> Shard conversions, return full slices
+    if not reshard_placements:
+        return tuple(slice(None) for _ in range(len(local_shape)))
+
+    # Compute shards for the Replicate -> Shard conversions on the local tensor
+    shards = compute_shards(local_shape, reshard_placements, reshard_indices)
+
+    if not shards:
+        # Empty shard - make sharded dimensions empty, keep others full
+        sharded_dims = set()
+        for p in reshard_placements:
+            if isinstance(p, Shard) or hasattr(p, 'split_factor'):
+                sharded_dims.add(p.dim)
+        return tuple(
+            slice(0, 0) if d in sharded_dims else slice(None)
+            for d in range(len(local_shape))
+        )
+
+    if len(shards) != 1:
+        # Multiple chunks - this shouldn't happen for simple Replicate -> Shard
+        raise ValueError(
+            f"Expected single shard for Replicate -> Shard conversion, got {len(shards)}"
+        )
+
+    shard = shards[0]
+    # Build slice tuple from global_offset and shape
+    # global_offset is relative to the input shape (local_shape), so it tells us
+    # where to slice the local tensor
+    return tuple(
+        slice(offset, offset + size)
+        for offset, size in zip(shard.global_offset, shard.shape)
+    )
+
+
 def dtensor_shards(dtensor, coord=None) -> List[ShardInfo]:
     """
     Compute chunks for a coordinate in a DTensor's mesh.

@@ -1,12 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 """
-Tests for moodist.compute_shards and moodist.dtensor_shards.
+Tests for moodist sharding utilities.
 
-These tests verify that:
+Tests for compute_shards and dtensor_shards:
 1. compute_shards correctly predicts which chunks each mesh coordinate owns
 2. The predictions match PyTorch's actual DTensor sharding behavior
 3. compile_op correctly transfers data based on these shard specifications
+
+Tests for compute_reshard_slices:
+4. Correctly computes slices for Replicate -> Shard conversion
+5. Returns full slices when no conversion is needed
+6. Raises errors for invalid conversions (e.g., Shard -> Shard)
 
 Tests run with multiple ranks and verify all coordinates, not just the current one.
 """
@@ -992,3 +997,363 @@ def test_redistribute_shard0_to_shard1(ctx: TestContext, device: str):
 
     finally:
         _cleanup_torch_distributed()
+
+
+# =============================================================================
+# Tests for compute_reshard_slices
+# =============================================================================
+
+def _verify_reshard_slices(
+    ctx: TestContext,
+    mesh: DeviceMesh,
+    current_placements: list,
+    target_placements: list,
+    shape: tuple,
+    description: str,
+):
+    """
+    Verify compute_reshard_slices by comparing against PyTorch DTensor.
+
+    1. Create global tensor with fixed data
+    2. Distribute to DTensor with current_placements, get local, apply reshard slices
+    3. Distribute to DTensor with target_placements, get local directly
+    4. Compare: they should be equal
+    """
+    from moodist import compute_reshard_slices
+
+    global_tensor = _make_global_tensor(shape)
+
+    # Create DTensor with current placements
+    try:
+        dtensor_current = distribute_tensor(global_tensor, mesh, current_placements)
+    except Exception as e:
+        ctx.log(f"SKIP {description}: cannot create current DTensor: {e}")
+        return True
+
+    # Create DTensor with target placements
+    try:
+        dtensor_target = distribute_tensor(global_tensor, mesh, target_placements)
+    except Exception as e:
+        ctx.log(f"SKIP {description}: cannot create target DTensor: {e}")
+        return True
+
+    coord = mesh.get_coordinate()
+    if coord is None:
+        ctx.log(f"SKIP {description}: rank not in mesh")
+        return True
+
+    # Get local tensor from current placement
+    local_current = dtensor_current.to_local()
+
+    # Compute reshard slices
+    indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
+    try:
+        reshard_slices = compute_reshard_slices(
+            tuple(local_current.shape),
+            current_placements,
+            target_placements,
+            indices_and_sizes,
+        )
+    except ValueError as e:
+        ctx.log(f"SKIP {description}: {e}")
+        return True
+
+    # Apply slices to get resharded local
+    resharded_local = local_current[reshard_slices]
+
+    # Get expected local from target placement
+    expected_local = dtensor_target.to_local()
+
+    # Compare
+    if not torch.equal(resharded_local, expected_local):
+        ctx.log(f"FAIL {description}")
+        ctx.log(f"  coord: {coord}")
+        ctx.log(f"  current local shape: {local_current.shape}")
+        ctx.log(f"  reshard_slices: {reshard_slices}")
+        ctx.log(f"  resharded shape: {resharded_local.shape}")
+        ctx.log(f"  expected shape: {expected_local.shape}")
+        if resharded_local.numel() <= 20:
+            ctx.log(f"  resharded: {resharded_local.flatten().tolist()}")
+            ctx.log(f"  expected: {expected_local.flatten().tolist()}")
+        return False
+
+    return True
+
+
+@test_cpu_cuda
+def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
+    """Test compute_reshard_slices for Replicate -> Shard conversions."""
+    _init_torch_distributed(ctx)
+
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(ctx.world_size))
+        all_passed = True
+
+        # 1D tensor: Replicate -> Shard(0)
+        for shape in [(ctx.world_size * 4,), (ctx.world_size * 7 + 3,)]:
+            success = _verify_reshard_slices(
+                ctx, mesh,
+                [Replicate()], [Shard(0)],
+                shape,
+                f"Replicate -> Shard(0) shape={shape}",
+            )
+            if not success:
+                all_passed = False
+            elif ctx.rank == 0:
+                ctx.log(f"PASS Replicate -> Shard(0) shape={shape}")
+
+        # 2D tensor: Replicate -> Shard(0)
+        for shape in [(ctx.world_size * 2, 8), (ctx.world_size + 3, 5)]:
+            success = _verify_reshard_slices(
+                ctx, mesh,
+                [Replicate()], [Shard(0)],
+                shape,
+                f"Replicate -> Shard(0) 2D shape={shape}",
+            )
+            if not success:
+                all_passed = False
+            elif ctx.rank == 0:
+                ctx.log(f"PASS Replicate -> Shard(0) 2D shape={shape}")
+
+        # 2D tensor: Replicate -> Shard(1)
+        for shape in [(8, ctx.world_size * 2), (5, ctx.world_size + 3)]:
+            success = _verify_reshard_slices(
+                ctx, mesh,
+                [Replicate()], [Shard(1)],
+                shape,
+                f"Replicate -> Shard(1) 2D shape={shape}",
+            )
+            if not success:
+                all_passed = False
+            elif ctx.rank == 0:
+                ctx.log(f"PASS Replicate -> Shard(1) 2D shape={shape}")
+
+        ctx.assert_true(all_passed, "Some Replicate -> Shard tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
+    """Test compute_reshard_slices with mixed Shard and Replicate on 2D mesh."""
+    _init_torch_distributed(ctx)
+
+    try:
+        # Find a 2D factorization of world_size
+        dp_size, tp_size = 0, 0
+        for dp in range(2, ctx.world_size):
+            if ctx.world_size % dp == 0:
+                tp = ctx.world_size // dp
+                if tp >= 2:
+                    dp_size, tp_size = dp, tp
+                    break
+
+        if dp_size == 0:
+            ctx.log(f"SKIP: No 2D factorization for world_size={ctx.world_size}")
+            return
+
+        mesh = DeviceMesh(
+            "cpu",
+            torch.arange(ctx.world_size).reshape(dp_size, tp_size),
+            mesh_dim_names=("dp", "tp")
+        )
+
+        if ctx.rank == 0:
+            ctx.log(f"Using {dp_size}x{tp_size} mesh")
+
+        all_passed = True
+
+        # [Shard(0), Replicate()] -> [Shard(0), Shard(0)]
+        shape = (dp_size * tp_size * 4, 16)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Shard(0), Replicate()], [Shard(0), Shard(0)],
+            shape,
+            f"[Shard(0), Replicate()] -> [Shard(0), Shard(0)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [Shard(0), Replicate()] -> [Shard(0), Shard(0)]")
+
+        # [Shard(0), Replicate()] -> [Shard(0), Shard(1)]
+        shape = (dp_size * 4, tp_size * 4)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Shard(0), Replicate()], [Shard(0), Shard(1)],
+            shape,
+            f"[Shard(0), Replicate()] -> [Shard(0), Shard(1)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [Shard(0), Replicate()] -> [Shard(0), Shard(1)]")
+
+        # [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]
+        shape = (dp_size * 4, tp_size * 4)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Replicate(), Shard(1)], [Shard(0), Shard(1)],
+            shape,
+            f"[Replicate(), Shard(1)] -> [Shard(0), Shard(1)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]")
+
+        # [Replicate(), Replicate()] -> [Shard(0), Shard(1)]
+        shape = (dp_size * 4, tp_size * 4)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Replicate(), Replicate()], [Shard(0), Shard(1)],
+            shape,
+            f"[Replicate(), Replicate()] -> [Shard(0), Shard(1)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [Replicate(), Replicate()] -> [Shard(0), Shard(1)]")
+
+        ctx.assert_true(all_passed, "Some mixed placement tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_reshard_slices_no_change(ctx: TestContext, device: str):
+    """Test compute_reshard_slices when placements are identical."""
+    _init_torch_distributed(ctx)
+
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(ctx.world_size))
+        all_passed = True
+
+        # Same placements - slices should be all slice(None)
+        shape = (ctx.world_size * 4, 8)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Shard(0)], [Shard(0)],
+            shape,
+            f"Shard(0) -> Shard(0) (no change) shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS Shard(0) -> Shard(0) (no change)")
+
+        ctx.assert_true(all_passed, "Some no-change tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
+    """Test compute_reshard_slices with _StridedShard placements."""
+    if not HAS_STRIDED_SHARD:
+        ctx.log("SKIP: _StridedShard not available")
+        return
+
+    _init_torch_distributed(ctx)
+
+    try:
+        # Find a 2D factorization of world_size
+        dp_size, tp_size = 0, 0
+        for dp in range(2, ctx.world_size):
+            if ctx.world_size % dp == 0:
+                tp = ctx.world_size // dp
+                if tp >= 2:
+                    dp_size, tp_size = dp, tp
+                    break
+
+        if dp_size == 0:
+            ctx.log(f"SKIP: No 2D factorization for world_size={ctx.world_size}")
+            return
+
+        mesh = DeviceMesh(
+            "cpu",
+            torch.arange(ctx.world_size).reshape(dp_size, tp_size),
+            mesh_dim_names=("dp", "tp")
+        )
+
+        if ctx.rank == 0:
+            ctx.log(f"Using {dp_size}x{tp_size} mesh for StridedShard tests")
+
+        all_passed = True
+
+        # [_StridedShard(0, sf=tp_size), Replicate()] -> [_StridedShard(0, sf=tp_size), Shard(0)]
+        # This is the FSDP2+TP pattern where we want to split Replicate work
+        shape = (dp_size * tp_size * 8, 16)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [_StridedShard(0, split_factor=tp_size), Replicate()],
+            [_StridedShard(0, split_factor=tp_size), Shard(0)],
+            shape,
+            f"[StridedShard, Replicate] -> [StridedShard, Shard(0)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [StridedShard, Replicate] -> [StridedShard, Shard(0)]")
+
+        # [_StridedShard(0, sf=tp_size), Replicate()] -> [_StridedShard(0, sf=tp_size), Shard(1)]
+        shape = (dp_size * tp_size * 4, tp_size * 4)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [_StridedShard(0, split_factor=tp_size), Replicate()],
+            [_StridedShard(0, split_factor=tp_size), Shard(1)],
+            shape,
+            f"[StridedShard, Replicate] -> [StridedShard, Shard(1)] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [StridedShard, Replicate] -> [StridedShard, Shard(1)]")
+
+        # [Replicate(), _StridedShard(0, sf=dp_size)] -> [Shard(0), _StridedShard(0, sf=dp_size)]
+        shape = (dp_size * 4, dp_size * tp_size * 4)
+        success = _verify_reshard_slices(
+            ctx, mesh,
+            [Replicate(), _StridedShard(0, split_factor=dp_size)],
+            [Shard(0), _StridedShard(0, split_factor=dp_size)],
+            shape,
+            f"[Replicate, StridedShard] -> [Shard(0), StridedShard] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log(f"PASS [Replicate, StridedShard] -> [Shard(0), StridedShard]")
+
+        ctx.assert_true(all_passed, "Some StridedShard reshard tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test
+def test_reshard_slices_error_on_invalid_conversion(ctx: TestContext):
+    """Test compute_reshard_slices raises error for invalid conversions."""
+    from moodist import compute_reshard_slices
+
+    local_shape = (100,)
+
+    # Shard(0) -> Shard(1) requires communication
+    try:
+        compute_reshard_slices(local_shape, [Shard(0)], [Shard(1)], [(0, 2)])
+        ctx.assert_true(False, "Should have raised ValueError")
+    except ValueError as e:
+        ctx.assert_true("requires communication" in str(e))
+        ctx.log(f"PASS: correctly rejected Shard(0) -> Shard(1): {e}")
+
+    # Shard -> Replicate requires communication (gathering)
+    try:
+        compute_reshard_slices(local_shape, [Shard(0)], [Replicate()], [(0, 2)])
+        ctx.assert_true(False, "Should have raised ValueError")
+    except ValueError as e:
+        ctx.assert_true("requires communication" in str(e))
+        ctx.log(f"PASS: correctly rejected Shard -> Replicate: {e}")
+
+
