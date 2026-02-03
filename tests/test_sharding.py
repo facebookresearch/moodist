@@ -324,6 +324,163 @@ def _verify_compile_op_allgather(
     return True
 
 
+def _verify_compile_op_scatter(
+    ctx: TestContext,
+    pg,
+    mesh: DeviceMesh,
+    placements: list,
+    shape: tuple,
+    description: str,
+    device: str = "cpu",
+):
+    """
+    Verify compile_op correctly performs a scatter based on shard specs.
+
+    Rank 0 contributes the full tensor, all ranks receive their shard.
+    """
+    global_tensor = _make_global_tensor(shape)
+
+    coord = mesh.get_coordinate()
+    if coord is None:
+        return True  # Not in mesh
+
+    # Get this rank's expected output chunks
+    indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
+    my_chunks = moodist.compute_shards(shape, placements, indices_and_sizes)
+
+    # Input: only rank 0 has the full tensor
+    if pg.rank() == 0:
+        inputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
+    else:
+        inputs = []
+
+    # Output: this rank's shard(s)
+    outputs = []
+    for chunk in my_chunks:
+        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+
+    # Compile the op
+    op = moodist.compile_op(
+        pg,
+        dtype=global_tensor.dtype,
+        inputs=inputs,
+        outputs=outputs if outputs else None,
+    )
+
+    # Build input tensor (only rank 0)
+    if pg.rank() == 0:
+        input_tensors = [global_tensor.to(device=device).contiguous()]
+    else:
+        input_tensors = []
+
+    # Output tensors
+    output_tensors = []
+    for chunk in my_chunks:
+        output_tensors.append(torch.zeros(chunk.shape, dtype=global_tensor.dtype, device=device))
+
+    # Execute
+    future = op(input_tensors, output_tensors)
+    future.wait()
+
+    # Verify outputs match expected chunks from global tensor
+    for i, chunk in enumerate(my_chunks):
+        global_slices = tuple(
+            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
+        )
+        expected = global_tensor[global_slices].to(device=device)
+        if not torch.equal(output_tensors[i], expected):
+            ctx.log(f"FAIL compile_op scatter {description}")
+            ctx.log(f"  coord: {coord}, chunk {i}: {chunk}")
+            if output_tensors[i].numel() <= 20:
+                ctx.log(f"  got: {output_tensors[i].flatten().tolist()}")
+                ctx.log(f"  expected: {expected.flatten().tolist()}")
+            return False
+
+    return True
+
+
+def _verify_compile_op_redistribute(
+    ctx: TestContext,
+    pg,
+    mesh: DeviceMesh,
+    input_placements: list,
+    output_placements: list,
+    shape: tuple,
+    description: str,
+    device: str = "cpu",
+):
+    """
+    Verify compile_op correctly redistributes from one sharding to another.
+
+    E.g., Shard(0) inputs -> Shard(1) outputs.
+    """
+    global_tensor = _make_global_tensor(shape)
+
+    coord = mesh.get_coordinate()
+    if coord is None:
+        return True  # Not in mesh
+
+    indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
+
+    # Get input chunks (what this rank contributes)
+    input_chunks = moodist.compute_shards(shape, input_placements, indices_and_sizes)
+
+    # Get output chunks (what this rank receives)
+    output_chunks = moodist.compute_shards(shape, output_placements, indices_and_sizes)
+
+    # Build input specs
+    inputs = []
+    for chunk in input_chunks:
+        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+
+    # Build output specs
+    outputs = []
+    for chunk in output_chunks:
+        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+
+    # Compile the op
+    op = moodist.compile_op(
+        pg,
+        dtype=global_tensor.dtype,
+        inputs=inputs if inputs else None,
+        outputs=outputs if outputs else None,
+    )
+
+    # Build input tensors
+    input_tensors = []
+    for chunk in input_chunks:
+        global_slices = tuple(
+            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
+        )
+        chunk_data = global_tensor[global_slices].to(device=device).contiguous()
+        input_tensors.append(chunk_data)
+
+    # Output tensors
+    output_tensors = []
+    for chunk in output_chunks:
+        output_tensors.append(torch.zeros(chunk.shape, dtype=global_tensor.dtype, device=device))
+
+    # Execute
+    future = op(input_tensors, output_tensors)
+    future.wait()
+
+    # Verify outputs match expected chunks from global tensor
+    for i, chunk in enumerate(output_chunks):
+        global_slices = tuple(
+            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
+        )
+        expected = global_tensor[global_slices].to(device=device)
+        if not torch.equal(output_tensors[i], expected):
+            ctx.log(f"FAIL compile_op redistribute {description}")
+            ctx.log(f"  coord: {coord}, output chunk {i}: {chunk}")
+            if output_tensors[i].numel() <= 20:
+                ctx.log(f"  got: {output_tensors[i].flatten().tolist()}")
+                ctx.log(f"  expected: {expected.flatten().tolist()}")
+            return False
+
+    return True
+
+
 def _test_configuration(
     ctx: TestContext,
     pg,
@@ -334,6 +491,7 @@ def _test_configuration(
     device: str = "cpu",
     test_all_coords: bool = True,
     test_compile_op: bool = True,
+    test_scatter: bool = True,
 ):
     """
     Test both compute_shards and compile_op for a configuration.
@@ -347,7 +505,8 @@ def _test_configuration(
         description: Test description for logging
         device: Device for compile_op tests ("cpu" or "cuda")
         test_all_coords: If True, verify all coordinates (not just current)
-        test_compile_op: If True, also test compile_op transfer
+        test_compile_op: If True, also test compile_op allgather transfer
+        test_scatter: If True, also test compile_op scatter transfer
     """
     success = True
 
@@ -360,9 +519,14 @@ def _test_configuration(
         if not _verify_compute_shards_all_coords(ctx, mesh, placements, shape, description):
             success = False
 
-    # Phase 3: Verify compile_op transfer
+    # Phase 3: Verify compile_op allgather transfer
     if test_compile_op:
         if not _verify_compile_op_allgather(ctx, pg, mesh, placements, shape, description, device):
+            success = False
+
+    # Phase 4: Verify compile_op scatter transfer
+    if test_scatter:
+        if not _verify_compile_op_scatter(ctx, pg, mesh, placements, shape, description, device):
             success = False
 
     if success and ctx.rank == 0:
@@ -772,6 +936,59 @@ def test_2d_mesh(ctx: TestContext, device: str):
                 all_passed = False
 
         ctx.assert_true(all_passed, "Some 2D mesh tests failed")
+
+    finally:
+        _cleanup_torch_distributed()
+
+
+@test_cpu_cuda
+def test_redistribute_shard0_to_shard1(ctx: TestContext, device: str):
+    """Test redistribution from Shard(0) to Shard(1) on 2D tensors."""
+    _init_torch_distributed(ctx)
+    pg = create_process_group(ctx)
+
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(ctx.world_size))
+        all_passed = True
+
+        # Test various 2D shapes where both dims are >= world_size
+        shapes = [
+            (ctx.world_size * 2, ctx.world_size * 2),
+            (ctx.world_size * 4, ctx.world_size * 2),
+            (ctx.world_size * 2, ctx.world_size * 4),
+            (ctx.world_size + 3, ctx.world_size + 5),  # uneven
+        ]
+
+        for shape in shapes:
+            success = _verify_compile_op_redistribute(
+                ctx, pg, mesh,
+                input_placements=[Shard(0)],
+                output_placements=[Shard(1)],
+                shape=shape,
+                description=f"redistribute Shard(0)->Shard(1) shape={shape}",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+            elif ctx.rank == 0:
+                ctx.log(f"PASS redistribute Shard(0)->Shard(1) shape={shape}")
+
+        # Also test Shard(1) -> Shard(0)
+        for shape in shapes:
+            success = _verify_compile_op_redistribute(
+                ctx, pg, mesh,
+                input_placements=[Shard(1)],
+                output_placements=[Shard(0)],
+                shape=shape,
+                description=f"redistribute Shard(1)->Shard(0) shape={shape}",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+            elif ctx.rank == 0:
+                ctx.log(f"PASS redistribute Shard(1)->Shard(0) shape={shape}")
+
+        ctx.assert_true(all_passed, "Some redistribute tests failed")
 
     finally:
         _cleanup_torch_distributed()
