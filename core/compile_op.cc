@@ -616,6 +616,27 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   log.debug(
       "compile_op phase5: rank %zu, %zu reads, %zu output copies\n", rank, op->reads.size(), op->outputCopies.size());
 
+  // Compute byte counts for logging
+  size_t inputBytes = 0, outputBytes = 0, readBytes = 0;
+  for (const auto& d : inputDescrs) {
+    if (d.rank == rank) {
+      inputBytes += d.numel * itemsize;
+    }
+  }
+  for (const auto& d : outputDescrs) {
+    if (d.rank == rank) {
+      outputBytes += d.numel * itemsize;
+    }
+  }
+  for (const auto& r : op->reads) {
+    readBytes += r.bytes;
+  }
+
+  log.info("compile_op[%u]: rank %zu/%zu, %zu inputs (%zu bytes), %zu outputs (%zu bytes), %zu tensor_ids "
+           "-> %zu reads (%zu bytes), %zu input copies, %zu output copies\n",
+      op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes, tensorIdNdim.size(),
+      op->reads.size(), readBytes, op->inputCopies.size(), op->outputCopies.size());
+
   return op;
 }
 
