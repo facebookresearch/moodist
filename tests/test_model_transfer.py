@@ -14,6 +14,7 @@ import hashlib
 import random
 
 import moodist
+from moodist import TensorRegion
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
@@ -27,6 +28,9 @@ TRAINER_RATIOS = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 0.9]
 
 # Seed for deterministic assignment of trainer shards to workers
 ASSIGNMENT_SEED = 42
+
+# Number of parameters to batch per compile_op call
+COMPILE_OP_BATCH_SIZE = 8
 
 
 def _cleanup_distributed():
@@ -203,9 +207,9 @@ class ModelTransfer:
             self.chunk_metadata: list[
                 tuple[str, int, list[int], list[int], torch.dtype]
             ] = []
-            self.compiled_ops: dict[str, tuple] = (
-                {}
-            )  # name -> (op, input_keys, output_info)
+            # Batched ops: list of (op, batch_params) where batch_params is
+            # list of (name, input_keys, output_info)
+            self.compiled_batches: list[tuple] = []
 
     def initialize(self):
         """Initialize transfer - trainers send metadata to workers."""
@@ -267,51 +271,61 @@ class ModelTransfer:
                     chunks_by_param[name] = []
                 chunks_by_param[name].append((trainer_rank, offset, shape, dtype))
 
-            # Compile ops for each parameter
-            for name in self.param_names:
-                p = self.named_parameters[name]
+            # Batch parameters for compile_op calls
+            for batch_start in range(0, len(self.param_names), COMPILE_OP_BATCH_SIZE):
+                batch_names = self.param_names[batch_start:batch_start + COMPILE_OP_BATCH_SIZE]
 
-                # Get global shape and dtype from worker's parameter
-                if isinstance(p, DTensor):
-                    global_shape = tuple(p.shape)
-                    dtype = p.dtype
-                    placements = list(p.placements)
-                    worker_rank_in_group = self.rank - self.num_trainers
-                    output_offset, output_shape = _compute_shard_for_rank(
-                        global_shape, placements, worker_rank_in_group, self.num_workers
-                    )
-                else:
-                    # Non-DTensor (replicated) - worker wants full tensor
-                    global_shape = tuple(p.shape)
-                    dtype = p.dtype
-                    output_offset = [0] * len(global_shape)
-                    output_shape = list(global_shape)
+                # Collect all inputs and outputs for this batch
+                all_inputs = []
+                all_outputs = []
+                batch_params = []  # (name, input_keys, output_info) per param
+                batch_dtype = None
 
-                # Build compile_op info
-                info = {
-                    "shape": global_shape,
-                    "dtype": dtype,
-                }
+                for name in batch_names:
+                    p = self.named_parameters[name]
 
-                # Inputs: chunks this worker received for this parameter
-                input_keys = []
-                if name in chunks_by_param:
-                    inputs = []
-                    for trainer_rank, offset, shape, _ in chunks_by_param[name]:
-                        inputs.append({"offset": offset, "shape": shape})
-                        input_keys.append((name, trainer_rank))
-                    info["inputs"] = inputs
+                    # Get global shape and dtype from worker's parameter
+                    if isinstance(p, DTensor):
+                        global_shape = tuple(p.shape)
+                        dtype = p.dtype
+                        placements = list(p.placements)
+                        worker_rank_in_group = self.rank - self.num_trainers
+                        output_offset, output_shape = _compute_shard_for_rank(
+                            global_shape, placements, worker_rank_in_group, self.num_workers
+                        )
+                    else:
+                        # Non-DTensor (replicated) - worker wants full tensor
+                        global_shape = tuple(p.shape)
+                        dtype = p.dtype
+                        output_offset = [0] * len(global_shape)
+                        output_shape = list(global_shape)
 
-                # Output: this worker's shard (if non-empty)
-                output_info = None
-                if 0 not in output_shape:
-                    info["outputs"] = [{"offset": output_offset, "shape": output_shape}]
+                    # All params in batch must have same dtype
+                    if batch_dtype is None:
+                        batch_dtype = dtype
+                    assert batch_dtype == dtype, f"Mixed dtypes in batch: {batch_dtype} vs {dtype}"
+
+                    # Inputs: chunks this worker received for this parameter
+                    input_keys = []
+                    if name in chunks_by_param:
+                        for trainer_rank, offset, shape, _ in chunks_by_param[name]:
+                            all_inputs.append(TensorRegion(offset=offset, shape=shape, tensor_id=name))
+                            input_keys.append((name, trainer_rank))
+
+                    # Output: this worker's shard
+                    all_outputs.append(TensorRegion(offset=output_offset, shape=output_shape, tensor_id=name))
                     output_info = (output_offset, output_shape)
 
-                # Compile the op
-                op = moodist.compile_op(self.workers_group, **info)
-                self.compiled_ops[name] = (op, input_keys, output_info)
-                # self.log_fn(f"Worker {worker_global_rank}: compiled op for {name}, inputs={len(input_keys)}, has_output={output_info is not None}")
+                    batch_params.append((name, input_keys, output_info))
+
+                # Compile the batched op
+                op = moodist.compile_op(
+                    self.workers_group,
+                    dtype=batch_dtype,
+                    inputs=all_inputs,
+                    outputs=all_outputs,
+                )
+                self.compiled_batches.append((op, batch_params))
 
     def send(self):
         """Trainer sends parameter chunks to assigned workers."""
@@ -364,22 +378,21 @@ class ModelTransfer:
 
         # self.log_fn(f"Worker {worker_global_rank}: received {len(received_chunks)} chunks")
 
-        # Run compiled ops to redistribute chunks among workers
+        # Run batched compiled ops to redistribute chunks among workers
         output_tensors: dict[str, torch.Tensor] = {}
 
         handles = []
 
-        for name in self.param_names:
-            op, input_keys, output_info = self.compiled_ops[name]
-
-            # Gather inputs
+        for op, batch_params in self.compiled_batches:
+            # Gather all inputs for this batch (in order)
             inputlist = []
-            for key in input_keys:
-                inputlist.append(received_chunks[key])
+            for name, input_keys, output_info in batch_params:
+                for key in input_keys:
+                    inputlist.append(received_chunks[key])
 
-            # Create output tensor if this worker has output
+            # Create all output tensors for this batch (in order)
             outputlist = []
-            if output_info is not None:
+            for name, input_keys, output_info in batch_params:
                 output_offset, output_shape = output_info
                 p = self.named_parameters[name]
                 dtype = p.dtype if isinstance(p, DTensor) else p.dtype
@@ -387,7 +400,7 @@ class ModelTransfer:
                 outputlist.append(t)
                 output_tensors[name] = t
 
-            # Run the op
+            # Run the batched op
             handles.append(op(inputlist, outputlist))
 
         for h in handles:
