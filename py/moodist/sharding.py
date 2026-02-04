@@ -40,8 +40,22 @@ def _compose_ranges(existing_ranges, local_start, local_size):
         local_size: size of the slice in the local view
 
     Returns:
-        list of (global_offset, size) tuples
+        list of (global_offset, size) tuples (never empty)
     """
+    # Handle size=0 case: find the global offset at local_start
+    if local_size == 0:
+        local_pos = 0
+        for global_offset, range_size in existing_ranges:
+            range_end = local_pos + range_size
+            if local_start < range_end:
+                return [(global_offset + (local_start - local_pos), 0)]
+            local_pos = range_end
+        # local_start is at the end of all ranges
+        if existing_ranges:
+            last_global, last_size = existing_ranges[-1]
+            return [(last_global + last_size, 0)]
+        return [(0, 0)]
+
     result = []
     local_pos = 0
     local_end = local_start + local_size
@@ -77,10 +91,12 @@ def _strided_shard_ranges(dim_size, split_factor, group_size, rank_index):
     while chunk_idx < num_chunks:
         offset = chunk_idx * chunk_size
         size = min(chunk_size, dim_size - offset)
-        if size > 0:
-            ranges.append((offset, size))
+        ranges.append((offset, size))
         chunk_idx += group_size
 
+    # Always return at least one range to preserve shape info
+    if not ranges:
+        return [(dim_size, 0)]
     return ranges
 
 
@@ -89,9 +105,7 @@ def _regular_shard_ranges(dim_size, group_size, rank_index):
     chunk_size = (dim_size + group_size - 1) // group_size
     offset = min(chunk_size * rank_index, dim_size)
     size = min(chunk_size, dim_size - offset)
-    if size > 0:
-        return [(offset, size)]
-    return []
+    return [(offset, size)]
 
 
 def compute_shards(shape, placements, indices_and_sizes) -> List[ShardInfo]:
@@ -165,20 +179,11 @@ def compute_shards(shape, placements, indices_and_sizes) -> List[ShardInfo]:
         elif isinstance(p, Shard):
             # Regular Shard
             shard = _regular_shard_ranges(total_local_size, group_size, rank_index)
-
-            if shard:
-                local_offset, local_size = shard[0]
-                dim_ranges[dim] = _compose_ranges(current_ranges, local_offset, local_size)
-            else:
-                dim_ranges[dim] = []
+            local_offset, local_size = shard[0]
+            dim_ranges[dim] = _compose_ranges(current_ranges, local_offset, local_size)
 
     # Cartesian product of ranges across dimensions = rectangular chunks
     all_dim_ranges = [dim_ranges.get(d, [(0, shape[d])]) for d in range(ndim)]
-
-    # Handle empty dimensions
-    for ranges in all_dim_ranges:
-        if not ranges:
-            return []
 
     # Precompute local offsets for each range in each dimension
     # local_offset[d][i] = sum of sizes of ranges 0..i-1 on dimension d
@@ -197,35 +202,36 @@ def compute_shards(shape, placements, indices_and_sizes) -> List[ShardInfo]:
         global_offset = [r[1][0] for r in combo]
         local_offset = [dim_local_offsets[d][r[0]] for d, r in enumerate(combo)]
         chunk_shape = [r[1][1] for r in combo]
-        if all(s > 0 for s in chunk_shape):
-            chunks.append(ShardInfo(global_offset, local_offset, chunk_shape))
+        chunks.append(ShardInfo(global_offset, local_offset, chunk_shape))
 
     return chunks
 
 
-def compute_reshard_slices(
+def compute_local_reshard(
     local_shape,
     current_placements,
     target_placements,
     indices_and_sizes,
-) -> Tuple[slice, ...]:
+) -> List[ShardInfo]:
     """
-    Compute slices to locally reshard a tensor from one placement to another.
+    Compute chunks for locally resharding a tensor from one placement to another.
 
     This function only supports local resharding (no communication). Specifically:
     - Replicate -> Shard: Each rank takes a unique portion of replicated data.
+    - Replicate -> _StridedShard: Each rank takes strided portions.
 
     It will raise an error if the resharding would require communication
     (e.g., Shard -> different Shard).
 
     Args:
-        local_shape: Shape of the local tensor to slice.
+        local_shape: Shape of the local tensor to reshard.
         current_placements: Current placement objects (Shard, Replicate, etc.).
         target_placements: Desired placement objects.
         indices_and_sizes: List of (index, group_size) tuples, one per placement.
 
     Returns:
-        Tuple of slice objects to apply to the local tensor.
+        List of ShardInfo objects describing chunks to extract from the local tensor.
+        Use apply_local_reshard() to apply these chunks to produce the resharded tensor.
 
     Example:
         >>> # DTensor with [Shard(0), Replicate()] on 2x2 mesh
@@ -234,8 +240,8 @@ def compute_reshard_slices(
         >>> current = [Shard(0), Replicate()]
         >>> target = [Shard(0), Shard(0)]
         >>> indices_and_sizes = [(0, 2), (1, 2)]
-        >>> slices = compute_reshard_slices(local_shape, current, target, indices_and_sizes)
-        >>> # slices = (slice(25, 50), slice(0, 50))  # second half of dim 0
+        >>> chunks = compute_local_reshard(local_shape, current, target, indices_and_sizes)
+        >>> resharded = apply_local_reshard(local_tensor, chunks)
     """
     if len(current_placements) != len(target_placements):
         raise ValueError(
@@ -283,38 +289,80 @@ def compute_reshard_slices(
             f"requires communication"
         )
 
-    # If no Replicate -> Shard conversions, return full slices
+    # If no Replicate -> Shard conversions, return single chunk covering full tensor
     if not reshard_placements:
-        return tuple(slice(None) for _ in range(len(local_shape)))
+        return [ShardInfo(
+            global_offset=[0] * len(local_shape),
+            local_offset=[0] * len(local_shape),
+            shape=list(local_shape),
+        )]
 
     # Compute shards for the Replicate -> Shard conversions on the local tensor
-    shards = compute_shards(local_shape, reshard_placements, reshard_indices)
+    return compute_shards(local_shape, reshard_placements, reshard_indices)
 
-    if not shards:
-        # Empty shard - make sharded dimensions empty, keep others full
-        sharded_dims = set()
-        for p in reshard_placements:
-            if isinstance(p, Shard) or hasattr(p, 'split_factor'):
-                sharded_dims.add(p.dim)
-        return tuple(
-            slice(0, 0) if d in sharded_dims else slice(None)
-            for d in range(len(local_shape))
+
+def apply_local_reshard(tensor, chunks: List[ShardInfo]):
+    """
+    Apply local reshard chunks to produce the resharded tensor.
+
+    This function takes a tensor and chunks computed by compute_local_reshard()
+    and produces the resharded local tensor.
+
+    Fast path: If there's a single chunk starting at origin, returns a view (no copy).
+    General path: Allocates output tensor and copies each chunk.
+
+    Args:
+        tensor: The input tensor to reshard.
+        chunks: List of ShardInfo objects from compute_local_reshard().
+
+    Returns:
+        The resharded tensor. May be a view (single chunk) or a copy (multiple chunks).
+
+    Example:
+        >>> chunks = compute_local_reshard(local_shape, current, target, indices_and_sizes)
+        >>> resharded = apply_local_reshard(local_tensor, chunks)
+    """
+    import torch
+
+    if not chunks:
+        raise ValueError("chunks cannot be empty")
+
+    ndim = len(chunks[0].shape)
+
+    # Compute output shape: max(local_offset + shape) for each dimension
+    output_shape = []
+    for d in range(ndim):
+        max_extent = max(c.local_offset[d] + c.shape[d] for c in chunks)
+        output_shape.append(max_extent)
+
+    # Fast path: single chunk -> return a view
+    if len(chunks) == 1:
+        chunk = chunks[0]
+        src_slices = tuple(
+            slice(go, go + s)
+            for go, s in zip(chunk.global_offset, chunk.shape)
         )
+        return tensor[src_slices]
 
-    if len(shards) != 1:
-        # Multiple chunks - this shouldn't happen for simple Replicate -> Shard
-        raise ValueError(
-            f"Expected single shard for Replicate -> Shard conversion, got {len(shards)}"
+    # General path: allocate output and copy each chunk
+    output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+
+    for chunk in chunks:
+        # Skip empty chunks (any dimension is 0)
+        if any(s == 0 for s in chunk.shape):
+            continue
+
+        src_slices = tuple(
+            slice(go, go + s)
+            for go, s in zip(chunk.global_offset, chunk.shape)
         )
+        dst_slices = tuple(
+            slice(lo, lo + s)
+            for lo, s in zip(chunk.local_offset, chunk.shape)
+        )
+        output[dst_slices].copy_(tensor[src_slices])
 
-    shard = shards[0]
-    # Build slice tuple from global_offset and shape
-    # global_offset is relative to the input shape (local_shape), so it tells us
-    # where to slice the local tensor
-    return tuple(
-        slice(offset, offset + size)
-        for offset, size in zip(shard.global_offset, shard.shape)
-    )
+    return output
 
 
 def dtensor_shards(dtensor, coord=None) -> List[ShardInfo]:

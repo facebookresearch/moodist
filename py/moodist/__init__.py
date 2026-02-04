@@ -38,7 +38,7 @@ from .queue import Queue, TransactionContextManager
 from .compile import compile_op, TensorRegion, specs_from_dtensor
 
 # Sharding utilities
-from .sharding import compute_shards, compute_reshard_slices, dtensor_shards, ShardInfo
+from .sharding import compute_shards, compute_local_reshard, apply_local_reshard, dtensor_shards, ShardInfo
 
 
 if TYPE_CHECKING:
@@ -93,7 +93,8 @@ __all__ = [
     "specs_from_dtensor",
     # Sharding
     "compute_shards",
-    "compute_reshard_slices",
+    "compute_local_reshard",
+    "apply_local_reshard",
     "dtensor_shards",
     "ShardInfo",
 ]

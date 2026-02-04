@@ -8,10 +8,11 @@ Tests for compute_shards and dtensor_shards:
 2. The predictions match PyTorch's actual DTensor sharding behavior
 3. compile_op correctly transfers data based on these shard specifications
 
-Tests for compute_reshard_slices:
-4. Correctly computes slices for Replicate -> Shard conversion
-5. Returns full slices when no conversion is needed
+Tests for compute_local_reshard and apply_local_reshard:
+4. Correctly computes chunks for Replicate -> Shard conversion
+5. Returns full tensor chunk when no conversion is needed
 6. Raises errors for invalid conversions (e.g., Shard -> Shard)
+7. apply_local_reshard produces correct output tensors
 
 Tests run with multiple ranks and verify all coordinates, not just the current one.
 """
@@ -69,45 +70,6 @@ def _make_global_tensor(shape, dtype=torch.float32):
     for s in shape:
         numel *= s
     return torch.arange(numel, dtype=dtype).reshape(shape)
-
-
-def _build_local_from_chunks(chunks, global_tensor):
-    """
-    Build the expected local tensor from chunks.
-
-    Args:
-        chunks: List of ShardInfo objects
-        global_tensor: The full global tensor
-
-    Returns:
-        The expected local tensor
-    """
-    if not chunks:
-        # Empty - return 0-element tensor with same ndim
-        return torch.zeros([0] * global_tensor.ndim, dtype=global_tensor.dtype)
-
-    # Compute local shape from max(local_offset + chunk_shape) per dimension
-    ndim = len(chunks[0].shape)
-    local_shape = [0] * ndim
-    for chunk in chunks:
-        for d in range(ndim):
-            local_shape[d] = max(local_shape[d], chunk.local_offset[d] + chunk.shape[d])
-
-    # Create local tensor
-    local_tensor = torch.zeros(local_shape, dtype=global_tensor.dtype)
-
-    # Copy chunks from global to local positions
-    for chunk in chunks:
-        # Build slices for global and local tensors
-        global_slices = tuple(
-            slice(go, go + cs) for go, cs in zip(chunk.global_offset, chunk.shape)
-        )
-        local_slices = tuple(
-            slice(lo, lo + cs) for lo, cs in zip(chunk.local_offset, chunk.shape)
-        )
-        local_tensor[local_slices] = global_tensor[global_slices]
-
-    return local_tensor
 
 
 def _get_all_mesh_coords(mesh):
@@ -169,11 +131,7 @@ def _verify_compute_shards_current_coord(
     predicted_chunks = moodist.compute_shards(shape, placements, indices_and_sizes)
 
     # Build expected local tensor from chunks
-    expected_local = _build_local_from_chunks(predicted_chunks, global_tensor)
-
-    # Compare - skip if both are empty (shape details don't matter for empty tensors)
-    if actual_local.numel() == 0 and expected_local.numel() == 0:
-        return True
+    expected_local = moodist.apply_local_reshard(global_tensor, predicted_chunks)
 
     if not torch.equal(actual_local, expected_local):
         ctx.log(f"FAIL {description}")
@@ -239,11 +197,7 @@ def _verify_compute_shards_all_coords(
         predicted_chunks = moodist.compute_shards(shape, placements, indices_and_sizes)
 
         # Build expected local tensor
-        expected_local = _build_local_from_chunks(predicted_chunks, global_tensor)
-
-        # Compare - skip if both are empty (shape details don't matter for empty tensors)
-        if owner_actual.numel() == 0 and expected_local.numel() == 0:
-            continue
+        expected_local = moodist.apply_local_reshard(global_tensor, predicted_chunks)
 
         if not torch.equal(owner_actual, expected_local):
             ctx.log(f"FAIL {description} at coord {coord}")
@@ -1000,10 +954,10 @@ def test_redistribute_shard0_to_shard1(ctx: TestContext, device: str):
 
 
 # =============================================================================
-# Tests for compute_reshard_slices
+# Tests for compute_local_reshard and apply_local_reshard
 # =============================================================================
 
-def _verify_reshard_slices(
+def _verify_local_reshard(
     ctx: TestContext,
     mesh: DeviceMesh,
     current_placements: list,
@@ -1012,14 +966,14 @@ def _verify_reshard_slices(
     description: str,
 ):
     """
-    Verify compute_reshard_slices by comparing against PyTorch DTensor.
+    Verify compute_local_reshard and apply_local_reshard by comparing against PyTorch DTensor.
 
     1. Create global tensor with fixed data
-    2. Distribute to DTensor with current_placements, get local, apply reshard slices
+    2. Distribute to DTensor with current_placements, get local, apply reshard
     3. Distribute to DTensor with target_placements, get local directly
     4. Compare: they should be equal
     """
-    from moodist import compute_reshard_slices
+    from moodist import compute_local_reshard, apply_local_reshard
 
     global_tensor = _make_global_tensor(shape)
 
@@ -1045,10 +999,10 @@ def _verify_reshard_slices(
     # Get local tensor from current placement
     local_current = dtensor_current.to_local()
 
-    # Compute reshard slices
+    # Compute reshard chunks
     indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
     try:
-        reshard_slices = compute_reshard_slices(
+        reshard_chunks = compute_local_reshard(
             tuple(local_current.shape),
             current_placements,
             target_placements,
@@ -1058,8 +1012,8 @@ def _verify_reshard_slices(
         ctx.log(f"SKIP {description}: {e}")
         return True
 
-    # Apply slices to get resharded local
-    resharded_local = local_current[reshard_slices]
+    # Apply reshard to get resharded local
+    resharded_local = apply_local_reshard(local_current, reshard_chunks)
 
     # Get expected local from target placement
     expected_local = dtensor_target.to_local()
@@ -1069,7 +1023,7 @@ def _verify_reshard_slices(
         ctx.log(f"FAIL {description}")
         ctx.log(f"  coord: {coord}")
         ctx.log(f"  current local shape: {local_current.shape}")
-        ctx.log(f"  reshard_slices: {reshard_slices}")
+        ctx.log(f"  reshard_chunks: {reshard_chunks}")
         ctx.log(f"  resharded shape: {resharded_local.shape}")
         ctx.log(f"  expected shape: {expected_local.shape}")
         if resharded_local.numel() <= 20:
@@ -1081,8 +1035,8 @@ def _verify_reshard_slices(
 
 
 @test_cpu_cuda
-def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
-    """Test compute_reshard_slices for Replicate -> Shard conversions."""
+def test_local_reshard_replicate_to_shard(ctx: TestContext, device: str):
+    """Test compute_local_reshard for Replicate -> Shard conversions."""
     _init_torch_distributed(ctx)
 
     try:
@@ -1091,7 +1045,7 @@ def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
 
         # 1D tensor: Replicate -> Shard(0)
         for shape in [(ctx.world_size * 4,), (ctx.world_size * 7 + 3,)]:
-            success = _verify_reshard_slices(
+            success = _verify_local_reshard(
                 ctx, mesh,
                 [Replicate()], [Shard(0)],
                 shape,
@@ -1104,7 +1058,7 @@ def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
 
         # 2D tensor: Replicate -> Shard(0)
         for shape in [(ctx.world_size * 2, 8), (ctx.world_size + 3, 5)]:
-            success = _verify_reshard_slices(
+            success = _verify_local_reshard(
                 ctx, mesh,
                 [Replicate()], [Shard(0)],
                 shape,
@@ -1117,7 +1071,7 @@ def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
 
         # 2D tensor: Replicate -> Shard(1)
         for shape in [(8, ctx.world_size * 2), (5, ctx.world_size + 3)]:
-            success = _verify_reshard_slices(
+            success = _verify_local_reshard(
                 ctx, mesh,
                 [Replicate()], [Shard(1)],
                 shape,
@@ -1135,8 +1089,8 @@ def test_reshard_slices_replicate_to_shard(ctx: TestContext, device: str):
 
 
 @test_cpu_cuda
-def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
-    """Test compute_reshard_slices with mixed Shard and Replicate on 2D mesh."""
+def test_local_reshard_mixed_placements(ctx: TestContext, device: str):
+    """Test compute_local_reshard with mixed Shard and Replicate on 2D mesh."""
     _init_torch_distributed(ctx)
 
     try:
@@ -1166,7 +1120,7 @@ def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
 
         # [Shard(0), Replicate()] -> [Shard(0), Shard(0)]
         shape = (dp_size * tp_size * 4, 16)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Shard(0), Replicate()], [Shard(0), Shard(0)],
             shape,
@@ -1179,7 +1133,7 @@ def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
 
         # [Shard(0), Replicate()] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Shard(0), Replicate()], [Shard(0), Shard(1)],
             shape,
@@ -1192,7 +1146,7 @@ def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
 
         # [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Replicate(), Shard(1)], [Shard(0), Shard(1)],
             shape,
@@ -1205,7 +1159,7 @@ def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
 
         # [Replicate(), Replicate()] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Replicate(), Replicate()], [Shard(0), Shard(1)],
             shape,
@@ -1223,8 +1177,8 @@ def test_reshard_slices_mixed_placements(ctx: TestContext, device: str):
 
 
 @test_cpu_cuda
-def test_reshard_slices_no_change(ctx: TestContext, device: str):
-    """Test compute_reshard_slices when placements are identical."""
+def test_local_reshard_no_change(ctx: TestContext, device: str):
+    """Test compute_local_reshard when placements are identical."""
     _init_torch_distributed(ctx)
 
     try:
@@ -1233,7 +1187,7 @@ def test_reshard_slices_no_change(ctx: TestContext, device: str):
 
         # Same placements - slices should be all slice(None)
         shape = (ctx.world_size * 4, 8)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Shard(0)], [Shard(0)],
             shape,
@@ -1251,8 +1205,8 @@ def test_reshard_slices_no_change(ctx: TestContext, device: str):
 
 
 @test_cpu_cuda
-def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
-    """Test compute_reshard_slices with _StridedShard placements."""
+def test_local_reshard_strided_shard(ctx: TestContext, device: str):
+    """Test compute_local_reshard with _StridedShard placements."""
     if not HAS_STRIDED_SHARD:
         ctx.log("SKIP: _StridedShard not available")
         return
@@ -1287,7 +1241,7 @@ def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
         # [_StridedShard(0, sf=tp_size), Replicate()] -> [_StridedShard(0, sf=tp_size), Shard(0)]
         # This is the FSDP2+TP pattern where we want to split Replicate work
         shape = (dp_size * tp_size * 8, 16)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [_StridedShard(0, split_factor=tp_size), Replicate()],
             [_StridedShard(0, split_factor=tp_size), Shard(0)],
@@ -1301,7 +1255,7 @@ def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
 
         # [_StridedShard(0, sf=tp_size), Replicate()] -> [_StridedShard(0, sf=tp_size), Shard(1)]
         shape = (dp_size * tp_size * 4, tp_size * 4)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [_StridedShard(0, split_factor=tp_size), Replicate()],
             [_StridedShard(0, split_factor=tp_size), Shard(1)],
@@ -1315,7 +1269,7 @@ def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
 
         # [Replicate(), _StridedShard(0, sf=dp_size)] -> [Shard(0), _StridedShard(0, sf=dp_size)]
         shape = (dp_size * 4, dp_size * tp_size * 4)
-        success = _verify_reshard_slices(
+        success = _verify_local_reshard(
             ctx, mesh,
             [Replicate(), _StridedShard(0, split_factor=dp_size)],
             [Shard(0), _StridedShard(0, split_factor=dp_size)],
@@ -1334,15 +1288,15 @@ def test_reshard_slices_strided_shard(ctx: TestContext, device: str):
 
 
 @test
-def test_reshard_slices_error_on_invalid_conversion(ctx: TestContext):
-    """Test compute_reshard_slices raises error for invalid conversions."""
-    from moodist import compute_reshard_slices
+def test_local_reshard_error_on_invalid_conversion(ctx: TestContext):
+    """Test compute_local_reshard raises error for invalid conversions."""
+    from moodist import compute_local_reshard
 
     local_shape = (100,)
 
     # Shard(0) -> Shard(1) requires communication
     try:
-        compute_reshard_slices(local_shape, [Shard(0)], [Shard(1)], [(0, 2)])
+        compute_local_reshard(local_shape, [Shard(0)], [Shard(1)], [(0, 2)])
         ctx.assert_true(False, "Should have raised ValueError")
     except ValueError as e:
         ctx.assert_true("requires communication" in str(e))
@@ -1350,7 +1304,7 @@ def test_reshard_slices_error_on_invalid_conversion(ctx: TestContext):
 
     # Shard -> Replicate requires communication (gathering)
     try:
-        compute_reshard_slices(local_shape, [Shard(0)], [Replicate()], [(0, 2)])
+        compute_local_reshard(local_shape, [Shard(0)], [Replicate()], [(0, 2)])
         ctx.assert_true(False, "Should have raised ValueError")
     except ValueError as e:
         ctx.assert_true("requires communication" in str(e))
