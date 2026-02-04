@@ -808,8 +808,8 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     std::vector<std::string> outputDevices;
 
     // Parse inputs and outputs: list of tuples (rank, offset, shape, tensor_id, device)
-    auto parse_transfer_list =
-        [&](PyObject* list, std::vector<std::string>& tensorIdStorage, std::vector<std::string>& deviceStorage) -> std::vector<moodist::api::TensorRegion> {
+    auto parse_transfer_list = [&](PyObject* list, std::vector<std::string>& tensorIdStorage,
+                                   std::vector<std::string>& deviceStorage) -> std::vector<moodist::api::TensorRegion> {
       std::vector<moodist::api::TensorRegion> result;
       if (!PyList_Check(list)) {
         PyErr_SetString(PyExc_TypeError, "Expected a list of tuples");
@@ -824,8 +824,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
         PyObject* item = PyList_GetItem(list, i); // Borrowed reference
         Py_ssize_t tuple_size = PyTuple_Check(item) ? PyTuple_Size(item) : 0;
         if (tuple_size != 5) {
-          PyErr_SetString(PyExc_TypeError,
-              "Each item must be a tuple of (rank, offset, shape, tensor_id, device)");
+          PyErr_SetString(PyExc_TypeError, "Each item must be a tuple of (rank, offset, shape, tensor_id, device)");
           return {};
         }
 

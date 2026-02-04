@@ -31,11 +31,11 @@ def test_compile_op_point_to_point(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [TensorRegion(offset=[0], shape=[4])]
+        inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
         outputs = None
     elif ctx.rank == 1:
         inputs = None
-        outputs = [TensorRegion(offset=[0], shape=[4])]
+        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
     else:
         inputs = None
         outputs = None
@@ -75,12 +75,12 @@ def test_compile_op_broadcast(ctx: TestContext, device: str):
 
     # Rank 0 is the source, all ranks receive
     if ctx.rank == 0:
-        inputs = [TensorRegion(offset=[0], shape=[8])]
+        inputs = [TensorRegion(offset=[0], shape=[8], device=device)]
     else:
         inputs = None
 
     # All ranks receive
-    outputs = [TensorRegion(offset=[0], shape=[8])]
+    outputs = [TensorRegion(offset=[0], shape=[8], device=device)]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -113,11 +113,11 @@ def test_compile_op_gather(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its chunk
-    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
+    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size], device=device)]
 
     # Only rank 0 receives
     if ctx.rank == 0:
-        outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
+        outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size], device=device)]
     else:
         outputs = None
 
@@ -159,12 +159,12 @@ def test_compile_op_scatter(ctx: TestContext, device: str):
 
     # Only rank 0 provides input (full tensor)
     if ctx.rank == 0:
-        inputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
+        inputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size], device=device)]
     else:
         inputs = None
 
     # Each rank receives its chunk
-    outputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
+    outputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size], device=device)]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -201,9 +201,9 @@ def test_compile_op_allgather(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its chunk
-    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size])]
+    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size], device=device)]
     # Each rank receives the full tensor
-    outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size])]
+    outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size], device=device)]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -236,9 +236,9 @@ def test_compile_op_2d_tensor(ctx: TestContext, device: str):
     dtype = torch.float32
 
     # Each rank contributes its row
-    inputs = [TensorRegion(offset=[ctx.rank, 0], shape=[1, 4])]
+    inputs = [TensorRegion(offset=[ctx.rank, 0], shape=[1, 4], device=device)]
     # All ranks receive full tensor
-    outputs = [TensorRegion(offset=[0, 0], shape=[ctx.world_size, 4])]
+    outputs = [TensorRegion(offset=[0, 0], shape=[ctx.world_size, 4], device=device)]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -273,15 +273,15 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
     # Rank 0 provides two separate input tensors that together cover the full output
     if ctx.rank == 0:
         inputs = [
-            TensorRegion(offset=[0], shape=[2]),
-            TensorRegion(offset=[2], shape=[2]),
+            TensorRegion(offset=[0], shape=[2], device=device),
+            TensorRegion(offset=[2], shape=[2], device=device),
         ]
     else:
         inputs = None
 
     # Rank 1 receives the full tensor
     if ctx.rank == 1:
-        outputs = [TensorRegion(offset=[0], shape=[4])]
+        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
     else:
         outputs = None
 
@@ -322,10 +322,10 @@ def test_compile_op_different_dtypes(ctx: TestContext, device: str):
         shape = [4]
 
         if ctx.rank == 0:
-            inputs = [TensorRegion(offset=[0], shape=[4])]
+            inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
         else:
             inputs = None
-        outputs = [TensorRegion(offset=[0], shape=[4])]
+        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
 
         op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -356,10 +356,10 @@ def test_compile_op_reuse(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [TensorRegion(offset=[0], shape=[4])]
+        inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
     else:
         inputs = None
-    outputs = [TensorRegion(offset=[0], shape=[4])]
+    outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
 
@@ -392,11 +392,11 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
     dtype = torch.float32
 
     if ctx.rank == 0:
-        inputs = [TensorRegion(offset=[0], shape=[4])]
+        inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
         outputs = None
     elif ctx.rank == 1:
         inputs = None
-        outputs = [TensorRegion(offset=[0], shape=[4])]
+        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
     else:
         # Rank 2+ are bystanders
         inputs = None
@@ -451,20 +451,20 @@ def test_compile_op_tensor_id_multi_tensor(ctx: TestContext, device: str):
     # Inputs: each rank provides its row of weight and weight2
     # Rank 0 provides bias, rank 1 provides scale
     inputs = [
-        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight_cols], tensor_id="weight"),
-        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight2_cols], tensor_id="weight2"),
+        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight_cols], device=device, tensor_id="weight"),
+        TensorRegion(offset=[ctx.rank, 0], shape=[1, weight2_cols], device=device, tensor_id="weight2"),
     ]
     if ctx.rank == 0:
-        inputs.append(TensorRegion(offset=[0], shape=[bias_size], tensor_id="bias"))
+        inputs.append(TensorRegion(offset=[0], shape=[bias_size], device=device, tensor_id="bias"))
     if ctx.rank == 1:
-        inputs.append(TensorRegion(offset=[0], shape=[scale_size], tensor_id="scale"))
+        inputs.append(TensorRegion(offset=[0], shape=[scale_size], device=device, tensor_id="scale"))
 
     # Outputs: all ranks receive all tensors
     outputs = [
-        TensorRegion(offset=[0, 0], shape=[weight_rows, weight_cols], tensor_id="weight"),
-        TensorRegion(offset=[0, 0], shape=[weight_rows, weight2_cols], tensor_id="weight2"),
-        TensorRegion(offset=[0], shape=[bias_size], tensor_id="bias"),
-        TensorRegion(offset=[0], shape=[scale_size], tensor_id="scale"),
+        TensorRegion(offset=[0, 0], shape=[weight_rows, weight_cols], device=device, tensor_id="weight"),
+        TensorRegion(offset=[0, 0], shape=[weight_rows, weight2_cols], device=device, tensor_id="weight2"),
+        TensorRegion(offset=[0], shape=[bias_size], device=device, tensor_id="bias"),
+        TensorRegion(offset=[0], shape=[scale_size], device=device, tensor_id="scale"),
     ]
 
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs, reduce="any")
@@ -525,3 +525,50 @@ def test_compile_op_tensor_id_multi_tensor(ctx: TestContext, device: str):
         torch.equal(scale_output, expected_scale),
         f"scale: got {scale_output}, expected {expected_scale}"
     )
+
+
+@test_cpu_cuda
+def test_compile_op_device_mismatch_error(ctx: TestContext, device: str):
+    """Test that passing a tensor with wrong device raises an error."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+
+    dtype = torch.float32
+
+    # Compile with the test device
+    if ctx.rank == 0:
+        inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
+        outputs = None
+    else:
+        inputs = None
+        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
+
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+
+    # Try to execute with wrong device tensor
+    wrong_device = "cpu" if device == "cuda" else "cuda"
+
+    # Skip if wrong_device is cuda but CUDA not available
+    if wrong_device == "cuda" and not torch.cuda.is_available():
+        return
+
+    try:
+        if ctx.rank == 0:
+            # Create tensor on wrong device
+            input_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=wrong_device)
+            future = op([input_tensor], [])
+        else:
+            output_tensor = torch.zeros(4, dtype=dtype, device=wrong_device)
+            future = op([], [output_tensor])
+
+        future.wait()
+        ctx.log(f"FAIL: Expected error for device mismatch, but op succeeded")
+        ctx.assert_true(False, "Expected RuntimeError for device mismatch")
+    except RuntimeError as e:
+        error_msg = str(e)
+        ctx.assert_true(
+            "wrong device" in error_msg,
+            f"Expected 'wrong device' in error message, got: {error_msg}"
+        )

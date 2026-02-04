@@ -309,11 +309,11 @@ class ModelTransfer:
                     input_keys = []
                     if name in chunks_by_param:
                         for trainer_rank, offset, shape, _ in chunks_by_param[name]:
-                            all_inputs.append(TensorRegion(offset=offset, shape=shape, tensor_id=name))
+                            all_inputs.append(TensorRegion(offset=offset, shape=shape, device="cpu", tensor_id=name))
                             input_keys.append((name, trainer_rank))
 
                     # Output: this worker's shard
-                    all_outputs.append(TensorRegion(offset=output_offset, shape=output_shape, tensor_id=name))
+                    all_outputs.append(TensorRegion(offset=output_offset, shape=output_shape, device="cpu", tensor_id=name))
                     output_info = (output_offset, output_shape)
 
                     batch_params.append((name, input_keys, output_info))

@@ -2257,8 +2257,8 @@ void ProcessGroupImpl::barrier() {
 // ============================================================================
 
 void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
-  REQUIRE(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size,
-          "scatter: sourceRank %d out of bounds [0, %zu)", sourceRank, size);
+  REQUIRE(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size, "scatter: sourceRank %d out of bounds [0, %zu)",
+      sourceRank, size);
 
   // Validate inputs
   if (static_cast<size_t>(sourceRank) == rank) {
@@ -2280,22 +2280,22 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
   // Validate device index for CUDA tensors
   if (isCuda) {
     REQUIRE(output.device_index() == group->deviceIndex,
-            "scatter: output CUDA device %d does not match process group device %d",
-            output.device_index(), group->deviceIndex);
+        "scatter: output CUDA device %d does not match process group device %d", output.device_index(),
+        group->deviceIndex);
   }
 
   // Validate all inputs have the same numel, dtype, and device as output (on source rank)
   if (static_cast<size_t>(sourceRank) == rank) {
     for (size_t i : indices(inputs)) {
       auto& input = inputs[i];
-      REQUIRE(static_cast<size_t>(input.numel()) == numel,
-              "scatter: input[%zu] has %lld elements, expected %zu", i, input.numel(), numel);
+      REQUIRE(static_cast<size_t>(input.numel()) == numel, "scatter: input[%zu] has %lld elements, expected %zu", i,
+          input.numel(), numel);
       REQUIRE(input.dtype() == dtype, "scatter: input[%zu] has different dtype than output", i);
       REQUIRE(input.is_cuda() == isCuda, "scatter: input[%zu] device type differs from output", i);
       if (isCuda) {
         REQUIRE(input.device_index() == group->deviceIndex,
-                "scatter: input[%zu] CUDA device %d does not match process group device %d",
-                i, input.device_index(), group->deviceIndex);
+            "scatter: input[%zu] CUDA device %d does not match process group device %d", i, input.device_index(),
+            group->deviceIndex);
       }
     }
   }
@@ -2355,8 +2355,8 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
 // ============================================================================
 
 void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
-  REQUIRE(destRank >= 0 && static_cast<size_t>(destRank) < size,
-          "gather: destRank %d out of bounds [0, %zu)", destRank, size);
+  REQUIRE(destRank >= 0 && static_cast<size_t>(destRank) < size, "gather: destRank %d out of bounds [0, %zu)", destRank,
+      size);
 
   // Validate outputs
   if (static_cast<size_t>(destRank) == rank) {
@@ -2378,22 +2378,22 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
   // Validate device index for CUDA tensors
   if (isCuda) {
     REQUIRE(input.device_index() == group->deviceIndex,
-            "gather: input CUDA device %d does not match process group device %d",
-            input.device_index(), group->deviceIndex);
+        "gather: input CUDA device %d does not match process group device %d", input.device_index(),
+        group->deviceIndex);
   }
 
   // Validate all outputs have the same numel, dtype, and device as input (on dest rank)
   if (static_cast<size_t>(destRank) == rank) {
     for (size_t i : indices(outputs)) {
       auto& output = outputs[i];
-      REQUIRE(static_cast<size_t>(output.numel()) == numel,
-              "gather: output[%zu] has %lld elements, expected %zu", i, output.numel(), numel);
+      REQUIRE(static_cast<size_t>(output.numel()) == numel, "gather: output[%zu] has %lld elements, expected %zu", i,
+          output.numel(), numel);
       REQUIRE(output.dtype() == dtype, "gather: output[%zu] has different dtype than input", i);
       REQUIRE(output.is_cuda() == isCuda, "gather: output[%zu] device type differs from input", i);
       if (isCuda) {
         REQUIRE(output.device_index() == group->deviceIndex,
-                "gather: output[%zu] CUDA device %d does not match process group device %d",
-                i, output.device_index(), group->deviceIndex);
+            "gather: output[%zu] CUDA device %d does not match process group device %d", i, output.device_index(),
+            group->deviceIndex);
       }
     }
   }
@@ -3820,38 +3820,34 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
   for (size_t i = 0; i < nInputs; ++i) {
     auto t = getTensorDataFromPtr(inputs[i]);
-    if (t->dtype != static_cast<int>(op->dtype)) {
-      throw std::runtime_error(fmt::sprintf("moodist: custom op input[%zu] has wrong dtype: got %s, expected %s", i,
-          formatDType(t->dtype), formatDType(static_cast<int>(op->dtype))));
-    }
-    if (t->shape != op->inputShapes[i]) {
-      throw std::runtime_error(fmt::sprintf("moodist: custom op input[%zu] has wrong shape: got %s, expected %s", i,
-          formatShape(t->shape), formatShape(op->inputShapes[i])));
-    }
-    if (t->bytes() != op->inputs[i]) {
-      throw std::runtime_error(
-          fmt::sprintf("moodist: custom op input[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
-              op->inputs[i]));
-    }
+    REQUIRE(t->dtype == static_cast<int>(op->dtype),
+        "moodist: custom op input[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
+        formatDType(static_cast<int>(op->dtype)));
+    REQUIRE(t->shape == op->inputShapes[i], "moodist: custom op input[%zu] has wrong shape: got %s, expected %s", i,
+        formatShape(t->shape), formatShape(op->inputShapes[i]));
+    REQUIRE(t->bytes() == op->inputs[i],
+        "moodist: custom op input[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
+        op->inputs[i]);
+    bool expectedCuda = op->inputDevices[i] == DeviceType::CUDA;
+    REQUIRE(t->isCuda == expectedCuda, "moodist: custom op input[%zu] has wrong device: got %s, expected %s", i,
+        t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
     e->inputs.push_back(std::move(t));
   }
   for (size_t i = 0; i < nOutputs; ++i) {
     auto t = getTensorDataFromPtr(outputs[i]);
-    if (t->dtype != static_cast<int>(op->dtype)) {
-      throw std::runtime_error(fmt::sprintf("moodist: custom op output[%zu] has wrong dtype: got %s, expected %s", i,
-          formatDType(t->dtype), formatDType(static_cast<int>(op->dtype))));
-    }
-    if (t->shape != op->outputShapes[i]) {
-      throw std::runtime_error(fmt::sprintf("moodist: custom op output[%zu] has wrong shape: got %s, expected %s", i,
-          formatShape(t->shape), formatShape(op->outputShapes[i])));
-    }
-    if (t->bytes() != op->outputs[i]) {
-      throw std::runtime_error(
-          fmt::sprintf("moodist: custom op output[%zu] has wrong size: got %zu bytes, expected %zu bytes", i,
-              t->bytes(), op->outputs[i]));
-    }
+    REQUIRE(t->dtype == static_cast<int>(op->dtype),
+        "moodist: custom op output[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
+        formatDType(static_cast<int>(op->dtype)));
+    REQUIRE(t->shape == op->outputShapes[i], "moodist: custom op output[%zu] has wrong shape: got %s, expected %s", i,
+        formatShape(t->shape), formatShape(op->outputShapes[i]));
+    REQUIRE(t->bytes() == op->outputs[i],
+        "moodist: custom op output[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
+        op->outputs[i]);
+    bool expectedCuda = op->outputDevices[i] == DeviceType::CUDA;
+    REQUIRE(t->isCuda == expectedCuda, "moodist: custom op output[%zu] has wrong device: got %s, expected %s", i,
+        t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
     e->outputs.push_back(std::move(t));

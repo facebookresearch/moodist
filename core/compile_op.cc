@@ -47,6 +47,19 @@ void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
   deserializeBuffer(ptr, size, result...);
 }
 
+// Parse device string without validation.
+// Returns the parsed DeviceType.
+// Throws if device string is invalid.
+DeviceType parseDevice(std::string_view device) {
+  if (device == "cpu") {
+    return DeviceType::CPU;
+  }
+  if (device == "cuda" || device.starts_with("cuda:")) {
+    return DeviceType::CUDA;
+  }
+  throw std::runtime_error("Invalid device string: " + std::string(device));
+}
+
 // Parse device string and validate CUDA index if specified.
 // Returns the parsed DeviceType.
 // Throws if:
@@ -140,6 +153,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     d.rank = region.rank;
     d.index = inputIndexCounter[region.rank]++;
     d.tensorId = std::string(region.tensorId);
+    d.device = parseDevice(region.device);
     int ndim = tensorIdNdim.at(d.tensorId);
     d.offset = Coord(ndim);
     d.shape = Coord(ndim);
@@ -154,6 +168,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     d.rank = region.rank;
     d.index = outputIndexCounter[region.rank]++;
     d.tensorId = std::string(region.tensorId);
+    d.device = parseDevice(region.device);
     int ndim = tensorIdNdim.at(d.tensorId);
     d.offset = Coord(ndim);
     d.shape = Coord(ndim);
@@ -567,6 +582,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     op->inputs.push_back(itemsize * inputDescrs[idx].numel);
     const Coord& sh = inputDescrs[idx].shape;
     op->inputShapes.emplace_back(sh.begin(), sh.end());
+    op->inputDevices.push_back(inputDescrs[idx].device);
   }
 
   // Populate outputs (my outputs) - sizes in bytes
@@ -574,6 +590,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     op->outputs.push_back(itemsize * outputDescrs[idx].numel);
     const Coord& sh = outputDescrs[idx].shape;
     op->outputShapes.emplace_back(sh.begin(), sh.end());
+    op->outputDevices.push_back(outputDescrs[idx].device);
   }
 
   // Add inputCopies from Phase 4
@@ -677,8 +694,8 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
 
   log.info("compile_op[%u]: rank %zu/%zu, %zu inputs (%zu bytes), %zu outputs (%zu bytes), %zu tensor_ids "
            "-> %zu reads (%zu bytes), %zu input copies, %zu output copies\n",
-      op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes, tensorIdNdim.size(),
-      op->reads.size(), readBytes, op->inputCopies.size(), op->outputCopies.size());
+      op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes,
+      tensorIdNdim.size(), op->reads.size(), readBytes, op->inputCopies.size(), op->outputCopies.size());
 
   return op;
 }

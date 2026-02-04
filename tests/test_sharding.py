@@ -240,10 +240,10 @@ def _verify_compile_op_allgather(
     # Build input specs from chunks (global offsets)
     inputs = []
     for chunk in my_chunks:
-        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape, device=device))
 
     # Output: full tensor
-    outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
+    outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape), device=device)]
 
     # Compile the op
     op = moodist.compile_op(
@@ -309,14 +309,14 @@ def _verify_compile_op_scatter(
 
     # Input: only rank 0 has the full tensor
     if pg.rank() == 0:
-        inputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
+        inputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape), device=device)]
     else:
         inputs = []
 
     # Output: this rank's shard(s)
     outputs = []
     for chunk in my_chunks:
-        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape, device=device))
 
     # Compile the op
     op = moodist.compile_op(
@@ -390,12 +390,12 @@ def _verify_compile_op_redistribute(
     # Build input specs
     inputs = []
     for chunk in input_chunks:
-        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+        inputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape, device=device))
 
     # Build output specs
     outputs = []
     for chunk in output_chunks:
-        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape))
+        outputs.append(TensorRegion(offset=chunk.global_offset, shape=chunk.shape, device=device))
 
     # Compile the op
     op = moodist.compile_op(
@@ -649,8 +649,8 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
             my_chunks = moodist.compute_shards(shape, [Replicate()], indices_and_sizes)
 
-            inputs = [TensorRegion(offset=c.global_offset, shape=c.shape) for c in my_chunks]
-            outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape))]
+            inputs = [TensorRegion(offset=c.global_offset, shape=c.shape, device=device) for c in my_chunks]
+            outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape), device=device)]
 
             try:
                 op = moodist.compile_op(
@@ -679,10 +679,10 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
         if coord is not None:
             # Only rank 0 provides input, and only first half
             if ctx.rank == 0:
-                inputs = [TensorRegion(offset=[0], shape=[8])]  # Only first half
+                inputs = [TensorRegion(offset=[0], shape=[8], device=device)]  # Only first half
             else:
                 inputs = []
-            outputs = [TensorRegion(offset=[0], shape=list(shape))]  # All ranks want full tensor
+            outputs = [TensorRegion(offset=[0], shape=list(shape), device=device)]  # All ranks want full tensor
 
             try:
                 op = moodist.compile_op(

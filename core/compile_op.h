@@ -212,6 +212,7 @@ struct TensorDescr {
   Coord shape;
   size_t numel;
   std::string tensorId; // Groups related tensor regions together
+  DeviceType device;    // Device type (CPU or CUDA)
 };
 
 // Phase 1: Logical mapping exchanged between ranks (sender → receiver)

@@ -27,8 +27,8 @@ def test_nvlink_plan_allgather(ctx: TestContext):
     shape = [ctx.world_size, 256]
     dtype = torch.float32
 
-    inputs = [{'offset': [ctx.rank, 0], 'shape': [1, 256]}]
-    outputs = [{'offset': [0, 0], 'shape': [ctx.world_size, 256]}]
+    inputs = [{'offset': [ctx.rank, 0], 'shape': [1, 256], 'device': 'cuda'}]
+    outputs = [{'offset': [0, 0], 'shape': [ctx.world_size, 256], 'device': 'cuda'}]
 
     ctx.log(f"Compiling all-gather op (shape={shape})")
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
@@ -66,12 +66,12 @@ def test_nvlink_plan_broadcast(ctx: TestContext):
 
     # Only rank 0 provides input
     if ctx.rank == 0:
-        inputs = [{'offset': [0, 0], 'shape': [1, 1024]}]
+        inputs = [{'offset': [0, 0], 'shape': [1, 1024], 'device': 'cuda'}]
     else:
         inputs = None
 
     # All ranks want the full data
-    outputs = [{'offset': [0, 0], 'shape': [1, 1024]}]
+    outputs = [{'offset': [0, 0], 'shape': [1, 1024], 'device': 'cuda'}]
 
     ctx.log(f"Compiling broadcast op (shape={shape})")
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
@@ -115,7 +115,7 @@ def test_nvlink_plan_partial_overlap(ctx: TestContext):
 
     # Only rank 0 provides input
     if ctx.rank == 0:
-        inputs = [{'offset': [0, 0], 'shape': [1, 4096]}]
+        inputs = [{'offset': [0, 0], 'shape': [1, 4096], 'device': 'cuda'}]
     else:
         inputs = None
 
@@ -127,7 +127,7 @@ def test_nvlink_plan_partial_overlap(ctx: TestContext):
         end = 4096
         start = end - 1024
 
-    outputs = [{'offset': [0, start], 'shape': [1, end - start]}]
+    outputs = [{'offset': [0, start], 'shape': [1, end - start], 'device': 'cuda'}]
 
     ctx.log(f"Compiling partial overlap op (slice [{start}, {end}))")
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
@@ -174,7 +174,7 @@ def test_nvlink_plan_distributed_inputs(ctx: TestContext):
 
     # Each rank provides its chunk
     my_start = ctx.rank * chunk_size
-    inputs = [{'offset': [0, my_start], 'shape': [1, chunk_size]}]
+    inputs = [{'offset': [0, my_start], 'shape': [1, chunk_size], 'device': 'cuda'}]
 
     # Each rank wants a slice that spans multiple chunks
     # Rank i wants [i*512, i*512 + chunk_size] which overlaps with neighbors
@@ -184,7 +184,7 @@ def test_nvlink_plan_distributed_inputs(ctx: TestContext):
         output_end = total_size
         output_start = output_end - chunk_size
 
-    outputs = [{'offset': [0, output_start], 'shape': [1, output_end - output_start]}]
+    outputs = [{'offset': [0, output_start], 'shape': [1, output_end - output_start], 'device': 'cuda'}]
 
     ctx.log(f"Compiling distributed inputs op: input=[{my_start}, {my_start + chunk_size}), output=[{output_start}, {output_end})")
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
@@ -237,7 +237,7 @@ def test_nvlink_plan_subset_reads(ctx: TestContext):
 
     # Only rank 0 provides the full input (contiguous, no inputCopy needed)
     if ctx.rank == 0:
-        inputs = [{'offset': [0, 0], 'shape': [1, total_size]}]
+        inputs = [{'offset': [0, 0], 'shape': [1, total_size], 'device': 'cuda'}]
     else:
         inputs = None
 
@@ -246,7 +246,7 @@ def test_nvlink_plan_subset_reads(ctx: TestContext):
     my_start = ctx.rank * slice_size
     my_end = my_start + slice_size
 
-    outputs = [{'offset': [0, my_start], 'shape': [1, slice_size]}]
+    outputs = [{'offset': [0, my_start], 'shape': [1, slice_size], 'device': 'cuda'}]
 
     ctx.log(f"Compiling subset reads op: output=[{my_start}, {my_end})")
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
