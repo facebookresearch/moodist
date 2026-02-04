@@ -119,23 +119,39 @@ struct Copy2d {
   size_t num;
 };
 
+// Generic hashing utilities for cache keys
+constexpr size_t kHashMultiplier = 0x9e3779b97f4a7c15; // 64-bit golden ratio
+
+struct Hasher {
+  size_t h = 0;
+
+  template<typename... Args>
+  void operator()(const Args&... args) {
+    ((h = (h + 1) * kHashMultiplier + static_cast<size_t>(args)), ...);
+  }
+};
+
+template<typename T>
+struct GenericHash {
+  size_t operator()(const T& k) const noexcept {
+    Hasher hasher;
+    k.hash(hasher);
+    return hasher.h;
+  }
+};
+
 // Cache key for scatter collective (used with compile_op)
 struct ScatterCacheKey {
   size_t numel;
   DType dtype;
   int sourceRank;
+  bool isCuda;
 
-  bool operator==(const ScatterCacheKey& other) const {
-    return numel == other.numel && dtype == other.dtype && sourceRank == other.sourceRank;
-  }
-};
+  bool operator==(const ScatterCacheKey&) const = default;
 
-struct ScatterCacheKeyHash {
-  size_t operator()(const ScatterCacheKey& k) const noexcept {
-    size_t h = std::hash<size_t>{}(k.numel);
-    h ^= std::hash<int>{}(static_cast<int>(k.dtype)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>{}(k.sourceRank) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
+  template<typename X>
+  void hash(X& x) const {
+    x(numel, dtype, sourceRank, isCuda);
   }
 };
 
@@ -144,18 +160,13 @@ struct GatherCacheKey {
   size_t numel;
   DType dtype;
   int destRank;
+  bool isCuda;
 
-  bool operator==(const GatherCacheKey& other) const {
-    return numel == other.numel && dtype == other.dtype && destRank == other.destRank;
-  }
-};
+  bool operator==(const GatherCacheKey&) const = default;
 
-struct GatherCacheKeyHash {
-  size_t operator()(const GatherCacheKey& k) const noexcept {
-    size_t h = std::hash<size_t>{}(k.numel);
-    h ^= std::hash<int>{}(static_cast<int>(k.dtype)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>{}(k.destRank) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
+  template<typename X>
+  void hash(X& x) const {
+    x(numel, dtype, destRank, isCuda);
   }
 };
 
@@ -408,10 +419,10 @@ struct ProcessGroupImpl : api::ProcessGroup {
   uint32_t nextCustomOpId = 1;
 
   // Cache for scatter collective compiled ops
-  HashMap<ScatterCacheKey, SharedPtr<CustomOpImpl>, ScatterCacheKeyHash> scatterCache;
+  HashMap<ScatterCacheKey, SharedPtr<CustomOpImpl>, GenericHash<ScatterCacheKey>> scatterCache;
 
   // Cache for gather collective compiled ops
-  HashMap<GatherCacheKey, SharedPtr<CustomOpImpl>, GatherCacheKeyHash> gatherCache;
+  HashMap<GatherCacheKey, SharedPtr<CustomOpImpl>, GenericHash<GatherCacheKey>> gatherCache;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
 
@@ -2246,32 +2257,50 @@ void ProcessGroupImpl::barrier() {
 // ============================================================================
 
 void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream) {
-  CHECK(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size);
+  REQUIRE(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size,
+          "scatter: sourceRank %d out of bounds [0, %zu)", sourceRank, size);
 
   // Validate inputs
   if (static_cast<size_t>(sourceRank) == rank) {
-    CHECK(inputs.size() == size);
-    for (auto& input : inputs) {
-      CHECK(input.is_contiguous());
+    REQUIRE(inputs.size() == size, "scatter: source rank must provide %zu inputs, got %zu", size, inputs.size());
+    for (size_t i : indices(inputs)) {
+      REQUIRE(inputs[i].is_contiguous(), "scatter: input[%zu] must be contiguous", i);
     }
   } else {
-    CHECK(inputs.empty());
+    REQUIRE(inputs.empty(), "scatter: non-source ranks must not provide inputs");
   }
 
-  CHECK(output.is_contiguous());
+  REQUIRE(output.is_contiguous(), "scatter: output must be contiguous");
 
   size_t numel = static_cast<size_t>(output.numel());
   DType dtype = output.dtype();
+  bool isCuda = output.is_cuda();
+  std::string_view deviceStr = isCuda ? "cuda" : "cpu";
 
-  // Validate all inputs have the same numel and dtype as output (on source rank)
+  // Validate device index for CUDA tensors
+  if (isCuda) {
+    REQUIRE(output.device_index() == group->deviceIndex,
+            "scatter: output CUDA device %d does not match process group device %d",
+            output.device_index(), group->deviceIndex);
+  }
+
+  // Validate all inputs have the same numel, dtype, and device as output (on source rank)
   if (static_cast<size_t>(sourceRank) == rank) {
-    for (auto& input : inputs) {
-      CHECK(static_cast<size_t>(input.numel()) == numel);
-      CHECK(input.dtype() == dtype);
+    for (size_t i : indices(inputs)) {
+      auto& input = inputs[i];
+      REQUIRE(static_cast<size_t>(input.numel()) == numel,
+              "scatter: input[%zu] has %lld elements, expected %zu", i, input.numel(), numel);
+      REQUIRE(input.dtype() == dtype, "scatter: input[%zu] has different dtype than output", i);
+      REQUIRE(input.is_cuda() == isCuda, "scatter: input[%zu] device type differs from output", i);
+      if (isCuda) {
+        REQUIRE(input.device_index() == group->deviceIndex,
+                "scatter: input[%zu] CUDA device %d does not match process group device %d",
+                i, input.device_index(), group->deviceIndex);
+      }
     }
   }
 
-  ScatterCacheKey key{numel, dtype, sourceRank};
+  ScatterCacheKey key{numel, dtype, sourceRank, isCuda};
 
   auto it = scatterCache.find(key);
   if (it == scatterCache.end()) {
@@ -2285,7 +2314,8 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
       inputSpecs.push_back(api::TensorRegion{.rank = sourceRank,
           .offset = {static_cast<int64_t>(i * numel)},
           .shape = {static_cast<int64_t>(numel)},
-          .tensorId = "0"});
+          .tensorId = "0",
+          .device = deviceStr});
     }
 
     // Outputs: each rank receives one output at offset [rank * numel] with shape [numel]
@@ -2294,7 +2324,8 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
       outputSpecs.push_back(api::TensorRegion{.rank = static_cast<int32_t>(i),
           .offset = {static_cast<int64_t>(i * numel)},
           .shape = {static_cast<int64_t>(numel)},
-          .tensorId = "0"});
+          .tensorId = "0",
+          .device = deviceStr});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
@@ -2324,32 +2355,50 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
 // ============================================================================
 
 void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream) {
-  CHECK(destRank >= 0 && static_cast<size_t>(destRank) < size);
+  REQUIRE(destRank >= 0 && static_cast<size_t>(destRank) < size,
+          "gather: destRank %d out of bounds [0, %zu)", destRank, size);
 
   // Validate outputs
   if (static_cast<size_t>(destRank) == rank) {
-    CHECK(outputs.size() == size);
-    for (auto& output : outputs) {
-      CHECK(output.is_contiguous());
+    REQUIRE(outputs.size() == size, "gather: dest rank must provide %zu outputs, got %zu", size, outputs.size());
+    for (size_t i : indices(outputs)) {
+      REQUIRE(outputs[i].is_contiguous(), "gather: output[%zu] must be contiguous", i);
     }
   } else {
-    CHECK(outputs.empty());
+    REQUIRE(outputs.empty(), "gather: non-dest ranks must not provide outputs");
   }
 
-  CHECK(input.is_contiguous());
+  REQUIRE(input.is_contiguous(), "gather: input must be contiguous");
 
   size_t numel = static_cast<size_t>(input.numel());
   DType dtype = input.dtype();
+  bool isCuda = input.is_cuda();
+  std::string_view deviceStr = isCuda ? "cuda" : "cpu";
 
-  // Validate all outputs have the same numel and dtype as input (on dest rank)
+  // Validate device index for CUDA tensors
+  if (isCuda) {
+    REQUIRE(input.device_index() == group->deviceIndex,
+            "gather: input CUDA device %d does not match process group device %d",
+            input.device_index(), group->deviceIndex);
+  }
+
+  // Validate all outputs have the same numel, dtype, and device as input (on dest rank)
   if (static_cast<size_t>(destRank) == rank) {
-    for (auto& output : outputs) {
-      CHECK(static_cast<size_t>(output.numel()) == numel);
-      CHECK(output.dtype() == dtype);
+    for (size_t i : indices(outputs)) {
+      auto& output = outputs[i];
+      REQUIRE(static_cast<size_t>(output.numel()) == numel,
+              "gather: output[%zu] has %lld elements, expected %zu", i, output.numel(), numel);
+      REQUIRE(output.dtype() == dtype, "gather: output[%zu] has different dtype than input", i);
+      REQUIRE(output.is_cuda() == isCuda, "gather: output[%zu] device type differs from input", i);
+      if (isCuda) {
+        REQUIRE(output.device_index() == group->deviceIndex,
+                "gather: output[%zu] CUDA device %d does not match process group device %d",
+                i, output.device_index(), group->deviceIndex);
+      }
     }
   }
 
-  GatherCacheKey key{numel, dtype, destRank};
+  GatherCacheKey key{numel, dtype, destRank, isCuda};
 
   auto it = gatherCache.find(key);
   if (it == gatherCache.end()) {
@@ -2363,7 +2412,8 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
       inputSpecs.push_back(api::TensorRegion{.rank = static_cast<int32_t>(i),
           .offset = {static_cast<int64_t>(i * numel)},
           .shape = {static_cast<int64_t>(numel)},
-          .tensorId = "0"});
+          .tensorId = "0",
+          .device = deviceStr});
     }
 
     // Outputs: dest rank receives world_size outputs, each at offset [i * numel] with shape [numel]
@@ -2372,7 +2422,8 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
       outputSpecs.push_back(api::TensorRegion{.rank = destRank,
           .offset = {static_cast<int64_t>(i * numel)},
           .shape = {static_cast<int64_t>(numel)},
-          .tensorId = "0"});
+          .tensorId = "0",
+          .device = deviceStr});
     }
 
     SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
@@ -3659,6 +3710,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
       std::span<const size_t>(group->nodeRanks[ctx.nodeIndex].data(), group->nodeRanks[ctx.nodeIndex].size());
   ctx.localRank = group->rankLocalRank[rank];
   ctx.rankLocalRank = std::span<const size_t>(group->rankLocalRank.data(), group->rankLocalRank.size());
+  ctx.deviceIndex = group->deviceIndex;
   ctx.nextOpId = &nextCustomOpId;
 
   // Call compile_op

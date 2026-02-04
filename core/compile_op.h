@@ -197,6 +197,9 @@ struct CompileContext {
   size_t localRank;                      // My index within nodeRanks
   std::span<const size_t> rankLocalRank; // Global rank -> local rank mapping
 
+  // Device info for validation
+  int deviceIndex; // CUDA device index for this rank
+
   // For generating unique op IDs
   uint32_t* nextOpId;
 };

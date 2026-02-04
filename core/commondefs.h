@@ -157,4 +157,15 @@ struct CtorCall {
       NORETURN(throwCheckFail(__FILE__, __LINE__, #x);)                                                                \
   }
 
+// REQUIRE: Like CHECK but for user input validation (no file/line, just message)
+[[noreturn]] [[gnu::cold]] inline void throwRequireFail(const std::string& msg) {
+  throw std::runtime_error(msg);
+}
+
+#define REQUIRE(cond, ...)                                                                                             \
+  {                                                                                                                    \
+    if (!(cond)) [[unlikely]]                                                                                          \
+      NORETURN(throwRequireFail(fmt::sprintf(__VA_ARGS__));)                                                           \
+  }
+
 } // namespace moodist

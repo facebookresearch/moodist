@@ -52,6 +52,7 @@ struct TensorRegion {
   std::vector<int64_t> offset;
   std::vector<int64_t> shape;
   std::string_view tensorId; // Caller keeps underlying string alive
+  std::string_view device;   // "cpu", "cuda", or "cuda:N" - caller keeps string alive
 };
 
 } // namespace moodist::api

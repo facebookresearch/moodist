@@ -47,6 +47,37 @@ void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
   deserializeBuffer(ptr, size, result...);
 }
 
+// Parse device string and validate CUDA index if specified.
+// Returns the parsed DeviceType.
+// Throws if:
+//   - device string is invalid
+//   - cuda:N is specified but N != expectedCudaIndex
+DeviceType parseAndValidateDevice(std::string_view device, int expectedCudaIndex) {
+  if (device == "cpu") {
+    return DeviceType::CPU;
+  }
+  if (device == "cuda") {
+    return DeviceType::CUDA;
+  }
+  if (device.starts_with("cuda:")) {
+    // Parse the index
+    std::string_view indexStr = device.substr(5);
+    int index = 0;
+    for (char c : indexStr) {
+      if (c < '0' || c > '9') {
+        throw std::runtime_error("Invalid device string: " + std::string(device));
+      }
+      index = index * 10 + (c - '0');
+    }
+    if (index != expectedCudaIndex) {
+      throw std::runtime_error("Device " + std::string(device) + " does not match process group's CUDA device " +
+                               std::to_string(expectedCudaIndex));
+    }
+    return DeviceType::CUDA;
+  }
+  throw std::runtime_error("Invalid device string: " + std::string(device));
+}
+
 } // namespace
 
 std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
@@ -84,6 +115,18 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   }
   for (size_t i : indices(outputs)) {
     validateAndRecordNdim(outputs[i], "output", i);
+  }
+
+  // Validate device strings for local regions (where rank == this rank)
+  for (const auto& region : inputs) {
+    if (static_cast<size_t>(region.rank) == rank) {
+      parseAndValidateDevice(region.device, ctx.deviceIndex);
+    }
+  }
+  for (const auto& region : outputs) {
+    if (static_cast<size_t>(region.rank) == rank) {
+      parseAndValidateDevice(region.device, ctx.deviceIndex);
+    }
   }
 
   // Parse inputs and outputs into TensorDescr structs

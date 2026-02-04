@@ -41,6 +41,12 @@ constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
 
+// Device type for tensor regions in compile_op
+enum class DeviceType : int8_t {
+  CPU = 0,
+  CUDA = 1,
+};
+
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
   constexpr uint32_t opType##name = __LINE__;                                                                          \
@@ -356,6 +362,8 @@ struct CustomOpDescriptor {
 
   IVector<IVector<int64_t>> inputShapes;
   IVector<IVector<int64_t>> outputShapes;
+  IVector<DeviceType> inputDevices;
+  IVector<DeviceType> outputDevices;
   DType dtype;
 };
 

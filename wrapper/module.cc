@@ -803,13 +803,13 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     // (TensorRegion.tensorId is a string_view pointing into these)
     std::vector<std::string> inputTensorIds;
     std::vector<std::string> outputTensorIds;
+    // Storage for device strings
+    std::vector<std::string> inputDevices;
+    std::vector<std::string> outputDevices;
 
-    // Default tensor_id for items without explicit tensor_id
-    static const std::string defaultTensorId = "0";
-
-    // Parse inputs and outputs: list of tuples (rank, offset, shape) or (rank, offset, shape, tensor_id)
+    // Parse inputs and outputs: list of tuples (rank, offset, shape, tensor_id, device)
     auto parse_transfer_list =
-        [&](PyObject* list, std::vector<std::string>& tensorIdStorage) -> std::vector<moodist::api::TensorRegion> {
+        [&](PyObject* list, std::vector<std::string>& tensorIdStorage, std::vector<std::string>& deviceStorage) -> std::vector<moodist::api::TensorRegion> {
       std::vector<moodist::api::TensorRegion> result;
       if (!PyList_Check(list)) {
         PyErr_SetString(PyExc_TypeError, "Expected a list of tuples");
@@ -818,13 +818,14 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
       Py_ssize_t len = PyList_Size(list);
       result.reserve(len);
       tensorIdStorage.reserve(len);
+      deviceStorage.reserve(len);
 
       for (Py_ssize_t i = 0; i < len; ++i) {
         PyObject* item = PyList_GetItem(list, i); // Borrowed reference
         Py_ssize_t tuple_size = PyTuple_Check(item) ? PyTuple_Size(item) : 0;
-        if (tuple_size < 3 || tuple_size > 4) {
+        if (tuple_size != 5) {
           PyErr_SetString(PyExc_TypeError,
-              "Each item must be a tuple of (rank, offset, shape) or (rank, offset, shape, tensor_id)");
+              "Each item must be a tuple of (rank, offset, shape, tensor_id, device)");
           return {};
         }
 
@@ -835,29 +836,32 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
           return {};
         }
 
-        // Parse tensor_id (default "0")
-        std::string_view tensorId;
-        if (tuple_size == 4) {
-          std::string tid = pyToString(PyTuple_GetItem(item, 3));
-          if (PyErr_Occurred()) {
-            return {};
-          }
-          tensorIdStorage.push_back(std::move(tid));
-          tensorId = tensorIdStorage.back();
-        } else {
-          tensorId = defaultTensorId;
+        // Parse tensor_id
+        std::string tid = pyToString(PyTuple_GetItem(item, 3));
+        if (PyErr_Occurred()) {
+          return {};
         }
+        tensorIdStorage.push_back(std::move(tid));
+        std::string_view tensorId = tensorIdStorage.back();
 
-        result.push_back(moodist::api::TensorRegion{rank, std::move(offset), std::move(shape), tensorId});
+        // Parse device
+        std::string dev = pyToString(PyTuple_GetItem(item, 4));
+        if (PyErr_Occurred()) {
+          return {};
+        }
+        deviceStorage.push_back(std::move(dev));
+        std::string_view device = deviceStorage.back();
+
+        result.push_back(moodist::api::TensorRegion{rank, std::move(offset), std::move(shape), tensorId, device});
       }
       return result;
     };
 
-    auto inputs = parse_transfer_list(inputs_obj, inputTensorIds);
+    auto inputs = parse_transfer_list(inputs_obj, inputTensorIds, inputDevices);
     if (PyErr_Occurred()) {
       return nullptr;
     }
-    auto outputs = parse_transfer_list(outputs_obj, outputTensorIds);
+    auto outputs = parse_transfer_list(outputs_obj, outputTensorIds, outputDevices);
     if (PyErr_Occurred()) {
       return nullptr;
     }

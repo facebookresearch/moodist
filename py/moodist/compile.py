@@ -23,12 +23,16 @@ class TensorRegion:
     Attributes:
         offset: Position in the global tensor (list of ints, one per dimension).
         shape: Shape of this region (list of ints, one per dimension).
+        device: Device for this region. Can be a torch.device or string like
+            "cpu", "cuda", or "cuda:N". If cuda:N is specified, it must match
+            the process group's CUDA device.
         tensor_id: Identifier for grouping regions. Regions with different tensor_ids
             are treated as separate logical tensors and can have different ndims.
             Defaults to "0".
     """
     offset: List[int]
     shape: List[int]
+    device: Union[str, torch.device]
     tensor_id: str = "0"
 
 
@@ -46,7 +50,8 @@ def specs_from_dtensor(dtensor, tensor_id: str = "0") -> List[TensorRegion]:
         List of TensorRegion objects for this rank's chunks.
     """
     shards = dtensor_shards(dtensor)
-    return [TensorRegion(s.global_offset, s.shape, tensor_id) for s in shards]
+    device = dtensor.device
+    return [TensorRegion(s.global_offset, s.shape, device, tensor_id) for s in shards]
 
 
 def _is_dtensor(x):
@@ -91,11 +96,14 @@ def _process_tensor_specs(specs, holder):
             # Convert dict to TensorRegion
             offset = x.get('offset')
             shape = x.get('shape')
+            device = x.get('device')
+            if device is None:
+                raise ValueError("'device' is required for dict-style tensor specifications")
             tensor_id = x.get('tensor_id', "0")
             # Convert tensor_id to string if it's an int
             if isinstance(tensor_id, int):
                 tensor_id = str(tensor_id)
-            processed.append(TensorRegion(offset=offset, shape=shape, tensor_id=tensor_id))
+            processed.append(TensorRegion(offset=offset, shape=shape, device=device, tensor_id=tensor_id))
         else:
             raise TypeError(
                 f"each input/output spec must be a TensorRegion, dict, or DTensor, "
@@ -122,8 +130,8 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         dtype: The PyTorch data type (torch.dtype) for the operation (e.g., torch.float32).
                All ranks must specify the same dtype. Can be omitted if using DTensors.
         inputs: Optional list of input tensor specifications. Each element can be either:
-                - A TensorRegion object
-                - A dict with 'offset', 'shape', and optionally 'tensor_id' keys
+                - A TensorRegion object (requires device field)
+                - A dict with 'offset', 'shape', 'device', and optionally 'tensor_id' keys
                 - A DTensor, from which specs are derived automatically
                 If None, this rank contributes no inputs to the operation.
         outputs: Optional list of output tensor specifications. Same format as inputs.
@@ -150,11 +158,11 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         >>> group = moodist.find_process_group("my_group")
         >>>
         >>> if group.rank() == 0:
-        >>>     inputs = [{'offset': [0, 0], 'shape': [2, 4]}]
+        >>>     inputs = [{'offset': [0, 0], 'shape': [2, 4], 'device': 'cuda'}]
         >>>     outputs = None
         >>> else:
         >>>     inputs = None
-        >>>     outputs = [{'offset': [0, 0], 'shape': [2, 4]}]
+        >>>     outputs = [{'offset': [0, 0], 'shape': [2, 4], 'device': 'cuda'}]
         >>>
         >>> op = moodist.compile_op(
         >>>     group,
@@ -166,11 +174,11 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         >>> # Using TensorRegion with tensor_id for batching multiple tensors:
         >>> from moodist import TensorRegion
         >>> inputs = [
-        >>>     TensorRegion(offset=[0, 0], shape=[10, 10], tensor_id="weight"),
-        >>>     TensorRegion(offset=[0], shape=[128], tensor_id="bias"),
+        >>>     TensorRegion(offset=[0, 0], shape=[10, 10], device="cuda", tensor_id="weight"),
+        >>>     TensorRegion(offset=[0], shape=[128], device="cuda", tensor_id="bias"),
         >>> ]
         >>>
-        >>> # Using DTensors (dtype derived automatically):
+        >>> # Using DTensors (dtype and device derived automatically):
         >>> op = moodist.compile_op(
         >>>     group,
         >>>     inputs=[input_dtensor],
@@ -226,7 +234,11 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
                 raise ValueError(
                     f"offset and shape must have same length, got {len(spec.offset)} and {len(spec.shape)}"
                 )
-            result.append((tuple(spec.offset), tuple(spec.shape), spec.tensor_id))
+            # Convert device to string for serialization
+            device_str = str(spec.device) if spec.device is not None else None
+            if device_str is None:
+                raise ValueError("'device' is required for TensorRegion")
+            result.append((tuple(spec.offset), tuple(spec.shape), spec.tensor_id, device_str))
         return tuple(result)
 
     if inputs is not None:
@@ -251,16 +263,16 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
             )
 
         if ninput is not None:
-            for offset, shape, tensor_id in ninput:
-                all_inputs.append((source_rank, offset, shape, tensor_id))
+            for offset, shape, tensor_id, device in ninput:
+                all_inputs.append((source_rank, offset, shape, tensor_id, device))
         if noutput is not None:
-            for offset, shape, tensor_id in noutput:
-                all_outputs.append((source_rank, offset, shape, tensor_id))
+            for offset, shape, tensor_id, device in noutput:
+                all_outputs.append((source_rank, offset, shape, tensor_id, device))
 
     # Validate per-tensor_id ndim consistency
     tensor_id_ndim = {}
     for items, kind in [(all_inputs, "input"), (all_outputs, "output")]:
-        for rank, offset, shape, tensor_id in items:
+        for rank, offset, shape, tensor_id, device in items:
             ndim = len(offset)
             if tensor_id in tensor_id_ndim:
                 if tensor_id_ndim[tensor_id] != ndim:
