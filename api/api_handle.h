@@ -147,7 +147,7 @@ struct ApiProxy<Future> {
     return this;
   }
 
-  void wait(CUstream stream);           // Defined in wrapper
+  void wait();                          // Defined in wrapper
   bool getResult(TensorPtr* outTensor); // Defined in wrapper
 };
 

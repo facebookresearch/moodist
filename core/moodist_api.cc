@@ -46,7 +46,7 @@ void queueWorkWait(api::QueueWork* work);
 
 // Forward declarations for Future, CustomOp, compileOpFull defined in processgroup.cc
 void futureDestroy(api::Future* future);
-void futureWait(api::Future* future, CUstream stream);
+void futureWait(api::Future* future);
 bool futureGetResult(api::Future* future, TensorPtr* outTensor);
 void customOpDestroy(api::CustomOp* op);
 api::FutureHandle customOpCall(

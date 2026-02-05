@@ -359,8 +359,7 @@ CustomOp ProcessGroup::compileOpFull(torch::Dtype dtype, const std::vector<api::
 
 void Future::wait() {
   if (handle) {
-    CUstream stream = c10::cuda::getCurrentCUDAStream().stream();
-    handle->wait(stream);
+    handle->wait();
   }
 }
 
@@ -439,8 +438,8 @@ void registerFreeMemoryCallback() {
 
 namespace api {
 
-void ApiProxy<Future>::wait(CUstream stream) {
-  coreApi.futureWait(ptr, stream);
+void ApiProxy<Future>::wait() {
+  coreApi.futureWait(ptr);
 }
 
 bool ApiProxy<Future>::getResult(TensorPtr* outTensor) {

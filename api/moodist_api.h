@@ -243,7 +243,7 @@ struct CoreApi {
 
   // Future operations - refcounted via ApiHandle
   void (*futureDestroy)(api::Future* future);
-  void (*futureWait)(api::Future* future, CUstream stream);
+  void (*futureWait)(api::Future* future);
   bool (*futureGetResult)(api::Future* future, TensorPtr* outTensor);
 
   // CustomOp operations - refcounted via ApiHandle

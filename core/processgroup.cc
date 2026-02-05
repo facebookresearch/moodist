@@ -355,7 +355,7 @@ Reduction toInternalReduction(ReduceOp op) {
 struct ApiFuture : api::Future {
   FutureImplSharedPtr impl;
   std::vector<TensorPtr> holdTensors; // Keep tensors alive until complete
-  Function<void(CUstream)> waitDoneCallback;
+  Function<void()> waitDoneCallback;
 };
 
 // CustomOpImpl - API boundary wrapper for compiled custom operations
@@ -365,7 +365,7 @@ struct CustomOpImpl : api::CustomOp {
 };
 
 // Forward declaration for futureWait (defined later, used by scatter)
-void futureWait(api::Future* future, CUstream stream);
+void futureWait(api::Future* future);
 
 struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
@@ -2347,7 +2347,7 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
   SharedPtr<ApiFuture> future = op->call(flatInputs.data(), flatInputs.size(), &flatOutput, 1, stream);
 
   // Wait for completion
-  futureWait(future.get(), stream);
+  futureWait(future.get());
 }
 
 // ============================================================================
@@ -2445,7 +2445,7 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
   SharedPtr<ApiFuture> future = op->call(&flatInput, 1, flatOutputs.data(), flatOutputs.size(), stream);
 
   // Wait for completion
-  futureWait(future.get(), stream);
+  futureWait(future.get());
 }
 
 // ============================================================================
@@ -2830,11 +2830,14 @@ bool getProfilingEnabled() {
 // ApiFuture functions
 // ============================================================================
 
+void futureWait(api::Future* future);
+
 void futureDestroy(api::Future* future) {
+  futureWait(future);
   internalDelete(static_cast<ApiFuture*>(future));
 }
 
-void futureWait(api::Future* future, CUstream stream) {
+void futureWait(api::Future* future) {
   auto* f = static_cast<ApiFuture*>(future);
   if (f->impl) {
     while (f->impl->done == 0) {
@@ -2842,7 +2845,7 @@ void futureWait(api::Future* future, CUstream stream) {
     }
   }
   if (f->waitDoneCallback) {
-    f->waitDoneCallback(stream);
+    f->waitDoneCallback();
     f->waitDoneCallback = nullptr;
   }
 }
@@ -3919,10 +3922,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     auto selfPtr = share(this);
     result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue, anyCuda,
                                    copyTensors = std::move(outputCopyTensors), op,
-                                   outputsCopy = std::move(outputsCopy)](CUstream stream) {
+                                   outputsCopy = std::move(outputsCopy)]() {
       if (anyCuda) {
         selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-        selfPtr->memFlush(stream);
+        selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
       }
       // Copy temporary tensors back to the appropriate slices of original outputs
       CHECK(copyTensors.size() == op->outputCopies.size());
@@ -3939,9 +3942,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     };
   } else if (anyCuda) {
     auto selfPtr = share(this);
-    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue](CUstream stream) {
+    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue]() {
       selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-      selfPtr->memFlush(stream);
+      selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
     };
   }
 
