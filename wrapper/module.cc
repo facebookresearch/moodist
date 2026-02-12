@@ -387,7 +387,10 @@ static auto* wrapper_get(PyObject* self) {
 template<typename T>
 static void wrapper_dealloc(PyObject* self) {
   auto* obj = reinterpret_cast<PyWrapper<T>*>(self);
-  obj->holder.~T();
+  {
+    GilRelease gil;
+    obj->holder.~T(); // Release GIL during destruction (may block, e.g., Future)
+  }
   PyTypeObject* tp = Py_TYPE(self);
   freefunc free_func = (freefunc)PyType_GetSlot(tp, Py_tp_free);
   if (free_func) {
@@ -731,14 +734,15 @@ static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObjec
 }
 
 static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, PyObject* kwds) {
-  static const char* kwlist[] = {"dtype", "inputs", "outputs", "reduce", nullptr};
+  static const char* kwlist[] = {"dtype", "inputs", "outputs", "reduce", "cpu_sync", nullptr};
   PyObject* dtype_obj = nullptr;
   PyObject* inputs_obj = nullptr;
   PyObject* outputs_obj = nullptr;
   PyObject* reduce_obj = Py_None;
+  int cpu_sync = 0;
 
-  if (!PyArg_ParseTupleAndKeywords(
-          args, kwds, "OOO|O", const_cast<char**>(kwlist), &dtype_obj, &inputs_obj, &outputs_obj, &reduce_obj)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OOO|Op", const_cast<char**>(kwlist), &dtype_obj, &inputs_obj,
+          &outputs_obj, &reduce_obj, &cpu_sync)) {
     return nullptr;
   }
 
@@ -868,7 +872,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     moodist::wrapper::CustomOp op;
     {
       GilRelease gil;
-      op = pg->compileOpFull(dtype, inputs, outputs, reduce);
+      op = pg->compileOpFull(dtype, inputs, outputs, reduce, cpu_sync != 0);
     }
     return wrap_customop(std::move(op));
   } catch (const moodist::PythonErrorAlreadySet&) {

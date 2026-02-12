@@ -10,7 +10,8 @@ def compile_op(
     dtype: torch.dtype | None = None,
     inputs: list[TensorRegion | DTensor] | None = None,
     outputs: list[TensorRegion | DTensor] | None = None,
-    reduce: str | None = None
+    reduce: str | None = None,
+    cpu_sync: bool = False
 ) -> CustomOp
 ```
 
@@ -154,6 +155,17 @@ inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [10, 20,
 ```
 
 The `reduce="any"` option is useful for replicated data patterns (e.g., `Replicate` placement in DTensor) where all sources have identical data and any one can be used.
+
+### `cpu_sync`
+**Type:** `bool` (default: `False`)
+
+If `True`, forces CPU-side synchronization before CUDA operations in the compiled operation. This ensures the CPU thread waits for the data transfer to complete before scheduling any CUDA operations.
+
+**When to use:**
+- When running on a CUDA stream that may have device-wide synchronization pending (e.g., from the CUDA memory allocator)
+- When you encounter deadlocks during `Future.wait()` with CUDA tensors
+
+**Performance note:** Enabling `cpu_sync` may reduce concurrency between CPU and GPU work. Only enable it if you experience deadlock issues.
 
 ## Return Value
 

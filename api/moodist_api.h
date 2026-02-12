@@ -253,7 +253,7 @@ struct CoreApi {
 
   // compileOpFull - compiles a distributed tensor operation
   api::CustomOpHandle (*compileOpFull)(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
-      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce);
+      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync);
 
   // Profiling
   void (*setProfilingEnabled)(bool enabled);

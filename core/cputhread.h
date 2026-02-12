@@ -365,6 +365,7 @@ struct CustomOpDescriptor {
   IVector<DeviceType> inputDevices;
   IVector<DeviceType> outputDevices;
   DType dtype;
+  bool cpuSync = false; // Force CPU-side wait in customOp before CUDA operations
 };
 
 struct QueueEntryCustom : QueueEntry {

@@ -5618,6 +5618,11 @@ struct CpuThreadImpl {
     size_t liveReads = 0;
     std::array<size_t, maxDevices> deviceLiveReads{};
 
+    std::chrono::steady_clock::time_point beginStart;
+    std::chrono::steady_clock::time_point endStart;
+    std::chrono::steady_clock::time_point readStart;
+    size_t bytesRead = 0;
+
     static constexpr size_t numParallel = 2;
     const size_t numDevices = self.devices.size();
 
@@ -5658,6 +5663,8 @@ struct CpuThreadImpl {
         return;
       }
 
+      bytesRead += read.bytes;
+
       ++liveReads;
       ++deviceLiveReads[di];
 
@@ -5676,6 +5683,8 @@ struct CpuThreadImpl {
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+
+      beginStart = std::chrono::steady_clock::now();
 
       // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
       {
@@ -5817,6 +5826,9 @@ struct CpuThreadImpl {
         }
       }
 
+      log.info("custom op %#x, init took %gs\n", stepValue, seconds(std::chrono::steady_clock::now() - beginStart));
+      readStart = std::chrono::steady_clock::now();
+
       readIndex = 0;
 
       while (readIndex != reads.size()) {
@@ -5838,6 +5850,13 @@ struct CpuThreadImpl {
 
       while (liveReads) {
         YIELD
+      }
+
+      {
+        auto s = seconds(std::chrono::steady_clock::now() - readStart);
+        log.info("custom op %#x, read %d bytes in %gs, %gG/s\n", stepValue, bytesRead, s,
+            bytesRead / 1024.0 / 1024 / 1024 / s);
+        endStart = std::chrono::steady_clock::now();
       }
 
       // Ensure first writeStepValue loop (stepValue) completes before second loop (stepValue+1).
@@ -5880,6 +5899,8 @@ struct CpuThreadImpl {
 
       params.inputs.clear();
       params.outputs.clear();
+
+      log.info("custom op %#x, end took %gs\n", stepValue, seconds(std::chrono::steady_clock::now() - endStart));
 
       self.cpuThread->freelistCustom.push(&params);
       self.allocatorCustom.deallocate(this);

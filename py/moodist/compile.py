@@ -113,7 +113,7 @@ def _process_tensor_specs(specs, holder):
     return processed
 
 
-def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
+def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sync=False):
     """Compile a custom collective operation for distributed tensor communication.
 
     This function creates an optimized collective operation that transfers data between
@@ -139,6 +139,9 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
         reduce: How to handle overlapping inputs. Options:
                 - None (default): Error if inputs overlap
                 - "any": Pick any source for overlapping regions (for replicated data)
+        cpu_sync: If True, force CPU-side synchronization before CUDA operations.
+                  This avoids potential deadlocks when CUDA has device-wide syncs pending.
+                  Default is False.
 
     Returns:
         A compiled custom operation object that can be used to efficiently execute the
@@ -286,4 +289,4 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None):
     assert queue.empty()
     group.barrier()
 
-    return group.compile_op_full(dtype, all_inputs, all_outputs, reduce=reduce)
+    return group.compile_op_full(dtype, all_inputs, all_outputs, reduce=reduce, cpu_sync=cpu_sync)

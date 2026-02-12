@@ -347,9 +347,9 @@ Future ProcessGroup::copy(torch::Tensor&, const torch::Tensor&) {
 }
 
 CustomOp ProcessGroup::compileOpFull(torch::Dtype dtype, const std::vector<api::TensorRegion>& inputs,
-    const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce) {
+    const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce, bool cpuSync) {
   DType dType = static_cast<DType>(static_cast<int>(c10::typeMetaToScalarType(c10::scalarTypeToTypeMeta(dtype))));
-  api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), dType, inputs, outputs, reduce);
+  api::CustomOpHandle opHandle = coreApi.compileOpFull(handle.get(), dType, inputs, outputs, reduce, cpuSync);
   return CustomOp(std::move(opHandle));
 }
 

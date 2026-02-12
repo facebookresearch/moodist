@@ -174,13 +174,30 @@ inline size_t linearOffset(const Coord& offset, const Coord& shape) {
   return result;
 }
 
-// Check if inner shape is contiguous within outer shape (trailing dimensions match)
+// Check if inner shape is contiguous within outer shape.
+// A region is contiguous if all dimensions after the last mismatch have inner == outer,
+// and all dimensions before the last mismatch have inner == 1.
 inline bool contiguous(const Coord& inner, const Coord& outer) {
+  // Find the last (innermost) dimension where inner != outer
+  int lastMismatch = -1;
   for (size_t i : range(inner.size())) {
-    if (i && inner[i] != outer[i]) {
+    if (inner[i] != outer[i]) {
+      lastMismatch = static_cast<int>(i);
+    }
+  }
+
+  // If no mismatch, entire tensor is selected - contiguous
+  if (lastMismatch < 0) {
+    return true;
+  }
+
+  // All dimensions before lastMismatch must have size 1
+  for (int i = 0; i < lastMismatch; ++i) {
+    if (inner[i] != 1) {
       return false;
     }
   }
+
   return true;
 }
 
@@ -282,7 +299,7 @@ struct ReadResponse {
 // ndim is validated per-tensorId (different tensorIds can have different ndims)
 std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
     std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs,
-    ReduceOp reduce = ReduceOp::None);
+    ReduceOp reduce = ReduceOp::None, bool cpuSync = false);
 
 } // namespace compile_op
 } // namespace moodist

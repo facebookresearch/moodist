@@ -1019,7 +1019,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
   // compileOpFull - compile a distributed tensor operation
   SharedPtr<CustomOpImpl> compileOpFull(DType dtype, std::span<const api::TensorRegion> inputs,
-      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce);
+      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync = false);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -3686,7 +3686,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const 
 // ============================================================================
 
 SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<const api::TensorRegion> inputsVec,
-    std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce) {
+    std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce, bool cpuSync) {
 
   // Ensure queues exist for compile_op communication
   if (queues.empty()) {
@@ -3717,7 +3717,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   ctx.nextOpId = &nextCustomOpId;
 
   // Call compile_op
-  auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce);
+  auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce, cpuSync);
 
   // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
   auto result = makeShared<CustomOpImpl>();
@@ -3737,9 +3737,13 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
 namespace {
 
 // Helper to convert TensorPtr to TensorDataPtr for cpuThread operations
-TensorDataPtr getTensorDataFromPtr(const TensorPtr& tensor) {
+TensorDataPtr getTensorDataFromPtr(const TensorPtr& tensor, Group* group) {
   if (!tensor.is_contiguous()) {
     throw std::runtime_error("Got a non-contiguous tensor. All tensors must be contiguous.");
+  }
+  if (tensor.is_cuda() && tensor.device_index() != group->deviceIndex) {
+    throw std::runtime_error(fmt::sprintf("Got a CUDA tensor on device %d, but process group expects device %d",
+        tensor.device_index(), group->deviceIndex));
   }
 
   TensorDataPtr td = TensorDataPtr::make();
@@ -3822,7 +3826,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   };
 
   for (size_t i = 0; i < nInputs; ++i) {
-    auto t = getTensorDataFromPtr(inputs[i]);
+    auto t = getTensorDataFromPtr(inputs[i], group.get());
     REQUIRE(t->dtype == static_cast<int>(op->dtype),
         "moodist: custom op input[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
         formatDType(static_cast<int>(op->dtype)));
@@ -3839,7 +3843,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     e->inputs.push_back(std::move(t));
   }
   for (size_t i = 0; i < nOutputs; ++i) {
-    auto t = getTensorDataFromPtr(outputs[i]);
+    auto t = getTensorDataFromPtr(outputs[i], group.get());
     REQUIRE(t->dtype == static_cast<int>(op->dtype),
         "moodist: custom op output[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
         formatDType(static_cast<int>(op->dtype)));
@@ -3859,6 +3863,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   // Create and return ApiFuture early so we can store tensors in it
   auto result = makeShared<ApiFuture>();
 
+  auto inputCopyStart = std::chrono::steady_clock::now();
+  size_t inputCopyBytes = 0;
   // Handle inputCopies: narrow input tensors to required slices and make contiguous
   for (const auto& x : op->inputCopies) {
     CHECK(x.index < nInputs);
@@ -3868,13 +3874,18 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       t = t.narrow(i, x.offset[i], x.shape[i]);
     }
     t = t.contiguous();
-    auto td = getTensorDataFromPtr(t);
+    inputCopyBytes += t.itemsize() * t.numel();
+    auto td = getTensorDataFromPtr(t, group.get());
     anyCuda |= td->isCuda;
     anyCpu |= !td->isCuda;
     e->inputs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
   }
+
+  auto t = seconds(std::chrono::steady_clock::now() - inputCopyStart);
+  log.info("compile_op copied %d inputs, %d bytes in %gs, %gG/s\n", op->inputCopies.size(), inputCopyBytes, t,
+      inputCopyBytes / 1024.0 / 1024 / 1024 / t);
 
   // Handle outputCopies: create temporary tensors that will be copied back after completion
   Vector<std::pair<TensorPtr, size_t>> outputCopyTensors; // (temp tensor, original output index)
@@ -3884,12 +3895,17 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     std::vector<int64_t> shape64(x.shape.begin(), x.shape.end());
     TensorPtr t = TensorPtr::empty(shape64, op->dtype, outputs[x.index].device_index());
     outputCopyTensors.emplace_back(t, x.index);
-    auto td = getTensorDataFromPtr(t);
+    auto td = getTensorDataFromPtr(t, group.get());
     anyCuda |= td->isCuda;
     anyCpu |= !td->isCuda;
     e->outputs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
+  }
+
+  // Force CPU sync if requested by the compiled op
+  if (op->cpuSync) {
+    anyCpu = true;
   }
 
   e->anyCuda = anyCuda;
@@ -3928,6 +3944,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
         selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
       }
       // Copy temporary tensors back to the appropriate slices of original outputs
+      auto outputCopyStart = std::chrono::steady_clock::now();
+      size_t outputCopyBytes = 0;
       CHECK(copyTensors.size() == op->outputCopies.size());
       for (size_t i = 0; i < op->outputCopies.size(); ++i) {
         const auto& [src, outputIdx] = copyTensors[i];
@@ -3938,7 +3956,12 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
           dst = dst.narrow(j, x.offset[j], x.shape[j]);
         }
         dst.copy_(src);
+
+        outputCopyBytes += dst.itemsize() * dst.numel();
       }
+      auto t = seconds(std::chrono::steady_clock::now() - outputCopyStart);
+      log.info("compile_op copied %d outputs, %d bytes in %gs, %gG/s\n", op->outputCopies.size(), outputCopyBytes, t,
+          outputCopyBytes / 1024.0 / 1024 / 1024 / t);
     };
   } else if (anyCuda) {
     auto selfPtr = share(this);
@@ -3953,9 +3976,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
 // API function that calls the member method
 api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
-    std::span<const api::TensorRegion> outputs, api::ReduceOp reduce) {
+    std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
-  SharedPtr<CustomOpImpl> op = impl->compileOpFull(dtype, inputs, outputs, reduce);
+  SharedPtr<CustomOpImpl> op = impl->compileOpFull(dtype, inputs, outputs, reduce, cpuSync);
   return api::CustomOpHandle::adopt(op.release());
 }
 

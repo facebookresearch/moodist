@@ -47,6 +47,11 @@ void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
   deserializeBuffer(ptr, size, result...);
 }
 
+// Helper to format Coord for logging
+std::string fmtCoord(const Coord& c) {
+  return fmt::to_string(fmt::join(c, ","));
+}
+
 // Parse device string without validation.
 // Returns the parsed DeviceType.
 // Throws if device string is invalid.
@@ -94,7 +99,8 @@ DeviceType parseAndValidateDevice(std::string_view device, int expectedCudaIndex
 } // namespace
 
 std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
-    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs, ReduceOp reduce) {
+    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs, ReduceOp reduce,
+    bool cpuSync) {
 
   const size_t rank = ctx.rank;
   const size_t size = ctx.size;
@@ -383,7 +389,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         gapCount++;
         if (gapCount <= maxReportedRegions) {
           gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
-              fmt::to_string(fmt::join(cellOffset, ",")).c_str(), fmt::to_string(fmt::join(cellShape, ",")).c_str());
+              fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str());
         }
       } else if (coveringInputs.size() > 1) {
         // Overlap detected
@@ -393,8 +399,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
             const LogicalInput& a = receivedInputs[coveringInputs[0]];
             const LogicalInput& b = receivedInputs[coveringInputs[1]];
             overlapDetails += fmt::sprintf("\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
-                outIdx, fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
-                fmt::to_string(fmt::join(cellShape, ",")).c_str(), a.inputRank, b.inputRank);
+                outIdx, fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str(), a.inputRank, b.inputRank);
           }
         } else {
           // reduce == Any: pick one randomly
@@ -498,6 +503,19 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   };
   Vector<InputCopy> inputCopies;
 
+  // Deduplication map: (inputIndex, offset, shape) -> copyIndex
+  // Using a vector of (key, value) pairs with linear search since copy count is typically small
+  struct InputCopyKey {
+    uint32_t inputIndex;
+    Coord offset;
+    Coord shape;
+
+    bool operator==(const InputCopyKey& other) const {
+      return inputIndex == other.inputIndex && offset == other.offset && shape == other.shape;
+    }
+  };
+  Vector<std::pair<InputCopyKey, uint32_t>> inputCopyDedup;
+
   // Process each request and build responses
   Vector<Vector<ReadResponse>> responsesToSend(size);
 
@@ -527,14 +545,35 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       resp.tensorShape = inp.shape;
       resp.isCopy = false;
     } else {
-      // Need to make a contiguous copy
-      uint32_t copyIndex = static_cast<uint32_t>(myInputIndices.size() + inputCopies.size());
+      // Need to make a contiguous copy - check for deduplication first
+      InputCopyKey key{req.inputIndex, relOffset, req.shape};
 
-      InputCopy copy;
-      copy.inputIndex = req.inputIndex;
-      copy.offset = relOffset;
-      copy.shape = req.shape;
-      inputCopies.push_back(std::move(copy));
+      // Search for existing copy with same key
+      uint32_t copyIndex = 0;
+      bool found = false;
+      for (const auto& [existingKey, existingIdx] : inputCopyDedup) {
+        if (existingKey == key) {
+          copyIndex = existingIdx;
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        // Create new copy
+        copyIndex = static_cast<uint32_t>(myInputIndices.size() + inputCopies.size());
+
+        InputCopy copy;
+        copy.inputIndex = req.inputIndex;
+        copy.offset = relOffset;
+        copy.shape = req.shape;
+        inputCopies.push_back(std::move(copy));
+
+        inputCopyDedup.push_back({key, copyIndex});
+
+        // log.debug("compile_op: input copy: inputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n", req.inputIndex,
+        //     fmtCoord(relOffset).c_str(), fmtCoord(req.shape).c_str(), fmtCoord(inp.shape).c_str());
+      }
 
       resp.tensorIndex = copyIndex;
       resp.inputOffset = 0;         // Copy is contiguous, starts at 0
@@ -576,6 +615,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   auto op = std::make_shared<CustomOpDescriptor>();
   op->id = (*ctx.nextOpId)++;
   op->dtype = dtype;
+  op->cpuSync = cpuSync;
 
   // Populate inputs (my inputs) - sizes in bytes
   for (size_t idx : myInputIndices) {
@@ -648,6 +688,10 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       oc.offset = relOutOffset;
       oc.shape = resp.requestShape;
       outputCopyList.push_back(std::move(oc));
+
+      // log.debug("compile_op: output copy: outputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
+      // resp.outputIndex,
+      //     fmtCoord(relOutOffset).c_str(), fmtCoord(resp.requestShape).c_str(), fmtCoord(out.shape).c_str());
 
       // Read into the copy buffer (which will be contiguous)
       read.outputIndex = copyIdx;

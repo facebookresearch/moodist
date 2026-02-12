@@ -196,7 +196,8 @@ public:
   Future copy(torch::Tensor& destination, const torch::Tensor& source);
   std::vector<torch::Tensor> share(const torch::Tensor& input);
   CustomOp compileOpFull(torch::Dtype dtype, const std::vector<api::TensorRegion>& inputs,
-      const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None);
+      const std::vector<api::TensorRegion>& outputs, moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None,
+      bool cpuSync = false);
 };
 
 void registerFreeMemoryCallback();
