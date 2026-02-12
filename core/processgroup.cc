@@ -3863,8 +3863,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   // Create and return ApiFuture early so we can store tensors in it
   auto result = makeShared<ApiFuture>();
 
-  auto inputCopyStart = std::chrono::steady_clock::now();
-  size_t inputCopyBytes = 0;
   // Handle inputCopies: narrow input tensors to required slices and make contiguous
   for (const auto& x : op->inputCopies) {
     CHECK(x.index < nInputs);
@@ -3874,7 +3872,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       t = t.narrow(i, x.offset[i], x.shape[i]);
     }
     t = t.contiguous();
-    inputCopyBytes += t.itemsize() * t.numel();
     auto td = getTensorDataFromPtr(t, group.get());
     anyCuda |= td->isCuda;
     anyCpu |= !td->isCuda;
@@ -3882,10 +3879,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
   }
-
-  auto t = seconds(std::chrono::steady_clock::now() - inputCopyStart);
-  log.info("compile_op copied %d inputs, %d bytes in %gs, %gG/s\n", op->inputCopies.size(), inputCopyBytes, t,
-      inputCopyBytes / 1024.0 / 1024 / 1024 / t);
 
   // Handle outputCopies: create temporary tensors that will be copied back after completion
   Vector<std::pair<TensorPtr, size_t>> outputCopyTensors; // (temp tensor, original output index)
@@ -3944,8 +3937,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
         selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
       }
       // Copy temporary tensors back to the appropriate slices of original outputs
-      auto outputCopyStart = std::chrono::steady_clock::now();
-      size_t outputCopyBytes = 0;
       CHECK(copyTensors.size() == op->outputCopies.size());
       for (size_t i = 0; i < op->outputCopies.size(); ++i) {
         const auto& [src, outputIdx] = copyTensors[i];
@@ -3956,12 +3947,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
           dst = dst.narrow(j, x.offset[j], x.shape[j]);
         }
         dst.copy_(src);
-
-        outputCopyBytes += dst.itemsize() * dst.numel();
       }
-      auto t = seconds(std::chrono::steady_clock::now() - outputCopyStart);
-      log.info("compile_op copied %d outputs, %d bytes in %gs, %gG/s\n", op->outputCopies.size(), outputCopyBytes, t,
-          outputCopyBytes / 1024.0 / 1024 / 1024 / t);
     };
   } else if (anyCuda) {
     auto selfPtr = share(this);
