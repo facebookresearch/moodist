@@ -579,6 +579,27 @@ static inline py::object getattr(PyObject* obj, PyObject* attr) {
   return py::reinterpret_steal<py::object>(ptr);
 }
 
+static inline py::object getattropt(PyObject* obj, PyObject* attr) {
+#if PY_VERSION_HEX >= 0x030d0000
+  PyObject* ptr;
+  int rc = PyObject_GetOptionalAttr(obj, attr, &ptr);
+  if (rc < 0) {
+    throw py::error_already_set();
+  }
+  return ptr ? py::reinterpret_steal<py::object>(ptr) : py::object();
+#else
+  PyObject* ptr = PyObject_GetAttr(obj, attr);
+  if (ptr) {
+    return py::reinterpret_steal<py::object>(ptr);
+  }
+  if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+    PyErr_Clear();
+    return py::object();
+  }
+  throw py::error_already_set();
+#endif
+}
+
 template<typename X>
 [[gnu::noinline]] static inline void putGlobal(X& x, PyObject* obj) {
   py::object name = getattr(obj, strQualName);
@@ -777,31 +798,36 @@ template<typename X>
       x(setstate);
       stealcheck(PyObject_CallOneArg(setstate.ptr(), state.ptr()));
     } else {
-      PyObject* stateobj = state.ptr();
-      PyObject* slotobj = Py_None;
-      if (Py_TYPE(stateobj) == &PyTuple_Type) {
-        slotobj = ConstructorList::get(state.ptr(), 1);
-        stateobj = ConstructorList::get(state.ptr(), 0);
-      }
-      if (stateobj != Py_None) {
-        py::object dict = getattr(r, strDict);
+      py::object setstateMethod = getattropt(r.ptr(), strSetState);
+      if (setstateMethod) {
+        stealcheck(PyObject_CallOneArg(setstateMethod.ptr(), state.ptr()));
+      } else {
+        PyObject* stateobj = state.ptr();
+        PyObject* slotobj = Py_None;
+        if (Py_TYPE(stateobj) == &PyTuple_Type) {
+          slotobj = ConstructorTuple::get(state.ptr(), 1);
+          stateobj = ConstructorTuple::get(state.ptr(), 0);
+        }
+        if (stateobj != Py_None) {
+          py::object dict = getattr(r, strDict);
 
-        Py_ssize_t i = 0;
-        PyObject* key;
-        PyObject* value;
-        while (PyDict_Next(stateobj, &i, &key, &value)) {
-          if (PyObject_SetItem(dict.ptr(), key, value)) {
-            throw py::error_already_set();
+          Py_ssize_t i = 0;
+          PyObject* key;
+          PyObject* value;
+          while (PyDict_Next(stateobj, &i, &key, &value)) {
+            if (PyObject_SetItem(dict.ptr(), key, value)) {
+              throw py::error_already_set();
+            }
           }
         }
-      }
-      if (slotobj != Py_None) {
-        Py_ssize_t i = 0;
-        PyObject* key;
-        PyObject* value;
-        while (PyDict_Next(slotobj, &i, &key, &value)) {
-          if (PyObject_SetAttr(r.ptr(), key, value)) {
-            throw py::error_already_set();
+        if (slotobj != Py_None) {
+          Py_ssize_t i = 0;
+          PyObject* key;
+          PyObject* value;
+          while (PyDict_Next(slotobj, &i, &key, &value)) {
+            if (PyObject_SetAttr(r.ptr(), key, value)) {
+              throw py::error_already_set();
+            }
           }
         }
       }

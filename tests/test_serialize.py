@@ -23,6 +23,31 @@ class _TestPoint:
     y: int
 
 
+class _TestMeta(type):
+    """Custom metaclass for testing type serialization."""
+    pass
+
+
+class _TestMetaClass(metaclass=_TestMeta):
+    """A class with a custom metaclass."""
+    pass
+
+
+class _TestSetState:
+    """A class that uses __getstate__/__setstate__ for serialization,
+    similar to how Pydantic BaseModel works."""
+
+    def __init__(self, a=None, b=None):
+        self.a = a
+        self.b = b
+
+    def __getstate__(self):
+        return {'__dict__': self.__dict__, 'extra': 'metadata'}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state['__dict__'])
+
+
 def roundtrip(obj):
     """Serialize and deserialize, return result."""
     tensor = moodist.serialize(obj)
@@ -240,6 +265,47 @@ def test_serialize_type(ctx: TestContext):
 
     result = roundtrip(dict)
     ctx.assert_true(result is dict, "type should be the same object")
+
+
+@test
+def test_serialize_type_with_metaclass(ctx: TestContext):
+    """Test serializing a class with a custom metaclass as a global reference.
+
+    Classes with custom metaclasses (e.g. Pydantic's ModelMetaclass) must be
+    serialized as globals, not via __reduce__. This requires PyType_Check
+    (subtype check) rather than exact PyType_Type comparison.
+    """
+    result = roundtrip(_TestMetaClass)
+    ctx.assert_true(result is _TestMetaClass,
+                    f"metaclass type should be the same object, got {result}")
+
+    # Also test that instances of metaclass-created classes still work
+    obj = _TestMetaClass()
+    result = roundtrip(obj)
+    ctx.assert_true(isinstance(result, _TestMetaClass),
+                    f"should be _TestMetaClass instance, got {type(result)}")
+
+
+@test
+def test_serialize_setstate(ctx: TestContext):
+    """Test serializing objects with __getstate__/__setstate__.
+
+    When __reduce_ex__ returns state in position 2 but no explicit setstate
+    in position 5, the deserializer must check for __setstate__ on the
+    reconstructed object (like pickle does), rather than falling back to
+    directly updating __dict__ with the state.
+
+    This is how Pydantic BaseModel serializes: __getstate__ returns a nested
+    dict like {'__dict__': {fields...}, '__pydantic_fields_set__': {...}},
+    and __setstate__ unpacks it properly.
+    """
+    val = _TestSetState(a=42, b="hello")
+    result = roundtrip(val)
+
+    ctx.assert_true(isinstance(result, _TestSetState),
+                    f"should be _TestSetState instance, got {type(result)}")
+    ctx.assert_equal(result.a, 42, "field a")
+    ctx.assert_equal(result.b, "hello", "field b")
 
 
 @test
