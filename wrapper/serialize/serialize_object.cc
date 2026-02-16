@@ -656,7 +656,14 @@ template<typename X>
     py::object reduceFunc = getattr(obj, strReduce);
     reduce = stealcheck(PyObject_CallNoArgs(reduceFunc.ptr()));
   } else {
-    reduce = stealcheck(PyObject_CallOneArg(reduceExFunc.ptr(), toint(5).ptr()));
+    PyObject* result = PyObject_CallOneArg(reduceExFunc.ptr(), toint(5).ptr());
+    if (!result) [[unlikely]] {
+      fmt::printf("putClassObject: failed to call __reduce_ex__(5) on type %s, __reduce_ex__ is %s\n",
+          (std::string)(py::str)((PyObject*)Py_TYPE(obj)),
+          (std::string)(py::str)((PyObject*)Py_TYPE(reduceExFunc.ptr())));
+      throw py::error_already_set();
+    }
+    reduce = py::reinterpret_steal<py::object>(result);
   }
   auto* type = Py_TYPE(reduce.ptr());
   if (type == &PyUnicode_Type) {
@@ -877,7 +884,7 @@ template<typename X>
     return;
   }
 
-  if (type == &PyFunction_Type || type == &PyType_Type) {
+  if (type == &PyFunction_Type || PyType_Check(obj)) {
     putGlobal(x, obj);
     return;
   }
