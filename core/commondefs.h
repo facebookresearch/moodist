@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 
 namespace moodist {
 
@@ -21,11 +22,14 @@ void numa_free(void* ptr, size_t bytes);
 void numa_run_on_node(int node);
 void numa_move(void* ptr, size_t bytes, int node);
 void numa_membind(int node);
+void numa_disable_balancing();
 
 void* internalAlloc(size_t bytes);
 void internalFree(void* ptr);
 void internalAllocatorSetNode(int node);
 size_t internalAllocSize(void* ptr);
+std::pair<uintptr_t, size_t> internalRegionAt(uintptr_t address);
+bool internalOwns(uintptr_t address);
 
 template<typename T, typename... Args>
 T* internalNew(Args&&... args) {

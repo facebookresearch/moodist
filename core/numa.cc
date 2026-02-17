@@ -107,4 +107,9 @@ void numa_membind(int node) {
   }
 }
 
+void numa_disable_balancing() {
+  // PR_SET_NUMA_BALANCING = 78, disable = 0
+  syscall(SYS_prctl, 78, 0);
+}
+
 } // namespace moodist

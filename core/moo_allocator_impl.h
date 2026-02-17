@@ -974,6 +974,8 @@ static void allocate_memory(size_t index) {
 
   uintptr_t addr = nextAddr;
 
+  numa_disable_balancing();
+
   for (size_t i = 0; i != 0x1000; ++i) {
     if (addr) {
       rv = mmap((void*)addr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -997,7 +999,13 @@ static void allocate_memory(size_t index) {
     }
   }
 
-  madvise(rv, bytes, MADV_HUGEPAGE);
+  // MADV_HUGEPAGE causes synchronous memory compaction on every page fault
+  // when /sys/kernel/mm/transparent_hugepage/defrag is set to "madvise".
+  // Under memory pressure with multiple processes, compaction scans billions
+  // of pages and almost always fails, causing multi-second stalls per fault.
+  // TODO: investigate faulting pages in on a background thread first, then
+  // calling MADV_HUGEPAGE to let khugepaged collapse them asynchronously.
+  // madvise(rv, bytes, MADV_HUGEPAGE);
 
   if (allocatorNode != -1) {
     numa_move(rv, bytes, allocatorNode);
@@ -1435,4 +1443,18 @@ size_t getMmappedBytes() {
 }
 size_t getLiveAllocations() {
   return currentLiveAllocations;
+}
+
+std::pair<uintptr_t, size_t> regionAt(uintptr_t address) {
+  PthreadLock lock(globals.slowPathMutex);
+  for (auto& v : allMappedRegions) {
+    if (address >= v.begin && address < v.end) {
+      return {v.begin, v.end - v.begin};
+    }
+  }
+  return {0, 0};
+}
+
+bool owns(uintptr_t address) {
+  return regionAt(address).second != 0;
 }

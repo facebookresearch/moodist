@@ -47,6 +47,12 @@ size_t internalAllocSize(void* ptr) {
 void internalAllocatorSetNode(int) {
   // No-op with stdlib malloc
 }
+std::pair<uintptr_t, size_t> internalRegionAt(uintptr_t) {
+  return {0, 0};
+}
+bool internalOwns(uintptr_t) {
+  return false;
+}
 #elif defined(MOODIST_ALLOCATOR_GUARDS)
 // Add guard bytes to detect buffer overflows and track allocations for double-free detection
 #include <bit>
@@ -179,6 +185,12 @@ void internalAllocatorSetNode(int node) {
   internal_allocator::allocatorNode = node;
   internal_allocator::move_pages();
 }
+std::pair<uintptr_t, size_t> internalRegionAt(uintptr_t address) {
+  return internal_allocator::regionAt(address);
+}
+bool internalOwns(uintptr_t address) {
+  return internal_allocator::owns(address);
+}
 #else
 // Default: use the new allocator directly (thread-safe, no locking needed)
 [[gnu::malloc]]
@@ -201,6 +213,12 @@ void internalAllocatorSetNode(int node) {
   log.debug("allocator node changed from %d to %d\n", internal_allocator::allocatorNode, node);
   internal_allocator::allocatorNode = node;
   internal_allocator::move_pages();
+}
+std::pair<uintptr_t, size_t> internalRegionAt(uintptr_t address) {
+  return internal_allocator::regionAt(address);
+}
+bool internalOwns(uintptr_t address) {
+  return internal_allocator::owns(address);
 }
 #endif
 
