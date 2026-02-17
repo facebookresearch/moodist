@@ -18,7 +18,7 @@
 #include <variant>
 #include <vector>
 
-namespace moodist {
+namespace moodist::serialize {
 
 // Helper to prevent implicit conversions in SFINAE checks for free serialize functions.
 template<typename T, bool = std::is_class_v<T>>
@@ -546,4 +546,4 @@ struct Deserialize {
   }
 };
 
-} // namespace moodist
+} // namespace moodist::serialize

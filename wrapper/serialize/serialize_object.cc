@@ -25,7 +25,7 @@
       throw std::runtime_error("CHECK failed: " #x);                                                                   \
   } while (0)
 
-namespace moodist {
+namespace moodist::serialize {
 
 // CoreApi - set by moodistSerializeInit
 CoreApi serializeCoreApi = {};
@@ -1225,11 +1225,11 @@ template<typename... T>
   }
 }
 
-} // namespace moodist
+} // namespace moodist::serialize
 
 // Internal functions (not exported)
 void* moodistSerializeObject(void* o, size_t* outSize, void** outCleanupCtx) {
-  using namespace moodist;
+  using namespace moodist::serialize;
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>((PyObject*)o));
   *outSize = buffer.msize;
@@ -1242,7 +1242,7 @@ void* moodistSerializeObject(void* o, size_t* outSize, void** outCleanupCtx) {
 }
 
 void* moodistDeserializeObject(const void* ptr, size_t len) {
-  using namespace moodist;
+  using namespace moodist::serialize;
   std::call_once(globalsInitFlag, globalsInit);
   py::object o;
   deserializeObjectFromBuffer(ptr, len, o);
@@ -1255,7 +1255,7 @@ extern "C" {
 // Initialize serialize library - receives CoreApi pointer and fills in serialize functions
 __attribute__((visibility("default"))) void moodistSerializeInit(moodist::CoreApi* api) {
   // Copy CoreApi for buffer allocation (used by buffer.h)
-  moodist::serializeCoreApi = *api;
+  moodist::serialize::serializeCoreApi = *api;
 
   // Fill in serialize functions in the CoreApi
   api->serializeObjectImpl = &moodistSerializeObject;

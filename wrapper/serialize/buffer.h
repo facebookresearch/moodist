@@ -12,7 +12,7 @@
 #include <new>
 #include <utility>
 
-namespace moodist {
+namespace moodist::serialize {
 
 extern CoreApi serializeCoreApi;
 
@@ -77,4 +77,4 @@ inline size_t internalAllocSize(const BufferHandle& h) {
   return serializeCoreApi.internalAllocSize(h.ptr);
 }
 
-} // namespace moodist
+} // namespace moodist::serialize
