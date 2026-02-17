@@ -356,6 +356,24 @@ static AlignedStorage<sizeof(Globals), alignof(Globals)> globalsStorage;
 #define spans (globals.spans)
 #define allMappedRegions (globals.allMappedRegions)
 
+// Immutable snapshot of allMappedRegions for lock-free regionAt lookups.
+// Published atomically after each mmap; old snapshots are deliberately leaked
+// (they're tiny and mmaps are rare).
+struct RegionSnapshot {
+  size_t count;
+  Span regions[];
+};
+static std::atomic<RegionSnapshot*> publishedRegions{nullptr};
+
+// Must be called under slowPathMutex after modifying allMappedRegions.
+static void publishRegionSnapshot() {
+  size_t n = allMappedRegions.size();
+  auto* snap = (RegionSnapshot*)bootstrap_alloc(sizeof(RegionSnapshot) + n * sizeof(Span));
+  snap->count = n;
+  memcpy(snap->regions, allMappedRegions.data(), n * sizeof(Span));
+  publishedRegions.store(snap, std::memory_order_release);
+}
+
 static thread_local Thread* currentThread = nullptr;
 
 struct FastThread {
@@ -1024,6 +1042,7 @@ static void allocate_memory(size_t index) {
 
   add_span(spans, (uintptr_t)rv, (uintptr_t)rv + bytes);
   add_span(allMappedRegions, (uintptr_t)rv, (uintptr_t)rv + bytes);
+  publishRegionSnapshot();
 
   allocate_memory(index);
 }
@@ -1446,10 +1465,13 @@ size_t getLiveAllocations() {
 }
 
 std::pair<uintptr_t, size_t> regionAt(uintptr_t address) {
-  PthreadLock lock(globals.slowPathMutex);
-  for (auto& v : allMappedRegions) {
-    if (address >= v.begin && address < v.end) {
-      return {v.begin, v.end - v.begin};
+  auto* snap = publishedRegions.load(std::memory_order_acquire);
+  if (!snap) {
+    return {0, 0};
+  }
+  for (size_t i = 0; i < snap->count; ++i) {
+    if (address >= snap->regions[i].begin && address < snap->regions[i].end) {
+      return {snap->regions[i].begin, snap->regions[i].end - snap->regions[i].begin};
     }
   }
   return {0, 0};
