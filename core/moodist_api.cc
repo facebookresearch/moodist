@@ -94,6 +94,7 @@ static CoreApi coreApi = {
     // CPU allocator functions
     .cpuAllocatorAlloc = cpuAllocatorAlloc,
     .cpuAllocatorFree = cpuAllocatorFree,
+    .cpuAllocatorOwns = cpuAllocatorOwns,
 
     // CUDA allocator functions
     .createCudaAllocatorImpl = createCudaAllocatorImpl,

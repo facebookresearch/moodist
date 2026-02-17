@@ -1,102 +1,80 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Buffer type for serialize library - uses coreApi for allocation
-// This is a copy of core/buffer.h but calls through coreApi instead of directly
+// Buffer handle for serialize library.
+// Allocates via cpuAllocatorAlloc so serialized data is directly usable by queues.
+// Data pointer = allocation pointer (no header), registered in cpu_allocator sharedHandles.
 
 #pragma once
 
-#include "api/types.h"
+#include "api/moodist_api.h"
 
-#include <atomic>
 #include <cstddef>
-#include <stdexcept>
-#include <type_traits>
+#include <new>
 #include <utility>
 
 namespace moodist {
 
-// Forward declaration - serializeCoreApi is defined in serialize_object.cc
-struct CoreApi;
 extern CoreApi serializeCoreApi;
 
-struct alignas(std::max_align_t) Buffer : api::Buffer {
-  union {
-    Buffer* next;
-    size_t msize;
-  };
-  std::byte* data() {
-    return (std::byte*)(this + 1);
-  }
-  const std::byte* data() const {
-    return (const std::byte*)(this + 1);
-  }
-  size_t size() const {
-    return msize;
-  }
-  Buffer() = delete;
-  ~Buffer() = delete;
-
-  static Buffer* allocate(size_t nbytes) {
-    Buffer* r = (Buffer*)serializeCoreApi.internalAlloc(sizeof(Buffer) + nbytes);
-    if (!r) {
-      throw std::bad_alloc();
-    }
-    r->msize = nbytes;
-    r->refcount.store(0, std::memory_order_relaxed);
-    return r;
-  }
-  static void deallocate(Buffer* buffer) {
-    serializeCoreApi.internalFree((std::byte*)buffer);
-  }
-  static size_t allocSize(Buffer* buffer) {
-    return serializeCoreApi.internalAllocSize((std::byte*)buffer);
-  }
-};
-static_assert(std::is_trivially_copyable_v<Buffer>);
-
 struct BufferHandle {
-  Buffer* buffer = nullptr;
+  std::byte* ptr = nullptr;
+  size_t msize = 0;
+  void* cleanupCtx = nullptr;
+
   BufferHandle() = default;
   BufferHandle(std::nullptr_t) noexcept {}
-  explicit BufferHandle(Buffer* buffer) noexcept : buffer(buffer) {}
   BufferHandle(const BufferHandle&) = delete;
   BufferHandle& operator=(const BufferHandle&) = delete;
-  BufferHandle(BufferHandle&& n) noexcept {
-    buffer = n.buffer;
-    n.buffer = nullptr;
+  BufferHandle(BufferHandle&& n) noexcept : ptr(n.ptr), msize(n.msize), cleanupCtx(n.cleanupCtx) {
+    n.ptr = nullptr;
+    n.cleanupCtx = nullptr;
   }
   BufferHandle& operator=(BufferHandle&& n) noexcept {
-    std::swap(buffer, n.buffer);
+    std::swap(ptr, n.ptr);
+    std::swap(msize, n.msize);
+    std::swap(cleanupCtx, n.cleanupCtx);
     return *this;
   }
   ~BufferHandle() {
-    if (buffer) {
-      Buffer::deallocate(buffer);
-      buffer = nullptr;
+    if (cleanupCtx) {
+      serializeCoreApi.cpuAllocatorFree(cleanupCtx);
+      ptr = nullptr;
+      cleanupCtx = nullptr;
     }
   }
+
   explicit operator bool() const noexcept {
-    return buffer;
+    return ptr;
   }
-  Buffer* operator->() const noexcept {
-    return buffer;
+
+  // operator-> returns this so buffer->msize and buffer->data() keep working
+  BufferHandle* operator->() noexcept {
+    return this;
   }
-  operator Buffer*() const noexcept {
-    return buffer;
+  const BufferHandle* operator->() const noexcept {
+    return this;
   }
-  Buffer* release() noexcept {
-    Buffer* r = buffer;
-    buffer = nullptr;
-    return r;
+
+  std::byte* data() const noexcept {
+    return ptr;
+  }
+  size_t size() const noexcept {
+    return msize;
   }
 };
 
 inline BufferHandle makeBuffer(size_t nbytes) {
-  return BufferHandle(Buffer::allocate(nbytes));
+  BufferHandle h;
+  h.ptr = (std::byte*)serializeCoreApi.cpuAllocatorAlloc(nbytes, &h.cleanupCtx);
+  if (!h.ptr) {
+    throw std::bad_alloc();
+  }
+  h.msize = nbytes;
+  return h;
 }
 
-inline size_t internalAllocSize(Buffer* buffer) {
-  return Buffer::allocSize(buffer);
+inline size_t internalAllocSize(const BufferHandle& h) {
+  return serializeCoreApi.internalAllocSize(h.ptr);
 }
 
 } // namespace moodist

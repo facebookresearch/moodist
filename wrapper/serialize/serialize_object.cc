@@ -1,4 +1,3 @@
-#include "api/moodist_api.h"
 #include "buffer.h"
 #include "serialization.h"
 
@@ -1211,7 +1210,7 @@ void serialize(X& x, py::tuple& v) {
 template<typename... T>
 [[gnu::always_inline]] [[gnu::warn_unused_result]] inline BufferHandle serializeObjectToBuffer(const T&... v) {
   SerializeObject x;
-  x.buffer = makeBuffer(0x80 - sizeof(Buffer));
+  x.buffer = makeBuffer(0x80);
   (x(v), ...);
   x.buffer->msize = x.size;
   return std::move(x.buffer);
@@ -1229,12 +1228,17 @@ template<typename... T>
 } // namespace moodist
 
 // Internal functions (not exported)
-moodist::api::BufferHandle moodistSerializeObject(void* o) {
+void* moodistSerializeObject(void* o, size_t* outSize, void** outCleanupCtx) {
   using namespace moodist;
   std::call_once(globalsInitFlag, globalsInit);
   auto buffer = serializeObjectToBuffer(py::reinterpret_borrow<py::object>((PyObject*)o));
-  Buffer* buf = buffer.release();
-  return api::BufferHandle::create(buf);
+  *outSize = buffer.msize;
+  *outCleanupCtx = buffer.cleanupCtx;
+  void* ptr = buffer.ptr;
+  // Release ownership without freeing
+  buffer.ptr = nullptr;
+  buffer.cleanupCtx = nullptr;
+  return ptr;
 }
 
 void* moodistDeserializeObject(const void* ptr, size_t len) {

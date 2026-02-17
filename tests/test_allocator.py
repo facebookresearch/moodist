@@ -26,6 +26,7 @@ def test_cpu_allocator_basic(ctx: TestContext):
     ctx.assert_equal(t.device.type, "cpu")
     ctx.assert_equal(t.numel(), 1000)
     ctx.assert_equal(t.sum().item(), 0.0)
+    ctx.assert_true(moodist.cpu_allocator_owns(t), "tensor should be owned by moodist cpu allocator")
 
     # Modify and verify
     t.fill_(42.0)
@@ -34,6 +35,7 @@ def test_cpu_allocator_basic(ctx: TestContext):
     # Allocate more tensors
     t2 = torch.ones(500, dtype=torch.float32)
     ctx.assert_equal(t2.sum().item(), 500.0)
+    ctx.assert_true(moodist.cpu_allocator_owns(t2), "tensor should be owned by moodist cpu allocator")
 
     # Clean up
     del t, t2

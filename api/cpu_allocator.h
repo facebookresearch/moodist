@@ -24,6 +24,7 @@ void moo_free(void*);
 // cpuAllocatorFree: deleter function (void(*)(void*)) suitable for DataPtr
 void* cpuAllocatorAlloc(size_t bytes, void** cleanupCtx);
 void cpuAllocatorFree(void* cleanupCtx);
+bool cpuAllocatorOwns(uintptr_t address);
 
 #ifdef MOODIST_WRAPPER
 // Enable the moodist CPU allocator as PyTorch's CPU allocator

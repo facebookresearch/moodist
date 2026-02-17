@@ -1432,6 +1432,21 @@ static PyObject* py_enable_cpu_allocator(PyObject* self, PyObject* args) {
   }
 }
 
+static PyObject* py_cpu_allocator_owns(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* tensor_obj;
+  if (!PyArg_ParseTuple(args, "O", &tensor_obj)) {
+    return nullptr;
+  }
+  if (!THPVariable_Check(tensor_obj)) {
+    PyErr_SetString(PyExc_TypeError, "Expected a torch.Tensor");
+    return nullptr;
+  }
+  const at::Tensor& tensor = THPVariable_Unpack(tensor_obj);
+  bool owned = moodist::coreApi.cpuAllocatorOwns((uintptr_t)tensor.data_ptr());
+  return PyBool_FromLong(owned);
+}
+
 static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
   (void)self;
   PyObject* dst_obj = nullptr;
@@ -1499,6 +1514,8 @@ static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
 static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Returns a greeting"},
     {"enable_cuda_allocator", py_enable_cuda_allocator, METH_NOARGS, "Enable moodist CUDA allocator"},
     {"enable_cpu_allocator", py_enable_cpu_allocator, METH_NOARGS, "Enable moodist CPU allocator"},
+    {"cpu_allocator_owns", py_cpu_allocator_owns, METH_VARARGS,
+        "Check if a tensor is owned by the moodist CPU allocator"},
     {"cuda_copy", py_cuda_copy, METH_VARARGS, "Copy tensor using moodist memory registration"},
     {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
     {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},

@@ -366,7 +366,7 @@ struct SerializeExpandable {
 
   [[gnu::noinline]] void expand(size_t nreq) {
     BufferHandle newbuffer = makeBuffer(std::max(buffer->msize * 2, buffer->msize + nreq));
-    newbuffer->msize = internalAllocSize(newbuffer) - sizeof(Buffer);
+    newbuffer->msize = internalAllocSize(newbuffer);
     std::memcpy(newbuffer->data(), buffer->data(), size);
     std::swap(buffer, newbuffer);
   }

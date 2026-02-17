@@ -1,11 +1,10 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Serialize/deserialize wrapper and Buffer API implementations.
+// Serialize/deserialize wrapper.
 // Uses function pointers from coreApi to call into libmoodist.so.
 
 #include "serialize_wrapper.h"
 
-#include "api/types.h"
 #include "moodist_loader.h"
 #include "torch_includes.h"
 
@@ -20,25 +19,7 @@ const at::Tensor& THPVariable_Unpack(PyObject* obj);
 
 namespace moodist {
 
-// =============================================================================
-// Buffer API proxy implementations
-// =============================================================================
-
 namespace api {
-
-void* ApiProxy<Buffer>::data() const {
-  if (!coreApi.serializeBufferPtr) {
-    throw std::runtime_error("Serialization not available");
-  }
-  return coreApi.serializeBufferPtr(ptr);
-}
-
-size_t ApiProxy<Buffer>::size() const {
-  if (!coreApi.serializeBufferSize) {
-    throw std::runtime_error("Serialization not available");
-  }
-  return coreApi.serializeBufferSize(ptr);
-}
 
 // destroy() implementation for api::Buffer - called by ApiHandle destructor
 void destroy(Buffer* buffer) {
@@ -68,17 +49,16 @@ PyObject* serialize(PyObject* self, PyObject* args) {
   }
 
   try {
-    auto handle = coreApi.serializeObjectImpl(obj);
-    void* ptr = coreApi.serializeBufferPtr(handle.get());
-    size_t size = coreApi.serializeBufferSize(handle.get());
+    size_t size;
+    void* cleanupCtx;
+    void* ptr = coreApi.serializeObjectImpl(obj, &size, &cleanupCtx);
 
-    // Create tensor from buffer data
-    // Use at::from_blob with a custom deleter that releases the handle
-    auto* handlePtr = new api::BufferHandle(std::move(handle));
+    // Create tensor from cpu_allocator memory.
+    // ptr is registered in cpu_allocator sharedHandles, so queues can use it directly.
     auto tensor = at::from_blob(
         ptr, {static_cast<int64_t>(size)},
-        [handlePtr](void*) {
-          delete handlePtr;
+        [cleanupCtx](void*) {
+          coreApi.cpuAllocatorFree(cleanupCtx);
         },
         at::TensorOptions().dtype(at::kByte));
 

@@ -165,7 +165,10 @@ struct CoreApi {
   void (*bufferDestroy)(api::Buffer* buf);
 
   // Serialize implementation functions - populated by loading serialize library
-  api::BufferHandle (*serializeObjectImpl)(void* pyObject);
+  // serializeObjectImpl: serializes a Python object into cpu_allocator memory.
+  // Returns data pointer (registered in cpu_allocator sharedHandles).
+  // Caller must call cpuAllocatorFree(outCleanupCtx) when done.
+  void* (*serializeObjectImpl)(void* pyObject, size_t* outSize, void** outCleanupCtx);
   void* (*deserializeObjectImpl)(const void* ptr, size_t len);
 
   // CPU allocator functions
@@ -173,6 +176,7 @@ struct CoreApi {
   // cpuAllocatorFree: deleter function pointer (void(*)(void*)) to pass to DataPtr
   void* (*cpuAllocatorAlloc)(size_t bytes, void** cleanupCtx);
   void (*cpuAllocatorFree)(void* cleanupCtx);
+  bool (*cpuAllocatorOwns)(uintptr_t address);
 
   // CUDA allocator functions
   CudaAllocatorImpl* (*createCudaAllocatorImpl)();
