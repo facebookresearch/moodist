@@ -567,7 +567,6 @@ struct QueueImpl {
     TensorDataPtr td = TensorDataPtr::make();
 
     td->dtype = static_cast<int>(value.dtype());
-    td->itemsize_ = value.itemsize();
     int ndim = value.ndimension();
     td->shape.resize(ndim);
     for (int i = 0; i != ndim; ++i) {

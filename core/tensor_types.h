@@ -4,21 +4,21 @@
 
 #include "common.h"
 
+#include <array>
+
 namespace moodist {
 
 struct TensorData {
   AllocatedCpuBufferSharedPtr buffer;
   uintptr_t dataPtr;
   size_t dataBytes;
-  int dtype;        // Stores torch::ScalarType value (matches moodist::DType in moodist_api.h)
-  size_t itemsize_; // Element size in bytes (stored to avoid dependency on API)
+  int dtype; // Stores torch::ScalarType value (matches moodist::DType in moodist_api.h)
   IVector<int64_t> shape;
   bool isCuda;
 
   void clear() {
     buffer = {};
     dtype = -1;
-    itemsize_ = 0;
     shape.clear();
     dataPtr = 0;
     dataBytes = 0;
@@ -31,8 +31,30 @@ struct TensorData {
   size_t bytes() {
     return dataBytes;
   }
+  // Returns element size in bytes, derived from dtype (torch::ScalarType values).
   size_t itemsize() {
-    return itemsize_;
+    // DType values: UInt8=0, Int8=1, Int16=2, Int32=3, Int64=4,
+    //               Float16=5, Float32=6, Float64=7, Bool=11, BFloat16=15
+    static constexpr std::array<size_t, 16> table = {{
+        1, // 0: UInt8
+        1, // 1: Int8
+        2, // 2: Int16
+        4, // 3: Int32
+        8, // 4: Int64
+        2, // 5: Float16
+        4, // 6: Float32
+        8, // 7: Float64
+        0, // 8: unused
+        0, // 9: unused
+        0, // 10: unused
+        1, // 11: Bool
+        0, // 12: unused
+        0, // 13: unused
+        0, // 14: unused
+        2, // 15: BFloat16
+    }};
+    CHECK(dtype >= 0 && static_cast<size_t>(dtype) < table.size() && table[dtype] != 0);
+    return table[dtype];
   }
   size_t numel() {
     size_t r = 1;
