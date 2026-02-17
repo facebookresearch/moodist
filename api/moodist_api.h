@@ -154,16 +154,6 @@ struct CoreApi {
   void (*internalFree)(void* ptr);
   size_t (*internalAllocSize)(void* ptr);
 
-  // Serialize functions
-  // Buffer inherits from ApiRefCounted - wrapper manages refcount via ApiHandle
-  // Wrapper's destroy(api::Buffer*) calls bufferDestroy to delete the object
-  // Note: PyObject* is void* here to avoid Python dependency in core
-  api::Buffer* (*bufferAllocate)(size_t nbytes); // Create buffer with core's allocator
-  void* (*serializeBufferPtr)(api::Buffer* buf);
-  size_t (*serializeBufferSize)(api::Buffer* buf);
-  void (*bufferSetSize)(api::Buffer* buf, size_t size); // Set actual used size
-  void (*bufferDestroy)(api::Buffer* buf);
-
   // Serialize implementation functions - populated by loading serialize library
   // serializeObjectImpl: serializes a Python object into cpu_allocator memory.
   // Returns data pointer (registered in cpu_allocator sharedHandles).

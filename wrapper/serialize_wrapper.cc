@@ -19,17 +19,6 @@ const at::Tensor& THPVariable_Unpack(PyObject* obj);
 
 namespace moodist {
 
-namespace api {
-
-// destroy() implementation for api::Buffer - called by ApiHandle destructor
-void destroy(Buffer* buffer) {
-  if (coreApi.bufferDestroy) {
-    coreApi.bufferDestroy(buffer);
-  }
-}
-
-} // namespace api
-
 // =============================================================================
 // Serialize/Deserialize Python functions
 // =============================================================================

@@ -60,7 +60,6 @@ struct Queue;
 struct Future;
 struct CustomOp;
 struct ProcessGroup;
-struct Buffer;
 struct QueueWork;
 
 // Forward declare ApiHandle for use in ApiProxy specializations
@@ -93,18 +92,6 @@ struct ApiProxy<Store> {
   std::vector<uint8_t> get(std::chrono::steady_clock::duration timeout, std::string_view key);
   bool check(std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
   void wait(std::chrono::steady_clock::duration timeout, std::span<const std::string_view> keys);
-};
-
-// Specialization for Buffer with data() and size() accessors
-template<>
-struct ApiProxy<Buffer> {
-  Buffer* ptr;
-  ApiProxy* operator->() {
-    return this;
-  }
-
-  void* data() const;  // Defined in wrapper
-  size_t size() const; // Defined in wrapper
 };
 
 // Specialization for Queue with queue operation accessors
@@ -170,7 +157,6 @@ void destroy(Queue*);
 void destroy(Future*);
 void destroy(CustomOp*);
 void destroy(ProcessGroup*);
-void destroy(Buffer*);
 void destroy(QueueWork*);
 
 // Smart pointer for managing objects across the API boundary.
@@ -322,7 +308,6 @@ public:
 
 // Convenience typedefs for common handle types
 using StoreHandle = ApiHandle<Store>;
-using BufferHandle = ApiHandle<Buffer>;
 using QueueHandle = ApiHandle<Queue>;
 using QueueWorkHandle = ApiHandle<QueueWork>;
 using FutureHandle = ApiHandle<Future>;

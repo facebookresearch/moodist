@@ -159,7 +159,6 @@ set(core_sources
   core/allocator.cc
   core/alltoall.cc
   core/async.cc
-  core/buffer_api.cc
   core/compile_op.cc
   core/connection.cc
   core/cpu_allocator.cc

@@ -11,13 +11,6 @@
 
 namespace moodist {
 
-// Forward declarations for buffer API functions defined in buffer_api.cc
-api::Buffer* bufferAllocate(size_t nbytes);
-void* serializeBufferPtr(api::Buffer* buf);
-size_t serializeBufferSize(api::Buffer* buf);
-void bufferSetSize(api::Buffer* buf, size_t size);
-void bufferDestroy(api::Buffer* buf);
-
 // Forward declarations for internal allocator functions defined in internal_allocator.cc
 void* internalAlloc(size_t bytes);
 void internalFree(void* ptr);
@@ -54,10 +47,6 @@ api::FutureHandle customOpCall(
 api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
     std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync);
 
-// Serialization is temporarily disabled - will be moved to separate library
-// Forward declaration for bufferDestroy defined in serialize_object.cc
-// void bufferDestroy(api::Buffer* buf);
-
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
 WrapperApi wrapperApi = {};
@@ -81,15 +70,9 @@ static CoreApi coreApi = {
     .internalFree = internalFree,
     .internalAllocSize = internalAllocSize,
 
-    // Buffer functions - implemented in core (buffer_api.cc)
-    // Serialize implementation functions are nullptr - will be set by loading serialize library
-    .bufferAllocate = bufferAllocate,
-    .serializeBufferPtr = serializeBufferPtr,
-    .serializeBufferSize = serializeBufferSize,
-    .bufferSetSize = bufferSetSize,
-    .bufferDestroy = bufferDestroy,
-    .serializeObjectImpl = nullptr,   // Set when serialize library is loaded
-    .deserializeObjectImpl = nullptr, // Set when serialize library is loaded
+    // Serialize implementation functions - nullptr until serialize library is loaded
+    .serializeObjectImpl = nullptr,
+    .deserializeObjectImpl = nullptr,
 
     // CPU allocator functions
     .cpuAllocatorAlloc = cpuAllocatorAlloc,
