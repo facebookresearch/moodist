@@ -211,6 +211,10 @@ struct CoreApi {
       api::ProcessGroup* pg, std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
   void (*processGroupCudaBarrier)(api::ProcessGroup* pg, CUstream stream);
 
+  // Cat operation - concatenate tensors from multiple ranks
+  api::FutureHandle (*processGroupCat)(
+      api::ProcessGroup* pg, const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out);
+
   // Queue factory functions - return ApiHandle (ownership via RVO)
   api::QueueHandle (*processGroupMakeQueue)(api::ProcessGroup* pg, int location, bool streaming, const char* name);
   api::QueueHandle (*processGroupMakeQueueMulti)(

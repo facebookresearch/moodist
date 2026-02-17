@@ -46,6 +46,8 @@ api::FutureHandle customOpCall(
     api::CustomOp* op, TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream);
 api::CustomOpHandle compileOpFull(api::ProcessGroup* pg, DType dtype, std::span<const api::TensorRegion> inputs,
     std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync);
+api::FutureHandle processGroupCat(
+    api::ProcessGroup* pg, const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out);
 
 // Global WrapperApi - copied from _C.so during initialization
 // libmoodist.so code accesses wrapper functions through this
@@ -112,6 +114,9 @@ static CoreApi coreApi = {
     .processGroupGather = processGroupGather,
     .processGroupAllToAll = processGroupAllToAll,
     .processGroupCudaBarrier = processGroupCudaBarrier,
+
+    // Cat operation
+    .processGroupCat = processGroupCat,
 
     // Queue factory functions
     .processGroupMakeQueue = processGroupMakeQueue,

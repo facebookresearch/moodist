@@ -668,6 +668,68 @@ static PyObject* processgroup_cuda_barrier(PyObject* self, PyObject*) {
 // Forward declarations for wrap functions (defined later)
 static PyObject* wrap_queue(std::shared_ptr<moodist::wrapper::Queue> queue);
 static PyObject* wrap_customop(moodist::wrapper::CustomOp&& op);
+static PyObject* wrap_future(moodist::wrapper::Future&& future);
+
+static PyObject* processgroup_cat(PyObject* self, PyObject* args, PyObject* kwds) {
+  static const char* kwlist[] = {"locals", "out", nullptr};
+  PyObject* locals_obj = nullptr;
+  PyObject* out_obj = Py_None;
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O", const_cast<char**>(kwlist), &locals_obj, &out_obj)) {
+    return nullptr;
+  }
+
+  if (!PyList_Check(locals_obj)) {
+    PyErr_SetString(PyExc_TypeError, "locals must be a list of (int, tensor) tuples");
+    return nullptr;
+  }
+
+  auto* pg = get_ptr<MoodistProcessGroup>(self);
+  try {
+    std::vector<std::pair<int, torch::Tensor>> locals;
+    Py_ssize_t len = PyList_Size(locals_obj);
+    locals.reserve(len);
+    for (Py_ssize_t i = 0; i < len; ++i) {
+      PyObject* item = PyList_GetItem(locals_obj, i);
+      if (!PyTuple_Check(item) || PyTuple_Size(item) != 2) {
+        PyErr_Format(PyExc_TypeError, "Expected (int, tensor) tuple at index %zd", i);
+        return nullptr;
+      }
+      PyObject* idx_obj = PyTuple_GetItem(item, 0);
+      PyObject* tensor_obj = PyTuple_GetItem(item, 1);
+      if (!PyLong_Check(idx_obj)) {
+        PyErr_Format(PyExc_TypeError, "Expected int as first element of tuple at index %zd", i);
+        return nullptr;
+      }
+      if (!THPVariable_Check(tensor_obj)) {
+        PyErr_Format(PyExc_TypeError, "Expected tensor as second element of tuple at index %zd", i);
+        return nullptr;
+      }
+      locals.emplace_back(PyLong_AsLong(idx_obj), THPVariable_Unpack(tensor_obj));
+    }
+
+    std::optional<torch::Tensor> out;
+    if (out_obj != Py_None) {
+      if (!THPVariable_Check(out_obj)) {
+        PyErr_SetString(PyExc_TypeError, "out must be a tensor or None");
+        return nullptr;
+      }
+      out = THPVariable_Unpack(out_obj);
+    }
+
+    moodist::wrapper::Future future;
+    {
+      GilRelease gil;
+      future = pg->cat(locals, out);
+    }
+    return wrap_future(std::move(future));
+  } catch (const moodist::PythonErrorAlreadySet&) {
+    return nullptr;
+  } catch (const std::exception& e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return nullptr;
+  }
+}
 
 static PyObject* processgroup_make_queue(PyObject* self, PyObject* args, PyObject* kwds) {
   static const char* kwlist[] = {"location", "streaming", "name", nullptr};
@@ -920,6 +982,7 @@ static PyMethodDef processgroup_methods[] = {
     {"_get_option", processgroup_get_option, METH_VARARGS, "Get option by name"},
     {"_set_option", processgroup_set_option, METH_VARARGS, "Set option by name"},
     {"cuda_barrier", processgroup_cuda_barrier, METH_NOARGS, "CUDA barrier synchronization"},
+    {"cat", (PyCFunction)processgroup_cat, METH_VARARGS | METH_KEYWORDS, "Concatenate tensors from multiple ranks"},
     {"Queue", (PyCFunction)processgroup_make_queue, METH_VARARGS | METH_KEYWORDS, "Create a message queue"},
     {"compile_op_full", (PyCFunction)processgroup_compile_op_full, METH_VARARGS | METH_KEYWORDS,
         "Compile a custom collective operation"},

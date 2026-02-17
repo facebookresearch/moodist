@@ -1031,6 +1031,9 @@ struct ProcessGroupImpl : api::ProcessGroup {
   // customOp - execute a compiled custom operation
   SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
       TensorPtr* outputs, size_t nOutputs, CUstream stream);
+
+  // cat - concatenate tensors from multiple ranks
+  api::FutureHandle cat(const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out);
 };
 
 // ============================================================================
@@ -2605,8 +2608,79 @@ void ProcessGroupImpl::cudaBarrier(CUstream stream) {
 }
 
 // ============================================================================
+// Helper to convert TensorPtr to TensorDataPtr for cpuThread operations
+// ============================================================================
+
+namespace {
+
+TensorDataPtr getTensorDataFromPtr(const TensorPtr& tensor, Group* group) {
+  if (!tensor.is_contiguous()) {
+    throw std::runtime_error("Got a non-contiguous tensor. All tensors must be contiguous.");
+  }
+  if (tensor.is_cuda() && tensor.device_index() != group->deviceIndex) {
+    throw std::runtime_error(fmt::sprintf("Got a CUDA tensor on device %d, but process group expects device %d",
+        tensor.device_index(), group->deviceIndex));
+  }
+
+  TensorDataPtr td = TensorDataPtr::make();
+  td->dtype = static_cast<int>(tensor.dtype());
+  int ndim = tensor.ndimension();
+  td->shape.resize(ndim);
+  for (int i = 0; i < ndim; ++i) {
+    td->shape[i] = tensor.size(i);
+  }
+  td->dataPtr = (uintptr_t)tensor.data_ptr();
+  td->dataBytes = td->itemsize() * td->numel();
+  td->isCuda = tensor.is_cuda();
+
+  return td;
+}
+
+} // namespace
+
+// ============================================================================
+// ProcessGroupImpl::cat() - Cat (concatenate from multiple ranks)
+// ============================================================================
+
+api::FutureHandle ProcessGroupImpl::cat(const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out) {
+  std::unique_lock l(threadUnsafe);
+
+  uint32_t stepValue = getNextStepValue();
+  uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+  CHECK(stepValue < 0x80000000);
+
+  auto future = FutureImplSharedPtr::make();
+
+  StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+  QueueEntryCat* e = group->cpuThread->freelistCat.pop();
+  e->task = taskCat;
+  e->stepValue = stepValue;
+  e->concurrencyIndex = concurrencyIndex;
+  e->sd = &sd;
+  e->locals.resize(count);
+  for (size_t i : range(count)) {
+    e->locals[i] = {indices[i], getTensorDataFromPtr(tensors[i], group.get())};
+  }
+  e->future = future;
+  e->out = nullptr;
+  if (out) {
+    e->out = getTensorDataFromPtr(*out, group.get());
+  }
+  group->cpuThread->enqueue(e);
+
+  auto result = makeShared<ApiFuture>();
+  result->impl = std::move(future);
+  return api::FutureHandle::adopt(result.release());
+}
+
+// ============================================================================
 // API Functions
 // ============================================================================
+
+api::FutureHandle processGroupCat(
+    api::ProcessGroup* pg, const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out) {
+  return static_cast<ProcessGroupImpl*>(pg)->cat(indices, tensors, count, out);
+}
 
 api::ProcessGroupHandle createProcessGroup(void* c10dStore, int rank, int size) {
   return api::ProcessGroupHandle::create(internalNew<ProcessGroupImpl>(c10dStore, rank, size));
@@ -3733,35 +3807,6 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
 // ============================================================================
 // ProcessGroupImpl::customOp - execute a compiled custom operation
 // ============================================================================
-
-namespace {
-
-// Helper to convert TensorPtr to TensorDataPtr for cpuThread operations
-TensorDataPtr getTensorDataFromPtr(const TensorPtr& tensor, Group* group) {
-  if (!tensor.is_contiguous()) {
-    throw std::runtime_error("Got a non-contiguous tensor. All tensors must be contiguous.");
-  }
-  if (tensor.is_cuda() && tensor.device_index() != group->deviceIndex) {
-    throw std::runtime_error(fmt::sprintf("Got a CUDA tensor on device %d, but process group expects device %d",
-        tensor.device_index(), group->deviceIndex));
-  }
-
-  TensorDataPtr td = TensorDataPtr::make();
-  td->dtype = static_cast<int>(tensor.dtype());
-  td->itemsize_ = tensor.itemsize();
-  int ndim = tensor.ndimension();
-  td->shape.resize(ndim);
-  for (int i = 0; i < ndim; ++i) {
-    td->shape[i] = tensor.size(i);
-  }
-  td->dataPtr = (uintptr_t)tensor.data_ptr();
-  td->dataBytes = td->itemsize() * td->numel();
-  td->isCuda = tensor.is_cuda();
-
-  return td;
-}
-
-} // namespace
 
 SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs,
     size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {

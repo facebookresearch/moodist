@@ -338,8 +338,29 @@ std::shared_ptr<Queue> ProcessGroup::makeQueue(
   return std::make_shared<Queue>(std::move(queueHandle));
 }
 
-Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>&, std::optional<torch::Tensor>) {
-  throw std::runtime_error("cat: not yet implemented");
+Future ProcessGroup::cat(const std::vector<std::pair<int, torch::Tensor>>& locals, std::optional<torch::Tensor> out) {
+  std::vector<int> indices;
+  std::vector<TensorPtr> tensors;
+  indices.reserve(locals.size());
+  tensors.reserve(locals.size());
+  for (auto& [index, tensor] : locals) {
+    indices.push_back(index);
+    tensors.push_back(wrapTensor(tensor));
+  }
+  TensorPtr outPtr;
+  if (out) {
+    outPtr = wrapTensor(*out);
+  }
+  api::FutureHandle futureHandle =
+      coreApi.processGroupCat(handle.get(), indices.data(), tensors.data(), tensors.size(), out ? &outPtr : nullptr);
+  Future result(std::move(futureHandle));
+  for (auto& [index, tensor] : locals) {
+    result.holdTensors.push_back(tensor);
+  }
+  if (out) {
+    result.holdTensors.push_back(*out);
+  }
+  return result;
 }
 
 Future ProcessGroup::copy(torch::Tensor&, const torch::Tensor&) {
