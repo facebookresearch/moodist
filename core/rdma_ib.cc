@@ -58,9 +58,8 @@ struct RdmaIb : Rdma {
 
     ibv_qp_ex* qp = ib->qpex;
 
-    // log.info(
-    //     "%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+    // log.info("%d: rdma write %d bytes (%p -> %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", group->rank, bytes,
+    //     localAddress, remoteAddress, lkey, rkey, -1, i, (uint64_t)(void*)callback);
 
     bool efa = qp != nullptr;
     if (!efa) {
@@ -95,6 +94,7 @@ struct RdmaIb : Rdma {
     ++callback->refcount;
 
     if (currentCqEntries == maxCqEntries) [[unlikely]] {
+      // log.info("%d: postWrite: CQ full (%d), queuing WR (i %d, %d bytes)\n", group->rank, maxCqEntries, i, bytes);
       queuedWrs.push_back([this, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline] {
         postWriteImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
       });
@@ -116,9 +116,8 @@ struct RdmaIb : Rdma {
 
     ibv_qp_ex* qp = ib->qpex;
 
-    // log.info(
-    //     "%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", rank, bytes,
-    //     localAddress, remoteAddress, lkey, rkey, &dev - devices.data(), i, (uint64_t)(void*)callback);
+    // log.info("%d: rdma read %d bytes (%p <- %p, lkey %#x, rkey %#x) (dev %d, i %d)  (cb %#x)\n", group->rank, bytes,
+    //     localAddress, remoteAddress, lkey, rkey, -1, i, (uint64_t)(void*)callback);
 
     bool efa = qp != nullptr;
     if (!efa) {
@@ -147,6 +146,7 @@ struct RdmaIb : Rdma {
     ++callback->refcount;
 
     if (currentCqEntries == maxCqEntries) [[unlikely]] {
+      // log.info("%d: postRead: CQ full (%d), queuing WR (i %d, %d bytes)\n", group->rank, maxCqEntries, i, bytes);
       queuedWrs.push_back([this, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
         postReadImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
       });
@@ -166,9 +166,8 @@ struct RdmaIb : Rdma {
 
     // bytesWritten += bytes;
 
-    // log.info(
-    //     "%d: post send %d bytes (%p lkey %#x) (dev %d, i %d, dev.currentCqEntries %d)\n", rank, bytes,
-    //     localAddress, lkey, &dev - devices.data(), i, dev.currentCqEntries);
+    // log.info("%d: post send %d bytes (%p lkey %#x) (dev %d, i %d, currentCqEntries %d)\n", group->rank, bytes,
+    //     localAddress, lkey, -1, i, currentCqEntries);
 
     ibv_qp_ex* qp = ib->qpex;
     bool efa = qp != nullptr;
@@ -197,6 +196,7 @@ struct RdmaIb : Rdma {
     ++callback->refcount;
 
     if (currentCqEntries == maxCqEntries) [[unlikely]] {
+      // log.info("%d: postSend: CQ full (%d), queuing WR (i %d, %d bytes)\n", group->rank, maxCqEntries, i, bytes);
       queuedWrs.push_back([this, i, localAddress, lkey, bytes, callback] {
         postSendImpl(i, localAddress, lkey, bytes, callback);
       });
@@ -278,6 +278,7 @@ struct RdmaIb : Rdma {
                 wc.opcode, wc.wr_id);
           } else {
             RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
+            // log.info("%d: recv completed (cb %#x, bytes %d)\n", group->rank, wc.wr_id, wc.byte_len);
             callback->decref();
           }
         }
