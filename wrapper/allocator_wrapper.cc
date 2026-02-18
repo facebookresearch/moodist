@@ -78,6 +78,11 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     return 1.0;
   }
   virtual void setMemoryFraction(double fraction, c10::DeviceIndex device) override {}
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 10)
+  virtual std::vector<c10::cuda::CUDACachingAllocator::StreamSegmentSize> getExpandableSegmentSizes(c10::DeviceIndex) {
+    return {};
+  }
+#endif
   virtual void enable(bool) {}
   virtual bool isEnabled() const {
     return true;
@@ -121,6 +126,9 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot(at::cuda::MempoolId_t) {
     return {};
   }
+  virtual c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot(at::cuda::MempoolId_t, bool) {
+    return {};
+  }
 
   virtual void beginAllocateToPool(
       c10::DeviceIndex device, c10::cuda::MempoolId_t mempool_id, std::function<bool(cudaStream_t)> filter) override {}
@@ -139,6 +147,9 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       size_t alloc_trace_max_entries, c10::cuda::CUDACachingAllocator::RecordContext when) {}
   virtual void recordHistory(bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
       size_t alloc_trace_max_entries, c10::cuda::CUDACachingAllocator::RecordContext when, bool) {}
+  virtual void recordHistory(bool enabled, c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
+      size_t alloc_trace_max_entries, c10::cuda::CUDACachingAllocator::RecordContext when, bool,
+      const std::vector<std::string>&) {}
 
   virtual void attachOutOfMemoryObserver(c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) override {}
   virtual void attachAllocatorTraceTracker(c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) override {}
