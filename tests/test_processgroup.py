@@ -248,6 +248,95 @@ def test_pg_allreduce_varying_data(ctx: TestContext, device: str):
     )
 
 
+@test_cpu_cuda
+def test_pg_allreduce_int64(ctx: TestContext, device: str):
+    """Test allreduce with int64 dtype."""
+    pg = create_process_group(ctx)
+
+    tensor_size = 8
+    # Each rank has tensor filled with (rank + 1)
+    tensor = torch.full((tensor_size,), ctx.rank + 1, device=device, dtype=torch.int64)
+
+    work = pg.allreduce([tensor])
+    work.wait()
+
+    # Sum of all ranks' contributions: 1 + 2 + ... + world_size
+    expected_value = ctx.world_size * (ctx.world_size + 1) // 2
+    expected = torch.full((tensor_size,), expected_value, device=device, dtype=torch.int64)
+
+    ctx.assert_true(
+        torch.equal(tensor, expected),
+        f"allreduce int64 mismatch: got {tensor}, expected {expected}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_allreduce_int64_large_values(ctx: TestContext, device: str):
+    """Test allreduce with int64 values near the wrapping boundary."""
+    pg = create_process_group(ctx)
+
+    # Use large values that would overflow int32 but fit in int64
+    base = 2**40 + ctx.rank * 2**35
+    tensor = torch.tensor([base, -base, base + 1, -(base + 1)], device=device, dtype=torch.int64)
+
+    work = pg.allreduce([tensor])
+    work.wait()
+
+    # Compute expected sum across ranks
+    expected_vals = []
+    for i in range(4):
+        val = 0
+        for r in range(ctx.world_size):
+            r_base = 2**40 + r * 2**35
+            vals = [r_base, -r_base, r_base + 1, -(r_base + 1)]
+            val += vals[i]
+        expected_vals.append(val)
+    expected = torch.tensor(expected_vals, device=device, dtype=torch.int64)
+
+    ctx.assert_true(
+        torch.equal(tensor, expected),
+        f"allreduce int64 large values mismatch: got {tensor}, expected {expected}"
+    )
+
+
+@test_cpu_cuda
+def test_pg_allreduce_int64_overflow(ctx: TestContext, device: str):
+    """Test allreduce with int64 values whose sum overflows and wraps.
+
+    Each rank contributes a value near INT64_MAX.  With >=2 ranks the sum
+    exceeds the int64 range and must wrap via two's-complement arithmetic,
+    which is the behaviour the checksum allreduce relies on.
+    """
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+
+    INT64_MAX = (1 << 63) - 1
+
+    # Each rank contributes INT64_MAX - rank.  With world_size ranks the
+    # mathematical sum is world_size * INT64_MAX - sum(0..world_size-1),
+    # which overflows int64.
+    val = INT64_MAX - ctx.rank
+    tensor = torch.tensor([val], device=device, dtype=torch.int64)
+
+    work = pg.allreduce([tensor])
+    work.wait()
+
+    # Compute the expected wrapped result: do the sum in Python (arbitrary
+    # precision) and wrap to signed int64.
+    exact = sum(INT64_MAX - r for r in range(ctx.world_size))
+    wrapped = exact % (1 << 64)
+    if wrapped >= (1 << 63):
+        wrapped -= 1 << 64
+    expected = torch.tensor([wrapped], device=device, dtype=torch.int64)
+
+    ctx.assert_true(
+        torch.equal(tensor, expected),
+        f"allreduce int64 overflow mismatch: got {tensor}, expected {expected}"
+    )
+
+
 @test
 def test_pg_barrier(ctx: TestContext):
     """Test barrier: all ranks synchronize."""
