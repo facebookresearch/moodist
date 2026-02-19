@@ -194,7 +194,7 @@ struct SchedulerImpl {
     uint32_t req = i.req.load(std::memory_order_acquire);
     size_t spinCount = 0;
     while (req == ack) {
-      _mm_pause();
+      cpu_pause();
       if (++spinCount >= 1 << 12) {
         if (t->terminate.load(std::memory_order_relaxed)) {
           return;
@@ -209,7 +209,7 @@ struct SchedulerImpl {
         if (globalNextReadIndex.compare_exchange_weak(readIndex, readIndex + 1)) {
           auto& q = globalQueues[readIndex % globalQueues.size()];
           while (q.size.load(std::memory_order_relaxed) == 0) {
-            _mm_pause();
+            cpu_pause();
             if (++spinCount > 1 << 12) {
               std::this_thread::yield();
             }

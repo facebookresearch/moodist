@@ -14,7 +14,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <x86intrin.h>
+#include "arch.h"
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -95,7 +95,7 @@ public:
     int deadlockCount = 0;
     do {
       while (locked_.load(std::memory_order_acquire)) {
-        _mm_pause();
+        cpu_pause();
         if (magic != 0) {
           fprintf(stderr, "BAD MUTEX MAGIC %d\n", magic);
           std::abort();
@@ -152,7 +152,7 @@ class SpinMutex {
   void lockLoop() {
     do {
       while (locked.load(std::memory_order_relaxed)) {
-        _mm_pause();
+        cpu_pause();
       }
     } while (locked.exchange(true, std::memory_order_acq_rel));
   }
@@ -199,11 +199,11 @@ public:
     __tsan_mutex_pre_lock(this, 0);
     do {
       while (locked.load(std::memory_order_relaxed)) {
-        _mm_pause();
+        cpu_pause();
       }
     } while (locked.exchange(true));
     while (shareCount.load()) {
-      _mm_pause();
+      cpu_pause();
     }
     __tsan_mutex_post_lock(this, 0, 0);
   }
@@ -233,7 +233,7 @@ public:
     __tsan_mutex_pre_lock(this, __tsan_mutex_read_lock);
     while (true) {
       while (locked.load(std::memory_order_relaxed)) {
-        _mm_pause();
+        cpu_pause();
       }
       shareCount.fetch_add(1);
       if (locked.load()) {

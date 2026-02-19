@@ -930,11 +930,11 @@ static void initRegion(Region* r, size_t index, size_t nbytes) {
 
 static uint64_t rngSeed() {
   uint64_t r = 0x42;
-  r += (__rdtsc() * 954311185259313919ul) % 0xffffffffffffl;
+  r += (rdtsc() * 954311185259313919ul) % 0xffffffffffffl;
   timespec ts{0, 0};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   r += ts.tv_sec * 1000000000l + ts.tv_nsec;
-  r += __rdtsc();
+  r += rdtsc();
   return r;
 }
 
@@ -1187,7 +1187,7 @@ size_t mooCounts[64];
 [[gnu::always_inline]] static inline size_t getSizeClass(size_t bytes) {
   bytes += !bytes;
   // Use | 7 for 8-byte minimum (needed for freelist pointer in hybrid mode)
-  return __builtin_ia32_lzcnt_u64((bytes - 1) | 7);
+  return lzcnt64((bytes - 1) | 7);
 }
 
 [[gnu::noinline]] static inline void* moo_alloc2(size_t index) {

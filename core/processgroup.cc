@@ -23,9 +23,9 @@
 #include "synchronization.h"
 #include "tensor_types.h"
 
+#include "arch.h"
 #include <atomic>
 #include <cstring>
-#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -674,7 +674,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
       uint32_t concurrencyIndex, size_t peerIndex, uint32_t opType, uint32_t stepValue, size_t bytes) {
     size_t i = group->ipcRanks[peerIndex];
     while (group->atomicStepValue[size * concurrencyIndex + i].load() < stepValue) {
-      _mm_pause();
+      cpu_pause();
     }
     auto& dyn = group->cpuLocalDyns[size * concurrencyIndex + i];
     CHECK_DYN(dyn, opType, stepValue, bytes);

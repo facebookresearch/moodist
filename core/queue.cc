@@ -500,7 +500,7 @@ struct QueueImpl {
       bool hasData = result.data != nullptr;
 
       while (result.safe == 0) {
-        _mm_pause();
+        cpu_pause();
       }
 
       {

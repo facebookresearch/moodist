@@ -14,10 +14,10 @@
 #include <new>
 #include <type_traits>
 
+#include "arch.h"
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
-#include <x86intrin.h>
 
 namespace moodist {
 

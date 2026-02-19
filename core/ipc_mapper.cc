@@ -474,7 +474,7 @@ struct IpcMapperImpl : IpcMapper {
     SharedStruct* nshared = peershared.at(peerIndex);
     auto& queue = nshared->queue[group->peerMyRemoteIndex[peerIndex]];
     while (queue.data.size() - (queue.front - queue.back) < n) {
-      _mm_pause();
+      cpu_pause();
     }
     size_t offset = queue.front % queue.data.size();
     size_t c = std::min(queue.data.size() - offset, n);
@@ -485,7 +485,7 @@ struct IpcMapperImpl : IpcMapper {
   void popImpl(size_t peerIndex, void* ptr, size_t n) {
     auto& queue = shared->queue[peerIndex];
     while (queue.front - queue.back < n) {
-      _mm_pause();
+      cpu_pause();
     }
     size_t offset = queue.back % queue.data.size();
     size_t c = std::min(queue.data.size() - offset, n);
@@ -509,7 +509,7 @@ struct IpcMapperImpl : IpcMapper {
     SharedStruct* nshared = peershared.at(peerIndex);
     auto& queue = nshared->eventQueue.at(group->peerMyRemoteIndex.at(peerIndex));
     while (queue.front - queue.back == queue.data.size()) {
-      _mm_pause();
+      cpu_pause();
     }
     queue.data[queue.front % queue.data.size()] = value;
     ++queue.front;
@@ -517,7 +517,7 @@ struct IpcMapperImpl : IpcMapper {
   uintptr_t popEventQueue(size_t peerIndex) {
     auto& queue = shared->eventQueue[peerIndex];
     while (queue.front == queue.back) {
-      _mm_pause();
+      cpu_pause();
     }
     uintptr_t r = queue.data[queue.back % queue.data.size()];
     ++queue.back;

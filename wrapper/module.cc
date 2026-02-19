@@ -24,9 +24,15 @@
 PyObject* THPVariable_Wrap(const at::TensorBase& tensor);
 
 // PyTorch tensor object layout (from torch/csrc/autograd/python_variable.h)
-// We define this ourselves to avoid pulling in pybind11 headers
+// We define this ourselves to avoid pulling in pybind11 headers.
+// PyTorch 2.7+ (commit 2b5eabc74b1, Nov 2025) changed cdata from
+// MaybeOwned<Tensor> to plain Tensor as part of the nogil rework.
 struct THPVariable {
+#ifdef MOODIST_THPVARIABLE_MAYBEOWNED
   PyObject_HEAD c10::MaybeOwned<at::Tensor> cdata;
+#else
+  PyObject_HEAD at::Tensor cdata;
+#endif
   PyObject* backward_hooks;
   PyObject* post_accumulate_grad_hooks;
 };
@@ -96,7 +102,11 @@ bool THPVariable_Check(PyObject* obj) {
 }
 
 const at::Tensor& THPVariable_Unpack(PyObject* obj) {
+#ifdef MOODIST_THPVARIABLE_MAYBEOWNED
   return *reinterpret_cast<THPVariable*>(obj)->cdata;
+#else
+  return reinterpret_cast<THPVariable*>(obj)->cdata;
+#endif
 }
 
 // Moodist headers

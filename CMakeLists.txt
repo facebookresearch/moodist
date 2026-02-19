@@ -59,6 +59,17 @@ if(MOODIST_BUILD_WRAPPER)
   )
   message(STATUS "PyTorch is at ${TorchPath}")
 
+  # Detect PyTorch version (major.minor)
+  execute_process(
+    COMMAND python -c "import torch; v=torch.__version__.split('.')[:2]; print(f'{v[0]}.{v[1]}', end='')"
+    OUTPUT_VARIABLE TORCH_VERSION
+    RESULT_VARIABLE torch_ver_result
+  )
+  if (NOT torch_ver_result EQUAL 0)
+    message(FATAL_ERROR "Failed to detect PyTorch version")
+  endif()
+  message(STATUS "PyTorch version: ${TORCH_VERSION}")
+
   # Detect _GLIBCXX_USE_CXX11_ABI from PyTorch (affects std::string layout)
   set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
 
@@ -243,6 +254,10 @@ set(wrapper_sources
 Python_add_library(_C MODULE USE_SABI 3.10 ${wrapper_sources})
 target_link_libraries(_C PRIVATE
   ${TorchPath}/lib/libtorch_python.so
+  ${TorchPath}/lib/libtorch.so
+  ${TorchPath}/lib/libtorch_cpu.so
+  ${TorchPath}/lib/libc10.so
+  ${TorchPath}/lib/libc10_cuda.so
   Threads::Threads
   dl  # For dlopen/dlsym
 )
@@ -259,6 +274,7 @@ target_include_directories(_C PRIVATE
 target_compile_definitions(_C PRIVATE
   _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}
   MOODIST_WRAPPER  # Enable direct wrapper function calls in _C.so
+  $<$<VERSION_LESS:${TORCH_VERSION},2.10>:MOODIST_THPVARIABLE_MAYBEOWNED>
 )
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
