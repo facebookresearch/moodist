@@ -1,6 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
-# docker run --rm -it -v .:/moodist -w /moodist quay.io/pypa/manylinux_2_28_x86_64 bash docker-build-wheels.sh
+# Build the Docker image first (one-time):
+#   x86_64:  docker build -t moodist-build-x86_64 -f Dockerfile.x86_64 .
+#   aarch64: docker build --platform linux/arm64 -t moodist-build-aarch64 -f Dockerfile.aarch64 .
+#
+# Then run the build:
+#   x86_64:  docker run --rm -it -v .:/moodist -w /moodist moodist-build-x86_64 bash docker-build-wheels.sh
+#   aarch64: docker run --rm -it --platform linux/arm64 -v .:/moodist -w /moodist moodist-build-aarch64 bash docker-build-wheels.sh
+#
+# Or run directly (installs CUDA each time, slower):
+#   x86_64:  docker run --rm -it -v .:/moodist -w /moodist quay.io/pypa/manylinux_2_28_x86_64 bash docker-build-wheels.sh
+#   aarch64: docker run --rm -it --platform linux/arm64 -v .:/moodist -w /moodist quay.io/pypa/manylinux_2_28_aarch64 bash docker-build-wheels.sh
 #
 # Builds a single wheel that works across Python versions (stable API).
 # The wheel contains multiple _C.so files, one per supported PyTorch version.
@@ -8,9 +18,28 @@
 
 set -e -u -x
 
-dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+# Architecture-dependent settings
+arch=$(uname -m)
+case "$arch" in
+    x86_64)
+        cuda_repo_arch="x86_64"
+        plat_tag="manylinux_2_28_x86_64"
+        ;;
+    aarch64)
+        cuda_repo_arch="sbsa"
+        plat_tag="manylinux_2_28_aarch64"
+        ;;
+    *)
+        echo "Unsupported architecture: $arch" >&2
+        exit 1
+        ;;
+esac
 
-dnf install -y cuda-toolkit-12
+# Install CUDA toolkit if not already present (pre-built Docker images skip this)
+if [ ! -d /usr/local/cuda ]; then
+    dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${cuda_repo_arch}/cuda-rhel8.repo"
+    dnf install -y cuda-toolkit-12-8
+fi
 
 # Use lowest supported Python version for building (stable API)
 # abi3 wheels built with 3.10 work with 3.10+
@@ -53,7 +82,7 @@ setup_venv() {
         if [[ -n "$pre" ]]; then
             pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch==$torchver.* >&2
         else
-            pip install torch==$torchver.* >&2
+            pip install --index-url https://download.pytorch.org/whl/cu128 torch==$torchver.* >&2
         fi
         deactivate
     fi
@@ -82,7 +111,7 @@ build_wheel() {
 
     if [[ -z "$core_lib" ]]; then
         # First PyTorch version: build everything
-        python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310 --dist-dir "$staging"
+        python setup.py bdist_wheel -k --plat $plat_tag --py-limited-api cp310 --dist-dir "$staging"
         whl=$(ls "$staging"/*.whl)
         # Extract core library from the wheel
         unzip -p "$whl" "moodist/libmoodist.so" > "$core_lib_saved"
@@ -90,7 +119,7 @@ build_wheel() {
         echo "Saved core library from $whl: $(ls -lh "$core_lib" | awk '{print $5}')"
     else
         # Subsequent versions: use pre-built core
-        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310 --dist-dir "$staging"
+        MOODIST_PREBUILT_CORE="$core_lib" python setup.py bdist_wheel -k --plat $plat_tag --py-limited-api cp310 --dist-dir "$staging"
         whl=$(ls "$staging"/*.whl)
     fi
 
@@ -184,7 +213,7 @@ echo "Building combined wheel from: $whl_list"
 echo "With serialize libraries: $serialize_lib_list"
 MOODIST_WHL_LIST=$whl_list MOODIST_SERIALIZE_LIBS=$serialize_lib_list python setup.py clean --all
 # Use --py-limited-api to produce an abi3 wheel (works with Python 3.10+)
-MOODIST_WHL_LIST=$whl_list MOODIST_SERIALIZE_LIBS=$serialize_lib_list python setup.py bdist_wheel -k --plat manylinux_2_28_x86_64 --py-limited-api cp310
+MOODIST_WHL_LIST=$whl_list MOODIST_SERIALIZE_LIBS=$serialize_lib_list python setup.py bdist_wheel -k --plat $plat_tag --py-limited-api cp310
 
 deactivate
 
