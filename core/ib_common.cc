@@ -18,11 +18,82 @@ IbCommon::IbCommon(Group* group) : group(group) {}
 
 IbCommon::~IbCommon() {}
 
+// Select the best GID index for the given port.
+// Preference order: IB > RoCE v2 > RoCE v1.
+// Returns the GID index and the resolved GID value.
+static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum) {
+  auto gidTypePriority = [](uint32_t gid_type) -> int {
+    switch (gid_type) {
+    case IBV_GID_TYPE_IB:
+      return 0;
+    case IBV_GID_TYPE_ROCE_V2:
+      return 1;
+    case IBV_GID_TYPE_ROCE_V1:
+      return 2;
+    default:
+      return 3;
+    }
+  };
+  auto gidTypeName = [](uint32_t gid_type) -> const char* {
+    switch (gid_type) {
+    case IBV_GID_TYPE_IB:
+      return "IB";
+    case IBV_GID_TYPE_ROCE_V1:
+      return "RoCE v1";
+    case IBV_GID_TYPE_ROCE_V2:
+      return "RoCE v2";
+    default:
+      return "unknown";
+    }
+  };
+
+  uint32_t bestIndex = 0;
+  ibv_gid bestGid{};
+  uint32_t bestGidType = 0;
+  int bestPriority = 4; // worse than any valid type
+  bool found = false;
+  for (uint32_t i = 0; i < 256; ++i) {
+    ibv_gid_entry entry;
+    int error = ibv_query_gid_ex(context, portNum, i, &entry, 0);
+    if (error) {
+      continue;
+    }
+    // Skip empty GIDs
+    ibv_gid zero{};
+    if (std::memcmp(&entry.gid, &zero, sizeof(zero)) == 0) {
+      continue;
+    }
+    int priority = gidTypePriority(entry.gid_type);
+    if (priority < bestPriority) {
+      bestPriority = priority;
+      bestIndex = i;
+      bestGid = entry.gid;
+      bestGidType = entry.gid_type;
+      found = true;
+    }
+  }
+
+  if (!found) {
+    // Fallback: use index 0 with ibv_query_gid (original behavior)
+    log.error("selectGid: no valid GID found via ibv_query_gid_ex, falling back to index 0\n");
+    int error = ibv_query_gid(context, portNum, 0, &bestGid);
+    if (error) {
+      throwErrno(errno, "ibv_query_gid");
+    }
+  } else {
+    log.debug("selectGid: using GID index %d (%s)\n", bestIndex, gidTypeName(bestGidType));
+  }
+
+  return {bestIndex, bestGid};
+}
+
 void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
   log.debug("Init IB\n");
+
+  auto [gidIndex, gid] = selectGid(context, portNum);
 
   IbAddress loopbackAddress;
 
@@ -94,10 +165,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
       address.lid = portAttributes.lid;
       address.qpNum = qp->qp_num;
       address.mtuIndex = portAttributes.active_mtu;
-      error = ibv_query_gid(context, portNum, 0, &address.gid);
-      if (error) {
-        throwErrno(errno, "ibv_query_gid");
-      }
+      address.gid = gid;
 
       if (i != rank) {
         group->setupComms->sendTo(i, address);
@@ -127,6 +195,8 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     attr.qp_state = IBV_QPS_RTR;
     std::memset(&attr.ah_attr, 0, sizeof(attr.ah_attr));
     attr.ah_attr.grh.dgid = remoteAddress.gid;
+    attr.ah_attr.grh.sgid_index = gidIndex;
+    attr.ah_attr.grh.hop_limit = 64;
     attr.ah_attr.is_global = true;
     attr.ah_attr.port_num = portNum;
     attr.ah_attr.dlid = remoteAddress.lid;
@@ -173,6 +243,8 @@ void IbCommon::init2Efa(int portNum, ibv_port_attr portAttributes) {
   const size_t size = group->size;
 
   log.debug("Init EFA\n");
+
+  auto [gidIndex, gid] = selectGid(context, portNum);
 
   recvChannel = ibv_create_comp_channel(context);
   if (!recvChannel) {
@@ -231,10 +303,7 @@ void IbCommon::init2Efa(int portNum, ibv_port_attr portAttributes) {
   address.lid = portAttributes.lid;
   address.qpNum = qp->qp_num;
   address.mtuIndex = portAttributes.active_mtu;
-  error = ibv_query_gid(context, portNum, 0, &address.gid);
-  if (error) {
-    throwErrno(errno, "ibv_query_gid");
-  }
+  address.gid = gid;
 
   qpex = ibv_qp_to_qp_ex(qp);
 
@@ -257,6 +326,8 @@ void IbCommon::init2Efa(int portNum, ibv_port_attr portAttributes) {
     ah_attr.port_num = portNum;
     ah_attr.dlid = remoteAddress.lid;
     ah_attr.is_global = true;
+    ah_attr.grh.sgid_index = gidIndex;
+    ah_attr.grh.hop_limit = 64;
     std::memcpy(&ah_attr.grh.dgid.raw, &remoteAddress.gid, sizeof(remoteAddress.gid));
     ahs.push_back(ibv_create_ah(protectionDomain, &ah_attr));
     if (!ahs.back()) {

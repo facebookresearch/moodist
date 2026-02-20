@@ -809,6 +809,7 @@ extern "C" __global__ void dummy_signal() {
   CHECK_NVRTC(nvrtcApi.createProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
 
   std::vector<std::pair<int, std::string>> archOptions;
+  archOptions.emplace_back(10000, "--gpu-architecture=sm_100");
   archOptions.emplace_back(9000, "--gpu-architecture=sm_90");
   archOptions.emplace_back(8090, "--gpu-architecture=sm_89");
   archOptions.emplace_back(8070, "--gpu-architecture=sm_87");
