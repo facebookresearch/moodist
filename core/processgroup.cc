@@ -1032,6 +1032,12 @@ struct ProcessGroupImpl : api::ProcessGroup {
   SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
       TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
+  // executeLocalOnly - fast path for all-local custom ops (no CPU thread)
+  SharedPtr<ApiFuture> executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op,
+      std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs,
+      TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
+      uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream);
+
   // cat - concatenate tensors from multiple ranks
   api::FutureHandle cat(const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out);
 };
@@ -3776,18 +3782,11 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
 
   // Build compile context
   compile_op::CompileContext ctx;
-  ctx.rank = rank;
-  ctx.size = size;
+  ctx.group = group.get();
   ctx.queues = std::span<SharedPtr<Queue>>(queues.data(), queues.size());
   ctx.barrier = [this]() {
     barrier();
   };
-  ctx.nodeIndex = group->rankToNodeIndex[rank];
-  ctx.nodeRanks =
-      std::span<const size_t>(group->nodeRanks[ctx.nodeIndex].data(), group->nodeRanks[ctx.nodeIndex].size());
-  ctx.localRank = group->rankLocalRank[rank];
-  ctx.rankLocalRank = std::span<const size_t>(group->rankLocalRank.data(), group->rankLocalRank.size());
-  ctx.deviceIndex = group->deviceIndex;
   ctx.nextOpId = &nextCustomOpId;
 
   // Call compile_op
@@ -3823,22 +3822,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     throw std::runtime_error("moodist: custom op expected different number of outputs");
   }
 
-  auto future = FutureImplSharedPtr::make();
-
-  StreamData& sd = group->getCpuStreamData(concurrencyIndex);
-  QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
-  e->task = taskCustom;
-  e->stepValue = stepValue;
-  e->concurrencyIndex = concurrencyIndex;
-  e->sd = &sd;
-  e->op = op;
-  e->future = future;
-  bool anyCuda = false;
-  bool anyCpu = false;
-
-  CHECK(e->inputs.empty());
-  CHECK(e->outputs.empty());
-
   auto formatShape = [](const auto& shape) {
     return fmt::sprintf("[%s]", fmt::to_string(fmt::join(shape, ", ")));
   };
@@ -3870,6 +3853,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     }
   };
 
+  // Validate inputs and outputs, build TensorDataPtr vectors
+  std::vector<TensorDataPtr> inputTDs;
+  std::vector<TensorDataPtr> outputTDs;
+
   for (size_t i = 0; i < nInputs; ++i) {
     auto t = getTensorDataFromPtr(inputs[i], group.get());
     REQUIRE(t->dtype == static_cast<int>(op->dtype),
@@ -3883,9 +3870,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     bool expectedCuda = op->inputDevices[i] == DeviceType::CUDA;
     REQUIRE(t->isCuda == expectedCuda, "moodist: custom op input[%zu] has wrong device: got %s, expected %s", i,
         t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
-    anyCuda |= t->isCuda;
-    anyCpu |= !t->isCuda;
-    e->inputs.push_back(std::move(t));
+    inputTDs.push_back(std::move(t));
   }
   for (size_t i = 0; i < nOutputs; ++i) {
     auto t = getTensorDataFromPtr(outputs[i], group.get());
@@ -3900,6 +3885,38 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     bool expectedCuda = op->outputDevices[i] == DeviceType::CUDA;
     REQUIRE(t->isCuda == expectedCuda, "moodist: custom op output[%zu] has wrong device: got %s, expected %s", i,
         t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
+    outputTDs.push_back(std::move(t));
+  }
+
+  // Fast path: all-local, all-CUDA, no copies — skip CPU thread entirely
+  if (op->allLocal) {
+    return executeLocalOnly(op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs,
+        concurrencyIndex, stepValue, stream);
+  }
+
+  // Slow path: dispatch to CPU thread
+  auto future = FutureImplSharedPtr::make();
+
+  StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+  QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
+  e->task = taskCustom;
+  e->stepValue = stepValue;
+  e->concurrencyIndex = concurrencyIndex;
+  e->sd = &sd;
+  e->op = op;
+  e->future = future;
+  bool anyCuda = false;
+  bool anyCpu = false;
+
+  CHECK(e->inputs.empty());
+  CHECK(e->outputs.empty());
+
+  for (auto& t : inputTDs) {
+    anyCuda |= t->isCuda;
+    anyCpu |= !t->isCuda;
+    e->inputs.push_back(std::move(t));
+  }
+  for (auto& t : outputTDs) {
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
     e->outputs.push_back(std::move(t));
@@ -4000,6 +4017,110 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
       selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
     };
+  }
+
+  return result;
+}
+
+// ============================================================================
+// ProcessGroupImpl::executeLocalOnly - fast path for all-local custom ops
+// ============================================================================
+
+SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op,
+    std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs,
+    TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
+    uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream) {
+
+  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
+  StreamGuard sg(stream, group->deviceIndex);
+
+  IpcMapper* ipcMapper = &*group->ipcMapper;
+  const auto& peerIndices = group->peerIndices;
+
+  std::shared_lock unmapLock(unmapMemoryMutex);
+  sync(stepValue);
+
+  // Step 1: Self-copies (local rank reading its own inputs)
+  for (const auto& lic : op->localInputCopies) {
+    if (lic.sourceRank != rank) {
+      continue;
+    }
+    CHECK(lic.myOutputIndex < outputs.size());
+    CHECK(lic.sourceInputIndex < inputs.size());
+    uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+    uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
+    if (dst != src && lic.bytes > 0) {
+      CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
+    }
+  }
+
+  // Step 2: IPC-map my inputs for readers
+  Vector<uintptr_t> mappedAddrs(op->localInputProvides.size());
+  for (size_t i : indices(op->localInputProvides)) {
+    const auto& lip = op->localInputProvides[i];
+    size_t peerIndex = group->getPeerIndex(lip.readerRank);
+    CHECK(lip.myInputIndex < inputs.size());
+    uintptr_t myAddr = inputs[lip.myInputIndex]->data() + lip.inputOffset;
+    ipcMapper->requestAddress(peerIndex, myAddr, lip.bytes, &mappedAddrs[i]);
+  }
+  ipcMapper->wait();
+
+  // Step 3: Exchange addresses via peerWriteDyn + ipcMapper push/pop
+  // Signal all peers (pushes sync pair to FIFO)
+  for (size_t peerIndex : peerIndices) {
+    peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
+  }
+  // Push mapped addresses AFTER signal (matching order per peer)
+  for (size_t i : indices(op->localInputProvides)) {
+    size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
+    ipcMapper->push(peerIndex, mappedAddrs[i]);
+  }
+
+  // Wait for all peer signals (pops sync pair from FIFO)
+  for (size_t peerIndex : peerIndices) {
+    peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
+  }
+  // Pop addresses from peers (reader knows count from localInputCopies)
+  Vector<uintptr_t> srcAddrs(op->localInputCopies.size());
+  for (size_t i : indices(op->localInputCopies)) {
+    const auto& lic = op->localInputCopies[i];
+    if (lic.sourceRank == rank) {
+      srcAddrs[i] = 0; // Already handled in Step 1
+      continue;
+    }
+    size_t peerIndex = group->getPeerIndex(lic.sourceRank);
+    srcAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
+  }
+
+  freePendingIpcEvents();
+
+  // Step 4: GPU barrier + peer copies
+  syncPeers(stream);
+  for (size_t i : indices(op->localInputCopies)) {
+    const auto& lic = op->localInputCopies[i];
+    if (lic.sourceRank == rank) {
+      continue;
+    }
+    CHECK(lic.myOutputIndex < outputs.size());
+    uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+    if (lic.bytes > 0) {
+      CHECK_CU(cuMemcpyDtoDAsync(dst, srcAddrs[i], lic.bytes, stream));
+    }
+  }
+  syncPeers(stream);
+
+  // Step 5: Return result — CPU-side immediately done, GPU work is on stream
+  auto result = makeShared<ApiFuture>();
+  auto future = FutureImplSharedPtr::make();
+  future->done = 1;
+  result->impl = std::move(future);
+
+  // Hold original tensors alive until the future is consumed
+  for (size_t i = 0; i < nInputs; ++i) {
+    result->holdTensors.push_back(inputPtrs[i]);
+  }
+  for (size_t i = 0; i < nOutputs; ++i) {
+    result->holdTensors.push_back(outputPtrs[i]);
   }
 
   return result;

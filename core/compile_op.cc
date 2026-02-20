@@ -3,14 +3,16 @@
 // compile_op implementation
 // See compile_op.h for design overview
 //
-// Five-phase protocol:
+// Six-phase protocol:
 // Phase 1: Exchange logical mappings (sender → receiver)
 // Phase 2: Overlap resolution via cell decomposition (local)
 // Phase 3: Send read requests (receiver → sender)
 // Phase 4: Process requests, generate copies (sender)
 // Phase 5: Finalize and generate reads (receiver)
+// Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
 
 #include "compile_op.h"
+#include "group.h"
 #include "queue.h"
 #include "serialization.h"
 
@@ -96,14 +98,27 @@ DeviceType parseAndValidateDevice(std::string_view device, int expectedCudaIndex
   throw std::runtime_error("Invalid device string: " + std::string(device));
 }
 
+// Phase 6: entry sent from reader to source rank describing what will be read
+struct ProvideEntry {
+  uint32_t readerRank;
+  uint32_t sourceInputIndex;
+  size_t sourceInputOffset;
+  size_t bytes;
+
+  template<typename X>
+  void serialize(X& x) {
+    x(readerRank, sourceInputIndex, sourceInputOffset, bytes);
+  }
+};
+
 } // namespace
 
 std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
     std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs, ReduceOp reduce,
     bool cpuSync) {
 
-  const size_t rank = ctx.rank;
-  const size_t size = ctx.size;
+  const size_t rank = ctx.group->rank;
+  const size_t size = ctx.group->size;
   size_t itemsize = wrapperApi.dtypeSize(dtype);
 
   // Validate per-tensorId ndim consistency
@@ -139,12 +154,12 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   // Validate device strings for local regions (where rank == this rank)
   for (const auto& region : inputs) {
     if (static_cast<size_t>(region.rank) == rank) {
-      parseAndValidateDevice(region.device, ctx.deviceIndex);
+      parseAndValidateDevice(region.device, ctx.group->deviceIndex);
     }
   }
   for (const auto& region : outputs) {
     if (static_cast<size_t>(region.rank) == rank) {
-      parseAndValidateDevice(region.device, ctx.deviceIndex);
+      parseAndValidateDevice(region.device, ctx.group->deviceIndex);
     }
   }
 
@@ -537,6 +552,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     resp.requestOffset = req.offset;
     resp.requestShape = req.shape;
     resp.senderRank = static_cast<uint32_t>(rank);
+    resp.inputDevice = inp.device;
 
     if (isContiguous) {
       // Can read directly from input
@@ -698,9 +714,24 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       read.outputOffset = 0;
     }
 
-    // For now, use simple reads (no NVLink optimization)
-    // TODO: Add NVLink path (gatewayReads, localCopies, localInputCopies)
-    op->reads.push_back(read);
+    // For CUDA-to-CUDA transfers: use local copy (NVLink/same-GPU) instead of RDMA read
+    // when source is on the same node (IPC-accessible) or is this rank itself.
+    // For CPU tensors, IB DMA engines are faster than memcpy, so keep as RDMA reads.
+    bool bothCuda = out.device == DeviceType::CUDA && resp.inputDevice == DeviceType::CUDA;
+    bool sourceIsLocal = read.rank == rank ||
+        (read.rank < ctx.group->ipcAccess.size() && ctx.group->ipcAccess[read.rank]);
+    if (sourceIsLocal && bothCuda) {
+      CustomOpDescriptor::LocalInputCopy lic;
+      lic.sourceRank = read.rank;
+      lic.sourceInputIndex = read.inputIndex;
+      lic.sourceInputOffset = read.inputOffset;
+      lic.bytes = read.bytes;
+      lic.myOutputIndex = read.outputIndex;
+      lic.myOutputOffset = read.outputOffset;
+      op->localInputCopies.push_back(lic);
+    } else {
+      op->reads.push_back(read);
+    }
 
     (void)inputContiguous; // Used by execution path, not stored in descriptor
   }
@@ -718,7 +749,66 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   ctx.barrier();
 
   log.debug(
-      "compile_op phase5: rank %zu, %zu reads, %zu output copies\n", rank, op->reads.size(), op->outputCopies.size());
+      "compile_op phase5: rank %zu, %zu reads, %zu local copies, %zu output copies\n",
+      rank, op->reads.size(), op->localInputCopies.size(), op->outputCopies.size());
+
+  // ============================================================================
+  // Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
+  // ============================================================================
+
+  // This rank is all-local if it has no IB reads, no non-contiguous copies, and no CPU sync
+  bool myAllLocal = op->reads.empty() && op->inputCopies.empty() && op->outputCopies.empty() && !cpuSync;
+
+  // Build messages to source ranks: tell each source what I will read from their inputs
+  Vector<Vector<ProvideEntry>> providesToSend(size);
+  for (const auto& lic : op->localInputCopies) {
+    if (lic.sourceRank == rank) {
+      continue; // Self-copies don't need to be communicated
+    }
+    ProvideEntry pe;
+    pe.readerRank = static_cast<uint32_t>(rank);
+    pe.sourceInputIndex = lic.sourceInputIndex;
+    pe.sourceInputOffset = lic.sourceInputOffset;
+    pe.bytes = lic.bytes;
+    providesToSend[lic.sourceRank].push_back(pe);
+  }
+
+  // Barrier before queue operations
+  ctx.barrier();
+
+  // Send (myAllLocal, provides) to each rank
+  for (size_t destRank : range(size)) {
+    TensorPtr tensor = serializeToTensorPtr(myAllLocal, providesToSend[destRank]);
+    ctx.queues[destRank]->put(std::move(tensor), 0);
+  }
+
+  // Receive from all ranks
+  bool allAllLocal = myAllLocal;
+  for (size_t i : range(size)) {
+    (void)i;
+    auto [tensor, qsize] = ctx.queues[rank]->get();
+    bool peerAllLocal;
+    Vector<ProvideEntry> entries;
+    deserializeFromTensorPtr(tensor, peerAllLocal, entries);
+    allAllLocal = allAllLocal && peerAllLocal;
+
+    for (const auto& pe : entries) {
+      CustomOpDescriptor::LocalInputProvide lip;
+      lip.readerRank = pe.readerRank;
+      lip.myInputIndex = pe.sourceInputIndex;
+      lip.inputOffset = pe.sourceInputOffset;
+      lip.bytes = pe.bytes;
+      op->localInputProvides.push_back(lip);
+    }
+  }
+
+  op->allLocal = allAllLocal;
+
+  // Final barrier after Phase 6
+  ctx.barrier();
+
+  log.debug("compile_op phase6: rank %zu, allLocal=%d, %zu provides\n", rank, op->allLocal,
+      op->localInputProvides.size());
 
   // Compute byte counts for logging
   size_t inputBytes = 0, outputBytes = 0, readBytes = 0;
@@ -732,14 +822,19 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       outputBytes += d.numel * itemsize;
     }
   }
+  size_t localCopyBytes = 0;
   for (const auto& r : op->reads) {
     readBytes += r.bytes;
   }
+  for (const auto& lc : op->localInputCopies) {
+    localCopyBytes += lc.bytes;
+  }
 
   log.info("compile_op[%u]: rank %zu/%zu, %zu inputs (%zu bytes), %zu outputs (%zu bytes), %zu tensor_ids "
-           "-> %zu reads (%zu bytes), %zu input copies, %zu output copies\n",
+           "-> %zu reads (%zu bytes), %zu local copies (%zu bytes), %zu input copies, %zu output copies\n",
       op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes,
-      tensorIdNdim.size(), op->reads.size(), readBytes, op->inputCopies.size(), op->outputCopies.size());
+      tensorIdNdim.size(), op->reads.size(), readBytes, op->localInputCopies.size(), localCopyBytes,
+      op->inputCopies.size(), op->outputCopies.size());
 
   return op;
 }

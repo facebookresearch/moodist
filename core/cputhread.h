@@ -100,6 +100,7 @@ OPTYPE(CreateQueueNamedResult);
 OPTYPE(Cat);
 OPTYPE(Cached);
 OPTYPE(Custom);
+OPTYPE(CompileOpLocal);
 
 OPTYPE(MessageShutdown);
 
@@ -349,11 +350,20 @@ struct CustomOpDescriptor {
     size_t myOutputOffset;
   };
 
+  // Reverse mapping: tells this rank which peers will read its inputs (for allLocal fast path)
+  struct LocalInputProvide {
+    uint32_t readerRank;   // Global rank that will read this input
+    uint32_t myInputIndex; // Which of my inputs they read
+    size_t inputOffset;    // Byte offset within my input
+    size_t bytes;
+  };
+
   IVector<Read> reads;
   IVector<Read> directReads;                // IB reads with no local sharing
   IVector<GatewayRead> gatewayReads;        // I fetch via IB for local group
   IVector<LocalCopy> localCopies;           // I copy from gateway's output via NVLink
   IVector<LocalInputCopy> localInputCopies; // I copy from local rank's input via NVLink
+  IVector<LocalInputProvide> localInputProvides; // Peers that will read my inputs (allLocal path)
   IVector<Copy> inputCopies;
   IVector<Copy> outputCopies;
 
@@ -366,6 +376,7 @@ struct CustomOpDescriptor {
   IVector<DeviceType> outputDevices;
   DType dtype;
   bool cpuSync = false; // Force CPU-side wait in customOp before CUDA operations
+  bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
 };
 
 struct QueueEntryCustom : QueueEntry {

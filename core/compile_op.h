@@ -21,6 +21,7 @@ namespace moodist {
 
 // Forward declarations
 class Queue;
+struct Group;
 
 namespace compile_op {
 
@@ -201,21 +202,11 @@ inline bool contiguous(const Coord& inner, const Coord& outer) {
   return true;
 }
 
-// Context passed from ProcessGroupImpl - avoids coupling to that class
+// Context passed from ProcessGroupImpl to compile_op
 struct CompileContext {
-  size_t rank;
-  size_t size;
+  Group* group;
   std::span<SharedPtr<Queue>> queues;
   Function<void()> barrier;
-
-  // Topology info for NVLink optimization
-  size_t nodeIndex;
-  std::span<const size_t> nodeRanks;     // Ranks on this node
-  size_t localRank;                      // My index within nodeRanks
-  std::span<const size_t> rankLocalRank; // Global rank -> local rank mapping
-
-  // Device info for validation
-  int deviceIndex; // CUDA device index for this rank
 
   // For generating unique op IDs
   uint32_t* nextOpId;
@@ -280,17 +271,18 @@ struct ReadResponse {
   size_t inputOffset;     // Linear offset within tensor
   Coord tensorShape;      // For stride computation at receiver
   bool isCopy;            // True if tensorIndex refers to a copy
+  DeviceType inputDevice; // Device type of input tensor
 
   template<typename X>
   void serialize(X& x) const {
     x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
-        isCopy);
+        isCopy, inputDevice);
   }
 
   template<typename X>
   void serialize(X& x) {
     x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
-        isCopy);
+        isCopy, inputDevice);
   }
 };
 
