@@ -117,6 +117,10 @@ struct CUipcEventHandle {
   char reserved[CU_IPC_HANDLE_SIZE];
 };
 
+struct CUmemFabricHandle {
+  unsigned char data[64];
+};
+
 // Memory types
 enum CUmemorytype {
   CU_MEMORYTYPE_HOST = 0x01,
@@ -156,6 +160,7 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR 
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128;
 
 // Pointer attributes
 using CUpointer_attribute = int;
