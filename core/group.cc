@@ -4,6 +4,7 @@
 #include "allgather.h"
 #include "api/tensor_ptr.h"
 #include "common.h"
+#include "compile_op_kernel.h"
 #include "connection.h"
 #include "cputhread.h"
 #include "ib_common.h"
@@ -49,6 +50,7 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
   kernels = std::make_unique<Kernels>(this);
+  compileOpKernels = std::make_unique<CompileOpKernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }

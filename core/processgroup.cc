@@ -10,6 +10,7 @@
 #include "api/tensor_ptr.h"
 #include "common.h"
 #include "compile_op.h"
+#include "compile_op_kernel.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
 #include "group.h"
@@ -4040,17 +4041,21 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   std::shared_lock unmapLock(unmapMemoryMutex);
   sync(stepValue);
 
-  // Step 1: Self-copies (local rank reading its own inputs)
-  for (const auto& lic : op->localInputCopies) {
-    if (lic.sourceRank != rank) {
-      continue;
-    }
-    CHECK(lic.myOutputIndex < outputs.size());
-    CHECK(lic.sourceInputIndex < inputs.size());
-    uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-    uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
-    if (dst != src && lic.bytes > 0) {
-      CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
+  int kernelVersion = group->compileOpKernels->version;
+
+  // Step 1: Self-copies (v0 path only — kernel path includes them in the launch)
+  if (kernelVersion == 0) {
+    for (const auto& lic : op->localInputCopies) {
+      if (lic.sourceRank != rank) {
+        continue;
+      }
+      CHECK(lic.myOutputIndex < outputs.size());
+      CHECK(lic.sourceInputIndex < inputs.size());
+      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
+      if (dst != src && lic.bytes > 0) {
+        CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
+      }
     }
   }
 
@@ -4094,20 +4099,72 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
 
   freePendingIpcEvents();
 
-  // Step 4: GPU barrier + peer copies
-  syncPeers(stream);
-  for (size_t i : indices(op->localInputCopies)) {
-    const auto& lic = op->localInputCopies[i];
-    if (lic.sourceRank == rank) {
-      continue;
+  // Step 4: GPU copies (with synchronization)
+  if (kernelVersion > 0) {
+    // Kernel path: compile kernel if not yet done
+    if (!group->compileOpKernels->cuCopyKernel) {
+      group->compileOpKernels->compile();
     }
-    CHECK(lic.myOutputIndex < outputs.size());
-    uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-    if (lic.bytes > 0) {
-      CHECK_CU(cuMemcpyDtoDAsync(dst, srcAddrs[i], lic.bytes, stream));
+
+    // Build descriptor table (both self-copies and peer copies)
+    CompileOpCopyParameters params;
+    params.stepValue = stepValue;
+    params.concurrencyIndex = concurrencyIndex;
+    params.numDescriptors = 0;
+    params._pad = 0;
+
+    // Add self-copies
+    for (const auto& lic : op->localInputCopies) {
+      if (lic.sourceRank != rank) {
+        continue;
+      }
+      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
+      if (dst != src && lic.bytes > 0) {
+        CHECK(params.numDescriptors < kMaxCopyDescriptors);
+        auto& d = params.descriptors[params.numDescriptors++];
+        d.src = src;
+        d.dst = dst;
+        d.bytes = lic.bytes;
+      }
     }
+    // Add peer copies
+    for (size_t i : indices(op->localInputCopies)) {
+      const auto& lic = op->localInputCopies[i];
+      if (lic.sourceRank == rank) {
+        continue;
+      }
+      if (lic.bytes > 0) {
+        CHECK(params.numDescriptors < kMaxCopyDescriptors);
+        auto& d = params.descriptors[params.numDescriptors++];
+        d.src = srcAddrs[i];
+        d.dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+        d.bytes = lic.bytes;
+      }
+    }
+
+    // Single kernel launch replaces syncPeers + copies + syncPeers
+    std::array<void*, 1> kparams = {&params};
+    CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuCopyKernel,
+        group->compileOpKernels->gridSize, 1, 1,
+        group->compileOpKernels->blockSize, 1, 1,
+        0, stream, kparams.data(), nullptr));
+  } else {
+    // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
+    syncPeers(stream);
+    for (size_t i : indices(op->localInputCopies)) {
+      const auto& lic = op->localInputCopies[i];
+      if (lic.sourceRank == rank) {
+        continue;
+      }
+      CHECK(lic.myOutputIndex < outputs.size());
+      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+      if (lic.bytes > 0) {
+        CHECK_CU(cuMemcpyDtoDAsync(dst, srcAddrs[i], lic.bytes, stream));
+      }
+    }
+    syncPeers(stream);
   }
-  syncPeers(stream);
 
   // Step 5: Return result — CPU-side immediately done, GPU work is on stream
   auto result = makeShared<ApiFuture>();

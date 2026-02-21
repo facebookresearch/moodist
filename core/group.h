@@ -17,6 +17,7 @@ struct IpcMapper;
 struct CpuThread;
 struct IbCommon;
 struct Kernels;
+struct CompileOpKernels;
 struct AllGather;
 struct ReduceScatter;
 
@@ -88,6 +89,7 @@ struct Group {
   size_t numTrueIbDevs = 0;
   bool rdmaSupportsCuda = false;
   std::unique_ptr<Kernels> kernels;
+  std::unique_ptr<CompileOpKernels> compileOpKernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   CpuThread* cpuThread = nullptr;
