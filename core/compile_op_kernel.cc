@@ -18,6 +18,8 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       version = 1;
     } else if (!strcmp(env, "v2")) {
       version = 2;
+    } else if (!strcmp(env, "v3")) {
+      version = 3;
     }
   }
 }
@@ -168,7 +170,9 @@ static std::string concurrencyIndexExpr(const PeerArrayRef& arr, size_t offset =
 // The generated code references local variables: i (size_t, chunk index),
 // count (size_t, total chunks), numBlocks (uint32_t), loopBytes (size_t),
 // tid16 (size_t), src and dst (uintptr_t).
-static std::string emitCascadingCopy(const std::vector<int>& unrollFactors) {
+// storeTmpl controls the store instruction — use $addr and $val placeholders.
+static std::string emitCascadingCopy(const std::vector<int>& unrollFactors,
+    const std::string& storeTmpl = "__stwt((uint4*)($addr), $val);") {
   std::string code;
   for (int uf : unrollFactors) {
     if (uf == 1) {
@@ -181,7 +185,10 @@ static std::string emitCascadingCopy(const std::vector<int>& unrollFactors) {
           "uint4 v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n", j, j);
     }
     for (int j = 0; j < uf; j++) {
-      code += fmt::sprintf("__stwt((uint4*)(dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16), v%d);\n", j, j);
+      std::string addr = fmt::sprintf("dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16", j);
+      std::string val = fmt::sprintf("v%d", j);
+      code += replace(storeTmpl, "$addr", addr, "$val", val);
+      code += "\n";
     }
     code += fmt::sprintf("i += %d * (size_t)numBlocks;\n", uf);
     code += "}\n";
@@ -396,7 +403,7 @@ compile_op_copy(CompileOpCopyParameters params) {
   }
 
   // v2 kernel: dynamic work distribution with global atomic counter
-  if (version == 2) {
+  if (version == 2 || version == 3) {
     source += replace(
         R"z(
 __device__ uint32_t workCounter[$maxConcurrency];
@@ -702,9 +709,11 @@ void CompileOpKernels::compileMulticast() {
   // Multicast kernel using multimem.st (PTX ISA 8.1, sm_90+).
   // Each thread loads from global memory and stores to the multicast VA using
   // multimem.st, which replicates the write to all bound GPUs via NVSwitch.
-  // No shared memory staging needed — direct global → multicast.
+  // Uses the same cascading unrolled copy as v1 for throughput.
 
   std::string source;
+
+  std::string multimemCascadingCopy = emitCascadingCopy({32, 16, 8, 4, 2, 1}, "multimem_st_v4($addr, $val);");
 
   source += R"z(
 using uintptr_t = unsigned long;
@@ -749,6 +758,66 @@ __device__ void multimem_st_v4(uintptr_t dst, uint4 val) {
   );
 }
 
+// Copy a region using all blocks cooperatively via multimem.st.
+// Same structure as v1 copy_descriptor_block but stores go through NVSwitch.
+__device__ uint32_t copy_descriptor_block(
+    uint32_t dynamicBlockIndex, uintptr_t src, uintptr_t dst, size_t bytes) {
+
+  const uint32_t tid = threadIdx.x;
+  const size_t tid16 = (size_t)tid * 16;
+  const size_t loopBytes = (size_t)$blockSize * 16;
+  const uint32_t numBlocks = $gridSize;
+  const uint32_t blockIndex = dynamicBlockIndex;
+
+  // Head: align src to 16-byte boundary
+  uint32_t srcMod = (uint32_t)(src & 15);
+  if (srcMod != 0 && bytes >= 16) {
+    uint32_t headBytes = 16 - srcMod;
+    if (headBytes > bytes) headBytes = (uint32_t)bytes;
+    for (uint32_t i = tid; i < headBytes; i += $blockSize) {
+      *(volatile uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+    }
+    src += headBytes;
+    dst += headBytes;
+    bytes -= headBytes;
+  }
+
+  bool aligned = (src & 15) == 0;
+
+  if (aligned && bytes >= loopBytes) {
+    size_t count = bytes / loopBytes;
+    dynamicBlockIndex = (dynamicBlockIndex + (uint32_t)count) % numBlocks;
+    size_t i = blockIndex;
+
+    $cascadingCopy
+
+    size_t done = count * loopBytes;
+    src += done;
+    dst += done;
+    bytes -= done;
+  }
+
+  // Remaining aligned uint4 elements (less than one block stride)
+  if (aligned) {
+    uint32_t remaining16 = (uint32_t)(bytes / 16);
+    for (uint32_t i = tid; i < remaining16; i += $blockSize) {
+      uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
+      multimem_st_v4(dst + (uintptr_t)i * 16, val);
+    }
+    size_t done16 = (size_t)remaining16 * 16;
+    src += done16;
+    dst += done16;
+    bytes -= done16;
+  }
+
+  // Tail: byte copy (does not replicate via multicast)
+  for (uint32_t i = tid; i < (uint32_t)bytes; i += $blockSize) {
+    *(volatile uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+  }
+
+  return dynamicBlockIndex;
+}
+
 } // namespace
 
 extern "C" __global__ void __launch_bounds__($blockSize, 1)
@@ -766,29 +835,14 @@ compile_op_multicast(CompileOpCopyParameters params) {
   }
   syncthreads();
 
-  // Process descriptors cooperatively across all blocks
-  const uint32_t numBlocks = $gridSize;
-  const uint32_t globalTid = blockIdx.x * $blockSize + threadIdx.x;
-  const uint32_t totalThreads = numBlocks * $blockSize;
-
+  // Copy work: dynamic block index rotates across descriptors
+  uint32_t dynamicBlockIndex = blockIdx.x;
   for (uint32_t d = 0; d < params.numDescriptors; d++) {
-    uintptr_t src = params.descriptors[d].src;
-    uintptr_t dst = params.descriptors[d].dst;
-    uint32_t totalBytes = params.descriptors[d].bytes;
-
-    // Aligned uint4 elements (16 bytes each) — use multimem.st
-    uint32_t elements = totalBytes / 16;
-    for (uint32_t i = globalTid; i < elements; i += totalThreads) {
-      uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
-      multimem_st_v4(dst + (uintptr_t)i * 16, val);
-    }
-
-    // Tail bytes (< 16) — use regular byte stores
-    uint32_t tailStart = elements * 16;
-    uint32_t tailBytes = totalBytes - tailStart;
-    for (uint32_t i = globalTid; i < tailBytes; i += totalThreads) {
-      *(volatile uint8_t*)(dst + tailStart + i) = *(const uint8_t*)(src + tailStart + i);
-    }
+    dynamicBlockIndex = copy_descriptor_block(
+        dynamicBlockIndex,
+        params.descriptors[d].src,
+        params.descriptors[d].dst,
+        params.descriptors[d].bytes);
   }
 
   // Fence to ensure multicast writes are visible across devices
@@ -806,8 +860,9 @@ compile_op_multicast(CompileOpCopyParameters params) {
 
   source =
       replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency", (size_t)Group::maxConcurrency,
-          "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits, "$copyDoneWrites", copyDoneWrites,
-          "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize", blockSize);
+          "$cascadingCopy", multimemCascadingCopy, "$stepValueWrites", stepValueWrites, "$stepValueWaits",
+          stepValueWaits, "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize,
+          "$blockSize", blockSize);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);
