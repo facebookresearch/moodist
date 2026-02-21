@@ -3,6 +3,7 @@
 #pragma once
 
 #include "api/allocator.h"
+#include "api/allocator_api.h"
 #include "common.h"
 #include "function.h"
 #include "hash_map.h"
@@ -72,6 +73,9 @@ struct IpcMapper {
   void sendRequestEvent(size_t peerIndex, const CUipcEventHandle& handle, Function<void(uintptr_t)> callback);
 
   void sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, Function<void(uintptr_t)> callback);
+
+  void sendRequestVMM(size_t peerIndex, CUmemGenericAllocationHandle handle, size_t handleSize, size_t offset,
+      Function<void(uintptr_t)> callback);
 
   void* getMySharedMem(size_t offset, size_t size);
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size);
@@ -164,6 +168,10 @@ struct IpcMapper {
     unsigned long long bufferId = -1;
     CUdeviceptr base = 0;
     size_t size = 0;
+    bool isVMM = false;
+    CUmemGenericAllocationHandle vmmHandle = 0;
+    size_t vmmOffset = 0;
+    size_t vmmHandleSize = 0;
 
     auto myRegion = allocator::mappedRegion(address);
 
@@ -171,6 +179,21 @@ struct IpcMapper {
       bufferId = myRegion.first;
       base = myRegion.first;
       size = myRegion.second;
+
+      // Allocator memory uses VMM — look up the VMM handle
+      unsigned long long handle;
+      size_t handleOffset, handleSize;
+      if (allocatorGetVMMHandle(address, &handle, &handleOffset, &handleSize)) {
+        isVMM = true;
+        vmmHandle = handle;
+        vmmHandleSize = handleSize;
+        // Compute the base address of this VMM handle chunk
+        // The handle covers [address - handleOffset, address - handleOffset + handleSize)
+        base = address - handleOffset;
+        size = handleSize;
+        vmmOffset = handleOffset;
+        bufferId = base; // Use the chunk base as a stable identifier
+      }
     } else {
       CHECK_CU(cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, address));
       CHECK(bufferId != -1);
@@ -189,8 +212,6 @@ struct IpcMapper {
     auto i = addressMap.find(base);
     if (i != addressMap.end()) {
       if (i->second.second == bufferId) {
-        // fmt::printf("requestAddress: %#x bytes at %#x is already mapped at %#x\n", length, address,
-        // i->second.first);
         size_t offset = address - base;
         callback(i->second.first + offset);
         return;
@@ -200,83 +221,155 @@ struct IpcMapper {
     }
 
     CHECK(size >= length);
-    log.debug("requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length,
-        address, size, base, bufferId);
-    CUipcMemHandle handle;
-    CHECK_CU(cuIpcGetMemHandle(&handle, base));
     size_t offset = address - base;
-    Mapped& mapped = peerIpcMap[peerIndex][handle];
-    uintptr_t baseAddress = mapped.peerAddress;
-    if (baseAddress) {
-      log.debug("requestAddress: (allocation mapped) %#x bytes at %#x is already mapped at %#x (offset %#x)\n", length,
-          address, baseAddress + offset, offset);
-      CHECK(mapped.localAddress == base);
-      CHECK(mapped.size == size);
-      CHECK(mapped.bufferId == bufferId);
-      CHECK(mapped.unmappable == unmappable);
-      addressMap[base] = {baseAddress, bufferId};
-      l.unlock();
-      callback(baseAddress + offset);
-    } else {
-      auto it = peerMapCallbacks[peerIndex].find(handle);
-      if (it != peerMapCallbacks[peerIndex].end()) {
-        CHECK(waitCount > 0);
-        auto& q = it->second;
-        CHECK(q.bufferId == bufferId);
-        CHECK(q.base == base);
-        CHECK(q.size == size);
+
+    if (isVMM) {
+      // VMM path: use cuMemExportToShareableHandle + Unix socket fd exchange
+      log.debug("requestAddress (VMM): %#x bytes at %#x, handle chunk %#x bytes at %#x (offset %#x)\n", length, address,
+          size, base, offset);
+
+      // Check if we already have a VMM mapping for this base
+      // We use a synthetic CUipcMemHandle keyed by base address for tracking
+      CUipcMemHandle syntheticHandle;
+      std::memset(&syntheticHandle, 0, sizeof(syntheticHandle));
+      std::memcpy(&syntheticHandle, &base, sizeof(base));
+
+      Mapped& mapped = peerIpcMap[peerIndex][syntheticHandle];
+      uintptr_t baseAddress = mapped.peerAddress;
+      if (baseAddress) {
+        log.debug("requestAddress (VMM): already mapped at %#x (offset %#x)\n", baseAddress + offset, offset);
+        CHECK(mapped.localAddress == base);
+        CHECK(mapped.size == size);
+        addressMap[base] = {baseAddress, bufferId};
+        l.unlock();
+        callback(baseAddress + offset);
+      } else {
+        auto it = peerMapCallbacks[peerIndex].find(syntheticHandle);
+        if (it != peerMapCallbacks[peerIndex].end()) {
+          CHECK(waitCount > 0);
+          auto& q = it->second;
+          CHECK(q.base == base);
+          CHECK(q.size == size);
+          q.list.emplace_back();
+          auto& e = q.list.back();
+          e.callback = std::move(callback);
+          e.offset = offset;
+          e.address = address;
+          log.debug("requestAddress (VMM): already being mapped, adding callback\n");
+          return;
+        }
+        auto& q = peerMapCallbacks[peerIndex][syntheticHandle];
+        q.bufferId = bufferId;
+        q.base = base;
+        q.size = size;
         q.list.emplace_back();
         auto& e = q.list.back();
         e.callback = std::move(callback);
         e.offset = offset;
         e.address = address;
-        log.debug("requestAddress: already being mapped, adding callback\n");
-        return;
+        l.unlock();
+        ++waitCount;
+        sendRequestVMM(peerIndex, vmmHandle, vmmHandleSize, 0,
+            [this, peerIndex, syntheticHandle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
+              auto& v = peerIpcMap[peerIndex][syntheticHandle];
+              v.localAddress = base;
+              v.peerAddress = mappedAddress;
+              v.size = size;
+              v.unmappable = unmappable;
+              v.bufferId = bufferId;
+              auto it = peerMapCallbacks[peerIndex].find(syntheticHandle);
+              CHECK(it != peerMapCallbacks[peerIndex].end());
+              auto& q = it->second;
+              CHECK(!q.list.empty());
+              for (auto& e : q.list) {
+                log.debug("requestAddress (VMM): new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length,
+                    e.address, mappedAddress + e.offset, e.offset);
+                peerIpcAddressMap[peerIndex][e.address] = {mappedAddress, bufferId};
+                std::move(e.callback)(mappedAddress + e.offset);
+              }
+              peerMapCallbacks[peerIndex].erase(it);
+              --waitCount;
+            });
       }
-      std::vector<CUipcMemHandle> unmapList;
-      auto& ipcMap = peerIpcMap[peerIndex];
-      for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
-        if (i->second.localAddress + i->second.size > base && i->second.localAddress < base + size) {
-          log.debug(
-              "requestAddress: enqueueing unmap of %#x bytes at %#x (mapped at %#x) due to allocations changing!\n",
-              i->second.size, i->second.localAddress, i->second.peerAddress);
-          peerQueuedUnmaps[peerIndex].emplace(i->first, true);
-          hasQueuedUnmaps = true;
+    } else {
+      // Legacy IPC path: cuIpcGetMemHandle
+      log.debug("requestAddress: %#x bytes at %#x is part of allocation of %#x bytes at %#x (buffer id %d)\n", length,
+          address, size, base, bufferId);
+      CUipcMemHandle handle;
+      CHECK_CU(cuIpcGetMemHandle(&handle, base));
+      Mapped& mapped = peerIpcMap[peerIndex][handle];
+      uintptr_t baseAddress = mapped.peerAddress;
+      if (baseAddress) {
+        log.debug("requestAddress: (allocation mapped) %#x bytes at %#x is already mapped at %#x (offset %#x)\n",
+            length, address, baseAddress + offset, offset);
+        CHECK(mapped.localAddress == base);
+        CHECK(mapped.size == size);
+        CHECK(mapped.bufferId == bufferId);
+        CHECK(mapped.unmappable == unmappable);
+        addressMap[base] = {baseAddress, bufferId};
+        l.unlock();
+        callback(baseAddress + offset);
+      } else {
+        auto it = peerMapCallbacks[peerIndex].find(handle);
+        if (it != peerMapCallbacks[peerIndex].end()) {
+          CHECK(waitCount > 0);
+          auto& q = it->second;
+          CHECK(q.bufferId == bufferId);
+          CHECK(q.base == base);
+          CHECK(q.size == size);
+          q.list.emplace_back();
+          auto& e = q.list.back();
+          e.callback = std::move(callback);
+          e.offset = offset;
+          e.address = address;
+          log.debug("requestAddress: already being mapped, adding callback\n");
+          return;
         }
+        std::vector<CUipcMemHandle> unmapList;
+        auto& ipcMap = peerIpcMap[peerIndex];
+        for (auto i = ipcMap.begin(); i != ipcMap.end(); ++i) {
+          if (i->second.localAddress + i->second.size > base && i->second.localAddress < base + size) {
+            log.debug(
+                "requestAddress: enqueueing unmap of %#x bytes at %#x (mapped at %#x) due to allocations changing!\n",
+                i->second.size, i->second.localAddress, i->second.peerAddress);
+            peerQueuedUnmaps[peerIndex].emplace(i->first, true);
+            hasQueuedUnmaps = true;
+          }
+        }
+        auto& q = peerMapCallbacks[peerIndex][handle];
+        q.bufferId = bufferId;
+        q.base = base;
+        q.size = size;
+        q.list.emplace_back();
+        auto& e = q.list.back();
+        e.callback = std::move(callback);
+        e.offset = offset;
+        e.address = address;
+        l.unlock();
+        ++waitCount;
+        sendRequestAddress(peerIndex, handle, size,
+            [this, peerIndex, handle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
+              auto& v = peerIpcMap[peerIndex][handle];
+              v.localAddress = base;
+              v.peerAddress = mappedAddress;
+              v.size = size;
+              v.unmappable = unmappable;
+              v.bufferId = bufferId;
+              auto it = peerMapCallbacks[peerIndex].find(handle);
+              CHECK(it != peerMapCallbacks[peerIndex].end());
+              auto& q = it->second;
+              CHECK(q.bufferId == bufferId);
+              CHECK(!q.list.empty());
+              for (auto& e : q.list) {
+                log.debug("requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length,
+                    e.address, mappedAddress + e.offset, e.offset);
+                peerIpcAddressMap[peerIndex][e.address] = {mappedAddress, bufferId};
+                std::move(e.callback)(mappedAddress + e.offset);
+              }
+              peerMapCallbacks[peerIndex].erase(it);
+              --waitCount;
+            });
       }
-      auto& q = peerMapCallbacks[peerIndex][handle];
-      q.bufferId = bufferId;
-      q.base = base;
-      q.size = size;
-      q.list.emplace_back();
-      auto& e = q.list.back();
-      e.callback = std::move(callback);
-      e.offset = offset;
-      e.address = address;
-      l.unlock();
-      ++waitCount;
-      sendRequestAddress(peerIndex, handle, size,
-          [this, peerIndex, handle, bufferId, length, base, size, unmappable](uintptr_t mappedAddress) {
-            auto& v = peerIpcMap[peerIndex][handle];
-            v.localAddress = base;
-            v.peerAddress = mappedAddress;
-            v.size = size;
-            v.unmappable = unmappable;
-            v.bufferId = bufferId;
-            auto it = peerMapCallbacks[peerIndex].find(handle);
-            CHECK(it != peerMapCallbacks[peerIndex].end());
-            auto& q = it->second;
-            CHECK(q.bufferId == bufferId);
-            CHECK(!q.list.empty());
-            for (auto& e : q.list) {
-              log.debug("requestAddress: new mapping -> %#x bytes at %#x mapped at %#x (offset %#x)\n", length,
-                  e.address, mappedAddress + e.offset, e.offset);
-              peerIpcAddressMap[peerIndex][e.address] = {mappedAddress, bufferId};
-              std::move(e.callback)(mappedAddress + e.offset);
-            }
-            peerMapCallbacks[peerIndex].erase(it);
-            --waitCount;
-          });
     }
   }
 

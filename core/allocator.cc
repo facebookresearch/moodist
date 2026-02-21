@@ -407,6 +407,7 @@ struct CudaAllocatorImpl {
   size_t nextMapBase = 0;
 
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
+  size_t allocationGranularity = 0;
 
   LocalFreeList<Vector<CUstream>> freeListStreams;
   LocalFreeList<EventRegion> freeListEventRegions;
@@ -544,28 +545,25 @@ struct CudaAllocatorImpl {
     return i;
   }
 
+  // Returns (handle, offset_within_handle, handle_size) for a given address,
+  // or nullopt if the address is not from a VMM allocation.
+  std::optional<std::tuple<CUmemGenericAllocationHandle, size_t, size_t>> getHandleForAddress(uintptr_t address) {
+    uintptr_t base = reservedBase.load(std::memory_order_relaxed);
+    if (base == 0) {
+      return std::nullopt;
+    }
+    uintptr_t chunkBase = base;
+    for (auto& [chunkSize, handle] : cuMemHandles) {
+      if (address >= chunkBase && address < chunkBase + chunkSize) {
+        size_t offset = address - chunkBase;
+        return std::tuple{handle, offset, chunkSize};
+      }
+      chunkBase += chunkSize;
+    }
+    return std::nullopt;
+  }
+
   bool mapMoreMemory(size_t minbytes, int currentDeviceIndex, CUstream currentStream) {
-    // if (reservedBase == 0) {
-    //   size_t free = 0;
-    //   size_t total = 0;
-    //   CHECK_CU(cuMemGetInfo(&free, &total));
-    //   memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free,
-    //   total);
-
-    //   constexpr size_t alignment = (size_t)1024 * 1024 * 1024 * 1024;
-    //   size_t reserveSize = (total + alignment - 1) / alignment * alignment;
-
-    //   memlog.info("Moodist CUDA Allocator reserving %d bytes\n", reserveSize);
-
-    //   CUdeviceptr base = 0;
-    //   CHECK_CU(cuMemAddressReserve(&base, reserveSize, alignment, 0, 0));
-    //   reservedBase = base;
-    //   reservedSize = reserveSize;
-    //   nextMapBase = base;
-
-    //   deviceIndex = currentDeviceIndex;
-    // }
-
     std::lock_guard mrl(mappedRegionsMutex);
 
     size_t free = 0;
@@ -592,71 +590,78 @@ struct CudaAllocatorImpl {
     if (bytes < minbytes) {
       return false;
     }
-    // // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 1024 * 4));
-    // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 512));
 
-    // CUmemGenericAllocationHandle handle;
-    // CUmemAllocationProp prop;
-    // std::memset(&prop, 0, sizeof(prop));
-    // prop.location.id = deviceIndex;
-    // prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    // prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    // prop.allocFlags.gpuDirectRDMACapable = 1;
+    // Initialize VA reservation on first call
+    if (reservedBase == 0) {
+      CUmemAllocationProp prop;
+      std::memset(&prop, 0, sizeof(prop));
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop.location.id = deviceIndex;
+      prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    // constexpr size_t alignment = (size_t)1024 * 1024 * 128;
-    // bytes = (bytes + alignment - 1) / alignment * alignment;
+      size_t granularity = 0;
+      CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+      allocationGranularity = granularity;
 
-    // CHECK_CU(cuMemCreate(&handle, bytes, &prop, 0));
+      constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+      CUdeviceptr base = 0;
+      CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+      reservedBase = base;
+      reservedSize = reserveSize;
+      nextMapBase = base;
 
-    // cuMemHandles.emplace_back(bytes, handle);
+      memlog.info(
+          "Moodist CUDA Allocator reserved %d bytes of VA at %#x (granularity %d)\n", reserveSize, base, granularity);
+    }
 
-    // uintptr_t address = nextMapBase;
-    // nextMapBase += bytes;
+    // Round up to allocation granularity
+    size_t granularity = allocationGranularity;
+    bytes = (bytes + granularity - 1) / granularity * granularity;
 
-    // memlog.info("mem map %#x %#x\n", address, bytes);
+    CUmemAllocationProp prop;
+    std::memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = deviceIndex;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    // CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
-
-    // int ndevices = 0;
-    // CHECK_CU(cuDeviceGetCount(&ndevices));
-
-    // log.info("device count is %d\n", ndevices);
-
-    // //CHECK(false);
-
-    // for (size_t i = 0; i != ndevices; ++i) {
-    //   std::array<CUmemAccessDesc, 1> desc;
-    //   std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-    //   desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    //   desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    //   desc[0].location.id = i;
-    //   CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
-    //   log.info("access ok for device %d\n", i);
-    // }
-
-    CUdeviceptr ptr;
-    auto err = cuMemAlloc(&ptr, bytes);
+    CUmemGenericAllocationHandle handle;
+    auto err = cuMemCreate(&handle, bytes, &prop, 0);
     while (err != CUDA_SUCCESS) {
-      if (bytes > minbytes + 1024 * 1024) {
-        bytes -= 1024 * 1024;
+      if (bytes > minbytes + granularity) {
+        bytes -= granularity;
       } else {
-        bytes = minbytes;
+        bytes = (minbytes + granularity - 1) / granularity * granularity;
       }
-      err = cuMemAlloc(&ptr, bytes);
-      if (bytes <= minbytes) {
+      err = cuMemCreate(&handle, bytes, &prop, 0);
+      if (bytes <= (minbytes + granularity - 1) / granularity * granularity) {
         break;
       }
     }
     if (err != CUDA_SUCCESS) {
       const char* str = "unknown cuda error";
       cuGetErrorString(err, &str);
-      memlog.error("CUDA Allocator failed to map %d bytes; %s\n", bytes, str);
+      memlog.error("CUDA Allocator failed to create %d bytes; %s\n", bytes, str);
       return false;
     }
-    uintptr_t address = ptr;
 
-    memlog.info("Moodist successfully mapped %d bytes at %#x\n", bytes, address);
+    uintptr_t address = nextMapBase;
+    CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
+
+    CUmemAccessDesc accessDesc;
+    std::memset(&accessDesc, 0, sizeof(accessDesc));
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = deviceIndex;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CHECK_CU(cuMemSetAccess(address, bytes, &accessDesc, 1));
+
+    cuMemHandles.emplace_back(bytes, handle);
+    nextMapBase += bytes;
+
+    memlog.info("Moodist successfully mapped %d bytes at %#x (cuMemCreate + cuMemMap)\n", bytes, address);
 
     add_span(mappedRegions, address, address + bytes);
 
@@ -1300,6 +1305,22 @@ void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* out
   auto result = allocatorMappedRegion(address);
   *outBase = result.first;
   *outSize = result.second;
+}
+
+bool allocatorGetVMMHandle(uintptr_t address, unsigned long long* outHandle, size_t* outOffset, size_t* outSize) {
+  if (!globalCudaAllocatorImpl) {
+    return false;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  auto result = globalCudaAllocatorImpl->getHandleForAddress(address);
+  if (!result) {
+    return false;
+  }
+  auto& [handle, offset, size] = *result;
+  *outHandle = handle;
+  *outOffset = offset;
+  *outSize = size;
+  return true;
 }
 
 // allocator namespace functions that are in core

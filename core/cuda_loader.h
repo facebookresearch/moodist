@@ -53,6 +53,60 @@ using cuuint32_t = uint32_t;
 // Virtual memory management handle
 using CUmemGenericAllocationHandle = unsigned long long;
 
+// Virtual memory management enums
+enum CUmemLocationType {
+  CU_MEM_LOCATION_TYPE_INVALID = 0,
+  CU_MEM_LOCATION_TYPE_DEVICE = 1,
+};
+
+enum CUmemAllocationType {
+  CU_MEM_ALLOCATION_TYPE_INVALID = 0,
+  CU_MEM_ALLOCATION_TYPE_PINNED = 1,
+};
+
+enum CUmemAllocationHandleType {
+  CU_MEM_HANDLE_TYPE_NONE = 0,
+  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1,
+  CU_MEM_HANDLE_TYPE_WIN32 = 2,
+  CU_MEM_HANDLE_TYPE_WIN32_KMT = 4,
+  CU_MEM_HANDLE_TYPE_FABRIC = 8,
+};
+
+enum CUmemAccess_flags {
+  CU_MEM_ACCESS_FLAGS_PROT_NONE = 0,
+  CU_MEM_ACCESS_FLAGS_PROT_READ = 1,
+  CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3,
+};
+
+enum CUmemAllocationGranularity_flags {
+  CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0,
+  CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 1,
+};
+
+// Virtual memory management structs
+struct CUmemLocation {
+  CUmemLocationType type;
+  int id;
+};
+
+struct CUmemAllocationProp {
+  CUmemAllocationType type;
+  CUmemAllocationHandleType requestedHandleTypes;
+  CUmemLocation location;
+  void* win32HandleMetaData;
+  struct {
+    unsigned char compressionType;
+    unsigned char gpuDirectRDMACapable;
+    unsigned short usage;
+    unsigned char reserved[4];
+  } allocFlags;
+};
+
+struct CUmemAccessDesc {
+  CUmemLocation location;
+  CUmemAccess_flags flags;
+};
+
 constexpr int CU_IPC_HANDLE_SIZE = 64;
 
 struct CUipcMemHandle {
@@ -243,6 +297,21 @@ using cuMemUnmap_t = CUresult (*)(CUdeviceptr ptr, size_t size);
 using cuMemAddressFree_t = CUresult (*)(CUdeviceptr ptr, size_t size);
 using cuMemRelease_t = CUresult (*)(uint64_t handle);
 
+// Virtual memory management
+using cuMemCreate_t = CUresult (*)(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags);
+using cuMemAddressReserve_t = CUresult (*)(
+    CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
+using cuMemMap_t = CUresult (*)(
+    CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
+using cuMemSetAccess_t = CUresult (*)(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+using cuMemGetAllocationGranularity_t = CUresult (*)(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option);
+using cuMemExportToShareableHandle_t = CUresult (*)(void* shareableHandle, CUmemGenericAllocationHandle handle,
+    CUmemAllocationHandleType handleType, unsigned long long flags);
+using cuMemImportShareableHandle_t = CUresult (*)(
+    CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType);
+
 // Pointer attributes
 using cuPointerGetAttribute_t = CUresult (*)(void* data, CUpointer_attribute attribute, CUdeviceptr ptr);
 using cuPointerSetAttribute_t = CUresult (*)(const void* value, CUpointer_attribute attribute, CUdeviceptr ptr);
@@ -330,6 +399,15 @@ struct CudaApi {
   cuMemUnmap_t memUnmap = nullptr;
   cuMemAddressFree_t memAddressFree = nullptr;
   cuMemRelease_t memRelease = nullptr;
+
+  // Virtual memory management
+  cuMemCreate_t memCreate = nullptr;
+  cuMemAddressReserve_t memAddressReserve = nullptr;
+  cuMemMap_t memMap = nullptr;
+  cuMemSetAccess_t memSetAccess = nullptr;
+  cuMemGetAllocationGranularity_t memGetAllocationGranularity = nullptr;
+  cuMemExportToShareableHandle_t memExportToShareableHandle = nullptr;
+  cuMemImportShareableHandle_t memImportShareableHandle = nullptr;
 
   // Pointer attributes
   cuPointerGetAttribute_t pointerGetAttribute = nullptr;
@@ -471,6 +549,33 @@ inline CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
 }
 inline CUresult cuMemRelease(uint64_t handle) {
   return cudaApi.memRelease(handle);
+}
+inline CUresult cuMemCreate(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags) {
+  return cudaApi.memCreate(handle, size, prop, flags);
+}
+inline CUresult cuMemAddressReserve(
+    CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags) {
+  return cudaApi.memAddressReserve(ptr, size, alignment, addr, flags);
+}
+inline CUresult cuMemMap(
+    CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags) {
+  return cudaApi.memMap(ptr, size, offset, handle, flags);
+}
+inline CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count) {
+  return cudaApi.memSetAccess(ptr, size, desc, count);
+}
+inline CUresult cuMemGetAllocationGranularity(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option) {
+  return cudaApi.memGetAllocationGranularity(granularity, prop, option);
+}
+inline CUresult cuMemExportToShareableHandle(void* shareableHandle, CUmemGenericAllocationHandle handle,
+    CUmemAllocationHandleType handleType, unsigned long long flags) {
+  return cudaApi.memExportToShareableHandle(shareableHandle, handle, handleType, flags);
+}
+inline CUresult cuMemImportShareableHandle(
+    CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType) {
+  return cudaApi.memImportShareableHandle(handle, osHandle, shHandleType);
 }
 inline CUresult cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr) {
   return cudaApi.pointerGetAttribute(data, attribute, ptr);
