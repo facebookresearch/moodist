@@ -94,6 +94,18 @@ struct IpcMapper {
 
   void sendNextVMMChunk(size_t peerIndex);
 
+  // Phase 1: Share a multicast handle with a peer. The peer's handler thread
+  // will import the handle and call cuMulticastAddDevice. The callback receives
+  // a handle index that must be passed to sendMulticastBind in Phase 2.
+  // ALL devices must complete addDevice before ANY device can bind.
+  void sendMulticastHandle(
+      size_t peerIndex, CUmemGenericAllocationHandle mcHandle, size_t size, Function<void(uintptr_t)> callback);
+
+  // Phase 2: Tell a peer to allocate scratch, bind, and map a multicast object
+  // that was previously registered via sendMulticastHandle. handleIndex is the
+  // value returned by the Phase 1 callback. Callback receives the peer's multicast VA.
+  void sendMulticastBind(size_t peerIndex, size_t handleIndex, size_t size, Function<void(uintptr_t)> callback);
+
   void* getMySharedMem(size_t offset, size_t size);
   void* getPeerSharedMem(size_t peerIndex, size_t offset, size_t size);
 

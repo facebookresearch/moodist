@@ -627,21 +627,62 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
     }
 
-    // int localSupportsMulticast = 0;
-    // CHECK_CU(cuDeviceGetAttribute(&localSupportsMulticast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
-    // supportsMulticast = localSupportsMulticast;
-    // for (size_t i : peerIndices) {
-    //   setupComms->sendTo(ipcRanks[i], supportsMulticast);
-    // }
-    // for (size_t i : peerIndices) {
-    //   supportsMulticast &= setupComms->recvFrom<bool>(ipcRanks[i]);
-    // }
+    // Fabric handle support detection — probe with an actual cuMemCreate
+    // since the device attribute alone doesn't guarantee IMEX is running.
+    {
+      bool localSupportsFabric = false;
+      int fabricAttr = 0;
+      cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
+      if (fabricAttr != 0) {
+        CUmemAllocationProp prop;
+        std::memset(&prop, 0, sizeof(prop));
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes =
+            (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = cuDevice;
 
-    // if (supportsMulticast) {
-    //   log.info("Multicast supported by all local devices\n");
-    // } else {
-    //   log.info("Multicast not supported by all local devices\n");
-    // }
+        size_t granularity = 0;
+        CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+        CUmemGenericAllocationHandle probeHandle;
+        auto probeErr = cuMemCreate(&probeHandle, granularity, &prop, 0);
+        if (probeErr == CUDA_SUCCESS) {
+          cuMemRelease(probeHandle);
+          localSupportsFabric = true;
+        }
+      }
+      supportsFabric = localSupportsFabric;
+      for (size_t i : ipcRanks) {
+        setupComms->sendTo(i, localSupportsFabric);
+      }
+      for (size_t i : ipcRanks) {
+        supportsFabric &= setupComms->recvFrom<bool>(i);
+      }
+      if (supportsFabric) {
+        log.info("Fabric handles supported for VMM IPC\n");
+      } else {
+        log.info("Fabric handles not available, using POSIX fd for VMM IPC\n");
+      }
+    }
+
+    // Multicast support detection
+    int mcAttr = 0;
+    CHECK_CU(cuDeviceGetAttribute(&mcAttr, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
+    bool localSupportsMulticast = mcAttr != 0;
+    supportsMulticast = localSupportsMulticast;
+    for (size_t i : ipcRanks) {
+      setupComms->sendTo(i, supportsMulticast);
+    }
+    for (size_t i : ipcRanks) {
+      supportsMulticast &= setupComms->recvFrom<bool>(i);
+    }
+
+    if (supportsMulticast) {
+      log.info("Multicast supported by all local devices\n");
+    } else {
+      log.info("Multicast not supported by all local devices\n");
+    }
 
     if (rank == 0) {
       log.debug(

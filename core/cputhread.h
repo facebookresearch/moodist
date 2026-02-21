@@ -359,10 +359,10 @@ struct CustomOpDescriptor {
   };
 
   IVector<Read> reads;
-  IVector<Read> directReads;                // IB reads with no local sharing
-  IVector<GatewayRead> gatewayReads;        // I fetch via IB for local group
-  IVector<LocalCopy> localCopies;           // I copy from gateway's output via NVLink
-  IVector<LocalInputCopy> localInputCopies; // I copy from local rank's input via NVLink
+  IVector<Read> directReads;                     // IB reads with no local sharing
+  IVector<GatewayRead> gatewayReads;             // I fetch via IB for local group
+  IVector<LocalCopy> localCopies;                // I copy from gateway's output via NVLink
+  IVector<LocalInputCopy> localInputCopies;      // I copy from local rank's input via NVLink
   IVector<LocalInputProvide> localInputProvides; // Peers that will read my inputs (allLocal path)
   IVector<Copy> inputCopies;
   IVector<Copy> outputCopies;
@@ -375,8 +375,30 @@ struct CustomOpDescriptor {
   IVector<DeviceType> inputDevices;
   IVector<DeviceType> outputDevices;
   DType dtype;
-  bool cpuSync = false; // Force CPU-side wait in customOp before CUDA operations
+  bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
+
+  // Multicast: source writes input data to mcVA, NVSwitch delivers to all peers' scratch buffers.
+  // Source entries: one per multicast region this rank created (kernel writes input → mcVA).
+  struct MulticastSource {
+    uint32_t sourceInputIndex;
+    size_t sourceInputOffset;
+    size_t bytes;
+    CUdeviceptr mcVA = 0;
+  };
+  // Destination entries: one per copy served by multicast (kernel copies scratchVA → output).
+  struct MulticastDest {
+    uint32_t sourceRank;
+    uint32_t sourceInputIndex;
+    size_t sourceInputOffset;
+    size_t bytes;
+    uint32_t myOutputIndex;
+    size_t myOutputOffset;
+    CUdeviceptr scratchVA = 0;
+    size_t allocSize = 0;
+  };
+  IVector<MulticastSource> multicastSources;
+  IVector<MulticastDest> multicastDests;
 };
 
 struct QueueEntryCustom : QueueEntry {

@@ -1043,9 +1043,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
       TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
   // executeLocalOnly - fast path for all-local custom ops (no CPU thread)
-  SharedPtr<ApiFuture> executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op,
-      std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs,
-      TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
+  SharedPtr<ApiFuture> executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op, std::vector<TensorDataPtr>& inputs,
+      std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
       uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream);
 
   // cat - concatenate tensors from multiple ranks
@@ -3948,8 +3947,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
   // Fast path: all-local, all-CUDA, no copies — skip CPU thread entirely
   if (op->allLocal) {
-    return executeLocalOnly(op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs,
-        concurrencyIndex, stepValue, stream);
+    return executeLocalOnly(
+        op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs, concurrencyIndex, stepValue, stream);
   }
 
   // Slow path: dispatch to CPU thread
@@ -4085,9 +4084,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 // ============================================================================
 
 SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op,
-    std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs,
-    TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
-    uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream) {
+    std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs,
+    TensorPtr* outputPtrs, size_t nOutputs, uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream) {
 
   EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
   StreamGuard sg(stream, group->deviceIndex);
@@ -4099,6 +4097,97 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   sync(stepValue);
 
   int kernelVersion = group->compileOpKernels->version;
+
+  // ==========================================================================
+  // Multicast path: O(1) delivery via NVSwitch multicast.
+  // Scratch buffers are permanently bound — no per-call rebinding.
+  // multicastSources/multicastDests are cleanly separated from localInputCopies.
+  // ==========================================================================
+  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) && kernelVersion > 0) {
+    // Lazy compile of multicast kernel
+    if (!group->compileOpKernels->cuMulticastKernel) {
+      group->compileOpKernels->compileMulticast();
+    }
+
+    // Peer sync for collective mismatch detection
+    for (size_t peerIndex : peerIndices) {
+      peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
+    }
+    for (size_t peerIndex : peerIndices) {
+      peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
+    }
+
+    freePendingIpcEvents();
+
+    // Source writes input data to multicast VA.
+    CompileOpCopyParameters params;
+    params.stepValue = stepValue;
+    params.concurrencyIndex = concurrencyIndex;
+    params.numDescriptors = 0;
+    params._pad = 0;
+
+    for (const auto& ms : op->multicastSources) {
+      if (ms.bytes == 0) {
+        continue;
+      }
+      CHECK(params.numDescriptors < kMaxCopyDescriptors);
+      auto& d = params.descriptors[params.numDescriptors++];
+      d.src = inputs[ms.sourceInputIndex]->data() + ms.sourceInputOffset;
+      d.dst = ms.mcVA;
+      d.bytes = ms.bytes;
+    }
+
+    if (params.numDescriptors > 0) {
+      std::array<void*, 1> kparams = {&params};
+      CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuMulticastKernel, group->compileOpKernels->gridSize, 1, 1,
+          group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+    }
+
+    // Step M2: Copy from scratch VA to output tensors.
+    // Data has arrived in each peer's scratch buffer via the multicast.
+    for (const auto& md : op->multicastDests) {
+      if (md.bytes == 0) {
+        continue;
+      }
+      CHECK(md.myOutputIndex < outputs.size());
+      uintptr_t dst = outputs[md.myOutputIndex]->data() + md.myOutputOffset;
+      uintptr_t src = md.scratchVA;
+      CHECK_CU(cuMemcpyDtoDAsync(dst, src, md.bytes, stream));
+    }
+
+    // Self-copies remaining in localInputCopies (sourceRank == rank).
+    for (const auto& lic : op->localInputCopies) {
+      if (lic.sourceRank != rank || lic.bytes == 0) {
+        continue;
+      }
+      CHECK(lic.myOutputIndex < outputs.size());
+      CHECK(lic.sourceInputIndex < inputs.size());
+      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
+      if (dst != src) {
+        CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
+      }
+    }
+
+    // Step M4: Return result
+    auto result = makeShared<ApiFuture>();
+    auto future = FutureImplSharedPtr::make();
+    future->done = 1;
+    result->impl = std::move(future);
+
+    for (size_t i = 0; i < nInputs; ++i) {
+      result->holdTensors.push_back(inputPtrs[i]);
+    }
+    for (size_t i = 0; i < nOutputs; ++i) {
+      result->holdTensors.push_back(outputPtrs[i]);
+    }
+
+    return result;
+  }
+
+  // ==========================================================================
+  // Copy path: O(N²) peer copies via kernel or cuMemcpy
+  // ==========================================================================
 
   // Step 1: Self-copies (v0 path only — kernel path includes them in the launch)
   if (kernelVersion == 0) {
@@ -4202,10 +4291,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
 
     // Single kernel launch replaces syncPeers + copies + syncPeers
     std::array<void*, 1> kparams = {&params};
-    CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuCopyKernel,
-        group->compileOpKernels->gridSize, 1, 1,
-        group->compileOpKernels->blockSize, 1, 1,
-        0, stream, kparams.data(), nullptr));
+    CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize, 1, 1,
+        group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
   } else {
     // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
     syncPeers(stream);

@@ -173,6 +173,14 @@ bool loadCuda() {
     cudaApi.launchKernel = (cuLaunchKernel_t)loadSym(lib, "cuLaunchKernel", name, ok, failed);
     cudaApi.launchHostFunc = (cuLaunchHostFunc_t)loadSym(lib, "cuLaunchHostFunc", name, ok, failed);
 
+    // Multicast (Hopper+ with NVSwitch)
+    cudaApi.multicastCreate = (cuMulticastCreate_t)loadSym(lib, "cuMulticastCreate", name, ok, failed);
+    cudaApi.multicastAddDevice = (cuMulticastAddDevice_t)loadSym(lib, "cuMulticastAddDevice", name, ok, failed);
+    cudaApi.multicastBindMem = (cuMulticastBindMem_t)loadSym(lib, "cuMulticastBindMem", name, ok, failed);
+    cudaApi.multicastGetGranularity =
+        (cuMulticastGetGranularity_t)loadSym(lib, "cuMulticastGetGranularity", name, ok, failed);
+    cudaApi.multicastUnbind = (cuMulticastUnbind_t)loadSym(lib, "cuMulticastUnbind", name, ok, failed);
+
     if (!ok) {
       log.error("Failed to load CUDA symbols from %s: %s\n", name, failed.c_str());
       cudaApi = {};
