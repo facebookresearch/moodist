@@ -4046,7 +4046,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   // Scratch buffers are permanently bound — no per-call rebinding.
   // multicastSources/multicastDests are cleanly separated from localInputCopies.
   // ==========================================================================
-  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) && kernelVersion > 0) {
+  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) && kernelVersion == 3) {
     // Lazy compile of multicast kernel
     if (!group->compileOpKernels->cuMulticastKernel) {
       group->compileOpKernels->compileMulticast();

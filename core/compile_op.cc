@@ -13,6 +13,7 @@
 // Phase 7: Multicast setup (source-side analysis, create per-region multicast objects)
 
 #include "compile_op.h"
+#include "compile_op_kernel.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "queue.h"
@@ -832,7 +833,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   // Phase 7: Multicast setup (if eligible)
   // ============================================================================
 
-  if (op->allLocal && ctx.group->supportsMulticast) {
+  if (op->allLocal && ctx.group->supportsMulticast && ctx.group->compileOpKernels->version == 3) {
     // Analyze localInputProvides (source-side view): group by source region.
     // If a region is read by ≥2 peers, create a multicast object for it.
     // The source rank creates the multicast object and sends the handle to each reader.
