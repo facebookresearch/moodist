@@ -57,7 +57,7 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
         print(f"All-gather benchmark: {backend}, {world_size} GPUs, "
               f"{iterations} iterations, {warmup} warmup")
         print()
-        print(f"{'size':>8}  {'med(us)':>8} {'p10(us)':>8} {'p90(us)':>8} {'GB/s':>8}")
+        print(f"{'size':>8}  {'med(us)':>8} {'p10(us)':>8} {'p90(us)':>8} {'algbw':>8} {'busbw':>8}")
         print("-" * 50)
 
     # Pre-compile compile_op for all sizes (compile once, run many)
@@ -73,7 +73,7 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
 
     for size in sizes:
         numel = size // 4
-        input_tensor = torch.ones(numel, device="cuda", dtype=torch.float32)
+        input_tensor = torch.full((numel,), rank + 1.0, device="cuda", dtype=torch.float32)
         output_tensor = torch.empty(numel * world_size, device="cuda", dtype=torch.float32)
 
         if backend == "moodist_compile_op":
@@ -86,6 +86,16 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
         for _ in range(warmup):
             run()
         torch.cuda.synchronize()
+
+        # Correctness check
+        for r in range(world_size):
+            chunk = output_tensor[r * numel:(r + 1) * numel]
+            expected = r + 1.0
+            if not torch.all(chunk == expected):
+                bad = (chunk != expected).sum().item()
+                print(f"RANK {rank}: CORRECTNESS FAILURE at size {format_size(size)}, "
+                      f"chunk {r}: {bad}/{numel} elements wrong", file=sys.stderr)
+                sys.exit(1)
 
         # Measured iterations
         start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
@@ -104,10 +114,11 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
         p10 = times_us[n // 10]
         p90 = times_us[n * 9 // 10]
         total_bytes = size * world_size
-        bw = (total_bytes / 1e9) / (median / 1e6) if median > 0 else 0
+        algbw = (total_bytes / 1e9) / (median / 1e6) if median > 0 else 0
+        busbw = algbw * (world_size - 1) / world_size
 
         if rank == 0:
-            print(f"{format_size(size):>8}  {median:>8.1f} {p10:>8.1f} {p90:>8.1f} {bw:>8.2f}")
+            print(f"{format_size(size):>8}  {median:>8.1f} {p10:>8.1f} {p90:>8.1f} {algbw:>8.2f} {busbw:>8.2f}")
 
     dist.destroy_process_group()
 
