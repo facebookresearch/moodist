@@ -81,7 +81,7 @@ struct Memfd {
   }
 };
 
-enum { requestBad, requestMapAddress, requestMapEvent, requestUnmap, requestMapVMM, requestUnmapVMM };
+enum { requestBad, requestMapAddress, requestMapEvent, requestUnmap, requestMapVMM };
 
 struct IpcMapperImpl : IpcMapper {
 
@@ -258,11 +258,17 @@ struct IpcMapperImpl : IpcMapper {
 
       HashMap<uintptr_t, uint32_t> activeMaps;
 
-      struct VMMMapping {
-        CUmemGenericAllocationHandle handle;
-        size_t size;
+      struct HandlerVMMPeer {
+        uintptr_t reservedBase = 0;
+        size_t reservedSize = 0;
+        struct ImportedChunk {
+          CUmemGenericAllocationHandle handle;
+          size_t offset;
+          size_t size;
+        };
+        std::vector<ImportedChunk> importedChunks;
       };
-      HashMap<uintptr_t, VMMMapping> activeVMMMaps;
+      std::array<HandlerVMMPeer, 8> handlerVMMPeers;
 
       while (true) {
         if (terminate.load(std::memory_order_relaxed)) {
@@ -291,6 +297,9 @@ struct IpcMapperImpl : IpcMapper {
             }
           }
         }
+
+        // Process any VMM chain continuations (outside mutex)
+        processVMMChains();
 
         for (auto& v : shared->slots) {
           int stage = v.stage;
@@ -331,7 +340,8 @@ struct IpcMapperImpl : IpcMapper {
               log.debug("%d: event mapped to %#x\n", group->rank, v.response);
             } else if (v.kind == requestMapVMM) {
               size_t peerIndex = group->getPeerIndex(sourceRank);
-              log.debug("%d: got VMM map request (size %#x) from rank %d!\n", group->rank, v.requestBytes, sourceRank);
+              log.debug("%d: got VMM map request (size %#x, offset %#x) from rank %d!\n", group->rank, v.requestBytes,
+                  v.requestVMMOffset, sourceRank);
 
               int fd = recvFdFromSocket(vmmRecvFds[peerIndex]);
 
@@ -340,51 +350,52 @@ struct IpcMapperImpl : IpcMapper {
                   &importedHandle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
               ::close(fd);
 
-              // Query granularity for address reservation
-              CUmemAllocationProp prop;
-              std::memset(&prop, 0, sizeof(prop));
-              prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-              prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-              CUdevice dev;
-              CHECK_CU(cuCtxGetDevice(&dev));
-              prop.location.id = dev;
+              auto& hpeer = handlerVMMPeers[peerIndex];
 
-              size_t granularity = 0;
-              CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+              // Lazy-init: reserve 1TB VA range for this peer on first chunk
+              if (hpeer.reservedBase == 0) {
+                CUmemAllocationProp prop;
+                std::memset(&prop, 0, sizeof(prop));
+                prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+                prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                CUdevice dev;
+                CHECK_CU(cuCtxGetDevice(&dev));
+                prop.location.id = dev;
+
+                size_t granularity = 0;
+                CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+                constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+                CUdeviceptr base = 0;
+                CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+                hpeer.reservedBase = base;
+                hpeer.reservedSize = reserveSize;
+
+                log.debug(
+                    "%d: reserved 1TB VA at %#x for peer %d (rank %d)\n", group->rank, base, peerIndex, sourceRank);
+              }
 
               size_t mapSize = v.requestBytes;
-              CUdeviceptr addr = 0;
-              CHECK_CU(cuMemAddressReserve(&addr, mapSize, granularity, 0, 0));
-              CHECK_CU(cuMemMap(addr, mapSize, 0, importedHandle, 0));
+              size_t chunkOffset = v.requestVMMOffset;
+              CHECK(chunkOffset + mapSize <= hpeer.reservedSize);
+              CUdeviceptr mapAddr = hpeer.reservedBase + chunkOffset;
+
+              CHECK_CU(cuMemMap(mapAddr, mapSize, 0, importedHandle, 0));
 
               CUmemAccessDesc accessDesc;
               std::memset(&accessDesc, 0, sizeof(accessDesc));
               accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+              CUdevice dev;
+              CHECK_CU(cuCtxGetDevice(&dev));
               accessDesc.location.id = dev;
               accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-              CHECK_CU(cuMemSetAccess(addr, mapSize, &accessDesc, 1));
+              CHECK_CU(cuMemSetAccess(mapAddr, mapSize, &accessDesc, 1));
 
-              // Return address adjusted by the offset within the handle
-              v.response = addr + v.requestVMMOffset;
-              activeVMMMaps[addr] = VMMMapping{importedHandle, mapSize};
+              hpeer.importedChunks.push_back({importedHandle, chunkOffset, mapSize});
+              v.response = mapAddr;
 
-              log.debug("%d: VMM mapped %#x bytes to %#x (offset %#x -> response %#x)\n", group->rank, mapSize, addr,
-                  v.requestVMMOffset, v.response);
-            } else if (v.kind == requestUnmapVMM) {
-              log.debug("%d: got VMM unmap request (address %#x size %#x) from rank %d!\n", group->rank,
-                  v.requestUnmapAddress, v.requestBytes, sourceRank);
-              std::lock_guard l(mutex);
-              auto i = activeVMMMaps.find(v.requestUnmapAddress);
-              if (i != activeVMMMaps.end()) {
-                cuMemUnmap(v.requestUnmapAddress, i->second.size);
-                cuMemAddressFree(v.requestUnmapAddress, i->second.size);
-                cuMemRelease(i->second.handle);
-                activeVMMMaps.erase(i);
-                v.response = 1;
-              } else {
-                log.error("VMM unmap: address %#x not found!\n", v.requestUnmapAddress);
-                v.response = 0;
-              }
+              log.debug("%d: VMM mapped %#x bytes at %#x (peer %d, offset %#x)\n", group->rank, mapSize, mapAddr,
+                  peerIndex, chunkOffset);
             } else {
               CHECK(false);
             }
@@ -405,13 +416,17 @@ struct IpcMapperImpl : IpcMapper {
         }
         CHECK_CU(err);
       }
-      for (auto& v : activeVMMMaps) {
-        auto err = cuMemUnmap(v.first, v.second.size);
-        if (err == CUDA_ERROR_DEINITIALIZED) {
-          break;
+      for (auto& peer : handlerVMMPeers) {
+        for (auto& chunk : peer.importedChunks) {
+          auto err = cuMemUnmap(peer.reservedBase + chunk.offset, chunk.size);
+          if (err == CUDA_ERROR_DEINITIALIZED) {
+            break;
+          }
+          cuMemRelease(chunk.handle);
         }
-        cuMemAddressFree(v.first, v.second.size);
-        cuMemRelease(v.second.handle);
+        if (peer.reservedBase) {
+          cuMemAddressFree(peer.reservedBase, peer.reservedSize);
+        }
       }
     } catch (const std::exception& e) {
       log.error("ipc mapper got exception %s\n", e.what());
@@ -509,6 +524,73 @@ struct IpcMapperImpl : IpcMapper {
     // Send the fd over the persistent Unix socket connection
     sendFdOverSocket(vmmSendFds[peerIndex], fd);
     ::close(fd);
+  }
+
+  void sendNextVMMChunk(size_t peerIndex) {
+    std::unique_lock l(mutex);
+    auto& peer = vmmPeers[peerIndex];
+
+    // Check if we've mapped enough
+    if (peer.mappedWatermark >= peer.pendingNeeded) {
+      peer.mappingInProgress = false;
+      auto callbacks = std::move(peer.pendingCallbacks);
+      uintptr_t peerBase = peer.peerBase;
+      l.unlock();
+      for (auto& cb : callbacks) {
+        log.debug("sendNextVMMChunk: invoking callback offset %#x -> %#x\n", cb.offset, peerBase + cb.offset);
+        std::move(cb.callback)(peerBase + cb.offset);
+      }
+      --waitCount;
+      return;
+    }
+
+    // Get the next chunk to map
+    size_t chunkIndex = peer.mappedChunkCount;
+    unsigned long long handle;
+    size_t chunkOffset, chunkSize;
+    l.unlock();
+
+    bool ok = allocatorGetChunk(chunkIndex, &handle, &chunkOffset, &chunkSize);
+    CHECK(ok);
+
+    constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024;
+    CHECK(chunkOffset + chunkSize <= reserveSize);
+
+    log.debug("sendNextVMMChunk: mapping chunk %d for peer %d (offset %#x, size %#x)\n", chunkIndex, peerIndex,
+        chunkOffset, chunkSize);
+
+    sendRequestVMM(
+        peerIndex, handle, chunkSize, chunkOffset, [this, peerIndex, chunkOffset, chunkSize](uintptr_t mappedAddress) {
+          // NOTE: mutex IS held here (callback dispatched from entry() under lock_guard)
+          auto& peer = vmmPeers[peerIndex];
+
+          // On first chunk, record the peer's base address
+          if (peer.mappedChunkCount == 0) {
+            peer.peerBase = mappedAddress - chunkOffset;
+            log.debug("sendNextVMMChunk: peer %d base = %#x\n", peerIndex, peer.peerBase);
+          }
+
+          peer.mappedWatermark = chunkOffset + chunkSize;
+          peer.mappedChunkCount++;
+          // Don't decrement waitCount or call sendNextVMMChunk here —
+          // we're under mutex and can't call enqueue(). The entry() thread
+          // will pick this up on the next iteration via vmmChainNeeded.
+          peer.vmmChainPending = true;
+        });
+  }
+
+  // Called from the entry() thread after releasing the mutex to continue
+  // VMM chunk chaining for any peer that needs it.
+  void processVMMChains() {
+    std::unique_lock l(mutex);
+    for (size_t i = 0; i < vmmPeers.size(); ++i) {
+      if (vmmPeers[i].vmmChainPending) {
+        vmmPeers[i].vmmChainPending = false;
+        l.unlock();
+        sendNextVMMChunk(i);
+        l.lock();
+      }
+    }
   }
 
   void init(int node) {
@@ -856,6 +938,10 @@ void IpcMapper::sendRequestUnmap(size_t peerIndex, uintptr_t base, size_t size, 
 void IpcMapper::sendRequestVMM(size_t peerIndex, CUmemGenericAllocationHandle handle, size_t handleSize, size_t offset,
     Function<void(uintptr_t)> callback) {
   ((IpcMapperImpl*)this)->sendRequestVMM(peerIndex, handle, handleSize, offset, std::move(callback));
+}
+
+void IpcMapper::sendNextVMMChunk(size_t peerIndex) {
+  ((IpcMapperImpl*)this)->sendNextVMMChunk(peerIndex);
 }
 
 void* IpcMapper::getMySharedMem(size_t offset, size_t size) {

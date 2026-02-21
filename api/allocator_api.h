@@ -71,10 +71,14 @@ void allocatorRemoveFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress,
 // Get the device index the allocator is initialized on (-1 if not yet initialized)
 int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl);
 
-// Get the VMM allocation handle for an address owned by the allocator.
-// Returns true if found, false if address is not from VMM allocator.
-// outHandle receives the CUmemGenericAllocationHandle, outOffset the offset
-// within that handle's allocation, and outSize the total size of that allocation.
-bool allocatorGetVMMHandle(uintptr_t address, unsigned long long* outHandle, size_t* outOffset, size_t* outSize);
+// Get the reserved VA base address (0 if not initialized)
+uintptr_t allocatorGetReservedBase();
+
+// Get number of cuMemCreate chunks
+size_t allocatorGetChunkCount();
+
+// Get chunk info by index: handle, offset within reserved range, size.
+// Returns true if index is valid, false otherwise.
+bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize);
 
 } // namespace moodist

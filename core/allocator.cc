@@ -545,24 +545,6 @@ struct CudaAllocatorImpl {
     return i;
   }
 
-  // Returns (handle, offset_within_handle, handle_size) for a given address,
-  // or nullopt if the address is not from a VMM allocation.
-  std::optional<std::tuple<CUmemGenericAllocationHandle, size_t, size_t>> getHandleForAddress(uintptr_t address) {
-    uintptr_t base = reservedBase.load(std::memory_order_relaxed);
-    if (base == 0) {
-      return std::nullopt;
-    }
-    uintptr_t chunkBase = base;
-    for (auto& [chunkSize, handle] : cuMemHandles) {
-      if (address >= chunkBase && address < chunkBase + chunkSize) {
-        size_t offset = address - chunkBase;
-        return std::tuple{handle, offset, chunkSize};
-      }
-      chunkBase += chunkSize;
-    }
-    return std::nullopt;
-  }
-
   bool mapMoreMemory(size_t minbytes, int currentDeviceIndex, CUstream currentStream) {
     std::lock_guard mrl(mappedRegionsMutex);
 
@@ -575,21 +557,26 @@ struct CudaAllocatorImpl {
     }
     CHECK(currentDeviceIndex == deviceIndex);
 
-    size_t bytes = free;
     constexpr size_t buffer = (size_t)1024 * 1024 * 512;
+    constexpr size_t chunkGranularity = (size_t)4 * 1024 * 1024; // 4 MB
     size_t safebytes = free > buffer ? free - buffer : 0;
-    if (safebytes >= minbytes) {
-      bytes = safebytes;
+    if (safebytes < chunkGranularity) {
+      memlog.info("Moodist CUDA Allocator: not enough free memory after buffer reservation. Device has %d free, %d "
+                  "total bytes of memory.\n",
+          free, total);
+      return false;
     }
-    if (mappedRegions.empty() && free / 2 > minbytes) {
-      bytes = free / 2;
+    // Allocate minbytes rounded up to chunk granularity, capped at safebytes
+    size_t bytes = (minbytes + chunkGranularity - 1) / chunkGranularity * chunkGranularity;
+    if (bytes > safebytes) {
+      bytes = (safebytes / chunkGranularity) * chunkGranularity;
+    }
+    if (bytes == 0) {
+      return false;
     }
     memlog.info(
         "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
         bytes, free, total);
-    if (bytes < minbytes) {
-      return false;
-    }
 
     // Initialize VA reservation on first call
     if (reservedBase == 0) {
@@ -649,6 +636,11 @@ struct CudaAllocatorImpl {
     }
 
     uintptr_t address = nextMapBase;
+    if (address + bytes > reservedBase + reservedSize) {
+      memlog.error("CUDA Allocator: mapping %d bytes at %#x would exceed 1TB VA reservation\n", bytes, address);
+      cuMemRelease(handle);
+      return false;
+    }
     CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
 
     CUmemAccessDesc accessDesc;
@@ -1307,19 +1299,37 @@ void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* out
   *outSize = result.second;
 }
 
-bool allocatorGetVMMHandle(uintptr_t address, unsigned long long* outHandle, size_t* outOffset, size_t* outSize) {
+uintptr_t allocatorGetReservedBase() {
+  if (!globalCudaAllocatorImpl) {
+    return 0;
+  }
+  return globalCudaAllocatorImpl->reservedBase.load(std::memory_order_relaxed);
+}
+
+size_t allocatorGetChunkCount() {
+  if (!globalCudaAllocatorImpl) {
+    return 0;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  return globalCudaAllocatorImpl->cuMemHandles.size();
+}
+
+bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize) {
   if (!globalCudaAllocatorImpl) {
     return false;
   }
   std::lock_guard l(globalCudaAllocatorImpl->mutex);
-  auto result = globalCudaAllocatorImpl->getHandleForAddress(address);
-  if (!result) {
+  auto& handles = globalCudaAllocatorImpl->cuMemHandles;
+  if (index >= handles.size()) {
     return false;
   }
-  auto& [handle, offset, size] = *result;
-  *outHandle = handle;
+  size_t offset = 0;
+  for (size_t i = 0; i < index; ++i) {
+    offset += handles[i].first;
+  }
+  *outHandle = handles[index].second;
   *outOffset = offset;
-  *outSize = size;
+  *outSize = handles[index].first;
   return true;
 }
 
