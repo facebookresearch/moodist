@@ -13,62 +13,6 @@
 
 namespace moodist {
 
-inline LogLevel memLogLevel = []() {
-  const char* c = std::getenv("MOODIST_MEM_LOG_LEVEL");
-  LogLevel r = LOG_INFO;
-  if (c) {
-    std::string s = c;
-    for (auto& c : s) {
-      c = std::toupper(c);
-    }
-    if (s == "NONE") {
-      r = LOG_NONE;
-    } else if (s == "ERROR") {
-      r = LOG_ERROR;
-    } else if (s == "INFO") {
-      r = LOG_INFO;
-    } else if (s == "VERBOSE") {
-      r = LOG_VERBOSE;
-    } else if (s == "DEBUG") {
-      r = LOG_DEBUG;
-    } else {
-      r = (LogLevel)std::atoi(c);
-    }
-    if (currentLogLevel < LOG_ERROR) {
-      r = LOG_ERROR;
-    }
-  }
-  return r;
-}();
-
-inline struct MemLog {
-  template<typename... Args>
-  void error(const char* fmt, Args&&... args) {
-    logat(LOG_ERROR, fmt, std::forward<Args>(args)...);
-  }
-  template<typename... Args>
-  void info(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_INFO) {
-      [[unlikely]];
-      logat(LOG_INFO, fmt, std::forward<Args>(args)...);
-    }
-  }
-  template<typename... Args>
-  void verbose(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_VERBOSE) {
-      [[unlikely]];
-      logat(LOG_VERBOSE, fmt, std::forward<Args>(args)...);
-    }
-  }
-  template<typename... Args>
-  void debug(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_DEBUG) {
-      [[unlikely]];
-      logat(LOG_DEBUG, fmt, std::forward<Args>(args)...);
-    }
-  }
-} memlog;
-
 namespace {
 
 struct Span {
@@ -260,7 +204,7 @@ using RegionSizeMap = std::multiset<RegionSize<std::set<Region, RegionCompare>>,
 void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
   return;
   uintptr_t e = 0;
-  // memlog.info("check map -- \n");
+  // log.info("check map -- \n");
   Vector<Span> tmp;
   HashMap<EventRegion*, bool> exists;
   for (auto& v : map) {
@@ -270,7 +214,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }
   }
   for (auto& v : map) {
-    // memlog.info("span %#x %#x\n", v.span.begin, v.span.end);
+    // log.info("span %#x %#x\n", v.span.begin, v.span.end);
     CHECK(v.span.begin > e);
     CHECK(v.span.end > v.span.begin);
     e = v.span.end;
@@ -284,7 +228,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }));
     uintptr_t ee = v.span.begin;
     for (auto& v2 : v.events) {
-      // memlog.info(" event %#x %#x\n", v2.span.begin, v2.span.end);
+      // log.info(" event %#x %#x\n", v2.span.begin, v2.span.end);
       CHECK(v2.span.end > v2.span.begin);
       CHECK(v2.span.begin >= v.span.begin);
       CHECK(v2.span.end <= v.span.end);
@@ -295,7 +239,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }
 
     // for (auto& v : tmp) {
-    //   memlog.info(" tmp %#x %#x\n", v.begin, v.end);
+    //   log.info(" tmp %#x %#x\n", v.begin, v.end);
     // }
 
     // CHECK(tmp.size() == 1);
@@ -521,7 +465,7 @@ struct CudaAllocatorImpl {
     }
     CHECK(i->events.empty());
     for (auto& v : eventRegionList) {
-      // memlog.info("v event span %#x %#x\n", v->span.begin, v->span.end);
+      // log.info("v event span %#x %#x\n", v->span.begin, v->span.end);
       i->events.push_back(*v);
     }
     // CHECK(std::is_sorted(
@@ -535,10 +479,10 @@ struct CudaAllocatorImpl {
       node.value().regionIterator = i;
       i->sizeIterator = sizeMap.insert(std::move(node));
     }
-    // memlog.info(
+    // log.info(
     //     "added span %#x %#x, size %d, i->sizeIterator bytes is %d\n", i->span.begin, i->span.end,
     //     i->span.end - i->span.begin, i->sizeIterator->bytes);
-    // memlog.info(
+    // log.info(
     //     "added span %#x %#x, size %d, i->sizeIterator bytes is %d\n", span.begin, span.end, span.end - span.begin,
     //     i->sizeIterator->bytes);
     checkMap(map, sizeMap);
@@ -561,8 +505,8 @@ struct CudaAllocatorImpl {
     constexpr size_t chunkGranularity = (size_t)4 * 1024 * 1024; // 4 MB
     size_t safebytes = free > buffer ? free - buffer : 0;
     if (safebytes < chunkGranularity) {
-      memlog.info("Moodist CUDA Allocator: not enough free memory after buffer reservation. Device has %d free, %d "
-                  "total bytes of memory.\n",
+      log.info("Moodist CUDA Allocator: not enough free memory after buffer reservation. Device has %d free, %d "
+               "total bytes of memory.\n",
           free, total);
       return false;
     }
@@ -574,7 +518,7 @@ struct CudaAllocatorImpl {
     if (bytes == 0) {
       return false;
     }
-    memlog.info(
+    log.info(
         "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
         bytes, free, total);
 
@@ -599,7 +543,7 @@ struct CudaAllocatorImpl {
       reservedSize = reserveSize;
       nextMapBase = base;
 
-      memlog.info(
+      log.info(
           "Moodist CUDA Allocator reserved %d bytes of VA at %#x (granularity %d)\n", reserveSize, base, granularity);
     }
 
@@ -631,13 +575,13 @@ struct CudaAllocatorImpl {
     if (err != CUDA_SUCCESS) {
       const char* str = "unknown cuda error";
       cuGetErrorString(err, &str);
-      memlog.error("CUDA Allocator failed to create %d bytes; %s\n", bytes, str);
+      log.error("CUDA Allocator failed to create %d bytes; %s\n", bytes, str);
       return false;
     }
 
     uintptr_t address = nextMapBase;
     if (address + bytes > reservedBase + reservedSize) {
-      memlog.error("CUDA Allocator: mapping %d bytes at %#x would exceed 1TB VA reservation\n", bytes, address);
+      log.error("CUDA Allocator: mapping %d bytes at %#x would exceed 1TB VA reservation\n", bytes, address);
       cuMemRelease(handle);
       return false;
     }
@@ -653,7 +597,7 @@ struct CudaAllocatorImpl {
     cuMemHandles.emplace_back(bytes, handle);
     nextMapBase += bytes;
 
-    memlog.info("Moodist successfully mapped %d bytes at %#x (cuMemCreate + cuMemMap)\n", bytes, address);
+    log.info("Moodist successfully mapped %d bytes at %#x (cuMemCreate + cuMemMap)\n", bytes, address);
 
     add_span(mappedRegions, address, address + bytes);
 
@@ -698,7 +642,7 @@ struct CudaAllocatorImpl {
         if (i->span.begin >= ptrEnd) {
           break;
         }
-        //        memlog.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)(CUevent)i->event, i->span.begin,
+        //        log.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)(CUevent)i->event, i->span.begin,
         //        i->span.end);
 
         if (i->eventStream != stream) {
@@ -722,22 +666,22 @@ struct CudaAllocatorImpl {
         updateSize(regions, r);
       }
 
-      // memlog.debug("span %#x %#x\n", r->span.begin, r->span.end);
+      // log.debug("span %#x %#x\n", r->span.begin, r->span.end);
       // for (auto& v : r->events) {
-      //   memlog.debug("event %#x %#x\n", v.span.begin, v.span.end);
+      //   log.debug("event %#x %#x\n", v.span.begin, v.span.end);
       // }
 
       checkMap(regions.map, regions.sizes);
-      // memlog.debug("ok, returning %#x\n", ptr);
+      // log.debug("ok, returning %#x\n", ptr);
       return ptr;
     }
     return 0;
   }
 
   uintptr_t allocate(size_t bytes, CUstream stream, int deviceIndex) {
-    memlog.debug("allocate %d\n", bytes);
+    log.debug("allocate %d\n", bytes);
     if (!pendingDeallocations.empty()) {
-      // memlog.info("waa %d pending deallocations\n", pendingDeallocations.size());
+      // log.info("waa %d pending deallocations\n", pendingDeallocations.size());
       auto tmp = std::move(pendingDeallocations);
       for (auto& v : tmp) {
         deallocate<true>(std::get<0>(v), std::get<1>(v), *std::get<2>(v));
@@ -765,13 +709,13 @@ struct CudaAllocatorImpl {
       return allocate(bytes, stream, deviceIndex);
     }
 
-    // memlog.info("Prefetcher memory exhausted, moving pending\n");
+    // log.info("Prefetcher memory exhausted, moving pending\n");
     if (!pendingFreeMemory.map.empty()) {
       freePending(pendingFreeMemory);
       return allocate(bytes, stream, deviceIndex);
     }
-    if (memLogLevel >= LOG_VERBOSE) {
-      memlog.verbose(
+    if (currentLogLevel >= LOG_VERBOSE) {
+      log.verbose(
           "Memory exhausted during allocation of %s. Free memory:\n%s\n", this->bytes(bytes), debugFreeMemory());
     }
     for (size_t i = 0; i != streamFreeMemory.size(); ++i) {
@@ -800,7 +744,7 @@ struct CudaAllocatorImpl {
     if (mapMoreMemory(bytes, deviceIndex, stream)) {
       return allocate(bytes, stream, deviceIndex);
     }
-    memlog.verbose("Free memory:\n%s\n", debugFreeMemory());
+    log.verbose("Free memory:\n%s\n", debugFreeMemory());
 
     std::lock_guard mrl(mappedRegionsMutex);
 
@@ -832,7 +776,7 @@ struct CudaAllocatorImpl {
   }
 
   // void deallocateImpl(uintptr_t cudaPtr, size_t alignedbytes, Vector<CUstream>& streams) {
-  //   // memlog.info("deallocate %d\n", alignedbytes);
+  //   // log.info("deallocate %d\n", alignedbytes);
   //   for (CUstream stream : streams) {
   //     MemoryEventHandle me = getMemoryEvent();
   //     CHECK_CU(cuEventRecord(me->event, stream));
@@ -869,7 +813,7 @@ struct CudaAllocatorImpl {
         }
         h->eventStream = stream;
         CHECK_CU(cuEventRecord(h->event, stream));
-        // memlog.debug(
+        // log.debug(
         //     "recorded event (0) for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
         //     (uintptr_t)(CUevent)h->event);
       } else {
@@ -882,11 +826,11 @@ struct CudaAllocatorImpl {
         }
         h->eventStream = stream;
         if (cuEventRecord(h->event, stream) != CUDA_SUCCESS) {
-          memlog.info("failed to record event!\n");
+          log.info("failed to record event!\n");
           failed = true;
           break;
         }
-        // memlog.debug(
+        // log.debug(
         //     "recorded event for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
         //     (uintptr_t)(CUevent)h->event);
       }
@@ -979,19 +923,19 @@ struct CudaAllocatorImpl {
       }
       insertRegion(freeMemory, span, tmpEventRegions);
 
-      // memlog.info("free %d bytes of pending\n", span.end - span.begin);
+      // log.info("free %d bytes of pending\n", span.end - span.begin);
 
       retval = true;
     }
     // if (!retval) {
-    //   memlog.info("failed to free any pending\n");
+    //   log.info("failed to free any pending\n");
     // }
     checkMap(freeMemory.map, freeMemory.sizes);
     return retval;
   }
 
   bool freePending(Regions& pendingFreeMemory) {
-    // memlog.info("free pending\n");
+    // log.info("free pending\n");
     //  CHECK(pendingFreeMemoryEvents.size() >= pendingFreeMemory.size());
     checkMap(pendingFreeMemory.map, pendingFreeMemory.sizes);
     checkMap(freeMemory.map, freeMemory.sizes);
@@ -1068,7 +1012,7 @@ struct CudaAllocatorImpl {
 
   // MemoryEventHandle getMemoryEvent() {
   //   if (memoryEventFreelist.empty()) {
-  //     memlog.debug("allocate new memory events!\n");
+  //     log.debug("allocate new memory events!\n");
   //     for (size_t i = 0; i != 0x1000; ++i) {
   //       MemoryEvent* me = memoryEventAllocator.allocate();
   //       CHECK_CU(cuEventCreate(&me->event, CU_EVENT_DISABLE_TIMING));
