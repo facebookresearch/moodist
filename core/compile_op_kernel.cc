@@ -26,6 +26,9 @@ CompileOpKernels::~CompileOpKernels() {
   if (cuModule) {
     cuModuleUnload(cuModule);
   }
+  if (cuMulticastModule) {
+    cuModuleUnload(cuMulticastModule);
+  }
 }
 
 // Helper for string template substitution, matching CollectiveBase::replace pattern
@@ -178,8 +181,7 @@ static std::string emitCascadingCopy(const std::vector<int>& unrollFactors) {
           "uint4 v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n", j, j);
     }
     for (int j = 0; j < uf; j++) {
-      code += fmt::sprintf(
-          "__stwt((uint4*)(dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16), v%d);\n", j, j);
+      code += fmt::sprintf("__stwt((uint4*)(dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16), v%d);\n", j, j);
     }
     code += fmt::sprintf("i += %d * (size_t)numBlocks;\n", uf);
     code += "}\n";
@@ -233,8 +235,7 @@ void CompileOpKernels::compile() {
         R"(
       *(volatile uint32_t*)$ptr = stepValue;
     )",
-        "$ptr",
-        concurrencyIndexExpr(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
+        "$ptr", concurrencyIndexExpr(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
 
     // Exit: wait for peer's copyDone at their slot in our array
     copyDoneWaits += replace(
@@ -282,8 +283,8 @@ __device__ uint32_t exitCounter[$maxConcurrency];
 
 )z";
 
-  source = replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency",
-      (size_t)Group::maxConcurrency);
+  source =
+      replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency", (size_t)Group::maxConcurrency);
 
   // v1 kernel: dynamic block index distribution with cascading unrolled copy
   if (version == 1) {
@@ -635,9 +636,258 @@ compile_op_copy(CompileOpCopyParameters params) {
   CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuCopyKernel));
   int localBytes = 0;
   CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, cuCopyKernel));
-  log.info("compile_op_copy: %d registers, %d local bytes, max %d threads/block\n", numRegs, localBytes, maxThreadsPerBlock);
+  log.info(
+      "compile_op_copy: %d registers, %d local bytes, max %d threads/block\n", numRegs, localBytes, maxThreadsPerBlock);
 
   log.info("compile_op kernel compile took %gs\n", seconds(std::chrono::steady_clock::now() - start));
+}
+
+void CompileOpKernels::compileMulticast() {
+  auto start = std::chrono::steady_clock::now();
+  CUdevice& cuDevice = group->cuDevice;
+
+  int computeMajor = 0;
+  int computeMinor = 0;
+
+  int major = 6;
+  int minor = 0;
+  if (!loadNvrtc()) {
+    throw std::runtime_error("NVRTC not available");
+  }
+  CHECK_NVRTC(nvrtcApi.version(&major, &minor));
+
+  CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+  CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+
+  // Multicast with multimem.cp.async.bulk requires sm_90+
+  if (computeMajor * 10 + computeMinor < 90) {
+    log.error("compile_op multicast kernel requires sm_90+, have sm_%d%d\n", computeMajor, computeMinor);
+    return;
+  }
+
+  size_t rank = group->rank;
+  const auto& peerIndices = group->peerIndices;
+
+  // Build sync address code fragments (same pattern as copy kernel)
+  std::string stepValueWrites;
+  std::string stepValueWaits;
+  std::string copyDoneWrites;
+  std::string copyDoneWaits;
+
+  for (size_t i : peerIndices) {
+    stepValueWrites += replace(
+        R"(
+      *(volatile uint32_t*)$ptr = stepValue;
+    )",
+        "$ptr", concurrencyIndexExpr(group->peerCudaStepValue[i], sizeof(uint32_t) * rank));
+
+    stepValueWaits += replace(
+        R"(while (*(volatile uint32_t*)($ptr) < stepValue);
+    )",
+        "$ptr", concurrencyIndexExpr(group->cudaStepValue, sizeof(uint32_t) * group->ipcRanks[i]));
+
+    copyDoneWrites += replace(
+        R"(
+      *(volatile uint32_t*)$ptr = stepValue;
+    )",
+        "$ptr", concurrencyIndexExpr(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
+
+    copyDoneWaits += replace(
+        R"(
+      while (*(volatile uint32_t*)$ptr < stepValue);
+    )",
+        "$ptr", concurrencyIndexExpr(group->cudaCopyDone, sizeof(uint32_t) * i));
+  }
+
+  // Multicast kernel using multimem.st (PTX ISA 8.1, sm_90+).
+  // Each thread loads from global memory and stores to the multicast VA using
+  // multimem.st, which replicates the write to all bound GPUs via NVSwitch.
+  // No shared memory staging needed — direct global → multicast.
+
+  std::string source;
+
+  source += R"z(
+using uintptr_t = unsigned long;
+using uint64_t = unsigned long;
+using uint32_t = unsigned int;
+using uint16_t = unsigned short;
+using uint8_t = unsigned char;
+using int32_t = int;
+using int64_t = long;
+using size_t = unsigned long;
+
+namespace {
+
+__device__ void syncthreads() {
+  asm volatile ("barrier.sync 0;" :: );
+}
+
+struct CopyDescriptor {
+  uintptr_t src;
+  uintptr_t dst;
+  uint32_t bytes;
+};
+
+struct CompileOpCopyParameters {
+  uint32_t stepValue;
+  uint32_t concurrencyIndex;
+  uint32_t numDescriptors;
+  uint32_t _pad;
+  CopyDescriptor descriptors[$kMaxCopyDescriptors];
+};
+
+__device__ uint32_t entryCounter[$maxConcurrency];
+__device__ uint32_t exitCounter[$maxConcurrency];
+
+// Store 16 bytes to multicast VA using multimem.st (replicates to all bound GPUs)
+// Vector qualifier requires floating-point type, so use .v4.f32 (same bits as uint4)
+__device__ void multimem_st_v4(uintptr_t dst, uint4 val) {
+  asm volatile(
+    "multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
+    :: "l"(dst), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)
+    : "memory"
+  );
+}
+
+} // namespace
+
+extern "C" __global__ void __launch_bounds__($blockSize, 1)
+compile_op_multicast(CompileOpCopyParameters params) {
+  const uint32_t stepValue = params.stepValue;
+  const uint32_t concurrencyIndex = params.concurrencyIndex;
+
+  // Entry barrier: first block signals peers, all blocks wait for peers
+  if (threadIdx.x == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      $stepValueWrites
+      __threadfence_system();
+    }
+    $stepValueWaits
+  }
+  syncthreads();
+
+  // Process descriptors cooperatively across all blocks
+  const uint32_t numBlocks = $gridSize;
+  const uint32_t globalTid = blockIdx.x * $blockSize + threadIdx.x;
+  const uint32_t totalThreads = numBlocks * $blockSize;
+
+  for (uint32_t d = 0; d < params.numDescriptors; d++) {
+    uintptr_t src = params.descriptors[d].src;
+    uintptr_t dst = params.descriptors[d].dst;
+    uint32_t totalBytes = params.descriptors[d].bytes;
+
+    // Aligned uint4 elements (16 bytes each) — use multimem.st
+    uint32_t elements = totalBytes / 16;
+    for (uint32_t i = globalTid; i < elements; i += totalThreads) {
+      uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
+      multimem_st_v4(dst + (uintptr_t)i * 16, val);
+    }
+
+    // Tail bytes (< 16) — use regular byte stores
+    uint32_t tailStart = elements * 16;
+    uint32_t tailBytes = totalBytes - tailStart;
+    for (uint32_t i = globalTid; i < tailBytes; i += totalThreads) {
+      *(volatile uint8_t*)(dst + tailStart + i) = *(const uint8_t*)(src + tailStart + i);
+    }
+  }
+
+  // Fence to ensure multicast writes are visible across devices
+  asm volatile("fence.sc.sys;" ::: "memory");
+
+  // Exit barrier: last block signals copyDone, waits for peers
+  __threadfence_system();
+  syncthreads();
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneWrites
+    $copyDoneWaits
+  }
+}
+)z";
+
+  source =
+      replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency", (size_t)Group::maxConcurrency,
+          "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits, "$copyDoneWrites", copyDoneWrites,
+          "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize", blockSize);
+
+  source = replace(source, "%%", "%");
+  source = autoindent(source);
+  source = addLineCountComments(source);
+
+  auto boolenv = [&](const char* name) {
+    const char* c = std::getenv(name);
+    if (!c) {
+      return false;
+    }
+    return !strcmp(c, "1");
+  };
+
+  if (boolenv("MOODIST_DUMP_KERNELS")) {
+    std::string fn = fmt::sprintf("moodist-multicast-kernel-rank%d.cu", rank);
+    FILE* f = fopen(fn.c_str(), "wb");
+    if (f) {
+      fwrite(source.data(), source.size(), 1, f);
+      fclose(f);
+      log.info("multicast kernel source dumped to %s\n", fn);
+    }
+  }
+
+  nvrtcProgram program;
+  CHECK_NVRTC(nvrtcApi.createProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
+
+  // Multicast requires sm_90+
+  std::vector<std::string> options;
+  options.push_back("--gpu-architecture=sm_90");
+  options.push_back("--use_fast_math");
+  options.push_back("--std=c++17");
+  options.push_back("-lineinfo");
+  std::vector<const char*> options2;
+  for (auto& v : options) {
+    options2.push_back(v.c_str());
+  }
+  nvrtcResult error = nvrtcApi.compileProgram(program, options2.size(), options2.data());
+
+  if (error != NVRTC_SUCCESS) {
+    log.error("Failed to compile multicast kernel--\n%s\n", source.c_str());
+    size_t logSize = 0;
+    std::string logstr;
+    CHECK_NVRTC(nvrtcApi.getProgramLogSize(program, &logSize));
+    logstr.resize(logSize);
+    CHECK_NVRTC(nvrtcApi.getProgramLog(program, logstr.data()));
+    log.error("%s\n", logstr);
+    CHECK_NVRTC(error);
+  }
+
+  size_t cubinSize = 0;
+  CHECK_NVRTC(nvrtcApi.getCUBINSize(program, &cubinSize));
+  std::vector<char> cubin;
+  cubin.resize(cubinSize);
+  CHECK_NVRTC(nvrtcApi.getCUBIN(program, cubin.data()));
+
+  if (boolenv("MOODIST_DUMP_KERNELS")) {
+    std::string fn = fmt::sprintf("moodist-multicast-kernel-rank%d.o", rank);
+    FILE* f = fopen(fn.c_str(), "wb");
+    if (f) {
+      fwrite(cubin.data(), cubin.size(), 1, f);
+      fclose(f);
+      log.info("multicast cubin dumped to %s\n", fn);
+    }
+  }
+
+  CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
+
+  CHECK_CU(cuModuleLoadDataEx(&cuMulticastModule, cubin.data(), 0, nullptr, nullptr));
+  CHECK_CU(cuModuleGetFunction(&cuMulticastKernel, cuMulticastModule, "compile_op_multicast"));
+
+  int numRegs = 0;
+  CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, cuMulticastKernel));
+  int maxThreadsPerBlock = 0;
+  CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuMulticastKernel));
+  int localBytes = 0;
+  CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, cuMulticastKernel));
+  log.info("compile_op_multicast: %d registers, %d local bytes, max %d threads/block\n", numRegs, localBytes,
+      maxThreadsPerBlock);
+
+  log.info("compile_op multicast kernel compile took %gs\n", seconds(std::chrono::steady_clock::now() - start));
 }
 
 } // namespace moodist

@@ -3,16 +3,18 @@
 // compile_op implementation
 // See compile_op.h for design overview
 //
-// Six-phase protocol:
+// Seven-phase protocol:
 // Phase 1: Exchange logical mappings (sender → receiver)
 // Phase 2: Overlap resolution via cell decomposition (local)
 // Phase 3: Send read requests (receiver → sender)
 // Phase 4: Process requests, generate copies (sender)
 // Phase 5: Finalize and generate reads (receiver)
 // Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
+// Phase 7: Multicast setup (source-side analysis, create per-region multicast objects)
 
 #include "compile_op.h"
 #include "group.h"
+#include "ipc_mapper.h"
 #include "queue.h"
 #include "serialization.h"
 
@@ -108,6 +110,23 @@ struct ProvideEntry {
   template<typename X>
   void serialize(X& x) {
     x(readerRank, sourceInputIndex, sourceInputOffset, bytes);
+  }
+};
+
+// Phase 7: multicast assignment sent from source rank to each reader peer.
+// Tells the reader: "your copy of (sourceInputIndex, sourceInputOffset, bytes)
+// will be delivered via multicast; here is your VA."
+struct MulticastAssignment {
+  uint32_t sourceRank;
+  uint32_t sourceInputIndex;
+  size_t sourceInputOffset;
+  size_t bytes;
+  uintptr_t scratchVA; // Peer's multicast VA (where data arrives)
+  size_t allocSize;    // Granularity-aligned buffer size
+
+  template<typename X>
+  void serialize(X& x) {
+    x(sourceRank, sourceInputIndex, sourceInputOffset, bytes, scratchVA, allocSize);
   }
 };
 
@@ -718,8 +737,8 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     // when source is on the same node (IPC-accessible) or is this rank itself.
     // For CPU tensors, IB DMA engines are faster than memcpy, so keep as RDMA reads.
     bool bothCuda = out.device == DeviceType::CUDA && resp.inputDevice == DeviceType::CUDA;
-    bool sourceIsLocal = read.rank == rank ||
-        (read.rank < ctx.group->ipcAccess.size() && ctx.group->ipcAccess[read.rank]);
+    bool sourceIsLocal =
+        read.rank == rank || (read.rank < ctx.group->ipcAccess.size() && ctx.group->ipcAccess[read.rank]);
     if (sourceIsLocal && bothCuda) {
       CustomOpDescriptor::LocalInputCopy lic;
       lic.sourceRank = read.rank;
@@ -748,9 +767,8 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   // Final barrier
   ctx.barrier();
 
-  log.debug(
-      "compile_op phase5: rank %zu, %zu reads, %zu local copies, %zu output copies\n",
-      rank, op->reads.size(), op->localInputCopies.size(), op->outputCopies.size());
+  log.debug("compile_op phase5: rank %zu, %zu reads, %zu local copies, %zu output copies\n", rank, op->reads.size(),
+      op->localInputCopies.size(), op->outputCopies.size());
 
   // ============================================================================
   // Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
@@ -807,8 +825,268 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   // Final barrier after Phase 6
   ctx.barrier();
 
-  log.debug("compile_op phase6: rank %zu, allLocal=%d, %zu provides\n", rank, op->allLocal,
-      op->localInputProvides.size());
+  log.debug(
+      "compile_op phase6: rank %zu, allLocal=%d, %zu provides\n", rank, op->allLocal, op->localInputProvides.size());
+
+  // ============================================================================
+  // Phase 7: Multicast setup (if eligible)
+  // ============================================================================
+
+  if (op->allLocal && ctx.group->supportsMulticast) {
+    // Analyze localInputProvides (source-side view): group by source region.
+    // If a region is read by ≥2 peers, create a multicast object for it.
+    // The source rank creates the multicast object and sends the handle to each reader.
+
+    struct RegionKey {
+      uint32_t inputIndex;
+      size_t inputOffset;
+      size_t bytes;
+
+      bool operator==(const RegionKey& other) const {
+        return inputIndex == other.inputIndex && inputOffset == other.inputOffset && bytes == other.bytes;
+      }
+    };
+
+    // Group localInputProvides by source region → list of reader ranks
+    Vector<std::pair<RegionKey, Vector<uint32_t>>> regionToReaders;
+
+    for (const auto& lip : op->localInputProvides) {
+      RegionKey key{lip.myInputIndex, lip.inputOffset, lip.bytes};
+
+      bool found = false;
+      for (auto& [k, readers] : regionToReaders) {
+        if (k == key) {
+          readers.push_back(lip.readerRank);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        Vector<uint32_t> readers;
+        readers.push_back(lip.readerRank);
+        regionToReaders.emplace_back(key, std::move(readers));
+      }
+    }
+
+    // Pending multicast objects: Phase 7a stores these, Phase 7b completes them.
+    struct PendingMulticast {
+      RegionKey key;
+      CUmemGenericAllocationHandle mcHandle;
+      size_t mcSize; // mcProp.size (rounded up to multicast granularity)
+      size_t mcGranularity;
+      Vector<uint32_t> readers;
+      HashMap<uint32_t, size_t> readerHandleIndices; // readerRank → handleIndex from Phase 1
+    };
+    Vector<PendingMulticast> pendingMulticasts;
+
+    bool useFabric = ctx.group->supportsFabric;
+
+    // Phase 7a: Create multicast objects, add source device, send addDevice to peers.
+    // After this phase + wait(), ALL devices have been added to each multicast object.
+    for (const auto& [key, readers] : regionToReaders) {
+      if (readers.size() < 1) {
+        continue;
+      }
+
+      // numDevices = source + all readers
+      CUmulticastObjectProp mcProp;
+      std::memset(&mcProp, 0, sizeof(mcProp));
+      mcProp.numDevices = static_cast<unsigned int>(readers.size() + 1);
+      mcProp.size = key.bytes;
+      mcProp.handleTypes =
+          useFabric ? (unsigned long long)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC)
+                    : (unsigned long long)CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+      mcProp.flags = 0;
+
+      size_t mcGranularity = 0;
+      CHECK_CU(cuMulticastGetGranularity(&mcGranularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
+      mcProp.size = (mcProp.size + mcGranularity - 1) / mcGranularity * mcGranularity;
+
+      CUdevice dev;
+      CHECK_CU(cuCtxGetDevice(&dev));
+
+      CUmemGenericAllocationHandle mcHandle;
+      log.info("compile_op phase7a: cuMulticastCreate numDevices=%u size=%zu handleTypes=%#llx flags=%#llx\n",
+          mcProp.numDevices, mcProp.size, mcProp.handleTypes, mcProp.flags);
+      CHECK_CU(cuMulticastCreate(&mcHandle, &mcProp));
+
+      // Source adds its own device
+      CHECK_CU(cuMulticastAddDevice(mcHandle, dev));
+
+      // Send addDevice requests to all readers (Phase 1 — import + addDevice only)
+      PendingMulticast pm;
+      pm.key = key;
+      pm.mcHandle = mcHandle;
+      pm.mcSize = mcProp.size;
+      pm.mcGranularity = mcGranularity;
+      pm.readers = readers;
+
+      for (uint32_t readerRank : readers) {
+        size_t peerIndex = ctx.group->getPeerIndex(readerRank);
+        ++ctx.group->ipcMapper->waitCount;
+        ctx.group->ipcMapper->sendMulticastHandle(peerIndex, mcHandle, mcProp.size,
+            [ipcMapper = ctx.group->ipcMapper.get(), readerRank, &pm](uintptr_t handleIndex) {
+              pm.readerHandleIndices[readerRank] = handleIndex;
+              --ipcMapper->waitCount;
+            });
+      }
+
+      // Wait for all addDevice callbacks for this MC object before moving pm
+      ctx.group->ipcMapper->wait();
+
+      pendingMulticasts.push_back(std::move(pm));
+    }
+
+    log.info("compile_op phase7a: all addDevice complete, %zu multicast objects\n", pendingMulticasts.size());
+
+    // Phase 7b: Now that all devices are added, bind scratch and map on all devices.
+    struct CreatedRegion {
+      RegionKey key;
+      CUdeviceptr sourceVA;
+      size_t allocSize;
+      HashMap<uint32_t, CUdeviceptr> readerVAs; // readerRank → peer's multicast VA
+    };
+    Vector<CreatedRegion> createdRegions;
+
+    for (auto& pm : pendingMulticasts) {
+      CUdevice dev;
+      CHECK_CU(cuCtxGetDevice(&dev));
+
+      // Source's scratch buffer
+      CUmemAllocationProp allocProp;
+      std::memset(&allocProp, 0, sizeof(allocProp));
+      allocProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      allocProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      allocProp.location.id = dev;
+      allocProp.requestedHandleTypes = useFabric ? CU_MEM_HANDLE_TYPE_FABRIC : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+
+      size_t allocGranularity = 0;
+      CHECK_CU(cuMemGetAllocationGranularity(&allocGranularity, &allocProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+      size_t allocSize = (pm.mcSize + allocGranularity - 1) / allocGranularity * allocGranularity;
+
+      CUmemGenericAllocationHandle scratchHandle;
+      CHECK_CU(cuMemCreate(&scratchHandle, allocSize, &allocProp, 0));
+      CHECK_CU(cuMulticastBindMem(pm.mcHandle, 0, scratchHandle, 0, allocSize, 0));
+
+      // Map the multicast object on source
+      CUdeviceptr mcVA = 0;
+      CHECK_CU(cuMemAddressReserve(&mcVA, allocSize, pm.mcGranularity, 0, 0));
+      CHECK_CU(cuMemMap(mcVA, allocSize, 0, pm.mcHandle, 0));
+
+      CUmemAccessDesc accessDesc;
+      std::memset(&accessDesc, 0, sizeof(accessDesc));
+      accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      accessDesc.location.id = dev;
+      accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      CHECK_CU(cuMemSetAccess(mcVA, allocSize, &accessDesc, 1));
+
+      // Send bind requests to each reader peer (Phase 2 — scratch + bind + map)
+      CreatedRegion cr;
+      cr.key = pm.key;
+      cr.sourceVA = mcVA;
+      cr.allocSize = allocSize;
+
+      for (uint32_t readerRank : pm.readers) {
+        size_t peerIndex = ctx.group->getPeerIndex(readerRank);
+        size_t handleIndex = pm.readerHandleIndices.at(readerRank);
+        ++ctx.group->ipcMapper->waitCount;
+        ctx.group->ipcMapper->sendMulticastBind(peerIndex, handleIndex, pm.mcSize,
+            [ipcMapper = ctx.group->ipcMapper.get(), readerRank, &cr](uintptr_t peerVA) {
+              cr.readerVAs[readerRank] = peerVA;
+              --ipcMapper->waitCount;
+            });
+      }
+
+      ctx.group->ipcMapper->wait();
+      createdRegions.push_back(std::move(cr));
+
+      log.info("compile_op phase7b: created multicast for input[%u]+%zu (%zu bytes), "
+               "%zu readers, VA=%#llx\n",
+          pm.key.inputIndex, pm.key.inputOffset, pm.key.bytes, pm.readers.size(), (unsigned long long)mcVA);
+    }
+
+    // Barrier: ensure all ipc_mapper handler work is complete on all ranks
+    ctx.barrier();
+
+    // Exchange multicast assignments via queues.
+    // Each source sends assignments to each peer; non-sources send empty lists.
+    Vector<Vector<MulticastAssignment>> assignmentsToSend(size);
+
+    for (const auto& cr : createdRegions) {
+      for (const auto& [readerRank, peerVA] : cr.readerVAs) {
+        MulticastAssignment ma;
+        ma.sourceRank = static_cast<uint32_t>(rank);
+        ma.sourceInputIndex = cr.key.inputIndex;
+        ma.sourceInputOffset = cr.key.inputOffset;
+        ma.bytes = cr.key.bytes;
+        ma.scratchVA = peerVA;
+        ma.allocSize = cr.allocSize;
+        assignmentsToSend[readerRank].push_back(ma);
+      }
+    }
+
+    ctx.barrier();
+
+    for (size_t destRank : range(size)) {
+      TensorPtr tensor = serializeToTensorPtr(assignmentsToSend[destRank]);
+      ctx.queues[destRank]->put(std::move(tensor), 0);
+    }
+
+    // Receive assignments from all ranks
+    Vector<MulticastAssignment> receivedAssignments;
+    for (size_t i : range(size)) {
+      (void)i;
+      auto [tensor, qsize] = ctx.queues[rank]->get();
+      Vector<MulticastAssignment> entries;
+      deserializeFromTensorPtr(tensor, entries);
+      for (auto& ma : entries) {
+        receivedAssignments.push_back(std::move(ma));
+      }
+    }
+
+    // Build MulticastSource entries (one per created region on this rank).
+    // Build MulticastDest entries from received assignments; remove from localInputCopies.
+    // Self-copies (sourceRank == rank) stay in localInputCopies — handled by the copy path.
+
+    for (const auto& cr : createdRegions) {
+      CustomOpDescriptor::MulticastSource ms;
+      ms.sourceInputIndex = cr.key.inputIndex;
+      ms.sourceInputOffset = cr.key.inputOffset;
+      ms.bytes = cr.key.bytes;
+      ms.mcVA = cr.sourceVA;
+      op->multicastSources.push_back(ms);
+    }
+
+    for (const auto& ma : receivedAssignments) {
+      bool matched = false;
+      for (auto it = op->localInputCopies.begin(); it != op->localInputCopies.end(); ++it) {
+        if (it->sourceRank == ma.sourceRank && it->sourceInputIndex == ma.sourceInputIndex &&
+            it->sourceInputOffset == ma.sourceInputOffset && it->bytes == ma.bytes) {
+          CustomOpDescriptor::MulticastDest md;
+          md.sourceRank = ma.sourceRank;
+          md.sourceInputIndex = ma.sourceInputIndex;
+          md.sourceInputOffset = ma.sourceInputOffset;
+          md.bytes = ma.bytes;
+          md.myOutputIndex = it->myOutputIndex;
+          md.myOutputOffset = it->myOutputOffset;
+          md.scratchVA = ma.scratchVA;
+          md.allocSize = ma.allocSize;
+          op->multicastDests.push_back(md);
+          op->localInputCopies.erase(it);
+          matched = true;
+          break;
+        }
+      }
+      CHECK(matched);
+    }
+
+    log.info("compile_op phase7: rank %zu, %zu multicast sources, %zu multicast dests, "
+             "%zu remaining localInputCopies\n",
+        rank, op->multicastSources.size(), op->multicastDests.size(), op->localInputCopies.size());
+
+    // Final barrier after Phase 7
+    ctx.barrier();
+  }
 
   // Compute byte counts for logging
   size_t inputBytes = 0, outputBytes = 0, readBytes = 0;

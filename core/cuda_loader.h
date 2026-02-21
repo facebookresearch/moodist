@@ -121,6 +121,19 @@ struct CUmemFabricHandle {
   unsigned char data[64];
 };
 
+// Multicast types
+struct CUmulticastObjectProp {
+  unsigned int numDevices;
+  size_t size;
+  unsigned long long handleTypes;
+  unsigned long long flags;
+};
+
+enum CUmulticastGranularity_flags {
+  CU_MULTICAST_GRANULARITY_MINIMUM = 0,
+  CU_MULTICAST_GRANULARITY_RECOMMENDED = 1,
+};
+
 // Memory types
 enum CUmemorytype {
   CU_MEMORYTYPE_HOST = 0x01,
@@ -161,6 +174,7 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132;
 
 // Pointer attributes
 using CUpointer_attribute = int;
@@ -317,6 +331,14 @@ using cuMemExportToShareableHandle_t = CUresult (*)(void* shareableHandle, CUmem
 using cuMemImportShareableHandle_t = CUresult (*)(
     CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType);
 
+// Multicast management (optional, Hopper+ with NVSwitch)
+using cuMulticastCreate_t = CUresult (*)(CUmemGenericAllocationHandle*, const CUmulticastObjectProp*);
+using cuMulticastAddDevice_t = CUresult (*)(CUmemGenericAllocationHandle, CUdevice);
+using cuMulticastBindMem_t = CUresult (*)(
+    CUmemGenericAllocationHandle, size_t, CUmemGenericAllocationHandle, size_t, size_t, unsigned long long);
+using cuMulticastGetGranularity_t = CUresult (*)(size_t*, const CUmulticastObjectProp*, CUmulticastGranularity_flags);
+using cuMulticastUnbind_t = CUresult (*)(CUmemGenericAllocationHandle, CUdevice, size_t, size_t);
+
 // Pointer attributes
 using cuPointerGetAttribute_t = CUresult (*)(void* data, CUpointer_attribute attribute, CUdeviceptr ptr);
 using cuPointerSetAttribute_t = CUresult (*)(const void* value, CUpointer_attribute attribute, CUdeviceptr ptr);
@@ -413,6 +435,13 @@ struct CudaApi {
   cuMemGetAllocationGranularity_t memGetAllocationGranularity = nullptr;
   cuMemExportToShareableHandle_t memExportToShareableHandle = nullptr;
   cuMemImportShareableHandle_t memImportShareableHandle = nullptr;
+
+  // Multicast (optional)
+  cuMulticastCreate_t multicastCreate = nullptr;
+  cuMulticastAddDevice_t multicastAddDevice = nullptr;
+  cuMulticastBindMem_t multicastBindMem = nullptr;
+  cuMulticastGetGranularity_t multicastGetGranularity = nullptr;
+  cuMulticastUnbind_t multicastUnbind = nullptr;
 
   // Pointer attributes
   cuPointerGetAttribute_t pointerGetAttribute = nullptr;
@@ -581,6 +610,23 @@ inline CUresult cuMemExportToShareableHandle(void* shareableHandle, CUmemGeneric
 inline CUresult cuMemImportShareableHandle(
     CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType) {
   return cudaApi.memImportShareableHandle(handle, osHandle, shHandleType);
+}
+inline CUresult cuMulticastCreate(CUmemGenericAllocationHandle* handle, const CUmulticastObjectProp* prop) {
+  return cudaApi.multicastCreate(handle, prop);
+}
+inline CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle handle, CUdevice dev) {
+  return cudaApi.multicastAddDevice(handle, dev);
+}
+inline CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mcHandle, size_t mcOffset,
+    CUmemGenericAllocationHandle memHandle, size_t memOffset, size_t size, unsigned long long flags) {
+  return cudaApi.multicastBindMem(mcHandle, mcOffset, memHandle, memOffset, size, flags);
+}
+inline CUresult cuMulticastGetGranularity(
+    size_t* granularity, const CUmulticastObjectProp* prop, CUmulticastGranularity_flags option) {
+  return cudaApi.multicastGetGranularity(granularity, prop, option);
+}
+inline CUresult cuMulticastUnbind(CUmemGenericAllocationHandle handle, CUdevice dev, size_t offset, size_t size) {
+  return cudaApi.multicastUnbind(handle, dev, offset, size);
 }
 inline CUresult cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr) {
   return cudaApi.pointerGetAttribute(data, attribute, ptr);

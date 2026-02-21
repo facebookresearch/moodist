@@ -33,6 +33,9 @@ struct CompileOpKernels {
   CUmodule cuModule = nullptr;
   CUfunction cuCopyKernel = nullptr;
 
+  CUmodule cuMulticastModule = nullptr;
+  CUfunction cuMulticastKernel = nullptr;
+
   size_t gridSize = 64;
   size_t blockSize = 256;
 
@@ -41,6 +44,7 @@ struct CompileOpKernels {
   CompileOpKernels(Group* group);
   ~CompileOpKernels();
   void compile();
+  void compileMulticast();
 };
 
 } // namespace moodist

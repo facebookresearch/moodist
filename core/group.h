@@ -94,6 +94,9 @@ struct Group {
   std::unique_ptr<ReduceScatter> reduceScatter;
   CpuThread* cpuThread = nullptr;
 
+  bool supportsFabric = false;
+  bool supportsMulticast = false;
+
   AllocatedArray cpuOutBuffer;
   AllocatedArray cpuInBuffer;
 
