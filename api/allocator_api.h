@@ -81,4 +81,7 @@ size_t allocatorGetChunkCount();
 // Returns true if index is valid, false otherwise.
 bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize);
 
+// Check if the allocator supports fabric handles
+bool allocatorSupportsFabric();
+
 } // namespace moodist

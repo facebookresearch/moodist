@@ -81,7 +81,7 @@ struct Memfd {
   }
 };
 
-enum { requestBad, requestMapAddress, requestMapEvent, requestUnmap, requestMapVMM };
+enum { requestBad, requestMapAddress, requestMapEvent, requestUnmap, requestMapVMM, requestMapVMMFabric };
 
 struct IpcMapperImpl : IpcMapper {
 
@@ -99,6 +99,7 @@ struct IpcMapperImpl : IpcMapper {
         CUipcMemHandle requestMapMemory;
         CUipcEventHandle requestMapEvent;
         uintptr_t requestUnmapAddress;
+        CUmemFabricHandle requestMapFabric;
       };
       size_t requestBytes;
       size_t requestVMMOffset; // For VMM: offset within the handle's allocation
@@ -173,6 +174,9 @@ struct IpcMapperImpl : IpcMapper {
   // vmmRecvFds[peerIndex] is used by the handler thread to receive fds from peer.
   std::array<int, 8> vmmSendFds{};
   std::array<int, 8> vmmRecvFds{};
+
+  // When true, use fabric handles instead of POSIX fd passing for VMM IPC
+  bool useFabric = false;
 
   // Send a file descriptor over a Unix socket using SCM_RIGHTS
   static void sendFdOverSocket(int sockFd, int fdToSend) {
@@ -270,6 +274,53 @@ struct IpcMapperImpl : IpcMapper {
       };
       std::array<HandlerVMMPeer, 8> handlerVMMPeers;
 
+      // Common VMM mapping logic: lazy-init VA reservation, map, set access, track
+      auto mapVMMHandle = [&](HandlerVMMPeer& hpeer, CUmemGenericAllocationHandle importedHandle, size_t mapSize,
+                              size_t chunkOffset, size_t peerIndex, size_t sourceRank) -> CUdeviceptr {
+        // Lazy-init: reserve 1TB VA range for this peer on first chunk
+        if (hpeer.reservedBase == 0) {
+          CUmemAllocationProp prop;
+          std::memset(&prop, 0, sizeof(prop));
+          prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+          prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+          CUdevice dev;
+          CHECK_CU(cuCtxGetDevice(&dev));
+          prop.location.id = dev;
+
+          size_t granularity = 0;
+          CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+          constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+          CUdeviceptr base = 0;
+          CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+          hpeer.reservedBase = base;
+          hpeer.reservedSize = reserveSize;
+
+          log.debug("%d: reserved 1TB VA at %#x for peer %d (rank %d)\n", group->rank, base, peerIndex, sourceRank);
+        }
+
+        CHECK(chunkOffset + mapSize <= hpeer.reservedSize);
+        CUdeviceptr mapAddr = hpeer.reservedBase + chunkOffset;
+
+        CHECK_CU(cuMemMap(mapAddr, mapSize, 0, importedHandle, 0));
+
+        CUmemAccessDesc accessDesc;
+        std::memset(&accessDesc, 0, sizeof(accessDesc));
+        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        CUdevice dev;
+        CHECK_CU(cuCtxGetDevice(&dev));
+        accessDesc.location.id = dev;
+        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CHECK_CU(cuMemSetAccess(mapAddr, mapSize, &accessDesc, 1));
+
+        hpeer.importedChunks.push_back({importedHandle, chunkOffset, mapSize});
+
+        log.debug("%d: VMM mapped %#x bytes at %#x (peer %d, offset %#x)\n", group->rank, mapSize, mapAddr, peerIndex,
+            chunkOffset);
+
+        return mapAddr;
+      };
+
       while (true) {
         if (terminate.load(std::memory_order_relaxed)) {
           break;
@@ -350,52 +401,18 @@ struct IpcMapperImpl : IpcMapper {
                   &importedHandle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
               ::close(fd);
 
-              auto& hpeer = handlerVMMPeers[peerIndex];
+              v.response = mapVMMHandle(handlerVMMPeers[peerIndex], importedHandle, v.requestBytes, v.requestVMMOffset,
+                  peerIndex, sourceRank);
+            } else if (v.kind == requestMapVMMFabric) {
+              size_t peerIndex = group->getPeerIndex(sourceRank);
+              log.debug("%d: got VMM fabric map request (size %#x, offset %#x) from rank %d!\n", group->rank,
+                  v.requestBytes, v.requestVMMOffset, sourceRank);
 
-              // Lazy-init: reserve 1TB VA range for this peer on first chunk
-              if (hpeer.reservedBase == 0) {
-                CUmemAllocationProp prop;
-                std::memset(&prop, 0, sizeof(prop));
-                prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-                prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                CUdevice dev;
-                CHECK_CU(cuCtxGetDevice(&dev));
-                prop.location.id = dev;
+              CUmemGenericAllocationHandle importedHandle;
+              CHECK_CU(cuMemImportShareableHandle(&importedHandle, &v.requestMapFabric, CU_MEM_HANDLE_TYPE_FABRIC));
 
-                size_t granularity = 0;
-                CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-
-                constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
-                CUdeviceptr base = 0;
-                CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
-                hpeer.reservedBase = base;
-                hpeer.reservedSize = reserveSize;
-
-                log.debug(
-                    "%d: reserved 1TB VA at %#x for peer %d (rank %d)\n", group->rank, base, peerIndex, sourceRank);
-              }
-
-              size_t mapSize = v.requestBytes;
-              size_t chunkOffset = v.requestVMMOffset;
-              CHECK(chunkOffset + mapSize <= hpeer.reservedSize);
-              CUdeviceptr mapAddr = hpeer.reservedBase + chunkOffset;
-
-              CHECK_CU(cuMemMap(mapAddr, mapSize, 0, importedHandle, 0));
-
-              CUmemAccessDesc accessDesc;
-              std::memset(&accessDesc, 0, sizeof(accessDesc));
-              accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-              CUdevice dev;
-              CHECK_CU(cuCtxGetDevice(&dev));
-              accessDesc.location.id = dev;
-              accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-              CHECK_CU(cuMemSetAccess(mapAddr, mapSize, &accessDesc, 1));
-
-              hpeer.importedChunks.push_back({importedHandle, chunkOffset, mapSize});
-              v.response = mapAddr;
-
-              log.debug("%d: VMM mapped %#x bytes at %#x (peer %d, offset %#x)\n", group->rank, mapSize, mapAddr,
-                  peerIndex, chunkOffset);
+              v.response = mapVMMHandle(handlerVMMPeers[peerIndex], importedHandle, v.requestBytes, v.requestVMMOffset,
+                  peerIndex, sourceRank);
             } else {
               CHECK(false);
             }
@@ -526,6 +543,21 @@ struct IpcMapperImpl : IpcMapper {
     ::close(fd);
   }
 
+  void sendRequestVMMFabric(size_t peerIndex, CUmemGenericAllocationHandle handle, size_t handleSize, size_t offset,
+      Function<void(uintptr_t)> callback) {
+    CUmemFabricHandle fabricHandle;
+    CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+
+    enqueue(peerIndex, std::move(callback), [&](auto& slot) {
+      slot.kind = requestMapVMMFabric;
+      slot.sourceRank = group->rank;
+      slot.requestStepValue = this->stepValue;
+      slot.requestBytes = handleSize;
+      slot.requestVMMOffset = offset;
+      slot.requestMapFabric = fabricHandle;
+    });
+  }
+
   void sendNextVMMChunk(size_t peerIndex) {
     std::unique_lock l(mutex);
     auto& peer = vmmPeers[peerIndex];
@@ -559,24 +591,29 @@ struct IpcMapperImpl : IpcMapper {
     log.debug("sendNextVMMChunk: mapping chunk %d for peer %d (offset %#x, size %#x)\n", chunkIndex, peerIndex,
         chunkOffset, chunkSize);
 
-    sendRequestVMM(
-        peerIndex, handle, chunkSize, chunkOffset, [this, peerIndex, chunkOffset, chunkSize](uintptr_t mappedAddress) {
-          // NOTE: mutex IS held here (callback dispatched from entry() under lock_guard)
-          auto& peer = vmmPeers[peerIndex];
+    auto callback = [this, peerIndex, chunkOffset, chunkSize](uintptr_t mappedAddress) {
+      // NOTE: mutex IS held here (callback dispatched from entry() under lock_guard)
+      auto& peer = vmmPeers[peerIndex];
 
-          // On first chunk, record the peer's base address
-          if (peer.mappedChunkCount == 0) {
-            peer.peerBase = mappedAddress - chunkOffset;
-            log.debug("sendNextVMMChunk: peer %d base = %#x\n", peerIndex, peer.peerBase);
-          }
+      // On first chunk, record the peer's base address
+      if (peer.mappedChunkCount == 0) {
+        peer.peerBase = mappedAddress - chunkOffset;
+        log.debug("sendNextVMMChunk: peer %d base = %#x\n", peerIndex, peer.peerBase);
+      }
 
-          peer.mappedWatermark = chunkOffset + chunkSize;
-          peer.mappedChunkCount++;
-          // Don't decrement waitCount or call sendNextVMMChunk here —
-          // we're under mutex and can't call enqueue(). The entry() thread
-          // will pick this up on the next iteration via vmmChainNeeded.
-          peer.vmmChainPending = true;
-        });
+      peer.mappedWatermark = chunkOffset + chunkSize;
+      peer.mappedChunkCount++;
+      // Don't decrement waitCount or call sendNextVMMChunk here —
+      // we're under mutex and can't call enqueue(). The entry() thread
+      // will pick this up on the next iteration via vmmChainNeeded.
+      peer.vmmChainPending = true;
+    };
+
+    if (useFabric) {
+      sendRequestVMMFabric(peerIndex, handle, chunkSize, chunkOffset, std::move(callback));
+    } else {
+      sendRequestVMM(peerIndex, handle, chunkSize, chunkOffset, std::move(callback));
+    }
   }
 
   // Called from the entry() thread after releasing the mutex to continue
@@ -726,95 +763,128 @@ struct IpcMapperImpl : IpcMapper {
       vmmRecvFds[i] = -1;
     }
 
-    std::string vmmAddress = fmt::sprintf("ipc-vmm-%d-%s", ::getpid(), randomName());
-
-    // Create listener
-    int listenFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    CHECK(listenFd >= 0);
-
+    // Check if fabric handles are available — probe with an actual cuMemCreate
+    // since the device attribute alone doesn't guarantee IMEX is running.
     {
-      sockaddr_un sa;
-      std::memset(&sa, 0, sizeof(sa));
-      sa.sun_family = AF_UNIX;
-      sa.sun_path[0] = '\0'; // Abstract namespace
-      std::string path = "moolib-" + vmmAddress;
-      size_t len = std::min(path.size(), sizeof(sa.sun_path) - 2);
-      std::memcpy(&sa.sun_path[1], path.data(), len);
-      int rc = ::bind(listenFd, (const sockaddr*)&sa, sizeof(sa));
-      CHECK(rc == 0);
-      rc = ::listen(listenFd, 16);
-      CHECK(rc == 0);
+      CUdevice dev;
+      CHECK_CU(cuCtxGetDevice(&dev));
+      int fabricAttr = 0;
+      cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+      if (fabricAttr != 0) {
+        CUmemAllocationProp prop;
+        std::memset(&prop, 0, sizeof(prop));
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes =
+            (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = dev;
+
+        size_t granularity = 0;
+        CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+        CUmemGenericAllocationHandle probeHandle;
+        auto probeErr = cuMemCreate(&probeHandle, granularity, &prop, 0);
+        if (probeErr == CUDA_SUCCESS) {
+          cuMemRelease(probeHandle);
+          useFabric = true;
+          log.info("Fabric handles supported, using fabric for VMM IPC\n");
+        } else {
+          log.info("Fabric handles not available (IMEX not running?), using POSIX fd for VMM IPC\n");
+        }
+      }
     }
 
-    // Exchange VMM socket addresses
-    for (size_t i : group->ipcRanks) {
-      group->setupComms->sendTo(i, vmmAddress);
-    }
+    if (!useFabric) {
+      std::string vmmAddress = fmt::sprintf("ipc-vmm-%d-%s", ::getpid(), randomName());
 
-    // Connect to each peer's listener (creates our send fd for that peer)
-    auto vmmData = serializeToBuffer(signature, (uint32_t)group->rank);
-    for (size_t i : group->ipcRanks) {
-      std::string peerAddr = group->setupComms->recvFrom<std::string>(i);
-      size_t peerIndex = group->getPeerIndex(i);
+      // Create listener
+      int listenFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      CHECK(listenFd >= 0);
 
-      int sockFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-      CHECK(sockFd >= 0);
-
-      sockaddr_un sa;
-      std::memset(&sa, 0, sizeof(sa));
-      sa.sun_family = AF_UNIX;
-      sa.sun_path[0] = '\0';
-      std::string path = "moolib-" + peerAddr;
-      size_t len = std::min(path.size(), sizeof(sa.sun_path) - 2);
-      std::memcpy(&sa.sun_path[1], path.data(), len);
-
-      int rc;
-      do {
-        rc = ::connect(sockFd, (const sockaddr*)&sa, sizeof(sa));
-      } while (rc == -1 && errno == EINTR);
-      CHECK(rc == 0);
-
-      // Send our rank for identification
-      ssize_t n;
-      do {
-        n = ::send(sockFd, vmmData->data(), vmmData->size(), 0);
-      } while (n == -1 && errno == EINTR);
-      CHECK(n == (ssize_t)vmmData->size());
-
-      vmmSendFds[peerIndex] = sockFd;
-    }
-
-    // Accept connections from all peers (creates recv fd for each peer)
-    for (size_t c = 0; c < group->ipcRanks.size(); ++c) {
-      int connFd;
-      do {
-        connFd = ::accept(listenFd, nullptr, nullptr);
-      } while (connFd == -1 && errno == EINTR);
-      CHECK(connFd >= 0);
-
-      // Read the rank identification
-      char buf[12];
-      size_t totalRead = 0;
-      while (totalRead < sizeof(buf)) {
-        ssize_t n;
-        do {
-          n = ::recv(connFd, buf + totalRead, sizeof(buf) - totalRead, 0);
-        } while (n == -1 && errno == EINTR);
-        CHECK(n > 0);
-        totalRead += n;
+      {
+        sockaddr_un sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        sa.sun_path[0] = '\0'; // Abstract namespace
+        std::string path = "moolib-" + vmmAddress;
+        size_t len = std::min(path.size(), sizeof(sa.sun_path) - 2);
+        std::memcpy(&sa.sun_path[1], path.data(), len);
+        int rc = ::bind(listenFd, (const sockaddr*)&sa, sizeof(sa));
+        CHECK(rc == 0);
+        rc = ::listen(listenFd, 16);
+        CHECK(rc == 0);
       }
 
-      uint64_t sig;
-      uint32_t sourceRank;
-      std::memcpy(&sig, buf, 8);
-      std::memcpy(&sourceRank, buf + 8, 4);
-      CHECK(sig == signature);
+      // Exchange VMM socket addresses
+      for (size_t i : group->ipcRanks) {
+        group->setupComms->sendTo(i, vmmAddress);
+      }
 
-      size_t peerIndex = group->getPeerIndex(sourceRank);
-      vmmRecvFds[peerIndex] = connFd;
-    }
+      // Connect to each peer's listener (creates our send fd for that peer)
+      auto vmmData = serializeToBuffer(signature, (uint32_t)group->rank);
+      for (size_t i : group->ipcRanks) {
+        std::string peerAddr = group->setupComms->recvFrom<std::string>(i);
+        size_t peerIndex = group->getPeerIndex(i);
 
-    ::close(listenFd);
+        int sockFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(sockFd >= 0);
+
+        sockaddr_un sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        sa.sun_path[0] = '\0';
+        std::string path = "moolib-" + peerAddr;
+        size_t len = std::min(path.size(), sizeof(sa.sun_path) - 2);
+        std::memcpy(&sa.sun_path[1], path.data(), len);
+
+        int rc;
+        do {
+          rc = ::connect(sockFd, (const sockaddr*)&sa, sizeof(sa));
+        } while (rc == -1 && errno == EINTR);
+        CHECK(rc == 0);
+
+        // Send our rank for identification
+        ssize_t n;
+        do {
+          n = ::send(sockFd, vmmData->data(), vmmData->size(), 0);
+        } while (n == -1 && errno == EINTR);
+        CHECK(n == (ssize_t)vmmData->size());
+
+        vmmSendFds[peerIndex] = sockFd;
+      }
+
+      // Accept connections from all peers (creates recv fd for each peer)
+      for (size_t c = 0; c < group->ipcRanks.size(); ++c) {
+        int connFd;
+        do {
+          connFd = ::accept(listenFd, nullptr, nullptr);
+        } while (connFd == -1 && errno == EINTR);
+        CHECK(connFd >= 0);
+
+        // Read the rank identification
+        char buf[12];
+        size_t totalRead = 0;
+        while (totalRead < sizeof(buf)) {
+          ssize_t n;
+          do {
+            n = ::recv(connFd, buf + totalRead, sizeof(buf) - totalRead, 0);
+          } while (n == -1 && errno == EINTR);
+          CHECK(n > 0);
+          totalRead += n;
+        }
+
+        uint64_t sig;
+        uint32_t sourceRank;
+        std::memcpy(&sig, buf, 8);
+        std::memcpy(&sourceRank, buf + 8, 4);
+        CHECK(sig == signature);
+
+        size_t peerIndex = group->getPeerIndex(sourceRank);
+        vmmRecvFds[peerIndex] = connFd;
+      }
+
+      ::close(listenFd);
+    } // !useFabric
 
     thread = std::thread([this] {
       entry();

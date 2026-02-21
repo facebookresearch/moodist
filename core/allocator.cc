@@ -352,6 +352,7 @@ struct CudaAllocatorImpl {
 
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
   size_t allocationGranularity = 0;
+  bool fabricSupported = false;
 
   LocalFreeList<Vector<CUstream>> freeListStreams;
   LocalFreeList<EventRegion> freeListEventRegions;
@@ -530,10 +531,20 @@ struct CudaAllocatorImpl {
 
     // Initialize VA reservation on first call
     if (reservedBase == 0) {
+      // Query fabric handle support
+      int fabricAttr = 0;
+      cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
+      fabricSupported = fabricAttr != 0;
+
+      CUmemAllocationHandleType handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+      if (fabricSupported) {
+        handleTypes = (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
+      }
+
       CUmemAllocationProp prop;
       std::memset(&prop, 0, sizeof(prop));
       prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-      prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+      prop.requestedHandleTypes = handleTypes;
       prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
       prop.location.id = deviceIndex;
       prop.allocFlags.gpuDirectRDMACapable = 1;
@@ -541,6 +552,20 @@ struct CudaAllocatorImpl {
       size_t granularity = 0;
       CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
       allocationGranularity = granularity;
+
+      // Probe: verify fabric handles actually work (device may report support
+      // but IMEX daemon may not be running)
+      if (fabricSupported) {
+        CUmemGenericAllocationHandle probeHandle;
+        auto probeErr = cuMemCreate(&probeHandle, granularity, &prop, 0);
+        if (probeErr != CUDA_SUCCESS) {
+          fabricSupported = false;
+          prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+          log.info("Fabric handle probe failed, falling back to POSIX fd for VMM IPC\n");
+        } else {
+          cuMemRelease(probeHandle);
+        }
+      }
 
       constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
       CUdeviceptr base = 0;
@@ -560,7 +585,10 @@ struct CudaAllocatorImpl {
     CUmemAllocationProp prop;
     std::memset(&prop, 0, sizeof(prop));
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.requestedHandleTypes =
+        fabricSupported
+            ? (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC)
+            : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = deviceIndex;
     prop.allocFlags.gpuDirectRDMACapable = 1;
@@ -1281,6 +1309,13 @@ bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outO
   *outOffset = offset;
   *outSize = handles[index].first;
   return true;
+}
+
+bool allocatorSupportsFabric() {
+  if (!globalCudaAllocatorImpl) {
+    return false;
+  }
+  return globalCudaAllocatorImpl->fabricSupported;
 }
 
 // allocator namespace functions that are in core
