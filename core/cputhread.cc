@@ -816,8 +816,9 @@ struct CpuThreadImpl {
 
     auto i = mrMapCuda.find(bufferId);
     if (i != mrMapCuda.end()) {
-      CHECK(i->second->address <= address && i->second->address + i->second->bytes >= address + bytes);
-      return &i->second->mr;
+      if (i->second->address <= address && i->second->address + i->second->bytes >= address + bytes) {
+        return &i->second->mr;
+      }
     }
 
     address = base;

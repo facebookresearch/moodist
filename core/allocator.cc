@@ -502,7 +502,13 @@ struct CudaAllocatorImpl {
     CHECK(currentDeviceIndex == deviceIndex);
 
     constexpr size_t buffer = (size_t)1024 * 1024 * 512;
-    constexpr size_t chunkGranularity = (size_t)4 * 1024 * 1024; // 4 MB
+    constexpr size_t minChunkGranularity = (size_t)4 * 1024 * 1024; // 4 MB
+    // Use 1/64 of total GPU memory as chunk granularity, but at least 4MB,
+    // rounded up to CUDA allocation granularity
+    size_t chunkGranularity = std::max(minChunkGranularity, total / 64);
+    if (allocationGranularity > 0) {
+      chunkGranularity = (chunkGranularity + allocationGranularity - 1) / allocationGranularity * allocationGranularity;
+    }
     size_t safebytes = free > buffer ? free - buffer : 0;
     if (safebytes < chunkGranularity) {
       log.info("Moodist CUDA Allocator: not enough free memory after buffer reservation. Device has %d free, %d "
