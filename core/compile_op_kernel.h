@@ -36,8 +36,9 @@ struct CompileOpKernels {
   CUmodule cuMulticastModule = nullptr;
   CUfunction cuMulticastKernel = nullptr;
 
-  size_t gridSize = 64;
+  size_t gridSize = 32;
   size_t blockSize = 256;
+  size_t dynamicSmemBytes = 0; // For v4 cp.async kernel
 
   int version = 0; // From MOODIST_COPY_KERNEL env var
 

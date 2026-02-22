@@ -20,6 +20,12 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       version = 2;
     } else if (!strcmp(env, "v3")) {
       version = 3;
+    } else if (!strcmp(env, "v4")) {
+      version = 4;
+    } else if (!strcmp(env, "v5")) {
+      version = 5;
+    } else if (!strcmp(env, "v6")) {
+      version = 6;
     }
   }
 }
@@ -171,8 +177,8 @@ static std::string concurrencyIndexExpr(const PeerArrayRef& arr, size_t offset =
 // count (size_t, total chunks), numBlocks (uint32_t), loopBytes (size_t),
 // tid16 (size_t), src and dst (uintptr_t).
 // storeTmpl controls the store instruction — use $addr and $val placeholders.
-static std::string emitCascadingCopy(const std::vector<int>& unrollFactors,
-    const std::string& storeTmpl = "__stwt((uint4*)($addr), $val);") {
+static std::string emitCascadingCopy(
+    const std::vector<int>& unrollFactors, const std::string& storeTmpl = "__stwt((uint4*)($addr), $val);") {
   std::string code;
   for (int uf : unrollFactors) {
     if (uf == 1) {
@@ -193,6 +199,76 @@ static std::string emitCascadingCopy(const std::vector<int>& unrollFactors,
     code += fmt::sprintf("i += %d * (size_t)numBlocks;\n", uf);
     code += "}\n";
   }
+  return code;
+}
+
+// Generate pipelined copy that pipelines across loop iterations.
+// Primes `depth` loads before the while loops, each loop body is purely
+// store-load pairs (no idle load phase between iterations), and drains
+// after all loops. Only unroll factors >= depth are used; remaining
+// elements are handled by a simple tail loop.
+// Same variable references as emitCascadingCopy: i, count, numBlocks,
+// loopBytes, tid16, src, dst.
+static std::string emitPipelinedCopy(
+    const std::vector<int>& unrollFactors, int depth, const std::string& storeTmpl = "__stwt((uint4*)($addr), $val);") {
+  std::string code;
+
+  // Declare carry registers
+  for (int k = 0; k < depth; k++) {
+    code += fmt::sprintf("uint4 v%d;\n", k);
+  }
+
+  // Prime: load first `depth` elements (bounds-checked for small data)
+  for (int k = 0; k < depth; k++) {
+    code += fmt::sprintf("if (i + %d * (size_t)numBlocks < count) "
+                         "v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n",
+        k, k, k);
+  }
+
+  // Cascaded pipelined loops (only UFs that are multiples of depth)
+  for (int uf : unrollFactors) {
+    if (uf < depth) {
+      break;
+    }
+
+    // Loop condition: need UF stores + depth loads ahead
+    code += fmt::sprintf("while (i + %d * (size_t)numBlocks < count) {\n", uf - 1 + depth);
+
+    // UF store-load pairs: store carry value, then load new value into same slot
+    for (int j = 0; j < uf; j++) {
+      int vIdx = j % depth;
+      // Store old carry value
+      std::string addr = fmt::sprintf("dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16", j);
+      std::string val = fmt::sprintf("v%d", vIdx);
+      code += replace(storeTmpl, "$addr", addr, "$val", val);
+      code += "\n";
+      // Load new value into same carry slot (depth positions ahead of store)
+      code += fmt::sprintf(
+          "v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n", vIdx, j + depth);
+    }
+
+    code += fmt::sprintf("i += %d * (size_t)numBlocks;\n", uf);
+    code += "}\n";
+  }
+
+  // Drain: store remaining carry values (bounds-checked)
+  for (int k = 0; k < depth; k++) {
+    code += fmt::sprintf("if (i + %d * (size_t)numBlocks < count) {\n", k);
+    std::string addr = fmt::sprintf("dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16", k);
+    std::string val = fmt::sprintf("v%d", k);
+    code += replace(storeTmpl, "$addr", addr, "$val", val);
+    code += "\n}\n";
+  }
+  code += fmt::sprintf("i += %d * (size_t)numBlocks;\n", depth);
+
+  // Tail: simple load-store for remaining elements
+  code += "while (i < count) {\n";
+  code += "uint4 tv = __ldcv((const uint4*)(src + i * loopBytes + tid16));\n";
+  code += replace(storeTmpl, "$addr", std::string("dst + i * loopBytes + tid16"), "$val", std::string("tv"));
+  code += "\n";
+  code += "i += (size_t)numBlocks;\n";
+  code += "}\n";
+
   return code;
 }
 
@@ -295,7 +371,7 @@ __device__ uint32_t exitCounter[$maxConcurrency];
 
   // v1 kernel: dynamic block index distribution with cascading unrolled copy
   if (version == 1) {
-    std::string cascadingCopy = emitCascadingCopy({32, 16, 8, 4, 2, 1});
+    std::string cascadingCopy = emitCascadingCopy({56, 32, 16, 8, 4, 2, 1});
 
     source += replace(
         R"z(
@@ -542,6 +618,454 @@ compile_op_copy(CompileOpCopyParameters params) {
         kMaxCopyDescriptors, "$maxConcurrency", (size_t)Group::maxConcurrency);
   }
 
+  // v4 kernel: cp.async pipelined copy with double-buffered shared memory.
+  // Loads go through the async copy engine (global → shared), stores use __stwt.
+  // Overlaps next tile's load with current tile's stores.
+  if (version == 4) {
+    // Use same grid size as other versions — communication kernels should
+    // use few SMs to leave resources for overlapped compute.
+    int maxSmem = 0;
+    CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+
+    size_t v4Ept = 28;
+    size_t smemPerBlock = 2 * v4Ept * blockSize * 16;
+
+    log.info("compile_op v4: %zu bytes smem/block, grid=%zu\n", smemPerBlock, gridSize);
+
+    source += replace(
+        R"z(
+__device__ uint32_t to_smem_u32(const void* ptr) {
+  uint32_t addr;
+  asm("{.reg .u64 s; cvta.to.shared.u64 s, %1; cvt.u32.u64 %0, s;}"
+      : "=r"(addr) : "l"((uintptr_t)ptr));
+  return addr;
+}
+
+__device__ void cp_async_16(void* smem_dst, const void* global_src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+      :: "r"(to_smem_u32(smem_dst)), "l"((uintptr_t)global_src) : "memory");
+}
+
+__device__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+__device__ void cp_async_wait_1() {
+  asm volatile("cp.async.wait_group 1;" ::: "memory");
+}
+
+} // namespace
+
+extern "C" __global__ void __launch_bounds__($blockSize, 1)
+compile_op_copy(CompileOpCopyParameters params) {
+  const uint32_t stepValue = params.stepValue;
+  const uint32_t concurrencyIndex = params.concurrencyIndex;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t numBlocks = $gridSize;
+
+  // Double-buffered shared memory for cp.async pipeline
+  const int EPT = $ept;
+  const int TILE = EPT * $blockSize;
+  extern __shared__ uint4 smem[];
+
+  // Entry barrier
+  if (tid == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      $stepValueWrites
+      __threadfence_system();
+    }
+    $stepValueWaits
+  }
+  syncthreads();
+
+  for (uint32_t d = 0; d < params.numDescriptors; d++) {
+    uintptr_t src = params.descriptors[d].src;
+    uintptr_t dst = params.descriptors[d].dst;
+    size_t totalElements = params.descriptors[d].bytes / 16;
+
+    const size_t tileStride = (size_t)numBlocks * TILE;
+    size_t firstBase = (size_t)blockIdx.x * TILE;
+    int curBuf = 0;
+
+    // Prefill first tile
+    if (firstBase < totalElements) {
+      size_t curElems = totalElements - firstBase;
+      if (curElems > (size_t)TILE) curElems = TILE;
+      for (int j = 0; j < EPT; j++) {
+        size_t idx = tid + (size_t)j * $blockSize;
+        if (idx < curElems) {
+          cp_async_16(&smem[idx], (const uint4*)(src + (firstBase + idx) * 16));
+        }
+      }
+      cp_async_commit();
+    }
+
+    for (size_t base = firstBase; base < totalElements; base += tileStride) {
+      size_t curElems = totalElements - base;
+      if (curElems > (size_t)TILE) curElems = TILE;
+      size_t nextBase = base + tileStride;
+      int nextBuf = 1 - curBuf;
+      bool hasNext = nextBase < totalElements;
+
+      // Start loading next tile into other buffer
+      if (hasNext) {
+        size_t nextElems = totalElements - nextBase;
+        if (nextElems > (size_t)TILE) nextElems = TILE;
+        for (int j = 0; j < EPT; j++) {
+          size_t idx = tid + (size_t)j * $blockSize;
+          if (idx < nextElems) {
+            cp_async_16(&smem[nextBuf * TILE + idx], (const uint4*)(src + (nextBase + idx) * 16));
+          }
+        }
+        cp_async_commit();
+      }
+
+      // Wait for current tile
+      if (hasNext) {
+        cp_async_wait_1();
+      } else {
+        cp_async_wait_all();
+      }
+      syncthreads();
+
+      // Load from shared memory and store to destination
+      for (int j = 0; j < EPT; j++) {
+        size_t idx = tid + (size_t)j * $blockSize;
+        if (idx < curElems) {
+          __stwt((uint4*)(dst + (base + idx) * 16), smem[curBuf * TILE + idx]);
+        }
+      }
+
+      syncthreads();
+      curBuf = nextBuf;
+    }
+
+    // Tail bytes (< 16)
+    size_t tailStart = totalElements * 16;
+    uint32_t tailBytes = params.descriptors[d].bytes - (uint32_t)tailStart;
+    for (uint32_t i = tid; i < tailBytes; i += $blockSize) {
+      *(uint8_t*)(dst + tailStart + i) = *(const uint8_t*)(src + tailStart + i);
+    }
+  }
+
+  // Exit barrier
+  __threadfence_system();
+  syncthreads();
+  if (tid == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneWrites
+    $copyDoneWaits
+  }
+}
+)z",
+        "$ept", v4Ept, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits, "$copyDoneWrites",
+        copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize", blockSize);
+  }
+
+  // v5 kernel: hybrid cp.async + register copy.
+  // Uses two hardware paths simultaneously:
+  // - Async copy engine (DMA): cp.async loads global → shared memory (double-buffered)
+  // - SM load units: __ldcv loads global → registers
+  // Each tile = ASYNC_TILE + REG_TILE elements. The async portion is double-buffered
+  // so next tile's DMA overlaps with current tile's register + store work.
+  if (version == 5) {
+    size_t v5AsyncEpt = 28;
+    size_t v5RegEpt = 28;
+    size_t smemPerBlock = 2 * v5AsyncEpt * blockSize * 16;
+
+    log.info("compile_op v5: async_ept=%zu, reg_ept=%zu, smem=%zu bytes (double-buffered)\n", v5AsyncEpt, v5RegEpt,
+        smemPerBlock);
+
+    // Generate unrolled register declarations
+    std::string regDecls = "uint4 ";
+    for (size_t j = 0; j < v5RegEpt; j++) {
+      if (j > 0) {
+        regDecls += ", ";
+      }
+      regDecls += fmt::sprintf("r%zu", j);
+    }
+    regDecls += ";";
+
+    // Generate unrolled __ldcv loads
+    std::string regLoads;
+    for (size_t j = 0; j < v5RegEpt; j++) {
+      regLoads += fmt::sprintf("if (tid + %zu * (size_t)%zu < regElems) "
+                               "r%zu = __ldcv((const uint4*)(src + (regBase + tid + %zu * (size_t)%zu) * 16));\n",
+          j, blockSize, j, j, blockSize);
+    }
+
+    // Generate unrolled __stwt stores for register portion
+    std::string regStores;
+    for (size_t j = 0; j < v5RegEpt; j++) {
+      regStores += fmt::sprintf("if (tid + %zu * (size_t)%zu < regElems) "
+                                "__stwt((uint4*)(dst + (regBase + tid + %zu * (size_t)%zu) * 16), r%zu);\n",
+          j, blockSize, j, blockSize, j);
+    }
+
+    source += replace(
+        R"z(
+__device__ uint32_t to_smem_u32(const void* ptr) {
+  uint32_t addr;
+  asm("{.reg .u64 s; cvta.to.shared.u64 s, %1; cvt.u32.u64 %0, s;}"
+      : "=r"(addr) : "l"((uintptr_t)ptr));
+  return addr;
+}
+
+__device__ void cp_async_16(void* smem_dst, const void* global_src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+      :: "r"(to_smem_u32(smem_dst)), "l"((uintptr_t)global_src) : "memory");
+}
+
+__device__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+__device__ void cp_async_wait_1() {
+  asm volatile("cp.async.wait_group 1;" ::: "memory");
+}
+
+} // namespace
+
+extern "C" __global__ void __launch_bounds__($blockSize, 1)
+compile_op_copy(CompileOpCopyParameters params) {
+  const uint32_t stepValue = params.stepValue;
+  const uint32_t concurrencyIndex = params.concurrencyIndex;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t numBlocks = $gridSize;
+
+  const int ASYNC_TILE = $asyncEpt * $blockSize;
+  const int REG_TILE = $regEpt * $blockSize;
+  const int TILE = ASYNC_TILE + REG_TILE;
+  extern __shared__ uint4 smem[];
+
+  // Entry barrier
+  if (tid == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      $stepValueWrites
+      __threadfence_system();
+    }
+    $stepValueWaits
+  }
+  syncthreads();
+
+  for (uint32_t d = 0; d < params.numDescriptors; d++) {
+    uintptr_t src = params.descriptors[d].src;
+    uintptr_t dst = params.descriptors[d].dst;
+    size_t totalElements = params.descriptors[d].bytes / 16;
+
+    const size_t tileStride = (size_t)numBlocks * TILE;
+    size_t firstBase = (size_t)blockIdx.x * TILE;
+    int curBuf = 0;
+
+    // Prefill: load first tile's async portion into buffer 0
+    if (firstBase < totalElements) {
+      size_t asyncElems = totalElements - firstBase;
+      if (asyncElems > (size_t)ASYNC_TILE) asyncElems = ASYNC_TILE;
+      for (int j = 0; j < $asyncEpt; j++) {
+        size_t idx = tid + (size_t)j * $blockSize;
+        if (idx < asyncElems) {
+          cp_async_16(&smem[idx], (const uint4*)(src + (firstBase + idx) * 16));
+        }
+      }
+      cp_async_commit();
+    }
+
+    for (size_t base = firstBase; base < totalElements; base += tileStride) {
+      size_t remaining = totalElements - base;
+      size_t nextBase = base + tileStride;
+      int nextBuf = 1 - curBuf;
+      bool hasNext = nextBase < totalElements;
+
+      // Step 1: Start loading NEXT tile's async portion (DMA engine)
+      if (hasNext) {
+        size_t nextAsyncElems = totalElements - nextBase;
+        if (nextAsyncElems > (size_t)ASYNC_TILE) nextAsyncElems = ASYNC_TILE;
+        for (int j = 0; j < $asyncEpt; j++) {
+          size_t idx = tid + (size_t)j * $blockSize;
+          if (idx < nextAsyncElems) {
+            cp_async_16(&smem[nextBuf * ASYNC_TILE + idx],
+                (const uint4*)(src + (nextBase + idx) * 16));
+          }
+        }
+        cp_async_commit();
+      }
+
+      // Step 2: Register loads for CURRENT tile's register portion
+      //         (SM load units, concurrent with DMA from step 1)
+      size_t regBase = base + ASYNC_TILE;
+      size_t regElems = 0;
+      if (remaining > (size_t)ASYNC_TILE) {
+        regElems = remaining - ASYNC_TILE;
+        if (regElems > (size_t)REG_TILE) regElems = REG_TILE;
+      }
+
+      $regDecls
+      $regLoads
+
+      // Step 3: Register stores (SM store units, DMA still in flight)
+      $regStores
+
+      // Step 4: Wait for CURRENT tile's async (prefilled or from prev iteration)
+      if (hasNext) {
+        cp_async_wait_1();
+      } else {
+        cp_async_wait_all();
+      }
+      syncthreads();
+
+      // Step 5: Store CURRENT tile's async portion from shared memory
+      size_t asyncElems = remaining;
+      if (asyncElems > (size_t)ASYNC_TILE) asyncElems = ASYNC_TILE;
+      for (int j = 0; j < $asyncEpt; j++) {
+        size_t idx = tid + (size_t)j * $blockSize;
+        if (idx < asyncElems) {
+          __stwt((uint4*)(dst + (base + idx) * 16), smem[curBuf * ASYNC_TILE + idx]);
+        }
+      }
+
+      syncthreads();
+      curBuf = nextBuf;
+    }
+
+    // Tail bytes (< 16)
+    size_t tailStart = totalElements * 16;
+    uint32_t tailBytes = params.descriptors[d].bytes - (uint32_t)tailStart;
+    for (uint32_t i = tid; i < tailBytes; i += $blockSize) {
+      *(uint8_t*)(dst + tailStart + i) = *(const uint8_t*)(src + tailStart + i);
+    }
+  }
+
+  // Exit barrier
+  __threadfence_system();
+  syncthreads();
+  if (tid == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneWrites
+    $copyDoneWaits
+  }
+}
+)z",
+        "$asyncEpt", v5AsyncEpt, "$regEpt", v5RegEpt, "$regDecls", regDecls, "$regLoads", regLoads, "$regStores",
+        regStores, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits, "$copyDoneWrites",
+        copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize", blockSize);
+  }
+
+  // v6 kernel: pipelined interleaved copy.
+  // Same structure as v1 but interleaves loads and stores instead of
+  // loading all then storing all. After an initial preamble of loads,
+  // each new load is followed by a store of the element loaded `depth`
+  // iterations earlier. This keeps the load pipeline continuously fed.
+  if (version == 6) {
+    std::string pipelinedCopy = emitPipelinedCopy({48}, 48);
+
+    source += replace(
+        R"z(
+__device__ uint32_t copy_descriptor_block(
+    uint32_t dynamicBlockIndex, uintptr_t src, uintptr_t dst, size_t bytes) {
+
+  const uint32_t tid = threadIdx.x;
+  const size_t tid16 = (size_t)tid * 16;
+  const size_t loopBytes = (size_t)$blockSize * 16;
+  const uint32_t numBlocks = $gridSize;
+  const uint32_t blockIndex = dynamicBlockIndex;
+
+  // Head: align src and dst to 16-byte boundary
+  uint32_t srcMod = (uint32_t)(src & 15);
+  uint32_t dstMod = (uint32_t)(dst & 15);
+  if (srcMod == dstMod && srcMod != 0 && bytes >= 16) {
+    uint32_t headBytes = 16 - srcMod;
+    if (headBytes > bytes) headBytes = (uint32_t)bytes;
+    for (uint32_t i = tid; i < headBytes; i += $blockSize) {
+      *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+    }
+    src += headBytes;
+    dst += headBytes;
+    bytes -= headBytes;
+  }
+
+  bool aligned = ((src | dst) & 15) == 0;
+
+  if (aligned && bytes >= loopBytes) {
+    size_t count = bytes / loopBytes;
+    dynamicBlockIndex = (dynamicBlockIndex + (uint32_t)count) % numBlocks;
+    size_t i = blockIndex;
+
+    $pipelinedCopy
+
+    size_t done = count * loopBytes;
+    src += done;
+    dst += done;
+    bytes -= done;
+  }
+
+  // Remaining aligned uint4 elements (less than one block stride)
+  if (aligned) {
+    uint32_t remaining16 = (uint32_t)(bytes / 16);
+    for (uint32_t i = tid; i < remaining16; i += $blockSize) {
+      uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
+      __stwt((uint4*)(dst + (uintptr_t)i * 16), val);
+    }
+    size_t done16 = (size_t)remaining16 * 16;
+    src += done16;
+    dst += done16;
+    bytes -= done16;
+  }
+
+  // Tail or fully unaligned: byte copy
+  for (uint32_t i = tid; i < (uint32_t)bytes; i += $blockSize) {
+    *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+  }
+
+  return dynamicBlockIndex;
+}
+
+} // namespace
+
+extern "C" __global__ void __launch_bounds__($blockSize, 1)
+compile_op_copy(CompileOpCopyParameters params) {
+  const uint32_t stepValue = params.stepValue;
+  const uint32_t concurrencyIndex = params.concurrencyIndex;
+
+  // Entry barrier: first block signals peers, all blocks wait for peers
+  if (threadIdx.x == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      $stepValueWrites
+      __threadfence_system();
+    }
+    $stepValueWaits
+  }
+  syncthreads();
+
+  // Copy work: dynamic block index rotates across descriptors
+  uint32_t dynamicBlockIndex = blockIdx.x;
+  for (uint32_t d = 0; d < params.numDescriptors; d++) {
+    dynamicBlockIndex = copy_descriptor_block(
+        dynamicBlockIndex,
+        params.descriptors[d].src,
+        params.descriptors[d].dst,
+        params.descriptors[d].bytes);
+  }
+
+  // Exit barrier: last block signals copyDone, waits for peers
+  __threadfence_system();
+  syncthreads();
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneWrites
+    $copyDoneWaits
+  }
+}
+)z",
+        "$pipelinedCopy", pipelinedCopy, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits,
+        "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize",
+        blockSize);
+  }
+
   source = replace(source, "%%", "%");
   source = autoindent(source);
   source = addLineCountComments(source);
@@ -637,14 +1161,28 @@ compile_op_copy(CompileOpCopyParameters params) {
 
   CHECK_CU(cuModuleGetFunction(&cuCopyKernel, cuModule, "compile_op_copy"));
 
+  // v4/v5 use extern __shared__ — opt in to max available shared memory
+  if (version == 4 || version == 5) {
+    int maxSmem = 0;
+    CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+
+    dynamicSmemBytes = 2 * 28 * blockSize * 16; // double-buffered
+    if (dynamicSmemBytes > (size_t)maxSmem) {
+      dynamicSmemBytes = maxSmem;
+    }
+    CHECK_CU(cuFuncSetAttribute(cuCopyKernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamicSmemBytes));
+  }
+
   int numRegs = 0;
   CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, cuCopyKernel));
   int maxThreadsPerBlock = 0;
   CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuCopyKernel));
   int localBytes = 0;
   CHECK_CU(cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, cuCopyKernel));
-  log.info(
-      "compile_op_copy: %d registers, %d local bytes, max %d threads/block\n", numRegs, localBytes, maxThreadsPerBlock);
+  int staticSmem = 0;
+  CHECK_CU(cuFuncGetAttribute(&staticSmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, cuCopyKernel));
+  log.info("compile_op_copy: %d registers, %d local bytes, %d static smem, %zu dynamic smem, max %d threads/block\n",
+      numRegs, localBytes, staticSmem, dynamicSmemBytes, maxThreadsPerBlock);
 
   log.info("compile_op kernel compile took %gs\n", seconds(std::chrono::steady_clock::now() - start));
 }
@@ -858,11 +1396,10 @@ compile_op_multicast(CompileOpCopyParameters params) {
 }
 )z";
 
-  source =
-      replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency", (size_t)Group::maxConcurrency,
-          "$cascadingCopy", multimemCascadingCopy, "$stepValueWrites", stepValueWrites, "$stepValueWaits",
-          stepValueWaits, "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize,
-          "$blockSize", blockSize);
+  source = replace(source, "$kMaxCopyDescriptors", kMaxCopyDescriptors, "$maxConcurrency",
+      (size_t)Group::maxConcurrency, "$cascadingCopy", multimemCascadingCopy, "$stepValueWrites", stepValueWrites,
+      "$stepValueWaits", stepValueWaits, "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits,
+      "$gridSize", gridSize, "$blockSize", blockSize);
 
   source = replace(source, "%%", "%");
   source = autoindent(source);
