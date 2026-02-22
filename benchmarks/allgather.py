@@ -40,7 +40,8 @@ DEFAULT_SIZES = [1024, 4096, 16384, 65536, 262144, 1024**2, 4 * 1024**2,
                  16 * 1024**2, 64 * 1024**2, 256 * 1024**2]
 
 
-def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int):
+def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int,
+                    profile: bool = False):
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -97,6 +98,24 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
                       f"chunk {r}: {bad}/{numel} elements wrong", file=sys.stderr)
                 sys.exit(1)
 
+        # Profiling
+        if profile:
+            trace_dir = f"traces/{backend}"
+            os.makedirs(trace_dir, exist_ok=True)
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            ) as prof:
+                for _ in range(10):
+                    run()
+            torch.cuda.synchronize()
+            prof.export_chrome_trace(
+                f"{trace_dir}/allgather_{format_size(size)}_rank{rank}.json")
+            if rank == 0:
+                print(f"  trace: {trace_dir}/allgather_{format_size(size)}_rank{rank}.json")
+
         # Measured iterations
         start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
         end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
@@ -131,10 +150,12 @@ def main():
                         help="Comma-separated sizes per rank, e.g. '1K,1M,64M'")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--profile", action="store_true",
+                        help="Generate Chrome traces in traces/<backend>/")
     args = parser.parse_args()
 
     sizes = [parse_size(s) for s in args.sizes.split(",")] if args.sizes else DEFAULT_SIZES
-    bench_allgather(args.backend, sizes, args.iterations, args.warmup)
+    bench_allgather(args.backend, sizes, args.iterations, args.warmup, args.profile)
 
 
 if __name__ == "__main__":
