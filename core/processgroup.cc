@@ -4217,7 +4217,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
         d.bytes = lic.bytes;
       }
     }
-    // Add peer copies
+    // Add peer copies (already sorted by staggered rotation in computeNvlinkPlan)
     for (size_t i : indices(op->localInputCopies)) {
       const auto& lic = op->localInputCopies[i];
       if (lic.sourceRank == rank) {

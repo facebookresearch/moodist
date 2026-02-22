@@ -756,6 +756,36 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     (void)inputContiguous; // Used by execution path, not stored in descriptor
   }
 
+  // Sort peer copies by staggered rotation to reduce NVLink contention.
+  // Rank r reads from (r+1)%N first, (r+2)%N second, etc., so at each
+  // descriptor step every rank reads from a different peer.
+  // Must be stable to preserve order within the same source rank — the
+  // IPC address push/pop FIFO requires matching order per peer.
+  std::stable_sort(op->localInputCopies.begin(), op->localInputCopies.end(),
+      [&](const CustomOpDescriptor::LocalInputCopy& a, const CustomOpDescriptor::LocalInputCopy& b) {
+        bool aSelf = a.sourceRank == rank;
+        bool bSelf = b.sourceRank == rank;
+        if (aSelf != bSelf) {
+          return aSelf;
+        }
+        uint32_t ra = (a.sourceRank - rank - 1 + size) % size;
+        uint32_t rb = (b.sourceRank - rank - 1 + size) % size;
+        return ra < rb;
+      });
+  {
+    std::string order;
+    for (const auto& lic : op->localInputCopies) {
+      if (lic.sourceRank == rank) {
+        continue;
+      }
+      if (!order.empty()) {
+        order += ", ";
+      }
+      order += fmt::sprintf("r%u(%uB)", lic.sourceRank, lic.bytes);
+    }
+    log.info("rank %zu: peer read order: [%s]\n", rank, order);
+  }
+
   // Add outputCopies
   for (const auto& oc : outputCopyList) {
     CustomOpDescriptor::Copy c;

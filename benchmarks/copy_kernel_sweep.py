@@ -21,7 +21,7 @@ def main():
     parser.add_argument("nproc", type=int, nargs="?", default=2,
                         help="Number of GPUs (default: 2)")
     parser.add_argument("--sizes", type=str,
-                        default="64,256,1K,4K,16K,64K,256K,1M,4M,16M,64M",
+                        default="64,256,1K,4K,16K,64K,256K,1M,4M,16M,64M,256M",
                         help="Comma-separated sizes per rank")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=50)

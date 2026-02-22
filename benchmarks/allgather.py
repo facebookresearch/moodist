@@ -17,7 +17,6 @@ import sys
 import torch
 import torch.distributed as dist
 
-
 def parse_size(s: str) -> int:
     s = s.strip().upper()
     for suffix, mult in [("G", 1024**3), ("M", 1024**2), ("K", 1024)]:
