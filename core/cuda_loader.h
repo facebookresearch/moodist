@@ -173,6 +173,7 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR 
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132;
 
@@ -184,8 +185,10 @@ constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_BUFFER_ID = 7;
 // Function attributes
 using CUfunction_attribute = int;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0;
+constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
+constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
 // Event flags
 constexpr unsigned int CU_EVENT_DEFAULT = 0x0;
@@ -291,6 +294,7 @@ using cuModuleGetFunction_t = CUresult (*)(CUfunction* hfunc, CUmodule hmod, con
 
 // Function management
 using cuFuncGetAttribute_t = CUresult (*)(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
+using cuFuncSetAttribute_t = CUresult (*)(CUfunction hfunc, CUfunction_attribute attrib, int value);
 
 // Memory management
 using cuMemAlloc_t = CUresult (*)(CUdeviceptr* dptr, size_t bytesize);
@@ -403,6 +407,7 @@ struct CudaApi {
 
   // Function management
   cuFuncGetAttribute_t funcGetAttribute = nullptr;
+  cuFuncSetAttribute_t funcSetAttribute = nullptr;
 
   // Memory management
   cuMemAlloc_t memAlloc = nullptr;
@@ -532,6 +537,9 @@ inline CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char
 }
 inline CUresult cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc) {
   return cudaApi.funcGetAttribute(pi, attrib, hfunc);
+}
+inline CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
+  return cudaApi.funcSetAttribute(hfunc, attrib, value);
 }
 inline CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
   return cudaApi.memAlloc(dptr, bytesize);
