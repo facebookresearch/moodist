@@ -26,6 +26,14 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       version = 5;
     } else if (!strcmp(env, "v6")) {
       version = 6;
+    } else if (!strcmp(env, "v7")) {
+      version = 7;
+    }
+  }
+  if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
+    int bs = atoi(env);
+    if (bs >= 32 && bs <= 1024 && (bs % 32) == 0) {
+      blockSize = bs;
     }
   }
 }
@@ -299,33 +307,37 @@ void CompileOpKernels::compile() {
   std::string copyDoneWrites;
   std::string copyDoneWaits;
 
-  for (size_t i : peerIndices) {
-    // Entry: write our stepValue into peer's stepValue array at our rank's slot
-    stepValueWrites += replace(
-        R"(
-      *(volatile uint32_t*)$ptr = stepValue;
-    )",
-        "$ptr", concurrencyIndexExpr(group->peerCudaStepValue[i], sizeof(uint32_t) * rank));
+  bool noSync = std::getenv("MOODIST_PROFILE_NOSYNC") && !strcmp(std::getenv("MOODIST_PROFILE_NOSYNC"), "1");
 
-    // Entry: wait for peer's stepValue at their rank's slot in our array
-    stepValueWaits += replace(
-        R"(while (*(volatile uint32_t*)($ptr) < stepValue);
-    )",
-        "$ptr", concurrencyIndexExpr(group->cudaStepValue, sizeof(uint32_t) * group->ipcRanks[i]));
+  if (!noSync) {
+    for (size_t i : peerIndices) {
+      // Entry: write our stepValue into peer's stepValue array at our rank's slot
+      stepValueWrites += replace(
+          R"(
+        *(volatile uint32_t*)$ptr = stepValue;
+      )",
+          "$ptr", concurrencyIndexExpr(group->peerCudaStepValue[i], sizeof(uint32_t) * rank));
 
-    // Exit: write copyDone into peer's copyDone array at our slot
-    copyDoneWrites += replace(
-        R"(
-      *(volatile uint32_t*)$ptr = stepValue;
-    )",
-        "$ptr", concurrencyIndexExpr(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
+      // Entry: wait for peer's stepValue at their rank's slot in our array
+      stepValueWaits += replace(
+          R"(while (*(volatile uint32_t*)($ptr) < stepValue);
+      )",
+          "$ptr", concurrencyIndexExpr(group->cudaStepValue, sizeof(uint32_t) * group->ipcRanks[i]));
 
-    // Exit: wait for peer's copyDone at their slot in our array
-    copyDoneWaits += replace(
-        R"(
-      while (*(volatile uint32_t*)$ptr < stepValue);
-    )",
-        "$ptr", concurrencyIndexExpr(group->cudaCopyDone, sizeof(uint32_t) * i));
+      // Exit: write copyDone into peer's copyDone array at our slot
+      copyDoneWrites += replace(
+          R"(
+        *(volatile uint32_t*)$ptr = stepValue;
+      )",
+          "$ptr", concurrencyIndexExpr(group->peerCudaCopyDone[i], sizeof(uint32_t) * group->peerMyRemoteIndex[i]));
+
+      // Exit: wait for peer's copyDone at their slot in our array
+      copyDoneWaits += replace(
+          R"(
+        while (*(volatile uint32_t*)$ptr < stepValue);
+      )",
+          "$ptr", concurrencyIndexExpr(group->cudaCopyDone, sizeof(uint32_t) * i));
+    }
   }
 
   // Generate source
@@ -962,7 +974,7 @@ compile_op_copy(CompileOpCopyParameters params) {
   // each new load is followed by a store of the element loaded `depth`
   // iterations earlier. This keeps the load pipeline continuously fed.
   if (version == 6) {
-    std::string pipelinedCopy = emitPipelinedCopy({48}, 48);
+    std::string pipelinedCopy = emitPipelinedCopy({48, 32, 16, 8, 4}, 4);
 
     source += replace(
         R"z(
@@ -1062,6 +1074,188 @@ compile_op_copy(CompileOpCopyParameters params) {
 }
 )z",
         "$pipelinedCopy", pipelinedCopy, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits,
+        "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize",
+        blockSize);
+  }
+
+  // v7 kernel: simple pipelined copy with configurable depth.
+  // depth = unroll factor = pipeline depth. No cascading.
+  // One main loop of depth store-load pairs + simple tail.
+  // MOODIST_COPY_DEPTH sets depth (default 4).
+  // MOODIST_COPY_LOAD_FIRST=1 issues load before store (default: store first).
+  if (version == 7) {
+    int v7depth = 4;
+    bool v7loadFirst = false;
+
+    if (auto* env = std::getenv("MOODIST_COPY_DEPTH")) {
+      v7depth = atoi(env);
+      if (v7depth < 1) {
+        v7depth = 1;
+      }
+      if (v7depth > 56) {
+        v7depth = 56;
+      }
+    }
+    if (auto* env = std::getenv("MOODIST_COPY_LOAD_FIRST")) {
+      v7loadFirst = !strcmp(env, "1");
+    }
+
+    log.info("compile_op v7: depth=%d, loadFirst=%d\n", v7depth, v7loadFirst);
+
+    std::string copyCode;
+
+    // Declare carry registers
+    for (int k = 0; k < v7depth; k++) {
+      copyCode += fmt::sprintf("uint4 v%d;\n", k);
+    }
+
+    // Prime: load first `depth` elements
+    for (int k = 0; k < v7depth; k++) {
+      copyCode +=
+          fmt::sprintf("if (i + %d * (size_t)numBlocks < count) "
+                       "v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n",
+              k, k, k);
+    }
+
+    // Main loop: depth store-load pairs per iteration
+    copyCode += fmt::sprintf("while (i + %d * (size_t)numBlocks < count) {\n", 2 * v7depth - 1);
+
+    for (int j = 0; j < v7depth; j++) {
+      std::string storeInstr =
+          fmt::sprintf("__stwt((uint4*)(dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16), v%d);\n", j, j);
+
+      if (v7loadFirst) {
+        // Load first: issue NVLink fetch before store
+        copyCode += fmt::sprintf(
+            "uint4 t%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n", j,
+            j + v7depth);
+        copyCode += storeInstr;
+        copyCode += fmt::sprintf("v%d = t%d;\n", j, j);
+      } else {
+        // Store first, then load
+        copyCode += storeInstr;
+        copyCode += fmt::sprintf(
+            "v%d = __ldcv((const uint4*)(src + (i + %d * (size_t)numBlocks) * loopBytes + tid16));\n", j, j + v7depth);
+      }
+    }
+
+    copyCode += fmt::sprintf("i += %d * (size_t)numBlocks;\n", v7depth);
+    copyCode += "}\n";
+
+    // Drain: store remaining carry values
+    for (int k = 0; k < v7depth; k++) {
+      copyCode += fmt::sprintf("if (i + %d * (size_t)numBlocks < count) {\n", k);
+      copyCode +=
+          fmt::sprintf("__stwt((uint4*)(dst + (i + %d * (size_t)numBlocks) * loopBytes + tid16), v%d);\n", k, k);
+      copyCode += "}\n";
+    }
+    copyCode += fmt::sprintf("i += %d * (size_t)numBlocks;\n", v7depth);
+
+    // Tail: simple load-store for remaining elements
+    copyCode += "while (i < count) {\n";
+    copyCode += "uint4 tv = __ldcv((const uint4*)(src + i * loopBytes + tid16));\n";
+    copyCode += "__stwt((uint4*)(dst + i * loopBytes + tid16), tv);\n";
+    copyCode += "i += (size_t)numBlocks;\n";
+    copyCode += "}\n";
+
+    source += replace(
+        R"z(
+__device__ uint32_t copy_descriptor_block(
+    uint32_t dynamicBlockIndex, uintptr_t src, uintptr_t dst, size_t bytes) {
+
+  const uint32_t tid = threadIdx.x;
+  const size_t tid16 = (size_t)tid * 16;
+  const size_t loopBytes = (size_t)$blockSize * 16;
+  const uint32_t numBlocks = $gridSize;
+  const uint32_t blockIndex = dynamicBlockIndex;
+
+  // Head: align src and dst to 16-byte boundary
+  uint32_t srcMod = (uint32_t)(src & 15);
+  uint32_t dstMod = (uint32_t)(dst & 15);
+  if (srcMod == dstMod && srcMod != 0 && bytes >= 16) {
+    uint32_t headBytes = 16 - srcMod;
+    if (headBytes > bytes) headBytes = (uint32_t)bytes;
+    for (uint32_t i = tid; i < headBytes; i += $blockSize) {
+      *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+    }
+    src += headBytes;
+    dst += headBytes;
+    bytes -= headBytes;
+  }
+
+  bool aligned = ((src | dst) & 15) == 0;
+
+  if (aligned && bytes >= loopBytes) {
+    size_t count = bytes / loopBytes;
+    dynamicBlockIndex = (dynamicBlockIndex + (uint32_t)count) % numBlocks;
+    size_t i = blockIndex;
+
+    $copyCode
+
+    size_t done = count * loopBytes;
+    src += done;
+    dst += done;
+    bytes -= done;
+  }
+
+  // Remaining aligned uint4 elements (less than one block stride)
+  if (aligned) {
+    uint32_t remaining16 = (uint32_t)(bytes / 16);
+    for (uint32_t i = tid; i < remaining16; i += $blockSize) {
+      uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
+      __stwt((uint4*)(dst + (uintptr_t)i * 16), val);
+    }
+    size_t done16 = (size_t)remaining16 * 16;
+    src += done16;
+    dst += done16;
+    bytes -= done16;
+  }
+
+  // Tail or fully unaligned: byte copy
+  for (uint32_t i = tid; i < (uint32_t)bytes; i += $blockSize) {
+    *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
+  }
+
+  return dynamicBlockIndex;
+}
+
+} // namespace
+
+extern "C" __global__ void __launch_bounds__($blockSize, 1)
+compile_op_copy(CompileOpCopyParameters params) {
+  const uint32_t stepValue = params.stepValue;
+  const uint32_t concurrencyIndex = params.concurrencyIndex;
+
+  // Entry barrier: first block signals peers, all blocks wait for peers
+  if (threadIdx.x == 0) {
+    if (atomicInc(&entryCounter[concurrencyIndex], $gridSize - 1) == 0) {
+      $stepValueWrites
+      __threadfence_system();
+    }
+    $stepValueWaits
+  }
+  syncthreads();
+
+  // Copy work: dynamic block index rotates across descriptors
+  uint32_t dynamicBlockIndex = blockIdx.x;
+  for (uint32_t d = 0; d < params.numDescriptors; d++) {
+    dynamicBlockIndex = copy_descriptor_block(
+        dynamicBlockIndex,
+        params.descriptors[d].src,
+        params.descriptors[d].dst,
+        params.descriptors[d].bytes);
+  }
+
+  // Exit barrier: last block signals copyDone, waits for peers
+  __threadfence_system();
+  syncthreads();
+  if (threadIdx.x == 0 && atomicInc(&exitCounter[concurrencyIndex], $gridSize - 1) == $gridSize - 1) {
+    $copyDoneWrites
+    $copyDoneWaits
+  }
+}
+)z",
+        "$copyCode", copyCode, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits,
         "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize",
         blockSize);
   }

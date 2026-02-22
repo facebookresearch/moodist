@@ -17,9 +17,64 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <type_traits>
 
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+
 namespace moodist {
+
+namespace {
+
+void crashHandler(int sig) {
+  const char* name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : "SIGNAL";
+  // Manual int-to-string (snprintf is not async-signal-safe)
+  char pidbuf[16];
+  char* p = pidbuf + sizeof(pidbuf);
+  pid_t pid = getpid();
+  do {
+    *--p = '0' + (pid % 10);
+    pid /= 10;
+  } while (pid);
+  write(STDERR_FILENO, "\nmoodist[", 9);
+  write(STDERR_FILENO, p, pidbuf + sizeof(pidbuf) - p);
+  write(STDERR_FILENO, "]: ", 3);
+  write(STDERR_FILENO, name, strlen(name));
+  write(STDERR_FILENO, " — backtrace:\n", 14);
+
+  raise(SIGSTOP);
+
+  void* frames[64];
+  int n = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, n, STDERR_FILENO);
+
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+std::once_flag crashHandlerFlag;
+
+void installCrashHandler() {
+  std::call_once(crashHandlerFlag, [] {
+    const char* env = std::getenv("MOODIST_CRASH_HANDLER");
+    if (!env || strcmp(env, "1") != 0) {
+      return;
+    }
+
+    struct sigaction sa = {};
+    sa.sa_handler = crashHandler;
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    log.info("crash handler installed\n");
+  });
+}
+
+} // namespace
 
 struct LocalDevice {
   IbvPtr<ibv_context, ibv_close_device> ctx;
@@ -63,6 +118,8 @@ Group::~Group() {
 }
 
 void Group::init(Function<void()> f, Function<void()> pghandle) {
+
+  installCrashHandler();
 
   auto start = std::chrono::steady_clock::now();
 
