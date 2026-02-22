@@ -33,32 +33,34 @@ void* loadSymOptional(void* lib, const char* name) {
 }
 
 // Helper: find library handle - check RTLD_DEFAULT first, then try dlopen
-// Prefers already-loaded libraries over loading new ones
-void* findLibrary(const char* testSymbol, const char* const* libNames) {
+// Prefers already-loaded libraries over loading new ones.
+// Returns true if found, with lib set to the handle (which may be RTLD_DEFAULT, i.e. NULL).
+bool findLibrary(const char* testSymbol, const char* const* libNames, void*& lib) {
   if (dlsym(RTLD_DEFAULT, testSymbol)) {
     log.verbose("found %s in RTLD_DEFAULT\n", testSymbol);
-    return RTLD_DEFAULT;
+    lib = RTLD_DEFAULT;
+    return true;
   }
   log.debug("%s not in RTLD_DEFAULT\n", testSymbol);
   // First pass: check for already-loaded libraries
   for (const char* const* l = libNames; *l; ++l) {
-    void* lib = dlopen(*l, RTLD_NOW | RTLD_NOLOAD);
+    lib = dlopen(*l, RTLD_NOW | RTLD_NOLOAD);
     if (lib) {
       log.verbose("found %s already loaded\n", *l);
-      return lib;
+      return true;
     }
   }
   // Second pass: try to load
   for (const char* const* l = libNames; *l; ++l) {
-    void* lib = dlopen(*l, RTLD_NOW);
+    lib = dlopen(*l, RTLD_NOW);
     if (lib) {
       log.verbose("loaded %s\n", *l);
-      return lib;
+      return true;
     }
     log.debug("%s not available: %s\n", *l, dlerror());
   }
   log.debug("no library found for %s\n", testSymbol);
-  return nullptr;
+  return false;
 }
 
 std::atomic<bool> cudaLoaded{false};
@@ -73,9 +75,9 @@ bool loadCuda() {
   }
 
   const char* libs[] = {"libcuda.so.1", "libcuda.so", nullptr};
-  void* lib = findLibrary("cuInit", libs);
+  void* lib = nullptr;
 
-  if (lib) {
+  if (findLibrary("cuInit", libs, lib)) {
     bool ok = true;
     std::string failed;
     const char* name = (lib == RTLD_DEFAULT) ? "RTLD_DEFAULT" : "libcuda.so";
@@ -108,6 +110,7 @@ bool loadCuda() {
 
     // Function management
     cudaApi.funcGetAttribute = (cuFuncGetAttribute_t)loadSym(lib, "cuFuncGetAttribute", name, ok, failed);
+    cudaApi.funcSetAttribute = (cuFuncSetAttribute_t)loadSym(lib, "cuFuncSetAttribute", name, ok, failed);
 
     // Memory management (note: many have _v2 suffix in actual symbol)
     cudaApi.memAlloc = (cuMemAlloc_t)loadSym(lib, "cuMemAlloc_v2", name, ok, failed);
@@ -197,9 +200,9 @@ bool loadNvml() {
   }
 
   const char* libs[] = {"libnvidia-ml.so.1", nullptr};
-  void* lib = findLibrary("nvmlInit_v2", libs);
+  void* lib = nullptr;
 
-  if (lib) {
+  if (findLibrary("nvmlInit_v2", libs, lib)) {
     bool ok = true;
     std::string failed;
     const char* name = (lib == RTLD_DEFAULT) ? "RTLD_DEFAULT" : "libnvidia-ml.so";
@@ -230,9 +233,9 @@ bool loadNvrtc() {
   }
 
   const char* libs[] = {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11", "libnvrtc.so", nullptr};
-  void* lib = findLibrary("nvrtcVersion", libs);
+  void* lib = nullptr;
 
-  if (lib) {
+  if (findLibrary("nvrtcVersion", libs, lib)) {
     bool ok = true;
     std::string failed;
     const char* name = (lib == RTLD_DEFAULT) ? "RTLD_DEFAULT" : "libnvrtc.so";
