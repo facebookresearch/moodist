@@ -4292,7 +4292,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     // Single kernel launch replaces syncPeers + copies + syncPeers
     std::array<void*, 1> kparams = {&params};
     CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize, 1, 1,
-        group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+        group->compileOpKernels->blockSize, 1, 1, group->compileOpKernels->dynamicSmemBytes, stream, kparams.data(),
+        nullptr));
   } else {
     // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
     syncPeers(stream);
