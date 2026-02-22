@@ -152,6 +152,7 @@ struct RdmaTcp : Rdma {
   }
 
   [[gnu::noinline]] [[gnu::cold]] void setError(size_t sourceRank = -1) {
+    CHECK(tcp != nullptr);
     if (errorState) {
       return;
     }
