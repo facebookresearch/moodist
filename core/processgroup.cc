@@ -4097,6 +4097,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   sync(stepValue);
 
   int kernelVersion = group->compileOpKernels->version;
+  bool copyWriteMode = false;
+  if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
+    copyWriteMode = !strcmp(env, "1");
+  }
 
   // ==========================================================================
   // Multicast path: O(1) delivery via NVSwitch multicast.
@@ -4205,14 +4209,33 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     }
   }
 
-  // Step 2: IPC-map my inputs for readers
-  Vector<uintptr_t> mappedAddrs(op->localInputProvides.size());
-  for (size_t i : indices(op->localInputProvides)) {
-    const auto& lip = op->localInputProvides[i];
-    size_t peerIndex = group->getPeerIndex(lip.readerRank);
-    CHECK(lip.myInputIndex < inputs.size());
-    uintptr_t myAddr = inputs[lip.myInputIndex]->data() + lip.inputOffset;
-    ipcMapper->requestAddress(peerIndex, myAddr, lip.bytes, &mappedAddrs[i]);
+  // Step 2: IPC-map addresses for peers
+  // Read mode: map my input addresses so peers can read from me
+  // Write mode: map my output addresses so peers can write to me
+  Vector<uintptr_t> mappedAddrs;
+  if (copyWriteMode) {
+    // Map output addresses for each localInputCopy (peers will write here)
+    mappedAddrs.resize(op->localInputCopies.size());
+    for (size_t i : indices(op->localInputCopies)) {
+      const auto& lic = op->localInputCopies[i];
+      if (lic.sourceRank == rank) {
+        continue;
+      }
+      size_t peerIndex = group->getPeerIndex(lic.sourceRank);
+      CHECK(lic.myOutputIndex < outputs.size());
+      uintptr_t myAddr = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+      ipcMapper->requestAddress(peerIndex, myAddr, lic.bytes, &mappedAddrs[i]);
+    }
+  } else {
+    // Map input addresses for each localInputProvide (peers will read from me)
+    mappedAddrs.resize(op->localInputProvides.size());
+    for (size_t i : indices(op->localInputProvides)) {
+      const auto& lip = op->localInputProvides[i];
+      size_t peerIndex = group->getPeerIndex(lip.readerRank);
+      CHECK(lip.myInputIndex < inputs.size());
+      uintptr_t myAddr = inputs[lip.myInputIndex]->data() + lip.inputOffset;
+      ipcMapper->requestAddress(peerIndex, myAddr, lip.bytes, &mappedAddrs[i]);
+    }
   }
   ipcMapper->wait();
 
@@ -4225,43 +4248,89 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
   }
 
-  // Group provides and copies by peer for interleaved push/pop.
-  // The ipcMapper FIFO queue is only 256 bytes per peer, so we can't push
-  // all addresses at once when there are many split chunks. Instead we
-  // push and pop one entry at a time per peer in round-robin order.
-  Vector<Vector<size_t>> providesByPeer(group->size);
-  for (size_t i : indices(op->localInputProvides)) {
-    size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
-    providesByPeer[peerIndex].push_back(i);
-  }
+  // Read mode: source pushes input addrs, reader pops them.
+  // Write mode: reader pushes output addrs, writer pops them.
+  // In both cases, the 1:1 per-peer correspondence is preserved.
+  Vector<uintptr_t> remoteAddrs; // srcAddrs in read mode, dstAddrs in write mode
 
-  Vector<Vector<size_t>> copiesByPeer(group->size);
-  for (size_t i : indices(op->localInputCopies)) {
-    if (op->localInputCopies[i].sourceRank == rank) {
-      continue;
+  if (copyWriteMode) {
+    // Writer pops destination addresses from localInputProvides.
+    // Reader pushes output addresses from localInputCopies.
+    Vector<Vector<size_t>> copiesByPeer(group->size); // push side (reader)
+    for (size_t i : indices(op->localInputCopies)) {
+      if (op->localInputCopies[i].sourceRank == rank) {
+        continue;
+      }
+      size_t peerIndex = group->getPeerIndex(op->localInputCopies[i].sourceRank);
+      copiesByPeer[peerIndex].push_back(i);
     }
-    size_t peerIndex = group->getPeerIndex(op->localInputCopies[i].sourceRank);
-    copiesByPeer[peerIndex].push_back(i);
-  }
 
-  Vector<uintptr_t> srcAddrs(op->localInputCopies.size());
-  Vector<size_t> pushProg(group->size);
-  Vector<size_t> popProg(group->size);
+    Vector<Vector<size_t>> providesByPeer(group->size); // pop side (writer)
+    for (size_t i : indices(op->localInputProvides)) {
+      size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
+      providesByPeer[peerIndex].push_back(i);
+    }
 
-  for (bool done = false; !done;) {
-    done = true;
-    for (size_t peerIndex : peerIndices) {
-      if (pushProg[peerIndex] < providesByPeer[peerIndex].size()) {
-        size_t i = providesByPeer[peerIndex][pushProg[peerIndex]++];
-        ipcMapper->push(peerIndex, mappedAddrs[i]);
-        done = false;
+    remoteAddrs.resize(op->localInputProvides.size());
+    Vector<size_t> pushProg(group->size);
+    Vector<size_t> popProg(group->size);
+
+    for (bool done = false; !done;) {
+      done = true;
+      // Reader pushes its mapped output addresses
+      for (size_t peerIndex : peerIndices) {
+        if (pushProg[peerIndex] < copiesByPeer[peerIndex].size()) {
+          size_t i = copiesByPeer[peerIndex][pushProg[peerIndex]++];
+          ipcMapper->push(peerIndex, mappedAddrs[i]);
+          done = false;
+        }
+      }
+      // Writer pops destination addresses
+      for (size_t peerIndex : peerIndices) {
+        if (popProg[peerIndex] < providesByPeer[peerIndex].size()) {
+          size_t i = providesByPeer[peerIndex][popProg[peerIndex]++];
+          remoteAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
+          done = false;
+        }
       }
     }
-    for (size_t peerIndex : peerIndices) {
-      if (popProg[peerIndex] < copiesByPeer[peerIndex].size()) {
-        size_t i = copiesByPeer[peerIndex][popProg[peerIndex]++];
-        srcAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
-        done = false;
+  } else {
+    // Source pushes input addresses from localInputProvides.
+    // Reader pops source addresses from localInputCopies.
+    Vector<Vector<size_t>> providesByPeer(group->size); // push side (source)
+    for (size_t i : indices(op->localInputProvides)) {
+      size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
+      providesByPeer[peerIndex].push_back(i);
+    }
+
+    Vector<Vector<size_t>> copiesByPeer(group->size); // pop side (reader)
+    for (size_t i : indices(op->localInputCopies)) {
+      if (op->localInputCopies[i].sourceRank == rank) {
+        continue;
+      }
+      size_t peerIndex = group->getPeerIndex(op->localInputCopies[i].sourceRank);
+      copiesByPeer[peerIndex].push_back(i);
+    }
+
+    remoteAddrs.resize(op->localInputCopies.size());
+    Vector<size_t> pushProg(group->size);
+    Vector<size_t> popProg(group->size);
+
+    for (bool done = false; !done;) {
+      done = true;
+      for (size_t peerIndex : peerIndices) {
+        if (pushProg[peerIndex] < providesByPeer[peerIndex].size()) {
+          size_t i = providesByPeer[peerIndex][pushProg[peerIndex]++];
+          ipcMapper->push(peerIndex, mappedAddrs[i]);
+          done = false;
+        }
+      }
+      for (size_t peerIndex : peerIndices) {
+        if (popProg[peerIndex] < copiesByPeer[peerIndex].size()) {
+          size_t i = copiesByPeer[peerIndex][popProg[peerIndex]++];
+          remoteAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
+          done = false;
+        }
       }
     }
   }
@@ -4282,7 +4351,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     params.numDescriptors = 0;
     params._pad = 0;
 
-    // Add self-copies
+    // Add self-copies (same in both read and write mode)
     for (const auto& lic : op->localInputCopies) {
       if (lic.sourceRank != rank) {
         continue;
@@ -4297,18 +4366,32 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
         d.bytes = lic.bytes;
       }
     }
-    // Add peer copies (already sorted by staggered rotation in computeNvlinkPlan)
-    for (size_t i : indices(op->localInputCopies)) {
-      const auto& lic = op->localInputCopies[i];
-      if (lic.sourceRank == rank) {
-        continue;
+    if (copyWriteMode) {
+      // Write mode: src=local input, dst=remote output (from remoteAddrs)
+      for (size_t i : indices(op->localInputProvides)) {
+        const auto& lip = op->localInputProvides[i];
+        if (lip.bytes > 0) {
+          CHECK(params.numDescriptors < kMaxCopyDescriptors);
+          auto& d = params.descriptors[params.numDescriptors++];
+          d.src = inputs[lip.myInputIndex]->data() + lip.inputOffset;
+          d.dst = remoteAddrs[i];
+          d.bytes = lip.bytes;
+        }
       }
-      if (lic.bytes > 0) {
-        CHECK(params.numDescriptors < kMaxCopyDescriptors);
-        auto& d = params.descriptors[params.numDescriptors++];
-        d.src = srcAddrs[i];
-        d.dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-        d.bytes = lic.bytes;
+    } else {
+      // Read mode: src=remote input (from remoteAddrs), dst=local output
+      for (size_t i : indices(op->localInputCopies)) {
+        const auto& lic = op->localInputCopies[i];
+        if (lic.sourceRank == rank) {
+          continue;
+        }
+        if (lic.bytes > 0) {
+          CHECK(params.numDescriptors < kMaxCopyDescriptors);
+          auto& d = params.descriptors[params.numDescriptors++];
+          d.src = remoteAddrs[i];
+          d.dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+          d.bytes = lic.bytes;
+        }
       }
     }
 
@@ -4320,15 +4403,24 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   } else {
     // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
     syncPeers(stream);
-    for (size_t i : indices(op->localInputCopies)) {
-      const auto& lic = op->localInputCopies[i];
-      if (lic.sourceRank == rank) {
-        continue;
+    if (copyWriteMode) {
+      for (size_t i : indices(op->localInputProvides)) {
+        const auto& lip = op->localInputProvides[i];
+        if (lip.bytes > 0) {
+          CHECK_CU(cuMemcpyDtoDAsync(remoteAddrs[i], inputs[lip.myInputIndex]->data() + lip.inputOffset, lip.bytes, stream));
+        }
       }
-      CHECK(lic.myOutputIndex < outputs.size());
-      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-      if (lic.bytes > 0) {
-        CHECK_CU(cuMemcpyDtoDAsync(dst, srcAddrs[i], lic.bytes, stream));
+    } else {
+      for (size_t i : indices(op->localInputCopies)) {
+        const auto& lic = op->localInputCopies[i];
+        if (lic.sourceRank == rank) {
+          continue;
+        }
+        CHECK(lic.myOutputIndex < outputs.size());
+        uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
+        if (lic.bytes > 0) {
+          CHECK_CU(cuMemcpyDtoDAsync(dst, remoteAddrs[i], lic.bytes, stream));
+        }
       }
     }
     syncPeers(stream);
