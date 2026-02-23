@@ -101,6 +101,8 @@ def main():
                         help="Comma-separated virtual block sizes to test, e.g. '32,64,128'")
     parser.add_argument("--kernel", type=str, default=None,
                         help="Fixed kernel config: 'v1' or 'v7:depth:bs[:lf]', e.g. 'v7:16:256'")
+    parser.add_argument("--write", action="store_true",
+                        help="Use write (push) mode instead of read (pull) mode")
     args = parser.parse_args()
 
     sizes = [s.strip() for s in args.sizes.split(",")]
@@ -177,6 +179,13 @@ def main():
 
     if args.nccl:
         configs.append(("nccl", {}))
+
+    # Add write mode env var to all non-nccl configs
+    if args.write:
+        for i, (label, env) in enumerate(configs):
+            if label != "nccl":
+                env["MOODIST_COPY_WRITE"] = "1"
+                configs[i] = (label + " write", env)
 
     print(f"Sweeping {len(configs)} configs, {args.gpus} GPUs, sizes: {sizes_str}")
     print(f"iterations={args.iterations}, warmup={args.warmup}")
