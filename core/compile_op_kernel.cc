@@ -1083,9 +1083,14 @@ compile_op_copy(CompileOpCopyParameters params) {
   // One main loop of depth store-load pairs + simple tail.
   // MOODIST_COPY_DEPTH sets depth (default 4).
   // MOODIST_COPY_LOAD_FIRST=1 issues load before store (default: store first).
+  // MOODIST_COPY_VIRTUAL_BS sets virtual block size (default = blockSize).
+  //   Threads are split into virtual blocks of this size (must be >= 32,
+  //   multiple of 32, <= blockSize). Total virtual blocks = gridSize * blockSize / vbs.
+  //   Each virtual block processes descriptors in staggered order for peer diversity.
   if (version == 7) {
     int v7depth = 4;
     bool v7loadFirst = false;
+    size_t v7virtualBs = blockSize;
 
     if (auto* env = std::getenv("MOODIST_COPY_DEPTH")) {
       v7depth = atoi(env);
@@ -1099,8 +1104,14 @@ compile_op_copy(CompileOpCopyParameters params) {
     if (auto* env = std::getenv("MOODIST_COPY_LOAD_FIRST")) {
       v7loadFirst = !strcmp(env, "1");
     }
+    if (auto* env = std::getenv("MOODIST_COPY_VIRTUAL_BS")) {
+      int vbs = atoi(env);
+      if (vbs >= 32 && vbs <= (int)blockSize && (vbs % 32) == 0) {
+        v7virtualBs = vbs;
+      }
+    }
 
-    log.info("compile_op v7: depth=%d, loadFirst=%d\n", v7depth, v7loadFirst);
+    log.info("compile_op v7: depth=%d, loadFirst=%d, virtualBs=%zu\n", v7depth, v7loadFirst, v7virtualBs);
 
     std::string copyCode;
 
@@ -1160,14 +1171,12 @@ compile_op_copy(CompileOpCopyParameters params) {
 
     source += replace(
         R"z(
-__device__ uint32_t copy_descriptor_block(
-    uint32_t dynamicBlockIndex, uintptr_t src, uintptr_t dst, size_t bytes) {
+__device__ void copy_descriptor(
+    uint32_t tid, uint32_t blockIndex, uint32_t numBlocks,
+    uintptr_t src, uintptr_t dst, size_t bytes) {
 
-  const uint32_t tid = threadIdx.x;
   const size_t tid16 = (size_t)tid * 16;
-  const size_t loopBytes = (size_t)$blockSize * 16;
-  const uint32_t numBlocks = $gridSize;
-  const uint32_t blockIndex = dynamicBlockIndex;
+  const size_t loopBytes = (size_t)$virtualBs * 16;
 
   // Head: align src and dst to 16-byte boundary
   uint32_t srcMod = (uint32_t)(src & 15);
@@ -1175,7 +1184,7 @@ __device__ uint32_t copy_descriptor_block(
   if (srcMod == dstMod && srcMod != 0 && bytes >= 16) {
     uint32_t headBytes = 16 - srcMod;
     if (headBytes > bytes) headBytes = (uint32_t)bytes;
-    for (uint32_t i = tid; i < headBytes; i += $blockSize) {
+    for (uint32_t i = tid; i < headBytes; i += $virtualBs) {
       *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
     }
     src += headBytes;
@@ -1187,7 +1196,6 @@ __device__ uint32_t copy_descriptor_block(
 
   if (aligned && bytes >= loopBytes) {
     size_t count = bytes / loopBytes;
-    dynamicBlockIndex = (dynamicBlockIndex + (uint32_t)count) % numBlocks;
     size_t i = blockIndex;
 
     $copyCode
@@ -1198,10 +1206,10 @@ __device__ uint32_t copy_descriptor_block(
     bytes -= done;
   }
 
-  // Remaining aligned uint4 elements (less than one block stride)
+  // Remaining aligned uint4 elements (less than one virtual block stride)
   if (aligned) {
     uint32_t remaining16 = (uint32_t)(bytes / 16);
-    for (uint32_t i = tid; i < remaining16; i += $blockSize) {
+    for (uint32_t i = tid; i < remaining16; i += $virtualBs) {
       uint4 val = __ldcv((const uint4*)(src + (uintptr_t)i * 16));
       __stwt((uint4*)(dst + (uintptr_t)i * 16), val);
     }
@@ -1212,11 +1220,9 @@ __device__ uint32_t copy_descriptor_block(
   }
 
   // Tail or fully unaligned: byte copy
-  for (uint32_t i = tid; i < (uint32_t)bytes; i += $blockSize) {
+  for (uint32_t i = tid; i < (uint32_t)bytes; i += $virtualBs) {
     *(uint8_t*)(dst + i) = *(const uint8_t*)(src + i);
   }
-
-  return dynamicBlockIndex;
 }
 
 } // namespace
@@ -1236,11 +1242,18 @@ compile_op_copy(CompileOpCopyParameters params) {
   }
   syncthreads();
 
-  // Copy work: dynamic block index rotates across descriptors
-  uint32_t dynamicBlockIndex = blockIdx.x;
-  for (uint32_t d = 0; d < params.numDescriptors; d++) {
-    dynamicBlockIndex = copy_descriptor_block(
-        dynamicBlockIndex,
+  // Virtual block mapping: split real blocks into virtual blocks of $virtualBs threads.
+  // Total virtual blocks = gridSize * (blockSize / virtualBs).
+  const uint32_t vpb = $blockSize / $virtualBs;
+  const uint32_t vid = blockIdx.x * vpb + threadIdx.x / $virtualBs;
+  const uint32_t vtid = threadIdx.x %% $virtualBs;
+  const uint32_t numVBlocks = $gridSize * vpb;
+
+  // Each virtual block processes descriptors in staggered order for peer diversity.
+  for (uint32_t dd = 0; dd < params.numDescriptors; dd++) {
+    uint32_t d = (vid + dd) %% params.numDescriptors;
+    copy_descriptor(
+        vtid, vid, numVBlocks,
         params.descriptors[d].src,
         params.descriptors[d].dst,
         params.descriptors[d].bytes);
@@ -1255,9 +1268,9 @@ compile_op_copy(CompileOpCopyParameters params) {
   }
 }
 )z",
-        "$copyCode", copyCode, "$stepValueWrites", stepValueWrites, "$stepValueWaits", stepValueWaits,
-        "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize, "$blockSize",
-        blockSize);
+        "$copyCode", copyCode, "$virtualBs", v7virtualBs, "$stepValueWrites", stepValueWrites, "$stepValueWaits",
+        stepValueWaits, "$copyDoneWrites", copyDoneWrites, "$copyDoneWaits", copyDoneWaits, "$gridSize", gridSize,
+        "$blockSize", blockSize);
   }
 
   source = replace(source, "%%", "%");

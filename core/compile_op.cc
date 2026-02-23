@@ -756,34 +756,83 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     (void)inputContiguous; // Used by execution path, not stored in descriptor
   }
 
-  // Sort peer copies by staggered rotation to reduce NVLink contention.
-  // Rank r reads from (r+1)%N first, (r+2)%N second, etc., so at each
-  // descriptor step every rank reads from a different peer.
-  // Must be stable to preserve order within the same source rank — the
-  // IPC address push/pop FIFO requires matching order per peer.
-  std::stable_sort(op->localInputCopies.begin(), op->localInputCopies.end(),
-      [&](const CustomOpDescriptor::LocalInputCopy& a, const CustomOpDescriptor::LocalInputCopy& b) {
-        bool aSelf = a.sourceRank == rank;
-        bool bSelf = b.sourceRank == rank;
-        if (aSelf != bSelf) {
-          return aSelf;
-        }
-        uint32_t ra = (a.sourceRank - rank - 1 + size) % size;
-        uint32_t rb = (b.sourceRank - rank - 1 + size) % size;
-        return ra < rb;
-      });
+  // Split large peer copies into chunks and interleave across peers.
+  // Without splitting (threshold=0), this is equivalent to staggered rotation.
+  // With splitting, reads from different peers are interleaved so that
+  // timing drift between ranks doesn't cause NVLink contention.
+  // MOODIST_COPY_CHUNK_SIZE sets the max chunk size in bytes (0 = no splitting).
   {
-    std::string order;
-    for (const auto& lic : op->localInputCopies) {
+    size_t chunkThreshold = 0;
+    if (auto* env = std::getenv("MOODIST_COPY_CHUNK_SIZE")) {
+      chunkThreshold = (size_t)atol(env);
+    }
+
+    // Group entries by peer, splitting large ones into chunks
+    Vector<CustomOpDescriptor::LocalInputCopy> selfCopies;
+    Vector<Vector<CustomOpDescriptor::LocalInputCopy>> peerChunks(size);
+
+    for (auto& lic : op->localInputCopies) {
       if (lic.sourceRank == rank) {
+        selfCopies.push_back(lic);
         continue;
       }
-      if (!order.empty()) {
-        order += ", ";
+      if (chunkThreshold > 0 && lic.bytes > chunkThreshold) {
+        size_t offset = 0;
+        while (offset < lic.bytes) {
+          size_t chunkBytes = std::min(chunkThreshold, lic.bytes - offset);
+          CustomOpDescriptor::LocalInputCopy chunk = lic;
+          chunk.sourceInputOffset += offset;
+          chunk.myOutputOffset += offset;
+          chunk.bytes = chunkBytes;
+          peerChunks[lic.sourceRank].push_back(chunk);
+          offset += chunkBytes;
+        }
+      } else {
+        peerChunks[lic.sourceRank].push_back(lic);
       }
-      order += fmt::sprintf("r%u(%uB)", lic.sourceRank, lic.bytes);
     }
-    log.info("rank %zu: peer read order: [%s]\n", rank, order);
+
+    // Build rotated peer order: (rank+1)%N, (rank+2)%N, ...
+    Vector<uint32_t> peerOrder;
+    for (uint32_t i = 1; i < (uint32_t)size; i++) {
+      peerOrder.push_back((rank + i) % size);
+    }
+
+    size_t maxRounds = 0;
+    for (uint32_t peer : peerOrder) {
+      maxRounds = std::max(maxRounds, peerChunks[peer].size());
+    }
+
+    // Rebuild: self-copies first, then interleaved peer copies
+    op->localInputCopies.clear();
+    for (auto& lic : selfCopies) {
+      op->localInputCopies.push_back(std::move(lic));
+    }
+    for (size_t round = 0; round < maxRounds; round++) {
+      for (uint32_t peer : peerOrder) {
+        if (round < peerChunks[peer].size()) {
+          op->localInputCopies.push_back(std::move(peerChunks[peer][round]));
+        }
+      }
+    }
+
+    // Log
+    size_t peerCopyCount = op->localInputCopies.size() - selfCopies.size();
+    if (chunkThreshold > 0 && maxRounds > 1) {
+      log.info("rank %zu: %zu peer copies, %zu rounds (chunk %zuB)\n", rank, peerCopyCount, maxRounds, chunkThreshold);
+    } else {
+      std::string order;
+      for (const auto& lic : op->localInputCopies) {
+        if (lic.sourceRank == rank) {
+          continue;
+        }
+        if (!order.empty()) {
+          order += ", ";
+        }
+        order += fmt::sprintf("r%u(%zuB)", lic.sourceRank, lic.bytes);
+      }
+      log.info("rank %zu: peer read order: [%s]\n", rank, order);
+    }
   }
 
   // Add outputCopies

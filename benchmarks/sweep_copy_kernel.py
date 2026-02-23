@@ -95,6 +95,12 @@ def main():
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--nccl", action="store_true", help="Include NCCL baseline")
+    parser.add_argument("--chunk-sizes", type=str, default=None,
+                        help="Comma-separated chunk sizes to test interleaving, e.g. '1M,2M,4M'")
+    parser.add_argument("--virtual-bs", type=str, default=None,
+                        help="Comma-separated virtual block sizes to test, e.g. '32,64,128'")
+    parser.add_argument("--kernel", type=str, default=None,
+                        help="Fixed kernel config: 'v1' or 'v7:depth:bs[:lf]', e.g. 'v7:16:256'")
     args = parser.parse_args()
 
     sizes = [s.strip() for s in args.sizes.split(",")]
@@ -103,24 +109,71 @@ def main():
     # Define configurations to sweep
     configs = []
 
-    # v1 baseline
-    configs.append(("v1", {"MOODIST_COPY_KERNEL": "v1"}))
+    if args.chunk_sizes or args.virtual_bs:
+        # Chunk size / virtual block size sweep mode
+        kernel_env = {"MOODIST_COPY_KERNEL": "v7", "MOODIST_COPY_DEPTH": "16",
+                      "MOODIST_COPY_BLOCK_SIZE": "256"}
+        kernel_label = "v7 d=16 bs=256"
+        if args.kernel:
+            parts = args.kernel.split(":")
+            if parts[0] == "v1":
+                kernel_env = {"MOODIST_COPY_KERNEL": "v1"}
+                kernel_label = "v1"
+            elif parts[0] == "v7" and len(parts) >= 3:
+                kernel_env = {"MOODIST_COPY_KERNEL": "v7",
+                              "MOODIST_COPY_DEPTH": parts[1],
+                              "MOODIST_COPY_BLOCK_SIZE": parts[2]}
+                kernel_label = f"v7 d={parts[1]} bs={parts[2]}"
+                if len(parts) >= 4 and parts[3] == "lf":
+                    kernel_env["MOODIST_COPY_LOAD_FIRST"] = "1"
+                    kernel_label += " lf"
 
-    # v7 sweep: depth x block_size x load_first
-    for depth in [1, 2, 3, 4, 8, 16, 32]:
-        for bs in [256, 512, 768, 1024]:
-            for lf in [False, True]:
-                label = f"v7 d={depth} bs={bs}"
-                if lf:
-                    label += " lf"
-                env = {
-                    "MOODIST_COPY_KERNEL": "v7",
-                    "MOODIST_COPY_DEPTH": str(depth),
-                    "MOODIST_COPY_BLOCK_SIZE": str(bs),
-                }
-                if lf:
-                    env["MOODIST_COPY_LOAD_FIRST"] = "1"
+        # Build list of (chunk_label, chunk_env_extra) pairs
+        chunk_variants = [("no-chunk", {})]
+        if args.chunk_sizes:
+            for cs in args.chunk_sizes.split(","):
+                cs = cs.strip()
+                chunk_bytes = parse_size(cs)
+                chunk_variants.append((f"chunk={cs}", {"MOODIST_COPY_CHUNK_SIZE": str(chunk_bytes)}))
+
+        # Build list of (vbs_label, vbs_env_extra) pairs
+        vbs_variants = [("", {})]
+        if args.virtual_bs:
+            for vbs in args.virtual_bs.split(","):
+                vbs = vbs.strip()
+                vbs_variants.append((f"vbs={vbs}", {"MOODIST_COPY_VIRTUAL_BS": vbs}))
+
+        # Cross product
+        for chunk_label, chunk_extra in chunk_variants:
+            for vbs_label, vbs_extra in vbs_variants:
+                parts = [kernel_label, chunk_label]
+                if vbs_label:
+                    parts.append(vbs_label)
+                label = " ".join(parts)
+                env = dict(kernel_env)
+                env.update(chunk_extra)
+                env.update(vbs_extra)
                 configs.append((label, env))
+    else:
+        # Default mode: sweep kernel parameters
+        # v1 baseline
+        configs.append(("v1", {"MOODIST_COPY_KERNEL": "v1"}))
+
+        # v7 sweep: depth x block_size x load_first
+        for depth in [1, 2, 3, 4, 8, 16, 32]:
+            for bs in [256, 512, 768, 1024]:
+                for lf in [False, True]:
+                    label = f"v7 d={depth} bs={bs}"
+                    if lf:
+                        label += " lf"
+                    env = {
+                        "MOODIST_COPY_KERNEL": "v7",
+                        "MOODIST_COPY_DEPTH": str(depth),
+                        "MOODIST_COPY_BLOCK_SIZE": str(bs),
+                    }
+                    if lf:
+                        env["MOODIST_COPY_LOAD_FIRST"] = "1"
+                    configs.append((label, env))
 
     if args.nccl:
         configs.append(("nccl", {}))
