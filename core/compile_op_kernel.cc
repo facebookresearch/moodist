@@ -1710,17 +1710,17 @@ compile_op_multicast(CompileOpCopyParameters params) {
 }
 
 // ---------------------------------------------------------------------------
-// CompiledKernel / compileKernel
+// CompiledModule
 // ---------------------------------------------------------------------------
 
-CompiledKernel::~CompiledKernel() {
+CompiledModule::~CompiledModule() {
   if (module) {
     cuModuleUnload(module);
   }
 }
 
-CompiledKernel compileKernel(
-    const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix) {
+CompiledModule CompiledModule::compile(
+    const std::string& source, CUdevice device, const char* dumpPrefix) {
   if (!loadNvrtc()) {
     throw std::runtime_error("NVRTC not available");
   }
@@ -1745,7 +1745,7 @@ CompiledKernel compileKernel(
 
   // Try architectures from newest to oldest
   static const std::pair<int, const char*> archOptions[] = {
-      {10300, "--gpu-architecture=sm_103a"},
+      {10030, "--gpu-architecture=sm_103a"},
       {10000, "--gpu-architecture=sm_100a"},
       {9000, "--gpu-architecture=sm_90a"},
       {8090, "--gpu-architecture=sm_89"},
@@ -1762,6 +1762,8 @@ CompiledKernel compileKernel(
   options.push_back(nullptr); // placeholder for arch
   options.push_back("--fmad=true");
   options.push_back("--std=c++17");
+  // options.push_back("--split-compile=0");
+  // options.push_back("--minimal");
 
   nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
   for (auto& [minArch, archFlag] : archOptions) {
@@ -1781,10 +1783,10 @@ CompiledKernel compileKernel(
     nvrtcApi.getProgramLogSize(program, &logSize);
     logstr.resize(logSize);
     nvrtcApi.getProgramLog(program, logstr.data());
-    log.error("Failed to compile kernel '%s':\n%s\n", functionName, logstr);
+    log.error("Failed to compile kernel:\n%s\n", logstr);
     log.error("Source:\n%s\n", source);
     nvrtcApi.destroyProgram(&program);
-    throw std::runtime_error(fmt::sprintf("NVRTC compilation failed for '%s'", functionName));
+    throw std::runtime_error("NVRTC compilation failed");
   }
 
   size_t cubinSize = 0;
@@ -1793,9 +1795,26 @@ CompiledKernel compileKernel(
   CHECK_NVRTC(nvrtcApi.getCUBIN(program, cubin.data()));
   CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
 
-  CompiledKernel result;
+  CompiledModule result;
   CHECK_CU(cuModuleLoadDataEx(&result.module, cubin.data(), 0, nullptr, nullptr));
-  CHECK_CU(cuModuleGetFunction(&result.function, result.module, functionName));
+  return result;
+}
+
+CUfunction CompiledModule::getFunction(const char* name) const {
+  CUfunction fn = nullptr;
+  CHECK_CU(cuModuleGetFunction(&fn, module, name));
+  return fn;
+}
+
+// ---------------------------------------------------------------------------
+// compileKernel — delegates to CompiledModule
+// ---------------------------------------------------------------------------
+
+CompiledKernel compileKernel(
+    const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix) {
+  CompiledKernel result;
+  result.module = CompiledModule::compile(source, device, dumpPrefix);
+  result.function = result.module.getFunction(functionName);
 
   int numRegs = 0;
   CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, result.function));

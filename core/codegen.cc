@@ -524,13 +524,14 @@ void emitExitBarrier(Group* group) {
   }
 }
 
-void emitMainKernel(Group* group, size_t gridSize, size_t blockSize) {
+void emitMainKernel(Group* group, size_t gridSize, size_t blockSize,
+                    const char* kernelName, const char* copyFnName) {
   using namespace codegen;
   int BS = (int)blockSize;
   int GS = (int)gridSize;
 
   emit(fmt::sprintf("extern \"C\" __global__ void __launch_bounds__(%d, 1)", BS));
-  emit("compile_op_copy(CompileOpCopyParameters params) {");
+  emit(fmt::sprintf("%s(CompileOpCopyParameters params) {", kernelName));
   builder().indent();
 
   emit("const uint32_t stepValue = params.stepValue;");
@@ -551,7 +552,7 @@ void emitMainKernel(Group* group, size_t gridSize, size_t blockSize) {
   for (Var dd : ForRange(u32, 0, params.dot("numDescriptors"))) {
     Var d = decl(u32, "d", (expr("blockIdx.x") + dd) % params.dot("numDescriptors"));
     Expr desc = params.dot("descriptors")[d];
-    emit(fmt::sprintf("copy_descriptor(tid, blockIdx.x, %d, ", GS) + desc.dot("src").str + ", " + desc.dot("dst").str +
+    emit(fmt::sprintf("%s(tid, blockIdx.x, %d, ", copyFnName, GS) + desc.dot("src").str + ", " + desc.dot("dst").str +
          ", " + desc.dot("bytes").str + ");");
   }
   emitBlank();

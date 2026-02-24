@@ -51,35 +51,44 @@ struct CompileOpKernels {
 // ---------------------------------------------------------------------------
 // Standalone kernel compilation via NVRTC.
 //
-// Takes a CUDA source string, compiles it for the given device, and returns
-// a loaded module + function handle. Handles architecture detection,
-// error logging, and optional dump to file (MOODIST_DUMP_KERNELS).
+// CompiledModule owns a CUmodule and can return function handles by name.
+// CompiledKernel is a convenience wrapper holding a module + single function.
 // ---------------------------------------------------------------------------
 
-struct CompiledKernel {
+struct CompiledModule {
   CUmodule module = nullptr;
-  CUfunction function = nullptr;
 
-  CompiledKernel() = default;
-  CompiledKernel(CompiledKernel&& o) noexcept : module(o.module), function(o.function) {
-    o.module = nullptr;
-    o.function = nullptr;
-  }
-  CompiledKernel(const CompiledKernel&) = delete;
-  CompiledKernel& operator=(const CompiledKernel&) = delete;
-  CompiledKernel& operator=(CompiledKernel&& o) noexcept {
+  CompiledModule() = default;
+  CompiledModule(CompiledModule&& o) noexcept : module(o.module) { o.module = nullptr; }
+  CompiledModule(const CompiledModule&) = delete;
+  CompiledModule& operator=(const CompiledModule&) = delete;
+  CompiledModule& operator=(CompiledModule&& o) noexcept {
     if (this != &o) {
-      if (module) {
-        cuModuleUnload(module);
-      }
+      if (module) cuModuleUnload(module);
       module = o.module;
-      function = o.function;
       o.module = nullptr;
-      o.function = nullptr;
     }
     return *this;
   }
-  ~CompiledKernel();
+  ~CompiledModule();
+
+  // Compile CUDA source for the given device. Handles NVRTC loading,
+  // arch detection/fallback, error logging, optional source dump.
+  static CompiledModule compile(
+      const std::string& source, CUdevice device,
+      const char* dumpPrefix = nullptr);
+
+  // Get a function handle by name from the loaded module.
+  CUfunction getFunction(const char* name) const;
+};
+
+struct CompiledKernel {
+  CompiledModule module;
+  CUfunction function = nullptr;
+
+  CompiledKernel() = default;
+  CompiledKernel(CompiledKernel&&) = default;
+  CompiledKernel& operator=(CompiledKernel&&) = default;
 };
 
 CompiledKernel compileKernel(

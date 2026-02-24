@@ -419,7 +419,9 @@ void emitEntryBarrier(Group* group, size_t gridSize);
 void emitExitBarrier(Group* group);
 
 // Emit the complete main kernel with barriers and descriptor loop.
-void emitMainKernel(Group* group, size_t gridSize, size_t blockSize);
+void emitMainKernel(Group* group, size_t gridSize, size_t blockSize,
+                    const char* kernelName = "compile_op_copy",
+                    const char* copyFnName = "copy_descriptor");
 
 // Generate a complete copy kernel source string. Convenience wrapper
 // that calls emitPreamble + emitCopyFunction + emitMainKernel.
