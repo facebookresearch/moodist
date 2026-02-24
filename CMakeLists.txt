@@ -197,6 +197,7 @@ set(core_sources
   core/store.cc
   core/tcpdev.cc
   core/processgroup.cc
+  core/ptx.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}

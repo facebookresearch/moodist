@@ -59,12 +59,16 @@ struct CompiledModule {
   CUmodule module = nullptr;
 
   CompiledModule() = default;
-  CompiledModule(CompiledModule&& o) noexcept : module(o.module) { o.module = nullptr; }
+  CompiledModule(CompiledModule&& o) noexcept : module(o.module) {
+    o.module = nullptr;
+  }
   CompiledModule(const CompiledModule&) = delete;
   CompiledModule& operator=(const CompiledModule&) = delete;
   CompiledModule& operator=(CompiledModule&& o) noexcept {
     if (this != &o) {
-      if (module) cuModuleUnload(module);
+      if (module) {
+        cuModuleUnload(module);
+      }
       module = o.module;
       o.module = nullptr;
     }
@@ -74,9 +78,7 @@ struct CompiledModule {
 
   // Compile CUDA source for the given device. Handles NVRTC loading,
   // arch detection/fallback, error logging, optional source dump.
-  static CompiledModule compile(
-      const std::string& source, CUdevice device,
-      const char* dumpPrefix = nullptr);
+  static CompiledModule compile(const std::string& source, CUdevice device, const char* dumpPrefix = nullptr);
 
   // Get a function handle by name from the loaded module.
   CUfunction getFunction(const char* name) const;

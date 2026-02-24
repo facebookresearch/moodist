@@ -524,8 +524,7 @@ void emitExitBarrier(Group* group) {
   }
 }
 
-void emitMainKernel(Group* group, size_t gridSize, size_t blockSize,
-                    const char* kernelName, const char* copyFnName) {
+void emitMainKernel(Group* group, size_t gridSize, size_t blockSize, const char* kernelName, const char* copyFnName) {
   using namespace codegen;
   int BS = (int)blockSize;
   int GS = (int)gridSize;
