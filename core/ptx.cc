@@ -3,6 +3,7 @@
 #include "ptx.h"
 
 #include <cstdio>
+#include <stdexcept>
 
 namespace moodist {
 namespace ptx {
@@ -443,6 +444,12 @@ RegType regTypeFor(ValType type) {
 
 // --- Val ---
 
+[[noreturn]] static void unsupported(const char* op, ValType type) {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "ptx: unsupported ValType %d for %s", (int)type, op);
+  throw std::runtime_error(buf);
+}
+
 Val::Val(ValType t) : type(t) {
   RegType rt = regTypeFor(t);
   auto& free = freeRegs[(int)rt];
@@ -482,6 +489,21 @@ Val& Val::operator=(Val&& o) noexcept {
   return *this;
 }
 
+Val& Val::operator=(int64_t v) {
+  Operand imm(v);
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    mov_u32(reg, imm);
+    break;
+  case RegType::B64:
+    mov_u64(reg, imm);
+    break;
+  default:
+    unsupported("=(imm)", type);
+  }
+  return *this;
+}
+
 // --- Operators ---
 
 Val Val::operator+(const Operand& b) const {
@@ -500,7 +522,7 @@ Val Val::operator+(const Operand& b) const {
     add_s64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("+", type);
   }
   return result;
 }
@@ -515,7 +537,7 @@ Val Val::operator-(const Operand& b) const {
     sub_s32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("-", type);
   }
   return result;
 }
@@ -536,7 +558,7 @@ Val Val::operator*(const Operand& b) const {
     mul_lo_s64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("*", type);
   }
   return result;
 }
@@ -551,7 +573,7 @@ Val Val::operator&(const Operand& b) const {
     and_b64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("&", type);
   }
   return result;
 }
@@ -566,7 +588,7 @@ Val Val::operator|(const Operand& b) const {
     or_b64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("|", type);
   }
   return result;
 }
@@ -578,7 +600,7 @@ Val Val::operator^(const Operand& b) const {
     xor_b32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("^", type);
   }
   return result;
 }
@@ -590,7 +612,7 @@ Val Val::operator~() const {
     not_b32(result.reg, reg);
     break;
   default:
-    break;
+    unsupported("~", type);
   }
   return result;
 }
@@ -605,7 +627,7 @@ Val Val::operator<<(const Operand& b) const {
     shl_b64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("<<", type);
   }
   return result;
 }
@@ -620,7 +642,7 @@ Val Val::operator>>(const Operand& b) const {
     shr_s32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported(">>", type);
   }
   return result;
 }
@@ -638,7 +660,7 @@ Val Val::operator<(const Operand& b) const {
     setp_lt_s64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("<", type);
   }
   return result;
 }
@@ -650,7 +672,7 @@ Val Val::operator<=(const Operand& b) const {
     setp_le_u32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("<=", type);
   }
   return result;
 }
@@ -662,7 +684,7 @@ Val Val::operator>(const Operand& b) const {
     setp_gt_u32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported(">", type);
   }
   return result;
 }
@@ -680,7 +702,7 @@ Val Val::operator>=(const Operand& b) const {
     setp_ge_s64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported(">=", type);
   }
   return result;
 }
@@ -695,7 +717,7 @@ Val Val::operator==(const Operand& b) const {
     setp_eq_s32(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("==", type);
   }
   return result;
 }
@@ -713,9 +735,41 @@ Val Val::operator!=(const Operand& b) const {
     setp_ne_s64(result.reg, reg, b);
     break;
   default:
-    break;
+    unsupported("!=", type);
   }
   return result;
+}
+
+void Val::operator+=(const Operand& b) {
+  switch (type) {
+  case ValType::U32:
+    add_u32(reg, reg, b);
+    break;
+  case ValType::S32:
+    add_s32(reg, reg, b);
+    break;
+  case ValType::U64:
+    add_u64(reg, reg, b);
+    break;
+  case ValType::S64:
+    add_s64(reg, reg, b);
+    break;
+  default:
+    unsupported("+=", type);
+  }
+}
+
+void Val::operator-=(const Operand& b) {
+  switch (type) {
+  case ValType::U32:
+    sub_u32(reg, reg, b);
+    break;
+  case ValType::S32:
+    sub_s32(reg, reg, b);
+    break;
+  default:
+    unsupported("-=", type);
+  }
 }
 
 // --- FunctionScope ---
@@ -759,13 +813,19 @@ Block* activateNewBlock(const char* prefix) {
 
 // --- ScopeGuard ---
 
-ScopeGuard::ScopeGuard(ScopeGuard&& o) noexcept : pendingBlock(std::move(o.pendingBlock)), closed(o.closed) {
+ScopeGuard::ScopeGuard(ScopeGuard&& o) noexcept
+    : pendingBlock(std::move(o.pendingBlock)), backEdgeTarget(o.backEdgeTarget), closed(o.closed) {
   o.closed = true;
 }
 
 ScopeGuard::~ScopeGuard() {
-  if (!closed && pendingBlock) {
-    activateBlock(std::move(pendingBlock));
+  if (!closed) {
+    if (backEdgeTarget) {
+      bra(backEdgeTarget);
+    }
+    if (pendingBlock) {
+      activateBlock(std::move(pendingBlock));
+    }
   }
 }
 
@@ -793,6 +853,19 @@ ScopeGuard _Else() {
   Block* prevBlock = blocks[blocks.size() - 2].get();
   prevBlock->emit("bra " + sg.pendingBlock->label);
   // Current block (the IF's skip target) becomes the else block — already active
+  return sg;
+}
+
+ScopeGuard _WhileImpl(Block* header, const Reg& pred) {
+  ScopeGuard sg;
+  // Create exit block (forward reference, not yet in function)
+  sg.pendingBlock = std::make_unique<Block>();
+  sg.pendingBlock->label = genLabel("endwhile");
+  sg.backEdgeTarget = header;
+  // Emit conditional branch: exit loop when pred is false
+  bra_not(pred, sg.pendingBlock.get());
+  // Create and activate body block
+  activateNewBlock("while_body");
   return sg;
 }
 
@@ -827,7 +900,7 @@ Val loadParam(int index, ValType type) {
     ld_param_u64(v.reg, paramName);
     break;
   default:
-    break;
+    unsupported("loadParam", type);
   }
   return v;
 }
@@ -842,8 +915,7 @@ Val widen(const Val& v) {
     wide = ValType::S64;
     break;
   default:
-    wide = v.type;
-    break;
+    unsupported("widen", v.type);
   }
   Val result(wide);
   cvt_u64_u32(result.reg, v.reg);
@@ -856,7 +928,7 @@ void storeGlobal(const Val& addr, const Val& val) {
     st_global_u32(addr.reg, val.reg);
     break;
   default:
-    break;
+    unsupported("storeGlobal", val.type);
   }
 }
 
@@ -864,11 +936,12 @@ void storeGlobal(const Val& addr, const Val& val) {
 // ptxTest
 // ---------------------------------------------------------------------------
 
-void ptxTest() {
+std::string ptxTest(const char* target) {
   Module mod;
-  mod.target = "sm_90a";
+  mod.target = target;
   setModule(&mod);
 
+  // --- Test 1: simple tid write ---
   auto* fn = mod.newFunction("test_write_tid");
   {
     FunctionScope fnScope(fn);
@@ -882,7 +955,7 @@ void ptxTest() {
     auto count = loadParam(1, ValType::U32);
     auto tid = threadIdx_x();
 
-    PTX_IF(tid < count) {
+    IF(tid < count) {
       auto addr = outPtr + widen(tid) * 4;
       storeGlobal(addr, tid);
     }
@@ -890,8 +963,98 @@ void ptxTest() {
     ret();
   }
 
+  // --- Test 2: vectorized copy (4 x u32 per thread) ---
+  auto* fn2 = mod.newFunction("test_copy_v4");
+  {
+    FunctionScope fnScope(fn2);
+    fn2->maxThreads = 256;
+    fn2->addParam(".u64"); // dst pointer
+    fn2->addParam(".u64"); // src pointer
+    fn2->addParam(".u32"); // count (number of u32 elements)
+
+    activateNewBlock("entry");
+
+    auto dst = loadParam(0, ValType::U64);
+    auto src = loadParam(1, ValType::U64);
+    auto count = loadParam(2, ValType::U32);
+
+    // Global thread ID
+    auto tid = threadIdx_x();
+    auto bid = blockIdx_x();
+    auto bdim = blockDim_x();
+    auto gid = bid * bdim + tid;
+
+    // Each thread handles 4 elements
+    auto base = gid * 4;
+
+    IF(base < count) {
+      // Byte offset for v4 u32 (16 bytes per group)
+      auto byteOff = widen(base) * 4;
+      auto srcAddr = src + byteOff;
+      auto dstAddr = dst + byteOff;
+
+      // Load 4 x u32 from src
+      Val v0(ValType::U32);
+      Val v1(ValType::U32);
+      Val v2(ValType::U32);
+      Val v3(ValType::U32);
+      ld_global_cv_v4_u32(v0, v1, v2, v3, srcAddr);
+
+      // Store 4 x u32 to dst
+      st_global_wt_v4_u32(dstAddr, v0, v1, v2, v3);
+    } ELSE {
+      // Out of bounds — write zeros to dst
+      auto byteOff = widen(base) * 4;
+      auto dstAddr = dst + byteOff;
+      Val zero(ValType::U32);
+      zero = 0;
+      st_global_wt_v4_u32(dstAddr, zero, zero, zero, zero);
+    }
+
+    // Second bounds check — flush after copy
+    IF(gid == 0) {
+      membar_sys();
+    }
+
+    ret();
+  }
+
+  // --- Test 3: strided loop (WHILE test) ---
+  auto* fn3 = mod.newFunction("test_strided_copy");
+  {
+    FunctionScope fnScope(fn3);
+    fn3->maxThreads = 256;
+    fn3->addParam(".u64"); // dst pointer
+    fn3->addParam(".u64"); // src pointer
+    fn3->addParam(".u32"); // count (number of u32 elements)
+
+    activateNewBlock("entry");
+
+    auto dst = loadParam(0, ValType::U64);
+    auto src = loadParam(1, ValType::U64);
+    auto count = loadParam(2, ValType::U32);
+
+    auto tid = threadIdx_x();
+    auto bdim = blockDim_x();
+    auto bid = blockIdx_x();
+    auto i = bid * bdim + tid;
+
+    WHILE(i < count) {
+      auto byteOff = widen(i) * 4;
+      auto srcAddr = src + byteOff;
+      auto dstAddr = dst + byteOff;
+      auto val = Val(ValType::U32);
+      ld_global_u32(val, srcAddr);
+      st_global_u32(dstAddr, val);
+      i += bdim;
+    }
+
+    ret();
+  }
+
   std::string ptx = mod.finalize();
   printf("=== PTX Test Output ===\n%s\n", ptx.c_str());
+  return ptx;
 }
 
 } // namespace ptx

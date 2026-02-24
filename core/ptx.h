@@ -174,8 +174,8 @@ void membar_sys();
 // Raw emit (escape hatch)
 void emit(const std::string& inst);
 
-// Test function: generates a simple kernel and prints the PTX.
-void ptxTest();
+// Test function: generates simple kernels and returns the PTX string.
+std::string ptxTest(const char* target = "sm_90a");
 
 // ---------------------------------------------------------------------------
 // DSL layer — typed values, RAII registers, operators, control flow
@@ -199,6 +199,7 @@ struct Val {
   ~Val();
   Val(Val&& o) noexcept;
   Val& operator=(Val&& o) noexcept;
+  Val& operator=(int64_t v); // emit mov with immediate
   Val(const Val&) = delete;
   Val& operator=(const Val&) = delete;
 
@@ -229,6 +230,10 @@ struct Val {
   Val operator>=(const Operand& b) const;
   Val operator==(const Operand& b) const;
   Val operator!=(const Operand& b) const;
+
+  // Compound assignment — modifies in place
+  void operator+=(const Operand& b);
+  void operator-=(const Operand& b);
 };
 
 // RAII function scope — sets TLS context, manages register free-lists.
@@ -249,6 +254,7 @@ Block* activateNewBlock(const char* prefix);
 // Owns a pending block that is activated when the scope closes.
 struct ScopeGuard {
   std::unique_ptr<Block> pendingBlock;
+  Block* backEdgeTarget = nullptr; // WHILE: emit bra before activating exit
   bool closed = false;
 
   ScopeGuard() = default;
@@ -280,9 +286,19 @@ struct ScopeGuard {
 
 ScopeGuard _If(const Reg& pred);
 ScopeGuard _Else();
+ScopeGuard _WhileImpl(Block* header, const Reg& pred);
 
-#define PTX_IF(pred) for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_If(pred))
-#define PTX_ELSE for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_Else())
+template <typename F>
+ScopeGuard _While(F&& condFn) {
+  Block* header = activateNewBlock("while");
+  Val pred = condFn();
+  return _WhileImpl(header, pred);
+}
+
+#define IF(pred) for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_If(pred))
+#define ELSE for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_Else())
+#define WHILE(cond) \
+  for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_While([&]() { return (cond); }))
 
 // Special registers
 Val threadIdx_x();

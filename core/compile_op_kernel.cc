@@ -1725,7 +1725,25 @@ CompiledModule CompiledModule::compile(const std::string& source, CUdevice devic
   if (!ptxTestDone) {
     ptxTestDone = true;
     if (auto* v = std::getenv("MOODIST_TEST_PTX"); v && !strcmp(v, "1")) {
-      ptx::ptxTest();
+      int cm = 0, cn = 0;
+      CHECK_CU(cuDeviceGetAttribute(&cm, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+      CHECK_CU(cuDeviceGetAttribute(&cn, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+      const char* target = "sm_60";
+      if (cm >= 10) target = "sm_100a";
+      else if (cm == 9) target = "sm_90a";
+      else if (cm == 8 && cn >= 9) target = "sm_89";
+      else if (cm == 8) target = "sm_80";
+      else if (cm == 7) target = "sm_70";
+
+      std::string ptx = ptx::ptxTest(target);
+      CUmodule testModule = nullptr;
+      CUresult err = cuModuleLoadDataEx(&testModule, ptx.c_str(), 0, nullptr, nullptr);
+      if (err == CUDA_SUCCESS) {
+        log.info("PTX test: cuModuleLoadDataEx succeeded (target=%s)\n", target);
+        cuModuleUnload(testModule);
+      } else {
+        log.error("PTX test: cuModuleLoadDataEx FAILED (error %d, target=%s)\n", (int)err, target);
+      }
     }
   }
 
