@@ -4,6 +4,7 @@
 #include "codegen.h"
 #include "common.h"
 #include "group.h"
+#include "ptx.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1719,8 +1720,15 @@ CompiledModule::~CompiledModule() {
   }
 }
 
-CompiledModule CompiledModule::compile(
-    const std::string& source, CUdevice device, const char* dumpPrefix) {
+CompiledModule CompiledModule::compile(const std::string& source, CUdevice device, const char* dumpPrefix) {
+  static bool ptxTestDone = false;
+  if (!ptxTestDone) {
+    ptxTestDone = true;
+    if (auto* v = std::getenv("MOODIST_TEST_PTX"); v && !strcmp(v, "1")) {
+      ptx::ptxTest();
+    }
+  }
+
   if (!loadNvrtc()) {
     throw std::runtime_error("NVRTC not available");
   }
@@ -1793,6 +1801,22 @@ CompiledModule CompiledModule::compile(
   CHECK_NVRTC(nvrtcApi.getCUBINSize(program, &cubinSize));
   std::vector<char> cubin(cubinSize);
   CHECK_NVRTC(nvrtcApi.getCUBIN(program, cubin.data()));
+
+  // Dump PTX if requested
+  if (std::getenv("MOODIST_DUMP_PTX") && !strcmp(std::getenv("MOODIST_DUMP_PTX"), "1")) {
+    size_t ptxSize = 0;
+    CHECK_NVRTC(nvrtcApi.getPTXSize(program, &ptxSize));
+    std::vector<char> ptx(ptxSize);
+    CHECK_NVRTC(nvrtcApi.getPTX(program, ptx.data()));
+    std::string filename = dumpPrefix ? std::string(dumpPrefix) + ".ptx" : "moodist-kernel.ptx";
+    FILE* f = fopen(filename.c_str(), "wb");
+    if (f) {
+      fwrite(ptx.data(), ptx.size(), 1, f);
+      fclose(f);
+      log.info("PTX dumped to %s (%zu bytes)\n", filename, ptxSize);
+    }
+  }
+
   CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
 
   CompiledModule result;

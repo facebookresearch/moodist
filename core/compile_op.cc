@@ -313,8 +313,7 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
     codegen::emitBlank();
     for (int depth : depths) {
       for (size_t bs : blockSizes) {
-        emitMainKernel(ctx.group, gridSize, bs,
-            fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs).c_str(),
+        emitMainKernel(ctx.group, gridSize, bs, fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs).c_str(),
             fmt::sprintf("copy_d%d_b%zu", depth, bs).c_str());
         codegen::emitBlank();
       }
