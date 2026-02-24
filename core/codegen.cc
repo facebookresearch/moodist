@@ -315,19 +315,12 @@ ForRange::Iter::~Iter() {
 
 } // namespace codegen
 
-std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, int depth) {
+// ---------------------------------------------------------------------------
+// Kernel generation building blocks
+// ---------------------------------------------------------------------------
+
+void emitPreamble() {
   using namespace codegen;
-  BuilderScope scope;
-
-  size_t rank = group->rank;
-  const auto& peerIndices = group->peerIndices;
-  bool noSync = std::getenv("MOODIST_PROFILE_NOSYNC") && !strcmp(std::getenv("MOODIST_PROFILE_NOSYNC"), "1");
-
-  int BS = (int)blockSize;
-  int LB = (int)(blockSize * 16);
-  int GS = (int)gridSize;
-
-  // ---- Preamble ----
   emit("using uintptr_t = unsigned long;");
   emit("using uint64_t = unsigned long;");
   emit("using uint32_t = unsigned int;");
@@ -356,10 +349,14 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
   emit(fmt::sprintf("__device__ uint32_t entryCounter[%zu];", Group::maxConcurrency));
   emit(fmt::sprintf("__device__ uint32_t exitCounter[%zu];", Group::maxConcurrency));
   emitBlank();
+}
 
-  // ---- copy_descriptor device function ----
-  // All sizes/counts are uint32_t. Only src/dst pointers are 64-bit.
-  emit("__device__ void copy_descriptor(");
+void emitCopyFunction(const char* functionName, size_t blockSize, int depth) {
+  using namespace codegen;
+  int BS = (int)blockSize;
+  int LB = (int)(blockSize * 16);
+
+  emit(fmt::sprintf("__device__ void %s(", functionName));
   emit("    const uint32_t tid, const uint32_t blockIndex, const uint32_t numBlocks,");
   emit("    uintptr_t src, uintptr_t dst, uint32_t bytes) {");
   builder().indent();
@@ -368,7 +365,7 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
   auto dst = expr("dst");
   auto numBlocks = expr("numBlocks");
 
-  emit(fmt::sprintf("const uint32_t tid16 = tid * 16;"));
+  emit("const uint32_t tid16 = tid * 16;");
   emit(fmt::sprintf("const uint32_t loopBytes = %du;", LB));
   auto tid16 = expr("tid16");
   auto loopBytes = expr("loopBytes");
@@ -401,13 +398,12 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
     Var i = decl(u32, "i", expr("blockIndex"));
     emitBlank();
 
-    // Declare carry registers
     for (int k = 0; k < depth; k++) {
       decl(uint4, fmt::sprintf("v%d", k).c_str());
     }
     emitBlank();
 
-    // Prime: load first `depth` elements
+    // Prime
     for (int k = 0; k < depth; k++) {
       auto vk = expr(fmt::sprintf("v%d", k).c_str());
       IF(i + k * numBlocks < count) {
@@ -416,7 +412,7 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
     }
     emitBlank();
 
-    // Main loop: store-load pairs
+    // Main loop
     WHILE(i + (2 * depth - 1) * numBlocks < count) {
       for (int j = 0; j < depth; j++) {
         auto vj = expr(fmt::sprintf("v%d", j).c_str());
@@ -474,45 +470,81 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
   builder().dedent();
   emit("}");
   emitBlank();
-  emit("} // namespace");
-  emitBlank();
+}
 
-  // ---- Main kernel ----
+void emitEntryBarrier(Group* group, size_t gridSize) {
+  using namespace codegen;
+  int GS = (int)gridSize;
+  size_t rank = group->rank;
+  const auto& peerIndices = group->peerIndices;
+  bool noSync = std::getenv("MOODIST_PROFILE_NOSYNC") && !strcmp(std::getenv("MOODIST_PROFILE_NOSYNC"), "1");
+
+  auto concurrencyIndex = expr("concurrencyIndex");
+  auto stepValue = expr("stepValue");
+
+  IF(call("atomicInc", expr("&entryCounter[concurrencyIndex]"), Expr(GS - 1)) == 0) {
+    if (!noSync) {
+      for (size_t i : peerIndices) {
+        auto& arr = group->peerCudaStepValue[i];
+        Expr addr = hex(arr.base) + hex(arr.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * rank);
+        emit(deref("volatile uint32_t", addr).str + " = stepValue;");
+      }
+    }
+    threadfence_system();
+  }
+  if (!noSync) {
+    for (size_t i : peerIndices) {
+      Expr addr = hex(group->cudaStepValue.buffer.cudaPointer) +
+                  hex(group->cudaStepValue.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * group->ipcRanks[i]);
+      WHILE(deref("volatile uint32_t", addr) < stepValue) {}
+    }
+  }
+}
+
+void emitExitBarrier(Group* group) {
+  using namespace codegen;
+  const auto& peerIndices = group->peerIndices;
+  bool noSync = std::getenv("MOODIST_PROFILE_NOSYNC") && !strcmp(std::getenv("MOODIST_PROFILE_NOSYNC"), "1");
+
+  auto concurrencyIndex = expr("concurrencyIndex");
+  auto stepValue = expr("stepValue");
+
+  if (!noSync) {
+    for (size_t i : peerIndices) {
+      auto& arr = group->peerCudaCopyDone[i];
+      Expr addr =
+          hex(arr.base) + hex(arr.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * group->peerMyRemoteIndex[i]);
+      emit(deref("volatile uint32_t", addr).str + " = stepValue;");
+    }
+    for (size_t i : peerIndices) {
+      Expr addr = hex(group->cudaCopyDone.buffer.cudaPointer) + hex(group->cudaCopyDone.itembytes) * concurrencyIndex +
+                  hex(sizeof(uint32_t) * i);
+      WHILE(deref("volatile uint32_t", addr) < stepValue) {}
+    }
+  }
+}
+
+void emitMainKernel(Group* group, size_t gridSize, size_t blockSize) {
+  using namespace codegen;
+  int BS = (int)blockSize;
+  int GS = (int)gridSize;
+
   emit(fmt::sprintf("extern \"C\" __global__ void __launch_bounds__(%d, 1)", BS));
   emit("compile_op_copy(CompileOpCopyParameters params) {");
   builder().indent();
-
-  auto stepValue = expr("stepValue");
-  auto concurrencyIndex = expr("concurrencyIndex");
 
   emit("const uint32_t stepValue = params.stepValue;");
   emit("const uint32_t concurrencyIndex = params.concurrencyIndex;");
   emitBlank();
 
-  // ---- Entry barrier ----
+  // Entry barrier
   IF(expr("threadIdx.x") == 0) {
-    IF(call("atomicInc", expr("&entryCounter[concurrencyIndex]"), Expr(GS - 1)) == 0) {
-      if (!noSync) {
-        for (size_t i : peerIndices) {
-          auto& arr = group->peerCudaStepValue[i];
-          Expr addr = hex(arr.base) + hex(arr.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * rank);
-          emit(deref("volatile uint32_t", addr).str + " = stepValue;");
-        }
-      }
-      threadfence_system();
-    }
-    if (!noSync) {
-      for (size_t i : peerIndices) {
-        Expr addr = hex(group->cudaStepValue.buffer.cudaPointer) +
-                    hex(group->cudaStepValue.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * group->ipcRanks[i]);
-        WHILE(deref("volatile uint32_t", addr) < stepValue) {}
-      }
-    }
+    emitEntryBarrier(group, gridSize);
   }
   syncthreads();
   emitBlank();
 
-  // ---- Descriptor loop (staggered for peer diversity) ----
+  // Descriptor loop (staggered for peer diversity)
   Var tid = decl(u32, "tid", expr("threadIdx.x"));
   auto params = expr("params");
 
@@ -524,28 +556,27 @@ std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, 
   }
   emitBlank();
 
-  // ---- Exit barrier ----
+  // Exit barrier
   threadfence_system();
   syncthreads();
   IF(expr("threadIdx.x") == 0 &&
       call("atomicInc", expr("&exitCounter[concurrencyIndex]"), Expr(GS - 1)) == Expr(GS - 1)) {
-    if (!noSync) {
-      for (size_t i : peerIndices) {
-        auto& arr = group->peerCudaCopyDone[i];
-        Expr addr =
-            hex(arr.base) + hex(arr.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * group->peerMyRemoteIndex[i]);
-        emit(deref("volatile uint32_t", addr).str + " = stepValue;");
-      }
-      for (size_t i : peerIndices) {
-        Expr addr = hex(group->cudaCopyDone.buffer.cudaPointer) +
-                    hex(group->cudaCopyDone.itembytes) * concurrencyIndex + hex(sizeof(uint32_t) * i);
-        WHILE(deref("volatile uint32_t", addr) < stepValue) {}
-      }
-    }
+    emitExitBarrier(group);
   }
 
   builder().dedent();
   emit("}");
+}
+
+std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, int depth) {
+  using namespace codegen;
+  BuilderScope scope;
+
+  emitPreamble();
+  emitCopyFunction("copy_descriptor", blockSize, depth);
+  emit("} // namespace");
+  emitBlank();
+  emitMainKernel(group, gridSize, blockSize);
 
   return scope.finalize();
 }

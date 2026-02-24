@@ -36,7 +36,7 @@ struct CompileOpKernels {
   CUmodule cuMulticastModule = nullptr;
   CUfunction cuMulticastKernel = nullptr;
 
-  size_t gridSize = 32;
+  size_t gridSize = 8;
   size_t blockSize = 256;
   size_t dynamicSmemBytes = 0; // For v4 cp.async kernel
 
@@ -67,10 +67,28 @@ struct CompiledKernel {
   }
   CompiledKernel(const CompiledKernel&) = delete;
   CompiledKernel& operator=(const CompiledKernel&) = delete;
+  CompiledKernel& operator=(CompiledKernel&& o) noexcept {
+    if (this != &o) {
+      if (module) {
+        cuModuleUnload(module);
+      }
+      module = o.module;
+      function = o.function;
+      o.module = nullptr;
+      o.function = nullptr;
+    }
+    return *this;
+  }
   ~CompiledKernel();
 };
 
 CompiledKernel compileKernel(
     const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix = nullptr);
+
+// Launch a copy kernel with the standard CompileOpCopyParameters layout.
+// Builds the parameter struct from the given arguments and calls cuLaunchKernel.
+void launchCopyKernel(CUfunction kernel, size_t gridSize, size_t blockSize, const CopyDescriptor* descriptors,
+    uint32_t numDescriptors, uint32_t stepValue, uint32_t concurrencyIndex, CUstream stream,
+    size_t dynamicSmemBytes = 0);
 
 } // namespace moodist
