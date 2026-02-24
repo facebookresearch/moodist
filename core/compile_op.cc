@@ -300,51 +300,63 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
 
   auto tuneStart = std::chrono::steady_clock::now();
 
-  for (int depth : depths) {
-    for (size_t bs : blockSizes) {
-      // Generate and compile the real production kernel with barriers
-      std::string source = generateCopyKernel(ctx.group, gridSize, bs, depth);
-      CompiledKernel kernel;
-      try {
-        kernel = compileKernel(source, "compile_op_copy", cuDevice);
-      } catch (...) {
-        // Skip candidates that fail to compile (e.g., register pressure)
-        // Still need to advance stepValue to keep all ranks in sync
-        stepValue += warmupIters + measuredIters;
+  // Generate a single source with all kernel variants, compile once.
+  {
+    codegen::BuilderScope scope;
+    emitPreamble();
+    for (int depth : depths) {
+      for (size_t bs : blockSizes) {
+        emitCopyFunction(fmt::sprintf("copy_d%d_b%zu", depth, bs).c_str(), bs, depth);
+      }
+    }
+    codegen::emit("} // namespace");
+    codegen::emitBlank();
+    for (int depth : depths) {
+      for (size_t bs : blockSizes) {
+        emitMainKernel(ctx.group, gridSize, bs,
+            fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs).c_str(),
+            fmt::sprintf("copy_d%d_b%zu", depth, bs).c_str());
+        codegen::emitBlank();
+      }
+    }
+    std::string source = scope.finalize();
+
+    CompiledModule module = CompiledModule::compile(source, cuDevice);
+
+    for (int depth : depths) {
+      for (size_t bs : blockSizes) {
+        auto name = fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs);
+        CUfunction fn = module.getFunction(name.c_str());
+
+        // Warmup
+        for (int i = 0; i < warmupIters; i++) {
+          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+        }
+        CHECK_CU(cuStreamSynchronize(stream));
+
+        // Measured runs: track best (minimum) elapsed time
+        float bestMs = INFINITY;
+        for (int iter = 0; iter < measuredIters; iter++) {
+          CHECK_CU(cuEventRecord(startEvent, stream));
+          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+          CHECK_CU(cuEventRecord(stopEvent, stream));
+          CHECK_CU(cuEventSynchronize(stopEvent));
+
+          float ms = 0.0f;
+          CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+          if (ms < bestMs) {
+            bestMs = ms;
+          }
+        }
+
         if (verbose) {
-          log.info("  depth=%d blockSize=%zu -> COMPILE FAILED\n", depth, bs);
+          log.info("  depth=%d blockSize=%zu -> %.3f ms\n", depth, bs, bestMs);
         }
-        continue;
-      }
 
-      // Warmup
-      for (int i = 0; i < warmupIters; i++) {
-        launchCopyKernel(kernel.function, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-      }
-      CHECK_CU(cuStreamSynchronize(stream));
-
-      // Measured runs: track best (minimum) elapsed time
-      float bestMs = INFINITY;
-      for (int iter = 0; iter < measuredIters; iter++) {
-        CHECK_CU(cuEventRecord(startEvent, stream));
-        launchCopyKernel(kernel.function, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-        CHECK_CU(cuEventRecord(stopEvent, stream));
-        CHECK_CU(cuEventSynchronize(stopEvent));
-
-        float ms = 0.0f;
-        CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
-        if (ms < bestMs) {
-          bestMs = ms;
+        if (bestMs < best.ms) {
+          best.ms = bestMs;
+          best.config = {depth, bs};
         }
-      }
-
-      if (verbose) {
-        log.info("  depth=%d blockSize=%zu -> %.3f ms\n", depth, bs, bestMs);
-      }
-
-      if (bestMs < best.ms) {
-        best.ms = bestMs;
-        best.config = {depth, bs};
       }
     }
   }
