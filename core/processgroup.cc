@@ -4350,7 +4350,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
       for (size_t i : indices(op->localInputProvides)) {
         const auto& lip = op->localInputProvides[i];
         if (lip.bytes > 0) {
-          CHECK_CU(cuMemcpyDtoDAsync(remoteAddrs[i], inputs[lip.myInputIndex]->data() + lip.inputOffset, lip.bytes, stream));
+          CHECK_CU(
+              cuMemcpyDtoDAsync(remoteAddrs[i], inputs[lip.myInputIndex]->data() + lip.inputOffset, lip.bytes, stream));
         }
       }
     } else {

@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "compile_op_kernel.h"
+#include "codegen.h"
 #include "common.h"
 #include "group.h"
 
@@ -28,6 +29,8 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       version = 6;
     } else if (!strcmp(env, "v7")) {
       version = 7;
+    } else if (!strcmp(env, "v8")) {
+      version = 8;
     }
   }
   if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
@@ -1273,6 +1276,23 @@ compile_op_copy(CompileOpCopyParameters params) {
         "$blockSize", blockSize);
   }
 
+  // v8 kernel: codegen DSL-generated pipelined copy.
+  // Same algorithm as v7 but generated using the codegen DSL.
+  if (version == 8) {
+    int v8depth = 4;
+    if (auto* env = std::getenv("MOODIST_COPY_DEPTH")) {
+      v8depth = atoi(env);
+      if (v8depth < 1) {
+        v8depth = 1;
+      }
+      if (v8depth > 56) {
+        v8depth = 56;
+      }
+    }
+    log.info("compile_op v8 (codegen): depth=%d, gridSize=%zu, blockSize=%zu\n", v8depth, gridSize, blockSize);
+    source = generateCopyKernel(group, gridSize, blockSize, v8depth);
+  }
+
   source = replace(source, "%%", "%");
   source = autoindent(source);
   source = addLineCountComments(source);
@@ -1687,6 +1707,102 @@ compile_op_multicast(CompileOpCopyParameters params) {
       maxThreadsPerBlock);
 
   log.info("compile_op multicast kernel compile took %gs\n", seconds(std::chrono::steady_clock::now() - start));
+}
+
+// ---------------------------------------------------------------------------
+// CompiledKernel / compileKernel
+// ---------------------------------------------------------------------------
+
+CompiledKernel::~CompiledKernel() {
+  if (module) {
+    cuModuleUnload(module);
+  }
+}
+
+CompiledKernel compileKernel(
+    const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix) {
+  if (!loadNvrtc()) {
+    throw std::runtime_error("NVRTC not available");
+  }
+
+  int computeMajor = 0, computeMinor = 0;
+  CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+  CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+
+  // Dump source if requested
+  if (dumpPrefix && std::getenv("MOODIST_DUMP_KERNELS") && !strcmp(std::getenv("MOODIST_DUMP_KERNELS"), "1")) {
+    std::string filename = std::string(dumpPrefix) + ".cu";
+    FILE* f = fopen(filename.c_str(), "wb");
+    if (f) {
+      fwrite(source.data(), source.size(), 1, f);
+      fclose(f);
+      log.info("kernel source dumped to %s\n", filename);
+    }
+  }
+
+  nvrtcProgram program;
+  CHECK_NVRTC(nvrtcApi.createProgram(&program, source.c_str(), nullptr, 0, nullptr, nullptr));
+
+  // Try architectures from newest to oldest
+  static const std::pair<int, const char*> archOptions[] = {
+      {10000, "--gpu-architecture=sm_100"},
+      {9000, "--gpu-architecture=sm_90"},
+      {8090, "--gpu-architecture=sm_89"},
+      {8070, "--gpu-architecture=sm_87"},
+      {8000, "--gpu-architecture=sm_80"},
+      {7050, "--gpu-architecture=sm_75"},
+      {7000, "--gpu-architecture=sm_70"},
+      {6000, "--gpu-architecture=sm_60"},
+      {0, "--gpu-architecture=sm_50"},
+  };
+
+  int deviceArch = computeMajor * 1000 + computeMinor * 10;
+  std::vector<const char*> options;
+  options.push_back(nullptr); // placeholder for arch
+  options.push_back("--use_fast_math");
+  options.push_back("--std=c++17");
+
+  nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
+  for (auto& [minArch, archFlag] : archOptions) {
+    if (deviceArch < minArch) {
+      continue;
+    }
+    options[0] = archFlag;
+    error = nvrtcApi.compileProgram(program, options.size(), options.data());
+    if (error != NVRTC_ERROR_INVALID_OPTION) {
+      break;
+    }
+  }
+
+  if (error != NVRTC_SUCCESS) {
+    size_t logSize = 0;
+    std::string logstr;
+    nvrtcApi.getProgramLogSize(program, &logSize);
+    logstr.resize(logSize);
+    nvrtcApi.getProgramLog(program, logstr.data());
+    log.error("Failed to compile kernel '%s':\n%s\n", functionName, logstr);
+    log.error("Source:\n%s\n", source);
+    nvrtcApi.destroyProgram(&program);
+    throw std::runtime_error(fmt::sprintf("NVRTC compilation failed for '%s'", functionName));
+  }
+
+  size_t cubinSize = 0;
+  CHECK_NVRTC(nvrtcApi.getCUBINSize(program, &cubinSize));
+  std::vector<char> cubin(cubinSize);
+  CHECK_NVRTC(nvrtcApi.getCUBIN(program, cubin.data()));
+  CHECK_NVRTC(nvrtcApi.destroyProgram(&program));
+
+  CompiledKernel result;
+  CHECK_CU(cuModuleLoadDataEx(&result.module, cubin.data(), 0, nullptr, nullptr));
+  CHECK_CU(cuModuleGetFunction(&result.function, result.module, functionName));
+
+  int numRegs = 0;
+  CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, result.function));
+  int maxThreads = 0;
+  CHECK_CU(cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, result.function));
+  log.info("compiled '%s': %d regs, max %d threads/block\n", functionName, numRegs, maxThreads);
+
+  return result;
 }
 
 } // namespace moodist
