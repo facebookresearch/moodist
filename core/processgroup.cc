@@ -4345,11 +4345,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     }
 
     // Build descriptor table (both self-copies and peer copies)
-    CompileOpCopyParameters params;
-    params.stepValue = stepValue;
-    params.concurrencyIndex = concurrencyIndex;
-    params.numDescriptors = 0;
-    params._pad = 0;
+    CopyDescriptor descriptors[kMaxCopyDescriptors];
+    uint32_t numDescriptors = 0;
 
     // Add self-copies (same in both read and write mode)
     for (const auto& lic : op->localInputCopies) {
@@ -4359,8 +4356,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
       uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
       uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
       if (dst != src && lic.bytes > 0) {
-        CHECK(params.numDescriptors < kMaxCopyDescriptors);
-        auto& d = params.descriptors[params.numDescriptors++];
+        CHECK(numDescriptors < kMaxCopyDescriptors);
+        auto& d = descriptors[numDescriptors++];
         d.src = src;
         d.dst = dst;
         d.bytes = lic.bytes;
@@ -4371,8 +4368,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
       for (size_t i : indices(op->localInputProvides)) {
         const auto& lip = op->localInputProvides[i];
         if (lip.bytes > 0) {
-          CHECK(params.numDescriptors < kMaxCopyDescriptors);
-          auto& d = params.descriptors[params.numDescriptors++];
+          CHECK(numDescriptors < kMaxCopyDescriptors);
+          auto& d = descriptors[numDescriptors++];
           d.src = inputs[lip.myInputIndex]->data() + lip.inputOffset;
           d.dst = remoteAddrs[i];
           d.bytes = lip.bytes;
@@ -4386,8 +4383,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
           continue;
         }
         if (lic.bytes > 0) {
-          CHECK(params.numDescriptors < kMaxCopyDescriptors);
-          auto& d = params.descriptors[params.numDescriptors++];
+          CHECK(numDescriptors < kMaxCopyDescriptors);
+          auto& d = descriptors[numDescriptors++];
           d.src = remoteAddrs[i];
           d.dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
           d.bytes = lic.bytes;
@@ -4396,10 +4393,15 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     }
 
     // Single kernel launch replaces syncPeers + copies + syncPeers
-    std::array<void*, 1> kparams = {&params};
-    CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize, 1, 1,
-        group->compileOpKernels->blockSize, 1, 1, group->compileOpKernels->dynamicSmemBytes, stream, kparams.data(),
-        nullptr));
+    if (op->tunedKernel) {
+      // Use per-op auto-tuned kernel
+      launchCopyKernel(op->tunedKernel->function, op->tunedGridSize, op->tunedBlockSize, descriptors, numDescriptors,
+          stepValue, concurrencyIndex, stream);
+    } else {
+      launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
+          group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
+          group->compileOpKernels->dynamicSmemBytes);
+    }
   } else {
     // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
     syncPeers(stream);

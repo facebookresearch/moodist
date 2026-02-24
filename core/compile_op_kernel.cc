@@ -1745,8 +1745,9 @@ CompiledKernel compileKernel(
 
   // Try architectures from newest to oldest
   static const std::pair<int, const char*> archOptions[] = {
-      {10000, "--gpu-architecture=sm_100"},
-      {9000, "--gpu-architecture=sm_90"},
+      {10300, "--gpu-architecture=sm_103a"},
+      {10000, "--gpu-architecture=sm_100a"},
+      {9000, "--gpu-architecture=sm_90a"},
       {8090, "--gpu-architecture=sm_89"},
       {8070, "--gpu-architecture=sm_87"},
       {8000, "--gpu-architecture=sm_80"},
@@ -1759,7 +1760,7 @@ CompiledKernel compileKernel(
   int deviceArch = computeMajor * 1000 + computeMinor * 10;
   std::vector<const char*> options;
   options.push_back(nullptr); // placeholder for arch
-  options.push_back("--use_fast_math");
+  options.push_back("--fmad=true");
   options.push_back("--std=c++17");
 
   nvrtcResult error = NVRTC_ERROR_INVALID_OPTION;
@@ -1803,6 +1804,21 @@ CompiledKernel compileKernel(
   log.info("compiled '%s': %d regs, max %d threads/block\n", functionName, numRegs, maxThreads);
 
   return result;
+}
+
+void launchCopyKernel(CUfunction kernel, size_t gridSize, size_t blockSize, const CopyDescriptor* descriptors,
+    uint32_t numDescriptors, uint32_t stepValue, uint32_t concurrencyIndex, CUstream stream, size_t dynamicSmemBytes) {
+  CompileOpCopyParameters params;
+  params.stepValue = stepValue;
+  params.concurrencyIndex = concurrencyIndex;
+  params.numDescriptors = numDescriptors;
+  params._pad = 0;
+  CHECK(numDescriptors <= kMaxCopyDescriptors);
+  for (uint32_t i = 0; i < numDescriptors; i++) {
+    params.descriptors[i] = descriptors[i];
+  }
+  std::array<void*, 1> kparams = {&params};
+  CHECK_CU(cuLaunchKernel(kernel, gridSize, 1, 1, blockSize, 1, 1, dynamicSmemBytes, stream, kparams.data(), nullptr));
 }
 
 } // namespace moodist

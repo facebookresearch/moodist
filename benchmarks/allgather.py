@@ -143,7 +143,7 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
 
 def main():
     parser = argparse.ArgumentParser(description="All-gather benchmark")
-    parser.add_argument("--backend", required=True,
+    parser.add_argument("--backend", default="moodist_compile_op",
                         choices=["nccl", "moodist", "moodist_compile_op"])
     parser.add_argument("--sizes", type=str, default=None,
                         help="Comma-separated sizes per rank, e.g. '1K,1M,64M'")

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "api/moodist_api.h"
+#include "compile_op_kernel.h"
 #include "group.h"
 #include "intrusive_list.h"
 #include "simple_vector.h"
@@ -399,6 +400,12 @@ struct CustomOpDescriptor {
   };
   IVector<MulticastSource> multicastSources;
   IVector<MulticastDest> multicastDests;
+
+  // Per-op compiled copy kernel (auto-tuned for this op's copy sizes).
+  // When set, executeLocalOnly uses this instead of the group-wide CompileOpKernels.
+  std::unique_ptr<CompiledKernel> tunedKernel;
+  size_t tunedGridSize = 32;
+  size_t tunedBlockSize = 256;
 };
 
 struct QueueEntryCustom : QueueEntry {

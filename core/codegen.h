@@ -392,8 +392,37 @@ struct ForRange {
 
 struct Group; // forward declare
 
-// Generate a v8 pipelined copy kernel source using the codegen DSL.
-// Bakes in sync addresses from Group for entry/exit barriers.
+// ---------------------------------------------------------------------------
+// Kernel generation building blocks.
+//
+// These functions append to the active codegen::Builder. They are composable:
+// call emitPreamble + emitCopyFunction + emitMainKernel to build a complete
+// kernel, or mix and match for tuning kernels.
+// ---------------------------------------------------------------------------
+
+// Emit type aliases, struct definitions, device counters, syncthreads helper.
+// Must be called first — provides the types used by everything else.
+void emitPreamble();
+
+// Emit a __device__ copy function with pipelined uint4 loads/stores.
+// functionName: name of the generated function (e.g. "copy_descriptor")
+// blockSize: threads per block (baked in as loopBytes constant)
+// depth: pipeline depth (number of in-flight uint4 loads)
+void emitCopyFunction(const char* functionName, size_t blockSize, int depth);
+
+// Emit entry barrier code (stepValue writes + waits).
+// Must be called inside an `if (threadIdx.x == 0)` block.
+void emitEntryBarrier(Group* group, size_t gridSize);
+
+// Emit exit barrier code (copyDone writes + waits).
+// Must be called inside an `if (threadIdx.x == 0 && lastBlock)` block.
+void emitExitBarrier(Group* group);
+
+// Emit the complete main kernel with barriers and descriptor loop.
+void emitMainKernel(Group* group, size_t gridSize, size_t blockSize);
+
+// Generate a complete copy kernel source string. Convenience wrapper
+// that calls emitPreamble + emitCopyFunction + emitMainKernel.
 std::string generateCopyKernel(Group* group, size_t gridSize, size_t blockSize, int depth);
 
 } // namespace moodist

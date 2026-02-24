@@ -350,6 +350,7 @@ using cuPointerSetAttribute_t = CUresult (*)(const void* value, CUpointer_attrib
 // Stream management
 using cuStreamCreateWithPriority_t = CUresult (*)(CUstream* phStream, unsigned int flags, int priority);
 using cuStreamDestroy_t = CUresult (*)(CUstream hStream);
+using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
 using cuStreamWaitEvent_t = CUresult (*)(CUstream hStream, CUevent hEvent, unsigned int flags);
 using cuStreamWaitValue32_t = CUresult (*)(CUstream stream, CUdeviceptr addr, cuuint32_t value, unsigned int flags);
 using cuStreamBatchMemOp_t = CUresult (*)(
@@ -361,6 +362,7 @@ using cuEventDestroy_t = CUresult (*)(CUevent hEvent);
 using cuEventRecord_t = CUresult (*)(CUevent hEvent, CUstream hStream);
 using cuEventQuery_t = CUresult (*)(CUevent hEvent);
 using cuEventSynchronize_t = CUresult (*)(CUevent hEvent);
+using cuEventElapsedTime_t = CUresult (*)(float* pMilliseconds, CUevent hStart, CUevent hEnd);
 
 // IPC
 using cuIpcGetMemHandle_t = CUresult (*)(CUipcMemHandle* pHandle, CUdeviceptr dptr);
@@ -455,6 +457,7 @@ struct CudaApi {
   // Stream management
   cuStreamCreateWithPriority_t streamCreateWithPriority = nullptr;
   cuStreamDestroy_t streamDestroy = nullptr;
+  cuStreamSynchronize_t streamSynchronize = nullptr;
   cuStreamWaitEvent_t streamWaitEvent = nullptr;
   cuStreamWaitValue32_t streamWaitValue32 = nullptr;
   cuStreamBatchMemOp_t streamBatchMemOp = nullptr;
@@ -465,6 +468,7 @@ struct CudaApi {
   cuEventRecord_t eventRecord = nullptr;
   cuEventQuery_t eventQuery = nullptr;
   cuEventSynchronize_t eventSynchronize = nullptr;
+  cuEventElapsedTime_t eventElapsedTime = nullptr;
 
   // IPC
   cuIpcGetMemHandle_t ipcGetMemHandle = nullptr;
@@ -648,6 +652,9 @@ inline CUresult cuStreamCreateWithPriority(CUstream* phStream, unsigned int flag
 inline CUresult cuStreamDestroy(CUstream hStream) {
   return cudaApi.streamDestroy(hStream);
 }
+inline CUresult cuStreamSynchronize(CUstream hStream) {
+  return cudaApi.streamSynchronize(hStream);
+}
 inline CUresult cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int flags) {
   return cudaApi.streamWaitEvent(hStream, hEvent, flags);
 }
@@ -672,6 +679,9 @@ inline CUresult cuEventQuery(CUevent hEvent) {
 }
 inline CUresult cuEventSynchronize(CUevent hEvent) {
   return cudaApi.eventSynchronize(hEvent);
+}
+inline CUresult cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd) {
+  return cudaApi.eventElapsedTime(pMilliseconds, hStart, hEnd);
 }
 inline CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
   return cudaApi.ipcGetMemHandle(pHandle, dptr);

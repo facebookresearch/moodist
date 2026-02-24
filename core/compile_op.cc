@@ -13,6 +13,7 @@
 // Phase 7: Multicast setup (source-side analysis, create per-region multicast objects)
 
 #include "compile_op.h"
+#include "codegen.h"
 #include "compile_op_kernel.h"
 #include "group.h"
 #include "ipc_mapper.h"
@@ -20,8 +21,11 @@
 #include "serialization.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 namespace moodist {
 namespace compile_op {
@@ -130,6 +134,234 @@ struct MulticastAssignment {
     x(sourceRank, sourceInputIndex, sourceInputOffset, bytes, scratchVA, allocSize);
   }
 };
+
+// ============================================================================
+// Auto-tuning infrastructure for copy kernel (depth, blockSize)
+// ============================================================================
+
+// Size categories for tuning cache keying.
+// Copies of similar magnitude likely have similar optimal configs.
+enum class SizeCategory : uint8_t {
+  Small = 0,  // 0 - 64 KB
+  Medium = 1, // 64 KB - 1 MB
+  Large = 2,  // 1 MB - 16 MB
+  Huge = 3,   // 16 MB+
+};
+
+SizeCategory sizeCategoryFor(size_t bytes) {
+  if (bytes <= 64 * 1024) {
+    return SizeCategory::Small;
+  }
+  if (bytes <= 1024 * 1024) {
+    return SizeCategory::Medium;
+  }
+  if (bytes <= 16 * 1024 * 1024) {
+    return SizeCategory::Large;
+  }
+  return SizeCategory::Huge;
+}
+
+// Representative size for benchmarking each category
+size_t representativeSize(SizeCategory cat) {
+  switch (cat) {
+  case SizeCategory::Small:
+    return 32 * 1024; // 32 KB
+  case SizeCategory::Medium:
+    return 512 * 1024; // 512 KB
+  case SizeCategory::Large:
+    return 8 * 1024 * 1024; // 8 MB
+  case SizeCategory::Huge:
+    return 64 * 1024 * 1024; // 64 MB
+  }
+  return 8 * 1024 * 1024;
+}
+
+struct TuningConfig {
+  int depth;
+  size_t blockSize;
+};
+
+struct TuningResult {
+  TuningConfig config;
+  float ms = INFINITY; // elapsed time in milliseconds (lower is better)
+};
+
+struct TuningKey {
+  int computeArch; // e.g. sm_90 → 90
+  SizeCategory sizeCat;
+
+  bool operator==(const TuningKey& o) const {
+    return computeArch == o.computeArch && sizeCat == o.sizeCat;
+  }
+};
+
+// Static tuning cache: persists across compile_op calls within a process.
+static std::mutex tuningCacheMutex;
+static HashMap<int, HashMap<uint8_t, TuningResult>> tuningCache; // computeArch → (sizeCat → result)
+
+bool tuningCacheLookup(const TuningKey& key, TuningResult& out) {
+  auto archIt = tuningCache.find(key.computeArch);
+  if (archIt == tuningCache.end()) {
+    return false;
+  }
+  auto catIt = archIt->second.find(static_cast<uint8_t>(key.sizeCat));
+  if (catIt == archIt->second.end()) {
+    return false;
+  }
+  out = catIt->second;
+  return true;
+}
+
+void tuningCacheStore(const TuningKey& key, const TuningResult& result) {
+  tuningCache[key.computeArch][static_cast<uint8_t>(key.sizeCat)] = result;
+}
+
+// Run the full tuning sweep for a given size category using the real
+// production kernel (with NVLink copies and barriers). All ranks in the
+// group must call this collectively with the same candidate sequence.
+// Returns the best (depth, blockSize) config.
+TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
+  static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
+  static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
+  static constexpr size_t gridSize = 8;
+  static constexpr int warmupIters = 50;
+  static constexpr int measuredIters = 100;
+
+  size_t copyBytes = representativeSize(sizeCat);
+  size_t rank = ctx.group->rank;
+  size_t size = ctx.group->size;
+  CUdevice cuDevice = ctx.group->cuDevice;
+  IpcMapper* ipcMapper = &*ctx.group->ipcMapper;
+
+  bool verbose = false;
+  if (auto* env = std::getenv("MOODIST_TUNE_VERBOSE")) {
+    verbose = !strcmp(env, "1");
+  }
+
+  if (verbose) {
+    log.info("tuning copy kernel for size category %d (%zu bytes), rank %zu/%zu...\n", static_cast<int>(sizeCat),
+        copyBytes, rank, size);
+  }
+
+  // Allocate synthetic src and dst buffers
+  CUdeviceptr syntheticSrc = 0, syntheticDst = 0;
+  CHECK_CU(cuMemAlloc(&syntheticSrc, copyBytes));
+  CHECK_CU(cuMemAlloc(&syntheticDst, copyBytes));
+  CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
+  CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
+
+  // Build the copy descriptor.
+  // Multi-GPU: IPC-map our syntheticSrc for the reader peer (ring: rank+1 reads from rank).
+  // Single-GPU: local-to-local copy.
+  CopyDescriptor desc;
+  desc.bytes = static_cast<uint32_t>(copyBytes);
+
+  if (size > 1) {
+    // Ring pattern: rank provides syntheticSrc to (rank+1)%size
+    size_t readerRank = (rank + 1) % size;
+    size_t sourceRank = (rank + size - 1) % size;
+    size_t readerPeerIndex = ctx.group->getPeerIndex(readerRank);
+    size_t sourcePeerIndex = ctx.group->getPeerIndex(sourceRank);
+
+    // IPC-map our syntheticSrc so the reader peer can access it
+    uintptr_t mappedAddr = 0;
+    ipcMapper->requestAddress(readerPeerIndex, syntheticSrc, copyBytes, &mappedAddr);
+    ipcMapper->wait();
+
+    // Barrier: all ranks have finished IPC mapping
+    ctx.barrier();
+
+    // Exchange addresses: push our mapped addr to reader, pop source's addr
+    ipcMapper->push(readerPeerIndex, mappedAddr);
+    uintptr_t remoteSrcAddr = ipcMapper->pop<uintptr_t>(sourcePeerIndex);
+
+    desc.src = remoteSrcAddr;
+    desc.dst = syntheticDst;
+  } else {
+    // Single-GPU: local copy
+    desc.src = syntheticSrc;
+    desc.dst = syntheticDst;
+  }
+
+  // Create stream and events for timing
+  CUstream stream = nullptr;
+  CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
+  CUevent startEvent = nullptr, stopEvent = nullptr;
+  CHECK_CU(cuEventCreate(&startEvent, CU_EVENT_DEFAULT));
+  CHECK_CU(cuEventCreate(&stopEvent, CU_EVENT_DEFAULT));
+
+  // stepValue counter — starts at 1, increments per launch.
+  // All ranks iterate the same candidates so barriers stay in sync.
+  uint32_t stepValue = 1;
+
+  TuningResult best;
+  best.config = {4, 256}; // default fallback
+  best.ms = INFINITY;
+
+  auto tuneStart = std::chrono::steady_clock::now();
+
+  for (int depth : depths) {
+    for (size_t bs : blockSizes) {
+      // Generate and compile the real production kernel with barriers
+      std::string source = generateCopyKernel(ctx.group, gridSize, bs, depth);
+      CompiledKernel kernel;
+      try {
+        kernel = compileKernel(source, "compile_op_copy", cuDevice);
+      } catch (...) {
+        // Skip candidates that fail to compile (e.g., register pressure)
+        // Still need to advance stepValue to keep all ranks in sync
+        stepValue += warmupIters + measuredIters;
+        if (verbose) {
+          log.info("  depth=%d blockSize=%zu -> COMPILE FAILED\n", depth, bs);
+        }
+        continue;
+      }
+
+      // Warmup
+      for (int i = 0; i < warmupIters; i++) {
+        launchCopyKernel(kernel.function, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+      }
+      CHECK_CU(cuStreamSynchronize(stream));
+
+      // Measured runs: track best (minimum) elapsed time
+      float bestMs = INFINITY;
+      for (int iter = 0; iter < measuredIters; iter++) {
+        CHECK_CU(cuEventRecord(startEvent, stream));
+        launchCopyKernel(kernel.function, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+        CHECK_CU(cuEventRecord(stopEvent, stream));
+        CHECK_CU(cuEventSynchronize(stopEvent));
+
+        float ms = 0.0f;
+        CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+        if (ms < bestMs) {
+          bestMs = ms;
+        }
+      }
+
+      if (verbose) {
+        log.info("  depth=%d blockSize=%zu -> %.3f ms\n", depth, bs, bestMs);
+      }
+
+      if (bestMs < best.ms) {
+        best.ms = bestMs;
+        best.config = {depth, bs};
+      }
+    }
+  }
+
+  // Cleanup
+  cuEventDestroy(stopEvent);
+  cuEventDestroy(startEvent);
+  cuStreamDestroy(stream);
+  cuMemFree(syntheticDst);
+  cuMemFree(syntheticSrc);
+
+  double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
+  log.info("tuning complete: best depth=%d blockSize=%zu (%.3f ms) in %.1fs\n", best.config.depth,
+      best.config.blockSize, best.ms, elapsed);
+
+  return best;
+}
 
 } // namespace
 
@@ -1193,6 +1425,78 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes,
       tensorIdNdim.size(), op->reads.size(), readBytes, op->localInputCopies.size(), localCopyBytes,
       op->inputCopies.size(), op->outputCopies.size());
+
+  // ============================================================================
+  // Auto-tuning: compile a per-op copy kernel with tuned (depth, blockSize)
+  // ============================================================================
+  // Only for v8 (codegen DSL) all-local ops with CUDA copies.
+  // Tuning runs microbenchmarks on this GPU and caches results by (arch, size category).
+
+  int kernelVersion = ctx.group->compileOpKernels->version;
+
+  if (kernelVersion == 8 && op->allLocal && !op->localInputCopies.empty()) {
+    // Find the dominant size category (largest total bytes per category)
+    size_t bytesPerCat[4] = {};
+    for (const auto& lic : op->localInputCopies) {
+      SizeCategory cat = sizeCategoryFor(lic.bytes);
+      bytesPerCat[static_cast<int>(cat)] += lic.bytes;
+    }
+    SizeCategory dominantCat = SizeCategory::Small;
+    size_t maxBytes = 0;
+    for (int i = 0; i < 4; i++) {
+      if (bytesPerCat[i] > maxBytes) {
+        maxBytes = bytesPerCat[i];
+        dominantCat = static_cast<SizeCategory>(i);
+      }
+    }
+
+    // Get compute arch for cache key
+    CUdevice cuDevice = ctx.group->cuDevice;
+    int computeMajor = 0, computeMinor = 0;
+    CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+    CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+    int computeArch = computeMajor * 10 + computeMinor;
+
+    TuningKey key{computeArch, dominantCat};
+    TuningResult result;
+    bool needsTuning = false;
+
+    {
+      std::lock_guard lock(tuningCacheMutex);
+      needsTuning = !tuningCacheLookup(key, result);
+    }
+
+    if (needsTuning) {
+      result = tuneCopyKernel(ctx, dominantCat);
+      std::lock_guard lock(tuningCacheMutex);
+      // Double-check: another thread might have tuned while we were running
+      TuningResult existing;
+      if (!tuningCacheLookup(key, existing)) {
+        tuningCacheStore(key, result);
+      } else {
+        result = existing;
+      }
+    }
+
+    // Generate and compile the final kernel with the tuned config
+    size_t tunedGridSize = 8;
+    std::string finalSource =
+        generateCopyKernel(ctx.group, tunedGridSize, result.config.blockSize, result.config.depth);
+
+    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu (%.3f ms)\n", op->id, result.config.depth,
+        result.config.blockSize, result.ms);
+
+    try {
+      auto ck = std::make_unique<CompiledKernel>(compileKernel(
+          finalSource, "compile_op_copy", cuDevice, fmt::sprintf("moodist-tuned-rank%zu-op%u", rank, op->id).c_str()));
+      op->tunedKernel = std::move(ck);
+      op->tunedGridSize = tunedGridSize;
+      op->tunedBlockSize = result.config.blockSize;
+    } catch (const std::exception& e) {
+      log.error(
+          "compile_op[%u]: failed to compile tuned kernel: %s (falling back to group kernel)\n", op->id, e.what());
+    }
+  }
 
   return op;
 }

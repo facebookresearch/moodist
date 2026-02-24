@@ -154,6 +154,7 @@ bool loadCuda() {
     cudaApi.streamCreateWithPriority =
         (cuStreamCreateWithPriority_t)loadSym(lib, "cuStreamCreateWithPriority", name, ok, failed);
     cudaApi.streamDestroy = (cuStreamDestroy_t)loadSym(lib, "cuStreamDestroy_v2", name, ok, failed);
+    cudaApi.streamSynchronize = (cuStreamSynchronize_t)loadSym(lib, "cuStreamSynchronize", name, ok, failed);
     cudaApi.streamWaitEvent = (cuStreamWaitEvent_t)loadSym(lib, "cuStreamWaitEvent", name, ok, failed);
     cudaApi.streamWaitValue32 = (cuStreamWaitValue32_t)loadSym(lib, "cuStreamWaitValue32_v2", name, ok, failed);
     cudaApi.streamBatchMemOp = (cuStreamBatchMemOp_t)loadSym(lib, "cuStreamBatchMemOp_v2", name, ok, failed);
@@ -164,6 +165,7 @@ bool loadCuda() {
     cudaApi.eventRecord = (cuEventRecord_t)loadSym(lib, "cuEventRecord", name, ok, failed);
     cudaApi.eventQuery = (cuEventQuery_t)loadSym(lib, "cuEventQuery", name, ok, failed);
     cudaApi.eventSynchronize = (cuEventSynchronize_t)loadSym(lib, "cuEventSynchronize", name, ok, failed);
+    cudaApi.eventElapsedTime = (cuEventElapsedTime_t)loadSym(lib, "cuEventElapsedTime", name, ok, failed);
 
     // IPC
     cudaApi.ipcGetMemHandle = (cuIpcGetMemHandle_t)loadSym(lib, "cuIpcGetMemHandle", name, ok, failed);
