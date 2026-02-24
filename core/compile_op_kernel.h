@@ -48,4 +48,29 @@ struct CompileOpKernels {
   void compileMulticast();
 };
 
+// ---------------------------------------------------------------------------
+// Standalone kernel compilation via NVRTC.
+//
+// Takes a CUDA source string, compiles it for the given device, and returns
+// a loaded module + function handle. Handles architecture detection,
+// error logging, and optional dump to file (MOODIST_DUMP_KERNELS).
+// ---------------------------------------------------------------------------
+
+struct CompiledKernel {
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+
+  CompiledKernel() = default;
+  CompiledKernel(CompiledKernel&& o) noexcept : module(o.module), function(o.function) {
+    o.module = nullptr;
+    o.function = nullptr;
+  }
+  CompiledKernel(const CompiledKernel&) = delete;
+  CompiledKernel& operator=(const CompiledKernel&) = delete;
+  ~CompiledKernel();
+};
+
+CompiledKernel compileKernel(
+    const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix = nullptr);
+
 } // namespace moodist
