@@ -96,6 +96,9 @@ struct CompiledKernel {
 CompiledKernel compileKernel(
     const std::string& source, const char* functionName, CUdevice device, const char* dumpPrefix = nullptr);
 
+// Compile a PTX string via cuModuleLoadDataEx JIT and return a CompiledKernel.
+CompiledKernel compileKernelPtx(const std::string& ptx, const char* functionName);
+
 // Launch a copy kernel with the standard CompileOpCopyParameters layout.
 // Builds the parameter struct from the given arguments and calls cuLaunchKernel.
 void launchCopyKernel(CUfunction kernel, size_t gridSize, size_t blockSize, const CopyDescriptor* descriptors,
