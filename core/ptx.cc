@@ -389,6 +389,9 @@ void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg&
   emitInst(
       "ld.global.cv.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
 }
+void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+  ld_global_cv_v4_u32(v[0], v[1], v[2], v[3], addr);
+}
 void ld_u8(const Reg& d, const Operand& addr) {
   emitInst("ld.u8 " + d.name + ", [" + addr.str + "]");
 }
@@ -403,6 +406,9 @@ void st_global_volatile_u32(const Operand& addr, const Operand& val) {
 void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3) {
   emitInst(
       "st.global.wt.v4.u32 [" + addr.str + "], {" + s0.name + ", " + s1.name + ", " + s2.name + ", " + s3.name + "}");
+}
+void st_global_wt_v4_u32(const Operand& addr, const std::array<Val, 4>& v) {
+  st_global_wt_v4_u32(addr, v[0], v[1], v[2], v[3]);
 }
 void st_u8(const Operand& addr, const Operand& val) {
   emitInst("st.u8 [" + addr.str + "], " + val.str);
@@ -534,6 +540,23 @@ Val& Val::operator=(int64_t v) {
     break;
   default:
     unsupported("=(imm)", type);
+  }
+  return *this;
+}
+
+Val& Val::operator=(const Val& o) {
+  if (regTypeFor(type) != regTypeFor(o.type)) {
+    unsupported("=(Val) type mismatch", type);
+  }
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    mov_u32(reg, Operand(o.reg));
+    break;
+  case RegType::B64:
+    mov_u64(reg, Operand(o.reg));
+    break;
+  default:
+    unsupported("=(Val)", type);
   }
   return *this;
 }
@@ -1108,15 +1131,31 @@ void storeGlobalVolatile(const Val& addr, const Val& val) {
 }
 
 void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
-  v0 = Val(ValType::U32);
-  v1 = Val(ValType::U32);
-  v2 = Val(ValType::U32);
-  v3 = Val(ValType::U32);
+  if (!v0.valid) {
+    v0 = Val(ValType::U32);
+  }
+  if (!v1.valid) {
+    v1 = Val(ValType::U32);
+  }
+  if (!v2.valid) {
+    v2 = Val(ValType::U32);
+  }
+  if (!v3.valid) {
+    v3 = Val(ValType::U32);
+  }
   ld_global_cv_v4_u32(v0, v1, v2, v3, addr.reg);
+}
+
+void ldcv_v4(std::array<Val, 4>& v, const Val& addr) {
+  ldcv_v4(v[0], v[1], v[2], v[3], addr);
 }
 
 void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3) {
   st_global_wt_v4_u32(addr.reg, v0, v1, v2, v3);
+}
+
+void stwt_v4(const Val& addr, const std::array<Val, 4>& v) {
+  stwt_v4(addr, v[0], v[1], v[2], v[3]);
 }
 
 Val atomicInc(const Val& addr, const Operand& modulo) {
