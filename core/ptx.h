@@ -181,6 +181,7 @@ void atom_global_inc_u32(const Reg& d, const Operand& addr, const Operand& b);
 // Synchronization
 void barrier_sync(int n = 0);
 void membar_sys();
+void warp_sync(uint32_t membermask = 0xFFFFFFFF);
 
 // Raw emit (escape hatch)
 void emit(const std::string& inst);

@@ -188,6 +188,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
 
         // Main loop: store-load overlap
         WHILE(i + (2 * depth - 1) * GS < count) {
+          //warp_sync();
           for (int j = 0; j < depth; j++) {
             stwt_v4(dstPtr, v[j]);
             dstPtr += stride;

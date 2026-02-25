@@ -471,6 +471,11 @@ void barrier_sync(int n) {
 void membar_sys() {
   emitInst("membar.sys");
 }
+void warp_sync(uint32_t membermask) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "0x%08x", membermask);
+  emitInst(std::string("bar.warp.sync ") + buf);
+}
 
 // Raw emit
 void emit(const std::string& inst) {
