@@ -330,7 +330,8 @@ Val paramBase(int index); // mov.b64 of param address, returns U64
 Val loadParamField(const Val& base, int offset, ValType type);
 
 // Type conversion
-Val widen(const Val& v); // U32→U64, S32→S64
+Val widen(const Val& v);  // U32→U64, S32→S64
+Val narrow(const Val& v); // U64→U32, S64→S32
 
 // Memory operations
 void storeGlobal(const Val& addr, const Val& val);
@@ -343,6 +344,12 @@ void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const
 
 // Atomic operations
 Val atomicInc(const Val& addr, const Operand& modulo);
+
+// Global variable address
+Val globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
+
+// Hex immediate — for baking GPU addresses into PTX
+Operand hexImm(uintptr_t value);
 
 } // namespace ptx
 } // namespace moodist
