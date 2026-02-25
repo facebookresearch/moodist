@@ -29,6 +29,7 @@ enum class Reduction { sum, min, max, avg, count };
 static constexpr size_t maxConcurrency = 16;
 static constexpr size_t maxDevices = 4;
 static constexpr size_t maxChunks = 8;
+static constexpr size_t maxBlocks = 1024;
 struct alignas(64) CpuAddresses {
   uint32_t stepValue;
   int pid;
@@ -82,6 +83,7 @@ struct Group {
   static constexpr size_t maxConcurrency = moodist::maxConcurrency;
   static constexpr size_t maxDevices = moodist::maxDevices;
   static constexpr size_t maxChunks = moodist::maxChunks;
+  static constexpr size_t maxBlocks = moodist::maxBlocks;
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
@@ -117,6 +119,9 @@ struct Group {
 
   AllocatedArray cudaCopyDone;
   std::array<PeerArrayRef, 8> peerCudaCopyDone;
+
+  AllocatedArray cudaBlockDone;
+  std::array<PeerArrayRef, 8> peerCudaBlockDone;
 
   AllocatedArray cudaMemSync;
   std::array<PeerArrayRef, 8> peerCudaMemSync;
