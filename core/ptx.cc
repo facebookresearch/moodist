@@ -85,6 +85,13 @@ void Function::addParam(const char* type) {
   paramDecls.push_back(std::string(".param ") + type + " " + paramName);
 }
 
+void Function::addParamBytes(int align, int size) {
+  int index = (int)paramDecls.size();
+  std::string paramName = name + "_param_" + std::to_string(index);
+  paramDecls.push_back(
+      ".param .align " + std::to_string(align) + " .b8 " + paramName + "[" + std::to_string(size) + "]");
+}
+
 std::string Function::param(int index) const {
   return name + "_param_" + std::to_string(index);
 }
@@ -244,8 +251,17 @@ void mul_wide_u32(const Reg& d, const Operand& a, const Operand& b) {
 void mul_wide_s32(const Reg& d, const Operand& a, const Operand& b) {
   emitInst(fmt3("mul.wide.s32", d, a, b));
 }
+void div_u32(const Reg& d, const Operand& a, const Operand& b) {
+  emitInst(fmt3("div.u32", d, a, b));
+}
+void div_s32(const Reg& d, const Operand& a, const Operand& b) {
+  emitInst(fmt3("div.s32", d, a, b));
+}
 void rem_u32(const Reg& d, const Operand& a, const Operand& b) {
   emitInst(fmt3("rem.u32", d, a, b));
+}
+void rem_s32(const Reg& d, const Operand& a, const Operand& b) {
+  emitInst(fmt3("rem.s32", d, a, b));
 }
 void min_u32(const Reg& d, const Operand& a, const Operand& b) {
   emitInst(fmt3("min.u32", d, a, b));
@@ -261,6 +277,12 @@ void max_s32(const Reg& d, const Operand& a, const Operand& b) {
 }
 
 // Bitwise
+void and_pred(const Reg& d, const Operand& a, const Operand& b) {
+  emitInst(fmt3("and.pred", d, a, b));
+}
+void or_pred(const Reg& d, const Operand& a, const Operand& b) {
+  emitInst(fmt3("or.pred", d, a, b));
+}
 void and_b32(const Reg& d, const Operand& a, const Operand& b) {
   emitInst(fmt3("and.b32", d, a, b));
 }
@@ -351,8 +373,17 @@ void ld_param_u32(const Reg& d, const std::string& paramName) {
 void ld_param_u64(const Reg& d, const std::string& paramName) {
   emitInst("ld.param.u64 " + d.name + ", [" + paramName + "]");
 }
+void ld_param_u32(const Reg& d, const Reg& addr, int offset) {
+  emitInst("ld.param.u32 " + d.name + ", [" + addr.name + "+" + std::to_string(offset) + "]");
+}
+void ld_param_u64(const Reg& d, const Reg& addr, int offset) {
+  emitInst("ld.param.u64 " + d.name + ", [" + addr.name + "+" + std::to_string(offset) + "]");
+}
 void ld_global_u32(const Reg& d, const Operand& addr) {
   emitInst("ld.global.u32 " + d.name + ", [" + addr.str + "]");
+}
+void ld_global_volatile_u32(const Reg& d, const Operand& addr) {
+  emitInst("ld.global.volatile.u32 " + d.name + ", [" + addr.str + "]");
 }
 void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
   emitInst(
@@ -365,6 +396,9 @@ void ld_u8(const Reg& d, const Operand& addr) {
 // Store
 void st_global_u32(const Operand& addr, const Operand& val) {
   emitInst("st.global.u32 [" + addr.str + "], " + val.str);
+}
+void st_global_volatile_u32(const Operand& addr, const Operand& val) {
+  emitInst("st.global.volatile.u32 [" + addr.str + "], " + val.str);
 }
 void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3) {
   emitInst(
@@ -563,9 +597,42 @@ Val Val::operator*(const Operand& b) const {
   return result;
 }
 
+Val Val::operator/(const Operand& b) const {
+  Val result(type);
+  switch (type) {
+  case ValType::U32:
+    div_u32(result.reg, reg, b);
+    break;
+  case ValType::S32:
+    div_s32(result.reg, reg, b);
+    break;
+  default:
+    unsupported("/", type);
+  }
+  return result;
+}
+
+Val Val::operator%(const Operand& b) const {
+  Val result(type);
+  switch (type) {
+  case ValType::U32:
+    rem_u32(result.reg, reg, b);
+    break;
+  case ValType::S32:
+    rem_s32(result.reg, reg, b);
+    break;
+  default:
+    unsupported("%", type);
+  }
+  return result;
+}
+
 Val Val::operator&(const Operand& b) const {
   Val result(type);
   switch (regTypeFor(type)) {
+  case RegType::Pred:
+    and_pred(result.reg, reg, b);
+    break;
   case RegType::B32:
     and_b32(result.reg, reg, b);
     break;
@@ -581,6 +648,9 @@ Val Val::operator&(const Operand& b) const {
 Val Val::operator|(const Operand& b) const {
   Val result(type);
   switch (regTypeFor(type)) {
+  case RegType::Pred:
+    or_pred(result.reg, reg, b);
+    break;
   case RegType::B32:
     or_b32(result.reg, reg, b);
     break;
@@ -772,6 +842,51 @@ void Val::operator-=(const Operand& b) {
   }
 }
 
+void Val::operator*=(const Operand& b) {
+  switch (type) {
+  case ValType::U32:
+    mul_lo_u32(reg, reg, b);
+    break;
+  case ValType::S32:
+    mul_lo_s32(reg, reg, b);
+    break;
+  case ValType::U64:
+    mul_lo_u64(reg, reg, b);
+    break;
+  case ValType::S64:
+    mul_lo_s64(reg, reg, b);
+    break;
+  default:
+    unsupported("*=", type);
+  }
+}
+
+void Val::operator/=(const Operand& b) {
+  switch (type) {
+  case ValType::U32:
+    div_u32(reg, reg, b);
+    break;
+  case ValType::S32:
+    div_s32(reg, reg, b);
+    break;
+  default:
+    unsupported("/=", type);
+  }
+}
+
+void Val::operator%=(const Operand& b) {
+  switch (type) {
+  case ValType::U32:
+    rem_u32(reg, reg, b);
+    break;
+  case ValType::S32:
+    rem_s32(reg, reg, b);
+    break;
+  default:
+    unsupported("%=", type);
+  }
+}
+
 // --- FunctionScope ---
 
 FunctionScope::FunctionScope(Function* f) : fn(f) {
@@ -905,6 +1020,27 @@ Val loadParam(int index, ValType type) {
   return v;
 }
 
+Val paramBase(int index) {
+  Val v(ValType::U64);
+  mov_b64(v.reg, Operand(currentFunction->param(index).c_str()));
+  return v;
+}
+
+Val loadParamField(const Val& base, int offset, ValType type) {
+  Val v(type);
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    ld_param_u32(v.reg, base.reg, offset);
+    break;
+  case RegType::B64:
+    ld_param_u64(v.reg, base.reg, offset);
+    break;
+  default:
+    unsupported("loadParamField", type);
+  }
+  return v;
+}
+
 Val widen(const Val& v) {
   ValType wide;
   switch (v.type) {
@@ -930,6 +1066,46 @@ void storeGlobal(const Val& addr, const Val& val) {
   default:
     unsupported("storeGlobal", val.type);
   }
+}
+
+Val loadGlobalVolatile(const Val& addr, ValType type) {
+  Val v(type);
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    ld_global_volatile_u32(v.reg, addr.reg);
+    break;
+  default:
+    unsupported("loadGlobalVolatile", type);
+  }
+  return v;
+}
+
+void storeGlobalVolatile(const Val& addr, const Val& val) {
+  switch (regTypeFor(val.type)) {
+  case RegType::B32:
+    st_global_volatile_u32(addr.reg, val.reg);
+    break;
+  default:
+    unsupported("storeGlobalVolatile", val.type);
+  }
+}
+
+void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+  v0 = Val(ValType::U32);
+  v1 = Val(ValType::U32);
+  v2 = Val(ValType::U32);
+  v3 = Val(ValType::U32);
+  ld_global_cv_v4_u32(v0, v1, v2, v3, addr.reg);
+}
+
+void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3) {
+  st_global_wt_v4_u32(addr.reg, v0, v1, v2, v3);
+}
+
+Val atomicInc(const Val& addr, const Operand& modulo) {
+  Val result(ValType::U32);
+  atom_global_inc_u32(result.reg, addr.reg, modulo);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1178,8 @@ std::string ptxTest(const char* target) {
 
       // Store 4 x u32 to dst
       st_global_wt_v4_u32(dstAddr, v0, v1, v2, v3);
-    } ELSE {
+    }
+    ELSE {
       // Out of bounds — write zeros to dst
       auto byteOff = widen(base) * 4;
       auto dstAddr = dst + byteOff;
@@ -1047,6 +1224,43 @@ std::string ptxTest(const char* target) {
       ld_global_u32(val, srcAddr);
       st_global_u32(dstAddr, val);
       i += bdim;
+    }
+
+    ret();
+  }
+
+  // --- Test 4: struct param loading ---
+  // Mimics loading from CompileOpCopyParameters:
+  //   offset 0: u32 stepValue
+  //   offset 4: u32 concurrencyIndex
+  //   offset 8: u32 numDescriptors
+  //   offset 16: CopyDescriptor descriptors[] (each 24 bytes: u64 src, u64 dst, u32 bytes)
+  auto* fn4 = mod.newFunction("test_struct_param");
+  {
+    FunctionScope fnScope(fn4);
+    fn4->maxThreads = 256;
+    fn4->addParamBytes(8, 4816); // .param .align 8 .b8 param[4816]
+
+    activateNewBlock("entry");
+
+    auto params = paramBase(0);
+    auto numDesc = loadParamField(params, 8, ValType::U32);
+    auto tid = threadIdx_x();
+
+    // Load first descriptor's src and dst
+    auto descBase = params + 16; // offset of descriptors[0]
+    auto src = loadParamField(descBase, 0, ValType::U64);
+    auto dst = loadParamField(descBase, 8, ValType::U64);
+    auto bytes = loadParamField(descBase, 16, ValType::U32);
+
+    // Simple copy: each thread copies one u32
+    IF(tid < bytes) {
+      auto off = widen(tid);
+      auto srcAddr = src + off;
+      auto dstAddr = dst + off;
+      Val v(ValType::U32);
+      ld_global_u32(v, srcAddr);
+      st_global_u32(dstAddr, v);
     }
 
     ret();
