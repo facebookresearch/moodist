@@ -845,6 +845,9 @@ void Group::init(Function<void()> f) {
     cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
     mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
 
+    cudaBlockDone = allocateArrayDevice(sizeof(uint32_t) * 8 * maxBlocks, Group::maxConcurrency);
+    mapPeerAddrs(cudaBlockDone, peerCudaBlockDone);
+
     cudaStepValuesBuffer = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
     cudaStepValuesDeviceChunksBuffer =
         allocateArrayDevice(sizeof(uint32_t) * Group::maxChunks * Group::maxDevices * size, Group::maxConcurrency);
@@ -866,6 +869,7 @@ void Group::init(Function<void()> f) {
         &cpuCommsDeviceDataSent2,
         &cudaProxyReady,
         &cudaCopyDone,
+        &cudaBlockDone,
         &cudaStepValuesBuffer,
         &cudaStepValuesDeviceChunksBuffer,
         &cudaMemSync,

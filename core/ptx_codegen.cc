@@ -33,10 +33,6 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
   Module mod;
   mod.target = target;
 
-  // Device globals for inter-block synchronization
-  mod.globals.push_back(fmt::sprintf(".global .align 4 .u32 entryCounter[%zu]", Group::maxConcurrency));
-  mod.globals.push_back(fmt::sprintf(".global .align 4 .u32 exitCounter[%zu]", Group::maxConcurrency));
-
   auto* fn = mod.newFunction("compile_op_copy");
   {
     FunctionScope fnScope(fn);
@@ -58,16 +54,11 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
     // Entry barrier (thread 0 only)
     // =================================================================
     IF(tid == 0) {
-      auto counterAddr = globalAddr("entryCounter") + widen(concurrencyIndex) * 4;
-      auto old = atomicInc(counterAddr, (uint32_t)(GS - 1));
-      IF(old == 0) {
-        // First block: write stepValue to each peer
-        for (size_t i : peerIndices) {
-          auto& arr = group->peerCudaStepValue[i];
-          auto addr = barrierAddr(arr.base, arr.itembytes, sizeof(uint32_t) * rank, concurrencyIndex);
-          storeGlobalVolatile(addr, stepValue);
-        }
-        membar_sys();
+      // Every block writes stepValue to each peer (idempotent — same value)
+      for (size_t i : peerIndices) {
+        auto& arr = group->peerCudaStepValue[i];
+        auto addr = barrierAddr(arr.base, arr.itembytes, sizeof(uint32_t) * rank, concurrencyIndex);
+        storeGlobalVolatile(addr, stepValue);
       }
       // Wait for all peers
       for (size_t i : peerIndices) {
@@ -248,27 +239,25 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
     }
 
     // =================================================================
-    // Exit barrier
+    // Exit barrier (per-block, no atomics)
     // =================================================================
     membar_sys();
     barrier_sync();
     IF(tid == 0) {
-      auto counterAddr = globalAddr("exitCounter") + widen(concurrencyIndex) * 4;
-      auto old = atomicInc(counterAddr, (uint32_t)(GS - 1));
-      IF(old == (GS - 1)) {
-        // Last block: write copyDone to peers
-        for (size_t i : peerIndices) {
-          auto& arr = group->peerCudaCopyDone[i];
-          auto addr =
-              barrierAddr(arr.base, arr.itembytes, sizeof(uint32_t) * group->peerMyRemoteIndex[i], concurrencyIndex);
-          storeGlobalVolatile(addr, stepValue);
-        }
-        // Wait for peer copyDone
-        for (size_t i : peerIndices) {
-          auto addr = barrierAddr(group->cudaCopyDone.buffer.cudaPointer, group->cudaCopyDone.itembytes,
-              sizeof(uint32_t) * i, concurrencyIndex);
-          WHILE(loadGlobalVolatile(addr, ValType::U32) < stepValue) {}
-        }
+      // Write copyDone to each peer at this block's slot
+      for (size_t i : peerIndices) {
+        auto& arr = group->peerCudaBlockDone[i];
+        auto offset = widen(blockIdx + (uint32_t)(group->peerMyRemoteIndex[i] * maxBlocks)) * 4;
+        auto addr = barrierAddr(arr.base, arr.itembytes, 0, concurrencyIndex) + offset;
+        storeGlobalVolatile(addr, stepValue);
+      }
+      // Wait for each peer's corresponding block
+      for (size_t i : peerIndices) {
+        auto offset = widen(blockIdx + (uint32_t)(i * maxBlocks)) * 4;
+        auto addr =
+            barrierAddr(group->cudaBlockDone.buffer.cudaPointer, group->cudaBlockDone.itembytes, 0, concurrencyIndex) +
+            offset;
+        WHILE(loadGlobalVolatile(addr, ValType::U32) < stepValue) {}
       }
     }
 
