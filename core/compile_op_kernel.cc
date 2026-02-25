@@ -1729,11 +1729,17 @@ CompiledModule CompiledModule::compile(const std::string& source, CUdevice devic
       CHECK_CU(cuDeviceGetAttribute(&cm, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
       CHECK_CU(cuDeviceGetAttribute(&cn, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
       const char* target = "sm_60";
-      if (cm >= 10) target = "sm_100a";
-      else if (cm == 9) target = "sm_90a";
-      else if (cm == 8 && cn >= 9) target = "sm_89";
-      else if (cm == 8) target = "sm_80";
-      else if (cm == 7) target = "sm_70";
+      if (cm >= 10) {
+        target = "sm_100a";
+      } else if (cm == 9) {
+        target = "sm_90a";
+      } else if (cm == 8 && cn >= 9) {
+        target = "sm_89";
+      } else if (cm == 8) {
+        target = "sm_80";
+      } else if (cm == 7) {
+        target = "sm_70";
+      }
 
       std::string ptx = ptx::ptxTest(target);
       CUmodule testModule = nullptr;

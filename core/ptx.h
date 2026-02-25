@@ -45,7 +45,8 @@ struct Function {
 
   // Parameters — stored as declaration strings like ".param .u64 name_param_0"
   std::vector<std::string> paramDecls;
-  void addParam(const char* type); // e.g. ".u64", ".u32"
+  void addParam(const char* type);         // e.g. ".u64", ".u32"
+  void addParamBytes(int align, int size); // .param .align A .b8 name[SIZE]
   // Returns the parameter name for use in ld.param, e.g. "name_param_0"
   std::string param(int index) const;
 
@@ -104,13 +105,18 @@ void mul_lo_u64(const Reg& d, const Operand& a, const Operand& b);
 void mul_lo_s64(const Reg& d, const Operand& a, const Operand& b);
 void mul_wide_u32(const Reg& d, const Operand& a, const Operand& b);
 void mul_wide_s32(const Reg& d, const Operand& a, const Operand& b);
+void div_u32(const Reg& d, const Operand& a, const Operand& b);
+void div_s32(const Reg& d, const Operand& a, const Operand& b);
 void rem_u32(const Reg& d, const Operand& a, const Operand& b);
+void rem_s32(const Reg& d, const Operand& a, const Operand& b);
 void min_u32(const Reg& d, const Operand& a, const Operand& b);
 void min_s32(const Reg& d, const Operand& a, const Operand& b);
 void max_u32(const Reg& d, const Operand& a, const Operand& b);
 void max_s32(const Reg& d, const Operand& a, const Operand& b);
 
 // Bitwise
+void and_pred(const Reg& d, const Operand& a, const Operand& b);
+void or_pred(const Reg& d, const Operand& a, const Operand& b);
 void and_b32(const Reg& d, const Operand& a, const Operand& b);
 void and_b64(const Reg& d, const Operand& a, const Operand& b);
 void or_b32(const Reg& d, const Operand& a, const Operand& b);
@@ -145,12 +151,16 @@ void mov_b64(const Reg& d, const Operand& a);
 // Load
 void ld_param_u32(const Reg& d, const std::string& paramName);
 void ld_param_u64(const Reg& d, const std::string& paramName);
+void ld_param_u32(const Reg& d, const Reg& addr, int offset);
+void ld_param_u64(const Reg& d, const Reg& addr, int offset);
 void ld_global_u32(const Reg& d, const Operand& addr);
+void ld_global_volatile_u32(const Reg& d, const Operand& addr);
 void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr);
 void ld_u8(const Reg& d, const Operand& addr);
 
 // Store
 void st_global_u32(const Operand& addr, const Operand& val);
+void st_global_volatile_u32(const Operand& addr, const Operand& val);
 void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3);
 void st_u8(const Operand& addr, const Operand& val);
 
@@ -214,6 +224,8 @@ struct Val {
   Val operator+(const Operand& b) const;
   Val operator-(const Operand& b) const;
   Val operator*(const Operand& b) const;
+  Val operator/(const Operand& b) const;
+  Val operator%(const Operand& b) const;
 
   // Bitwise — result has same type as *this
   Val operator&(const Operand& b) const;
@@ -234,6 +246,9 @@ struct Val {
   // Compound assignment — modifies in place
   void operator+=(const Operand& b);
   void operator-=(const Operand& b);
+  void operator*=(const Operand& b);
+  void operator/=(const Operand& b);
+  void operator%=(const Operand& b);
 };
 
 // RAII function scope — sets TLS context, manages register free-lists.
@@ -288,7 +303,7 @@ ScopeGuard _If(const Reg& pred);
 ScopeGuard _Else();
 ScopeGuard _WhileImpl(Block* header, const Reg& pred);
 
-template <typename F>
+template<typename F>
 ScopeGuard _While(F&& condFn) {
   Block* header = activateNewBlock("while");
   Val pred = condFn();
@@ -297,8 +312,10 @@ ScopeGuard _While(F&& condFn) {
 
 #define IF(pred) for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_If(pred))
 #define ELSE for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_Else())
-#define WHILE(cond) \
-  for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_While([&]() { return (cond); }))
+#define WHILE(cond)                                                                                                    \
+  for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_While([&]() {                                              \
+         return (cond);                                                                                                \
+       }))
 
 // Special registers
 Val threadIdx_x();
@@ -308,11 +325,24 @@ Val blockDim_x();
 // Parameter loading — emits ld.param, returns typed Val
 Val loadParam(int index, ValType type);
 
+// Parameter struct access — for .param .b8 byte-array params
+Val paramBase(int index); // mov.b64 of param address, returns U64
+Val loadParamField(const Val& base, int offset, ValType type);
+
 // Type conversion
 Val widen(const Val& v); // U32→U64, S32→S64
 
 // Memory operations
 void storeGlobal(const Val& addr, const Val& val);
+Val loadGlobalVolatile(const Val& addr, ValType type);
+void storeGlobalVolatile(const Val& addr, const Val& val);
+
+// Vectorized load/store (4 x u32)
+void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
+void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3);
+
+// Atomic operations
+Val atomicInc(const Val& addr, const Operand& modulo);
 
 } // namespace ptx
 } // namespace moodist
