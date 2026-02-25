@@ -110,13 +110,14 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
         // Byte copy loop: tid stride blockSize
         auto i = Val(ValType::U32);
         mov_u32(i, tid);
+        auto srcP = src + widen(tid);
+        auto dstP = dst + widen(tid);
         WHILE(i < headBytes) {
-          auto off = widen(i);
-          auto srcAddr = src + off;
-          auto dstAddr = dst + off;
           Val v(ValType::U32);
-          ld_u8(v, srcAddr);
-          st_u8(dstAddr, v);
+          ld_u8(v, srcP);
+          st_u8(dstP, v);
+          srcP += (int64_t)BS;
+          dstP += (int64_t)BS;
           i += (int32_t)BS;
         }
         barrier_sync();
@@ -136,11 +137,15 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       // ---------------------------------------------------------------
       IF(aligned & (bytes >= (int32_t)loopBytes)) {
         auto count = bytes / (int32_t)loopBytes;
-        auto tid16 = tid * (int32_t)16;
-        auto tid16w = widen(tid16);
+        auto tid16w = widen(tid * (int32_t)16);
+        int64_t stride = (int64_t)GS * loopBytes;
 
         auto i = Val(ValType::U32);
         mov_u32(i, blockIdx);
+
+        // Running pointers: avoid recomputing addresses each iteration
+        auto srcPtr = src + widen(blockIdx) * (int32_t)loopBytes + tid16w;
+        auto dstPtr = dst + widen(blockIdx) * (int32_t)loopBytes + tid16w;
 
         // Pipeline registers: depth x 4 u32 values
         std::array<std::array<Val, 4>, 56> v; // max depth 56
@@ -153,23 +158,18 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
         // Prime: load depth values
         for (int k = 0; k < depth; k++) {
           IF(i + (int32_t)(k * GS) < count) {
-            auto off = widen(i + (int32_t)(k * GS)) * (int32_t)loopBytes + tid16w;
-            auto srcAddr = src + off;
-            ld_global_cv_v4_u32(v[k][0], v[k][1], v[k][2], v[k][3], srcAddr);
+            ld_global_cv_v4_u32(v[k][0], v[k][1], v[k][2], v[k][3], srcPtr);
           }
+          srcPtr += stride;
         }
 
         // Main loop: store-load overlap
         WHILE(i + (int32_t)((2 * depth - 1) * GS) < count) {
           for (int j = 0; j < depth; j++) {
-            // Store v[j]
-            auto storeOff = widen(i + (int32_t)(j * GS)) * (int32_t)loopBytes + tid16w;
-            auto dstAddr = dst + storeOff;
-            st_global_wt_v4_u32(dstAddr, v[j][0], v[j][1], v[j][2], v[j][3]);
-            // Load v[j] from next position
-            auto loadOff = widen(i + (int32_t)((j + depth) * GS)) * (int32_t)loopBytes + tid16w;
-            auto srcAddr = src + loadOff;
-            ld_global_cv_v4_u32(v[j][0], v[j][1], v[j][2], v[j][3], srcAddr);
+            st_global_wt_v4_u32(dstPtr, v[j][0], v[j][1], v[j][2], v[j][3]);
+            dstPtr += stride;
+            ld_global_cv_v4_u32(v[j][0], v[j][1], v[j][2], v[j][3], srcPtr);
+            srcPtr += stride;
           }
           i += (int32_t)(depth * GS);
         }
@@ -177,19 +177,19 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
         // Drain: store remaining
         for (int k = 0; k < depth; k++) {
           IF(i + (int32_t)(k * GS) < count) {
-            auto off = widen(i + (int32_t)(k * GS)) * (int32_t)loopBytes + tid16w;
-            auto dstAddr = dst + off;
-            st_global_wt_v4_u32(dstAddr, v[k][0], v[k][1], v[k][2], v[k][3]);
+            st_global_wt_v4_u32(dstPtr, v[k][0], v[k][1], v[k][2], v[k][3]);
           }
+          dstPtr += stride;
         }
         i += (int32_t)(depth * GS);
 
         // Tail: simple loop for remaining full blocks
         WHILE(i < count) {
-          auto off = widen(i) * (int32_t)loopBytes + tid16w;
           Val t0, t1, t2, t3;
-          ldcv_v4(t0, t1, t2, t3, src + off);
-          stwt_v4(dst + off, t0, t1, t2, t3);
+          ldcv_v4(t0, t1, t2, t3, srcPtr);
+          stwt_v4(dstPtr, t0, t1, t2, t3);
+          srcPtr += stride;
+          dstPtr += stride;
           i += (int32_t)GS;
         }
 
@@ -208,11 +208,15 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
         auto remaining16 = bytes / (int32_t)16;
         auto i = Val(ValType::U32);
         mov_u32(i, tid);
+        auto srcPtr = src + widen(tid) * (int32_t)16;
+        auto dstPtr = dst + widen(tid) * (int32_t)16;
+        int64_t stride16 = (int64_t)BS * 16;
         WHILE(i < remaining16) {
-          auto off = widen(i) * (int32_t)16;
           Val t0, t1, t2, t3;
-          ldcv_v4(t0, t1, t2, t3, src + off);
-          stwt_v4(dst + off, t0, t1, t2, t3);
+          ldcv_v4(t0, t1, t2, t3, srcPtr);
+          stwt_v4(dstPtr, t0, t1, t2, t3);
+          srcPtr += stride16;
+          dstPtr += stride16;
           i += (int32_t)BS;
         }
         auto done16 = remaining16 * (int32_t)16;
@@ -228,11 +232,14 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       {
         auto i = Val(ValType::U32);
         mov_u32(i, tid);
+        auto srcPtr = src + widen(tid);
+        auto dstPtr = dst + widen(tid);
         WHILE(i < bytes) {
-          auto off = widen(i);
           Val v(ValType::U32);
-          ld_u8(v, src + off);
-          st_u8(dst + off, v);
+          ld_u8(v, srcPtr);
+          st_u8(dstPtr, v);
+          srcPtr += (int64_t)BS;
+          dstPtr += (int64_t)BS;
           i += (int32_t)BS;
         }
       }
