@@ -198,6 +198,7 @@ set(core_sources
   core/tcpdev.cc
   core/processgroup.cc
   core/ptx.cc
+  core/ptx_codegen.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}

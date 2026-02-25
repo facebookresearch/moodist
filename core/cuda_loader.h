@@ -190,6 +190,13 @@ constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
+// JIT options
+using CUjit_option = int;
+constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER = 5;
+constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER = 3;
+constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+
 // Event flags
 constexpr unsigned int CU_EVENT_DEFAULT = 0x0;
 constexpr unsigned int CU_EVENT_BLOCKING_SYNC = 0x1;

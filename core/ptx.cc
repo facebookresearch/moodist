@@ -181,7 +181,7 @@ std::string Module::finalize() const {
   s += "\n";
 
   for (const auto& g : globals) {
-    s += g + "\n";
+    s += g + ";\n";
   }
   if (!globals.empty()) {
     s += "\n";
@@ -1058,6 +1058,23 @@ Val widen(const Val& v) {
   return result;
 }
 
+Val narrow(const Val& v) {
+  ValType n;
+  switch (v.type) {
+  case ValType::U64:
+    n = ValType::U32;
+    break;
+  case ValType::S64:
+    n = ValType::S32;
+    break;
+  default:
+    unsupported("narrow", v.type);
+  }
+  Val result(n);
+  cvt_u32_u64(result.reg, v.reg);
+  return result;
+}
+
 void storeGlobal(const Val& addr, const Val& val) {
   switch (regTypeFor(val.type)) {
   case RegType::B32:
@@ -1106,6 +1123,18 @@ Val atomicInc(const Val& addr, const Operand& modulo) {
   Val result(ValType::U32);
   atom_global_inc_u32(result.reg, addr.reg, modulo);
   return result;
+}
+
+Val globalAddr(const char* name) {
+  Val v(ValType::U64);
+  mov_u64(v.reg, Operand(name));
+  return v;
+}
+
+Operand hexImm(uintptr_t value) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)value);
+  return Operand(buf);
 }
 
 // ---------------------------------------------------------------------------

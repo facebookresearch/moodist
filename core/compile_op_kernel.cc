@@ -4,7 +4,7 @@
 #include "codegen.h"
 #include "common.h"
 #include "group.h"
-#include "ptx.h"
+#include "ptx_codegen.h"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +32,8 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       version = 7;
     } else if (!strcmp(env, "v8")) {
       version = 8;
+    } else if (!strcmp(env, "v9")) {
+      version = 9;
     }
   }
   if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
@@ -290,13 +292,6 @@ void CompileOpKernels::compile() {
 
   int computeMajor = 0;
   int computeMinor = 0;
-
-  int major = 6;
-  int minor = 0;
-  if (!loadNvrtc()) {
-    throw std::runtime_error("NVRTC not available");
-  }
-  CHECK_NVRTC(nvrtcApi.version(&major, &minor));
 
   CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
   CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
@@ -1294,6 +1289,92 @@ compile_op_copy(CompileOpCopyParameters params) {
     source = generateCopyKernel(group, gridSize, blockSize, v8depth);
   }
 
+  // v9 kernel: direct PTX generation via PTX DSL.
+  // Same algorithm as v8 but generates PTX directly, bypassing NVRTC.
+  if (version == 9) {
+    int v9depth = 4;
+    if (auto* env = std::getenv("MOODIST_COPY_DEPTH")) {
+      v9depth = atoi(env);
+      if (v9depth < 1) {
+        v9depth = 1;
+      }
+      if (v9depth > 56) {
+        v9depth = 56;
+      }
+    }
+
+    const char* target = "sm_60";
+    if (computeMajor >= 10) {
+      target = "sm_100a";
+    } else if (computeMajor == 9) {
+      target = "sm_90a";
+    } else if (computeMajor == 8 && computeMinor >= 9) {
+      target = "sm_89";
+    } else if (computeMajor == 8) {
+      target = "sm_80";
+    } else if (computeMajor == 7) {
+      target = "sm_70";
+    }
+
+    log.info("compile_op v9 (ptx): depth=%d, gridSize=%zu, blockSize=%zu, target=%s\n", v9depth, gridSize, blockSize,
+        target);
+    std::string ptx = generateCopyKernelPtx(group, gridSize, blockSize, v9depth, target);
+
+    auto boolenv = [&](const char* name) {
+      const char* c = std::getenv(name);
+      if (!c) {
+        return false;
+      }
+      return !strcmp(c, "1");
+    };
+
+    if (boolenv("MOODIST_DUMP_KERNELS")) {
+      std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%d.ptx", rank);
+      FILE* f = fopen(fn.c_str(), "wb");
+      if (f) {
+        fwrite(ptx.data(), ptx.size(), 1, f);
+        fclose(f);
+        log.info("compile_op PTX dumped to %s\n", fn);
+      }
+    }
+
+    char jitErrorLog[4096] = {};
+    char jitInfoLog[4096] = {};
+    CUjit_option jitOptions[] = {
+        CU_JIT_ERROR_LOG_BUFFER,
+        CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        CU_JIT_INFO_LOG_BUFFER,
+        CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+    };
+    void* jitValues[] = {
+        jitErrorLog,
+        (void*)(uintptr_t)sizeof(jitErrorLog),
+        jitInfoLog,
+        (void*)(uintptr_t)sizeof(jitInfoLog),
+    };
+    CUresult jitErr = cuModuleLoadDataEx(&cuModule, ptx.c_str(), 4, jitOptions, jitValues);
+    if (jitErr != CUDA_SUCCESS) {
+      log.error("PTX JIT compilation failed (error %d)\n", (int)jitErr);
+      if (jitErrorLog[0]) {
+        log.error("ptxas error log:\n%s\n", jitErrorLog);
+      }
+      if (jitInfoLog[0]) {
+        log.error("ptxas info log:\n%s\n", jitInfoLog);
+      }
+      log.error("PTX source:\n%s\n", ptx.c_str());
+      CHECK_CU(jitErr);
+    }
+    CHECK_CU(cuModuleGetFunction(&cuCopyKernel, cuModule, "compile_op_copy"));
+
+    int numRegs = 0;
+    CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, cuCopyKernel));
+    int maxThreadsPerBlock = 0;
+    CHECK_CU(cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuCopyKernel));
+    log.info("compile_op_copy (v9): %d registers, max %d threads/block\n", numRegs, maxThreadsPerBlock);
+    log.info("compile_op kernel compile took %gs\n", seconds(std::chrono::steady_clock::now() - start));
+    return;
+  }
+
   source = replace(source, "%%", "%");
   source = autoindent(source);
   source = addLineCountComments(source);
@@ -1315,6 +1396,10 @@ compile_op_copy(CompileOpCopyParameters params) {
       fclose(f);
       log.info("compile_op kernel source dumped to %s\n", cuFilename);
     }
+  }
+
+  if (!loadNvrtc()) {
+    throw std::runtime_error("NVRTC not available");
   }
 
   nvrtcProgram program;
