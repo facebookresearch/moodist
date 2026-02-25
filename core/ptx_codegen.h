@@ -7,11 +7,12 @@
 
 namespace moodist {
 
+struct CopyKernelConfig;
 struct Group;
 
 // Generate a complete copy kernel as PTX source, bypassing NVRTC.
 // Uses the PTX DSL (ptx.h) to emit the same algorithm as v8.
-std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSize, int depth, const char* target);
+std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, const char* target);
 
 // Return the PTX target string (e.g. "sm_90a") for the given compute capability.
 const char* computeTarget(int computeMajor, int computeMinor);

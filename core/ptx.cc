@@ -392,6 +392,20 @@ void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg&
 void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
   ld_global_cv_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
+void ld_global_nc_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
+  emitInst(
+      "ld.global.nc.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+}
+void ld_global_nc_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+  ld_global_nc_v4_u32(v[0], v[1], v[2], v[3], addr);
+}
+void ld_global_cs_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
+  emitInst(
+      "ld.global.cs.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+}
+void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+  ld_global_cs_v4_u32(v[0], v[1], v[2], v[3], addr);
+}
 void ld_u8(const Reg& d, const Operand& addr) {
   emitInst("ld.u8 " + d.name + ", [" + addr.str + "]");
 }
@@ -402,6 +416,15 @@ void st_global_u32(const Operand& addr, const Operand& val) {
 }
 void st_global_volatile_u32(const Operand& addr, const Operand& val) {
   emitInst("st.global.volatile.u32 [" + addr.str + "], " + val.str);
+}
+void ld_global_acquire_sys_u32(const Reg& d, const Operand& addr) {
+  emitInst("ld.acquire.sys.global.u32 " + d.name + ", [" + addr.str + "]");
+}
+void st_global_relaxed_sys_u32(const Operand& addr, const Operand& val) {
+  emitInst("st.relaxed.sys.global.u32 [" + addr.str + "], " + val.str);
+}
+void st_global_release_sys_u32(const Operand& addr, const Operand& val) {
+  emitInst("st.release.sys.global.u32 [" + addr.str + "], " + val.str);
 }
 void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3) {
   emitInst(
@@ -1130,6 +1153,38 @@ void storeGlobalVolatile(const Val& addr, const Val& val) {
   }
 }
 
+Val loadGlobalAcquireSys(const Val& addr, ValType type) {
+  Val v(type);
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    ld_global_acquire_sys_u32(v.reg, addr.reg);
+    break;
+  default:
+    unsupported("loadGlobalAcquireSys", type);
+  }
+  return v;
+}
+
+void storeGlobalRelaxedSys(const Val& addr, const Val& val) {
+  switch (regTypeFor(val.type)) {
+  case RegType::B32:
+    st_global_relaxed_sys_u32(addr.reg, val.reg);
+    break;
+  default:
+    unsupported("storeGlobalRelaxedSys", val.type);
+  }
+}
+
+void storeGlobalReleaseSys(const Val& addr, const Val& val) {
+  switch (regTypeFor(val.type)) {
+  case RegType::B32:
+    st_global_release_sys_u32(addr.reg, val.reg);
+    break;
+  default:
+    unsupported("storeGlobalReleaseSys", val.type);
+  }
+}
+
 void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
   if (!v0.valid) {
     v0 = Val(ValType::U32);
@@ -1148,6 +1203,46 @@ void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
 
 void ldcv_v4(std::array<Val, 4>& v, const Val& addr) {
   ldcv_v4(v[0], v[1], v[2], v[3], addr);
+}
+
+void ldnc_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+  if (!v0.valid) {
+    v0 = Val(ValType::U32);
+  }
+  if (!v1.valid) {
+    v1 = Val(ValType::U32);
+  }
+  if (!v2.valid) {
+    v2 = Val(ValType::U32);
+  }
+  if (!v3.valid) {
+    v3 = Val(ValType::U32);
+  }
+  ld_global_nc_v4_u32(v0, v1, v2, v3, addr.reg);
+}
+
+void ldnc_v4(std::array<Val, 4>& v, const Val& addr) {
+  ldnc_v4(v[0], v[1], v[2], v[3], addr);
+}
+
+void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+  if (!v0.valid) {
+    v0 = Val(ValType::U32);
+  }
+  if (!v1.valid) {
+    v1 = Val(ValType::U32);
+  }
+  if (!v2.valid) {
+    v2 = Val(ValType::U32);
+  }
+  if (!v3.valid) {
+    v3 = Val(ValType::U32);
+  }
+  ld_global_cs_v4_u32(v0, v1, v2, v3, addr.reg);
+}
+
+void ldcs_v4(std::array<Val, 4>& v, const Val& addr) {
+  ldcs_v4(v[0], v[1], v[2], v[3], addr);
 }
 
 void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3) {

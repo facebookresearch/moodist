@@ -404,8 +404,7 @@ struct CustomOpDescriptor {
   // Per-op compiled copy kernel (auto-tuned for this op's copy sizes).
   // When set, executeLocalOnly uses this instead of the group-wide CompileOpKernels.
   std::unique_ptr<CompiledKernel> tunedKernel;
-  size_t tunedGridSize = 32;
-  size_t tunedBlockSize = 256;
+  CopyKernelConfig tunedConfig;
 };
 
 struct QueueEntryCustom : QueueEntry {
