@@ -1646,6 +1646,15 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     if (kernelVersion == 9) {
       const char* target = computeTarget(computeMajor, computeMinor);
       std::string ptx = generateCopyKernelPtx(ctx.group, result.config, target);
+      if (std::getenv("MOODIST_DUMP_KERNELS")) {
+        std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
+        FILE* f = fopen(fn.c_str(), "wb");
+        if (f) {
+          fwrite(ptx.data(), ptx.size(), 1, f);
+          fclose(f);
+          log.info("compile_op PTX dumped to %s\n", fn);
+        }
+      }
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
     } else {
       std::string finalSource =
