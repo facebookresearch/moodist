@@ -82,12 +82,12 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
     // Descriptor loop (staggered for peer diversity)
     // =================================================================
     auto dd = Val(ValType::U32);
-    dd = (int64_t)0;
+    dd = 0;
     WHILE(dd < numDescriptors) {
       auto d = (blockIdx + dd) % numDescriptors;
 
       // Load descriptor fields: offset 16 + d * 24
-      auto descAddr = params + (int64_t)16 + widen(d) * (int64_t)24;
+      auto descAddr = params + 16 + widen(d) * 24;
       auto src = loadParamField(descAddr, 0, ValType::U64);
       auto dst = loadParamField(descAddr, 8, ValType::U64);
       auto bytes = loadParamField(descAddr, 16, ValType::U32);
@@ -95,30 +95,30 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       // ---------------------------------------------------------------
       // Phase 1: Head alignment
       // ---------------------------------------------------------------
-      auto srcMod = narrow(src) & (int32_t)15;
-      auto dstMod = narrow(dst) & (int32_t)15;
-      IF((srcMod == dstMod) & (srcMod != (int32_t)0) & (bytes >= (int32_t)16)) {
+      auto srcMod = narrow(src) & 15;
+      auto dstMod = narrow(dst) & 15;
+      IF((srcMod == dstMod) & (srcMod != 0) & (bytes >= 16)) {
         auto headBytes = Val(ValType::U32);
-        headBytes = (int64_t)16;
+        headBytes = 16;
         headBytes -= srcMod;
 
         // Clamp to remaining bytes
         IF(headBytes > bytes) {
-          mov_u32(headBytes, bytes);
+          headBytes = bytes;
         }
 
         // Byte copy loop: tid stride blockSize
         auto i = Val(ValType::U32);
-        mov_u32(i, tid);
+        i = tid;
         auto srcP = src + widen(tid);
         auto dstP = dst + widen(tid);
         WHILE(i < headBytes) {
           Val v(ValType::U32);
           ld_u8(v, srcP);
           st_u8(dstP, v);
-          srcP += (int64_t)BS;
-          dstP += (int64_t)BS;
-          i += (int32_t)BS;
+          srcP += BS;
+          dstP += BS;
+          i += BS;
         }
         barrier_sync();
 
@@ -130,22 +130,22 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       }
 
       // Check alignment after head adjustment
-      auto aligned = ((narrow(src) | narrow(dst)) & (int32_t)15) == (int32_t)0;
+      auto aligned = ((narrow(src) | narrow(dst)) & 15) == 0;
 
       // ---------------------------------------------------------------
       // Phase 2: Pipelined bulk copy (depth-unrolled)
       // ---------------------------------------------------------------
-      IF(aligned & (bytes >= (int32_t)loopBytes)) {
-        auto count = bytes / (int32_t)loopBytes;
-        auto tid16w = widen(tid * (int32_t)16);
+      IF(aligned & (bytes >= loopBytes)) {
+        auto count = bytes / loopBytes;
+        auto tid16w = widen(tid * 16);
         int64_t stride = (int64_t)GS * loopBytes;
 
         auto i = Val(ValType::U32);
-        mov_u32(i, blockIdx);
+        i = blockIdx;
 
         // Running pointers: avoid recomputing addresses each iteration
-        auto srcPtr = src + widen(blockIdx) * (int32_t)loopBytes + tid16w;
-        auto dstPtr = dst + widen(blockIdx) * (int32_t)loopBytes + tid16w;
+        auto srcPtr = src + widen(blockIdx) * loopBytes + tid16w;
+        auto dstPtr = dst + widen(blockIdx) * loopBytes + tid16w;
 
         // Pipeline registers: depth x 4 u32 values
         std::array<std::array<Val, 4>, 56> v; // max depth 56
@@ -157,44 +157,44 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
 
         // Prime: load depth values
         for (int k = 0; k < depth; k++) {
-          IF(i + (int32_t)(k * GS) < count) {
-            ld_global_cv_v4_u32(v[k][0], v[k][1], v[k][2], v[k][3], srcPtr);
+          IF(i + k * GS < count) {
+            ldcv_v4(v[k], srcPtr);
           }
           srcPtr += stride;
         }
 
         // Main loop: store-load overlap
-        WHILE(i + (int32_t)((2 * depth - 1) * GS) < count) {
+        WHILE(i + (2 * depth - 1) * GS < count) {
           for (int j = 0; j < depth; j++) {
-            st_global_wt_v4_u32(dstPtr, v[j][0], v[j][1], v[j][2], v[j][3]);
+            stwt_v4(dstPtr, v[j]);
             dstPtr += stride;
-            ld_global_cv_v4_u32(v[j][0], v[j][1], v[j][2], v[j][3], srcPtr);
+            ldcv_v4(v[j], srcPtr);
             srcPtr += stride;
           }
-          i += (int32_t)(depth * GS);
+          i += depth * GS;
         }
 
         // Drain: store remaining
         for (int k = 0; k < depth; k++) {
-          IF(i + (int32_t)(k * GS) < count) {
-            st_global_wt_v4_u32(dstPtr, v[k][0], v[k][1], v[k][2], v[k][3]);
+          IF(i + k * GS < count) {
+            stwt_v4(dstPtr, v[k]);
           }
           dstPtr += stride;
         }
-        i += (int32_t)(depth * GS);
+        i += depth * GS;
 
         // Tail: simple loop for remaining full blocks
         WHILE(i < count) {
-          Val t0, t1, t2, t3;
-          ldcv_v4(t0, t1, t2, t3, srcPtr);
-          stwt_v4(dstPtr, t0, t1, t2, t3);
+          std::array<Val, 4> t;
+          ldcv_v4(t, srcPtr);
+          stwt_v4(dstPtr, t);
           srcPtr += stride;
           dstPtr += stride;
-          i += (int32_t)GS;
+          i += GS;
         }
 
         // Update pointers
-        auto done = count * (int32_t)loopBytes;
+        auto done = count * loopBytes;
         auto doneWide = widen(done);
         src += doneWide;
         dst += doneWide;
@@ -205,21 +205,21 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       // Phase 3: Remaining aligned uint4 elements
       // ---------------------------------------------------------------
       IF(aligned) {
-        auto remaining16 = bytes / (int32_t)16;
+        auto remaining16 = bytes / 16;
         auto i = Val(ValType::U32);
-        mov_u32(i, tid);
-        auto srcPtr = src + widen(tid) * (int32_t)16;
-        auto dstPtr = dst + widen(tid) * (int32_t)16;
+        i = tid;
+        auto srcPtr = src + widen(tid) * 16;
+        auto dstPtr = dst + widen(tid) * 16;
         int64_t stride16 = (int64_t)BS * 16;
         WHILE(i < remaining16) {
-          Val t0, t1, t2, t3;
-          ldcv_v4(t0, t1, t2, t3, srcPtr);
-          stwt_v4(dstPtr, t0, t1, t2, t3);
+          std::array<Val, 4> t;
+          ldcv_v4(t, srcPtr);
+          stwt_v4(dstPtr, t);
           srcPtr += stride16;
           dstPtr += stride16;
-          i += (int32_t)BS;
+          i += BS;
         }
-        auto done16 = remaining16 * (int32_t)16;
+        auto done16 = remaining16 * 16;
         auto done16w = widen(done16);
         src += done16w;
         dst += done16w;
@@ -231,20 +231,20 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
       // ---------------------------------------------------------------
       {
         auto i = Val(ValType::U32);
-        mov_u32(i, tid);
+        i = tid;
         auto srcPtr = src + widen(tid);
         auto dstPtr = dst + widen(tid);
         WHILE(i < bytes) {
           Val v(ValType::U32);
           ld_u8(v, srcPtr);
           st_u8(dstPtr, v);
-          srcPtr += (int64_t)BS;
-          dstPtr += (int64_t)BS;
-          i += (int32_t)BS;
+          srcPtr += BS;
+          dstPtr += BS;
+          i += BS;
         }
       }
 
-      dd += (int32_t)1;
+      dd += 1;
     }
 
     // =================================================================
@@ -255,7 +255,7 @@ std::string generateCopyKernelPtx(Group* group, size_t gridSize, size_t blockSiz
     IF(tid == 0) {
       auto counterAddr = globalAddr("exitCounter") + widen(concurrencyIndex) * 4;
       auto old = atomicInc(counterAddr, (uint32_t)(GS - 1));
-      IF(old == (int32_t)(GS - 1)) {
+      IF(old == (GS - 1)) {
         // Last block: write copyDone to peers
         for (size_t i : peerIndices) {
           auto& arr = group->peerCudaCopyDone[i];
