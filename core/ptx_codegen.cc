@@ -53,11 +53,169 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     }
   };
 
-  size_t rank = group->rank;
-  const auto& peerIndices = group->peerIndices;
   int BS = (int)config.blockSize;
   int GS = (int)config.gridSize;
   int loopBytes = BS * 16;
+
+  // Copy engine: emits Phases 1-4 (head alignment, pipelined bulk, remainder, tail).
+  // src/dst/bytes are mutable PTX Vals (updated as copy progresses).
+  auto emitRegisterCopy = [&](Val& src, Val& dst, Val& bytes, const Val& tid, const Val& blockIdx) {
+    // ---------------------------------------------------------------
+    // Phase 1: Head alignment
+    // ---------------------------------------------------------------
+    auto srcMod = narrow(src) & 15;
+    auto dstMod = narrow(dst) & 15;
+    IF((srcMod == dstMod) & (srcMod != 0) & (bytes >= 16)) {
+      auto headBytes = Val(ValType::U32);
+      headBytes = 16;
+      headBytes -= srcMod;
+
+      // Clamp to remaining bytes
+      IF(headBytes > bytes) {
+        headBytes = bytes;
+      }
+
+      // Byte copy loop: tid stride blockSize
+      auto i = Val(ValType::U32);
+      i = tid;
+      auto srcP = src + widen(tid);
+      auto dstP = dst + widen(tid);
+      WHILE(i < headBytes) {
+        Val v(ValType::U32);
+        ld_u8(v, srcP);
+        st_u8(dstP, v);
+        srcP += BS;
+        dstP += BS;
+        i += BS;
+      }
+      barrier_sync();
+
+      // Update pointers and remaining byte count
+      auto headWide = widen(headBytes);
+      src += headWide;
+      dst += headWide;
+      bytes -= headBytes;
+    }
+
+    // Check alignment after head adjustment
+    auto aligned = ((narrow(src) | narrow(dst)) & 15) == 0;
+
+    // ---------------------------------------------------------------
+    // Phase 2: Pipelined bulk copy (depth-unrolled)
+    // ---------------------------------------------------------------
+    IF(aligned & (bytes >= loopBytes)) {
+      auto count = bytes / loopBytes;
+      auto tid16w = widen(tid * 16);
+      int64_t stride = (int64_t)GS * loopBytes;
+
+      auto i = Val(ValType::U32);
+      i = blockIdx;
+
+      // Running pointers: avoid recomputing addresses each iteration
+      auto srcPtr = src + widen(blockIdx) * loopBytes + tid16w;
+      auto dstPtr = dst + widen(blockIdx) * loopBytes + tid16w;
+
+      // Pipeline registers: depth x 4 u32 values
+      std::array<std::array<Val, 4>, 56> v; // max depth 56
+      for (int k = 0; k < depth; k++) {
+        for (int c = 0; c < 4; c++) {
+          v[k][c] = Val(ValType::U32);
+        }
+      }
+
+      // Prime: load depth values
+      for (int k = 0; k < depth; k++) {
+        IF(i + k * GS < count) {
+          ld_v4(v[k], srcPtr);
+        }
+        srcPtr += stride;
+      }
+
+      // Main loop: store-load overlap
+      WHILE(i + (2 * depth - 1) * GS < count) {
+        // warp_sync();
+        for (int j = 0; j < depth; j++) {
+          stwt_v4(dstPtr, v[j]);
+          dstPtr += stride;
+          ld_v4(v[j], srcPtr);
+          srcPtr += stride;
+        }
+        i += depth * GS;
+      }
+
+      // Drain: store remaining
+      for (int k = 0; k < depth; k++) {
+        IF(i + k * GS < count) {
+          stwt_v4(dstPtr, v[k]);
+        }
+        dstPtr += stride;
+      }
+      i += depth * GS;
+
+      // Tail: simple loop for remaining full blocks
+      WHILE(i < count) {
+        std::array<Val, 4> t;
+        ld_v4(t, srcPtr);
+        stwt_v4(dstPtr, t);
+        srcPtr += stride;
+        dstPtr += stride;
+        i += GS;
+      }
+
+      // Update pointers
+      auto done = count * loopBytes;
+      auto doneWide = widen(done);
+      src += doneWide;
+      dst += doneWide;
+      bytes -= done;
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 3: Remaining aligned uint4 elements
+    // ---------------------------------------------------------------
+    IF(aligned) {
+      auto remaining16 = bytes / 16;
+      auto i = Val(ValType::U32);
+      i = tid;
+      auto srcPtr = src + widen(tid) * 16;
+      auto dstPtr = dst + widen(tid) * 16;
+      int64_t stride16 = (int64_t)BS * 16;
+      WHILE(i < remaining16) {
+        std::array<Val, 4> t;
+        ld_v4(t, srcPtr);
+        stwt_v4(dstPtr, t);
+        srcPtr += stride16;
+        dstPtr += stride16;
+        i += BS;
+      }
+      auto done16 = remaining16 * 16;
+      auto done16w = widen(done16);
+      src += done16w;
+      dst += done16w;
+      bytes -= done16;
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4: Tail bytes
+    // ---------------------------------------------------------------
+    {
+      auto i = Val(ValType::U32);
+      i = tid;
+      auto srcPtr = src + widen(tid);
+      auto dstPtr = dst + widen(tid);
+      WHILE(i < bytes) {
+        Val v(ValType::U32);
+        ld_u8(v, srcPtr);
+        st_u8(dstPtr, v);
+        srcPtr += BS;
+        dstPtr += BS;
+        i += BS;
+      }
+    }
+  };
+
+  size_t rank = group->rank;
+  const auto& peerIndices = group->peerIndices;
 
   Module mod;
   mod.target = target;
@@ -115,158 +273,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       auto dst = loadParamField(descAddr, 8, ValType::U64);
       auto bytes = loadParamField(descAddr, 16, ValType::U32);
 
-      // ---------------------------------------------------------------
-      // Phase 1: Head alignment
-      // ---------------------------------------------------------------
-      auto srcMod = narrow(src) & 15;
-      auto dstMod = narrow(dst) & 15;
-      IF((srcMod == dstMod) & (srcMod != 0) & (bytes >= 16)) {
-        auto headBytes = Val(ValType::U32);
-        headBytes = 16;
-        headBytes -= srcMod;
-
-        // Clamp to remaining bytes
-        IF(headBytes > bytes) {
-          headBytes = bytes;
-        }
-
-        // Byte copy loop: tid stride blockSize
-        auto i = Val(ValType::U32);
-        i = tid;
-        auto srcP = src + widen(tid);
-        auto dstP = dst + widen(tid);
-        WHILE(i < headBytes) {
-          Val v(ValType::U32);
-          ld_u8(v, srcP);
-          st_u8(dstP, v);
-          srcP += BS;
-          dstP += BS;
-          i += BS;
-        }
-        barrier_sync();
-
-        // Update pointers and remaining byte count
-        auto headWide = widen(headBytes);
-        src += headWide;
-        dst += headWide;
-        bytes -= headBytes;
-      }
-
-      // Check alignment after head adjustment
-      auto aligned = ((narrow(src) | narrow(dst)) & 15) == 0;
-
-      // ---------------------------------------------------------------
-      // Phase 2: Pipelined bulk copy (depth-unrolled)
-      // ---------------------------------------------------------------
-      IF(aligned & (bytes >= loopBytes)) {
-        auto count = bytes / loopBytes;
-        auto tid16w = widen(tid * 16);
-        int64_t stride = (int64_t)GS * loopBytes;
-
-        auto i = Val(ValType::U32);
-        i = blockIdx;
-
-        // Running pointers: avoid recomputing addresses each iteration
-        auto srcPtr = src + widen(blockIdx) * loopBytes + tid16w;
-        auto dstPtr = dst + widen(blockIdx) * loopBytes + tid16w;
-
-        // Pipeline registers: depth x 4 u32 values
-        std::array<std::array<Val, 4>, 56> v; // max depth 56
-        for (int k = 0; k < depth; k++) {
-          for (int c = 0; c < 4; c++) {
-            v[k][c] = Val(ValType::U32);
-          }
-        }
-
-        // Prime: load depth values
-        for (int k = 0; k < depth; k++) {
-          IF(i + k * GS < count) {
-            ld_v4(v[k], srcPtr);
-          }
-          srcPtr += stride;
-        }
-
-        // Main loop: store-load overlap
-        WHILE(i + (2 * depth - 1) * GS < count) {
-          //warp_sync();
-          for (int j = 0; j < depth; j++) {
-            stwt_v4(dstPtr, v[j]);
-            dstPtr += stride;
-            ld_v4(v[j], srcPtr);
-            srcPtr += stride;
-          }
-          i += depth * GS;
-        }
-
-        // Drain: store remaining
-        for (int k = 0; k < depth; k++) {
-          IF(i + k * GS < count) {
-            stwt_v4(dstPtr, v[k]);
-          }
-          dstPtr += stride;
-        }
-        i += depth * GS;
-
-        // Tail: simple loop for remaining full blocks
-        WHILE(i < count) {
-          std::array<Val, 4> t;
-          ld_v4(t, srcPtr);
-          stwt_v4(dstPtr, t);
-          srcPtr += stride;
-          dstPtr += stride;
-          i += GS;
-        }
-
-        // Update pointers
-        auto done = count * loopBytes;
-        auto doneWide = widen(done);
-        src += doneWide;
-        dst += doneWide;
-        bytes -= done;
-      }
-
-      // ---------------------------------------------------------------
-      // Phase 3: Remaining aligned uint4 elements
-      // ---------------------------------------------------------------
-      IF(aligned) {
-        auto remaining16 = bytes / 16;
-        auto i = Val(ValType::U32);
-        i = tid;
-        auto srcPtr = src + widen(tid) * 16;
-        auto dstPtr = dst + widen(tid) * 16;
-        int64_t stride16 = (int64_t)BS * 16;
-        WHILE(i < remaining16) {
-          std::array<Val, 4> t;
-          ld_v4(t, srcPtr);
-          stwt_v4(dstPtr, t);
-          srcPtr += stride16;
-          dstPtr += stride16;
-          i += BS;
-        }
-        auto done16 = remaining16 * 16;
-        auto done16w = widen(done16);
-        src += done16w;
-        dst += done16w;
-        bytes -= done16;
-      }
-
-      // ---------------------------------------------------------------
-      // Phase 4: Tail bytes
-      // ---------------------------------------------------------------
-      {
-        auto i = Val(ValType::U32);
-        i = tid;
-        auto srcPtr = src + widen(tid);
-        auto dstPtr = dst + widen(tid);
-        WHILE(i < bytes) {
-          Val v(ValType::U32);
-          ld_u8(v, srcPtr);
-          st_u8(dstPtr, v);
-          srcPtr += BS;
-          dstPtr += BS;
-          i += BS;
-        }
-      }
+      emitRegisterCopy(src, dst, bytes, tid, blockIdx);
 
       dd += 1;
     }
