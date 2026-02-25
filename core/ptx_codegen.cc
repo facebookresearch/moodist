@@ -10,6 +10,21 @@
 
 namespace moodist {
 
+const char* computeTarget(int computeMajor, int computeMinor) {
+  if (computeMajor >= 10) {
+    return "sm_100a";
+  } else if (computeMajor == 9) {
+    return "sm_90a";
+  } else if (computeMajor == 8 && computeMinor >= 9) {
+    return "sm_89";
+  } else if (computeMajor == 8) {
+    return "sm_80";
+  } else if (computeMajor == 7) {
+    return "sm_70";
+  }
+  return "sm_60";
+}
+
 // Helper: compute volatile address for barrier synchronization.
 // Returns base + itembytes * concurrencyIndex + offset, all baked as hex constants.
 static ptx::Val barrierAddr(uintptr_t base, uintptr_t itembytes, size_t offset, const ptx::Val& concurrencyIndex) {

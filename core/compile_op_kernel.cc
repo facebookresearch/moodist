@@ -1303,18 +1303,7 @@ compile_op_copy(CompileOpCopyParameters params) {
       }
     }
 
-    const char* target = "sm_60";
-    if (computeMajor >= 10) {
-      target = "sm_100a";
-    } else if (computeMajor == 9) {
-      target = "sm_90a";
-    } else if (computeMajor == 8 && computeMinor >= 9) {
-      target = "sm_89";
-    } else if (computeMajor == 8) {
-      target = "sm_80";
-    } else if (computeMajor == 7) {
-      target = "sm_70";
-    }
+    const char* target = computeTarget(computeMajor, computeMinor);
 
     log.info("compile_op v9 (ptx): depth=%d, gridSize=%zu, blockSize=%zu, target=%s\n", v9depth, gridSize, blockSize,
         target);
@@ -1813,18 +1802,7 @@ CompiledModule CompiledModule::compile(const std::string& source, CUdevice devic
       int cm = 0, cn = 0;
       CHECK_CU(cuDeviceGetAttribute(&cm, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
       CHECK_CU(cuDeviceGetAttribute(&cn, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
-      const char* target = "sm_60";
-      if (cm >= 10) {
-        target = "sm_100a";
-      } else if (cm == 9) {
-        target = "sm_90a";
-      } else if (cm == 8 && cn >= 9) {
-        target = "sm_89";
-      } else if (cm == 8) {
-        target = "sm_80";
-      } else if (cm == 7) {
-        target = "sm_70";
-      }
+      const char* target = computeTarget(cm, cn);
 
       std::string ptx = ptx::ptxTest(target);
       CUmodule testModule = nullptr;
@@ -1954,6 +1932,45 @@ CompiledKernel compileKernel(
   int maxThreads = 0;
   CHECK_CU(cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, result.function));
   log.info("compiled '%s': %d regs, max %d threads/block\n", functionName, numRegs, maxThreads);
+
+  return result;
+}
+
+CompiledKernel compileKernelPtx(const std::string& ptx, const char* functionName) {
+  char jitErrorLog[4096] = {};
+  char jitInfoLog[4096] = {};
+  CUjit_option jitOptions[] = {
+      CU_JIT_ERROR_LOG_BUFFER,
+      CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+      CU_JIT_INFO_LOG_BUFFER,
+      CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+  };
+  void* jitValues[] = {
+      jitErrorLog,
+      (void*)(uintptr_t)sizeof(jitErrorLog),
+      jitInfoLog,
+      (void*)(uintptr_t)sizeof(jitInfoLog),
+  };
+
+  CompiledKernel result;
+  CUresult jitErr = cuModuleLoadDataEx(&result.module.module, ptx.c_str(), 4, jitOptions, jitValues);
+  if (jitErr != CUDA_SUCCESS) {
+    log.error("PTX JIT compilation failed (error %d)\n", (int)jitErr);
+    if (jitErrorLog[0]) {
+      log.error("ptxas error log:\n%s\n", jitErrorLog);
+    }
+    if (jitInfoLog[0]) {
+      log.error("ptxas info log:\n%s\n", jitInfoLog);
+    }
+    CHECK_CU(jitErr);
+  }
+  CHECK_CU(cuModuleGetFunction(&result.function, result.module.module, functionName));
+
+  int numRegs = 0;
+  CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, result.function));
+  int maxThreads = 0;
+  CHECK_CU(cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, result.function));
+  log.info("compiled PTX '%s': %d regs, max %d threads/block\n", functionName, numRegs, maxThreads);
 
   return result;
 }
