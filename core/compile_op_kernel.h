@@ -28,6 +28,14 @@ struct CompileOpCopyParameters {
   CopyDescriptor descriptors[kMaxCopyDescriptors];
 };
 
+// Configuration for the PTX copy kernel generator and auto-tuner.
+struct CopyKernelConfig {
+  int depth = 4;
+  size_t blockSize = 256;
+  size_t gridSize = 8;
+  const char* loadOp = "cv"; // "cv" (cache volatile), "cs" (cache streaming), "nc" (non-coherent)
+};
+
 struct CompileOpKernels {
   Group* group;
   CUmodule cuModule = nullptr;

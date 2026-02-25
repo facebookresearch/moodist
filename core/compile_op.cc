@@ -177,13 +177,8 @@ size_t representativeSize(SizeCategory cat) {
   return 8 * 1024 * 1024;
 }
 
-struct TuningConfig {
-  int depth;
-  size_t blockSize;
-};
-
 struct TuningResult {
-  TuningConfig config;
+  CopyKernelConfig config;
   float ms = INFINITY; // elapsed time in milliseconds (lower is better)
 };
 
@@ -296,8 +291,7 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
   uint32_t stepValue = 1;
 
   TuningResult best;
-  best.config = {4, 256}; // default fallback
-  best.ms = INFINITY;
+  best.config.gridSize = gridSize;
 
   auto tuneStart = std::chrono::steady_clock::now();
 
@@ -355,7 +349,8 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
 
         if (bestMs < best.ms) {
           best.ms = bestMs;
-          best.config = {depth, bs};
+          best.config.depth = depth;
+          best.config.blockSize = bs;
         }
       }
     }
@@ -381,8 +376,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
   static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
   static constexpr size_t gridSize = 8;
-  static constexpr int warmupIters = 50;
-  static constexpr int measuredIters = 100;
+  static constexpr int warmupIters = 2;
+  static constexpr int measuredIters = 6;
 
   size_t copyBytes = representativeSize(sizeCat);
   size_t rank = ctx.group->rank;
@@ -449,60 +444,64 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   uint32_t stepValue = 1;
 
   TuningResult best;
-  best.config = {4, 256};
-  best.ms = INFINITY;
+  best.config.gridSize = gridSize;
 
   auto tuneStart = std::chrono::steady_clock::now();
 
-  // For each (depth, blockSize): generate PTX, JIT-load, benchmark, unload.
+  // For each (depth, blockSize, loadOp): generate PTX, JIT-load, benchmark, unload.
   // PTX generation is microseconds and cuModuleLoadDataEx JIT is faster than NVRTC.
-  for (int depth : depths) {
-    for (size_t bs : blockSizes) {
-      std::string ptx = generateCopyKernelPtx(ctx.group, gridSize, bs, depth, target);
+  static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
+  for (const char* loadOp : loadOps) {
+    for (int depth : depths) {
+      for (size_t bs : blockSizes) {
+        CopyKernelConfig cfg{depth, bs, gridSize, loadOp};
+        std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
 
-      CUmodule variantModule = nullptr;
-      CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
-      if (jitErr != CUDA_SUCCESS) {
+        CUmodule variantModule = nullptr;
+        CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
+        if (jitErr != CUDA_SUCCESS) {
+          if (verbose) {
+            log.info("  depth=%d blockSize=%zu loadOp=%s -> JIT failed (error %d), skipping\n", depth, bs, loadOp,
+                (int)jitErr);
+          }
+          continue;
+        }
+
+        CUfunction fn = nullptr;
+        CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
+
+        // Warmup
+        for (int i = 0; i < warmupIters; i++) {
+          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+        }
+        CHECK_CU(cuStreamSynchronize(stream));
+
+        // Measured runs: track best (minimum) elapsed time
+        float bestMs = INFINITY;
+        for (int iter = 0; iter < measuredIters; iter++) {
+          CHECK_CU(cuEventRecord(startEvent, stream));
+          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+          CHECK_CU(cuEventRecord(stopEvent, stream));
+          CHECK_CU(cuEventSynchronize(stopEvent));
+
+          float ms = 0.0f;
+          CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+          if (ms < bestMs) {
+            bestMs = ms;
+          }
+        }
+
         if (verbose) {
-          log.info("  depth=%d blockSize=%zu -> JIT failed (error %d), skipping\n", depth, bs, (int)jitErr);
+          log.info("  depth=%d blockSize=%zu loadOp=%s -> %.3f ms\n", depth, bs, loadOp, bestMs);
         }
-        continue;
-      }
 
-      CUfunction fn = nullptr;
-      CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
-
-      // Warmup
-      for (int i = 0; i < warmupIters; i++) {
-        launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-      }
-      CHECK_CU(cuStreamSynchronize(stream));
-
-      // Measured runs: track best (minimum) elapsed time
-      float bestMs = INFINITY;
-      for (int iter = 0; iter < measuredIters; iter++) {
-        CHECK_CU(cuEventRecord(startEvent, stream));
-        launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-        CHECK_CU(cuEventRecord(stopEvent, stream));
-        CHECK_CU(cuEventSynchronize(stopEvent));
-
-        float ms = 0.0f;
-        CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
-        if (ms < bestMs) {
-          bestMs = ms;
+        if (bestMs < best.ms) {
+          best.ms = bestMs;
+          best.config = cfg;
         }
-      }
 
-      if (verbose) {
-        log.info("  depth=%d blockSize=%zu -> %.3f ms\n", depth, bs, bestMs);
+        cuModuleUnload(variantModule);
       }
-
-      if (bestMs < best.ms) {
-        best.ms = bestMs;
-        best.config = {depth, bs};
-      }
-
-      cuModuleUnload(variantModule);
     }
   }
 
@@ -514,8 +513,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   cuMemFree(syntheticSrc);
 
   double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("v9 tuning complete: best depth=%d blockSize=%zu (%.3f ms) in %.1fs\n", best.config.depth,
-      best.config.blockSize, best.ms, elapsed);
+  log.info("v9 tuning complete: best depth=%d blockSize=%zu loadOp=%s (%.3f ms) in %.1fs\n", best.config.depth,
+      best.config.blockSize, best.config.loadOp, best.ms, elapsed);
 
   return best;
 }
@@ -1641,31 +1640,20 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     }
 
     // Generate and compile the final kernel with the tuned config
-    size_t tunedGridSize = 8;
+    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu loadOp=%s (%.3f ms)\n", op->id,
+        result.config.depth, result.config.blockSize, result.config.loadOp, result.ms);
 
-    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu (%.3f ms)\n", op->id, result.config.depth,
-        result.config.blockSize, result.ms);
-
-    try {
-      if (kernelVersion == 9) {
-        const char* target = computeTarget(computeMajor, computeMinor);
-        std::string ptx =
-            generateCopyKernelPtx(ctx.group, tunedGridSize, result.config.blockSize, result.config.depth, target);
-        auto ck = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-        op->tunedKernel = std::move(ck);
-      } else {
-        std::string finalSource =
-            generateCopyKernel(ctx.group, tunedGridSize, result.config.blockSize, result.config.depth);
-        auto ck = std::make_unique<CompiledKernel>(compileKernel(finalSource, "compile_op_copy", cuDevice,
-            fmt::sprintf("moodist-tuned-rank%zu-op%u", rank, op->id).c_str()));
-        op->tunedKernel = std::move(ck);
-      }
-      op->tunedGridSize = tunedGridSize;
-      op->tunedBlockSize = result.config.blockSize;
-    } catch (const std::exception& e) {
-      log.error(
-          "compile_op[%u]: failed to compile tuned kernel: %s (falling back to group kernel)\n", op->id, e.what());
+    if (kernelVersion == 9) {
+      const char* target = computeTarget(computeMajor, computeMinor);
+      std::string ptx = generateCopyKernelPtx(ctx.group, result.config, target);
+      op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+    } else {
+      std::string finalSource =
+          generateCopyKernel(ctx.group, result.config.gridSize, result.config.blockSize, result.config.depth);
+      op->tunedKernel = std::make_unique<CompiledKernel>(compileKernel(
+          finalSource, "compile_op_copy", cuDevice, fmt::sprintf("moodist-tuned-rank%zu-op%u", rank, op->id).c_str()));
     }
+    op->tunedConfig = result.config;
   }
 
   return op;

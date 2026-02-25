@@ -338,12 +338,21 @@ Val narrow(const Val& v); // U64→U32, S64→S32
 void storeGlobal(const Val& addr, const Val& val);
 Val loadGlobalVolatile(const Val& addr, ValType type);
 void storeGlobalVolatile(const Val& addr, const Val& val);
+Val loadGlobalAcquireSys(const Val& addr, ValType type);
+void storeGlobalRelaxedSys(const Val& addr, const Val& val);
+void storeGlobalReleaseSys(const Val& addr, const Val& val);
 
 // Vectorized load/store (4 x u32)
 void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr);
+void ld_global_nc_v4_u32(std::array<Val, 4>& v, const Operand& addr);
+void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr);
 void st_global_wt_v4_u32(const Operand& addr, const std::array<Val, 4>& v);
 void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
 void ldcv_v4(std::array<Val, 4>& v, const Val& addr);
+void ldnc_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
+void ldnc_v4(std::array<Val, 4>& v, const Val& addr);
+void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
+void ldcs_v4(std::array<Val, 4>& v, const Val& addr);
 void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3);
 void stwt_v4(const Val& addr, const std::array<Val, 4>& v);
 

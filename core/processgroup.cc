@@ -4282,8 +4282,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
 
   // Step 4: GPU copies (with synchronization)
   if (kernelVersion > 0) {
-    // Kernel path: compile kernel if not yet done
-    if (!group->compileOpKernels->cuCopyKernel) {
+    // Kernel path: compile kernel if not yet done (not needed for v9 — uses per-op tuned kernels)
+    if (!group->compileOpKernels->cuCopyKernel && kernelVersion != 9) {
       group->compileOpKernels->compile();
     }
 
@@ -4336,14 +4336,16 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
     }
 
     // Single kernel launch replaces syncPeers + copies + syncPeers
-    if (op->tunedKernel) {
-      // Use per-op auto-tuned kernel
-      launchCopyKernel(op->tunedKernel->function, op->tunedGridSize, op->tunedBlockSize, descriptors, numDescriptors,
-          stepValue, concurrencyIndex, stream);
-    } else {
-      launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
-          group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
-          group->compileOpKernels->dynamicSmemBytes);
+    if (numDescriptors > 0) {
+      if (op->tunedKernel) {
+        // Use per-op auto-tuned kernel
+        launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize, descriptors,
+            numDescriptors, stepValue, concurrencyIndex, stream);
+      } else {
+        launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
+            group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
+            group->compileOpKernels->dynamicSmemBytes);
+      }
     }
   } else {
     // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
