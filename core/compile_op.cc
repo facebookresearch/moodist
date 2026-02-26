@@ -448,61 +448,106 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
 
   auto tuneStart = std::chrono::steady_clock::now();
 
-  // For each (depth, blockSize, loadOp): generate PTX, JIT-load, benchmark, unload.
-  // PTX generation is microseconds and cuModuleLoadDataEx JIT is faster than NVRTC.
+  // Build candidate configs
+  Vector<CopyKernelConfig> candidates;
+
+  // Register pipeline variants: loadOp × depth × blockSize
   static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
   for (const char* loadOp : loadOps) {
     for (int depth : depths) {
       for (size_t bs : blockSizes) {
-        CopyKernelConfig cfg{depth, bs, gridSize, loadOp};
-        std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
-
-        CUmodule variantModule = nullptr;
-        CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
-        if (jitErr != CUDA_SUCCESS) {
-          if (verbose) {
-            log.info("  depth=%d blockSize=%zu loadOp=%s -> JIT failed (error %d), skipping\n", depth, bs, loadOp,
-                (int)jitErr);
-          }
-          continue;
-        }
-
-        CUfunction fn = nullptr;
-        CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
-
-        // Warmup
-        for (int i = 0; i < warmupIters; i++) {
-          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-        }
-        CHECK_CU(cuStreamSynchronize(stream));
-
-        // Measured runs: track best (minimum) elapsed time
-        float bestMs = INFINITY;
-        for (int iter = 0; iter < measuredIters; iter++) {
-          CHECK_CU(cuEventRecord(startEvent, stream));
-          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-          CHECK_CU(cuEventRecord(stopEvent, stream));
-          CHECK_CU(cuEventSynchronize(stopEvent));
-
-          float ms = 0.0f;
-          CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
-          if (ms < bestMs) {
-            bestMs = ms;
-          }
-        }
-
-        if (verbose) {
-          log.info("  depth=%d blockSize=%zu loadOp=%s -> %.3f ms\n", depth, bs, loadOp, bestMs);
-        }
-
-        if (bestMs < best.ms) {
-          best.ms = bestMs;
-          best.config = cfg;
-        }
-
-        cuModuleUnload(variantModule);
+        candidates.push_back({depth, bs, gridSize, loadOp, "reg"});
       }
     }
+  }
+
+  // Bulk copy engine variants: blockSize × chunkSize × dmaMode
+  // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
+  // Restrict to power-of-2 block sizes for clean per-warp division.
+  {
+    int maxSmem = 0;
+    CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+    static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304};
+    static constexpr size_t bulkBlockSizes[] = {128, 256, 512, 1024};
+    for (size_t chunk : chunkSizes) {
+      for (size_t bs : bulkBlockSizes) {
+        size_t numWarps = bs / 32;
+        size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
+        if (totalSmem > (size_t)maxSmem) {
+          continue;
+        }
+        // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
+        if (chunk % (numWarps * 16) == 0) {
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true});
+        }
+        // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
+        if (chunk % (bs * 16) == 0) {
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false});
+        }
+      }
+    }
+  }
+
+  // Evaluate all candidates
+  for (const auto& cfg : candidates) {
+    std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
+
+    CUmodule variantModule = nullptr;
+    CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
+    if (jitErr != CUDA_SUCCESS) {
+      if (verbose) {
+        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> JIT failed (error %d), skipping\n", cfg.copyEngine,
+            cfg.depth, cfg.blockSize, cfg.loadOp, (int)jitErr);
+      }
+      continue;
+    }
+
+    CUfunction fn = nullptr;
+    CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
+
+    // Opt in to larger shared memory if needed (double-buffered bulk engine)
+    size_t totalSmem = !strcmp(cfg.copyEngine, "bulk") ? 2 * cfg.bulkChunkSize + 2 * (cfg.blockSize / 32) * 8 : 0;
+    if (totalSmem > 48 * 1024) {
+      cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem);
+    }
+
+    // Warmup
+    for (int i = 0; i < warmupIters; i++) {
+      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
+    }
+    CHECK_CU(cuStreamSynchronize(stream));
+
+    // Measured runs: track best (minimum) elapsed time
+    float bestMs = INFINITY;
+    for (int iter = 0; iter < measuredIters; iter++) {
+      CHECK_CU(cuEventRecord(startEvent, stream));
+      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
+      CHECK_CU(cuEventRecord(stopEvent, stream));
+      CHECK_CU(cuEventSynchronize(stopEvent));
+
+      float ms = 0.0f;
+      CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+      if (ms < bestMs) {
+        bestMs = ms;
+      }
+    }
+
+    if (verbose) {
+      if (!strcmp(cfg.copyEngine, "bulk")) {
+        log.info("  %s blockSize=%zu chunk=%zuK dma=%s -> %.3f ms\n", cfg.copyEngine, cfg.blockSize,
+            cfg.bulkChunkSize / 1024, cfg.bulkWarpLeaderDma ? "warp" : "thread", bestMs);
+      } else {
+        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> %.3f ms\n", cfg.copyEngine, cfg.depth, cfg.blockSize,
+            cfg.loadOp, bestMs);
+      }
+    }
+
+    if (bestMs < best.ms) {
+      best.ms = bestMs;
+      best.config = cfg;
+    }
+
+    cuModuleUnload(variantModule);
   }
 
   // Cleanup
@@ -513,8 +558,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   cuMemFree(syntheticSrc);
 
   double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("v9 tuning complete: best depth=%d blockSize=%zu loadOp=%s (%.3f ms) in %.1fs\n", best.config.depth,
-      best.config.blockSize, best.config.loadOp, best.ms, elapsed);
+  log.info("v9 tuning complete: best %s depth=%d blockSize=%zu loadOp=%s (%.3f ms) in %.1fs\n", best.config.copyEngine,
+      best.config.depth, best.config.blockSize, best.config.loadOp, best.ms, elapsed);
 
   return best;
 }
@@ -1639,9 +1684,14 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       }
     }
 
+    // Override copy engine from env var (for testing)
+    if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
+      result.config.copyEngine = env;
+    }
+
     // Generate and compile the final kernel with the tuned config
-    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu loadOp=%s (%.3f ms)\n", op->id,
-        result.config.depth, result.config.blockSize, result.config.loadOp, result.ms);
+    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu loadOp=%s copyEngine=%s (%.3f ms)\n", op->id,
+        result.config.depth, result.config.blockSize, result.config.loadOp, result.config.copyEngine, result.ms);
 
     if (kernelVersion == 9) {
       const char* target = computeTarget(computeMajor, computeMinor);
@@ -1656,6 +1706,16 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         }
       }
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+      // Opt in to larger shared memory if needed (double-buffered bulk engine)
+      {
+        size_t totalSmem = !strcmp(result.config.copyEngine, "bulk")
+                               ? 2 * result.config.bulkChunkSize + 2 * (result.config.blockSize / 32) * 8
+                               : 0;
+        if (totalSmem > 48 * 1024) {
+          cuFuncSetAttribute(
+              op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem);
+        }
+      }
     } else {
       std::string finalSource =
           generateCopyKernel(ctx.group, result.config.gridSize, result.config.blockSize, result.config.depth);

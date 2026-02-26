@@ -33,7 +33,10 @@ struct CopyKernelConfig {
   int depth = 4;
   size_t blockSize = 256;
   size_t gridSize = 8;
-  const char* loadOp = "cv"; // "cv" (cache volatile), "cs" (cache streaming), "nc" (non-coherent)
+  const char* loadOp = "cv";      // "cv" (cache volatile), "cs" (cache streaming), "nc" (non-coherent)
+  const char* copyEngine = "reg"; // "reg" (register pipeline), "bulk" (cp.async.bulk)
+  size_t bulkChunkSize = 16384;   // staging buffer size for bulk engine (bytes)
+  bool bulkWarpLeaderDma = true;  // true: 1 DMA per warp, false: 1 DMA per thread
 };
 
 struct CompileOpKernels {

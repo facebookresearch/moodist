@@ -96,6 +96,14 @@ std::string Function::param(int index) const {
   return name + "_param_" + std::to_string(index);
 }
 
+std::string Function::addShared(int align, int sizeBytes, const char* suffix) {
+  int index = (int)sharedDecls.size();
+  std::string sym = name + "_shared_" + (suffix ? suffix : std::to_string(index));
+  sharedDecls.push_back(
+      ".shared .align " + std::to_string(align) + " .b8 " + sym + "[" + std::to_string(sizeBytes) + "]");
+  return sym;
+}
+
 Block* Function::newBlock(const char* label) {
   auto b = std::make_unique<Block>();
   b->label = label;
@@ -135,6 +143,11 @@ std::string Function::finalize() const {
       s += regPrefix(type);
       s += "<" + std::to_string(count) + ">;\n";
     }
+  }
+
+  // Shared memory declarations
+  for (const auto& decl : sharedDecls) {
+    s += "    " + decl + ";\n";
   }
 
   s += "\n";
@@ -406,6 +419,12 @@ void ld_global_cs_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg&
 void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
   ld_global_cs_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
+void ld_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
+  emitInst("ld.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+}
+void ld_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+  ld_v4_u32(v[0], v[1], v[2], v[3], addr);
+}
 void ld_u8(const Reg& d, const Operand& addr) {
   emitInst("ld.u8 " + d.name + ", [" + addr.str + "]");
 }
@@ -477,6 +496,54 @@ void warp_sync(uint32_t membermask) {
   emitInst(std::string("bar.warp.sync ") + buf);
 }
 
+// mbarrier operations
+void mbarrier_init(const Val& addr, int count) {
+  emitInst("mbarrier.init.shared::cta.b64 [" + addr.reg.name + "], " + std::to_string(count));
+}
+
+Val mbarrier_arrive(const Val& addr) {
+  Val state(ValType::U64);
+  emitInst("mbarrier.arrive.shared::cta.b64 " + state.reg.name + ", [" + addr.reg.name + "]");
+  return state;
+}
+
+void mbarrier_expect_tx(const Val& addr, const Val& txCount) {
+  emitInst("mbarrier.expect_tx.shared::cta.b64 [" + addr.reg.name + "], " + txCount.reg.name);
+}
+
+Val mbarrier_try_wait_parity(const Val& addr, const Val& phaseParity) {
+  Val result(ValType::Pred);
+  emitInst("mbarrier.try_wait.parity.shared::cta.b64 " + result.reg.name + ", [" + addr.reg.name + "], " +
+           phaseParity.reg.name);
+  return result;
+}
+
+// cp.async.bulk operations
+void cp_async_bulk_shared_global(const Val& dst, const Val& src, const Val& size, const Val& mbar) {
+  emitInst("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [" + dst.reg.name + "], [" + src.reg.name +
+           "], " + size.reg.name + ", [" + mbar.reg.name + "]");
+}
+
+void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size) {
+  emitInst(
+      "cp.async.bulk.global.shared::cta.bulk_group [" + dst.reg.name + "], [" + src.reg.name + "], " + size.reg.name);
+}
+
+void cp_async_bulk_commit_group() {
+  emitInst("cp.async.bulk.commit_group");
+}
+
+void cp_async_bulk_wait_group(int n) {
+  emitInst("cp.async.bulk.wait_group " + std::to_string(n));
+}
+
+// Shared memory address conversion
+Val cvta_shared(const Val& sharedAddr) {
+  Val result(ValType::U64);
+  emitInst("cvta.shared.u64 " + result.reg.name + ", " + sharedAddr.reg.name);
+  return result;
+}
+
 // Raw emit
 void emit(const std::string& inst) {
   emitInst(inst);
@@ -546,13 +613,33 @@ Val::Val(Val&& o) noexcept : reg(std::move(o.reg)), type(o.type), valid(o.valid)
 
 Val& Val::operator=(Val&& o) noexcept {
   if (this != &o) {
-    if (valid) {
-      freeRegs[(int)reg.type].push_back(reg.id);
+    if (valid && o.valid) {
+      // Already has a register in emitted PTX — emit mov to preserve it
+      if (regTypeFor(type) == regTypeFor(o.type)) {
+        switch (regTypeFor(type)) {
+        case RegType::B32:
+          mov_u32(reg, Operand(o.reg));
+          break;
+        case RegType::B64:
+          mov_u64(reg, Operand(o.reg));
+          break;
+        default:
+          break;
+        }
+      }
+      // Free the source register
+      freeRegs[(int)o.reg.type].push_back(o.reg.id);
+      o.valid = false;
+    } else {
+      // Uninitialized destination — just transfer ownership
+      if (valid) {
+        freeRegs[(int)reg.type].push_back(reg.id);
+      }
+      reg = std::move(o.reg);
+      type = o.type;
+      valid = o.valid;
+      o.valid = false;
     }
-    reg = std::move(o.reg);
-    type = o.type;
-    valid = o.valid;
-    o.valid = false;
   }
   return *this;
 }
@@ -734,6 +821,18 @@ Val Val::operator~() const {
     break;
   default:
     unsupported("~", type);
+  }
+  return result;
+}
+
+Val Val::operator!() const {
+  Val result(ValType::Pred);
+  switch (regTypeFor(type)) {
+  case RegType::Pred:
+    emitInst("not.pred " + result.reg.name + ", " + reg.name);
+    break;
+  default:
+    unsupported("!", type);
   }
   return result;
 }
@@ -935,6 +1034,16 @@ void Val::operator%=(const Operand& b) {
     break;
   default:
     unsupported("%=", type);
+  }
+}
+
+void Val::operator^=(const Operand& b) {
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    xor_b32(reg, reg, b);
+    break;
+  default:
+    unsupported("^=", type);
   }
 }
 
@@ -1248,6 +1357,15 @@ void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
 
 void ldcs_v4(std::array<Val, 4>& v, const Val& addr) {
   ldcs_v4(v[0], v[1], v[2], v[3], addr);
+}
+
+void ld_plain_v4(std::array<Val, 4>& v, const Val& addr) {
+  for (auto& vi : v) {
+    if (!vi.valid) {
+      vi = Val(ValType::U32);
+    }
+  }
+  ld_v4_u32(v, addr.reg);
 }
 
 void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3) {

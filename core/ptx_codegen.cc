@@ -214,6 +214,8 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     }
   };
 
+  bool useBulk = !strcmp(config.copyEngine, "bulk");
+
   size_t rank = group->rank;
   const auto& peerIndices = group->peerIndices;
 
@@ -226,6 +228,19 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     fn->maxThreads = BS;
     fn->addParamBytes(8, (int)sizeof(CompileOpCopyParameters));
 
+    // Declare shared memory for bulk copy engine
+    // Double-buffered: 2 data buffers + 2 mbarrier arrays (one per warp per phase)
+    std::string smemBuf0Sym, smemBuf1Sym, smemMbar0Sym, smemMbar1Sym;
+    int bulkChunkSize = (int)config.bulkChunkSize;
+    int numWarps = BS / 32;
+    constexpr int kMbarrierSize = 8;
+    if (useBulk) {
+      smemBuf0Sym = fn->addShared(16, bulkChunkSize, "buf0");
+      smemBuf1Sym = fn->addShared(16, bulkChunkSize, "buf1");
+      smemMbar0Sym = fn->addShared(8, kMbarrierSize * numWarps, "mbar0");
+      smemMbar1Sym = fn->addShared(8, kMbarrierSize * numWarps, "mbar1");
+    }
+
     activateNewBlock("entry");
 
     // --- Load kernel parameters ---
@@ -237,20 +252,41 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     auto tid = threadIdx_x();
     auto blockIdx = blockIdx_x();
 
+    // Bulk copy engine: per-warp mbarrier initialization
+    Val smemBuf0SharedAddr(ValType::U64), smemBuf1SharedAddr(ValType::U64);
+    Val smemBuf0GenAddr(ValType::U64), smemBuf1GenAddr(ValType::U64);
+    Val smemMbar0SharedAddr(ValType::U64), smemMbar1SharedAddr(ValType::U64);
+    Val warpIdx(ValType::U32);
+    Val laneIdx(ValType::U32);
+    if (useBulk) {
+      smemBuf0SharedAddr = globalAddr(smemBuf0Sym.c_str());
+      smemBuf1SharedAddr = globalAddr(smemBuf1Sym.c_str());
+      smemBuf0GenAddr = cvta_shared(smemBuf0SharedAddr);
+      smemBuf1GenAddr = cvta_shared(smemBuf1SharedAddr);
+      smemMbar0SharedAddr = globalAddr(smemMbar0Sym.c_str());
+      smemMbar1SharedAddr = globalAddr(smemMbar1Sym.c_str());
+      warpIdx = tid / 32;
+      laneIdx = tid & 31;
+
+      // Each warp leader initializes its own mbarrier in both phase buffers
+      IF(laneIdx == 0) {
+        auto myMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
+        auto myMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
+        mbarrier_init(myMbar0, 1);
+        mbarrier_init(myMbar1, 1);
+      }
+      barrier_sync();
+    }
+
     // =================================================================
     // Entry barrier (thread 0 only)
     // =================================================================
     IF(tid == 0) {
-      // Every block writes stepValue to each peer (idempotent — same value).
-      // relaxed.sys: no data from this kernel needs flushing (prior kernel's
-      // data is already visible due to implicit inter-kernel memory barrier).
       for (size_t i : peerIndices) {
         auto& arr = group->peerCudaStepValue[i];
         auto addr = barrierAddr(arr.base, arr.itembytes, sizeof(uint32_t) * rank, concurrencyIndex);
         storeGlobalRelaxedSys(addr, stepValue);
       }
-      // Wait for all peers. acquire.sys: ensures subsequent reads (the data
-      // copies) see the data written by the prior kernel on the peer GPU.
       for (size_t i : peerIndices) {
         auto addr = barrierAddr(group->cudaStepValue.buffer.cudaPointer, group->cudaStepValue.itembytes,
             sizeof(uint32_t) * group->ipcRanks[i], concurrencyIndex);
@@ -273,7 +309,155 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       auto dst = loadParamField(descAddr, 8, ValType::U64);
       auto bytes = loadParamField(descAddr, 16, ValType::U32);
 
-      emitRegisterCopy(src, dst, bytes, tid, blockIdx);
+      if (useBulk) {
+        // =============================================================
+        // Bulk copy engine: per-warp double-buffered cp.async.bulk
+        //
+        // Each warp independently:
+        //   1. DMAs its portion from global → shared (ping-pong buffers)
+        //   2. Writes back from shared → global via registers
+        //   3. Overlaps DMA of next chunk with write-back of current
+        // =============================================================
+
+        // Distribute work across blocks
+        auto blockBytes = (bytes / GS / 16) * 16;
+        auto blockStart = widen(blockIdx * blockBytes);
+        src += blockStart;
+        dst += blockStart;
+        auto myBytes = Val(ValType::U32);
+        myBytes = blockBytes;
+        IF(blockIdx == GS - 1) {
+          myBytes = bytes - blockIdx * blockBytes;
+        }
+
+        // Distribute work across warps within this block
+        int perWarpChunk = bulkChunkSize / numWarps;
+        auto warpTotal = (myBytes / numWarps / 16) * 16;
+        auto warpStartOff = widen(warpIdx * warpTotal);
+        auto warpSrc = src + warpStartOff;
+        auto warpDst = dst + warpStartOff;
+        auto warpRemaining = Val(ValType::U32);
+        warpRemaining = warpTotal;
+        IF(warpIdx == numWarps - 1) {
+          warpRemaining = myBytes - warpIdx * warpTotal;
+        }
+
+        // Per-warp shared memory and mbarrier addresses
+        auto warpBufOff = widen(warpIdx) * perWarpChunk;
+        auto wBuf0S = smemBuf0SharedAddr + warpBufOff;
+        auto wBuf1S = smemBuf1SharedAddr + warpBufOff;
+        auto wBuf0G = smemBuf0GenAddr + warpBufOff;
+        auto wBuf1G = smemBuf1GenAddr + warpBufOff;
+        auto wMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
+        auto wMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
+
+        // Helpers to emit DMA and write-back (C++ lambdas, called at codegen time)
+        auto emitDma = [&](const Val& bufS, const Val& mbar, const Val& srcAddr, const Val& size) {
+          IF(laneIdx == 0) {
+            mbarrier_expect_tx(mbar, size);
+          }
+          if (config.bulkWarpLeaderDma) {
+            IF(laneIdx == 0) {
+              cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
+              mbarrier_arrive(mbar);
+            }
+          } else {
+            auto pt = size / 32;
+            auto off = widen(laneIdx * pt);
+            cp_async_bulk_shared_global(bufS + off, srcAddr + off, pt, mbar);
+            IF(laneIdx == 0) {
+              mbarrier_arrive(mbar);
+            }
+          }
+        };
+
+        auto emitWriteBack = [&](const Val& bufG, const Val& dstAddr, const Val& size) {
+          auto i = widen(laneIdx * 16);
+          int64_t stride = 32 * 16;
+          WHILE(narrow(i) < size) {
+            std::array<Val, 4> t;
+            ld_plain_v4(t, bufG + i);
+            stwt_v4(dstAddr + i, t);
+            i += stride;
+          }
+        };
+
+        // Parity counters for each mbarrier (track phase advancement)
+        auto parity0 = Val(ValType::U32);
+        parity0 = 0;
+        auto parity1 = Val(ValType::U32);
+        parity1 = 0;
+
+        // Phase: 0 = current data in buf0, 1 = current data in buf1
+        auto phase = Val(ValType::U32);
+        phase = 0;
+
+        // Track current chunk size for write-back
+        auto curChunk = Val(ValType::U32);
+        curChunk = 0;
+
+        // ---- Prolog: DMA first chunk into buf[0] ----
+        {
+          auto firstChunk = Val(ValType::U32);
+          firstChunk = warpRemaining;
+          IF(firstChunk > perWarpChunk) {
+            firstChunk = perWarpChunk;
+          }
+          firstChunk = (firstChunk / 16) * 16;
+
+          IF(firstChunk > 0) {
+            emitDma(wBuf0S, wMbar0, warpSrc, firstChunk);
+            warpSrc += widen(firstChunk);
+            warpRemaining -= firstChunk;
+          }
+          curChunk = firstChunk;
+        }
+
+        // ---- Main loop: overlap DMA and write-back ----
+        WHILE(warpRemaining > 0) {
+          auto nextChunk = Val(ValType::U32);
+          nextChunk = warpRemaining;
+          IF(nextChunk > perWarpChunk) {
+            nextChunk = perWarpChunk;
+          }
+          nextChunk = (nextChunk / 16) * 16;
+
+          IF(phase == 0) {
+            // Wait for buf[0] DMA, start DMA into buf[1], write back buf[0]
+            WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
+            emitDma(wBuf1S, wMbar1, warpSrc, nextChunk);
+            emitWriteBack(wBuf0G, warpDst, curChunk);
+            parity0 = parity0 ^ 1;
+          }
+          ELSE {
+            // Wait for buf[1] DMA, start DMA into buf[0], write back buf[1]
+            WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
+            emitDma(wBuf0S, wMbar0, warpSrc, nextChunk);
+            emitWriteBack(wBuf1G, warpDst, curChunk);
+            parity1 = parity1 ^ 1;
+          }
+
+          warpDst += widen(curChunk);
+          warpSrc += widen(nextChunk);
+          warpRemaining -= nextChunk;
+          curChunk = nextChunk;
+          phase = phase ^ 1;
+        }
+
+        // ---- Epilog: write back last chunk ----
+        IF(curChunk > 0) {
+          IF(phase == 0) {
+            WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
+            emitWriteBack(wBuf0G, warpDst, curChunk);
+          }
+          ELSE {
+            WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
+            emitWriteBack(wBuf1G, warpDst, curChunk);
+          }
+        }
+      } else {
+        emitRegisterCopy(src, dst, bytes, tid, blockIdx);
+      }
 
       dd += 1;
     }
