@@ -369,6 +369,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
               mbarrier_arrive(mbar);
             }
           }
+          warp_sync(); // reconverge after lane-0 divergence
         };
 
         auto emitWriteBack = [&](const Val& bufG, const Val& dstAddr, const Val& size) {
@@ -380,6 +381,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             stwt_v4(dstAddr + i, t);
             i += stride;
           }
+          warp_sync(); // reconverge after potentially divergent loop
         };
 
         // Parity counters for each mbarrier (track phase advancement)
@@ -414,7 +416,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
         }
 
         // ---- Main loop: overlap DMA and write-back ----
-        WHILE(warpRemaining > 0) {
+        WHILE(warpRemaining >= 16) {
           auto nextChunk = Val(ValType::U32);
           nextChunk = warpRemaining;
           IF(nextChunk > perWarpChunk) {
@@ -426,14 +428,18 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             // Wait for buf[0] DMA, start DMA into buf[1], write back buf[0]
             WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
             emitDma(wBuf1S, wMbar1, warpSrc, nextChunk);
-            emitWriteBack(wBuf0G, warpDst, curChunk);
+            if (!config.bulkSkipWriteBack) {
+              emitWriteBack(wBuf0G, warpDst, curChunk);
+            }
             parity0 = parity0 ^ 1;
           }
           ELSE {
             // Wait for buf[1] DMA, start DMA into buf[0], write back buf[1]
             WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
             emitDma(wBuf0S, wMbar0, warpSrc, nextChunk);
-            emitWriteBack(wBuf1G, warpDst, curChunk);
+            if (!config.bulkSkipWriteBack) {
+              emitWriteBack(wBuf1G, warpDst, curChunk);
+            }
             parity1 = parity1 ^ 1;
           }
 
@@ -448,11 +454,34 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
         IF(curChunk > 0) {
           IF(phase == 0) {
             WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
-            emitWriteBack(wBuf0G, warpDst, curChunk);
+            if (!config.bulkSkipWriteBack) {
+              emitWriteBack(wBuf0G, warpDst, curChunk);
+            }
           }
           ELSE {
             WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
-            emitWriteBack(wBuf1G, warpDst, curChunk);
+            if (!config.bulkSkipWriteBack) {
+              emitWriteBack(wBuf1G, warpDst, curChunk);
+            }
+          }
+          warpDst += widen(curChunk);
+        }
+
+        // ---- Tail: remaining bytes < 16, direct global→global byte copy ----
+        if (!config.bulkSkipWriteBack) {
+          IF(warpRemaining > 0) {
+            auto i = Val(ValType::U32);
+            i = laneIdx;
+            auto tailSrc = warpSrc + widen(laneIdx);
+            auto tailDst = warpDst + widen(laneIdx);
+            WHILE(i < warpRemaining) {
+              Val v(ValType::U32);
+              ld_u8(v, tailSrc);
+              st_u8(tailDst, v);
+              tailSrc += 32;
+              tailDst += 32;
+              i += 32;
+            }
           }
         }
       } else {
