@@ -555,13 +555,55 @@ struct ProcessGroupImpl : api::ProcessGroup {
     return w;
   }
 
+  void internalBarrier() {
+    uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
+    std::atomic_uint32_t cpuDone = 0;
+    QueueEntryBarrier* e = group->cpuThread->freelistBarrier.pop();
+    e->task = taskInternalBarrier;
+    e->stepValue = 0;
+    e->sd = &group->getStreamData(nullptr);
+    e->concurrencyIndex = concurrencyIndex;
+    e->cpuDone = &cpuDone;
+    group->cpuThread->enqueue(e);
+    while (cpuDone == 0) {
+      futexWait(&cpuDone, 0, std::chrono::seconds(10));
+    }
+  }
+
+  void resetStepValue() {
+    // Reset the 32-bit step value to prevent overflow.
+    // All ranks must collectively reach this point — we synchronize with
+    // internalBarrier before and after zeroing the barrier arrays.
+    log.verbose("Reset step value begin\n");
+    while (group->cpuThread->busy) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    internalBarrier();
+
+    CHECK_CU(cuCtxSynchronize());
+    std::memset(group->mySharedMem, 0, group->mySharedMemSize);
+    nextStepValue = 0x1000;
+    for (auto& a : group->buffersToReset) {
+      auto& buffer = a->buffer;
+      if (buffer.hostAllocated || buffer.numaAllocated) {
+        std::memset(buffer.cpuPointer, 0, buffer.bytes);
+      } else {
+        CHECK_CU(cuMemsetD8(buffer.cudaPointer, 0, buffer.bytes));
+      }
+    }
+    CHECK_CU(cuCtxSynchronize());
+
+    log.info("Reset step value done, syncing\n");
+    internalBarrier();
+    log.verbose("Reset step value end\n");
+  }
+
   uint32_t getNextStepValue() {
     uint32_t r = std::exchange(nextStepValue, nextStepValue + 0x1000);
     if (r < 0x80000000) {
       return r;
     }
-    // Reset needed - for now just return 1
-    nextStepValue = 0x1000;
+    resetStepValue();
     return 1;
   }
 
@@ -3786,6 +3828,9 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   ctx.queues = std::span<SharedPtr<Queue>>(queues.data(), queues.size());
   ctx.barrier = [this]() {
     barrier();
+  };
+  ctx.resetBarriers = [this]() {
+    resetStepValue();
   };
   ctx.nextOpId = &nextCustomOpId;
 

@@ -1669,11 +1669,19 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     }
 
     if (needsTuning) {
+      // Reset barrier arrays before tuning — tuning kernels use the same
+      // barrier memory as production kernels and would leave stale values.
+      ctx.resetBarriers();
+
       if (kernelVersion == 9) {
         result = tuneCopyKernelV9(ctx, dominantCat);
       } else {
         result = tuneCopyKernel(ctx, dominantCat);
       }
+
+      // Reset barrier arrays after tuning — clear residual step values
+      // from tuning iterations before production kernels start.
+      ctx.resetBarriers();
       std::lock_guard lock(tuningCacheMutex);
       // Double-check: another thread might have tuned while we were running
       TuningResult existing;
@@ -1687,6 +1695,9 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     // Override copy engine from env var (for testing)
     if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
       result.config.copyEngine = env;
+    }
+    if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
+      result.config.bulkSkipWriteBack = true;
     }
 
     // Generate and compile the final kernel with the tuned config
