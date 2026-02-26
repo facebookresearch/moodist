@@ -388,6 +388,7 @@ Val mbarrier_try_wait_parity(const Val& addr, const Val& phaseParity); // return
 // cp.async.bulk (sm_90+)
 void cp_async_bulk_shared_global(const Val& dst, const Val& src, const Val& size, const Val& mbar);
 void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size);
+void cp_async_bulk_prefetch_l2(const Val& src, const Val& size);
 void cp_async_bulk_commit_group();
 void cp_async_bulk_wait_group(int n);
 

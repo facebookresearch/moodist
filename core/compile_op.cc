@@ -496,8 +496,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   {
     int maxSmem = 0;
     CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
-    static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304};
-    static constexpr size_t bulkBlockSizes[] = {128, 256, 512, 1024};
+    static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
+    static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
     for (size_t chunk : chunkSizes) {
       for (size_t bs : bulkBlockSizes) {
         size_t numWarps = bs / 32;

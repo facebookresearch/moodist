@@ -406,13 +406,54 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
               warp_sync();
             } else {
               // Register write-back: load from shared, store to global
-              auto i = widen(laneIdx * 16);
+              // Each thread handles every 32nd 16-byte chunk.
+              // stride = 32 * 16 = 512 bytes between consecutive accesses per thread.
               int64_t stride = 32 * 16;
-              WHILE(narrow(i) < size) {
-                std::array<Val, 4> t;
-                ld_plain_v4(t, bufG + i);
-                stwt_v4(dstAddr + i, t);
-                i += stride;
+              int itersPerChunk = perWarpChunk / (int)stride;
+
+              if (itersPerChunk > 0) {
+                // Unrolled path for full-size chunks (all iterations except possibly the last)
+                IF(size == perWarpChunk) {
+                  // Pipelined: load depth-2, then store depth-2
+                  auto off = widen(laneIdx * 16);
+                  int i = 0;
+                  while (i + 1 < itersPerChunk) {
+                    // Load 2
+                    std::array<Val, 4> t0, t1;
+                    ld_plain_v4(t0, bufG + off);
+                    ld_plain_v4(t1, bufG + off + stride);
+                    // Store 2
+                    stwt_v4(dstAddr + off, t0);
+                    stwt_v4(dstAddr + off + stride, t1);
+                    off += stride * 2;
+                    i += 2;
+                  }
+                  // Handle odd remainder
+                  if (i < itersPerChunk) {
+                    std::array<Val, 4> t;
+                    ld_plain_v4(t, bufG + off);
+                    stwt_v4(dstAddr + off, t);
+                  }
+                }
+                ELSE {
+                  // Dynamic loop for partial last chunk
+                  auto i = widen(laneIdx * 16);
+                  WHILE(narrow(i) < size) {
+                    std::array<Val, 4> t;
+                    ld_plain_v4(t, bufG + i);
+                    stwt_v4(dstAddr + i, t);
+                    i += stride;
+                  }
+                }
+              } else {
+                // perWarpChunk < stride: always use dynamic loop
+                auto i = widen(laneIdx * 16);
+                WHILE(narrow(i) < size) {
+                  std::array<Val, 4> t;
+                  ld_plain_v4(t, bufG + i);
+                  stwt_v4(dstAddr + i, t);
+                  i += stride;
+                }
               }
               warp_sync();
             }
@@ -500,6 +541,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             warpDst += widen(curChunk);
             warpSrc += widen(nextChunk);
             warpRemaining -= nextChunk;
+
             curChunk = nextChunk;
             phase = phase ^ 1;
           }

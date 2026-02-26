@@ -529,6 +529,10 @@ void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size
       "cp.async.bulk.global.shared::cta.bulk_group [" + dst.reg.name + "], [" + src.reg.name + "], " + size.reg.name);
 }
 
+void cp_async_bulk_prefetch_l2(const Val& src, const Val& size) {
+  emitInst("cp.async.bulk.prefetch.L2.global [" + src.reg.name + "], " + size.reg.name);
+}
+
 void cp_async_bulk_commit_group() {
   emitInst("cp.async.bulk.commit_group");
 }
