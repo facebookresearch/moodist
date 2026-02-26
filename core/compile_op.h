@@ -207,6 +207,7 @@ struct CompileContext {
   Group* group;
   std::span<SharedPtr<Queue>> queues;
   Function<void()> barrier;
+  Function<void()> resetBarriers; // Reset step value / barrier arrays (before/after tuning)
 
   // For generating unique op IDs
   uint32_t* nextOpId;
