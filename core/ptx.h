@@ -51,6 +51,11 @@ struct Function {
   // Returns the parameter name for use in ld.param, e.g. "name_param_0"
   std::string param(int index) const;
 
+  // Shared memory declarations — emitted after register declarations
+  std::vector<std::string> sharedDecls;
+  // Declare a shared memory array. Returns the symbol name.
+  std::string addShared(int align, int sizeBytes, const char* suffix = nullptr);
+
   // Register allocation — one counter per type class
   int regCounts[4] = {};
   Reg reg(RegType type);
@@ -245,12 +250,16 @@ struct Val {
   Val operator==(const Operand& b) const;
   Val operator!=(const Operand& b) const;
 
+  // Predicate negation
+  Val operator!() const;
+
   // Compound assignment — modifies in place
   void operator+=(const Operand& b);
   void operator-=(const Operand& b);
   void operator*=(const Operand& b);
   void operator/=(const Operand& b);
   void operator%=(const Operand& b);
+  void operator^=(const Operand& b);
 };
 
 // RAII function scope — sets TLS context, manages register free-lists.
@@ -347,6 +356,7 @@ void storeGlobalReleaseSys(const Val& addr, const Val& val);
 void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr);
 void ld_global_nc_v4_u32(std::array<Val, 4>& v, const Operand& addr);
 void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr);
+void ld_v4_u32(std::array<Val, 4>& v, const Operand& addr); // generic addressing (no cache qualifier)
 void st_global_wt_v4_u32(const Operand& addr, const std::array<Val, 4>& v);
 void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
 void ldcv_v4(std::array<Val, 4>& v, const Val& addr);
@@ -354,6 +364,7 @@ void ldnc_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
 void ldnc_v4(std::array<Val, 4>& v, const Val& addr);
 void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
 void ldcs_v4(std::array<Val, 4>& v, const Val& addr);
+void ld_plain_v4(std::array<Val, 4>& v, const Val& addr); // generic addressing, no cache qualifier
 void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3);
 void stwt_v4(const Val& addr, const std::array<Val, 4>& v);
 
@@ -365,6 +376,21 @@ Val globalAddr(const char* name); // mov.u64 of global symbol address, returns U
 
 // Hex immediate — for baking GPU addresses into PTX
 Operand hexImm(uintptr_t value);
+
+// mbarrier operations (sm_90+)
+void mbarrier_init(const Val& addr, int count);
+Val mbarrier_arrive(const Val& addr); // returns state token (u64)
+void mbarrier_expect_tx(const Val& addr, const Val& txCount);
+Val mbarrier_try_wait_parity(const Val& addr, const Val& phaseParity); // returns pred
+
+// cp.async.bulk (sm_90+)
+void cp_async_bulk_shared_global(const Val& dst, const Val& src, const Val& size, const Val& mbar);
+void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size);
+void cp_async_bulk_commit_group();
+void cp_async_bulk_wait_group(int n);
+
+// Shared memory address conversion
+Val cvta_shared(const Val& sharedAddr); // convert shared addr to generic
 
 } // namespace ptx
 } // namespace moodist
