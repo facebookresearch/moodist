@@ -37,6 +37,7 @@ struct CopyKernelConfig {
   const char* copyEngine = "reg"; // "reg" (register pipeline), "bulk" (cp.async.bulk)
   size_t bulkChunkSize = 16384;   // staging buffer size for bulk engine (bytes)
   bool bulkWarpLeaderDma = true;  // true: 1 DMA per warp, false: 1 DMA per thread
+  bool bulkSkipWriteBack = false; // debug: skip shared→global write-back
 };
 
 struct CompileOpKernels {
