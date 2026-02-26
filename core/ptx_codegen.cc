@@ -36,183 +36,274 @@ static ptx::Val barrierAddr(uintptr_t base, uintptr_t itembytes, size_t offset, 
   return addr;
 }
 
-std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, const char* target) {
+// Select load function based on loadOp config
+static void ld_v4(const char* loadOp, std::array<ptx::Val, 4>& v, const ptx::Val& addr) {
   using namespace ptx;
+  if (!strcmp(loadOp, "nc")) {
+    ldnc_v4(v, addr);
+  } else if (!strcmp(loadOp, "cs")) {
+    ldcs_v4(v, addr);
+  } else {
+    ldcv_v4(v, addr);
+  }
+}
 
-  int depth = config.depth;
-  const char* loadOp = config.loadOp;
-
-  // Select load function based on loadOp
-  auto ld_v4 = [loadOp](std::array<Val, 4>& v, const Val& addr) {
-    if (!strcmp(loadOp, "nc")) {
-      ldnc_v4(v, addr);
-    } else if (!strcmp(loadOp, "cs")) {
-      ldcs_v4(v, addr);
-    } else {
-      ldcv_v4(v, addr);
-    }
-  };
+// Register copy engine: emits Phases 1-4 (head alignment, pipelined bulk, remainder, tail).
+// src/dst/bytes are mutable PTX Vals (updated as copy progresses).
+static void emitRegisterCopy(const CopyKernelConfig& config,
+    ptx::Val& src, ptx::Val& dst, ptx::Val& bytes,
+    const ptx::Val& tid, const ptx::Val& blockIdx) {
+  using namespace ptx;
 
   int BS = (int)config.blockSize;
   int GS = (int)config.gridSize;
+  int depth = config.depth;
   int loopBytes = BS * 16;
+  const char* loadOp = config.loadOp;
 
-  // Copy engine: emits Phases 1-4 (head alignment, pipelined bulk, remainder, tail).
-  // src/dst/bytes are mutable PTX Vals (updated as copy progresses).
-  auto emitRegisterCopy = [&](Val& src, Val& dst, Val& bytes, const Val& tid, const Val& blockIdx) {
-    // ---------------------------------------------------------------
-    // Phase 1: Head alignment
-    // ---------------------------------------------------------------
-    auto srcMod = narrow(src) & 15;
-    auto dstMod = narrow(dst) & 15;
-    IF((srcMod == dstMod) & (srcMod != 0) & (bytes >= 16)) {
-      auto headBytes = Val(ValType::U32);
-      headBytes = 16;
-      headBytes -= srcMod;
+  // ---------------------------------------------------------------
+  // Phase 1: Head alignment
+  // ---------------------------------------------------------------
+  auto srcMod = narrow(src) & 15;
+  auto dstMod = narrow(dst) & 15;
+  IF((srcMod == dstMod) & (srcMod != 0) & (bytes >= 16)) {
+    auto headBytes = Val(ValType::U32);
+    headBytes = 16;
+    headBytes -= srcMod;
 
-      // Clamp to remaining bytes
-      IF(headBytes > bytes) {
-        headBytes = bytes;
-      }
-
-      // Byte copy loop: tid stride blockSize
-      auto i = Val(ValType::U32);
-      i = tid;
-      auto srcP = src + widen(tid);
-      auto dstP = dst + widen(tid);
-      WHILE(i < headBytes) {
-        Val v(ValType::U32);
-        ld_u8(v, srcP);
-        st_u8(dstP, v);
-        srcP += BS;
-        dstP += BS;
-        i += BS;
-      }
-      barrier_sync();
-
-      // Update pointers and remaining byte count
-      auto headWide = widen(headBytes);
-      src += headWide;
-      dst += headWide;
-      bytes -= headBytes;
+    IF(headBytes > bytes) {
+      headBytes = bytes;
     }
 
-    // Check alignment after head adjustment
-    auto aligned = ((narrow(src) | narrow(dst)) & 15) == 0;
+    auto i = Val(ValType::U32);
+    i = tid;
+    auto srcP = src + widen(tid);
+    auto dstP = dst + widen(tid);
+    WHILE(i < headBytes) {
+      Val v(ValType::U32);
+      ld_u8(v, srcP);
+      st_u8(dstP, v);
+      srcP += BS;
+      dstP += BS;
+      i += BS;
+    }
+    barrier_sync();
 
-    // ---------------------------------------------------------------
-    // Phase 2: Pipelined bulk copy (depth-unrolled)
-    // ---------------------------------------------------------------
-    IF(aligned & (bytes >= loopBytes)) {
-      auto count = bytes / loopBytes;
-      auto tid16w = widen(tid * 16);
-      int64_t stride = (int64_t)GS * loopBytes;
+    auto headWide = widen(headBytes);
+    src += headWide;
+    dst += headWide;
+    bytes -= headBytes;
+  }
 
-      auto i = Val(ValType::U32);
-      i = blockIdx;
+  auto aligned = ((narrow(src) | narrow(dst)) & 15) == 0;
 
-      // Running pointers: avoid recomputing addresses each iteration
-      auto srcPtr = src + widen(blockIdx) * loopBytes + tid16w;
-      auto dstPtr = dst + widen(blockIdx) * loopBytes + tid16w;
+  // ---------------------------------------------------------------
+  // Phase 2: Pipelined bulk copy (depth-unrolled)
+  // ---------------------------------------------------------------
+  IF(aligned & (bytes >= loopBytes)) {
+    auto count = bytes / loopBytes;
+    auto tid16w = widen(tid * 16);
+    int64_t stride = (int64_t)GS * loopBytes;
 
-      // Pipeline registers: depth x 4 u32 values
-      std::array<std::array<Val, 4>, 56> v; // max depth 56
-      for (int k = 0; k < depth; k++) {
-        for (int c = 0; c < 4; c++) {
-          v[k][c] = Val(ValType::U32);
-        }
+    auto i = Val(ValType::U32);
+    i = blockIdx;
+
+    auto srcPtr = src + widen(blockIdx) * loopBytes + tid16w;
+    auto dstPtr = dst + widen(blockIdx) * loopBytes + tid16w;
+
+    std::array<std::array<Val, 4>, 56> v; // max depth 56
+    for (int k = 0; k < depth; k++) {
+      for (int c = 0; c < 4; c++) {
+        v[k][c] = Val(ValType::U32);
       }
+    }
 
-      // Prime: load depth values
-      for (int k = 0; k < depth; k++) {
-        IF(i + k * GS < count) {
-          ld_v4(v[k], srcPtr);
-        }
-        srcPtr += stride;
+    // Prime: load depth values
+    for (int k = 0; k < depth; k++) {
+      IF(i + k * GS < count) {
+        ld_v4(loadOp, v[k], srcPtr);
       }
+      srcPtr += stride;
+    }
 
-      // Main loop: store-load overlap
-      WHILE(i + (2 * depth - 1) * GS < count) {
-        // warp_sync();
-        for (int j = 0; j < depth; j++) {
-          stwt_v4(dstPtr, v[j]);
-          dstPtr += stride;
-          ld_v4(v[j], srcPtr);
-          srcPtr += stride;
-        }
-        i += depth * GS;
-      }
-
-      // Drain: store remaining
-      for (int k = 0; k < depth; k++) {
-        IF(i + k * GS < count) {
-          stwt_v4(dstPtr, v[k]);
-        }
+    // Main loop: store-load overlap
+    WHILE(i + (2 * depth - 1) * GS < count) {
+      for (int j = 0; j < depth; j++) {
+        stwt_v4(dstPtr, v[j]);
         dstPtr += stride;
+        ld_v4(loadOp, v[j], srcPtr);
+        srcPtr += stride;
       }
       i += depth * GS;
+    }
 
-      // Tail: simple loop for remaining full blocks
-      WHILE(i < count) {
+    // Drain: store remaining
+    for (int k = 0; k < depth; k++) {
+      IF(i + k * GS < count) {
+        stwt_v4(dstPtr, v[k]);
+      }
+      dstPtr += stride;
+    }
+    i += depth * GS;
+
+    // Tail: simple loop for remaining full blocks
+    WHILE(i < count) {
+      std::array<Val, 4> t;
+      ld_v4(loadOp, t, srcPtr);
+      stwt_v4(dstPtr, t);
+      srcPtr += stride;
+      dstPtr += stride;
+      i += GS;
+    }
+
+    auto done = count * loopBytes;
+    auto doneWide = widen(done);
+    src += doneWide;
+    dst += doneWide;
+    bytes -= done;
+  }
+
+  // ---------------------------------------------------------------
+  // Phase 3: Remaining aligned uint4 elements
+  // ---------------------------------------------------------------
+  IF(aligned) {
+    auto remaining16 = bytes / 16;
+    auto i = Val(ValType::U32);
+    i = tid;
+    auto srcPtr = src + widen(tid) * 16;
+    auto dstPtr = dst + widen(tid) * 16;
+    int64_t stride16 = (int64_t)BS * 16;
+    WHILE(i < remaining16) {
+      std::array<Val, 4> t;
+      ld_v4(loadOp, t, srcPtr);
+      stwt_v4(dstPtr, t);
+      srcPtr += stride16;
+      dstPtr += stride16;
+      i += BS;
+    }
+    auto done16 = remaining16 * 16;
+    auto done16w = widen(done16);
+    src += done16w;
+    dst += done16w;
+    bytes -= done16;
+  }
+
+  // ---------------------------------------------------------------
+  // Phase 4: Tail bytes
+  // ---------------------------------------------------------------
+  {
+    auto i = Val(ValType::U32);
+    i = tid;
+    auto srcPtr = src + widen(tid);
+    auto dstPtr = dst + widen(tid);
+    WHILE(i < bytes) {
+      Val v(ValType::U32);
+      ld_u8(v, srcPtr);
+      st_u8(dstPtr, v);
+      srcPtr += BS;
+      dstPtr += BS;
+      i += BS;
+    }
+  }
+}
+
+// Bulk DMA: global → shared via cp.async.bulk with mbarrier completion
+static void emitBulkDma(const CopyKernelConfig& config, bool singleLane,
+    const ptx::Val& bufS, const ptx::Val& mbar,
+    const ptx::Val& srcAddr, const ptx::Val& size, const ptx::Val& laneIdx) {
+  using namespace ptx;
+  if (singleLane) {
+    mbarrier_expect_tx(mbar, size);
+    cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
+    mbarrier_arrive(mbar);
+  } else {
+    IF(laneIdx == 0) {
+      mbarrier_expect_tx(mbar, size);
+    }
+    if (config.bulkWarpLeaderDma) {
+      IF(laneIdx == 0) {
+        cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
+        mbarrier_arrive(mbar);
+      }
+    } else {
+      auto pt = size / 32;
+      auto off = widen(laneIdx * pt);
+      cp_async_bulk_shared_global(bufS + off, srcAddr + off, pt, mbar);
+      IF(laneIdx == 0) {
+        mbarrier_arrive(mbar);
+      }
+    }
+    warp_sync();
+  }
+}
+
+// Bulk write-back: shared → global via registers or cp.async.bulk DMA
+static void emitBulkWriteBack(const CopyKernelConfig& config, bool singleLane, int perWarpChunk,
+    const ptx::Val& bufS, const ptx::Val& bufG,
+    const ptx::Val& dstAddr, const ptx::Val& size, const ptx::Val& laneIdx) {
+  using namespace ptx;
+  if (singleLane) {
+    cp_async_bulk_global_shared(dstAddr, bufS, size);
+    cp_async_bulk_commit_group();
+  } else if (config.bulkWriteBack) {
+    IF(laneIdx == 0) {
+      cp_async_bulk_global_shared(dstAddr, bufS, size);
+      cp_async_bulk_commit_group();
+    }
+    warp_sync();
+  } else {
+    // Register write-back: load from shared, store to global
+    int64_t stride = 32 * 16;
+    int itersPerChunk = perWarpChunk / (int)stride;
+
+    if (itersPerChunk > 0) {
+      IF(size == perWarpChunk) {
+        // Unrolled path for full-size chunks: pipelined load-2/store-2
+        auto off = widen(laneIdx * 16);
+        int i = 0;
+        while (i + 1 < itersPerChunk) {
+          std::array<Val, 4> t0, t1;
+          ld_plain_v4(t0, bufG + off);
+          ld_plain_v4(t1, bufG + off + stride);
+          stwt_v4(dstAddr + off, t0);
+          stwt_v4(dstAddr + off + stride, t1);
+          off += stride * 2;
+          i += 2;
+        }
+        if (i < itersPerChunk) {
+          std::array<Val, 4> t;
+          ld_plain_v4(t, bufG + off);
+          stwt_v4(dstAddr + off, t);
+        }
+      }
+      ELSE {
+        // Dynamic loop for partial last chunk
+        auto i = widen(laneIdx * 16);
+        WHILE(narrow(i) < size) {
+          std::array<Val, 4> t;
+          ld_plain_v4(t, bufG + i);
+          stwt_v4(dstAddr + i, t);
+          i += stride;
+        }
+      }
+    } else {
+      auto i = widen(laneIdx * 16);
+      WHILE(narrow(i) < size) {
         std::array<Val, 4> t;
-        ld_v4(t, srcPtr);
-        stwt_v4(dstPtr, t);
-        srcPtr += stride;
-        dstPtr += stride;
-        i += GS;
-      }
-
-      // Update pointers
-      auto done = count * loopBytes;
-      auto doneWide = widen(done);
-      src += doneWide;
-      dst += doneWide;
-      bytes -= done;
-    }
-
-    // ---------------------------------------------------------------
-    // Phase 3: Remaining aligned uint4 elements
-    // ---------------------------------------------------------------
-    IF(aligned) {
-      auto remaining16 = bytes / 16;
-      auto i = Val(ValType::U32);
-      i = tid;
-      auto srcPtr = src + widen(tid) * 16;
-      auto dstPtr = dst + widen(tid) * 16;
-      int64_t stride16 = (int64_t)BS * 16;
-      WHILE(i < remaining16) {
-        std::array<Val, 4> t;
-        ld_v4(t, srcPtr);
-        stwt_v4(dstPtr, t);
-        srcPtr += stride16;
-        dstPtr += stride16;
-        i += BS;
-      }
-      auto done16 = remaining16 * 16;
-      auto done16w = widen(done16);
-      src += done16w;
-      dst += done16w;
-      bytes -= done16;
-    }
-
-    // ---------------------------------------------------------------
-    // Phase 4: Tail bytes
-    // ---------------------------------------------------------------
-    {
-      auto i = Val(ValType::U32);
-      i = tid;
-      auto srcPtr = src + widen(tid);
-      auto dstPtr = dst + widen(tid);
-      WHILE(i < bytes) {
-        Val v(ValType::U32);
-        ld_u8(v, srcPtr);
-        st_u8(dstPtr, v);
-        srcPtr += BS;
-        dstPtr += BS;
-        i += BS;
+        ld_plain_v4(t, bufG + i);
+        stwt_v4(dstAddr + i, t);
+        i += stride;
       }
     }
-  };
+    warp_sync();
+  }
+}
+
+std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, const char* target) {
+  using namespace ptx;
+
+  int BS = (int)config.blockSize;
+  int GS = (int)config.gridSize;
 
   bool useBulk = !strcmp(config.copyEngine, "bulk");
 
@@ -365,100 +456,6 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
           auto wMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
           auto wMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
 
-          // Helpers to emit DMA and write-back (C++ lambdas, called at codegen time)
-          auto emitDma = [&](const Val& bufS, const Val& mbar, const Val& srcAddr, const Val& size) {
-            if (singleLane) {
-              // Single-lane: we ARE lane 0, no branching or sync needed
-              mbarrier_expect_tx(mbar, size);
-              cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
-              mbarrier_arrive(mbar);
-            } else {
-              IF(laneIdx == 0) {
-                mbarrier_expect_tx(mbar, size);
-              }
-              if (config.bulkWarpLeaderDma) {
-                IF(laneIdx == 0) {
-                  cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
-                  mbarrier_arrive(mbar);
-                }
-              } else {
-                auto pt = size / 32;
-                auto off = widen(laneIdx * pt);
-                cp_async_bulk_shared_global(bufS + off, srcAddr + off, pt, mbar);
-                IF(laneIdx == 0) {
-                  mbarrier_arrive(mbar);
-                }
-              }
-              warp_sync();
-            }
-          };
-
-          auto emitWriteBack = [&](const Val& bufS, const Val& bufG, const Val& dstAddr, const Val& size) {
-            if (singleLane) {
-              // Single-lane: fire-and-forget DMA, no branching or sync
-              cp_async_bulk_global_shared(dstAddr, bufS, size);
-              cp_async_bulk_commit_group();
-            } else if (config.bulkWriteBack) {
-              IF(laneIdx == 0) {
-                cp_async_bulk_global_shared(dstAddr, bufS, size);
-                cp_async_bulk_commit_group();
-              }
-              warp_sync();
-            } else {
-              // Register write-back: load from shared, store to global
-              // Each thread handles every 32nd 16-byte chunk.
-              // stride = 32 * 16 = 512 bytes between consecutive accesses per thread.
-              int64_t stride = 32 * 16;
-              int itersPerChunk = perWarpChunk / (int)stride;
-
-              if (itersPerChunk > 0) {
-                // Unrolled path for full-size chunks (all iterations except possibly the last)
-                IF(size == perWarpChunk) {
-                  // Pipelined: load depth-2, then store depth-2
-                  auto off = widen(laneIdx * 16);
-                  int i = 0;
-                  while (i + 1 < itersPerChunk) {
-                    // Load 2
-                    std::array<Val, 4> t0, t1;
-                    ld_plain_v4(t0, bufG + off);
-                    ld_plain_v4(t1, bufG + off + stride);
-                    // Store 2
-                    stwt_v4(dstAddr + off, t0);
-                    stwt_v4(dstAddr + off + stride, t1);
-                    off += stride * 2;
-                    i += 2;
-                  }
-                  // Handle odd remainder
-                  if (i < itersPerChunk) {
-                    std::array<Val, 4> t;
-                    ld_plain_v4(t, bufG + off);
-                    stwt_v4(dstAddr + off, t);
-                  }
-                }
-                ELSE {
-                  // Dynamic loop for partial last chunk
-                  auto i = widen(laneIdx * 16);
-                  WHILE(narrow(i) < size) {
-                    std::array<Val, 4> t;
-                    ld_plain_v4(t, bufG + i);
-                    stwt_v4(dstAddr + i, t);
-                    i += stride;
-                  }
-                }
-              } else {
-                // perWarpChunk < stride: always use dynamic loop
-                auto i = widen(laneIdx * 16);
-                WHILE(narrow(i) < size) {
-                  std::array<Val, 4> t;
-                  ld_plain_v4(t, bufG + i);
-                  stwt_v4(dstAddr + i, t);
-                  i += stride;
-                }
-              }
-              warp_sync();
-            }
-          };
-
           // Parity counters for each mbarrier (track phase advancement)
           auto parity0 = Val(ValType::U32);
           parity0 = 0;
@@ -483,7 +480,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             firstChunk = (firstChunk / 16) * 16;
 
             IF(firstChunk > 0) {
-              emitDma(wBuf0S, wMbar0, warpSrc, firstChunk);
+              emitBulkDma(config, singleLane, wBuf0S, wMbar0, warpSrc, firstChunk, laneIdx);
               warpSrc += widen(firstChunk);
               warpRemaining -= firstChunk;
             }
@@ -512,9 +509,9 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
                   warp_sync();
                 }
               }
-              emitDma(wBuf1S, wMbar1, warpSrc, nextChunk);
+              emitBulkDma(config, singleLane, wBuf1S, wMbar1, warpSrc, nextChunk, laneIdx);
               if (!config.bulkSkipWriteBack) {
-                emitWriteBack(wBuf0S, wBuf0G, warpDst, curChunk);
+                emitBulkWriteBack(config, singleLane, perWarpChunk, wBuf0S, wBuf0G, warpDst, curChunk, laneIdx);
               }
               parity0 = parity0 ^ 1;
             }
@@ -531,9 +528,9 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
                   warp_sync();
                 }
               }
-              emitDma(wBuf0S, wMbar0, warpSrc, nextChunk);
+              emitBulkDma(config, singleLane, wBuf0S, wMbar0, warpSrc, nextChunk, laneIdx);
               if (!config.bulkSkipWriteBack) {
-                emitWriteBack(wBuf1S, wBuf1G, warpDst, curChunk);
+                emitBulkWriteBack(config, singleLane, perWarpChunk, wBuf1S, wBuf1G, warpDst, curChunk, laneIdx);
               }
               parity1 = parity1 ^ 1;
             }
@@ -551,13 +548,13 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             IF(phase == 0) {
               WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
               if (!config.bulkSkipWriteBack) {
-                emitWriteBack(wBuf0S, wBuf0G, warpDst, curChunk);
+                emitBulkWriteBack(config, singleLane, perWarpChunk, wBuf0S, wBuf0G, warpDst, curChunk, laneIdx);
               }
             }
             ELSE {
               WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
               if (!config.bulkSkipWriteBack) {
-                emitWriteBack(wBuf1S, wBuf1G, warpDst, curChunk);
+                emitBulkWriteBack(config, singleLane, perWarpChunk, wBuf1S, wBuf1G, warpDst, curChunk, laneIdx);
               }
             }
             warpDst += widen(curChunk);
@@ -610,7 +607,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
           warp_sync(); // reconverge all lanes after single-lane pipeline
         }
       } else {
-        emitRegisterCopy(src, dst, bytes, tid, blockIdx);
+        emitRegisterCopy(config, src, dst, bytes, tid, blockIdx);
       }
 
       dd += 1;
