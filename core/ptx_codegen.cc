@@ -267,15 +267,6 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       smemMbar1SharedAddr = globalAddr(smemMbar1Sym.c_str());
       warpIdx = tid / 32;
       laneIdx = tid & 31;
-
-      // Each warp leader initializes its own mbarrier in both phase buffers
-      IF(laneIdx == 0) {
-        auto myMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
-        auto myMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
-        mbarrier_init(myMbar0, 1);
-        mbarrier_init(myMbar1, 1);
-      }
-      barrier_sync();
     }
 
     // =================================================================
@@ -301,7 +292,8 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     auto dd = Val(ValType::U32);
     dd = 0;
     WHILE(dd < numDescriptors) {
-      auto d = (blockIdx + dd) % numDescriptors;
+      // auto d = (blockIdx + dd) % numDescriptors;
+      auto d = dd;
 
       // Load descriptor fields: offset 16 + d * 24
       auto descAddr = params + 16 + widen(d) * 24;
@@ -319,170 +311,261 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
         //   3. Overlaps DMA of next chunk with write-back of current
         // =============================================================
 
-        // Distribute work across blocks
-        auto blockBytes = (bytes / GS / 16) * 16;
-        auto blockStart = widen(blockIdx * blockBytes);
-        src += blockStart;
-        dst += blockStart;
-        auto myBytes = Val(ValType::U32);
-        myBytes = blockBytes;
-        IF(blockIdx == GS - 1) {
-          myBytes = bytes - blockIdx * blockBytes;
+        // Re-initialize mbarriers for this descriptor (phase must start fresh)
+        IF(laneIdx == 0) {
+          auto myMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
+          auto myMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
+          mbarrier_init(myMbar0, 1);
+          mbarrier_init(myMbar1, 1);
+        }
+        barrier_sync();
+
+        // When both DMA and write-back are warp-leader bulk, only lane 0 does
+        // any real work. Guard the entire pipeline so the other 31 lanes idle,
+        // avoiding divergence overhead and unnecessary warp_sync barriers.
+        bool singleLane = config.bulkWarpLeaderDma && config.bulkWriteBack;
+        Val guard(ValType::Pred);
+        if (singleLane) {
+          guard = (laneIdx == 0);
+        } else {
+          guard = 1;
         }
 
-        // Distribute work across warps within this block
-        int perWarpChunk = bulkChunkSize / numWarps;
-        auto warpTotal = (myBytes / numWarps / 16) * 16;
-        auto warpStartOff = widen(warpIdx * warpTotal);
-        auto warpSrc = src + warpStartOff;
-        auto warpDst = dst + warpStartOff;
-        auto warpRemaining = Val(ValType::U32);
-        warpRemaining = warpTotal;
-        IF(warpIdx == numWarps - 1) {
-          warpRemaining = myBytes - warpIdx * warpTotal;
-        }
+        IF(guard) {
 
-        // Per-warp shared memory and mbarrier addresses
-        auto warpBufOff = widen(warpIdx) * perWarpChunk;
-        auto wBuf0S = smemBuf0SharedAddr + warpBufOff;
-        auto wBuf1S = smemBuf1SharedAddr + warpBufOff;
-        auto wBuf0G = smemBuf0GenAddr + warpBufOff;
-        auto wBuf1G = smemBuf1GenAddr + warpBufOff;
-        auto wMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
-        auto wMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
-
-        // Helpers to emit DMA and write-back (C++ lambdas, called at codegen time)
-        auto emitDma = [&](const Val& bufS, const Val& mbar, const Val& srcAddr, const Val& size) {
-          IF(laneIdx == 0) {
-            mbarrier_expect_tx(mbar, size);
+          // Distribute work across blocks
+          auto blockBytes = (bytes / GS / 16) * 16;
+          auto blockStart = widen(blockIdx * blockBytes);
+          src += blockStart;
+          dst += blockStart;
+          auto myBytes = Val(ValType::U32);
+          myBytes = blockBytes;
+          IF(blockIdx == GS - 1) {
+            myBytes = bytes - blockIdx * blockBytes;
           }
-          if (config.bulkWarpLeaderDma) {
-            IF(laneIdx == 0) {
+
+          // Distribute work across warps within this block
+          int perWarpChunk = bulkChunkSize / numWarps;
+          auto warpTotal = (myBytes / numWarps / 16) * 16;
+          auto warpStartOff = widen(warpIdx * warpTotal);
+          auto warpSrc = src + warpStartOff;
+          auto warpDst = dst + warpStartOff;
+          auto warpRemaining = Val(ValType::U32);
+          warpRemaining = warpTotal;
+          IF(warpIdx == numWarps - 1) {
+            warpRemaining = myBytes - warpIdx * warpTotal;
+          }
+
+          // Per-warp shared memory and mbarrier addresses
+          auto warpBufOff = widen(warpIdx) * perWarpChunk;
+          auto wBuf0S = smemBuf0SharedAddr + warpBufOff;
+          auto wBuf1S = smemBuf1SharedAddr + warpBufOff;
+          auto wBuf0G = smemBuf0GenAddr + warpBufOff;
+          auto wBuf1G = smemBuf1GenAddr + warpBufOff;
+          auto wMbar0 = smemMbar0SharedAddr + widen(warpIdx) * kMbarrierSize;
+          auto wMbar1 = smemMbar1SharedAddr + widen(warpIdx) * kMbarrierSize;
+
+          // Helpers to emit DMA and write-back (C++ lambdas, called at codegen time)
+          auto emitDma = [&](const Val& bufS, const Val& mbar, const Val& srcAddr, const Val& size) {
+            if (singleLane) {
+              // Single-lane: we ARE lane 0, no branching or sync needed
+              mbarrier_expect_tx(mbar, size);
               cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
               mbarrier_arrive(mbar);
+            } else {
+              IF(laneIdx == 0) {
+                mbarrier_expect_tx(mbar, size);
+              }
+              if (config.bulkWarpLeaderDma) {
+                IF(laneIdx == 0) {
+                  cp_async_bulk_shared_global(bufS, srcAddr, size, mbar);
+                  mbarrier_arrive(mbar);
+                }
+              } else {
+                auto pt = size / 32;
+                auto off = widen(laneIdx * pt);
+                cp_async_bulk_shared_global(bufS + off, srcAddr + off, pt, mbar);
+                IF(laneIdx == 0) {
+                  mbarrier_arrive(mbar);
+                }
+              }
+              warp_sync();
             }
-          } else {
-            auto pt = size / 32;
-            auto off = widen(laneIdx * pt);
-            cp_async_bulk_shared_global(bufS + off, srcAddr + off, pt, mbar);
-            IF(laneIdx == 0) {
-              mbarrier_arrive(mbar);
+          };
+
+          auto emitWriteBack = [&](const Val& bufS, const Val& bufG, const Val& dstAddr, const Val& size) {
+            if (singleLane) {
+              // Single-lane: fire-and-forget DMA, no branching or sync
+              cp_async_bulk_global_shared(dstAddr, bufS, size);
+              cp_async_bulk_commit_group();
+            } else if (config.bulkWriteBack) {
+              IF(laneIdx == 0) {
+                cp_async_bulk_global_shared(dstAddr, bufS, size);
+                cp_async_bulk_commit_group();
+              }
+              warp_sync();
+            } else {
+              // Register write-back: load from shared, store to global
+              auto i = widen(laneIdx * 16);
+              int64_t stride = 32 * 16;
+              WHILE(narrow(i) < size) {
+                std::array<Val, 4> t;
+                ld_plain_v4(t, bufG + i);
+                stwt_v4(dstAddr + i, t);
+                i += stride;
+              }
+              warp_sync();
+            }
+          };
+
+          // Parity counters for each mbarrier (track phase advancement)
+          auto parity0 = Val(ValType::U32);
+          parity0 = 0;
+          auto parity1 = Val(ValType::U32);
+          parity1 = 0;
+
+          // Phase: 0 = current data in buf0, 1 = current data in buf1
+          auto phase = Val(ValType::U32);
+          phase = 0;
+
+          // Track current chunk size for write-back
+          auto curChunk = Val(ValType::U32);
+          curChunk = 0;
+
+          // ---- Prolog: DMA first chunk into buf[0] ----
+          {
+            auto firstChunk = Val(ValType::U32);
+            firstChunk = warpRemaining;
+            IF(firstChunk > perWarpChunk) {
+              firstChunk = perWarpChunk;
+            }
+            firstChunk = (firstChunk / 16) * 16;
+
+            IF(firstChunk > 0) {
+              emitDma(wBuf0S, wMbar0, warpSrc, firstChunk);
+              warpSrc += widen(firstChunk);
+              warpRemaining -= firstChunk;
+            }
+            curChunk = firstChunk;
+          }
+
+          // ---- Main loop: overlap DMA and write-back ----
+          WHILE(warpRemaining >= 16) {
+            auto nextChunk = Val(ValType::U32);
+            nextChunk = warpRemaining;
+            IF(nextChunk > perWarpChunk) {
+              nextChunk = perWarpChunk;
+            }
+            nextChunk = (nextChunk / 16) * 16;
+
+            IF(phase == 0) {
+              // Wait for buf[0] DMA, start DMA into buf[1], write back buf[0]
+              WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
+              if (config.bulkWriteBack) {
+                if (singleLane) {
+                  cp_async_bulk_wait_group(1);
+                } else {
+                  IF(laneIdx == 0) {
+                    cp_async_bulk_wait_group(1);
+                  }
+                  warp_sync();
+                }
+              }
+              emitDma(wBuf1S, wMbar1, warpSrc, nextChunk);
+              if (!config.bulkSkipWriteBack) {
+                emitWriteBack(wBuf0S, wBuf0G, warpDst, curChunk);
+              }
+              parity0 = parity0 ^ 1;
+            }
+            ELSE {
+              // Wait for buf[1] DMA, start DMA into buf[0], write back buf[1]
+              WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
+              if (config.bulkWriteBack) {
+                if (singleLane) {
+                  cp_async_bulk_wait_group(1);
+                } else {
+                  IF(laneIdx == 0) {
+                    cp_async_bulk_wait_group(1);
+                  }
+                  warp_sync();
+                }
+              }
+              emitDma(wBuf0S, wMbar0, warpSrc, nextChunk);
+              if (!config.bulkSkipWriteBack) {
+                emitWriteBack(wBuf1S, wBuf1G, warpDst, curChunk);
+              }
+              parity1 = parity1 ^ 1;
+            }
+
+            warpDst += widen(curChunk);
+            warpSrc += widen(nextChunk);
+            warpRemaining -= nextChunk;
+            curChunk = nextChunk;
+            phase = phase ^ 1;
+          }
+
+          // ---- Epilog: write back last chunk ----
+          IF(curChunk > 0) {
+            IF(phase == 0) {
+              WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
+              if (!config.bulkSkipWriteBack) {
+                emitWriteBack(wBuf0S, wBuf0G, warpDst, curChunk);
+              }
+            }
+            ELSE {
+              WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
+              if (!config.bulkSkipWriteBack) {
+                emitWriteBack(wBuf1S, wBuf1G, warpDst, curChunk);
+              }
+            }
+            warpDst += widen(curChunk);
+          }
+
+          // ---- Tail: remaining bytes < 16, byte copy ----
+          if (!config.bulkSkipWriteBack) {
+            IF(warpRemaining > 0) {
+              if (singleLane) {
+                // Single lane: sequential byte copy
+                auto i = Val(ValType::U32);
+                i = 0;
+                WHILE(i < warpRemaining) {
+                  Val v(ValType::U32);
+                  ld_u8(v, warpSrc + widen(i));
+                  st_u8(warpDst + widen(i), v);
+                  i += 1;
+                }
+              } else {
+                // All lanes: strided byte copy
+                auto i = Val(ValType::U32);
+                i = laneIdx;
+                auto tailSrc = warpSrc + widen(laneIdx);
+                auto tailDst = warpDst + widen(laneIdx);
+                WHILE(i < warpRemaining) {
+                  Val v(ValType::U32);
+                  ld_u8(v, tailSrc);
+                  st_u8(tailDst, v);
+                  tailSrc += 32;
+                  tailDst += 32;
+                  i += 32;
+                }
+              }
             }
           }
-          warp_sync(); // reconverge after lane-0 divergence
-        };
-
-        auto emitWriteBack = [&](const Val& bufG, const Val& dstAddr, const Val& size) {
-          auto i = widen(laneIdx * 16);
-          int64_t stride = 32 * 16;
-          WHILE(narrow(i) < size) {
-            std::array<Val, 4> t;
-            ld_plain_v4(t, bufG + i);
-            stwt_v4(dstAddr + i, t);
-            i += stride;
-          }
-          warp_sync(); // reconverge after potentially divergent loop
-        };
-
-        // Parity counters for each mbarrier (track phase advancement)
-        auto parity0 = Val(ValType::U32);
-        parity0 = 0;
-        auto parity1 = Val(ValType::U32);
-        parity1 = 0;
-
-        // Phase: 0 = current data in buf0, 1 = current data in buf1
-        auto phase = Val(ValType::U32);
-        phase = 0;
-
-        // Track current chunk size for write-back
-        auto curChunk = Val(ValType::U32);
-        curChunk = 0;
-
-        // ---- Prolog: DMA first chunk into buf[0] ----
-        {
-          auto firstChunk = Val(ValType::U32);
-          firstChunk = warpRemaining;
-          IF(firstChunk > perWarpChunk) {
-            firstChunk = perWarpChunk;
-          }
-          firstChunk = (firstChunk / 16) * 16;
-
-          IF(firstChunk > 0) {
-            emitDma(wBuf0S, wMbar0, warpSrc, firstChunk);
-            warpSrc += widen(firstChunk);
-            warpRemaining -= firstChunk;
-          }
-          curChunk = firstChunk;
-        }
-
-        // ---- Main loop: overlap DMA and write-back ----
-        WHILE(warpRemaining >= 16) {
-          auto nextChunk = Val(ValType::U32);
-          nextChunk = warpRemaining;
-          IF(nextChunk > perWarpChunk) {
-            nextChunk = perWarpChunk;
-          }
-          nextChunk = (nextChunk / 16) * 16;
-
-          IF(phase == 0) {
-            // Wait for buf[0] DMA, start DMA into buf[1], write back buf[0]
-            WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
-            emitDma(wBuf1S, wMbar1, warpSrc, nextChunk);
-            if (!config.bulkSkipWriteBack) {
-              emitWriteBack(wBuf0G, warpDst, curChunk);
-            }
-            parity0 = parity0 ^ 1;
-          }
-          ELSE {
-            // Wait for buf[1] DMA, start DMA into buf[0], write back buf[1]
-            WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
-            emitDma(wBuf0S, wMbar0, warpSrc, nextChunk);
-            if (!config.bulkSkipWriteBack) {
-              emitWriteBack(wBuf1G, warpDst, curChunk);
-            }
-            parity1 = parity1 ^ 1;
-          }
-
-          warpDst += widen(curChunk);
-          warpSrc += widen(nextChunk);
-          warpRemaining -= nextChunk;
-          curChunk = nextChunk;
-          phase = phase ^ 1;
-        }
-
-        // ---- Epilog: write back last chunk ----
-        IF(curChunk > 0) {
-          IF(phase == 0) {
-            WHILE(!mbarrier_try_wait_parity(wMbar0, parity0)) {}
-            if (!config.bulkSkipWriteBack) {
-              emitWriteBack(wBuf0G, warpDst, curChunk);
+          // ---- Flush: wait for all write-back DMAs before next descriptor ----
+          if (config.bulkWriteBack && !config.bulkSkipWriteBack) {
+            if (singleLane) {
+              cp_async_bulk_wait_group(0);
+            } else {
+              IF(laneIdx == 0) {
+                cp_async_bulk_wait_group(0);
+              }
+              warp_sync();
             }
           }
-          ELSE {
-            WHILE(!mbarrier_try_wait_parity(wMbar1, parity1)) {}
-            if (!config.bulkSkipWriteBack) {
-              emitWriteBack(wBuf1G, warpDst, curChunk);
-            }
-          }
-          warpDst += widen(curChunk);
-        }
 
-        // ---- Tail: remaining bytes < 16, direct global→global byte copy ----
-        if (!config.bulkSkipWriteBack) {
-          IF(warpRemaining > 0) {
-            auto i = Val(ValType::U32);
-            i = laneIdx;
-            auto tailSrc = warpSrc + widen(laneIdx);
-            auto tailDst = warpDst + widen(laneIdx);
-            WHILE(i < warpRemaining) {
-              Val v(ValType::U32);
-              ld_u8(v, tailSrc);
-              st_u8(tailDst, v);
-              tailSrc += 32;
-              tailDst += 32;
-              i += 32;
-            }
-          }
+        } // end IF(guard)
+        if (singleLane) {
+          warp_sync(); // reconverge all lanes after single-lane pipeline
         }
       } else {
         emitRegisterCopy(src, dst, bytes, tid, blockIdx);
