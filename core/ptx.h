@@ -215,9 +215,11 @@ struct Val {
   explicit Val(ValType type);
   ~Val();
   Val(Val&& o) noexcept;
+  Val(const Val& o) noexcept {
+    *this = o;
+  }
   Val& operator=(Val&& o) noexcept;
-  Val& operator=(int64_t v); // emit mov with immediate
-  Val(const Val&) = delete;
+  Val& operator=(int64_t v);    // emit mov with immediate
   Val& operator=(const Val& o); // emit mov (same register type required)
 
   operator const Reg&() const {

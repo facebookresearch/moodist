@@ -219,7 +219,13 @@ void tuningCacheStore(const TuningKey& key, const TuningResult& result) {
 TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
   static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
   static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
-  static constexpr size_t gridSize = 8;
+  size_t gridSize = 8;
+  if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
+    int gs = atoi(env);
+    if (gs >= 1 && gs <= 128) {
+      gridSize = gs;
+    }
+  }
   static constexpr int warmupIters = 50;
   static constexpr int measuredIters = 100;
 
@@ -282,9 +288,15 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
   // Create stream and events for timing
   CUstream stream = nullptr;
   CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
-  CUevent startEvent = nullptr, stopEvent = nullptr;
-  CHECK_CU(cuEventCreate(&startEvent, CU_EVENT_DEFAULT));
-  CHECK_CU(cuEventCreate(&stopEvent, CU_EVENT_DEFAULT));
+  Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
+
+  auto createEvents = [&](int count) {
+    while ((int)events.size() < count * 2) {
+      CUevent e = nullptr;
+      CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
+      events.push_back(e);
+    }
+  };
 
   // stepValue counter — starts at 1, increments per launch.
   // All ranks iterate the same candidates so barriers stay in sync.
@@ -328,16 +340,20 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
         }
         CHECK_CU(cuStreamSynchronize(stream));
 
-        // Measured runs: track best (minimum) elapsed time
+        // Measured runs: record all events without synchronizing
+        createEvents(measuredIters);
+        for (int iter = 0; iter < measuredIters; iter++) {
+          CHECK_CU(cuEventRecord(events[iter * 2], stream));
+          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
+          CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
+        }
+        CHECK_CU(cuStreamSynchronize(stream));
+
+        // Query elapsed times
         float bestMs = INFINITY;
         for (int iter = 0; iter < measuredIters; iter++) {
-          CHECK_CU(cuEventRecord(startEvent, stream));
-          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-          CHECK_CU(cuEventRecord(stopEvent, stream));
-          CHECK_CU(cuEventSynchronize(stopEvent));
-
           float ms = 0.0f;
-          CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+          CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
           if (ms < bestMs) {
             bestMs = ms;
           }
@@ -357,8 +373,9 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
   }
 
   // Cleanup
-  cuEventDestroy(stopEvent);
-  cuEventDestroy(startEvent);
+  for (auto& e : events) {
+    cuEventDestroy(e);
+  }
   cuStreamDestroy(stream);
   cuMemFree(syntheticDst);
   cuMemFree(syntheticSrc);
@@ -375,7 +392,13 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
 TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
   static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
-  static constexpr size_t gridSize = 8;
+  size_t gridSize = 8;
+  if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
+    int gs = atoi(env);
+    if (gs >= 1 && gs <= 128) {
+      gridSize = gs;
+    }
+  }
   static constexpr int warmupIters = 2;
   static constexpr int measuredIters = 6;
 
@@ -437,9 +460,15 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   // Create stream and events for timing
   CUstream stream = nullptr;
   CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
-  CUevent startEvent = nullptr, stopEvent = nullptr;
-  CHECK_CU(cuEventCreate(&startEvent, CU_EVENT_DEFAULT));
-  CHECK_CU(cuEventCreate(&stopEvent, CU_EVENT_DEFAULT));
+  Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
+
+  auto createEvents = [&](int count) {
+    while ((int)events.size() < count * 2) {
+      CUevent e = nullptr;
+      CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
+      events.push_back(e);
+    }
+  };
 
   uint32_t stepValue = 1;
 
@@ -478,11 +507,13 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
         }
         // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
         if (chunk % (numWarps * 16) == 0) {
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true});
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true, false, false});
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true, false, true});
         }
         // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
         if (chunk % (bs * 16) == 0) {
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false});
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false, false, false});
+          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false, false, true});
         }
       }
     }
@@ -490,10 +521,14 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
 
   // Evaluate all candidates
   for (const auto& cfg : candidates) {
+    auto t0 = std::chrono::steady_clock::now();
     std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
+    double genSec = seconds(std::chrono::steady_clock::now() - t0);
 
+    t0 = std::chrono::steady_clock::now();
     CUmodule variantModule = nullptr;
     CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
+    double jitSec = seconds(std::chrono::steady_clock::now() - t0);
     if (jitErr != CUDA_SUCCESS) {
       if (verbose) {
         log.info("  %s depth=%d blockSize=%zu loadOp=%s -> JIT failed (error %d), skipping\n", cfg.copyEngine,
@@ -517,16 +552,22 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     }
     CHECK_CU(cuStreamSynchronize(stream));
 
-    // Measured runs: track best (minimum) elapsed time
+    // Measured runs: record all events without synchronizing
+    t0 = std::chrono::steady_clock::now();
+    createEvents(measuredIters);
+    for (int iter = 0; iter < measuredIters; iter++) {
+      CHECK_CU(cuEventRecord(events[iter * 2], stream));
+      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
+      CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
+    }
+    CHECK_CU(cuStreamSynchronize(stream));
+    double measureSec = seconds(std::chrono::steady_clock::now() - t0);
+
+    // Query elapsed times
     float bestMs = INFINITY;
     for (int iter = 0; iter < measuredIters; iter++) {
-      CHECK_CU(cuEventRecord(startEvent, stream));
-      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
-      CHECK_CU(cuEventRecord(stopEvent, stream));
-      CHECK_CU(cuEventSynchronize(stopEvent));
-
       float ms = 0.0f;
-      CHECK_CU(cuEventElapsedTime(&ms, startEvent, stopEvent));
+      CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
       if (ms < bestMs) {
         bestMs = ms;
       }
@@ -534,11 +575,12 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
 
     if (verbose) {
       if (!strcmp(cfg.copyEngine, "bulk")) {
-        log.info("  %s blockSize=%zu chunk=%zuK dma=%s -> %.3f ms\n", cfg.copyEngine, cfg.blockSize,
-            cfg.bulkChunkSize / 1024, cfg.bulkWarpLeaderDma ? "warp" : "thread", bestMs);
+        log.info("  %s blockSize=%zu chunk=%zuK dma=%s wb=%s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n",
+            cfg.copyEngine, cfg.blockSize, cfg.bulkChunkSize / 1024, cfg.bulkWarpLeaderDma ? "warp" : "thread",
+            cfg.bulkWriteBack ? "bulk" : "reg", bestMs, genSec, jitSec, measureSec);
       } else {
-        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> %.3f ms\n", cfg.copyEngine, cfg.depth, cfg.blockSize,
-            cfg.loadOp, bestMs);
+        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n",
+            cfg.copyEngine, cfg.depth, cfg.blockSize, cfg.loadOp, bestMs, genSec, jitSec, measureSec);
       }
     }
 
@@ -551,8 +593,9 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   }
 
   // Cleanup
-  cuEventDestroy(stopEvent);
-  cuEventDestroy(startEvent);
+  for (auto& e : events) {
+    cuEventDestroy(e);
+  }
   cuStreamDestroy(stream);
   cuMemFree(syntheticDst);
   cuMemFree(syntheticSrc);
@@ -1698,6 +1741,9 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
     }
     if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
       result.config.bulkSkipWriteBack = true;
+    }
+    if (std::getenv("MOODIST_BULK_WRITEBACK")) {
+      result.config.bulkWriteBack = true;
     }
 
     // Generate and compile the final kernel with the tuned config

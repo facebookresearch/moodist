@@ -38,6 +38,7 @@ struct CopyKernelConfig {
   size_t bulkChunkSize = 16384;   // staging buffer size for bulk engine (bytes)
   bool bulkWarpLeaderDma = true;  // true: 1 DMA per warp, false: 1 DMA per thread
   bool bulkSkipWriteBack = false; // debug: skip shared→global write-back
+  bool bulkWriteBack = false;     // true: use cp.async.bulk for write-back (shared→global DMA)
 };
 
 struct CompileOpKernels {

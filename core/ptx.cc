@@ -647,6 +647,10 @@ Val& Val::operator=(Val&& o) noexcept {
 Val& Val::operator=(int64_t v) {
   Operand imm(v);
   switch (regTypeFor(type)) {
+  case RegType::Pred:
+    // setp.eq.u32 %p, v, 1  →  true if v != 0, false if v == 0
+    emitInst("setp.ne.u32 " + reg.name + ", " + std::to_string(v) + ", 0");
+    break;
   case RegType::B32:
     mov_u32(reg, imm);
     break;
@@ -660,10 +664,17 @@ Val& Val::operator=(int64_t v) {
 }
 
 Val& Val::operator=(const Val& o) {
+  if (!valid) {
+    // Uninitialized: allocate a register matching the source type
+    *this = Val(o.type);
+  }
   if (regTypeFor(type) != regTypeFor(o.type)) {
     unsupported("=(Val) type mismatch", type);
   }
   switch (regTypeFor(type)) {
+  case RegType::Pred:
+    emitInst("mov.pred " + reg.name + ", " + o.reg.name);
+    break;
   case RegType::B32:
     mov_u32(reg, Operand(o.reg));
     break;

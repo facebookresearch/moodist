@@ -42,6 +42,12 @@ CompileOpKernels::CompileOpKernels(Group* group) : group(group) {
       blockSize = bs;
     }
   }
+  if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
+    int gs = atoi(env);
+    if (gs >= 1 && gs <= 128) {
+      gridSize = gs;
+    }
+  }
 }
 
 CompileOpKernels::~CompileOpKernels() {
