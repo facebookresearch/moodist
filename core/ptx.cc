@@ -215,12 +215,12 @@ static void emitInst(const std::string& inst) {
   currentBlock->emit(inst);
 }
 
-static std::string fmt3(const char* op, const Reg& d, const Operand& a, const Operand& b) {
-  return std::string(op) + " " + d.name + ", " + a.str + ", " + b.str;
+static std::string fmt3(const char* op, const Value& d, const Value& a, const Value& b) {
+  return std::string(op) + " " + d.str() + ", " + a.str() + ", " + b.str();
 }
 
-static std::string fmt2(const char* op, const Reg& d, const Operand& a) {
-  return std::string(op) + " " + d.name + ", " + a.str;
+static std::string fmt2(const char* op, const Value& d, const Value& a) {
+  return std::string(op) + " " + d.str() + ", " + a.str();
 }
 
 // ---------------------------------------------------------------------------
@@ -228,239 +228,239 @@ static std::string fmt2(const char* op, const Reg& d, const Operand& a) {
 // ---------------------------------------------------------------------------
 
 // Arithmetic
-void add_u32(const Reg& d, const Operand& a, const Operand& b) {
+void add_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("add.u32", d, a, b));
 }
-void add_s32(const Reg& d, const Operand& a, const Operand& b) {
+void add_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("add.s32", d, a, b));
 }
-void add_u64(const Reg& d, const Operand& a, const Operand& b) {
+void add_u64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("add.u64", d, a, b));
 }
-void add_s64(const Reg& d, const Operand& a, const Operand& b) {
+void add_s64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("add.s64", d, a, b));
 }
-void sub_u32(const Reg& d, const Operand& a, const Operand& b) {
+void sub_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("sub.u32", d, a, b));
 }
-void sub_s32(const Reg& d, const Operand& a, const Operand& b) {
+void sub_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("sub.s32", d, a, b));
 }
-void mul_lo_u32(const Reg& d, const Operand& a, const Operand& b) {
+void mul_lo_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.lo.u32", d, a, b));
 }
-void mul_lo_s32(const Reg& d, const Operand& a, const Operand& b) {
+void mul_lo_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.lo.s32", d, a, b));
 }
-void mul_lo_u64(const Reg& d, const Operand& a, const Operand& b) {
+void mul_lo_u64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.lo.u64", d, a, b));
 }
-void mul_lo_s64(const Reg& d, const Operand& a, const Operand& b) {
+void mul_lo_s64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.lo.s64", d, a, b));
 }
-void mul_wide_u32(const Reg& d, const Operand& a, const Operand& b) {
+void mul_wide_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.wide.u32", d, a, b));
 }
-void mul_wide_s32(const Reg& d, const Operand& a, const Operand& b) {
+void mul_wide_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.wide.s32", d, a, b));
 }
-void div_u32(const Reg& d, const Operand& a, const Operand& b) {
+void div_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("div.u32", d, a, b));
 }
-void div_s32(const Reg& d, const Operand& a, const Operand& b) {
+void div_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("div.s32", d, a, b));
 }
-void rem_u32(const Reg& d, const Operand& a, const Operand& b) {
+void rem_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("rem.u32", d, a, b));
 }
-void rem_s32(const Reg& d, const Operand& a, const Operand& b) {
+void rem_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("rem.s32", d, a, b));
 }
-void min_u32(const Reg& d, const Operand& a, const Operand& b) {
+void min_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("min.u32", d, a, b));
 }
-void min_s32(const Reg& d, const Operand& a, const Operand& b) {
+void min_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("min.s32", d, a, b));
 }
-void max_u32(const Reg& d, const Operand& a, const Operand& b) {
+void max_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("max.u32", d, a, b));
 }
-void max_s32(const Reg& d, const Operand& a, const Operand& b) {
+void max_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("max.s32", d, a, b));
 }
 
 // Bitwise
-void and_pred(const Reg& d, const Operand& a, const Operand& b) {
+void and_pred(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("and.pred", d, a, b));
 }
-void or_pred(const Reg& d, const Operand& a, const Operand& b) {
+void or_pred(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("or.pred", d, a, b));
 }
-void and_b32(const Reg& d, const Operand& a, const Operand& b) {
+void and_b32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("and.b32", d, a, b));
 }
-void and_b64(const Reg& d, const Operand& a, const Operand& b) {
+void and_b64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("and.b64", d, a, b));
 }
-void or_b32(const Reg& d, const Operand& a, const Operand& b) {
+void or_b32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("or.b32", d, a, b));
 }
-void or_b64(const Reg& d, const Operand& a, const Operand& b) {
+void or_b64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("or.b64", d, a, b));
 }
-void xor_b32(const Reg& d, const Operand& a, const Operand& b) {
+void xor_b32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("xor.b32", d, a, b));
 }
-void not_b32(const Reg& d, const Operand& a) {
+void not_b32(const Value& d, const Value& a) {
   emitInst(fmt2("not.b32", d, a));
 }
-void shl_b32(const Reg& d, const Operand& a, const Operand& b) {
+void shl_b32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shl.b32", d, a, b));
 }
-void shl_b64(const Reg& d, const Operand& a, const Operand& b) {
+void shl_b64(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shl.b64", d, a, b));
 }
-void shr_u32(const Reg& d, const Operand& a, const Operand& b) {
+void shr_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shr.u32", d, a, b));
 }
-void shr_s32(const Reg& d, const Operand& a, const Operand& b) {
+void shr_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shr.s32", d, a, b));
 }
 
 // Comparison
-void setp_eq_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_eq_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.eq.u32", p, a, b));
 }
-void setp_ne_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ne_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ne.u32", p, a, b));
 }
-void setp_lt_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_lt_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.lt.u32", p, a, b));
 }
-void setp_le_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_le_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.le.u32", p, a, b));
 }
-void setp_gt_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_gt_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.gt.u32", p, a, b));
 }
-void setp_ge_u32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ge_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ge.u32", p, a, b));
 }
-void setp_eq_s32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_eq_s32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.eq.s32", p, a, b));
 }
-void setp_ne_s32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ne_s32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ne.s32", p, a, b));
 }
-void setp_lt_s32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_lt_s32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.lt.s32", p, a, b));
 }
-void setp_ge_s32(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ge_s32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ge.s32", p, a, b));
 }
-void setp_ne_s64(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ne_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ne.s64", p, a, b));
 }
-void setp_lt_s64(const Reg& p, const Operand& a, const Operand& b) {
+void setp_lt_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.lt.s64", p, a, b));
 }
-void setp_ge_s64(const Reg& p, const Operand& a, const Operand& b) {
+void setp_ge_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ge.s64", p, a, b));
 }
 
 // Move
-void mov_u32(const Reg& d, const Operand& a) {
+void mov_u32(const Value& d, const Value& a) {
   emitInst(fmt2("mov.u32", d, a));
 }
-void mov_u64(const Reg& d, const Operand& a) {
+void mov_u64(const Value& d, const Value& a) {
   emitInst(fmt2("mov.u64", d, a));
 }
-void mov_b64(const Reg& d, const Operand& a) {
+void mov_b64(const Value& d, const Value& a) {
   emitInst(fmt2("mov.b64", d, a));
 }
 
 // Load
-void ld_param_u32(const Reg& d, const std::string& paramName) {
-  emitInst("ld.param.u32 " + d.name + ", [" + paramName + "]");
+void ld_param_u32(const Value& d, const std::string& paramName) {
+  emitInst("ld.param.u32 " + d.str() + ", [" + paramName + "]");
 }
-void ld_param_u64(const Reg& d, const std::string& paramName) {
-  emitInst("ld.param.u64 " + d.name + ", [" + paramName + "]");
+void ld_param_u64(const Value& d, const std::string& paramName) {
+  emitInst("ld.param.u64 " + d.str() + ", [" + paramName + "]");
 }
-void ld_param_u32(const Reg& d, const Reg& addr, int offset) {
-  emitInst("ld.param.u32 " + d.name + ", [" + addr.name + "+" + std::to_string(offset) + "]");
+void ld_param_u32(const Value& d, const Value& addr, int offset) {
+  emitInst("ld.param.u32 " + d.str() + ", [" + addr.str() + "+" + std::to_string(offset) + "]");
 }
-void ld_param_u64(const Reg& d, const Reg& addr, int offset) {
-  emitInst("ld.param.u64 " + d.name + ", [" + addr.name + "+" + std::to_string(offset) + "]");
+void ld_param_u64(const Value& d, const Value& addr, int offset) {
+  emitInst("ld.param.u64 " + d.str() + ", [" + addr.str() + "+" + std::to_string(offset) + "]");
 }
-void ld_global_u32(const Reg& d, const Operand& addr) {
-  emitInst("ld.global.u32 " + d.name + ", [" + addr.str + "]");
+void ld_global_u32(const Value& d, const Value& addr) {
+  emitInst("ld.global.u32 " + d.str() + ", [" + addr.str() + "]");
 }
-void ld_global_volatile_u32(const Reg& d, const Operand& addr) {
-  emitInst("ld.global.volatile.u32 " + d.name + ", [" + addr.str + "]");
+void ld_global_volatile_u32(const Value& d, const Value& addr) {
+  emitInst("ld.global.volatile.u32 " + d.str() + ", [" + addr.str() + "]");
 }
-void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
-  emitInst(
-      "ld.global.cv.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
+  emitInst("ld.global.cv.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" +
+           addr.str() + "]");
 }
-void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+void ld_global_cv_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   ld_global_cv_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
-void ld_global_nc_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
-  emitInst(
-      "ld.global.nc.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+void ld_global_nc_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
+  emitInst("ld.global.nc.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" +
+           addr.str() + "]");
 }
-void ld_global_nc_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+void ld_global_nc_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   ld_global_nc_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
-void ld_global_cs_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
-  emitInst(
-      "ld.global.cs.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+void ld_global_cs_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
+  emitInst("ld.global.cs.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" +
+           addr.str() + "]");
 }
-void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+void ld_global_cs_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   ld_global_cs_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
-void ld_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr) {
-  emitInst("ld.v4.u32 {" + d0.name + ", " + d1.name + ", " + d2.name + ", " + d3.name + "}, [" + addr.str + "]");
+void ld_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
+  emitInst("ld.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" + addr.str() + "]");
 }
-void ld_v4_u32(std::array<Val, 4>& v, const Operand& addr) {
+void ld_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   ld_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
-void ld_u8(const Reg& d, const Operand& addr) {
-  emitInst("ld.u8 " + d.name + ", [" + addr.str + "]");
+void ld_u8(const Value& d, const Value& addr) {
+  emitInst("ld.u8 " + d.str() + ", [" + addr.str() + "]");
 }
 
 // Store
-void st_global_u32(const Operand& addr, const Operand& val) {
-  emitInst("st.global.u32 [" + addr.str + "], " + val.str);
+void st_global_u32(const Value& addr, const Value& val) {
+  emitInst("st.global.u32 [" + addr.str() + "], " + val.str());
 }
-void st_global_volatile_u32(const Operand& addr, const Operand& val) {
-  emitInst("st.global.volatile.u32 [" + addr.str + "], " + val.str);
+void st_global_volatile_u32(const Value& addr, const Value& val) {
+  emitInst("st.global.volatile.u32 [" + addr.str() + "], " + val.str());
 }
-void ld_global_acquire_sys_u32(const Reg& d, const Operand& addr) {
-  emitInst("ld.acquire.sys.global.u32 " + d.name + ", [" + addr.str + "]");
+void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
+  emitInst("ld.acquire.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
 }
-void st_global_relaxed_sys_u32(const Operand& addr, const Operand& val) {
-  emitInst("st.relaxed.sys.global.u32 [" + addr.str + "], " + val.str);
+void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
+  emitInst("st.relaxed.sys.global.u32 [" + addr.str() + "], " + val.str());
 }
-void st_global_release_sys_u32(const Operand& addr, const Operand& val) {
-  emitInst("st.release.sys.global.u32 [" + addr.str + "], " + val.str);
+void st_global_release_sys_u32(const Value& addr, const Value& val) {
+  emitInst("st.release.sys.global.u32 [" + addr.str() + "], " + val.str());
 }
-void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3) {
-  emitInst(
-      "st.global.wt.v4.u32 [" + addr.str + "], {" + s0.name + ", " + s1.name + ", " + s2.name + ", " + s3.name + "}");
+void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, const Value& s2, const Value& s3) {
+  emitInst("st.global.wt.v4.u32 [" + addr.str() + "], {" + s0.str() + ", " + s1.str() + ", " + s2.str() + ", " +
+           s3.str() + "}");
 }
-void st_global_wt_v4_u32(const Operand& addr, const std::array<Val, 4>& v) {
+void st_global_wt_v4_u32(const Value& addr, const std::array<Value, 4>& v) {
   st_global_wt_v4_u32(addr, v[0], v[1], v[2], v[3]);
 }
-void st_u8(const Operand& addr, const Operand& val) {
-  emitInst("st.u8 [" + addr.str + "], " + val.str);
+void st_u8(const Value& addr, const Value& val) {
+  emitInst("st.u8 [" + addr.str() + "], " + val.str());
 }
 
 // Conversion
-void cvt_u64_u32(const Reg& d, const Operand& a) {
+void cvt_u64_u32(const Value& d, const Value& a) {
   emitInst(fmt2("cvt.u64.u32", d, a));
 }
-void cvt_u32_u64(const Reg& d, const Operand& a) {
+void cvt_u32_u64(const Value& d, const Value& a) {
   emitInst(fmt2("cvt.u32.u64", d, a));
 }
 
@@ -468,19 +468,19 @@ void cvt_u32_u64(const Reg& d, const Operand& a) {
 void bra(const Block* target) {
   emitInst("bra " + target->label);
 }
-void bra(const Reg& pred, const Block* target) {
-  emitInst("@" + pred.name + " bra " + target->label);
+void bra(const Value& pred, const Block* target) {
+  emitInst("@" + pred.str() + " bra " + target->label);
 }
-void bra_not(const Reg& pred, const Block* target) {
-  emitInst("@!" + pred.name + " bra " + target->label);
+void bra_not(const Value& pred, const Block* target) {
+  emitInst("@!" + pred.str() + " bra " + target->label);
 }
 void ret() {
   emitInst("ret");
 }
 
 // Atomic
-void atom_global_inc_u32(const Reg& d, const Operand& addr, const Operand& b) {
-  emitInst("atom.global.inc.u32 " + d.name + ", [" + addr.str + "], " + b.str);
+void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b) {
+  emitInst("atom.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
 }
 
 // Synchronization
@@ -496,41 +496,43 @@ void warp_sync(uint32_t membermask) {
   emitInst(std::string("bar.warp.sync ") + buf);
 }
 
-// mbarrier operations
-void mbarrier_init(const Val& addr, int count) {
-  emitInst("mbarrier.init.shared::cta.b64 [" + addr.reg.name + "], " + std::to_string(count));
+void trap() {
+  emitInst("trap");
 }
 
-Val mbarrier_arrive(const Val& addr) {
-  Val state(ValType::U64);
-  emitInst("mbarrier.arrive.shared::cta.b64 " + state.reg.name + ", [" + addr.reg.name + "]");
+// mbarrier operations
+void mbarrier_init(const Value& addr, int count) {
+  emitInst("mbarrier.init.shared::cta.b64 [" + addr.str() + "], " + std::to_string(count));
+}
+
+Value mbarrier_arrive(const Value& addr) {
+  Value state(ValType::U64);
+  emitInst("mbarrier.arrive.shared::cta.b64 " + state.str() + ", [" + addr.str() + "]");
   return state;
 }
 
-void mbarrier_expect_tx(const Val& addr, const Val& txCount) {
-  emitInst("mbarrier.expect_tx.shared::cta.b64 [" + addr.reg.name + "], " + txCount.reg.name);
+void mbarrier_expect_tx(const Value& addr, const Value& txCount) {
+  emitInst("mbarrier.expect_tx.shared::cta.b64 [" + addr.str() + "], " + txCount.str());
 }
 
-Val mbarrier_try_wait_parity(const Val& addr, const Val& phaseParity) {
-  Val result(ValType::Pred);
-  emitInst("mbarrier.try_wait.parity.shared::cta.b64 " + result.reg.name + ", [" + addr.reg.name + "], " +
-           phaseParity.reg.name);
+Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity) {
+  Value result(ValType::Pred);
+  emitInst("mbarrier.try_wait.parity.shared::cta.b64 " + result.str() + ", [" + addr.str() + "], " + phaseParity.str());
   return result;
 }
 
 // cp.async.bulk operations
-void cp_async_bulk_shared_global(const Val& dst, const Val& src, const Val& size, const Val& mbar) {
-  emitInst("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [" + dst.reg.name + "], [" + src.reg.name +
-           "], " + size.reg.name + ", [" + mbar.reg.name + "]");
+void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value& size, const Value& mbar) {
+  emitInst("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [" + dst.str() + "], [" + src.str() + "], " +
+           size.str() + ", [" + mbar.str() + "]");
 }
 
-void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size) {
-  emitInst(
-      "cp.async.bulk.global.shared::cta.bulk_group [" + dst.reg.name + "], [" + src.reg.name + "], " + size.reg.name);
+void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size) {
+  emitInst("cp.async.bulk.global.shared::cta.bulk_group [" + dst.str() + "], [" + src.str() + "], " + size.str());
 }
 
-void cp_async_bulk_prefetch_l2(const Val& src, const Val& size) {
-  emitInst("cp.async.bulk.prefetch.L2.global [" + src.reg.name + "], " + size.reg.name);
+void cp_async_bulk_prefetch_l2(const Value& src, const Value& size) {
+  emitInst("cp.async.bulk.prefetch.L2.global [" + src.str() + "], " + size.str());
 }
 
 void cp_async_bulk_commit_group() {
@@ -541,10 +543,18 @@ void cp_async_bulk_wait_group(int n) {
   emitInst("cp.async.bulk.wait_group " + std::to_string(n));
 }
 
+void bar_sync(int barrierId, int threadCount) {
+  emitInst("bar.sync " + std::to_string(barrierId) + ", " + std::to_string(threadCount));
+}
+
+void bar_sync(const Value& barrierId, int threadCount) {
+  emitInst("bar.sync " + barrierId.str() + ", " + std::to_string(threadCount));
+}
+
 // Shared memory address conversion
-Val cvta_shared(const Val& sharedAddr) {
-  Val result(ValType::U64);
-  emitInst("cvta.shared.u64 " + result.reg.name + ", " + sharedAddr.reg.name);
+Value cvta_shared(const Value& sharedAddr) {
+  Value result(ValType::U64);
+  emitInst("cvta.shared.u64 " + result.str() + ", " + sharedAddr.str());
   return result;
 }
 
@@ -581,7 +591,7 @@ RegType regTypeFor(ValType type) {
   return RegType::B32;
 }
 
-// --- Val ---
+// --- Value ---
 
 [[noreturn]] static void unsupported(const char* op, ValType type) {
   char buf[128];
@@ -589,7 +599,7 @@ RegType regTypeFor(ValType type) {
   throw std::runtime_error(buf);
 }
 
-Val::Val(ValType t) : type(t) {
+Value::Value(ValType t) : type(t), kind(Register) {
   RegType rt = regTypeFor(t);
   auto& free = freeRegs[(int)rt];
   int id;
@@ -605,27 +615,48 @@ Val::Val(ValType t) : type(t) {
   valid = true;
 }
 
-Val::~Val() {
-  if (valid) {
+Value::Value(int32_t v) : type(ValType::U32), kind(Immediate), immStr(std::to_string(v)) {}
+
+Value::Value(uint32_t v) : type(ValType::U32), kind(Immediate), immStr(std::to_string(v)) {}
+
+Value::Value(int64_t v) : type(ValType::U64), kind(Immediate), immStr(std::to_string(v)) {}
+
+Value::Value(uint64_t v) : type(ValType::U64), kind(Immediate), immStr(std::to_string(v)) {}
+
+Value::Value(const char* s) : type(ValType::U64), kind(Immediate), immStr(s) {}
+
+Value::Value(const Reg& r, ValType t) : reg(r), type(t), valid(true), kind(Register) {}
+
+const std::string& Value::str() const {
+  if (kind == Register) {
+    return reg.name;
+  }
+  return immStr;
+}
+
+Value::~Value() {
+  if (valid && kind == Register) {
     freeRegs[(int)reg.type].push_back(reg.id);
   }
 }
 
-Val::Val(Val&& o) noexcept : reg(std::move(o.reg)), type(o.type), valid(o.valid) {
+Value::Value(Value&& o) noexcept
+    : reg(std::move(o.reg)), type(o.type), valid(o.valid), kind(o.kind), immStr(std::move(o.immStr)) {
   o.valid = false;
+  o.kind = None;
 }
 
-Val& Val::operator=(Val&& o) noexcept {
+Value& Value::operator=(Value&& o) noexcept {
   if (this != &o) {
-    if (valid && o.valid) {
+    if (valid && kind == Register && o.valid && o.kind == Register) {
       // Already has a register in emitted PTX — emit mov to preserve it
       if (regTypeFor(type) == regTypeFor(o.type)) {
         switch (regTypeFor(type)) {
         case RegType::B32:
-          mov_u32(reg, Operand(o.reg));
+          mov_u32(*this, o);
           break;
         case RegType::B64:
-          mov_u64(reg, Operand(o.reg));
+          mov_u64(*this, o);
           break;
         default:
           break;
@@ -634,32 +665,34 @@ Val& Val::operator=(Val&& o) noexcept {
       // Free the source register
       freeRegs[(int)o.reg.type].push_back(o.reg.id);
       o.valid = false;
+      o.kind = None;
     } else {
       // Uninitialized destination — just transfer ownership
-      if (valid) {
+      if (valid && kind == Register) {
         freeRegs[(int)reg.type].push_back(reg.id);
       }
       reg = std::move(o.reg);
       type = o.type;
       valid = o.valid;
+      kind = o.kind;
+      immStr = std::move(o.immStr);
       o.valid = false;
+      o.kind = None;
     }
   }
   return *this;
 }
 
-Val& Val::operator=(int64_t v) {
-  Operand imm(v);
+Value& Value::operator=(int64_t v) {
   switch (regTypeFor(type)) {
   case RegType::Pred:
-    // setp.eq.u32 %p, v, 1  →  true if v != 0, false if v == 0
-    emitInst("setp.ne.u32 " + reg.name + ", " + std::to_string(v) + ", 0");
+    emitInst("setp.ne.u32 " + str() + ", " + std::to_string(v) + ", 0");
     break;
   case RegType::B32:
-    mov_u32(reg, imm);
+    mov_u32(*this, Value((int32_t)v));
     break;
   case RegType::B64:
-    mov_u64(reg, imm);
+    mov_u64(*this, Value(v));
     break;
   default:
     unsupported("=(imm)", type);
@@ -667,46 +700,70 @@ Val& Val::operator=(int64_t v) {
   return *this;
 }
 
-Val& Val::operator=(const Val& o) {
-  if (!valid) {
+Value& Value::operator=(const Value& o) {
+  if (!valid || kind != Register) {
     // Uninitialized: allocate a register matching the source type
-    *this = Val(o.type);
+    *this = Value(o.type);
   }
-  if (regTypeFor(type) != regTypeFor(o.type)) {
-    unsupported("=(Val) type mismatch", type);
-  }
-  switch (regTypeFor(type)) {
-  case RegType::Pred:
-    emitInst("mov.pred " + reg.name + ", " + o.reg.name);
-    break;
-  case RegType::B32:
-    mov_u32(reg, Operand(o.reg));
-    break;
-  case RegType::B64:
-    mov_u64(reg, Operand(o.reg));
-    break;
-  default:
-    unsupported("=(Val)", type);
+  if (o.kind == Register) {
+    if (regTypeFor(type) != regTypeFor(o.type)) {
+      unsupported("=(Value) type mismatch", type);
+    }
+    switch (regTypeFor(type)) {
+    case RegType::Pred:
+      emitInst("mov.pred " + str() + ", " + o.str());
+      break;
+    case RegType::B32:
+      mov_u32(*this, o);
+      break;
+    case RegType::B64:
+      mov_u64(*this, o);
+      break;
+    default:
+      unsupported("=(Value)", type);
+    }
+  } else {
+    // Source is an immediate — emit mov
+    switch (regTypeFor(type)) {
+    case RegType::Pred:
+      emitInst("setp.ne.u32 " + str() + ", " + o.immStr + ", 0");
+      break;
+    case RegType::B32:
+      mov_u32(*this, o);
+      break;
+    case RegType::B64:
+      mov_u64(*this, o);
+      break;
+    default:
+      unsupported("=(Value imm)", type);
+    }
   }
   return *this;
 }
 
+Value::operator const Reg&() const {
+  if (kind != Register) {
+    throw std::runtime_error("ptx: Value is not a register (cannot use as destination)");
+  }
+  return reg;
+}
+
 // --- Operators ---
 
-Val Val::operator+(const Operand& b) const {
-  Val result(type);
+Value Value::operator+(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    add_u32(result.reg, reg, b);
+    add_u32(result, *this, b);
     break;
   case ValType::S32:
-    add_s32(result.reg, reg, b);
+    add_s32(result, *this, b);
     break;
   case ValType::U64:
-    add_u64(result.reg, reg, b);
+    add_u64(result, *this, b);
     break;
   case ValType::S64:
-    add_s64(result.reg, reg, b);
+    add_s64(result, *this, b);
     break;
   default:
     unsupported("+", type);
@@ -714,14 +771,14 @@ Val Val::operator+(const Operand& b) const {
   return result;
 }
 
-Val Val::operator-(const Operand& b) const {
-  Val result(type);
+Value Value::operator-(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    sub_u32(result.reg, reg, b);
+    sub_u32(result, *this, b);
     break;
   case ValType::S32:
-    sub_s32(result.reg, reg, b);
+    sub_s32(result, *this, b);
     break;
   default:
     unsupported("-", type);
@@ -729,20 +786,20 @@ Val Val::operator-(const Operand& b) const {
   return result;
 }
 
-Val Val::operator*(const Operand& b) const {
-  Val result(type);
+Value Value::operator*(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    mul_lo_u32(result.reg, reg, b);
+    mul_lo_u32(result, *this, b);
     break;
   case ValType::S32:
-    mul_lo_s32(result.reg, reg, b);
+    mul_lo_s32(result, *this, b);
     break;
   case ValType::U64:
-    mul_lo_u64(result.reg, reg, b);
+    mul_lo_u64(result, *this, b);
     break;
   case ValType::S64:
-    mul_lo_s64(result.reg, reg, b);
+    mul_lo_s64(result, *this, b);
     break;
   default:
     unsupported("*", type);
@@ -750,14 +807,14 @@ Val Val::operator*(const Operand& b) const {
   return result;
 }
 
-Val Val::operator/(const Operand& b) const {
-  Val result(type);
+Value Value::operator/(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    div_u32(result.reg, reg, b);
+    div_u32(result, *this, b);
     break;
   case ValType::S32:
-    div_s32(result.reg, reg, b);
+    div_s32(result, *this, b);
     break;
   default:
     unsupported("/", type);
@@ -765,14 +822,14 @@ Val Val::operator/(const Operand& b) const {
   return result;
 }
 
-Val Val::operator%(const Operand& b) const {
-  Val result(type);
+Value Value::operator%(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    rem_u32(result.reg, reg, b);
+    rem_u32(result, *this, b);
     break;
   case ValType::S32:
-    rem_s32(result.reg, reg, b);
+    rem_s32(result, *this, b);
     break;
   default:
     unsupported("%", type);
@@ -780,17 +837,17 @@ Val Val::operator%(const Operand& b) const {
   return result;
 }
 
-Val Val::operator&(const Operand& b) const {
-  Val result(type);
+Value Value::operator&(const Value& b) const {
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::Pred:
-    and_pred(result.reg, reg, b);
+    and_pred(result, *this, b);
     break;
   case RegType::B32:
-    and_b32(result.reg, reg, b);
+    and_b32(result, *this, b);
     break;
   case RegType::B64:
-    and_b64(result.reg, reg, b);
+    and_b64(result, *this, b);
     break;
   default:
     unsupported("&", type);
@@ -798,17 +855,17 @@ Val Val::operator&(const Operand& b) const {
   return result;
 }
 
-Val Val::operator|(const Operand& b) const {
-  Val result(type);
+Value Value::operator|(const Value& b) const {
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::Pred:
-    or_pred(result.reg, reg, b);
+    or_pred(result, *this, b);
     break;
   case RegType::B32:
-    or_b32(result.reg, reg, b);
+    or_b32(result, *this, b);
     break;
   case RegType::B64:
-    or_b64(result.reg, reg, b);
+    or_b64(result, *this, b);
     break;
   default:
     unsupported("|", type);
@@ -816,11 +873,11 @@ Val Val::operator|(const Operand& b) const {
   return result;
 }
 
-Val Val::operator^(const Operand& b) const {
-  Val result(type);
+Value Value::operator^(const Value& b) const {
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    xor_b32(result.reg, reg, b);
+    xor_b32(result, *this, b);
     break;
   default:
     unsupported("^", type);
@@ -828,11 +885,11 @@ Val Val::operator^(const Operand& b) const {
   return result;
 }
 
-Val Val::operator~() const {
-  Val result(type);
+Value Value::operator~() const {
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    not_b32(result.reg, reg);
+    not_b32(result, *this);
     break;
   default:
     unsupported("~", type);
@@ -840,11 +897,11 @@ Val Val::operator~() const {
   return result;
 }
 
-Val Val::operator!() const {
-  Val result(ValType::Pred);
+Value Value::operator!() const {
+  Value result(ValType::Pred);
   switch (regTypeFor(type)) {
   case RegType::Pred:
-    emitInst("not.pred " + result.reg.name + ", " + reg.name);
+    emitInst("not.pred " + result.str() + ", " + str());
     break;
   default:
     unsupported("!", type);
@@ -852,14 +909,14 @@ Val Val::operator!() const {
   return result;
 }
 
-Val Val::operator<<(const Operand& b) const {
-  Val result(type);
+Value Value::operator<<(const Value& b) const {
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    shl_b32(result.reg, reg, b);
+    shl_b32(result, *this, b);
     break;
   case RegType::B64:
-    shl_b64(result.reg, reg, b);
+    shl_b64(result, *this, b);
     break;
   default:
     unsupported("<<", type);
@@ -867,14 +924,14 @@ Val Val::operator<<(const Operand& b) const {
   return result;
 }
 
-Val Val::operator>>(const Operand& b) const {
-  Val result(type);
+Value Value::operator>>(const Value& b) const {
+  Value result(type);
   switch (type) {
   case ValType::U32:
-    shr_u32(result.reg, reg, b);
+    shr_u32(result, *this, b);
     break;
   case ValType::S32:
-    shr_s32(result.reg, reg, b);
+    shr_s32(result, *this, b);
     break;
   default:
     unsupported(">>", type);
@@ -882,17 +939,17 @@ Val Val::operator>>(const Operand& b) const {
   return result;
 }
 
-Val Val::operator<(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator<(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_lt_u32(result.reg, reg, b);
+    setp_lt_u32(result, *this, b);
     break;
   case ValType::S32:
-    setp_lt_s32(result.reg, reg, b);
+    setp_lt_s32(result, *this, b);
     break;
   case ValType::S64:
-    setp_lt_s64(result.reg, reg, b);
+    setp_lt_s64(result, *this, b);
     break;
   default:
     unsupported("<", type);
@@ -900,11 +957,11 @@ Val Val::operator<(const Operand& b) const {
   return result;
 }
 
-Val Val::operator<=(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator<=(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_le_u32(result.reg, reg, b);
+    setp_le_u32(result, *this, b);
     break;
   default:
     unsupported("<=", type);
@@ -912,11 +969,11 @@ Val Val::operator<=(const Operand& b) const {
   return result;
 }
 
-Val Val::operator>(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator>(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_gt_u32(result.reg, reg, b);
+    setp_gt_u32(result, *this, b);
     break;
   default:
     unsupported(">", type);
@@ -924,17 +981,17 @@ Val Val::operator>(const Operand& b) const {
   return result;
 }
 
-Val Val::operator>=(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator>=(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_ge_u32(result.reg, reg, b);
+    setp_ge_u32(result, *this, b);
     break;
   case ValType::S32:
-    setp_ge_s32(result.reg, reg, b);
+    setp_ge_s32(result, *this, b);
     break;
   case ValType::S64:
-    setp_ge_s64(result.reg, reg, b);
+    setp_ge_s64(result, *this, b);
     break;
   default:
     unsupported(">=", type);
@@ -942,14 +999,14 @@ Val Val::operator>=(const Operand& b) const {
   return result;
 }
 
-Val Val::operator==(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator==(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_eq_u32(result.reg, reg, b);
+    setp_eq_u32(result, *this, b);
     break;
   case ValType::S32:
-    setp_eq_s32(result.reg, reg, b);
+    setp_eq_s32(result, *this, b);
     break;
   default:
     unsupported("==", type);
@@ -957,17 +1014,17 @@ Val Val::operator==(const Operand& b) const {
   return result;
 }
 
-Val Val::operator!=(const Operand& b) const {
-  Val result(ValType::Pred);
+Value Value::operator!=(const Value& b) const {
+  Value result(ValType::Pred);
   switch (type) {
   case ValType::U32:
-    setp_ne_u32(result.reg, reg, b);
+    setp_ne_u32(result, *this, b);
     break;
   case ValType::S32:
-    setp_ne_s32(result.reg, reg, b);
+    setp_ne_s32(result, *this, b);
     break;
   case ValType::S64:
-    setp_ne_s64(result.reg, reg, b);
+    setp_ne_s64(result, *this, b);
     break;
   default:
     unsupported("!=", type);
@@ -975,87 +1032,87 @@ Val Val::operator!=(const Operand& b) const {
   return result;
 }
 
-void Val::operator+=(const Operand& b) {
+void Value::operator+=(const Value& b) {
   switch (type) {
   case ValType::U32:
-    add_u32(reg, reg, b);
+    add_u32(*this, *this, b);
     break;
   case ValType::S32:
-    add_s32(reg, reg, b);
+    add_s32(*this, *this, b);
     break;
   case ValType::U64:
-    add_u64(reg, reg, b);
+    add_u64(*this, *this, b);
     break;
   case ValType::S64:
-    add_s64(reg, reg, b);
+    add_s64(*this, *this, b);
     break;
   default:
     unsupported("+=", type);
   }
 }
 
-void Val::operator-=(const Operand& b) {
+void Value::operator-=(const Value& b) {
   switch (type) {
   case ValType::U32:
-    sub_u32(reg, reg, b);
+    sub_u32(*this, *this, b);
     break;
   case ValType::S32:
-    sub_s32(reg, reg, b);
+    sub_s32(*this, *this, b);
     break;
   default:
     unsupported("-=", type);
   }
 }
 
-void Val::operator*=(const Operand& b) {
+void Value::operator*=(const Value& b) {
   switch (type) {
   case ValType::U32:
-    mul_lo_u32(reg, reg, b);
+    mul_lo_u32(*this, *this, b);
     break;
   case ValType::S32:
-    mul_lo_s32(reg, reg, b);
+    mul_lo_s32(*this, *this, b);
     break;
   case ValType::U64:
-    mul_lo_u64(reg, reg, b);
+    mul_lo_u64(*this, *this, b);
     break;
   case ValType::S64:
-    mul_lo_s64(reg, reg, b);
+    mul_lo_s64(*this, *this, b);
     break;
   default:
     unsupported("*=", type);
   }
 }
 
-void Val::operator/=(const Operand& b) {
+void Value::operator/=(const Value& b) {
   switch (type) {
   case ValType::U32:
-    div_u32(reg, reg, b);
+    div_u32(*this, *this, b);
     break;
   case ValType::S32:
-    div_s32(reg, reg, b);
+    div_s32(*this, *this, b);
     break;
   default:
     unsupported("/=", type);
   }
 }
 
-void Val::operator%=(const Operand& b) {
+void Value::operator%=(const Value& b) {
   switch (type) {
   case ValType::U32:
-    rem_u32(reg, reg, b);
+    rem_u32(*this, *this, b);
     break;
   case ValType::S32:
-    rem_s32(reg, reg, b);
+    rem_s32(*this, *this, b);
     break;
   default:
     unsupported("%=", type);
   }
 }
 
-void Val::operator^=(const Operand& b) {
+void Value::operator^=(const Value& b) {
   switch (regTypeFor(type)) {
   case RegType::B32:
-    xor_b32(reg, reg, b);
+    xor_b32(*this, *this, b);
     break;
   default:
     unsupported("^=", type);
@@ -1104,12 +1161,16 @@ Block* activateNewBlock(const char* prefix) {
 // --- ScopeGuard ---
 
 ScopeGuard::ScopeGuard(ScopeGuard&& o) noexcept
-    : pendingBlock(std::move(o.pendingBlock)), backEdgeTarget(o.backEdgeTarget), closed(o.closed) {
+    : pendingBlock(std::move(o.pendingBlock)), backEdgeTarget(o.backEdgeTarget), stepFn(std::move(o.stepFn)),
+      closed(o.closed) {
   o.closed = true;
 }
 
 ScopeGuard::~ScopeGuard() {
   if (!closed) {
+    if (stepFn) {
+      stepFn();
+    }
     if (backEdgeTarget) {
       bra(backEdgeTarget);
     }
@@ -1121,7 +1182,7 @@ ScopeGuard::~ScopeGuard() {
 
 // --- Control flow ---
 
-ScopeGuard _If(const Reg& pred) {
+ScopeGuard _If(const Value& pred) {
   ScopeGuard sg;
   // Create skip block (forward reference, not yet in function)
   sg.pendingBlock = std::make_unique<Block>();
@@ -1146,7 +1207,7 @@ ScopeGuard _Else() {
   return sg;
 }
 
-ScopeGuard _WhileImpl(Block* header, const Reg& pred) {
+ScopeGuard _WhileImpl(Block* header, const Value& pred) {
   ScopeGuard sg;
   // Create exit block (forward reference, not yet in function)
   sg.pendingBlock = std::make_unique<Block>();
@@ -1161,33 +1222,33 @@ ScopeGuard _WhileImpl(Block* header, const Reg& pred) {
 
 // --- Convenience functions ---
 
-Val threadIdx_x() {
-  Val v(ValType::U32);
-  mov_u32(v.reg, "%tid.x");
+Value threadIdx_x() {
+  Value v(ValType::U32);
+  mov_u32(v, "%tid.x");
   return v;
 }
 
-Val blockIdx_x() {
-  Val v(ValType::U32);
-  mov_u32(v.reg, "%ctaid.x");
+Value blockIdx_x() {
+  Value v(ValType::U32);
+  mov_u32(v, "%ctaid.x");
   return v;
 }
 
-Val blockDim_x() {
-  Val v(ValType::U32);
-  mov_u32(v.reg, "%ntid.x");
+Value blockDim_x() {
+  Value v(ValType::U32);
+  mov_u32(v, "%ntid.x");
   return v;
 }
 
-Val loadParam(int index, ValType type) {
-  Val v(type);
+Value loadParam(int index, ValType type) {
+  Value v(type);
   std::string paramName = currentFunction->param(index);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    ld_param_u32(v.reg, paramName);
+    ld_param_u32(v, paramName);
     break;
   case RegType::B64:
-    ld_param_u64(v.reg, paramName);
+    ld_param_u64(v, paramName);
     break;
   default:
     unsupported("loadParam", type);
@@ -1195,20 +1256,20 @@ Val loadParam(int index, ValType type) {
   return v;
 }
 
-Val paramBase(int index) {
-  Val v(ValType::U64);
-  mov_b64(v.reg, Operand(currentFunction->param(index).c_str()));
+Value paramBase(int index) {
+  Value v(ValType::U64);
+  mov_b64(v, Value(currentFunction->param(index).c_str()));
   return v;
 }
 
-Val loadParamField(const Val& base, int offset, ValType type) {
-  Val v(type);
+Value loadParamField(const Value& base, int offset, ValType type) {
+  Value v(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    ld_param_u32(v.reg, base.reg, offset);
+    ld_param_u32(v, base, offset);
     break;
   case RegType::B64:
-    ld_param_u64(v.reg, base.reg, offset);
+    ld_param_u64(v, base, offset);
     break;
   default:
     unsupported("loadParamField", type);
@@ -1216,7 +1277,7 @@ Val loadParamField(const Val& base, int offset, ValType type) {
   return v;
 }
 
-Val widen(const Val& v) {
+Value widen(const Value& v) {
   ValType wide;
   switch (v.type) {
   case ValType::U32:
@@ -1228,12 +1289,12 @@ Val widen(const Val& v) {
   default:
     unsupported("widen", v.type);
   }
-  Val result(wide);
-  cvt_u64_u32(result.reg, v.reg);
+  Value result(wide);
+  cvt_u64_u32(result, v);
   return result;
 }
 
-Val narrow(const Val& v) {
+Value narrow(const Value& v) {
   ValType n;
   switch (v.type) {
   case ValType::U64:
@@ -1245,26 +1306,26 @@ Val narrow(const Val& v) {
   default:
     unsupported("narrow", v.type);
   }
-  Val result(n);
-  cvt_u32_u64(result.reg, v.reg);
+  Value result(n);
+  cvt_u32_u64(result, v);
   return result;
 }
 
-void storeGlobal(const Val& addr, const Val& val) {
+void storeGlobal(const Value& addr, const Value& val) {
   switch (regTypeFor(val.type)) {
   case RegType::B32:
-    st_global_u32(addr.reg, val.reg);
+    st_global_u32(addr, val);
     break;
   default:
     unsupported("storeGlobal", val.type);
   }
 }
 
-Val loadGlobalVolatile(const Val& addr, ValType type) {
-  Val v(type);
+Value loadGlobalVolatile(const Value& addr, ValType type) {
+  Value v(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    ld_global_volatile_u32(v.reg, addr.reg);
+    ld_global_volatile_u32(v, addr);
     break;
   default:
     unsupported("loadGlobalVolatile", type);
@@ -1272,21 +1333,21 @@ Val loadGlobalVolatile(const Val& addr, ValType type) {
   return v;
 }
 
-void storeGlobalVolatile(const Val& addr, const Val& val) {
+void storeGlobalVolatile(const Value& addr, const Value& val) {
   switch (regTypeFor(val.type)) {
   case RegType::B32:
-    st_global_volatile_u32(addr.reg, val.reg);
+    st_global_volatile_u32(addr, val);
     break;
   default:
     unsupported("storeGlobalVolatile", val.type);
   }
 }
 
-Val loadGlobalAcquireSys(const Val& addr, ValType type) {
-  Val v(type);
+Value loadGlobalAcquireSys(const Value& addr, ValType type) {
+  Value v(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
-    ld_global_acquire_sys_u32(v.reg, addr.reg);
+    ld_global_acquire_sys_u32(v, addr);
     break;
   default:
     unsupported("loadGlobalAcquireSys", type);
@@ -1294,119 +1355,119 @@ Val loadGlobalAcquireSys(const Val& addr, ValType type) {
   return v;
 }
 
-void storeGlobalRelaxedSys(const Val& addr, const Val& val) {
+void storeGlobalRelaxedSys(const Value& addr, const Value& val) {
   switch (regTypeFor(val.type)) {
   case RegType::B32:
-    st_global_relaxed_sys_u32(addr.reg, val.reg);
+    st_global_relaxed_sys_u32(addr, val);
     break;
   default:
     unsupported("storeGlobalRelaxedSys", val.type);
   }
 }
 
-void storeGlobalReleaseSys(const Val& addr, const Val& val) {
+void storeGlobalReleaseSys(const Value& addr, const Value& val) {
   switch (regTypeFor(val.type)) {
   case RegType::B32:
-    st_global_release_sys_u32(addr.reg, val.reg);
+    st_global_release_sys_u32(addr, val);
     break;
   default:
     unsupported("storeGlobalReleaseSys", val.type);
   }
 }
 
-void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+void ldcv_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr) {
   if (!v0.valid) {
-    v0 = Val(ValType::U32);
+    v0 = Value(ValType::U32);
   }
   if (!v1.valid) {
-    v1 = Val(ValType::U32);
+    v1 = Value(ValType::U32);
   }
   if (!v2.valid) {
-    v2 = Val(ValType::U32);
+    v2 = Value(ValType::U32);
   }
   if (!v3.valid) {
-    v3 = Val(ValType::U32);
+    v3 = Value(ValType::U32);
   }
-  ld_global_cv_v4_u32(v0, v1, v2, v3, addr.reg);
+  ld_global_cv_v4_u32(v0, v1, v2, v3, addr);
 }
 
-void ldcv_v4(std::array<Val, 4>& v, const Val& addr) {
+void ldcv_v4(std::array<Value, 4>& v, const Value& addr) {
   ldcv_v4(v[0], v[1], v[2], v[3], addr);
 }
 
-void ldnc_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+void ldnc_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr) {
   if (!v0.valid) {
-    v0 = Val(ValType::U32);
+    v0 = Value(ValType::U32);
   }
   if (!v1.valid) {
-    v1 = Val(ValType::U32);
+    v1 = Value(ValType::U32);
   }
   if (!v2.valid) {
-    v2 = Val(ValType::U32);
+    v2 = Value(ValType::U32);
   }
   if (!v3.valid) {
-    v3 = Val(ValType::U32);
+    v3 = Value(ValType::U32);
   }
-  ld_global_nc_v4_u32(v0, v1, v2, v3, addr.reg);
+  ld_global_nc_v4_u32(v0, v1, v2, v3, addr);
 }
 
-void ldnc_v4(std::array<Val, 4>& v, const Val& addr) {
+void ldnc_v4(std::array<Value, 4>& v, const Value& addr) {
   ldnc_v4(v[0], v[1], v[2], v[3], addr);
 }
 
-void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr) {
+void ldcs_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr) {
   if (!v0.valid) {
-    v0 = Val(ValType::U32);
+    v0 = Value(ValType::U32);
   }
   if (!v1.valid) {
-    v1 = Val(ValType::U32);
+    v1 = Value(ValType::U32);
   }
   if (!v2.valid) {
-    v2 = Val(ValType::U32);
+    v2 = Value(ValType::U32);
   }
   if (!v3.valid) {
-    v3 = Val(ValType::U32);
+    v3 = Value(ValType::U32);
   }
-  ld_global_cs_v4_u32(v0, v1, v2, v3, addr.reg);
+  ld_global_cs_v4_u32(v0, v1, v2, v3, addr);
 }
 
-void ldcs_v4(std::array<Val, 4>& v, const Val& addr) {
+void ldcs_v4(std::array<Value, 4>& v, const Value& addr) {
   ldcs_v4(v[0], v[1], v[2], v[3], addr);
 }
 
-void ld_plain_v4(std::array<Val, 4>& v, const Val& addr) {
+void ld_plain_v4(std::array<Value, 4>& v, const Value& addr) {
   for (auto& vi : v) {
     if (!vi.valid) {
-      vi = Val(ValType::U32);
+      vi = Value(ValType::U32);
     }
   }
-  ld_v4_u32(v, addr.reg);
+  ld_v4_u32(v, addr);
 }
 
-void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3) {
-  st_global_wt_v4_u32(addr.reg, v0, v1, v2, v3);
+void stwt_v4(const Value& addr, const Value& v0, const Value& v1, const Value& v2, const Value& v3) {
+  st_global_wt_v4_u32(addr, v0, v1, v2, v3);
 }
 
-void stwt_v4(const Val& addr, const std::array<Val, 4>& v) {
+void stwt_v4(const Value& addr, const std::array<Value, 4>& v) {
   stwt_v4(addr, v[0], v[1], v[2], v[3]);
 }
 
-Val atomicInc(const Val& addr, const Operand& modulo) {
-  Val result(ValType::U32);
-  atom_global_inc_u32(result.reg, addr.reg, modulo);
+Value atomicInc(const Value& addr, const Value& modulo) {
+  Value result(ValType::U32);
+  atom_global_inc_u32(result, addr, modulo);
   return result;
 }
 
-Val globalAddr(const char* name) {
-  Val v(ValType::U64);
-  mov_u64(v.reg, Operand(name));
+Value globalAddr(const char* name) {
+  Value v(ValType::U64);
+  mov_u64(v, Value(name));
   return v;
 }
 
-Operand hexImm(uintptr_t value) {
+Value hexImm(uintptr_t value) {
   char buf[32];
   snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)value);
-  return Operand(buf);
+  return Value(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,10 +1532,10 @@ std::string ptxTest(const char* target) {
       auto dstAddr = dst + byteOff;
 
       // Load 4 x u32 from src
-      Val v0(ValType::U32);
-      Val v1(ValType::U32);
-      Val v2(ValType::U32);
-      Val v3(ValType::U32);
+      Value v0(ValType::U32);
+      Value v1(ValType::U32);
+      Value v2(ValType::U32);
+      Value v3(ValType::U32);
       ld_global_cv_v4_u32(v0, v1, v2, v3, srcAddr);
 
       // Store 4 x u32 to dst
@@ -1484,7 +1545,7 @@ std::string ptxTest(const char* target) {
       // Out of bounds — write zeros to dst
       auto byteOff = widen(base) * 4;
       auto dstAddr = dst + byteOff;
-      Val zero(ValType::U32);
+      Value zero(ValType::U32);
       zero = 0;
       st_global_wt_v4_u32(dstAddr, zero, zero, zero, zero);
     }
@@ -1521,7 +1582,7 @@ std::string ptxTest(const char* target) {
       auto byteOff = widen(i) * 4;
       auto srcAddr = src + byteOff;
       auto dstAddr = dst + byteOff;
-      auto val = Val(ValType::U32);
+      auto val = Value(ValType::U32);
       ld_global_u32(val, srcAddr);
       st_global_u32(dstAddr, val);
       i += bdim;
@@ -1559,7 +1620,7 @@ std::string ptxTest(const char* target) {
       auto off = widen(tid);
       auto srcAddr = src + off;
       auto dstAddr = dst + off;
-      Val v(ValType::U32);
+      Value v(ValType::U32);
       ld_global_u32(v, srcAddr);
       st_global_u32(dstAddr, v);
     }

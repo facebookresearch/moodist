@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,17 +19,6 @@ struct Reg {
   RegType type;
   int id;
   std::string name; // "%p0", "%rs0", "%r0", "%rd0"
-};
-
-// Instruction operand — wraps a register, immediate, or special name.
-struct Operand {
-  std::string str;
-  Operand(const Reg& r) : str(r.name) {}
-  Operand(int32_t v) : str(std::to_string(v)) {}
-  Operand(uint32_t v) : str(std::to_string(v)) {}
-  Operand(int64_t v) : str(std::to_string(v)) {}
-  Operand(uint64_t v) : str(std::to_string(v)) {}
-  Operand(const char* s) : str(s) {} // for "%tid.x" etc.
 };
 
 // A basic block: labeled sequence of instructions.
@@ -95,106 +85,6 @@ void setBlock(Block* b);
 Reg reg(RegType type);
 
 // ---------------------------------------------------------------------------
-// Free-standing instruction helpers (emit to currentBlock)
-// ---------------------------------------------------------------------------
-
-// Arithmetic
-void add_u32(const Reg& d, const Operand& a, const Operand& b);
-void add_s32(const Reg& d, const Operand& a, const Operand& b);
-void add_u64(const Reg& d, const Operand& a, const Operand& b);
-void add_s64(const Reg& d, const Operand& a, const Operand& b);
-void sub_u32(const Reg& d, const Operand& a, const Operand& b);
-void sub_s32(const Reg& d, const Operand& a, const Operand& b);
-void mul_lo_u32(const Reg& d, const Operand& a, const Operand& b);
-void mul_lo_s32(const Reg& d, const Operand& a, const Operand& b);
-void mul_lo_u64(const Reg& d, const Operand& a, const Operand& b);
-void mul_lo_s64(const Reg& d, const Operand& a, const Operand& b);
-void mul_wide_u32(const Reg& d, const Operand& a, const Operand& b);
-void mul_wide_s32(const Reg& d, const Operand& a, const Operand& b);
-void div_u32(const Reg& d, const Operand& a, const Operand& b);
-void div_s32(const Reg& d, const Operand& a, const Operand& b);
-void rem_u32(const Reg& d, const Operand& a, const Operand& b);
-void rem_s32(const Reg& d, const Operand& a, const Operand& b);
-void min_u32(const Reg& d, const Operand& a, const Operand& b);
-void min_s32(const Reg& d, const Operand& a, const Operand& b);
-void max_u32(const Reg& d, const Operand& a, const Operand& b);
-void max_s32(const Reg& d, const Operand& a, const Operand& b);
-
-// Bitwise
-void and_pred(const Reg& d, const Operand& a, const Operand& b);
-void or_pred(const Reg& d, const Operand& a, const Operand& b);
-void and_b32(const Reg& d, const Operand& a, const Operand& b);
-void and_b64(const Reg& d, const Operand& a, const Operand& b);
-void or_b32(const Reg& d, const Operand& a, const Operand& b);
-void or_b64(const Reg& d, const Operand& a, const Operand& b);
-void xor_b32(const Reg& d, const Operand& a, const Operand& b);
-void not_b32(const Reg& d, const Operand& a);
-void shl_b32(const Reg& d, const Operand& a, const Operand& b);
-void shl_b64(const Reg& d, const Operand& a, const Operand& b);
-void shr_u32(const Reg& d, const Operand& a, const Operand& b);
-void shr_s32(const Reg& d, const Operand& a, const Operand& b);
-
-// Comparison
-void setp_eq_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_ne_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_lt_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_le_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_gt_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_ge_u32(const Reg& p, const Operand& a, const Operand& b);
-void setp_eq_s32(const Reg& p, const Operand& a, const Operand& b);
-void setp_ne_s32(const Reg& p, const Operand& a, const Operand& b);
-void setp_lt_s32(const Reg& p, const Operand& a, const Operand& b);
-void setp_ge_s32(const Reg& p, const Operand& a, const Operand& b);
-void setp_ne_s64(const Reg& p, const Operand& a, const Operand& b);
-void setp_lt_s64(const Reg& p, const Operand& a, const Operand& b);
-void setp_ge_s64(const Reg& p, const Operand& a, const Operand& b);
-
-// Move
-void mov_u32(const Reg& d, const Operand& a);
-void mov_u64(const Reg& d, const Operand& a);
-void mov_b64(const Reg& d, const Operand& a);
-
-// Load
-void ld_param_u32(const Reg& d, const std::string& paramName);
-void ld_param_u64(const Reg& d, const std::string& paramName);
-void ld_param_u32(const Reg& d, const Reg& addr, int offset);
-void ld_param_u64(const Reg& d, const Reg& addr, int offset);
-void ld_global_u32(const Reg& d, const Operand& addr);
-void ld_global_volatile_u32(const Reg& d, const Operand& addr);
-void ld_global_cv_v4_u32(const Reg& d0, const Reg& d1, const Reg& d2, const Reg& d3, const Operand& addr);
-void ld_u8(const Reg& d, const Operand& addr);
-
-// Store
-void st_global_u32(const Operand& addr, const Operand& val);
-void st_global_volatile_u32(const Operand& addr, const Operand& val);
-void st_global_wt_v4_u32(const Operand& addr, const Reg& s0, const Reg& s1, const Reg& s2, const Reg& s3);
-void st_u8(const Operand& addr, const Operand& val);
-
-// Conversion
-void cvt_u64_u32(const Reg& d, const Operand& a);
-void cvt_u32_u64(const Reg& d, const Operand& a);
-
-// Control flow
-void bra(const Block* target);
-void bra(const Reg& pred, const Block* target);
-void bra_not(const Reg& pred, const Block* target);
-void ret();
-
-// Atomic
-void atom_global_inc_u32(const Reg& d, const Operand& addr, const Operand& b);
-
-// Synchronization
-void barrier_sync(int n = 0);
-void membar_sys();
-void warp_sync(uint32_t membermask = 0xFFFFFFFF);
-
-// Raw emit (escape hatch)
-void emit(const std::string& inst);
-
-// Test function: generates simple kernels and returns the PTX string.
-std::string ptxTest(const char* target = "sm_90a");
-
-// ---------------------------------------------------------------------------
 // DSL layer — typed values, RAII registers, operators, control flow
 // ---------------------------------------------------------------------------
 
@@ -204,65 +94,184 @@ enum class ValType { Pred, U16, S16, U32, S32, U64, S64 };
 // Map ValType to RegType for register allocation.
 RegType regTypeFor(ValType type);
 
-// RAII register — allocates from free-list on construct, returns on destruct.
-// Implicitly converts to Reg (for destination params) and Operand (for source params).
-struct Val {
-  Reg reg;
+// A value that can be either a register (typed, RAII) or an immediate (typed or untyped constant).
+// Replaces the old Val and Operand types.
+struct Value {
+  Reg reg; // only valid when kind == Register
   ValType type;
   bool valid = false;
 
-  Val() = default;
-  explicit Val(ValType type);
-  ~Val();
-  Val(Val&& o) noexcept;
-  Val(const Val& o) noexcept {
+  enum Kind { None, Register, Immediate };
+  Kind kind = None;
+  std::string immStr; // string representation for immediates
+
+  // --- Constructors ---
+  Value() = default;
+  explicit Value(ValType type);      // allocate register (existing Val behavior)
+  Value(int32_t v);                  // immediate, type = U32 (implicit)
+  Value(uint32_t v);                 // immediate, type = U32 (implicit)
+  Value(int64_t v);                  // immediate, type = U64 (implicit)
+  Value(uint64_t v);                 // immediate, type = U64 (implicit)
+  Value(const char* s);              // immediate, untyped (e.g. "%tid.x")
+  Value(const Reg& r, ValType type); // wrap existing Reg as register Value
+
+  // --- String representation ---
+  // Returns register name for registers, literal string for immediates.
+  const std::string& str() const;
+
+  // --- RAII ---
+  ~Value();
+  Value(Value&& o) noexcept;
+  Value(const Value& o) noexcept {
     *this = o;
   }
-  Val& operator=(Val&& o) noexcept;
-  Val& operator=(int64_t v);    // emit mov with immediate
-  Val& operator=(const Val& o); // emit mov (same register type required)
+  Value& operator=(Value&& o) noexcept;
+  Value& operator=(int64_t v);      // emit mov with immediate
+  Value& operator=(const Value& o); // emit mov
 
-  operator const Reg&() const {
-    return reg;
-  }
-  operator Operand() const {
-    return Operand(reg);
-  }
+  // --- Implicit conversion to Reg (for lvalue use) ---
+  operator const Reg&() const;
 
-  // Arithmetic — result has same type as *this
-  Val operator+(const Operand& b) const;
-  Val operator-(const Operand& b) const;
-  Val operator*(const Operand& b) const;
-  Val operator/(const Operand& b) const;
-  Val operator%(const Operand& b) const;
+  // --- Arithmetic — result has same type as *this ---
+  Value operator+(const Value& b) const;
+  Value operator-(const Value& b) const;
+  Value operator*(const Value& b) const;
+  Value operator/(const Value& b) const;
+  Value operator%(const Value& b) const;
 
-  // Bitwise — result has same type as *this
-  Val operator&(const Operand& b) const;
-  Val operator|(const Operand& b) const;
-  Val operator^(const Operand& b) const;
-  Val operator~() const;
-  Val operator<<(const Operand& b) const;
-  Val operator>>(const Operand& b) const;
+  // --- Bitwise — result has same type as *this ---
+  Value operator&(const Value& b) const;
+  Value operator|(const Value& b) const;
+  Value operator^(const Value& b) const;
+  Value operator~() const;
+  Value operator<<(const Value& b) const;
+  Value operator>>(const Value& b) const;
 
-  // Comparison — result is Pred
-  Val operator<(const Operand& b) const;
-  Val operator<=(const Operand& b) const;
-  Val operator>(const Operand& b) const;
-  Val operator>=(const Operand& b) const;
-  Val operator==(const Operand& b) const;
-  Val operator!=(const Operand& b) const;
+  // --- Comparison — result is Pred ---
+  Value operator<(const Value& b) const;
+  Value operator<=(const Value& b) const;
+  Value operator>(const Value& b) const;
+  Value operator>=(const Value& b) const;
+  Value operator==(const Value& b) const;
+  Value operator!=(const Value& b) const;
 
-  // Predicate negation
-  Val operator!() const;
+  // --- Predicate negation ---
+  Value operator!() const;
 
-  // Compound assignment — modifies in place
-  void operator+=(const Operand& b);
-  void operator-=(const Operand& b);
-  void operator*=(const Operand& b);
-  void operator/=(const Operand& b);
-  void operator%=(const Operand& b);
-  void operator^=(const Operand& b);
+  // --- Compound assignment — modifies in place ---
+  void operator+=(const Value& b);
+  void operator-=(const Value& b);
+  void operator*=(const Value& b);
+  void operator/=(const Value& b);
+  void operator%=(const Value& b);
+  void operator^=(const Value& b);
 };
+
+// Backward compatibility alias
+using Val = Value;
+
+// ---------------------------------------------------------------------------
+// Free-standing instruction helpers (emit to currentBlock)
+// ---------------------------------------------------------------------------
+
+// Arithmetic
+void add_u32(const Value& d, const Value& a, const Value& b);
+void add_s32(const Value& d, const Value& a, const Value& b);
+void add_u64(const Value& d, const Value& a, const Value& b);
+void add_s64(const Value& d, const Value& a, const Value& b);
+void sub_u32(const Value& d, const Value& a, const Value& b);
+void sub_s32(const Value& d, const Value& a, const Value& b);
+void mul_lo_u32(const Value& d, const Value& a, const Value& b);
+void mul_lo_s32(const Value& d, const Value& a, const Value& b);
+void mul_lo_u64(const Value& d, const Value& a, const Value& b);
+void mul_lo_s64(const Value& d, const Value& a, const Value& b);
+void mul_wide_u32(const Value& d, const Value& a, const Value& b);
+void mul_wide_s32(const Value& d, const Value& a, const Value& b);
+void div_u32(const Value& d, const Value& a, const Value& b);
+void div_s32(const Value& d, const Value& a, const Value& b);
+void rem_u32(const Value& d, const Value& a, const Value& b);
+void rem_s32(const Value& d, const Value& a, const Value& b);
+void min_u32(const Value& d, const Value& a, const Value& b);
+void min_s32(const Value& d, const Value& a, const Value& b);
+void max_u32(const Value& d, const Value& a, const Value& b);
+void max_s32(const Value& d, const Value& a, const Value& b);
+
+// Bitwise
+void and_pred(const Value& d, const Value& a, const Value& b);
+void or_pred(const Value& d, const Value& a, const Value& b);
+void and_b32(const Value& d, const Value& a, const Value& b);
+void and_b64(const Value& d, const Value& a, const Value& b);
+void or_b32(const Value& d, const Value& a, const Value& b);
+void or_b64(const Value& d, const Value& a, const Value& b);
+void xor_b32(const Value& d, const Value& a, const Value& b);
+void not_b32(const Value& d, const Value& a);
+void shl_b32(const Value& d, const Value& a, const Value& b);
+void shl_b64(const Value& d, const Value& a, const Value& b);
+void shr_u32(const Value& d, const Value& a, const Value& b);
+void shr_s32(const Value& d, const Value& a, const Value& b);
+
+// Comparison
+void setp_eq_u32(const Value& p, const Value& a, const Value& b);
+void setp_ne_u32(const Value& p, const Value& a, const Value& b);
+void setp_lt_u32(const Value& p, const Value& a, const Value& b);
+void setp_le_u32(const Value& p, const Value& a, const Value& b);
+void setp_gt_u32(const Value& p, const Value& a, const Value& b);
+void setp_ge_u32(const Value& p, const Value& a, const Value& b);
+void setp_eq_s32(const Value& p, const Value& a, const Value& b);
+void setp_ne_s32(const Value& p, const Value& a, const Value& b);
+void setp_lt_s32(const Value& p, const Value& a, const Value& b);
+void setp_ge_s32(const Value& p, const Value& a, const Value& b);
+void setp_ne_s64(const Value& p, const Value& a, const Value& b);
+void setp_lt_s64(const Value& p, const Value& a, const Value& b);
+void setp_ge_s64(const Value& p, const Value& a, const Value& b);
+
+// Move
+void mov_u32(const Value& d, const Value& a);
+void mov_u64(const Value& d, const Value& a);
+void mov_b64(const Value& d, const Value& a);
+
+// Load
+void ld_param_u32(const Value& d, const std::string& paramName);
+void ld_param_u64(const Value& d, const std::string& paramName);
+void ld_param_u32(const Value& d, const Value& addr, int offset);
+void ld_param_u64(const Value& d, const Value& addr, int offset);
+void ld_global_u32(const Value& d, const Value& addr);
+void ld_global_volatile_u32(const Value& d, const Value& addr);
+void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
+void ld_u8(const Value& d, const Value& addr);
+
+// Store
+void st_global_u32(const Value& addr, const Value& val);
+void st_global_volatile_u32(const Value& addr, const Value& val);
+void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, const Value& s2, const Value& s3);
+void st_u8(const Value& addr, const Value& val);
+
+// Conversion
+void cvt_u64_u32(const Value& d, const Value& a);
+void cvt_u32_u64(const Value& d, const Value& a);
+
+// Control flow
+void bra(const Block* target);
+void bra(const Value& pred, const Block* target);
+void bra_not(const Value& pred, const Block* target);
+void ret();
+
+// Atomic
+void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b);
+
+// Synchronization
+void barrier_sync(int n = 0);
+void membar_sys();
+void warp_sync(uint32_t membermask = 0xFFFFFFFF);
+
+// Trap
+void trap();
+
+// Raw emit (escape hatch)
+void emit(const std::string& inst);
+
+// Test function: generates simple kernels and returns the PTX string.
+std::string ptxTest(const char* target = "sm_90a");
 
 // RAII function scope — sets TLS context, manages register free-lists.
 // On destruction, writes register high-water marks to Function::regCounts[].
@@ -283,6 +292,7 @@ Block* activateNewBlock(const char* prefix);
 struct ScopeGuard {
   std::unique_ptr<Block> pendingBlock;
   Block* backEdgeTarget = nullptr; // WHILE: emit bra before activating exit
+  std::function<void()> stepFn;    // FOR: emit step before back-edge
   bool closed = false;
 
   ScopeGuard() = default;
@@ -290,110 +300,122 @@ struct ScopeGuard {
   ScopeGuard(const ScopeGuard&) = delete;
   ScopeGuard& operator=(const ScopeGuard&) = delete;
   ~ScopeGuard();
-
-  struct Iter {
-    bool done;
-    int operator*() const {
-      return 0;
-    }
-    Iter& operator++() {
-      done = true;
-      return *this;
-    }
-    bool operator!=(const Iter& o) const {
-      return done != o.done;
-    }
-  };
-  Iter begin() {
-    return {false};
-  }
-  Iter end() {
-    return {true};
-  }
 };
 
-ScopeGuard _If(const Reg& pred);
+ScopeGuard _If(const Value& pred);
 ScopeGuard _Else();
-ScopeGuard _WhileImpl(Block* header, const Reg& pred);
+ScopeGuard _WhileImpl(Block* header, const Value& pred);
 
 template<typename F>
 ScopeGuard _While(F&& condFn) {
   Block* header = activateNewBlock("while");
-  Val pred = condFn();
-  return _WhileImpl(header, pred);
+  auto cond = condFn();
+  if constexpr (std::is_convertible_v<decltype(cond), bool>) {
+    // Constant or boolean condition — materialize as predicate
+    Value pred(ValType::Pred);
+    pred = cond ? 1 : 0;
+    return _WhileImpl(header, pred);
+  } else {
+    return _WhileImpl(header, cond);
+  }
 }
 
-#define IF(pred) for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_If(pred))
-#define ELSE for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_Else())
+template<typename CondFn, typename StepFn>
+ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
+  Block* header = activateNewBlock("for");
+  Value pred = condFn();
+  auto sg = _WhileImpl(header, pred);
+  sg.stepFn = std::forward<StepFn>(stepFn);
+  return sg;
+}
+
+#define IF(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_If(pred); true)
+#define ELSE else if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Else(); true)
 #define WHILE(cond)                                                                                                    \
-  for ([[maybe_unused]] auto _ptx_scope_ : ::moodist::ptx::_While([&]() {                                              \
-         return (cond);                                                                                                \
-       }))
+  if ([[maybe_unused]] auto _ptx_while_scope_ = ::moodist::ptx::_While([&]() {                                         \
+        return (cond);                                                                                                 \
+      });                                                                                                              \
+      true)
+#define BREAK ::moodist::ptx::bra(_ptx_while_scope_.pendingBlock.get())
+#define FOR(init, cond, step)                                                                                          \
+  if (init; true)                                                                                                      \
+    if ([[maybe_unused]] auto _ptx_while_scope_ = ::moodist::ptx::_For(                                                \
+            [&]() {                                                                                                    \
+              return (cond);                                                                                           \
+            },                                                                                                         \
+            [&]() {                                                                                                    \
+              step;                                                                                                    \
+            });                                                                                                        \
+        true)
 
 // Special registers
-Val threadIdx_x();
-Val blockIdx_x();
-Val blockDim_x();
+Value threadIdx_x();
+Value blockIdx_x();
+Value blockDim_x();
 
-// Parameter loading — emits ld.param, returns typed Val
-Val loadParam(int index, ValType type);
+// Parameter loading — emits ld.param, returns typed Value
+Value loadParam(int index, ValType type);
 
 // Parameter struct access — for .param .b8 byte-array params
-Val paramBase(int index); // mov.b64 of param address, returns U64
-Val loadParamField(const Val& base, int offset, ValType type);
+Value paramBase(int index); // mov.b64 of param address, returns U64
+Value loadParamField(const Value& base, int offset, ValType type);
 
 // Type conversion
-Val widen(const Val& v);  // U32→U64, S32→S64
-Val narrow(const Val& v); // U64→U32, S64→S32
+Value widen(const Value& v);  // U32→U64, S32→S64
+Value narrow(const Value& v); // U64→U32, S64→S32
 
 // Memory operations
-void storeGlobal(const Val& addr, const Val& val);
-Val loadGlobalVolatile(const Val& addr, ValType type);
-void storeGlobalVolatile(const Val& addr, const Val& val);
-Val loadGlobalAcquireSys(const Val& addr, ValType type);
-void storeGlobalRelaxedSys(const Val& addr, const Val& val);
-void storeGlobalReleaseSys(const Val& addr, const Val& val);
+void storeGlobal(const Value& addr, const Value& val);
+Value loadGlobalVolatile(const Value& addr, ValType type);
+void storeGlobalVolatile(const Value& addr, const Value& val);
+Value loadGlobalAcquireSys(const Value& addr, ValType type);
+void storeGlobalRelaxedSys(const Value& addr, const Value& val);
+void storeGlobalReleaseSys(const Value& addr, const Value& val);
 
 // Vectorized load/store (4 x u32)
-void ld_global_cv_v4_u32(std::array<Val, 4>& v, const Operand& addr);
-void ld_global_nc_v4_u32(std::array<Val, 4>& v, const Operand& addr);
-void ld_global_cs_v4_u32(std::array<Val, 4>& v, const Operand& addr);
-void ld_v4_u32(std::array<Val, 4>& v, const Operand& addr); // generic addressing (no cache qualifier)
-void st_global_wt_v4_u32(const Operand& addr, const std::array<Val, 4>& v);
-void ldcv_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
-void ldcv_v4(std::array<Val, 4>& v, const Val& addr);
-void ldnc_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
-void ldnc_v4(std::array<Val, 4>& v, const Val& addr);
-void ldcs_v4(Val& v0, Val& v1, Val& v2, Val& v3, const Val& addr);
-void ldcs_v4(std::array<Val, 4>& v, const Val& addr);
-void ld_plain_v4(std::array<Val, 4>& v, const Val& addr); // generic addressing, no cache qualifier
-void stwt_v4(const Val& addr, const Val& v0, const Val& v1, const Val& v2, const Val& v3);
-void stwt_v4(const Val& addr, const std::array<Val, 4>& v);
+void ld_global_cv_v4_u32(std::array<Value, 4>& v, const Value& addr);
+void ld_global_nc_v4_u32(std::array<Value, 4>& v, const Value& addr);
+void ld_global_cs_v4_u32(std::array<Value, 4>& v, const Value& addr);
+void ld_v4_u32(std::array<Value, 4>& v, const Value& addr); // generic addressing (no cache qualifier)
+void st_global_wt_v4_u32(const Value& addr, const std::array<Value, 4>& v);
+void ldcv_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr);
+void ldcv_v4(std::array<Value, 4>& v, const Value& addr);
+void ldnc_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr);
+void ldnc_v4(std::array<Value, 4>& v, const Value& addr);
+void ldcs_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr);
+void ldcs_v4(std::array<Value, 4>& v, const Value& addr);
+void ld_plain_v4(std::array<Value, 4>& v, const Value& addr); // generic addressing, no cache qualifier
+void stwt_v4(const Value& addr, const Value& v0, const Value& v1, const Value& v2, const Value& v3);
+void stwt_v4(const Value& addr, const std::array<Value, 4>& v);
 
 // Atomic operations
-Val atomicInc(const Val& addr, const Operand& modulo);
+Value atomicInc(const Value& addr, const Value& modulo);
 
 // Global variable address
-Val globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
+Value globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
 
 // Hex immediate — for baking GPU addresses into PTX
-Operand hexImm(uintptr_t value);
+Value hexImm(uintptr_t value);
 
 // mbarrier operations (sm_90+)
-void mbarrier_init(const Val& addr, int count);
-Val mbarrier_arrive(const Val& addr); // returns state token (u64)
-void mbarrier_expect_tx(const Val& addr, const Val& txCount);
-Val mbarrier_try_wait_parity(const Val& addr, const Val& phaseParity); // returns pred
+void mbarrier_init(const Value& addr, int count);
+Value mbarrier_arrive(const Value& addr); // returns state token (u64)
+void mbarrier_expect_tx(const Value& addr, const Value& txCount);
+Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity); // returns pred
 
 // cp.async.bulk (sm_90+)
-void cp_async_bulk_shared_global(const Val& dst, const Val& src, const Val& size, const Val& mbar);
-void cp_async_bulk_global_shared(const Val& dst, const Val& src, const Val& size);
-void cp_async_bulk_prefetch_l2(const Val& src, const Val& size);
+void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value& size, const Value& mbar);
+void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size);
+void cp_async_bulk_prefetch_l2(const Value& src, const Value& size);
 void cp_async_bulk_commit_group();
 void cp_async_bulk_wait_group(int n);
 
+// Named barrier with explicit thread count (bar.sync barrierID, threadCount)
+void bar_sync(int barrierId, int threadCount);
+void bar_sync(const Value& barrierId, int threadCount);
+
 // Shared memory address conversion
-Val cvta_shared(const Val& sharedAddr); // convert shared addr to generic
+Value cvta_shared(const Value& sharedAddr); // convert shared addr to generic
 
 } // namespace ptx
 } // namespace moodist
