@@ -296,6 +296,138 @@ static void emitBulkWriteBack(const CopyKernelConfig& config, bool singleLane, i
   }
 }
 
+// N-buffer bulk copy engine: single-lane DMA with manual double-buffering per warp
+static void emitBulkNbuf(const CopyKernelConfig& config, int numWarps, int bulkChunkSize, int GS, ptx::Val& src,
+    ptx::Val& dst, const ptx::Val& bytes, const ptx::Val& blockIdx, const ptx::Val& warpIdx, const ptx::Val& laneIdx,
+    const ptx::Val& smemBufS, const ptx::Val& smemMbarS) {
+  using namespace ptx;
+  constexpr int kMbarrierSize = 8;
+
+  uint32_t numReads = config.nbufReadCount.value();
+  uint32_t numWrites = config.nbufWriteCount.value();
+  uint32_t numBufs = numReads + numWrites;
+
+  CHECK(numReads >= 1);
+
+  uint32_t lcm = std::lcm(numBufs, numReads * 2);
+
+  bool shareBarriers = false; // TODO
+
+  uint32_t blockSharedAlignment = (numWarps * numBufs * 256);
+  uint32_t blockSharedSize = bulkChunkSize / blockSharedAlignment * blockSharedAlignment;
+  uint32_t warpSharedSize = blockSharedSize / numWarps;
+  uint32_t bufferSize = warpSharedSize / numBufs;
+  CHECK(bufferSize > 0 && bufferSize % 256 == 0);
+  auto offset = u32(0);
+  auto blockBytes = u32((bytes / GS / blockSharedSize) * blockSharedSize);
+  auto blockStart = u32(blockIdx * blockBytes);
+  auto warpBytes = u32(blockBytes / numWarps);
+  auto warpStartGlobal = u32(warpIdx * warpBytes);
+  auto warpStartShared = u32(warpIdx * warpSharedSize);
+  src += widen(blockStart + warpStartGlobal);
+  dst += widen(blockStart + warpStartGlobal);
+  auto sharedMemAddr = smemBufS + widen(warpStartShared);
+  Vector<Value> mbars;
+  for (int n : range(numReads)) {
+    mbars.push_back(smemMbarS + widen((numReads * warpIdx + n) * kMbarrierSize));
+    mbarrier_init(mbars.back(), 1);
+  }
+  auto f = [&](bool first) {
+    WHILE(true) {
+      for (uint32_t i : range(lcm)) {
+        uint32_t bufferIndex = i % numBufs;
+        uint32_t prevBufferIndex = (i + numBufs - 1) % numBufs;
+        uint32_t readIndex = i % numReads;
+        uint32_t parity = (i / numReads) & 1;
+        uint32_t prevParity = ((i + lcm - 1) / numReads) & 1;
+
+        auto& curMbar = mbars[readIndex];
+        auto& prevMbar = mbars[(readIndex + numReads - 1) % numReads];
+
+        mbarrier_expect_tx(curMbar, bufferSize);
+        if (!config.bulkSkipWriteBack.value()) {
+          cp_async_bulk_wait_group(numBufs - 2);
+        }
+        cp_async_bulk_shared_global(sharedMemAddr + bufferSize * bufferIndex, src + widen(offset), bufferSize, curMbar);
+        mbarrier_arrive(curMbar);
+
+        if (!first || i != 0) {
+          WHILE(!mbarrier_try_wait_parity(prevMbar, prevParity)) {}
+
+          if (!config.bulkSkipWriteBack.value()) {
+            cp_async_bulk_global_shared(
+                dst + widen(offset - bufferSize), sharedMemAddr + bufferSize * prevBufferIndex, bufferSize);
+            cp_async_bulk_commit_group();
+          }
+        }
+        offset += bufferSize;
+        IF(offset == warpBytes) {
+          WHILE(!mbarrier_try_wait_parity(curMbar, parity)) {}
+
+          if (!config.bulkSkipWriteBack.value()) {
+            cp_async_bulk_global_shared(
+                dst + widen(offset - bufferSize), sharedMemAddr + bufferSize * bufferIndex, bufferSize);
+            cp_async_bulk_commit_group();
+            cp_async_bulk_wait_group(0);
+          }
+          BREAK;
+        }
+        IF(offset > warpBytes) {
+          trap();
+        }
+      }
+      if (first) {
+        BREAK;
+      }
+    }
+  };
+  // auto f = [&](bool first) {
+  //   WHILE(true) {
+  //     for (int i = 0; i != (first ? 4 : 8); ++i) {
+  //       auto& curMbar = i & 1 ? myMbar2 : myMbar1;
+  //       auto& prevMbar = (i + 7) & 1 ? myMbar2 : myMbar1;
+
+  //       mbarrier_expect_tx(curMbar, chunkSize / 2);
+  //       if (!config.bulkSkipWriteBack.value()) {
+  //         cp_async_bulk_wait_group(0);
+  //       }
+  //       auto curBufs = sharedMemAddr + (i & 1 ? chunkSize / 2 : 0);
+  //       cp_async_bulk_shared_global(curBufs, src + widen(offset), chunkSize / 2, curMbar);
+  //       mbarrier_arrive(curMbar);
+
+  //       if (!first || i != 0) {
+  //         WHILE(!mbarrier_try_wait_parity(prevMbar, (i + 7) & 2 ? 1 : 0)) {}
+
+  //         if (!config.bulkSkipWriteBack.value()) {
+  //           auto prevBufs = sharedMemAddr + ((i + 7) & 1 ? chunkSize / 2 : 0);
+  //           cp_async_bulk_global_shared(dst + widen(offset - chunkSize / 2), prevBufs, chunkSize / 2);
+  //           cp_async_bulk_commit_group();
+  //         }
+  //       }
+  //       auto nextOffset = offset + chunkSize / 2;
+  //       IF(offset == warpBytes) {
+  //         WHILE(!mbarrier_try_wait_parity(curMbar, i & 2 ? 1 : 0)) {}
+
+  //         if (!config.bulkSkipWriteBack.value()) {
+  //           cp_async_bulk_global_shared(dst + widen(offset), curBufs, chunkSize / 2);
+  //           cp_async_bulk_commit_group();
+  //           cp_async_bulk_wait_group(0);
+  //         }
+  //         BREAK;
+  //       }
+  //       offset = nextOffset;
+  //     }
+  //     if (first) {
+  //       BREAK;
+  //     }
+  //   }
+  // };
+  IF(warpBytes != 0) {
+    f(true);
+    f(false);
+  }
+}
+
 // Warp-pipelined bulk copy engine: warps cooperate as pipeline stages
 static void emitBulkWarpPipe(const CopyKernelConfig& config, int numWarps, int bulkChunkSize, int GS, ptx::Val& src,
     ptx::Val& dst, const ptx::Val& bytes, const ptx::Val& blockIdx, const ptx::Val& warpIdx, const ptx::Val& laneIdx,
@@ -305,75 +437,6 @@ static void emitBulkWarpPipe(const CopyKernelConfig& config, int numWarps, int b
 
   int pipeDepth = config.warppipeDepth.value() > 0 ? std::min(config.warppipeDepth.value(), numWarps) : numWarps;
   pipeDepth = std::min(pipeDepth, 8);
-
-  if (pipeDepth == 1) {
-    uint32_t chunkSize = bulkChunkSize / numWarps;
-    CHECK(bulkChunkSize % numWarps == 0);
-    CHECK(chunkSize % 1024 == 0);
-    IF(laneIdx == 0) {
-      // int roundBytes = numWarps * stageChunk;
-      auto offset = u32(0);
-      auto blockBytes = u32((bytes / GS / bulkChunkSize) * bulkChunkSize);
-      auto blockStart = u32(blockIdx * blockBytes);
-      auto warpBytes = u32(blockBytes / numWarps);
-      auto warpStartGlobal = u32(warpIdx * warpBytes);
-      auto warpStartShared = u32(warpIdx * chunkSize);
-      src += widen(blockStart + warpStartGlobal);
-      dst += widen(blockStart + warpStartGlobal);
-      auto myBufS = smemBufS + widen(warpStartShared);
-      auto myMbar1 = smemMbarS + widen(2 * warpIdx * kMbarrierSize);
-      mbarrier_init(myMbar1, 1);
-      auto myMbar2 = smemMbarS + widen((2 * warpIdx + 1) * kMbarrierSize);
-      mbarrier_init(myMbar2, 1);
-      auto f = [&](bool first) {
-        WHILE(true) {
-          for (int i = 0; i != (first ? 4 : 8); ++i) {
-            auto& curMbar = i & 1 ? myMbar2 : myMbar1;
-            auto& prevMbar = (i + 7) & 1 ? myMbar2 : myMbar1;
-
-            mbarrier_expect_tx(curMbar, chunkSize / 2);
-            if (!config.bulkSkipWriteBack.value()) {
-              cp_async_bulk_wait_group(0);
-            }
-            auto curBufs = myBufS + (i & 1 ? chunkSize / 2 : 0);
-            cp_async_bulk_shared_global(curBufs, src + widen(offset), chunkSize / 2, curMbar);
-            mbarrier_arrive(curMbar);
-
-            if (!first || i != 0) {
-              WHILE(!mbarrier_try_wait_parity(prevMbar, (i + 7) & 2 ? 1 : 0)) {}
-
-              if (!config.bulkSkipWriteBack.value()) {
-                auto prevBufs = myBufS + ((i + 7) & 1 ? chunkSize / 2 : 0);
-                cp_async_bulk_global_shared(dst + widen(offset - chunkSize / 2), prevBufs, chunkSize / 2);
-                cp_async_bulk_commit_group();
-              }
-            }
-            auto nextOffset = offset + chunkSize / 2;
-            IF(offset == warpBytes) {
-              WHILE(!mbarrier_try_wait_parity(curMbar, i & 2 ? 1 : 0)) {}
-
-              if (!config.bulkSkipWriteBack.value()) {
-                cp_async_bulk_global_shared(dst + widen(offset), curBufs, chunkSize / 2);
-                cp_async_bulk_commit_group();
-                cp_async_bulk_wait_group(0);
-              }
-              BREAK;
-            }
-            offset = nextOffset;
-          }
-          if (first) {
-            BREAK;
-          }
-        }
-      };
-      IF(warpBytes != 0) {
-        f(true);
-        f(false);
-      }
-    }
-    warp_sync();
-    return;
-  }
 
   int stageChunk = bulkChunkSize / numWarps;
   CHECK(bulkChunkSize % numWarps == 0);
@@ -690,6 +753,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
 
   bool useBulk = !strcmp(config.copyEngine, "bulk");
   bool useWarppipe = useBulk && !strcmp(config.bulkMode.value(), "warppipe");
+  bool useNbuf = useBulk && !strcmp(config.bulkMode.value(), "nbuf");
 
   size_t rank = group->rank;
   const auto& peerIndices = group->peerIndices;
@@ -714,10 +778,11 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     constexpr int kMbarrierSize = 8;
     if (useBulk) {
       bulkChunkSize = (int)config.bulkChunkSize.value();
-      if (useWarppipe) {
-        // Warppipe: one buffer array + one mbarrier array
+      if (useWarppipe || useNbuf) {
+        // Warppipe/Nbuf: one buffer array + one mbarrier array
         smemBufSym = fn->addShared(16, bulkChunkSize, "buf");
-        smemMbarSym = fn->addShared(8, kMbarrierSize * numWarps * 2, "mbar");
+        int numMbarriers = useNbuf ? numWarps * config.nbufReadCount.value() : numWarps * 2;
+        smemMbarSym = fn->addShared(8, kMbarrierSize * numMbarriers, "mbar");
       } else {
         // Double-buffered: 2 data buffers + 2 mbarrier arrays
         smemBuf0Sym = fn->addShared(16, bulkChunkSize, "buf0");
@@ -749,7 +814,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     if (useBulk) {
       warpIdx = tid / 32;
       laneIdx = tid & 31;
-      if (useWarppipe) {
+      if (useWarppipe || useNbuf) {
         smemBufSharedAddr = globalAddr(smemBufSym.c_str());
         smemBufGenAddr = cvta_shared(smemBufSharedAddr);
         smemMbarSharedAddr = globalAddr(smemMbarSym.c_str());
@@ -835,7 +900,13 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       auto dst = loadParamField(descAddr, 8, ValType::U64);
       auto bytes = loadParamField(descAddr, 16, ValType::U32);
 
-      if (useWarppipe) {
+      if (useNbuf) {
+        IF(laneIdx == 0) {
+          emitBulkNbuf(config, numWarps, bulkChunkSize, GS, src, dst, bytes, blockIdx, warpIdx, laneIdx,
+              smemBufSharedAddr, smemMbarSharedAddr);
+        }
+        warp_sync();
+      } else if (useWarppipe) {
         emitBulkWarpPipe(config, numWarps, bulkChunkSize, GS, src, dst, bytes, blockIdx, warpIdx, laneIdx,
             smemBufSharedAddr, smemBufGenAddr, smemMbarSharedAddr);
       } else if (useBulk) {

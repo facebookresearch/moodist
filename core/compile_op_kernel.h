@@ -43,7 +43,7 @@ struct CopyKernelConfig {
 
   // Bulk-only fields
   std::optional<size_t> bulkChunkSize;   // staging buffer size (bytes)
-  std::optional<const char*> bulkMode;   // "doublebuf" or "warppipe"
+  std::optional<const char*> bulkMode;   // "doublebuf", "warppipe", or "nbuf"
   std::optional<bool> bulkSkipWriteBack; // debug: skip shared→global write-back
   std::optional<bool> bulkWriteBack;     // true: use cp.async.bulk for write-back (shared→global DMA)
 
@@ -52,6 +52,10 @@ struct CopyKernelConfig {
 
   // Bulk warppipe-only fields
   std::optional<int> warppipeDepth; // 0 = use numWarps, >0 = limit pipeline depth (max 15)
+
+  // Bulk nbuf-only fields
+  std::optional<int> nbufReadCount;  // number of read buffers per warp (1-4)
+  std::optional<int> nbufWriteCount; // number of write buffers per warp (1-4)
 
   // Factory functions for constructing engine-specific configs
   static CopyKernelConfig reg(int depth, size_t blockSize, size_t gridSize, const char* loadOp) {
@@ -88,6 +92,20 @@ struct CopyKernelConfig {
     c.warppipeDepth = pipeDepth;
     c.bulkSkipWriteBack = false;
     c.bulkWriteBack = writeBack;
+    return c;
+  }
+
+  static CopyKernelConfig nbuf(size_t blockSize, size_t gridSize, size_t chunkSize, int readCount, int writeCount) {
+    CopyKernelConfig c;
+    c.copyEngine = "bulk";
+    c.blockSize = blockSize;
+    c.gridSize = gridSize;
+    c.bulkChunkSize = chunkSize;
+    c.bulkMode = "nbuf";
+    c.nbufReadCount = readCount;
+    c.nbufWriteCount = writeCount;
+    c.bulkSkipWriteBack = false;
+    c.bulkWriteBack = false;
     return c;
   }
 };
