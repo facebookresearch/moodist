@@ -237,6 +237,12 @@ std::string formatConfig(const CopyKernelConfig& c) {
   if (c.warppipeDepth.has_value()) {
     s += fmt::sprintf(" pipeDepth=%d", c.warppipeDepth.value());
   }
+  if (c.nbufReadCount.has_value()) {
+    s += fmt::sprintf(" readBufs=%d", c.nbufReadCount.value());
+  }
+  if (c.nbufWriteCount.has_value()) {
+    s += fmt::sprintf(" writeBufs=%d", c.nbufWriteCount.value());
+  }
   return s;
 }
 
@@ -531,6 +537,7 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   {
     int maxSmem = 0;
     CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+    // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
     static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
     static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
     for (size_t chunk : chunkSizes) {
@@ -565,6 +572,20 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
             for (int depth : pipeDepths) {
               if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
                 candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth, false));
+              }
+            }
+          }
+        }
+
+        // Nbuf: single buffer + readBufs mbarriers per warp
+        {
+          if ((chunk * 2) % (numWarps * 1024) == 0) {
+            for (int rb = 1; rb <= 4; rb++) {
+              for (int wb = 0; wb <= 4; wb++) {
+                size_t totalSmem = chunk + numWarps * rb * 8;
+                if (totalSmem <= (size_t)maxSmem) {
+                  candidates.push_back(CopyKernelConfig::nbuf(bs, gridSize, chunk * 2, rb, wb));
+                }
               }
             }
           }
@@ -654,7 +675,9 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
       size_t chunk = cfg.bulkChunkSize.value();
       size_t numWarps = cfg.blockSize / 32;
       if (!strcmp(cfg.bulkMode.value(), "warppipe")) {
-        totalSmem = chunk + numWarps * 8;
+        totalSmem = chunk + numWarps * 2 * 8;
+      } else if (!strcmp(cfg.bulkMode.value(), "nbuf")) {
+        totalSmem = chunk + numWarps * cfg.nbufReadCount.value() * 8;
       } else {
         totalSmem = 2 * chunk + 2 * numWarps * 8;
       }
@@ -1874,7 +1897,9 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         size_t numWarps = result.config.blockSize / 32;
         size_t totalSmem;
         if (!strcmp(result.config.bulkMode.value(), "warppipe")) {
-          totalSmem = chunk + numWarps * 8;
+          totalSmem = chunk + numWarps * 2 * 8;
+        } else if (!strcmp(result.config.bulkMode.value(), "nbuf")) {
+          totalSmem = chunk + numWarps * result.config.nbufReadCount.value() * 8;
         } else {
           totalSmem = 2 * chunk + 2 * numWarps * 8;
         }
