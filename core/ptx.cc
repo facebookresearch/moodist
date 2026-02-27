@@ -15,6 +15,7 @@ namespace ptx {
 static thread_local Module* currentModule = nullptr;
 static thread_local Function* currentFunction = nullptr;
 static thread_local Block* currentBlock = nullptr;
+static thread_local std::string currentPred;
 
 void setModule(Module* m) {
   currentModule = m;
@@ -186,6 +187,15 @@ Function* Module::newFunction(const char* name) {
   return ptr;
 }
 
+std::string Module::addGlobal(const char* type, int count, const char* name) {
+  std::string decl = ".global " + std::string(type) + " " + name;
+  if (count > 1) {
+    decl += "[" + std::to_string(count) + "]";
+  }
+  globals.push_back(decl);
+  return name;
+}
+
 std::string Module::finalize() const {
   std::string s;
   s += ".version " + version + "\n";
@@ -212,7 +222,7 @@ std::string Module::finalize() const {
 // ---------------------------------------------------------------------------
 
 static void emitInst(const std::string& inst) {
-  currentBlock->emit(inst);
+  currentBlock->emit(currentPred + inst);
 }
 
 static std::string fmt3(const char* op, const Value& d, const Value& a, const Value& b) {
@@ -245,6 +255,9 @@ void sub_u32(const Value& d, const Value& a, const Value& b) {
 }
 void sub_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("sub.s32", d, a, b));
+}
+void sub_u64(const Value& d, const Value& a, const Value& b) {
+  emitInst(fmt3("sub.u64", d, a, b));
 }
 void mul_lo_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("mul.lo.u32", d, a, b));
@@ -361,6 +374,12 @@ void setp_ge_s32(const Value& p, const Value& a, const Value& b) {
 void setp_ne_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ne.s64", p, a, b));
 }
+void setp_eq_u64(const Value& p, const Value& a, const Value& b) {
+  emitInst(fmt3("setp.eq.u64", p, a, b));
+}
+void setp_ne_u64(const Value& p, const Value& a, const Value& b) {
+  emitInst(fmt3("setp.ne.u64", p, a, b));
+}
 void setp_lt_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.lt.s64", p, a, b));
 }
@@ -394,6 +413,9 @@ void ld_param_u64(const Value& d, const Value& addr, int offset) {
 }
 void ld_global_u32(const Value& d, const Value& addr) {
   emitInst("ld.global.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+void ld_global_u64(const Value& d, const Value& addr) {
+  emitInst("ld.global.u64 " + d.str() + ", [" + addr.str() + "]");
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr) {
   emitInst("ld.global.volatile.u32 " + d.str() + ", [" + addr.str() + "]");
@@ -432,6 +454,9 @@ void ld_u8(const Value& d, const Value& addr) {
 // Store
 void st_global_u32(const Value& addr, const Value& val) {
   emitInst("st.global.u32 [" + addr.str() + "], " + val.str());
+}
+void st_global_u64(const Value& addr, const Value& val) {
+  emitInst("st.global.u64 [" + addr.str() + "], " + val.str());
 }
 void st_global_volatile_u32(const Value& addr, const Value& val) {
   emitInst("st.global.volatile.u32 [" + addr.str() + "], " + val.str());
@@ -549,6 +574,14 @@ void bar_sync(int barrierId, int threadCount) {
 
 void bar_sync(const Value& barrierId, int threadCount) {
   emitInst("bar.sync " + barrierId.str() + ", " + std::to_string(threadCount));
+}
+
+void bar_arrive(int barrierId, int threadCount) {
+  emitInst("bar.arrive " + std::to_string(barrierId) + ", " + std::to_string(threadCount));
+}
+
+void bar_arrive(const Value& barrierId, int threadCount) {
+  emitInst("bar.arrive " + barrierId.str() + ", " + std::to_string(threadCount));
 }
 
 // Shared memory address conversion
@@ -780,6 +813,9 @@ Value Value::operator-(const Value& b) const {
   case ValType::S32:
     sub_s32(result, *this, b);
     break;
+  case ValType::U64:
+    sub_u64(result, *this, b);
+    break;
   default:
     unsupported("-", type);
   }
@@ -1008,6 +1044,9 @@ Value Value::operator==(const Value& b) const {
   case ValType::S32:
     setp_eq_s32(result, *this, b);
     break;
+  case ValType::U64:
+    setp_eq_u64(result, *this, b);
+    break;
   default:
     unsupported("==", type);
   }
@@ -1022,6 +1061,9 @@ Value Value::operator!=(const Value& b) const {
     break;
   case ValType::S32:
     setp_ne_s32(result, *this, b);
+    break;
+  case ValType::U64:
+    setp_ne_u64(result, *this, b);
     break;
   case ValType::S64:
     setp_ne_s64(result, *this, b);
@@ -1207,17 +1249,34 @@ ScopeGuard _Else() {
   return sg;
 }
 
-ScopeGuard _WhileImpl(Block* header, const Value& pred) {
+ScopeGuard _WhileImpl(Block* header, const Value& cond) {
   ScopeGuard sg;
   // Create exit block (forward reference, not yet in function)
   sg.pendingBlock = std::make_unique<Block>();
   sg.pendingBlock->label = genLabel("endwhile");
   sg.backEdgeTarget = header;
-  // Emit conditional branch: exit loop when pred is false
-  bra_not(pred, sg.pendingBlock.get());
+  // Convert non-pred to pred if needed (e.g. WHILE(true) → Value(1))
+  if (cond.type != ValType::Pred) {
+    bra_not(cond != 0, sg.pendingBlock.get());
+  } else {
+    bra_not(cond, sg.pendingBlock.get());
+  }
   // Create and activate body block
   activateNewBlock("while_body");
   return sg;
+}
+
+// --- Predicated execution ---
+
+PredGuard::PredGuard(const Value& pred) {
+  if (!currentPred.empty()) {
+    throw std::runtime_error("nested PRED not supported");
+  }
+  currentPred = "@" + pred.str() + " ";
+}
+
+PredGuard::~PredGuard() {
+  currentPred.clear();
 }
 
 // --- Convenience functions ---
@@ -1237,6 +1296,12 @@ Value blockIdx_x() {
 Value blockDim_x() {
   Value v(ValType::U32);
   mov_u32(v, "%ntid.x");
+  return v;
+}
+
+Value clock64() {
+  Value v(ValType::U64);
+  mov_u64(v, Value("%clock64"));
   return v;
 }
 

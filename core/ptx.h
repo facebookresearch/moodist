@@ -69,6 +69,10 @@ struct Module {
 
   Function* newFunction(const char* name);
 
+  // Declare a global variable. Returns the symbol name.
+  // Example: addGlobal(".u64", 256, "counters") → ".global .u64 counters[256]"
+  std::string addGlobal(const char* type, int count, const char* name);
+
   // Serialize the complete module to a PTX string
   std::string finalize() const;
 };
@@ -170,6 +174,39 @@ struct Value {
 // Backward compatibility alias
 using Val = Value;
 
+// Commutative free functions for int + Value (Value + int works via implicit conversion)
+inline Value operator+(int a, const Value& b) {
+  return Value(int32_t(a)) + b;
+}
+inline Value operator*(int a, const Value& b) {
+  return Value(int32_t(a)) * b;
+}
+// Convenience factory functions for typed registers
+inline Value u16() {
+  return Value(ValType::U16);
+}
+inline Value u16(const Value& v) {
+  Value r(ValType::U16);
+  r = v;
+  return r;
+}
+inline Value u32() {
+  return Value(ValType::U32);
+}
+inline Value u32(const Value& v) {
+  Value r(ValType::U32);
+  r = v;
+  return r;
+}
+inline Value u64() {
+  return Value(ValType::U64);
+}
+inline Value u64(const Value& v) {
+  Value r(ValType::U64);
+  r = v;
+  return r;
+}
+
 // ---------------------------------------------------------------------------
 // Free-standing instruction helpers (emit to currentBlock)
 // ---------------------------------------------------------------------------
@@ -181,6 +218,7 @@ void add_u64(const Value& d, const Value& a, const Value& b);
 void add_s64(const Value& d, const Value& a, const Value& b);
 void sub_u32(const Value& d, const Value& a, const Value& b);
 void sub_s32(const Value& d, const Value& a, const Value& b);
+void sub_u64(const Value& d, const Value& a, const Value& b);
 void mul_lo_u32(const Value& d, const Value& a, const Value& b);
 void mul_lo_s32(const Value& d, const Value& a, const Value& b);
 void mul_lo_u64(const Value& d, const Value& a, const Value& b);
@@ -222,6 +260,8 @@ void setp_ne_s32(const Value& p, const Value& a, const Value& b);
 void setp_lt_s32(const Value& p, const Value& a, const Value& b);
 void setp_ge_s32(const Value& p, const Value& a, const Value& b);
 void setp_ne_s64(const Value& p, const Value& a, const Value& b);
+void setp_eq_u64(const Value& p, const Value& a, const Value& b);
+void setp_ne_u64(const Value& p, const Value& a, const Value& b);
 void setp_lt_s64(const Value& p, const Value& a, const Value& b);
 void setp_ge_s64(const Value& p, const Value& a, const Value& b);
 
@@ -236,12 +276,14 @@ void ld_param_u64(const Value& d, const std::string& paramName);
 void ld_param_u32(const Value& d, const Value& addr, int offset);
 void ld_param_u64(const Value& d, const Value& addr, int offset);
 void ld_global_u32(const Value& d, const Value& addr);
+void ld_global_u64(const Value& d, const Value& addr);
 void ld_global_volatile_u32(const Value& d, const Value& addr);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
 void ld_u8(const Value& d, const Value& addr);
 
 // Store
 void st_global_u32(const Value& addr, const Value& val);
+void st_global_u64(const Value& addr, const Value& val);
 void st_global_volatile_u32(const Value& addr, const Value& val);
 void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, const Value& s2, const Value& s3);
 void st_u8(const Value& addr, const Value& val);
@@ -309,15 +351,8 @@ ScopeGuard _WhileImpl(Block* header, const Value& pred);
 template<typename F>
 ScopeGuard _While(F&& condFn) {
   Block* header = activateNewBlock("while");
-  auto cond = condFn();
-  if constexpr (std::is_convertible_v<decltype(cond), bool>) {
-    // Constant or boolean condition — materialize as predicate
-    Value pred(ValType::Pred);
-    pred = cond ? 1 : 0;
-    return _WhileImpl(header, pred);
-  } else {
-    return _WhileImpl(header, cond);
-  }
+  Value cond = condFn();
+  return _WhileImpl(header, cond);
 }
 
 template<typename CondFn, typename StepFn>
@@ -330,7 +365,7 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
 }
 
 #define IF(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_If(pred); true)
-#define ELSE else if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Else(); true)
+#define ELSE if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Else(); true)
 #define WHILE(cond)                                                                                                    \
   if ([[maybe_unused]] auto _ptx_while_scope_ = ::moodist::ptx::_While([&]() {                                         \
         return (cond);                                                                                                 \
@@ -348,10 +383,21 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
             });                                                                                                        \
         true)
 
+// Predicated execution — all instructions in body are prefixed with @pred.
+struct PredGuard {
+  PredGuard(const Value& pred);
+  ~PredGuard();
+  PredGuard(const PredGuard&) = delete;
+  PredGuard& operator=(const PredGuard&) = delete;
+  PredGuard(PredGuard&&) = delete;
+};
+#define PRED(pred) if ([[maybe_unused]] auto _ptx_pred_ = ::moodist::ptx::PredGuard(pred); true)
+
 // Special registers
 Value threadIdx_x();
 Value blockIdx_x();
 Value blockDim_x();
+Value clock64();
 
 // Parameter loading — emits ld.param, returns typed Value
 Value loadParam(int index, ValType type);
@@ -413,6 +459,8 @@ void cp_async_bulk_wait_group(int n);
 // Named barrier with explicit thread count (bar.sync barrierID, threadCount)
 void bar_sync(int barrierId, int threadCount);
 void bar_sync(const Value& barrierId, int threadCount);
+void bar_arrive(int barrierId, int threadCount);
+void bar_arrive(const Value& barrierId, int threadCount);
 
 // Shared memory address conversion
 Value cvta_shared(const Value& sharedAddr); // convert shared addr to generic

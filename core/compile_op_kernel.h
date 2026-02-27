@@ -29,16 +29,67 @@ struct CompileOpCopyParameters {
 };
 
 // Configuration for the PTX copy kernel generator and auto-tuner.
+// Engine-specific fields are std::optional — only populated for the relevant engine type.
+// Accessing an unpopulated field throws std::bad_optional_access.
 struct CopyKernelConfig {
-  int depth = 4;
+  // Universal fields (all engine types)
   size_t blockSize = 256;
   size_t gridSize = 8;
-  const char* loadOp = "cv";      // "cv" (cache volatile), "cs" (cache streaming), "nc" (non-coherent)
   const char* copyEngine = "reg"; // "reg" (register pipeline), "bulk" (cp.async.bulk)
-  size_t bulkChunkSize = 16384;   // staging buffer size for bulk engine (bytes)
-  bool bulkWarpLeaderDma = true;  // true: 1 DMA per warp, false: 1 DMA per thread
-  bool bulkSkipWriteBack = false; // debug: skip shared→global write-back
-  bool bulkWriteBack = false;     // true: use cp.async.bulk for write-back (shared→global DMA)
+
+  // Reg-only fields
+  std::optional<int> depth;          // pipeline depth (1-32)
+  std::optional<const char*> loadOp; // "cv" (cache volatile), "cs" (cache streaming), "nc" (non-coherent)
+
+  // Bulk-only fields
+  std::optional<size_t> bulkChunkSize;   // staging buffer size (bytes)
+  std::optional<const char*> bulkMode;   // "doublebuf" or "warppipe"
+  std::optional<bool> bulkSkipWriteBack; // debug: skip shared→global write-back
+  std::optional<bool> bulkWriteBack;     // true: use cp.async.bulk for write-back (shared→global DMA)
+
+  // Bulk doublebuf-only fields
+  std::optional<bool> bulkWarpLeaderDma; // true: 1 DMA per warp, false: 1 DMA per thread
+
+  // Bulk warppipe-only fields
+  std::optional<int> warppipeDepth; // 0 = use numWarps, >0 = limit pipeline depth (max 15)
+
+  // Factory functions for constructing engine-specific configs
+  static CopyKernelConfig reg(int depth, size_t blockSize, size_t gridSize, const char* loadOp) {
+    CopyKernelConfig c;
+    c.copyEngine = "reg";
+    c.blockSize = blockSize;
+    c.gridSize = gridSize;
+    c.depth = depth;
+    c.loadOp = loadOp;
+    return c;
+  }
+
+  static CopyKernelConfig bulk(
+      size_t blockSize, size_t gridSize, size_t chunkSize, bool warpLeaderDma, bool writeBack) {
+    CopyKernelConfig c;
+    c.copyEngine = "bulk";
+    c.blockSize = blockSize;
+    c.gridSize = gridSize;
+    c.bulkChunkSize = chunkSize;
+    c.bulkMode = "doublebuf";
+    c.bulkWarpLeaderDma = warpLeaderDma;
+    c.bulkSkipWriteBack = false;
+    c.bulkWriteBack = writeBack;
+    return c;
+  }
+
+  static CopyKernelConfig warppipe(size_t blockSize, size_t gridSize, size_t chunkSize, int pipeDepth, bool writeBack) {
+    CopyKernelConfig c;
+    c.copyEngine = "bulk";
+    c.blockSize = blockSize;
+    c.gridSize = gridSize;
+    c.bulkChunkSize = chunkSize;
+    c.bulkMode = "warppipe";
+    c.warppipeDepth = pipeDepth;
+    c.bulkSkipWriteBack = false;
+    c.bulkWriteBack = writeBack;
+    return c;
+  }
 };
 
 struct CompileOpKernels {

@@ -212,6 +212,34 @@ void tuningCacheStore(const TuningKey& key, const TuningResult& result) {
   tuningCache[key.computeArch][static_cast<uint8_t>(key.sizeCat)] = result;
 }
 
+// Format a CopyKernelConfig for log output, printing only populated fields.
+std::string formatConfig(const CopyKernelConfig& c) {
+  std::string s = c.copyEngine;
+  if (c.depth.has_value()) {
+    s += fmt::sprintf(" depth=%d", c.depth.value());
+  }
+  s += fmt::sprintf(" blockSize=%zu", c.blockSize);
+  if (c.loadOp.has_value()) {
+    s += fmt::sprintf(" loadOp=%s", c.loadOp.value());
+  }
+  if (c.bulkChunkSize.has_value()) {
+    s += fmt::sprintf(" chunk=%zuK", c.bulkChunkSize.value() / 1024);
+  }
+  if (c.bulkMode.has_value()) {
+    s += fmt::sprintf(" mode=%s", c.bulkMode.value());
+  }
+  if (c.bulkWarpLeaderDma.has_value()) {
+    s += fmt::sprintf(" dma=%s", c.bulkWarpLeaderDma.value() ? "warp" : "thread");
+  }
+  if (c.bulkWriteBack.has_value()) {
+    s += fmt::sprintf(" wb=%s", c.bulkWriteBack.value() ? "bulk" : "reg");
+  }
+  if (c.warppipeDepth.has_value()) {
+    s += fmt::sprintf(" pipeDepth=%d", c.warppipeDepth.value());
+  }
+  return s;
+}
+
 // Run the full tuning sweep for a given size category using the real
 // production kernel (with NVLink copies and barriers). All ranks in the
 // group must call this collectively with the same candidate sequence.
@@ -381,7 +409,7 @@ TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
   cuMemFree(syntheticSrc);
 
   double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("tuning complete: best depth=%d blockSize=%zu (%.3f ms) in %.1fs\n", best.config.depth,
+  log.info("tuning complete: best depth=%d blockSize=%zu (%.3f ms) in %.1fs\n", best.config.depth.value(),
       best.config.blockSize, best.ms, elapsed);
 
   return best;
@@ -480,19 +508,26 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   // Build candidate configs
   Vector<CopyKernelConfig> candidates;
 
+  // Read env vars for fixed-value settings (applied to all relevant candidates)
+  int envWarppipeDepth = 0;
+  if (auto* env = std::getenv("MOODIST_WARPPIPE_DEPTH")) {
+    int d = atoi(env);
+    if (d >= 0 && d <= 32) {
+      envWarppipeDepth = d;
+    }
+  }
+
   // Register pipeline variants: loadOp × depth × blockSize
   static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
   for (const char* loadOp : loadOps) {
     for (int depth : depths) {
       for (size_t bs : blockSizes) {
-        candidates.push_back({depth, bs, gridSize, loadOp, "reg"});
+        candidates.push_back(CopyKernelConfig::reg(depth, bs, gridSize, loadOp));
       }
     }
   }
 
-  // Bulk copy engine variants: blockSize × chunkSize × dmaMode
-  // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
-  // Restrict to power-of-2 block sizes for clean per-warp division.
+  // Bulk copy engine variants: blockSize × chunkSize × dmaMode × bulkMode
   {
     int maxSmem = 0;
     CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
@@ -501,22 +536,86 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     for (size_t chunk : chunkSizes) {
       for (size_t bs : bulkBlockSizes) {
         size_t numWarps = bs / 32;
-        size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
-        if (totalSmem > (size_t)maxSmem) {
-          continue;
+
+        // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
+        {
+          size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
+          if (totalSmem <= (size_t)maxSmem) {
+            // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
+            if (chunk % (numWarps * 16) == 0) {
+              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, false));
+              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, true));
+            }
+            // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
+            if (chunk % (bs * 16) == 0) {
+              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, false));
+              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, true));
+            }
+          }
         }
-        // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
-        if (chunk % (numWarps * 16) == 0) {
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true, false, false});
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, true, false, true});
-        }
-        // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
-        if (chunk % (bs * 16) == 0) {
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false, false, false});
-          candidates.push_back({1, bs, gridSize, "cv", "bulk", chunk, false, false, true});
+
+        // Warppipe: total smem = chunkSize + numWarps * 8
+        // Warppipe uses single-lane DMA (warp leader always), so no dmaMode sweep.
+        // stageChunk = chunk/numWarps must divide cleanly for 16-byte aligned DMAs.
+        {
+          size_t totalSmem = chunk + numWarps * 8;
+          if (totalSmem <= (size_t)maxSmem && (chunk * 2) % (numWarps * 1024) == 0) {
+            static constexpr int pipeDepths[] = {1, 2, 4, 8, 16};
+            // static constexpr int pipeDepths[] = {1};
+            for (int depth : pipeDepths) {
+              if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
+                candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth, false));
+              }
+            }
+          }
         }
       }
     }
+  }
+
+  // Filter candidates by env vars
+  if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
+    for (auto& c : candidates) {
+      c.bulkSkipWriteBack = true;
+    } // if (totalSmem > 48 * 1024) {
+      //   CHECK_CU(cuFuncSetAttribute(
+      //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+      // }
+  }
+  if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                         [env](const CopyKernelConfig& c) {
+                           return strcmp(c.copyEngine, env) != 0;
+                         }),
+        candidates.end());
+  }
+  if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
+    size_t bs = atoi(env);
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                         [bs](const CopyKernelConfig& c) {
+                           return c.blockSize != bs;
+                         }),
+        candidates.end());
+  }
+  if (auto* env = std::getenv("MOODIST_BULK_MODE")) {
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                         [env](const CopyKernelConfig& c) {
+                           return c.bulkMode.has_value() && strcmp(c.bulkMode.value(), env) != 0;
+                         }),
+        candidates.end());
+  }
+  if (std::getenv("MOODIST_BULK_WRITEBACK")) {
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                         [](const CopyKernelConfig& c) {
+                           return c.bulkWriteBack.has_value() && !c.bulkWriteBack.value();
+                         }),
+        candidates.end());
+  }
+
+  REQUIRE(!candidates.empty(), "No tuning candidates remain after env var filtering");
+
+  if (verbose) {
+    log.info("tuning v9: %zu candidates after env var filtering\n", candidates.size());
   }
 
   // Evaluate all candidates
@@ -525,14 +624,23 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
     double genSec = seconds(std::chrono::steady_clock::now() - t0);
 
+    if (auto* env = std::getenv("MOODIST_DUMP_TUNE_PTX"); env && !strcmp(env, "1")) {
+      fprintf(stderr, "=== PTX for %s ===\n%s\n=== END PTX ===\n", formatConfig(cfg).c_str(), ptx.c_str());
+    }
+
     t0 = std::chrono::steady_clock::now();
     CUmodule variantModule = nullptr;
-    CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 0, nullptr, nullptr);
+    char jitErrorLog[4096] = {};
+    CUjit_option jitOpts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+    void* jitOptVals[] = {jitErrorLog, (void*)(uintptr_t)sizeof(jitErrorLog)};
+    CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 2, jitOpts, jitOptVals);
     double jitSec = seconds(std::chrono::steady_clock::now() - t0);
     if (jitErr != CUDA_SUCCESS) {
       if (verbose) {
-        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> JIT failed (error %d), skipping\n", cfg.copyEngine,
-            cfg.depth, cfg.blockSize, cfg.loadOp, (int)jitErr);
+        log.info("  %s -> JIT failed (error %d), skipping\n", formatConfig(cfg), (int)jitErr);
+        if (jitErrorLog[0]) {
+          log.info("  ptxas: %s\n", jitErrorLog);
+        }
       }
       continue;
     }
@@ -540,11 +648,21 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     CUfunction fn = nullptr;
     CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
 
-    // Opt in to larger shared memory if needed (double-buffered bulk engine)
-    size_t totalSmem = !strcmp(cfg.copyEngine, "bulk") ? 2 * cfg.bulkChunkSize + 2 * (cfg.blockSize / 32) * 8 : 0;
-    if (totalSmem > 48 * 1024) {
-      cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem);
+    // Opt in to larger shared memory if needed (bulk copy engine)
+    size_t totalSmem = 0;
+    if (!strcmp(cfg.copyEngine, "bulk")) {
+      size_t chunk = cfg.bulkChunkSize.value();
+      size_t numWarps = cfg.blockSize / 32;
+      if (!strcmp(cfg.bulkMode.value(), "warppipe")) {
+        totalSmem = chunk + numWarps * 8;
+      } else {
+        totalSmem = 2 * chunk + 2 * numWarps * 8;
+      }
     }
+    // if (totalSmem > 48 * 1024) {
+    //   log.info("totalSmem is %d\n", totalSmem);
+    //   CHECK_CU(cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+    // }
 
     // Warmup
     for (int i = 0; i < warmupIters; i++) {
@@ -574,14 +692,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     }
 
     if (verbose) {
-      if (!strcmp(cfg.copyEngine, "bulk")) {
-        log.info("  %s blockSize=%zu chunk=%zuK dma=%s wb=%s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n",
-            cfg.copyEngine, cfg.blockSize, cfg.bulkChunkSize / 1024, cfg.bulkWarpLeaderDma ? "warp" : "thread",
-            cfg.bulkWriteBack ? "bulk" : "reg", bestMs, genSec, jitSec, measureSec);
-      } else {
-        log.info("  %s depth=%d blockSize=%zu loadOp=%s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n",
-            cfg.copyEngine, cfg.depth, cfg.blockSize, cfg.loadOp, bestMs, genSec, jitSec, measureSec);
-      }
+      log.info("  %s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n", formatConfig(cfg), bestMs, genSec, jitSec,
+          measureSec);
     }
 
     if (bestMs < best.ms) {
@@ -601,8 +713,7 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   cuMemFree(syntheticSrc);
 
   double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("v9 tuning complete: best %s depth=%d blockSize=%zu loadOp=%s (%.3f ms) in %.1fs\n", best.config.copyEngine,
-      best.config.depth, best.config.blockSize, best.config.loadOp, best.ms, elapsed);
+  log.info("v9 tuning complete: best %s (%.3f ms) in %.1fs\n", formatConfig(best.config), best.ms, elapsed);
 
   return best;
 }
@@ -1735,20 +1846,14 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
       }
     }
 
-    // Override copy engine from env var (for testing)
-    if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
-      result.config.copyEngine = env;
-    }
+    // Debug override: skip shared→global write-back (applied post-tuning since
+    // it doesn't affect tuning performance — the write-back is just skipped).
     if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
       result.config.bulkSkipWriteBack = true;
     }
-    if (std::getenv("MOODIST_BULK_WRITEBACK")) {
-      result.config.bulkWriteBack = true;
-    }
 
     // Generate and compile the final kernel with the tuned config
-    log.info("compile_op[%u]: auto-tuned kernel depth=%d blockSize=%zu loadOp=%s copyEngine=%s (%.3f ms)\n", op->id,
-        result.config.depth, result.config.blockSize, result.config.loadOp, result.config.copyEngine, result.ms);
+    log.info("compile_op[%u]: auto-tuned kernel %s (%.3f ms)\n", op->id, formatConfig(result.config), result.ms);
 
     if (kernelVersion == 9) {
       const char* target = computeTarget(computeMajor, computeMinor);
@@ -1763,19 +1868,24 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         }
       }
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-      // Opt in to larger shared memory if needed (double-buffered bulk engine)
-      {
-        size_t totalSmem = !strcmp(result.config.copyEngine, "bulk")
-                               ? 2 * result.config.bulkChunkSize + 2 * (result.config.blockSize / 32) * 8
-                               : 0;
-        if (totalSmem > 48 * 1024) {
-          cuFuncSetAttribute(
-              op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem);
+      // Opt in to larger shared memory if needed (bulk copy engine)
+      if (!strcmp(result.config.copyEngine, "bulk")) {
+        size_t chunk = result.config.bulkChunkSize.value();
+        size_t numWarps = result.config.blockSize / 32;
+        size_t totalSmem;
+        if (!strcmp(result.config.bulkMode.value(), "warppipe")) {
+          totalSmem = chunk + numWarps * 8;
+        } else {
+          totalSmem = 2 * chunk + 2 * numWarps * 8;
         }
+        // if (totalSmem > 48 * 1024) {
+        //   CHECK_CU(cuFuncSetAttribute(
+        //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+        // }
       }
     } else {
       std::string finalSource =
-          generateCopyKernel(ctx.group, result.config.gridSize, result.config.blockSize, result.config.depth);
+          generateCopyKernel(ctx.group, result.config.gridSize, result.config.blockSize, result.config.depth.value());
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernel(
           finalSource, "compile_op_copy", cuDevice, fmt::sprintf("moodist-tuned-rank%zu-op%u", rank, op->id).c_str()));
     }
