@@ -2,6 +2,7 @@
 
 #include "ptx.h"
 
+#include <cassert>
 #include <cstdio>
 #include <stdexcept>
 
@@ -533,6 +534,12 @@ void mbarrier_init(const Value& addr, int count) {
 Value mbarrier_arrive(const Value& addr) {
   Value state(ValType::U64);
   emitInst("mbarrier.arrive.shared::cta.b64 " + state.str() + ", [" + addr.str() + "]");
+  return state;
+}
+
+Value mbarrier_arrive_noComplete(const Value& addr) {
+  Value state(ValType::U64);
+  emitInst("mbarrier.arrive.noComplete.shared::cta.b64 " + state.str() + ", [" + addr.str() + "]");
   return state;
 }
 
@@ -1264,6 +1271,23 @@ ScopeGuard _WhileImpl(Block* header, const Value& cond) {
   // Create and activate body block
   activateNewBlock("while_body");
   return sg;
+}
+
+// --- Labels ---
+
+Label::Label() {
+  block = std::make_unique<Block>();
+  block->label = genLabel("label");
+}
+
+Label::Label(const char* name) {
+  block = std::make_unique<Block>();
+  block->label = genLabel(name);
+}
+
+void activateLabel(Label& label) {
+  assert(label.block && "Label already placed");
+  activateBlock(std::move(label.block));
 }
 
 // --- Predicated execution ---

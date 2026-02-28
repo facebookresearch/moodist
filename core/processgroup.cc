@@ -4143,7 +4143,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
 
   int kernelVersion = group->compileOpKernels->version;
   bool copyWriteMode = false;
-  if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
+  if (op->tunedConfig.copyWrite.has_value()) {
+    copyWriteMode = op->tunedConfig.copyWrite.value();
+  } else if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
     copyWriteMode = !strcmp(env, "1");
   }
 

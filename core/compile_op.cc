@@ -243,6 +243,9 @@ std::string formatConfig(const CopyKernelConfig& c) {
   if (c.nbufWriteCount.has_value()) {
     s += fmt::sprintf(" writeBufs=%d", c.nbufWriteCount.value());
   }
+  if (c.copyWrite.has_value()) {
+    s += c.copyWrite.value() ? " write" : " read";
+  }
   return s;
 }
 
@@ -465,9 +468,13 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
   CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
 
-  // Build the copy descriptor (same IPC mapping as v8 tuning)
+  // Build the copy descriptor
   CopyDescriptor desc;
   desc.bytes = static_cast<uint32_t>(copyBytes);
+
+  // Set up IPC mappings for both read and write directions
+  uintptr_t remoteSrcAddr = 0; // for read mode: remote peer's src buffer
+  uintptr_t remoteDstAddr = 0; // for write mode: remote peer's dst buffer
 
   if (size > 1) {
     size_t readerRank = (rank + 1) % size;
@@ -475,14 +482,25 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     size_t readerPeerIndex = ctx.group->getPeerIndex(readerRank);
     size_t sourcePeerIndex = ctx.group->getPeerIndex(sourceRank);
 
-    uintptr_t mappedAddr = 0;
-    ipcMapper->requestAddress(readerPeerIndex, syntheticSrc, copyBytes, &mappedAddr);
+    // Map src for read mode (reader pulls from our src)
+    uintptr_t mappedSrcAddr = 0;
+    ipcMapper->requestAddress(readerPeerIndex, syntheticSrc, copyBytes, &mappedSrcAddr);
+    ipcMapper->wait();
+
+    // Map dst for write mode (source pushes to our dst)
+    uintptr_t mappedDstAddr = 0;
+    ipcMapper->requestAddress(sourcePeerIndex, syntheticDst, copyBytes, &mappedDstAddr);
     ipcMapper->wait();
 
     ctx.barrier();
 
-    ipcMapper->push(readerPeerIndex, mappedAddr);
-    uintptr_t remoteSrcAddr = ipcMapper->pop<uintptr_t>(sourcePeerIndex);
+    // Exchange read-mode addresses: push our src to reader, pop source's src
+    ipcMapper->push(readerPeerIndex, mappedSrcAddr);
+    remoteSrcAddr = ipcMapper->pop<uintptr_t>(sourcePeerIndex);
+
+    // Exchange write-mode addresses: push our dst to source, pop reader's dst
+    ipcMapper->push(sourcePeerIndex, mappedDstAddr);
+    remoteDstAddr = ipcMapper->pop<uintptr_t>(readerPeerIndex);
 
     desc.src = remoteSrcAddr;
     desc.dst = syntheticDst;
@@ -538,7 +556,7 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     int maxSmem = 0;
     CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
     // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
-    static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
+    static constexpr size_t chunkSizes[] = {114688};
     static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
     for (size_t chunk : chunkSizes) {
       for (size_t bs : bulkBlockSizes) {
@@ -580,7 +598,7 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
         // Nbuf: single buffer + readBufs mbarriers per warp
         {
           if ((chunk * 2) % (numWarps * 1024) == 0) {
-            for (int rb = 1; rb <= 4; rb++) {
+            for (int rb = 2; rb <= 4; rb++) {
               for (int wb = 0; wb <= 4; wb++) {
                 size_t totalSmem = chunk + numWarps * rb * 8;
                 if (totalSmem <= (size_t)maxSmem) {
@@ -592,6 +610,21 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
         }
       }
     }
+  }
+
+  // Expand candidates into read + write variants
+  {
+    Vector<CopyKernelConfig> expanded;
+    expanded.reserve(candidates.size() * 2);
+    for (const auto& c : candidates) {
+      CopyKernelConfig read = c;
+      read.copyWrite = false;
+      expanded.push_back(read);
+      CopyKernelConfig write = c;
+      write.copyWrite = true;
+      expanded.push_back(write);
+    }
+    candidates = std::move(expanded);
   }
 
   // Filter candidates by env vars
@@ -632,6 +665,14 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
                          }),
         candidates.end());
   }
+  if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
+    bool writeOnly = !strcmp(env, "1");
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                         [writeOnly](const CopyKernelConfig& c) {
+                           return c.copyWrite.value_or(false) != writeOnly;
+                         }),
+        candidates.end());
+  }
 
   REQUIRE(!candidates.empty(), "No tuning candidates remain after env var filtering");
 
@@ -641,6 +682,17 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
 
   // Evaluate all candidates
   for (const auto& cfg : candidates) {
+    // Set descriptor direction based on copyWrite
+    if (size > 1) {
+      if (cfg.copyWrite.value_or(false)) {
+        desc.src = syntheticSrc;
+        desc.dst = remoteDstAddr;
+      } else {
+        desc.src = remoteSrcAddr;
+        desc.dst = syntheticDst;
+      }
+    }
+
     auto t0 = std::chrono::steady_clock::now();
     std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
     double genSec = seconds(std::chrono::steady_clock::now() - t0);

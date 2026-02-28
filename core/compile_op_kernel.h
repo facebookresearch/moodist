@@ -57,6 +57,9 @@ struct CopyKernelConfig {
   std::optional<int> nbufReadCount;  // number of read buffers per warp (1-4)
   std::optional<int> nbufWriteCount; // number of write buffers per warp (1-4)
 
+  // IPC direction (applies to all engine types)
+  std::optional<bool> copyWrite; // true: push (write to remote dst), false: pull (read from remote src)
+
   // Factory functions for constructing engine-specific configs
   static CopyKernelConfig reg(int depth, size_t blockSize, size_t gridSize, const char* loadOp) {
     CopyKernelConfig c;
