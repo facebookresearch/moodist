@@ -233,6 +233,11 @@ void min_u32(const Value& d, const Value& a, const Value& b);
 void min_s32(const Value& d, const Value& a, const Value& b);
 void max_u32(const Value& d, const Value& a, const Value& b);
 void max_s32(const Value& d, const Value& a, const Value& b);
+inline Value min_u32(const Value& a, const Value& b) {
+  Value result(ValType::U32);
+  min_u32(result, a, b);
+  return result;
+}
 
 // Bitwise
 void and_pred(const Value& d, const Value& a, const Value& b);
@@ -384,6 +389,28 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
         true)
 
 // Predicated execution — all instructions in body are prefixed with @pred.
+
+// Forward jump labels — declare anywhere, GOTO to jump, LABEL to place.
+//   Label tail("tail");
+//   ...
+//   GOTO(tail);
+//   ...
+//   LABEL(tail);  // subsequent instructions go here
+struct Label {
+  std::unique_ptr<Block> block;
+  Label();
+  Label(const char* name);
+  Label(const Label&) = delete;
+  Label& operator=(const Label&) = delete;
+};
+void activateLabel(Label& label);
+
+#define GOTO(label) ::moodist::ptx::bra((label).block.get())
+#define GOTO_IF(pred, label) ::moodist::ptx::bra(pred, (label).block.get())
+#define GOTO_IF_NOT(pred, label) ::moodist::ptx::bra_not(pred, (label).block.get())
+#define LABEL(label) ::moodist::ptx::activateLabel(label)
+
+// Predicated execution — all instructions in body are prefixed with @pred.
 struct PredGuard {
   PredGuard(const Value& pred);
   ~PredGuard();
@@ -446,6 +473,8 @@ Value hexImm(uintptr_t value);
 // mbarrier operations (sm_90+)
 void mbarrier_init(const Value& addr, int count);
 Value mbarrier_arrive(const Value& addr); // returns state token (u64)
+Value mbarrier_arrive_noComplete(
+    const Value& addr); // arrive with .noComplete hint (caller guarantees this won't complete the phase)
 void mbarrier_expect_tx(const Value& addr, const Value& txCount);
 Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity); // returns pred
 
