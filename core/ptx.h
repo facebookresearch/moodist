@@ -285,6 +285,12 @@ void ld_global_u64(const Value& d, const Value& addr);
 void ld_global_volatile_u32(const Value& d, const Value& addr);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
 void ld_u8(const Value& d, const Value& addr);
+void ld_shared_acquire_cta_u32(const Value& d, const Value& addr);
+inline Value ld_shared_acquire_cta_u32(const Value& addr) {
+  Value result(ValType::U32);
+  ld_shared_acquire_cta_u32(result, addr);
+  return result;
+}
 
 // Store
 void st_global_u32(const Value& addr, const Value& val);
@@ -292,6 +298,7 @@ void st_global_u64(const Value& addr, const Value& val);
 void st_global_volatile_u32(const Value& addr, const Value& val);
 void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, const Value& s2, const Value& s3);
 void st_u8(const Value& addr, const Value& val);
+void st_shared_release_cta_u32(const Value& addr, const Value& val);
 
 // Conversion
 void cvt_u64_u32(const Value& d, const Value& a);
@@ -484,6 +491,7 @@ void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value
 void cp_async_bulk_prefetch_l2(const Value& src, const Value& size);
 void cp_async_bulk_commit_group();
 void cp_async_bulk_wait_group(int n);
+void cp_async_bulk_wait_group_read(int n);
 
 // Named barrier with explicit thread count (bar.sync barrierID, threadCount)
 void bar_sync(int barrierId, int threadCount);

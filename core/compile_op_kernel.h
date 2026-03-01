@@ -85,7 +85,7 @@ struct CopyKernelConfig {
     return c;
   }
 
-  static CopyKernelConfig warppipe(size_t blockSize, size_t gridSize, size_t chunkSize, int pipeDepth, bool writeBack) {
+  static CopyKernelConfig warppipe(size_t blockSize, size_t gridSize, size_t chunkSize, int pipeDepth) {
     CopyKernelConfig c;
     c.copyEngine = "bulk";
     c.blockSize = blockSize;
@@ -94,7 +94,6 @@ struct CopyKernelConfig {
     c.bulkMode = "warppipe";
     c.warppipeDepth = pipeDepth;
     c.bulkSkipWriteBack = false;
-    c.bulkWriteBack = writeBack;
     return c;
   }
 
@@ -108,7 +107,6 @@ struct CopyKernelConfig {
     c.nbufReadCount = readCount;
     c.nbufWriteCount = writeCount;
     c.bulkSkipWriteBack = false;
-    c.bulkWriteBack = false;
     return c;
   }
 };
