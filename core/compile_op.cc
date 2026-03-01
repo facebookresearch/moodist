@@ -589,7 +589,7 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
             // static constexpr int pipeDepths[] = {1};
             for (int depth : pipeDepths) {
               if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
-                candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth, false));
+                candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth));
               }
             }
           }
@@ -603,6 +603,19 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
                 size_t totalSmem = chunk + numWarps * rb * 8;
                 if (totalSmem <= (size_t)maxSmem) {
                   candidates.push_back(CopyKernelConfig::nbuf(bs, gridSize, chunk * 2, rb, wb));
+
+                  if (bs >= 64) {
+                    CopyKernelConfig c;
+                    c.copyEngine = "bulk";
+                    c.blockSize = bs;
+                    c.gridSize = gridSize;
+                    c.bulkChunkSize = chunk * 2;
+                    c.bulkMode = "nbuf2";
+                    c.nbufReadCount = rb;
+                    c.nbufWriteCount = wb;
+                    c.bulkSkipWriteBack = false;
+                    candidates.push_back(c);
+                  }
                 }
               }
             }

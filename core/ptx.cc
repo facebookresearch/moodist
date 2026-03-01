@@ -471,6 +471,12 @@ void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
 void st_global_release_sys_u32(const Value& addr, const Value& val) {
   emitInst("st.release.sys.global.u32 [" + addr.str() + "], " + val.str());
 }
+void ld_shared_acquire_cta_u32(const Value& d, const Value& addr) {
+  emitInst("ld.acquire.cta.shared.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+void st_shared_release_cta_u32(const Value& addr, const Value& val) {
+  emitInst("st.release.cta.shared.u32 [" + addr.str() + "], " + val.str());
+}
 void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, const Value& s2, const Value& s3) {
   emitInst("st.global.wt.v4.u32 [" + addr.str() + "], {" + s0.str() + ", " + s1.str() + ", " + s2.str() + ", " +
            s3.str() + "}");
@@ -573,6 +579,9 @@ void cp_async_bulk_commit_group() {
 
 void cp_async_bulk_wait_group(int n) {
   emitInst("cp.async.bulk.wait_group " + std::to_string(n));
+}
+void cp_async_bulk_wait_group_read(int n) {
+  emitInst("cp.async.bulk.wait_group.read " + std::to_string(n));
 }
 
 void bar_sync(int barrierId, int threadCount) {
