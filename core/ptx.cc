@@ -428,6 +428,18 @@ void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, cons
 void ld_global_cv_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   ld_global_cv_v4_u32(v[0], v[1], v[2], v[3], addr);
 }
+void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr) {
+  v[0] = Value(ValType::U32);
+  v[1] = Value(ValType::U32);
+  v[2] = Value(ValType::U32);
+  v[3] = Value(ValType::U32);
+  emitInst("ld.shared.v4.u32 {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " + v[3].str() + "}, [" +
+           addr.str() + "]");
+}
+void st_shared_v4_u32(const Value& addr, const std::array<Value, 4>& v) {
+  emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " +
+           v[3].str() + "}");
+}
 void ld_global_nc_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
   emitInst("ld.global.nc.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" +
            addr.str() + "]");
@@ -545,7 +557,7 @@ Value mbarrier_arrive(const Value& addr) {
 
 Value mbarrier_arrive_noComplete(const Value& addr) {
   Value state(ValType::U64);
-  emitInst("mbarrier.arrive.noComplete.shared::cta.b64 " + state.str() + ", [" + addr.str() + "]");
+  emitInst("mbarrier.arrive.noComplete.shared::cta.b64 " + state.str() + ", [" + addr.str() + "], 1");
   return state;
 }
 
@@ -1287,11 +1299,13 @@ ScopeGuard _WhileImpl(Block* header, const Value& cond) {
 Label::Label() {
   block = std::make_unique<Block>();
   block->label = genLabel("label");
+  rawPtr = block.get();
 }
 
 Label::Label(const char* name) {
   block = std::make_unique<Block>();
   block->label = genLabel(name);
+  rawPtr = block.get();
 }
 
 void activateLabel(Label& label) {

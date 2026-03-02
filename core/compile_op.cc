@@ -243,6 +243,17 @@ std::string formatConfig(const CopyKernelConfig& c) {
   if (c.nbufWriteCount.has_value()) {
     s += fmt::sprintf(" writeBufs=%d", c.nbufWriteCount.value());
   }
+  if (c.flexReadMethod.has_value()) {
+    s += fmt::sprintf(
+        " read=%s(%d)x%d", c.flexReadMethod.value(), c.flexReadThreads.value(), c.flexNumParallelReads.value_or(1));
+  }
+  if (c.flexWriteMethod.has_value()) {
+    s += fmt::sprintf(
+        " write=%s(%d)x%d", c.flexWriteMethod.value(), c.flexWriteThreads.value(), c.flexNumParallelWrites.value_or(1));
+  }
+  if (c.flexNumBuffers.has_value()) {
+    s += fmt::sprintf(" bufs=%d", c.flexNumBuffers.value());
+  }
   if (c.copyWrite.has_value()) {
     s += c.copyWrite.value() ? " write" : " read";
   }
@@ -623,6 +634,57 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
         }
       }
     }
+
+    // Flexbuf: split block into read group + write group, each bulk or reg
+    {
+      static constexpr int flexNumBuffers[] = {2, 4, 8, 16, 32};
+      static constexpr int regThreadCounts[] = {32, 64, 128, 256, 512};
+      for (size_t chunk : chunkSizes) {
+        for (int numBuffers : flexNumBuffers) {
+          size_t totalSmem = chunk + numBuffers * 8;
+          if (totalSmem > (size_t)maxSmem) {
+            continue;
+          }
+          // bulk-read + bulk-write
+          // for (int readParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
+          //   for (int writeParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
+          //     candidates.push_back(CopyKernelConfig::flexbuf(
+          //         gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
+          //   }
+          // }
+          for (int readParallel : {1, 2, 4, 8, 16}) {
+            for (int writeParallel : {1, 2, 4, 8, 16}) {
+              candidates.push_back(CopyKernelConfig::flexbuf(
+                  gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
+              if (candidates.back().blockSize > 1024) {
+                candidates.pop_back();
+              }
+              // for (int p : range(6)) {
+              //   candidates.push_back(CopyKernelConfig::flexbuf(
+              //       gridSize, chunk * 2, "reg", 32 * (1 << p), readParallel, "bulk", 32, writeParallel, numBuffers));
+              //   if (candidates.back().blockSize > 1024) {
+              //     candidates.pop_back();
+              //   }
+              // }
+            }
+          }
+          // // bulk-read + reg-write
+          // for (int writeThreads : regThreadCounts) {
+          //   if (32 + writeThreads <= 1024) {
+          //     candidates.push_back(
+          //         CopyKernelConfig::flexbuf(gridSize, chunk, "bulk", 32, 1, "reg", writeThreads, 1, numBuffers));
+          //   }
+          // }
+          // // reg-read + bulk-write
+          // for (int readThreads : regThreadCounts) {
+          //   if (readThreads + 32 <= 1024) {
+          //     candidates.push_back(
+          //         CopyKernelConfig::flexbuf(gridSize, chunk, "reg", readThreads, 1, "bulk", 32, 1, numBuffers));
+          //   }
+          // }
+        }
+      }
+    }
   }
 
   // Expand candidates into read + write variants
@@ -746,6 +808,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
       } else {
         totalSmem = 2 * chunk + 2 * numWarps * 8;
       }
+    } else if (!strcmp(cfg.copyEngine, "flexbuf")) {
+      totalSmem = cfg.bulkChunkSize.value() + cfg.flexNumBuffers.value() * 8;
     }
     // if (totalSmem > 48 * 1024) {
     //   log.info("totalSmem is %d\n", totalSmem);
@@ -1956,7 +2020,7 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         }
       }
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-      // Opt in to larger shared memory if needed (bulk copy engine)
+      // Opt in to larger shared memory if needed
       if (!strcmp(result.config.copyEngine, "bulk")) {
         size_t chunk = result.config.bulkChunkSize.value();
         size_t numWarps = result.config.blockSize / 32;
@@ -1968,6 +2032,12 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         } else {
           totalSmem = 2 * chunk + 2 * numWarps * 8;
         }
+        // if (totalSmem > 48 * 1024) {
+        //   CHECK_CU(cuFuncSetAttribute(
+        //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+        // }
+      } else if (!strcmp(result.config.copyEngine, "flexbuf")) {
+        // size_t totalSmem = result.config.bulkChunkSize.value() + result.config.flexNumBuffers.value() * 8;
         // if (totalSmem > 48 * 1024) {
         //   CHECK_CU(cuFuncSetAttribute(
         //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));

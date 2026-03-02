@@ -291,6 +291,8 @@ inline Value ld_shared_acquire_cta_u32(const Value& addr) {
   ld_shared_acquire_cta_u32(result, addr);
   return result;
 }
+void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr);
+void st_shared_v4_u32(const Value& addr, const std::array<Value, 4>& v);
 
 // Store
 void st_global_u32(const Value& addr, const Value& val);
@@ -397,7 +399,8 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
 
 // Predicated execution — all instructions in body are prefixed with @pred.
 
-// Forward jump labels — declare anywhere, GOTO to jump, LABEL to place.
+// Labels — declare anywhere, GOTO to jump, LABEL to place.
+// Supports both forward jumps (GOTO before LABEL) and backward jumps/loops (GOTO after LABEL).
 //   Label tail("tail");
 //   ...
 //   GOTO(tail);
@@ -405,6 +408,7 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
 //   LABEL(tail);  // subsequent instructions go here
 struct Label {
   std::unique_ptr<Block> block;
+  Block* rawPtr = nullptr; // stable pointer, valid before and after LABEL
   Label();
   Label(const char* name);
   Label(const Label&) = delete;
@@ -412,9 +416,9 @@ struct Label {
 };
 void activateLabel(Label& label);
 
-#define GOTO(label) ::moodist::ptx::bra((label).block.get())
-#define GOTO_IF(pred, label) ::moodist::ptx::bra(pred, (label).block.get())
-#define GOTO_IF_NOT(pred, label) ::moodist::ptx::bra_not(pred, (label).block.get())
+#define GOTO(label) ::moodist::ptx::bra((label).rawPtr)
+#define GOTO_IF(pred, label) ::moodist::ptx::bra(pred, (label).rawPtr)
+#define GOTO_IF_NOT(pred, label) ::moodist::ptx::bra_not(pred, (label).rawPtr)
 #define LABEL(label) ::moodist::ptx::activateLabel(label)
 
 // Predicated execution — all instructions in body are prefixed with @pred.
@@ -484,6 +488,9 @@ Value mbarrier_arrive_noComplete(
     const Value& addr); // arrive with .noComplete hint (caller guarantees this won't complete the phase)
 void mbarrier_expect_tx(const Value& addr, const Value& txCount);
 Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity); // returns pred
+inline void mbarrier_wait_parity(const Value& addr, const Value& phaseParity) {
+  WHILE(!mbarrier_try_wait_parity(addr, phaseParity)) {}
+}
 
 // cp.async.bulk (sm_90+)
 void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value& size, const Value& mbar);

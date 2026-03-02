@@ -57,6 +57,15 @@ struct CopyKernelConfig {
   std::optional<int> nbufReadCount;  // number of read buffers per warp (1-4)
   std::optional<int> nbufWriteCount; // number of write buffers per warp (1-4)
 
+  // Flexbuf-only fields
+  std::optional<const char*> flexReadMethod;  // "bulk" or "reg"
+  std::optional<const char*> flexWriteMethod; // "bulk" or "reg"
+  std::optional<int> flexReadThreads;         // threads in read group (bulk always 32)
+  std::optional<int> flexWriteThreads;        // threads in write group (bulk always 32)
+  std::optional<int> flexNumBuffers;          // number of shared memory ring buffers
+  std::optional<int> flexNumParallelReads;    // number of parallel read units (read threads split evenly)
+  std::optional<int> flexNumParallelWrites;   // number of parallel write units (write threads split evenly)
+
   // IPC direction (applies to all engine types)
   std::optional<bool> copyWrite; // true: push (write to remote dst), false: pull (read from remote src)
 
@@ -68,6 +77,24 @@ struct CopyKernelConfig {
     c.gridSize = gridSize;
     c.depth = depth;
     c.loadOp = loadOp;
+    return c;
+  }
+
+  static CopyKernelConfig flexbuf(size_t gridSize, size_t chunkSize, const char* readMethod, int readThreads,
+      int numParallelReads, const char* writeMethod, int writeThreads, int numParallelWrites, int numBuffers) {
+    CopyKernelConfig c;
+    c.copyEngine = "flexbuf";
+    c.gridSize = gridSize;
+    c.blockSize = readThreads * numParallelReads + writeThreads * numParallelWrites;
+    c.bulkChunkSize = chunkSize;
+    c.bulkSkipWriteBack = false;
+    c.flexReadMethod = readMethod;
+    c.flexWriteMethod = writeMethod;
+    c.flexReadThreads = readThreads;
+    c.flexWriteThreads = writeThreads;
+    c.flexNumBuffers = numBuffers;
+    c.flexNumParallelReads = numParallelReads;
+    c.flexNumParallelWrites = numParallelWrites;
     return c;
   }
 
