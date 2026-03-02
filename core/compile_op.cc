@@ -254,6 +254,9 @@ std::string formatConfig(const CopyKernelConfig& c) {
   if (c.flexNumBuffers.has_value()) {
     s += fmt::sprintf(" bufs=%d", c.flexNumBuffers.value());
   }
+  if (c.lockstepNumBuffers.has_value()) {
+    s += fmt::sprintf(" bufs=%d parallel=%d", c.lockstepNumBuffers.value(), c.lockstepNumParallel.value());
+  }
   if (c.copyWrite.has_value()) {
     s += c.copyWrite.value() ? " write" : " read";
   }
@@ -687,6 +690,14 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
     }
   }
 
+  // Lockstep candidates
+  {
+    static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
+    for (size_t bs : lockstepBlockSizes) {
+      candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1));
+    }
+  }
+
   // Expand candidates into read + write variants
   {
     Vector<CopyKernelConfig> expanded;
@@ -810,6 +821,8 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
       }
     } else if (!strcmp(cfg.copyEngine, "flexbuf")) {
       totalSmem = cfg.bulkChunkSize.value() + cfg.flexNumBuffers.value() * 8;
+    } else if (!strcmp(cfg.copyEngine, "lockstep")) {
+      totalSmem = cfg.bulkChunkSize.value() + cfg.lockstepNumBuffers.value() * 8;
     }
     // if (totalSmem > 48 * 1024) {
     //   log.info("totalSmem is %d\n", totalSmem);

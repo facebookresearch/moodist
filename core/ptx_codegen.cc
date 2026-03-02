@@ -353,7 +353,7 @@ static void emitBulkNbuf(const CopyKernelConfig& config, uint32_t numBlockWarps,
     mbarrier_init(mbars.back(), 1);
   }
   // auto iteration = u32(0);
-  auto offset = u32(0);
+  auto offset = to_u32(0);
   Label alldone;
   auto f = [&](bool isFirst) {
     WHILE(true) {
@@ -475,10 +475,10 @@ static void emitBulkNbuf2(const CopyKernelConfig& config, uint32_t inputNumBlock
     PRED((laneIdx == 0) & role == 0) mbarrier_init(mbars.back(), 1);
   }
   Value spin = smemSpinAddr + widen(warpIndex * 4);
-  PRED((laneIdx == 0) & role == 0) st_shared_release_cta_u32(spin, u32(0));
+  PRED((laneIdx == 0) & role == 0) st_shared_release_cta_u32(spin, to_u32(0));
   barrier_sync(2);
   // auto iteration = u32(0);
-  auto offset = u32(0);
+  auto offset = to_u32(0);
   Label alldone;
   auto f = [&](bool isFirst, int role) {
     WHILE(true) {
@@ -948,7 +948,7 @@ struct EmitFlexBuf {
 
   void emit(int role, int method, Value src, Value dst, Value bytes) {
     Label alldone;
-    auto offset = u32(blockIndex * bufferSize);
+    auto offset = to_u32(blockIndex * bufferSize);
     uint32_t numParallel = role == roleRead ? numParallelReads : numParallelWrites;
     uint32_t numThreads = role == roleRead ? numReadWarps * 32 : numWriteWarps * 32;
 
@@ -1082,6 +1082,109 @@ struct EmitFlexBuf {
   }
 };
 
+struct EmitLockstep {
+  const CopyKernelConfig& config;
+  u32 blockIndex;
+  u32 warpIndex;
+  u32 laneIndex;
+
+  // Inputs (set before init())
+  uint32_t numBlocks = config.gridSize;
+  uint32_t inputSharedSize = *config.bulkChunkSize;
+
+  // uint32_t numParallel = *config.lockstepNumParallel;
+
+  // Computed in init()
+  // uint32_t numWarps;
+  // uint32_t numWarpsTotal;
+
+  // uint32_t numBuffers = config.lockstepNumBuffers.value();
+  uint32_t numBuffers = config.blockSize / 32;
+  uint32_t blockSharedAlignment = numBuffers * 256;
+  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
+  uint32_t bufferSize = blockSharedSize / numBuffers;
+
+  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
+  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
+  u32 sharedOffset = addShared32(4, 4);
+
+  u32 bufferIndex = warpIndex;
+
+  u32 syncIndex = 1 + warpIndex / 2;
+  u32 pairIndex = warpIndex % 2;
+
+  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
+  u32 barrier = barrierBaseAddr + bufferIndex * 8;
+
+  void init() {
+    // st_shared_release_cta_u32(sharedOffset, blockIndex * bufferSize);
+  }
+
+  void emit(u64 src, u64 dst, u32 bytes) {
+    Label alldone;
+    // IF(laneIndex != 0) {
+    //   WHILE(!bar_red_or(syncIndex, 64, 0)) {}
+    //   GOTO(alldone);
+    // }
+
+    IF(laneIndex == 0) {
+      st_shared_release_cta_u32(sharedOffset, blockIndex * bufferSize);
+      mbarrier_init(barrier, 1);
+    }
+    barrier_sync();
+
+    Value isLeader = laneIndex == 0;
+
+    IF(pairIndex != 0) {
+      GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
+    }
+
+    PRED(bytes % 16 != 0) trap();
+    PRED(src % 16 != 0) trap();
+    PRED(dst % 16 != 0) trap();
+
+    Label loop;
+    LABEL(loop);
+
+    for (uint32_t parity : range(2)) {
+      u32 offset = 0;
+      PRED(isLeader) offset = atom_shared_relaxed_cta_add_u32(sharedOffset, numBlocks * bufferSize);
+      offset = shfl_sync_idx_b32(offset, 0, 31);
+      IF(offset >= bytes) {
+        bar_red_or(syncIndex, 64, 1);
+        GOTO(alldone);
+      }
+
+      u64 srcaddr = src + widen(offset);
+      u64 dstaddr = dst + widen(offset);
+
+      u32 size = min_u32(bytes - offset, bufferSize);
+
+      IF(isLeader) {
+        cp_async_bulk_wait_group_read(0);
+        mbarrier_expect_tx(barrier, size);
+        mbarrier_arrive_noComplete(barrier);
+        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
+      }
+
+      bar_red_or(syncIndex, 64, 0);
+
+      IF(isLeader) {
+        mbarrier_wait_parity(barrier, parity);
+        cp_async_bulk_global_shared(dstaddr, buffer, size);
+        cp_async_bulk_commit_group();
+      }
+
+      GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
+    }
+
+    GOTO(loop);
+
+    LABEL(alldone);
+    barrier_sync();
+  }
+};
+
 std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, const char* target) {
   using namespace ptx;
 
@@ -1090,6 +1193,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
 
   bool useBulk = !strcmp(config.copyEngine, "bulk");
   bool useFlexbuf = !strcmp(config.copyEngine, "flexbuf");
+  bool useLockstep = !strcmp(config.copyEngine, "lockstep");
   bool useWarppipe = useBulk && !strcmp(config.bulkMode.value(), "warppipe");
   bool useNbuf = useBulk && !strcmp(config.bulkMode.value(), "nbuf");
   bool useNbuf2 = useBulk && !strcmp(config.bulkMode.value(), "nbuf2");
@@ -1157,12 +1261,10 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     Val smemMbar0SharedAddr(ValType::U64), smemMbar1SharedAddr(ValType::U64);
     Val smemBufSharedAddr(ValType::U64), smemBufGenAddr(ValType::U64);
     Val smemMbarSharedAddr(ValType::U64);
-    Val warpIdx(ValType::U32);
-    Val laneIdx(ValType::U32);
     Value smemSpinAddr;
+    auto warpIdx = tid / 32;
+    auto laneIdx = tid & 31;
     if (useBulk) {
-      warpIdx = tid / 32;
-      laneIdx = tid & 31;
       if (useWarppipe || useNbuf || useNbuf2) {
         smemBufSharedAddr = globalAddr(smemBufSym.c_str());
         smemBufGenAddr = cvta_shared(smemBufSharedAddr);
@@ -1194,6 +1296,11 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
     if (useFlexbuf) {
       flexbuf.emplace(EmitFlexBuf{config, blockIdx, warpIdx, laneIdx, smemBufSharedAddr, smemMbarSharedAddr});
       flexbuf->init();
+    }
+    std::optional<EmitLockstep> lockstep;
+    if (useLockstep) {
+      lockstep.emplace(EmitLockstep{config, blockIdx, warpIdx, laneIdx});
+      lockstep->init();
     }
     IF(tid == 0) {
       for (size_t i : peerIndices) {
@@ -1274,6 +1381,8 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
             smemBufSharedAddr, smemMbarSharedAddr, smemSpinAddr);
       } else if (useFlexbuf) {
         flexbuf->emit(src, dst, bytes);
+      } else if (useLockstep) {
+        lockstep->emit(src, dst, bytes);
       } else if (useWarppipe) {
         emitBulkWarpPipe(config, numWarps, bulkChunkSize, GS, src, dst, bytes, blockIdx, warpIdx, laneIdx,
             smemBufSharedAddr, smemBufGenAddr, smemMbarSharedAddr);

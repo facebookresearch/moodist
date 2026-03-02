@@ -104,37 +104,41 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
 
         # Warmup
         for _ in range(warmup):
+            for t in output_tensors:
+                t.zero_()
             run()
-        torch.cuda.synchronize()
+            output_tensors = [o.clone() for o in output_tensors]
 
-        # Correctness check
-        # output_tensors[0] (if rank > 0): chunks from ranks 0..rank-1
-        # output_tensors[1] (if rank < world_size-1): chunks from ranks rank+1..N-1
-        oidx = 0
-        if rank > 0:
-            out = output_tensors[oidx]
-            for r in range(rank):
-                chunk = out[r * numel:(r + 1) * numel]
-                expected = r + 1.0
-                if not torch.all(chunk == expected):
-                    bad = (chunk != expected).sum().item()
-                    print(f"RANK {rank}: CORRECTNESS FAILURE at size "
-                          f"{format_size(size)}, chunk {r}: "
-                          f"{bad}/{numel} elements wrong", file=sys.stderr)
-                    #sys.exit(1)
-            oidx += 1
-        if rank < world_size - 1:
-            out = output_tensors[oidx]
-            for r in range(rank + 1, world_size):
-                local_r = r - rank - 1
-                chunk = out[local_r * numel:(local_r + 1) * numel]
-                expected = r + 1.0
-                if not torch.all(chunk == expected):
-                    bad = (chunk != expected).sum().item()
-                    print(f"RANK {rank}: CORRECTNESS FAILURE at size "
-                          f"{format_size(size)}, chunk {r}: "
-                          f"{bad}/{numel} elements wrong", file=sys.stderr)
-                    #sys.exit(1)
+            # Correctness check
+            # output_tensors[0] (if rank > 0): chunks from ranks 0..rank-1
+            # output_tensors[1] (if rank < world_size-1): chunks from ranks rank+1..N-1
+            oidx = 0
+            if rank > 0:
+                out = output_tensors[oidx]
+                for r in range(rank):
+                    chunk = out[r * numel:(r + 1) * numel]
+                    expected = r + 1.0
+                    if not torch.all(chunk == expected):
+                        bad = (chunk != expected).sum().item()
+                        print(f"RANK {rank}: CORRECTNESS FAILURE at size "
+                            f"{format_size(size)}, chunk {r}: "
+                            f"{bad}/{numel} elements wrong", file=sys.stderr)
+                        #sys.exit(1)
+                oidx += 1
+            if rank < world_size - 1:
+                out = output_tensors[oidx]
+                for r in range(rank + 1, world_size):
+                    local_r = r - rank - 1
+                    chunk = out[local_r * numel:(local_r + 1) * numel]
+                    expected = r + 1.0
+                    if not torch.all(chunk == expected):
+                        bad = (chunk != expected).sum().item()
+                        print(f"RANK {rank}: CORRECTNESS FAILURE at size "
+                            f"{format_size(size)}, chunk {r}: "
+                            f"{bad}/{numel} elements wrong", file=sys.stderr)
+                        #sys.exit(1)
+
+        torch.cuda.synchronize()
 
         # Profiling
         if profile:
