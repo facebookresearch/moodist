@@ -24,6 +24,13 @@ void setModule(Module* m) {
 void setFunction(Function* f) {
   currentFunction = f;
 }
+Function* getFunction() {
+  return currentFunction;
+}
+Value addShared(int align, int sizeBytes, const char* suffix) {
+  std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
+  return globalAddr(sym.c_str());
+}
 void setBlock(Block* b) {
   currentBlock = b;
 }
@@ -290,6 +297,9 @@ void rem_u32(const Value& d, const Value& a, const Value& b) {
 void rem_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("rem.s32", d, a, b));
 }
+void rem_u64(const Value& d, const Value& a, const Value& b) {
+  emitInst(fmt3("rem.u64", d, a, b));
+}
 void min_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("min.u32", d, a, b));
 }
@@ -527,6 +537,61 @@ void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b) {
   emitInst("atom.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
 }
 
+static Value atomAdd(const char* space, const char* sem, const char* scope, const Value& addr, const Value& b) {
+  Value d(ValType::U32);
+  emitInst(std::string("atom.") + sem + "." + scope + "." + space + ".add.u32 " + d.str() + ", [" + addr.str() + "], " +
+           b.str());
+  return d;
+}
+Value atom_global_relaxed_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "relaxed", "cta", addr, b);
+}
+Value atom_global_relaxed_gpu_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "relaxed", "gpu", addr, b);
+}
+Value atom_global_relaxed_sys_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "relaxed", "sys", addr, b);
+}
+Value atom_global_acquire_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acquire", "cta", addr, b);
+}
+Value atom_global_acquire_gpu_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acquire", "gpu", addr, b);
+}
+Value atom_global_acquire_sys_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acquire", "sys", addr, b);
+}
+Value atom_global_release_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "release", "cta", addr, b);
+}
+Value atom_global_release_gpu_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "release", "gpu", addr, b);
+}
+Value atom_global_release_sys_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "release", "sys", addr, b);
+}
+Value atom_global_acq_rel_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acq_rel", "cta", addr, b);
+}
+Value atom_global_acq_rel_gpu_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acq_rel", "gpu", addr, b);
+}
+Value atom_global_acq_rel_sys_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("global", "acq_rel", "sys", addr, b);
+}
+Value atom_shared_relaxed_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("shared::cta", "relaxed", "cta", addr, b);
+}
+Value atom_shared_acquire_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("shared::cta", "acquire", "cta", addr, b);
+}
+Value atom_shared_release_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("shared::cta", "release", "cta", addr, b);
+}
+Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b) {
+  return atomAdd("shared::cta", "acq_rel", "cta", addr, b);
+}
+
 // Synchronization
 void barrier_sync(int n) {
   emitInst("barrier.sync " + std::to_string(n));
@@ -602,6 +667,58 @@ void bar_sync(int barrierId, int threadCount) {
 
 void bar_sync(const Value& barrierId, int threadCount) {
   emitInst("bar.sync " + barrierId.str() + ", " + std::to_string(threadCount));
+}
+
+static Value barRed(const char* op, const std::string& barrier, int threadCount, const Value& pred) {
+  Value d(ValType::U32);
+  emitInst("bar.red." + std::string(op) + ".u32 " + d.str() + ", " + barrier + ", " + std::to_string(threadCount) +
+           ", " + pred.str());
+  return d;
+}
+static Value barRedPred(const char* op, const std::string& barrier, int threadCount, const Value& pred) {
+  Value d(ValType::Pred);
+  emitInst("bar.red." + std::string(op) + ".pred " + d.str() + ", " + barrier + ", " + std::to_string(threadCount) +
+           ", " + pred.str());
+  return d;
+}
+Value bar_red_popc(int barrierId, int threadCount, const Value& pred) {
+  return barRed("popc", std::to_string(barrierId), threadCount, pred);
+}
+Value bar_red_popc(const Value& barrierId, int threadCount, const Value& pred) {
+  return barRed("popc", barrierId.str(), threadCount, pred);
+}
+Value bar_red_and(int barrierId, int threadCount, const Value& pred) {
+  return barRedPred("and", std::to_string(barrierId), threadCount, pred);
+}
+Value bar_red_and(const Value& barrierId, int threadCount, const Value& pred) {
+  return barRedPred("and", barrierId.str(), threadCount, pred);
+}
+Value bar_red_or(int barrierId, int threadCount, const Value& pred) {
+  return barRedPred("or", std::to_string(barrierId), threadCount, pred);
+}
+Value bar_red_or(const Value& barrierId, int threadCount, const Value& pred) {
+  return barRedPred("or", barrierId.str(), threadCount, pred);
+}
+
+static Value shflSync(const char* mode, const Value& a, const Value& b, uint32_t c, uint32_t membermask) {
+  Value d(ValType::U32);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "shfl.sync.%s.b32 %s, %s, %s, 0x%x, 0x%x", mode, d.str().c_str(), a.str().c_str(),
+      b.str().c_str(), c, membermask);
+  emitInst(buf);
+  return d;
+}
+Value shfl_sync_idx_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask) {
+  return shflSync("idx", a, b, c, membermask);
+}
+Value shfl_sync_up_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask) {
+  return shflSync("up", a, b, c, membermask);
+}
+Value shfl_sync_down_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask) {
+  return shflSync("down", a, b, c, membermask);
+}
+Value shfl_sync_bfly_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask) {
+  return shflSync("bfly", a, b, c, membermask);
 }
 
 void bar_arrive(int barrierId, int threadCount) {
@@ -894,6 +1011,9 @@ Value Value::operator%(const Value& b) const {
     break;
   case ValType::S32:
     rem_s32(result, *this, b);
+    break;
+  case ValType::U64:
+    rem_u64(result, *this, b);
     break;
   default:
     unsupported("%", type);
@@ -1574,6 +1694,17 @@ Value globalAddr(const char* name) {
   Value v(ValType::U64);
   mov_u64(v, Value(name));
   return v;
+}
+
+Value sharedAddr(const char* name) {
+  Value v(ValType::U32);
+  emitInst(std::string("mov.u32 ") + v.str() + ", " + name);
+  return v;
+}
+
+Value addShared32(int align, int sizeBytes, const char* suffix) {
+  std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
+  return sharedAddr(sym.c_str());
 }
 
 Value hexImm(uintptr_t value) {

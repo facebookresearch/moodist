@@ -83,6 +83,7 @@ struct Module {
 
 void setModule(Module* m);
 void setFunction(Function* f);
+Function* getFunction();
 void setBlock(Block* b);
 
 // Register allocation via currentFunction
@@ -174,6 +175,198 @@ struct Value {
 // Backward compatibility alias
 using Val = Value;
 
+// Forward declaration for Operand proxy type used in TValue arithmetic operators.
+template<ValType T>
+struct Operand;
+
+// Typed PTX value — wraps Value with compile-time type constraints.
+// Integer constructors always allocate a register (safe for loop variables).
+// Arithmetic operators accept Operand<T>, which is implicitly constructable from
+// integers (immediate, no register) or TValue<T> (borrows existing register).
+// Comparisons return plain Value (pred). Implicit conversion to const Value& avoids mov.
+template<ValType T>
+struct TValue {
+  Value inner;
+
+  TValue() = default;
+  TValue(Value v) : inner(std::move(v)) {
+    if (inner.type != T) {
+      throw std::runtime_error("ptx::TValue: type mismatch");
+    }
+  }
+  // Integer constructors always allocate a register + emit mov
+  TValue(int32_t v) : inner(T) {
+    static_assert(T == ValType::U32 || T == ValType::S32, "int32_t not valid for this type");
+    inner = int64_t(v);
+  }
+  TValue(uint32_t v) : inner(T) {
+    static_assert(T == ValType::U32, "uint32_t not valid for this type");
+    inner = int64_t(v);
+  }
+  TValue(int64_t v) : inner(T) {
+    static_assert(T == ValType::U64 || T == ValType::S64, "int64_t not valid for this type");
+    inner = v;
+  }
+  TValue(uint64_t v) : inner(T) {
+    static_assert(T == ValType::U64, "uint64_t not valid for this type");
+    inner = int64_t(v);
+  }
+
+  operator const Value&() const {
+    return inner;
+  }
+
+  TValue& operator=(Value v) {
+    inner = std::move(v);
+    return *this;
+  }
+  TValue& operator=(int64_t v) {
+    inner = v;
+    return *this;
+  }
+
+  TValue operator+(const Operand<T>& b) const;
+  TValue operator-(const Operand<T>& b) const;
+  TValue operator*(const Operand<T>& b) const;
+  TValue operator/(const Operand<T>& b) const;
+  TValue operator%(const Operand<T>& b) const;
+  TValue operator&(const Operand<T>& b) const;
+  TValue operator|(const Operand<T>& b) const;
+  TValue operator^(const Operand<T>& b) const;
+  TValue operator~() const {
+    return ~inner;
+  }
+  TValue operator<<(const Operand<T>& b) const;
+  TValue operator>>(const Operand<T>& b) const;
+
+  void operator+=(const Operand<T>& b);
+  void operator-=(const Operand<T>& b);
+  void operator*=(const Operand<T>& b);
+  void operator/=(const Operand<T>& b);
+  void operator%=(const Operand<T>& b);
+
+  Value operator<(const Operand<T>& b) const;
+  Value operator<=(const Operand<T>& b) const;
+  Value operator>(const Operand<T>& b) const;
+  Value operator>=(const Operand<T>& b) const;
+  Value operator==(const Operand<T>& b) const;
+  Value operator!=(const Operand<T>& b) const;
+};
+
+// Operand proxy — used as argument type for TValue arithmetic operators.
+// Integers become immediates (no register allocation); TValues borrow their register.
+template<ValType T>
+struct Operand {
+  Value owned;      // owns the Value for integer immediates or moved-in temporaries
+  const Value* ref; // always points to the operand value
+
+  static Value makeImm(int64_t v) {
+    if constexpr (T == ValType::U64 || T == ValType::S64) {
+      return Value(v);
+    } else {
+      return Value(int32_t(v));
+    }
+  }
+
+  Operand(int64_t v) : owned(makeImm(v)), ref(&owned) {}
+  Operand(const Value& v) : ref(&v) {}                               // borrow any Value
+  Operand(const TValue<T>& v) : ref(&v.inner) {}                     // borrow existing register
+  Operand(TValue<T>&& v) : owned(std::move(v.inner)), ref(&owned) {} // take ownership of temporary
+
+  const Value& get() const {
+    return *ref;
+  }
+};
+
+// TValue operator definitions (after Operand is complete)
+template<ValType T>
+TValue<T> TValue<T>::operator+(const Operand<T>& b) const {
+  return inner + b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator-(const Operand<T>& b) const {
+  return inner - b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator*(const Operand<T>& b) const {
+  return inner * b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator/(const Operand<T>& b) const {
+  return inner / b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator%(const Operand<T>& b) const {
+  return inner % b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator&(const Operand<T>& b) const {
+  return inner & b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator|(const Operand<T>& b) const {
+  return inner | b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator^(const Operand<T>& b) const {
+  return inner ^ b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator<<(const Operand<T>& b) const {
+  return inner << b.get();
+}
+template<ValType T>
+TValue<T> TValue<T>::operator>>(const Operand<T>& b) const {
+  return inner >> b.get();
+}
+template<ValType T>
+void TValue<T>::operator+=(const Operand<T>& b) {
+  inner += b.get();
+}
+template<ValType T>
+void TValue<T>::operator-=(const Operand<T>& b) {
+  inner -= b.get();
+}
+template<ValType T>
+void TValue<T>::operator*=(const Operand<T>& b) {
+  inner *= b.get();
+}
+template<ValType T>
+void TValue<T>::operator/=(const Operand<T>& b) {
+  inner /= b.get();
+}
+template<ValType T>
+void TValue<T>::operator%=(const Operand<T>& b) {
+  inner %= b.get();
+}
+template<ValType T>
+Value TValue<T>::operator<(const Operand<T>& b) const {
+  return inner < b.get();
+}
+template<ValType T>
+Value TValue<T>::operator<=(const Operand<T>& b) const {
+  return inner <= b.get();
+}
+template<ValType T>
+Value TValue<T>::operator>(const Operand<T>& b) const {
+  return inner > b.get();
+}
+template<ValType T>
+Value TValue<T>::operator>=(const Operand<T>& b) const {
+  return inner >= b.get();
+}
+template<ValType T>
+Value TValue<T>::operator==(const Operand<T>& b) const {
+  return inner == b.get();
+}
+template<ValType T>
+Value TValue<T>::operator!=(const Operand<T>& b) const {
+  return inner != b.get();
+}
+
+using u32 = TValue<ValType::U32>;
+using u64 = TValue<ValType::U64>;
+
 // Commutative free functions for int + Value (Value + int works via implicit conversion)
 inline Value operator+(int a, const Value& b) {
   return Value(int32_t(a)) + b;
@@ -182,26 +375,26 @@ inline Value operator*(int a, const Value& b) {
   return Value(int32_t(a)) * b;
 }
 // Convenience factory functions for typed registers
-inline Value u16() {
+inline Value to_u16() {
   return Value(ValType::U16);
 }
-inline Value u16(const Value& v) {
+inline Value to_u16(const Value& v) {
   Value r(ValType::U16);
   r = v;
   return r;
 }
-inline Value u32() {
+inline Value to_u32() {
   return Value(ValType::U32);
 }
-inline Value u32(const Value& v) {
+inline Value to_u32(const Value& v) {
   Value r(ValType::U32);
   r = v;
   return r;
 }
-inline Value u64() {
+inline Value to_u64() {
   return Value(ValType::U64);
 }
-inline Value u64(const Value& v) {
+inline Value to_u64(const Value& v) {
   Value r(ValType::U64);
   r = v;
   return r;
@@ -229,6 +422,7 @@ void div_u32(const Value& d, const Value& a, const Value& b);
 void div_s32(const Value& d, const Value& a, const Value& b);
 void rem_u32(const Value& d, const Value& a, const Value& b);
 void rem_s32(const Value& d, const Value& a, const Value& b);
+void rem_u64(const Value& d, const Value& a, const Value& b);
 void min_u32(const Value& d, const Value& a, const Value& b);
 void min_s32(const Value& d, const Value& a, const Value& b);
 void max_u32(const Value& d, const Value& a, const Value& b);
@@ -314,6 +508,24 @@ void ret();
 
 // Atomic
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b);
+// Atomic add (global, all semantics × {cta,gpu,sys} scopes)
+Value atom_global_relaxed_cta_add_u32(const Value& addr, const Value& b);
+Value atom_global_relaxed_gpu_add_u32(const Value& addr, const Value& b);
+Value atom_global_relaxed_sys_add_u32(const Value& addr, const Value& b);
+Value atom_global_acquire_cta_add_u32(const Value& addr, const Value& b);
+Value atom_global_acquire_gpu_add_u32(const Value& addr, const Value& b);
+Value atom_global_acquire_sys_add_u32(const Value& addr, const Value& b);
+Value atom_global_release_cta_add_u32(const Value& addr, const Value& b);
+Value atom_global_release_gpu_add_u32(const Value& addr, const Value& b);
+Value atom_global_release_sys_add_u32(const Value& addr, const Value& b);
+Value atom_global_acq_rel_cta_add_u32(const Value& addr, const Value& b);
+Value atom_global_acq_rel_gpu_add_u32(const Value& addr, const Value& b);
+Value atom_global_acq_rel_sys_add_u32(const Value& addr, const Value& b);
+// Atomic add (shared::cta, all semantics, cta scope)
+Value atom_shared_relaxed_cta_add_u32(const Value& addr, const Value& b);
+Value atom_shared_acquire_cta_add_u32(const Value& addr, const Value& b);
+Value atom_shared_release_cta_add_u32(const Value& addr, const Value& b);
+Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b);
 
 // Synchronization
 void barrier_sync(int n = 0);
@@ -447,6 +659,15 @@ Value loadParamField(const Value& base, int offset, ValType type);
 // Type conversion
 Value widen(const Value& v);  // U32→U64, S32→S64
 Value narrow(const Value& v); // U64→U32, S64→S32
+inline Value widen(int32_t v) {
+  return widen(Value(v));
+} // disambiguates widen(int literal)
+inline u64 widen(const u32& v) {
+  return widen(v.inner);
+}
+inline u32 narrow(const u64& v) {
+  return narrow(v.inner);
+}
 
 // Memory operations
 void storeGlobal(const Value& addr, const Value& val);
@@ -477,6 +698,9 @@ Value atomicInc(const Value& addr, const Value& modulo);
 
 // Global variable address
 Value globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
+Value sharedAddr(const char* name); // mov.u32 of shared symbol address, returns U32 (native shared-space address)
+Value addShared(int align, int sizeBytes, const char* suffix = nullptr);   // declare shared mem, return U64 address
+Value addShared32(int align, int sizeBytes, const char* suffix = nullptr); // declare shared mem, return U32 address
 
 // Hex immediate — for baking GPU addresses into PTX
 Value hexImm(uintptr_t value);
@@ -503,6 +727,19 @@ void cp_async_bulk_wait_group_read(int n);
 // Named barrier with explicit thread count (bar.sync barrierID, threadCount)
 void bar_sync(int barrierId, int threadCount);
 void bar_sync(const Value& barrierId, int threadCount);
+// bar.red reductions — return count/predicate result in d
+Value bar_red_popc(int barrierId, int threadCount, const Value& pred);
+Value bar_red_popc(const Value& barrierId, int threadCount, const Value& pred);
+Value bar_red_and(int barrierId, int threadCount, const Value& pred);
+Value bar_red_and(const Value& barrierId, int threadCount, const Value& pred);
+Value bar_red_or(int barrierId, int threadCount, const Value& pred);
+Value bar_red_or(const Value& barrierId, int threadCount, const Value& pred);
+// shfl.sync — warp shuffle (sm_70+). b=source lane/offset, c=clamp/segment, membermask=participant mask.
+// Broadcast from lane 0: shfl_sync_idx_b32(val, 0, 0x1f, 0xffffffff)
+Value shfl_sync_idx_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask = 0xffffffff);
+Value shfl_sync_up_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask = 0xffffffff);
+Value shfl_sync_down_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask = 0xffffffff);
+Value shfl_sync_bfly_b32(const Value& a, const Value& b, uint32_t c, uint32_t membermask = 0xffffffff);
 void bar_arrive(int barrierId, int threadCount);
 void bar_arrive(const Value& barrierId, int threadCount);
 

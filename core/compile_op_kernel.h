@@ -66,6 +66,10 @@ struct CopyKernelConfig {
   std::optional<int> flexNumParallelReads;    // number of parallel read units (read threads split evenly)
   std::optional<int> flexNumParallelWrites;   // number of parallel write units (write threads split evenly)
 
+  // Lockstep-only fields
+  std::optional<int> lockstepNumBuffers;  // number of shared memory ring buffers
+  std::optional<int> lockstepNumParallel; // number of parallel read/write units
+
   // IPC direction (applies to all engine types)
   std::optional<bool> copyWrite; // true: push (write to remote dst), false: pull (read from remote src)
 
@@ -95,6 +99,19 @@ struct CopyKernelConfig {
     c.flexNumBuffers = numBuffers;
     c.flexNumParallelReads = numParallelReads;
     c.flexNumParallelWrites = numParallelWrites;
+    return c;
+  }
+
+  static CopyKernelConfig lockstep(
+      size_t gridSize, size_t chunkSize, size_t blockSize, int numBuffers, int numParallel) {
+    CopyKernelConfig c;
+    c.copyEngine = "lockstep";
+    c.gridSize = gridSize;
+    c.blockSize = blockSize;
+    c.bulkChunkSize = chunkSize;
+    c.bulkSkipWriteBack = false;
+    c.lockstepNumBuffers = numBuffers;
+    c.lockstepNumParallel = numParallel;
     return c;
   }
 
