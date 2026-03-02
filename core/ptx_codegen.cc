@@ -10,6 +10,8 @@
 
 namespace moodist {
 
+using namespace ptx;
+
 const char* computeTarget(int computeMajor, int computeMinor) {
   if (computeMajor >= 10) {
     return "sm_100a";
@@ -872,6 +874,214 @@ static void emitBulkDoubleBuf(const CopyKernelConfig& config, int numWarps, int 
   }
 }
 
+struct EmitFlexBuf {
+  const CopyKernelConfig& config;
+  const Value& blockIndex;
+  const Value& warpIndex;
+  const Value& laneIndex;
+  const Value& smemBufAddr;
+  const Value& smemMbarAddr;
+
+  // Inputs (set before init())
+  uint32_t numBlocks = config.gridSize;
+  uint32_t inputSharedSize = *config.bulkChunkSize;
+
+  uint32_t numParallelReads = *config.flexNumParallelReads;
+  uint32_t numParallelWrites = *config.flexNumParallelWrites;
+
+  // Computed in init()
+  uint32_t numReadWarps;
+  uint32_t numWriteWarps;
+  uint32_t numReadWarpsTotal;
+  uint32_t numWriteWarpsTotal;
+  Value role;
+  Vector<Value> readBarriers;
+  Vector<Value> writeBarriers;
+
+  uint32_t numBuffers = config.flexNumBuffers.value();
+  uint32_t blockSharedAlignment = numBuffers * 256;
+  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
+  uint32_t bufferSize = blockSharedSize / numBuffers;
+
+  Value isReader;
+  Value parallelIndex;
+  Value parallelWarpIndex;
+  Value parallelThreadIndex;
+
+  void init() {
+
+    uint32_t numReadThreads = config.flexReadThreads.value();
+    uint32_t numWriteThreads = config.flexWriteThreads.value();
+
+    CHECK(numReadThreads % 32 == 0);
+    CHECK(numWriteThreads % 32 == 0);
+    numReadWarps = numReadThreads / 32;
+    numWriteWarps = numWriteThreads / 32;
+    numReadWarpsTotal = numReadWarps * numParallelReads;
+    numWriteWarpsTotal = numWriteWarps * numParallelWrites;
+
+    for (int n : range(numBuffers)) {
+      readBarriers.push_back(smemMbarAddr + widen(n * 8));
+      writeBarriers.push_back(smemMbarAddr + widen((numBuffers + n) * 8));
+      IF((laneIndex == 0) & (warpIndex == 0)) {
+        mbarrier_init(readBarriers.back(), numReadWarps);
+        mbarrier_init(writeBarriers.back(), numWriteWarps);
+      }
+    }
+
+    CHECK(bufferSize > 0 && bufferSize % 256 == 0);
+
+    isReader = warpIndex < numReadWarpsTotal;
+    IF(isReader) {
+      parallelIndex = warpIndex / numReadWarps;
+      parallelWarpIndex = warpIndex % numReadWarps;
+    }
+    ELSE {
+      parallelIndex = (warpIndex - numReadWarpsTotal) / numWriteWarps;
+      parallelWarpIndex = (warpIndex - numReadWarpsTotal) % numWriteWarps;
+    }
+    parallelThreadIndex = parallelWarpIndex * 32 + laneIndex;
+  }
+
+  enum { roleRead, roleWrite };
+  enum { methodBulk, methodReg };
+
+  void emit(int role, int method, Value src, Value dst, Value bytes) {
+    Label alldone;
+    auto offset = u32(blockIndex * bufferSize);
+    uint32_t numParallel = role == roleRead ? numParallelReads : numParallelWrites;
+    uint32_t numThreads = role == roleRead ? numReadWarps * 32 : numWriteWarps * 32;
+
+    auto f = [&](uint32_t parallel) {
+      Value isLeader = laneIndex == 0;
+      if (method == methodBulk) {
+        GOTO_IF_NOT(isLeader, alldone);
+      } else {
+        warp_sync();
+      }
+      Label loop;
+      for (int primeIteration : range(2)) {
+        if (primeIteration == 1) {
+          LABEL(loop);
+        }
+
+        for (uint32_t i : range(numBuffers * 2)) {
+          uint32_t bufferIndex = i % numBuffers;
+          if (bufferIndex % numParallel == parallel) {
+            uint32_t parity = (i / numBuffers) & 1;
+            auto& readBar = readBarriers[bufferIndex];
+            auto& writeBar = writeBarriers[bufferIndex];
+            Value size = min_u32(bytes - offset, bufferSize);
+
+            if (role == roleRead) {
+              if (method == methodBulk) {
+                if (primeIteration == 1 || parity == 1) {
+                  mbarrier_wait_parity(writeBar, parity ^ 1);
+                }
+                // mbarrier_arrive(readBar);
+                mbarrier_expect_tx(readBar, size);
+                mbarrier_arrive_noComplete(readBar);
+                cp_async_bulk_shared_global(smemBufAddr + bufferSize * bufferIndex, src + widen(offset), size, readBar);
+                mbarrier_wait_parity(readBar, parity);
+              } else {
+                if (primeIteration == 1 || parity == 1) {
+                  IF(isLeader) mbarrier_wait_parity(writeBar, parity ^ 1);
+                }
+                warp_sync();
+                auto srcaddr = src + widen(offset);
+                auto dstaddr = smemBufAddr + bufferSize * bufferIndex;
+                // FOR(auto i = u32(parallelThreadIndex * 16), i < size, i += numThreads * 16) {
+                //   std::array<Value, 4> v;
+                //   ldcv_v4(v, srcaddr + widen(i));
+                //   st_shared_v4_u32(dstaddr + widen(i), v);
+                // }
+                {
+                  auto i = u32(parallelThreadIndex * 16);
+                  WHILE(i < size) {
+                    constexpr int unroll = 4;
+                    std::array<std::array<Value, 4>, unroll> v;
+                    for (int u : range(unroll)) {
+                      Value ui = i + numThreads * 16 * u;
+                      PRED(ui < size) ldcv_v4(v[u], srcaddr + widen(ui));
+                    }
+                    for (int u : range(unroll)) {
+                      Value ui = i + numThreads * 16 * u;
+                      PRED(ui < size) st_shared_v4_u32(dstaddr + widen(ui), v[u]);
+                    }
+                    i += numThreads * 16 * unroll;
+                  }
+                }
+                warp_sync();
+                PRED(isLeader) mbarrier_arrive(readBar);
+              }
+            } else {
+              if (method == methodBulk) {
+                mbarrier_wait_parity(readBar, parity);
+                cp_async_bulk_global_shared(dst + widen(offset), smemBufAddr + bufferSize * bufferIndex, size);
+                cp_async_bulk_commit_group();
+                cp_async_bulk_wait_group_read(0);
+                mbarrier_arrive(writeBar);
+              } else {
+                IF(isLeader) mbarrier_wait_parity(readBar, parity);
+                warp_sync();
+                auto srcaddr = smemBufAddr + bufferSize * bufferIndex;
+                auto dstaddr = dst + widen(offset);
+                FOR(auto i = u32(parallelThreadIndex * 16), i < size, i += numThreads * 16) {
+                  std::array<Value, 4> v;
+                  ld_shared_v4_u32(v, srcaddr + widen(i));
+                  stwt_v4(dstaddr + widen(i), v);
+                }
+                warp_sync();
+                PRED(isLeader) mbarrier_arrive(writeBar);
+                warp_sync();
+              }
+            }
+          }
+
+          offset += numBlocks * bufferSize;
+          GOTO_IF(offset >= bytes, alldone);
+        }
+
+        if (primeIteration == 1) {
+          GOTO(loop);
+        }
+      }
+      GOTO(alldone);
+    };
+
+    GOTO_IF(offset >= bytes, alldone);
+    for (uint32_t parallel : range(numParallel)) {
+      IF(parallelIndex == parallel) {
+        f(parallel);
+      }
+    }
+
+    LABEL(alldone);
+    warp_sync();
+  }
+
+  void emit(Value src, Value dst, Value bytes) {
+    IF(isReader) {
+      if (!strcmp(config.flexReadMethod.value(), "bulk")) {
+        emit(roleRead, methodBulk, src, dst, bytes);
+      } else if (!strcmp(config.flexReadMethod.value(), "reg")) {
+        emit(roleRead, methodReg, src, dst, bytes);
+      } else {
+        CHECK(false);
+      }
+    }
+    ELSE {
+      if (!strcmp(config.flexWriteMethod.value(), "bulk")) {
+        emit(roleWrite, methodBulk, src, dst, bytes);
+      } else if (!strcmp(config.flexWriteMethod.value(), "reg")) {
+        emit(roleWrite, methodReg, src, dst, bytes);
+      } else {
+        CHECK(false);
+      }
+    }
+  }
+};
+
 std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, const char* target) {
   using namespace ptx;
 
@@ -879,6 +1089,7 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
   int GS = (int)config.gridSize;
 
   bool useBulk = !strcmp(config.copyEngine, "bulk");
+  bool useFlexbuf = !strcmp(config.copyEngine, "flexbuf");
   bool useWarppipe = useBulk && !strcmp(config.bulkMode.value(), "warppipe");
   bool useNbuf = useBulk && !strcmp(config.bulkMode.value(), "nbuf");
   bool useNbuf2 = useBulk && !strcmp(config.bulkMode.value(), "nbuf2");
@@ -923,6 +1134,11 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
         smemMbar1Sym = fn->addShared(8, kMbarrierSize * numWarps, "mbar1");
       }
     }
+    if (useFlexbuf) {
+      bulkChunkSize = (int)config.bulkChunkSize.value();
+      smemBufSym = fn->addShared(16, bulkChunkSize, "buf");
+      smemMbarSym = fn->addShared(8, 2 * kMbarrierSize * config.flexNumBuffers.value(), "mbar");
+    }
 
     activateNewBlock("entry");
 
@@ -964,10 +1180,21 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       }
       laneIdx = tid & 31;
     }
+    if (useFlexbuf) {
+      warpIdx = tid / 32;
+      laneIdx = tid & 31;
+      smemBufSharedAddr = globalAddr(smemBufSym.c_str());
+      smemMbarSharedAddr = globalAddr(smemMbarSym.c_str());
+    }
 
     // =================================================================
     // Entry barrier (thread 0 only)
     // =================================================================
+    std::optional<EmitFlexBuf> flexbuf;
+    if (useFlexbuf) {
+      flexbuf.emplace(EmitFlexBuf{config, blockIdx, warpIdx, laneIdx, smemBufSharedAddr, smemMbarSharedAddr});
+      flexbuf->init();
+    }
     IF(tid == 0) {
       for (size_t i : peerIndices) {
         auto& arr = group->peerCudaStepValue[i];
@@ -1045,6 +1272,8 @@ std::string generateCopyKernelPtx(Group* group, const CopyKernelConfig& config, 
       } else if (useNbuf2) {
         emitBulkNbuf2(config, numWarps, bulkChunkSize, GS, src, dst, bytes, blockIdx, warpIdx, laneIdx,
             smemBufSharedAddr, smemMbarSharedAddr, smemSpinAddr);
+      } else if (useFlexbuf) {
+        flexbuf->emit(src, dst, bytes);
       } else if (useWarppipe) {
         emitBulkWarpPipe(config, numWarps, bulkChunkSize, GS, src, dst, bytes, blockIdx, warpIdx, laneIdx,
             smemBufSharedAddr, smemBufGenAddr, smemMbarSharedAddr);
