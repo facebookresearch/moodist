@@ -693,8 +693,9 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
   // Lockstep candidates
   {
     static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
+    bool lockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
     for (size_t bs : lockstepBlockSizes) {
-      candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1));
+      candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
     }
   }
 
@@ -1664,7 +1665,10 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
   // Phase 7: Multicast setup (if eligible)
   // ============================================================================
 
-  if (op->allLocal && ctx.group->supportsMulticast && ctx.group->compileOpKernels->version == 3) {
+  bool useLockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
+
+  if (op->allLocal && ctx.group->supportsMulticast &&
+      (ctx.group->compileOpKernels->version == 3 || useLockstepMulticast)) {
     // Analyze localInputProvides (source-side view): group by source region.
     // If a region is read by ≥2 peers, create a multicast object for it.
     // The source rank creates the multicast object and sends the handle to each reader.
@@ -1954,12 +1958,17 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
 
   int kernelVersion = ctx.group->compileOpKernels->version;
 
-  if ((kernelVersion == 8 || kernelVersion == 9) && op->allLocal && !op->localInputCopies.empty()) {
+  if ((kernelVersion == 8 || kernelVersion == 9) && op->allLocal &&
+      (!op->localInputCopies.empty() || !op->multicastSources.empty())) {
     // Find the dominant size category (largest total bytes per category)
     size_t bytesPerCat[4] = {};
     for (const auto& lic : op->localInputCopies) {
       SizeCategory cat = sizeCategoryFor(lic.bytes);
       bytesPerCat[static_cast<int>(cat)] += lic.bytes;
+    }
+    for (const auto& ms : op->multicastSources) {
+      SizeCategory cat = sizeCategoryFor(ms.bytes);
+      bytesPerCat[static_cast<int>(cat)] += ms.bytes;
     }
     SizeCategory dominantCat = SizeCategory::Small;
     size_t maxBytes = 0;

@@ -1172,6 +1172,7 @@ struct EmitLockstep {
       IF(isLeader) {
         mbarrier_wait_parity(barrier, parity);
         cp_async_bulk_global_shared(dstaddr, buffer, size);
+        //multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
         cp_async_bulk_commit_group();
       }
 

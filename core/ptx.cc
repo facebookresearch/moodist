@@ -31,6 +31,10 @@ Value addShared(int align, int sizeBytes, const char* suffix) {
   std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
   return globalAddr(sym.c_str());
 }
+Value addGlobalVar(const char* type, int count, const char* suffix) {
+  std::string sym = currentModule->addGlobal(type, count, suffix);
+  return globalAddr(sym.c_str());
+}
 void setBlock(Block* b) {
   currentBlock = b;
 }
@@ -644,6 +648,10 @@ void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value
 
 void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size) {
   emitInst("cp.async.bulk.global.shared::cta.bulk_group [" + dst.str() + "], [" + src.str() + "], " + size.str());
+}
+
+void multimem_cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size) {
+  emitInst("multimem.cp.async.bulk.global.shared::cta.bulk_group [" + dst.str() + "], [" + src.str() + "], " + size.str());
 }
 
 void cp_async_bulk_prefetch_l2(const Value& src, const Value& size) {

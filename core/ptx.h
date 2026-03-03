@@ -701,6 +701,7 @@ Value globalAddr(const char* name); // mov.u64 of global symbol address, returns
 Value sharedAddr(const char* name); // mov.u32 of shared symbol address, returns U32 (native shared-space address)
 Value addShared(int align, int sizeBytes, const char* suffix = nullptr);   // declare shared mem, return U64 address
 Value addShared32(int align, int sizeBytes, const char* suffix = nullptr); // declare shared mem, return U32 address
+Value addGlobalVar(const char* type, int count, const char* suffix = nullptr); // declare global var, return U64 address
 
 // Hex immediate — for baking GPU addresses into PTX
 Value hexImm(uintptr_t value);
@@ -719,6 +720,7 @@ inline void mbarrier_wait_parity(const Value& addr, const Value& phaseParity) {
 // cp.async.bulk (sm_90+)
 void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value& size, const Value& mbar);
 void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size);
+void multimem_cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size);
 void cp_async_bulk_prefetch_l2(const Value& src, const Value& size);
 void cp_async_bulk_commit_group();
 void cp_async_bulk_wait_group(int n);
