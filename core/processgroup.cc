@@ -4097,10 +4097,16 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   // Scratch buffers are permanently bound — no per-call rebinding.
   // multicastSources/multicastDests are cleanly separated from localInputCopies.
   // ==========================================================================
-  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) && kernelVersion == 3) {
-    // Lazy compile of multicast kernel
-    if (!group->compileOpKernels->cuMulticastKernel) {
-      group->compileOpKernels->compileMulticast();
+  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) &&
+      (kernelVersion == 3 ||
+       (kernelVersion == 9 && op->tunedConfig.lockstepMulticast.value_or(false)))) {
+    bool isLockstepMulticast = kernelVersion == 9 && op->tunedConfig.lockstepMulticast.value_or(false);
+
+    if (!isLockstepMulticast) {
+      // Lazy compile of multicast kernel (version 3 path)
+      if (!group->compileOpKernels->cuMulticastKernel) {
+        group->compileOpKernels->compileMulticast();
+      }
     }
 
     // Peer sync for collective mismatch detection
@@ -4133,8 +4139,13 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
 
     if (params.numDescriptors > 0) {
       std::array<void*, 1> kparams = {&params};
-      CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuMulticastKernel, group->compileOpKernels->gridSize, 1, 1,
-          group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+      if (isLockstepMulticast) {
+        launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize,
+            params.descriptors, params.numDescriptors, stepValue, concurrencyIndex, stream);
+      } else {
+        CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuMulticastKernel, group->compileOpKernels->gridSize, 1, 1,
+            group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+      }
     }
 
     // Step M2: Copy from scratch VA to output tensors.
