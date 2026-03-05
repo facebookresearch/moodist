@@ -7,3 +7,4 @@ build/
 wheels
 py/moodist/version.py
 
+CLAUDE.md
