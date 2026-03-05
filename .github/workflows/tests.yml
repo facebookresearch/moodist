@@ -1,0 +1,124 @@
+# NOTE: Tier 2 (GPU CI) requires a paid GitHub plan and a
+# configured GPU runner group. See docs for setup instructions.
+# Recommended: set a spending limit in GitHub billing settings.
+
+name: CI Tests
+
+# ---------------------------------------------------------------------------
+# Tier 1: CPU linting + syntax check — runs on every push and PR (free)
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  lint-and-syntax:
+    name: "Tier 1 — Lint & Syntax Check (CPU)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          # TODO: confirm minimum Python version with maintainers
+          # no explicit requirement found in repo, 3.10 used as default
+          python-version: "3.10"
+
+      - name: Run syntax check on all Python files
+        run: |
+          find py/ tests/ benchmarks/ -name "*.py" | xargs python3 -m py_compile
+          python3 -m py_compile setup.py
+
+      - name: Note on skipped tests
+        run: |
+          echo "GPU and InfiniBand tests skipped — no GPU available on standard GitHub runner."
+          echo "Apply the 'GPU CI' label to a pull request to trigger the full test suite."
+
+# ---------------------------------------------------------------------------
+# Tier 2: Full GPU + InfiniBand test suite — label-triggered only (paid)
+# ---------------------------------------------------------------------------
+
+  gpu-tests:
+    name: "Tier 2 — Full GPU & IB Tests"
+    # Trigger only when the pull request carries the 'GPU CI' label
+    if: |
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'GPU CI')
+
+    # TODO: A maintainer must configure a GPU self-hosted runner group
+    # before enabling this. Requires a paid GitHub plan and a runner
+    # registered under Settings > Actions > Runner groups.
+    # Uncomment and replace <runner-group-name> once configured:
+    # runs-on:
+    #   group: <runner-group-name>
+    #   labels: [self-hosted, gpu]
+    runs-on: ubuntu-latest  # placeholder — replace with GPU runner above
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect GPU
+        run: |
+          if ! nvidia-smi; then
+            echo "No GPU detected — skipping GPU test suite."
+            exit 0
+          fi
+          echo "GPU detected."
+          nvidia-smi
+
+      - name: Detect InfiniBand
+        id: detect-ib
+        run: |
+          if ls /dev/infiniband 2>/dev/null; then
+            echo "InfiniBand device found."
+            echo "ib_available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No IB device found — InfiniBand tests will be skipped."
+            echo "ib_available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          # TODO: confirm minimum Python version with maintainers
+          # no explicit requirement found in repo, 3.10 used as default
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cu124
+
+      - name: Build Moodist
+        run: |
+          pip install -e .
+
+      - name: Run full test suite
+        run: |
+          if [ "${{ steps.detect-ib.outputs.ib_available }}" = "true" ]; then
+            echo "Running full test suite including InfiniBand tests."
+            torchrun --nproc-per-node=$(nvidia-smi --list-gpus | wc -l) tests/run.py
+          else
+            echo "Skipping InfiniBand tests — no IB device detected."
+            # test_processgroup.py is excluded: it creates MoodistProcessGroup
+            # which requires RDMA/InfiniBand hardware for all collectives.
+            torchrun --nproc-per-node=$(nvidia-smi --list-gpus | wc -l) tests/run.py \
+              test_allocator.py \
+              test_compile_op.py \
+              test_cuda_copy.py \
+              test_device_mesh.py \
+              test_model_transfer.py \
+              test_nvlink_plan.py \
+              test_queue.py \
+              test_serialize.py \
+              test_sharding.py \
+              test_store.py \
+              test_stress.py
+          fi
