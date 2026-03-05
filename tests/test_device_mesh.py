@@ -220,7 +220,6 @@ def test_wrapper_cleanup_on_destroy(ctx: TestContext):
     )
 
     # Get references before destruction
-    default_pg = dist.distributed_c10d._world.default_pg
 
     # Find the wrapper (it's a different type than MoodistProcessGroup)
     wrappers_before = [

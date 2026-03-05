@@ -122,8 +122,8 @@ def test_cpu_allocator_operations(ctx: TestContext):
     f = torch.relu(a)
 
     # Reductions
-    s = a.sum()
-    m = a.mean()
+    a.sum()
+    a.mean()
 
     del a, b, c, d, e, f
     gc.collect()
@@ -239,8 +239,8 @@ def test_cuda_allocator_operations(ctx: TestContext):
     f = torch.relu(a)
 
     # Reductions
-    s = a.sum()
-    m = a.mean()
+    a.sum()
+    a.mean()
 
     del a, b, c, d, e, f
     torch.cuda.synchronize()

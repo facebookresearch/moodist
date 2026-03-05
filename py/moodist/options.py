@@ -2,7 +2,6 @@
 
 """MoodistOptions: Per-ProcessGroup options with attribute access and context manager support."""
 
-from typing import Optional
 
 
 class MoodistOptionsContext:

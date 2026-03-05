@@ -100,11 +100,11 @@ def main():
     log("_world REGISTRIES")
     log("=" * 60)
 
-    log(f"\n_world.pg_map keys:")
+    log("\n_world.pg_map keys:")
     for pg in dist.distributed_c10d._world.pg_map:
         log(f"  {type(pg).__name__} @ {id(pg)}")
 
-    log(f"\n_world.pg_group_ranks keys:")
+    log("\n_world.pg_group_ranks keys:")
     for pg in dist.distributed_c10d._world.pg_group_ranks:
         log(f"  {type(pg).__name__} @ {id(pg)}")
 
@@ -175,9 +175,9 @@ def main():
     log("CLEANUP TEST - DESTROY SINGLE GROUP")
     log("=" * 60)
 
-    log(f"\nBEFORE destroying new_pg:")
+    log("\nBEFORE destroying new_pg:")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
-    log(f"  pg_group_ranks keys:")
+    log("  pg_group_ranks keys:")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
 
@@ -192,28 +192,28 @@ def main():
     ]
     log(f"  Wrappers before: {[(type(w).__name__, wid) for w, wid in wrappers_before]}")
 
-    log(f"\nCalling dist.destroy_process_group(new_pg)...")
+    log("\nCalling dist.destroy_process_group(new_pg)...")
     dist.destroy_process_group(new_pg)
 
-    log(f"\nAFTER destroy_process_group(new_pg) (before gc.collect):")
+    log("\nAFTER destroy_process_group(new_pg) (before gc.collect):")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
 
-    log(f"\nCalling gc.collect()...")
+    log("\nCalling gc.collect()...")
     gc.collect()
 
-    log(f"\nAFTER gc.collect (still holding new_pg reference):")
+    log("\nAFTER gc.collect (still holding new_pg reference):")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
 
     # The problem: we still hold a reference to new_pg, so it can't be GC'd
-    log(f"\nDeleting local new_pg reference...")
+    log("\nDeleting local new_pg reference...")
     del new_pg
     gc.collect()
 
-    log(f"\nAFTER del new_pg + gc.collect:")
+    log("\nAFTER del new_pg + gc.collect:")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
@@ -235,9 +235,9 @@ def main():
     log("CLEANUP TEST - DESTROY ALL")
     log("=" * 60)
 
-    log(f"\nBEFORE destroy_process_group:")
+    log("\nBEFORE destroy_process_group:")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
-    log(f"  pg_group_ranks keys:")
+    log("  pg_group_ranks keys:")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
 
@@ -257,18 +257,18 @@ def main():
     wrapper_ids_before = [id(w) for w in wrappers_before]
     log(f"  Wrapper ids: {wrapper_ids_before}")
 
-    log(f"\nCalling dist.destroy_process_group()...")
+    log("\nCalling dist.destroy_process_group()...")
     dist.destroy_process_group()
 
-    log(f"\nAFTER destroy_process_group (before gc.collect):")
+    log("\nAFTER destroy_process_group (before gc.collect):")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
 
-    log(f"\nCalling gc.collect()...")
+    log("\nCalling gc.collect()...")
     gc.collect()
 
-    log(f"\nAFTER gc.collect:")
+    log("\nAFTER gc.collect:")
     log(f"  len(pg_group_ranks) = {len(dist.distributed_c10d._world.pg_group_ranks)}")
     for pg in list(dist.distributed_c10d._world.pg_group_ranks.keys()):
         log(f"    {type(pg).__name__} @ {id(pg)}")
@@ -280,7 +280,7 @@ def main():
     ]
     log(f"\n  Wrappers remaining: {len(wrappers_after)}")
     if wrappers_after:
-        log(f"  WARNING: Wrapper leak detected!")
+        log("  WARNING: Wrapper leak detected!")
         for w in wrappers_after:
             log(f"    {type(w).__name__} @ {id(w)}")
 

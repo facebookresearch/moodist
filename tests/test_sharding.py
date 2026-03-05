@@ -19,7 +19,7 @@ Tests run with multiple ranks and verify all coordinates, not just the current o
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, DeviceMesh, distribute_tensor
+from torch.distributed.tensor import DeviceMesh, distribute_tensor
 from torch.distributed.tensor.placement_types import Shard, Replicate
 
 import moodist
@@ -653,7 +653,7 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape), device=device)]
 
             try:
-                op = moodist.compile_op(
+                moodist.compile_op(
                     pg,
                     dtype=global_tensor.dtype,
                     inputs=inputs,
@@ -685,7 +685,7 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             outputs = [TensorRegion(offset=[0], shape=list(shape), device=device)]  # All ranks want full tensor
 
             try:
-                op = moodist.compile_op(
+                moodist.compile_op(
                     pg,
                     dtype=global_tensor.dtype,
                     inputs=inputs,
@@ -1129,7 +1129,7 @@ def test_local_reshard_mixed_placements(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [Shard(0), Replicate()] -> [Shard(0), Shard(0)]")
+            ctx.log("PASS [Shard(0), Replicate()] -> [Shard(0), Shard(0)]")
 
         # [Shard(0), Replicate()] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
@@ -1142,7 +1142,7 @@ def test_local_reshard_mixed_placements(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [Shard(0), Replicate()] -> [Shard(0), Shard(1)]")
+            ctx.log("PASS [Shard(0), Replicate()] -> [Shard(0), Shard(1)]")
 
         # [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
@@ -1155,7 +1155,7 @@ def test_local_reshard_mixed_placements(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]")
+            ctx.log("PASS [Replicate(), Shard(1)] -> [Shard(0), Shard(1)]")
 
         # [Replicate(), Replicate()] -> [Shard(0), Shard(1)]
         shape = (dp_size * 4, tp_size * 4)
@@ -1168,7 +1168,7 @@ def test_local_reshard_mixed_placements(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [Replicate(), Replicate()] -> [Shard(0), Shard(1)]")
+            ctx.log("PASS [Replicate(), Replicate()] -> [Shard(0), Shard(1)]")
 
         ctx.assert_true(all_passed, "Some mixed placement tests failed")
 
@@ -1196,7 +1196,7 @@ def test_local_reshard_no_change(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS Shard(0) -> Shard(0) (no change)")
+            ctx.log("PASS Shard(0) -> Shard(0) (no change)")
 
         ctx.assert_true(all_passed, "Some no-change tests failed")
 
@@ -1251,7 +1251,7 @@ def test_local_reshard_strided_shard(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [StridedShard, Replicate] -> [StridedShard, Shard(0)]")
+            ctx.log("PASS [StridedShard, Replicate] -> [StridedShard, Shard(0)]")
 
         # [_StridedShard(0, sf=tp_size), Replicate()] -> [_StridedShard(0, sf=tp_size), Shard(1)]
         shape = (dp_size * tp_size * 4, tp_size * 4)
@@ -1265,7 +1265,7 @@ def test_local_reshard_strided_shard(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [StridedShard, Replicate] -> [StridedShard, Shard(1)]")
+            ctx.log("PASS [StridedShard, Replicate] -> [StridedShard, Shard(1)]")
 
         # [Replicate(), _StridedShard(0, sf=dp_size)] -> [Shard(0), _StridedShard(0, sf=dp_size)]
         shape = (dp_size * 4, dp_size * tp_size * 4)
@@ -1279,7 +1279,7 @@ def test_local_reshard_strided_shard(ctx: TestContext, device: str):
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log(f"PASS [Replicate, StridedShard] -> [Shard(0), StridedShard]")
+            ctx.log("PASS [Replicate, StridedShard] -> [Shard(0), StridedShard]")
 
         ctx.assert_true(all_passed, "Some StridedShard reshard tests failed")
 

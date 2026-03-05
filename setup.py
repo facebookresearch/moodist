@@ -8,7 +8,6 @@ import sys
 
 import setuptools
 from setuptools.command import build_ext
-from distutils import spawn
 
 zip_files = {}
 

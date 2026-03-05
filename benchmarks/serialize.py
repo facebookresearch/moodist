@@ -13,7 +13,6 @@ This benchmark tests various patterns that stress the hash table:
 
 import time
 import pickle
-import torch
 import moodist
 
 

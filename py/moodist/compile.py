@@ -1,11 +1,11 @@
 import weakref
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Union
 
 import torch
 
 from .queue import Queue
-from .sharding import dtensor_shards, ShardInfo
+from .sharding import dtensor_shards
 
 
 weak_group = weakref.WeakValueDictionary()

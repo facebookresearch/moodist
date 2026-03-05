@@ -18,7 +18,6 @@ Usage:
 """
 
 import os
-import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -29,6 +28,7 @@ import torch
 
 if TYPE_CHECKING:
     import moodist
+
 
 
 @dataclass
