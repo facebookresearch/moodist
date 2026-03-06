@@ -158,7 +158,6 @@ struct RdmaTcp : Rdma {
     }
     errorStateSourceRank = sourceRank;
     errorState = true;
-    tcp->close();
   }
 
   void onRead(size_t i, BufferHandle buffer, void* handle) {
