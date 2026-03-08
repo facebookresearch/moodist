@@ -50,6 +50,14 @@ struct Function {
   int regCounts[4] = {};
   Reg reg(RegType type);
 
+  // DSL register allocation state
+  // std::vector<int> freeRegs[4];
+  int regHighWater[4] = {};
+
+  // Label/branch target counters
+  int labelCounter = 0;
+  int brxCounter = 0;
+
   // Basic blocks — owned by the function, serialized in order
   std::vector<std::unique_ptr<Block>> blocks;
   Block* newBlock(const char* label);
@@ -72,6 +80,13 @@ struct Module {
   // Declare a global variable. Returns the symbol name.
   // Example: addGlobal(".u64", 256, "counters") → ".global .u64 counters[256]"
   std::string addGlobal(const char* type, int count, const char* name);
+
+  // Declare an initialized constant memory array. Returns the symbol name.
+  // Data is embedded directly in the PTX as a byte initializer list.
+  // align: byte alignment (must be power of 2)
+  // data/size: raw bytes to embed
+  // name: symbol name
+  std::string addConst(int align, const void* data, size_t size, const char* name);
 
   // Serialize the complete module to a PTX string
   std::string finalize() const;
@@ -99,8 +114,6 @@ enum class ValType { Pred, U16, S16, U32, S32, U64, S64 };
 // Map ValType to RegType for register allocation.
 RegType regTypeFor(ValType type);
 
-// A value that can be either a register (typed, RAII) or an immediate (typed or untyped constant).
-// Replaces the old Val and Operand types.
 struct Value {
   Reg reg; // only valid when kind == Register
   ValType type;
@@ -112,25 +125,27 @@ struct Value {
 
   // --- Constructors ---
   Value() = default;
-  explicit Value(ValType type);      // allocate register (existing Val behavior)
-  Value(int32_t v);                  // immediate, type = U32 (implicit)
-  Value(uint32_t v);                 // immediate, type = U32 (implicit)
-  Value(int64_t v);                  // immediate, type = U64 (implicit)
-  Value(uint64_t v);                 // immediate, type = U64 (implicit)
-  Value(const char* s);              // immediate, untyped (e.g. "%tid.x")
-  Value(const Reg& r, ValType type); // wrap existing Reg as register Value
+  explicit Value(ValType type);       // allocate register (existing Val behavior)
+  Value(ValType type, std::string s); // immediate, untyped (e.g. "%tid.x")
+  Value(const Reg& r, ValType type);  // wrap existing Reg as register Value
+
+  Value(int64_t v) {
+    *this = imm(ValType::S64, v);
+  }
 
   // --- String representation ---
   // Returns register name for registers, literal string for immediates.
   const std::string& str() const;
 
+  static Value imm(ValType, int64_t);
+
   // --- RAII ---
   ~Value();
-  Value(Value&& o) noexcept;
-  Value(const Value& o) noexcept {
+  Value(Value&& o);
+  Value(const Value& o) {
     *this = o;
   }
-  Value& operator=(Value&& o) noexcept;
+  Value& operator=(Value&& o);
   Value& operator=(int64_t v);      // emit mov with immediate
   Value& operator=(const Value& o); // emit mov
 
@@ -188,28 +203,15 @@ template<ValType T>
 struct TValue {
   Value inner;
 
-  TValue() = default;
+  TValue() : inner(T) {}
   TValue(Value v) : inner(std::move(v)) {
     if (inner.type != T) {
       throw std::runtime_error("ptx::TValue: type mismatch");
     }
   }
   // Integer constructors always allocate a register + emit mov
-  TValue(int32_t v) : inner(T) {
-    static_assert(T == ValType::U32 || T == ValType::S32, "int32_t not valid for this type");
-    inner = int64_t(v);
-  }
-  TValue(uint32_t v) : inner(T) {
-    static_assert(T == ValType::U32, "uint32_t not valid for this type");
-    inner = int64_t(v);
-  }
   TValue(int64_t v) : inner(T) {
-    static_assert(T == ValType::U64 || T == ValType::S64, "int64_t not valid for this type");
     inner = v;
-  }
-  TValue(uint64_t v) : inner(T) {
-    static_assert(T == ValType::U64, "uint64_t not valid for this type");
-    inner = int64_t(v);
   }
 
   operator const Value&() const {
@@ -233,9 +235,9 @@ struct TValue {
   TValue operator&(const Operand<T>& b) const;
   TValue operator|(const Operand<T>& b) const;
   TValue operator^(const Operand<T>& b) const;
-  TValue operator~() const {
-    return ~inner;
-  }
+  // TValue operator~() const {
+  //   return ~inner;
+  // }
   TValue operator<<(const Operand<T>& b) const;
   TValue operator>>(const Operand<T>& b) const;
 
@@ -260,15 +262,7 @@ struct Operand {
   Value owned;      // owns the Value for integer immediates or moved-in temporaries
   const Value* ref; // always points to the operand value
 
-  static Value makeImm(int64_t v) {
-    if constexpr (T == ValType::U64 || T == ValType::S64) {
-      return Value(v);
-    } else {
-      return Value(int32_t(v));
-    }
-  }
-
-  Operand(int64_t v) : owned(makeImm(v)), ref(&owned) {}
+  Operand(int64_t v) : owned(Value::imm(T, v)), ref(&owned) {}
   Operand(const Value& v) : ref(&v) {}                               // borrow any Value
   Operand(const TValue<T>& v) : ref(&v.inner) {}                     // borrow existing register
   Operand(TValue<T>&& v) : owned(std::move(v.inner)), ref(&owned) {} // take ownership of temporary
@@ -367,14 +361,15 @@ Value TValue<T>::operator!=(const Operand<T>& b) const {
 using u32 = TValue<ValType::U32>;
 using u64 = TValue<ValType::U64>;
 
-// Commutative free functions for int + Value (Value + int works via implicit conversion)
-inline Value operator+(int a, const Value& b) {
-  return Value(int32_t(a)) + b;
+template<ValType T>
+inline TValue<T> operator+(int64_t a, const TValue<T>& b) {
+  return Value::imm(T, a) + b;
 }
-inline Value operator*(int a, const Value& b) {
-  return Value(int32_t(a)) * b;
+template<ValType T>
+inline TValue<T> operator*(int64_t a, const TValue<T>& b) {
+  return Value::imm(T, a) * b;
 }
-// Convenience factory functions for typed registers
+
 inline Value to_u16() {
   return Value(ValType::U16);
 }
@@ -474,9 +469,50 @@ void ld_param_u32(const Value& d, const std::string& paramName);
 void ld_param_u64(const Value& d, const std::string& paramName);
 void ld_param_u32(const Value& d, const Value& addr, int offset);
 void ld_param_u64(const Value& d, const Value& addr, int offset);
+inline u64 ld_param_u64(const Value& addr, int offset) {
+  u64 result;
+  ld_param_u64(result, addr, offset);
+  return result;
+}
 void ld_global_u32(const Value& d, const Value& addr);
+inline Value ld_global_u32(const Value& addr) {
+  u32 result;
+  ld_global_u32(result, addr);
+  return result;
+}
 void ld_global_u64(const Value& d, const Value& addr);
+inline u64 ld_global_u64(const u64& addr) {
+  u64 result;
+  ld_global_u64(result, addr);
+  return result;
+}
+void ld_const_u32(const Value& d, const Value& addr);
+inline Value ld_const_u32(const Value& addr) {
+  u32 result;
+  ld_const_u32(result, addr);
+  return result;
+}
+void ld_const_u64(const Value& d, const Value& addr);
+inline u64 ld_const_u64(const Value& addr) {
+  u64 result;
+  ld_const_u64(result, addr);
+  return result;
+}
+void ld_const_u8(const Value& d, const Value& addr);
+inline Value ld_const_u8(const Value& addr) {
+  Value result(ValType::U32);
+  ld_const_u8(result, addr);
+  return result;
+}
 void ld_global_volatile_u32(const Value& d, const Value& addr);
+void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
+inline Value ld_global_acquire_sys_u32(const Value& addr) {
+  Value result(ValType::U32);
+  ld_global_acquire_sys_u32(result, addr);
+  return result;
+}
+void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
+void st_global_release_sys_u32(const Value& addr, const Value& val);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
 void ld_u8(const Value& d, const Value& addr);
 void ld_shared_acquire_cta_u32(const Value& d, const Value& addr);
@@ -501,9 +537,11 @@ void cvt_u64_u32(const Value& d, const Value& a);
 void cvt_u32_u64(const Value& d, const Value& a);
 
 // Control flow
+struct Label;
 void bra(const Block* target);
 void bra(const Value& pred, const Block* target);
 void bra_not(const Value& pred, const Block* target);
+void brx_idx(const Value& index, const std::vector<Label>& targets);
 void ret();
 
 // Atomic
@@ -625,6 +663,8 @@ struct Label {
   Label(const char* name);
   Label(const Label&) = delete;
   Label& operator=(const Label&) = delete;
+  Label(Label&&) = default;
+  Label& operator=(Label&&) = default;
 };
 void activateLabel(Label& label);
 
@@ -644,10 +684,10 @@ struct PredGuard {
 #define PRED(pred) if ([[maybe_unused]] auto _ptx_pred_ = ::moodist::ptx::PredGuard(pred); true)
 
 // Special registers
-Value threadIdx_x();
-Value blockIdx_x();
-Value blockDim_x();
-Value clock64();
+u32 threadIdx_x();
+u32 blockIdx_x();
+u32 blockDim_x();
+u64 clock64();
 
 // Parameter loading — emits ld.param, returns typed Value
 Value loadParam(int index, ValType type);
@@ -659,9 +699,6 @@ Value loadParamField(const Value& base, int offset, ValType type);
 // Type conversion
 Value widen(const Value& v);  // U32→U64, S32→S64
 Value narrow(const Value& v); // U64→U32, S64→S32
-inline Value widen(int32_t v) {
-  return widen(Value(v));
-} // disambiguates widen(int literal)
 inline u64 widen(const u32& v) {
   return widen(v.inner);
 }
@@ -698,13 +735,21 @@ Value atomicInc(const Value& addr, const Value& modulo);
 
 // Global variable address
 Value globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
+Value constAddr(const char* name);  // mov.u32 of const symbol address, returns U32
 Value sharedAddr(const char* name); // mov.u32 of shared symbol address, returns U32 (native shared-space address)
-Value addShared(int align, int sizeBytes, const char* suffix = nullptr);   // declare shared mem, return U64 address
-Value addShared32(int align, int sizeBytes, const char* suffix = nullptr); // declare shared mem, return U32 address
-Value addGlobalVar(const char* type, int count, const char* suffix = nullptr); // declare global var, return U64 address
+Value addShared(int align, int sizeBytes, const char* suffix = nullptr);    // declare shared mem, return U64 address
+Value addShared32(int align, int sizeBytes, const char* suffix = nullptr);  // declare shared mem, return U32 address
+Value addGlobalVar(int align, int sizeBytes, const char* suffix = nullptr); // declare global var, return U64 address
+Value addConst32(
+    int align, const void* data, size_t size, const char* name); // declare initialized const, return U32 address
+
+template<typename T>
+Value addConst32(const std::vector<T>& vec, const char* name) {
+  return addConst32(alignof(T), vec.data(), vec.size() * sizeof(T), name);
+}
 
 // Hex immediate — for baking GPU addresses into PTX
-Value hexImm(uintptr_t value);
+// Value hexImm(uintptr_t value);
 
 // mbarrier operations (sm_90+)
 void mbarrier_init(const Value& addr, int count);
