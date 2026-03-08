@@ -2934,10 +2934,9 @@ bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* ou
   if (timeout) {
     timeoutOpt = *timeout;
   }
-  auto [tensor, size] = q->get(block, timeoutOpt);
+  auto tensor = q->getTensor(block, timeoutOpt, outSize);
   if (tensor.defined()) {
     *outTensor = std::move(tensor);
-    *outSize = size;
     return true;
   }
   return false;
@@ -2945,7 +2944,7 @@ bool queueGet(api::Queue* queue, bool block, const float* timeout, TensorPtr* ou
 
 api::QueueWorkHandle queuePut(api::Queue* queue, const TensorPtr& tensor, uint32_t transaction, bool waitOnDestroy) {
   auto* q = static_cast<Queue*>(queue);
-  QueueWork work = q->put(tensor, transaction, waitOnDestroy);
+  QueueWork work = q->putTensor(tensor, transaction, waitOnDestroy);
   // Transfer ownership to heap and wrap in ApiHandle
   auto* workPtr = internalNew<QueueWork>(std::move(work));
   return api::QueueWorkHandle::create(workPtr);
