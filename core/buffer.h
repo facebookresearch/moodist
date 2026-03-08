@@ -96,9 +96,14 @@ struct SharedBufferHandle {
     }
   }
   SharedBufferHandle& operator=(const SharedBufferHandle& n) noexcept {
-    buffer = n.buffer;
-    if (buffer) {
-      addref();
+    if (buffer != n.buffer) {
+      if (buffer && decref() == 0) {
+        Buffer::deallocate(buffer);
+      }
+      buffer = n.buffer;
+      if (buffer) {
+        addref();
+      }
     }
     return *this;
   }
@@ -135,8 +140,11 @@ struct SharedBufferHandle {
     buffer = nullptr;
     return r;
   }
-  void acquire(Buffer* buffer) noexcept {
-    buffer = buffer;
+  void acquire(Buffer* b) noexcept {
+    if (buffer && decref() == 0) {
+      Buffer::deallocate(buffer);
+    }
+    buffer = b;
   }
 };
 
