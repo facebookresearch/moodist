@@ -212,8 +212,6 @@ struct IpcMapper {
 
       // Fast path: already mapped enough
       if (needed <= peer.mappedWatermark && peer.peerBase != 0) {
-        log.debug(
-            "requestAddress (VMM fast): %#x bytes at offset %#x -> %#x\n", length, offset, peer.peerBase + offset);
         l.unlock();
         callback(peer.peerBase + offset);
         return;

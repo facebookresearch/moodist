@@ -9,6 +9,8 @@
 #include "api/types.h"
 #include "common.h"
 #include "cputhread.h"
+#include "queue.h"
+#include "serialization.h"
 #include "shared_ptr.h"
 
 #include <cstdint>
@@ -211,6 +213,42 @@ struct CompileContext {
 
   // For generating unique op IDs
   uint32_t* nextOpId;
+
+  Vector<std::pair<uint32_t, TensorDataPtr>> queuedReceives;
+
+  HashMap<std::string, Vector<std::unique_ptr<AllocatedArray>>> cachedBuffers;
+
+  template<typename... T>
+  void send(uint32_t torank, const T&... v) {
+    auto& q = queues[torank];
+    uint32_t t = q->transactionBegin();
+    q->putBuffer(serializeToBuffer((uint32_t)group->rank), t);
+    q->putBuffer(serializeToBuffer(v...), t);
+    q->transactionCommit(t);
+  }
+  template<typename... T>
+  void receive(uint32_t fromrank, T&... v) {
+    auto deserialize = [&](auto&& t, auto&... v) {
+      deserializeBuffer((void*)t->data(), t->bytes(), v...);
+    };
+    for (auto i = queuedReceives.begin(); i != queuedReceives.end(); ++i) {
+      if (i->first == fromrank) {
+        deserialize(i->second, v...);
+        queuedReceives.erase(i);
+        return;
+      }
+    }
+    auto& q = queues[group->rank];
+    while (true) {
+      uint32_t sourceRank;
+      deserialize(q->get(), sourceRank);
+      if (sourceRank == fromrank) {
+        deserialize(q->get(), v...);
+        return;
+      }
+      queuedReceives.emplace_back(sourceRank, q->get());
+    }
+  }
 };
 
 // Tensor descriptor (for inputs and outputs)
@@ -245,18 +283,19 @@ struct LogicalInput {
 struct ReadRequest {
   Coord offset; // Global coordinates
   Coord shape;
+  uint32_t cellIndex;
   uint32_t requesterRank; // Who is requesting (for response routing)
   uint32_t inputIndex;    // Sender's input index
   uint32_t outputIndex;   // For correlation in response
 
   template<typename X>
   void serialize(X& x) const {
-    x(offset, shape, requesterRank, inputIndex, outputIndex);
+    x(offset, shape, cellIndex, requesterRank, inputIndex, outputIndex);
   }
 
   template<typename X>
   void serialize(X& x) {
-    x(offset, shape, requesterRank, inputIndex, outputIndex);
+    x(offset, shape, cellIndex, requesterRank, inputIndex, outputIndex);
   }
 };
 
@@ -271,28 +310,28 @@ struct ReadResponse {
   uint32_t tensorIndex;   // Input index or copy index
   size_t inputOffset;     // Linear offset within tensor
   Coord tensorShape;      // For stride computation at receiver
+  uint32_t cellIndex;     // Global cell index for dependency signaling
   bool isCopy;            // True if tensorIndex refers to a copy
   DeviceType inputDevice; // Device type of input tensor
 
   template<typename X>
   void serialize(X& x) const {
     x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
-        isCopy, inputDevice);
+        cellIndex, isCopy, inputDevice);
   }
 
   template<typename X>
   void serialize(X& x) {
     x(requesterRank, outputIndex, requestOffset, requestShape, senderRank, tensorIndex, inputOffset, tensorShape,
-        isCopy, inputDevice);
+        cellIndex, isCopy, inputDevice);
   }
 };
 
 // Main compile function
 // Returns a compiled CustomOpDescriptor ready for execution
 // ndim is validated per-tensorId (different tensorIds can have different ndims)
-std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
-    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs,
-    ReduceOp reduce = ReduceOp::None, bool cpuSync = false);
+std::shared_ptr<CustomOpDescriptor> compile(CompileContext& ctx, DType dtype, std::span<const api::TensorRegion> inputs,
+    std::span<const api::TensorRegion> outputs, ReduceOp reduce = ReduceOp::None, bool cpuSync = false);
 
 } // namespace compile_op
 } // namespace moodist

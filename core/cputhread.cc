@@ -5614,7 +5614,7 @@ struct CpuThreadImpl {
     Vector<TemporaryBufferHandle> remoteInputList;
     Vector<bool> remoteInputListReady;
 
-    Vector<CustomOpDescriptor::Read> reads;
+    Vector<CustomOpDescriptor::IbRead> reads;
 
     size_t liveReads = 0;
     std::array<size_t, maxDevices> deviceLiveReads{};
@@ -5792,7 +5792,7 @@ struct CpuThreadImpl {
         }
       }
 
-      reads = op->reads;
+      reads = op->ibReads;
       std::ranges::shuffle(reads, getRng());
 
       if (params.anyCuda) {

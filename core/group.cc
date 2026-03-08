@@ -10,6 +10,7 @@
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "queue.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
