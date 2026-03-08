@@ -17,15 +17,11 @@ static constexpr uint32_t kMaxCopyDescriptors = 200;
 struct CopyDescriptor {
   uintptr_t src;
   uintptr_t dst;
-  uint32_t bytes; // Max 4GB per region, sufficient for tensor slices
 };
 
 struct CompileOpCopyParameters {
   uint32_t stepValue;
   uint32_t concurrencyIndex;
-  uint32_t numDescriptors;
-  uint32_t _pad;
-  CopyDescriptor descriptors[kMaxCopyDescriptors];
 };
 
 // Configuration for the PTX copy kernel generator and auto-tuner.
@@ -35,7 +31,7 @@ struct CopyKernelConfig {
   // Universal fields (all engine types)
   size_t blockSize = 256;
   size_t gridSize = 8;
-  const char* copyEngine = "reg"; // "reg" (register pipeline), "bulk" (cp.async.bulk)
+  const char* copyEngine = nullptr; // "reg" (register pipeline), "bulk" (cp.async.bulk)
 
   // Reg-only fields
   std::optional<int> depth;          // pipeline depth (1-32)
@@ -67,12 +63,15 @@ struct CopyKernelConfig {
   std::optional<int> flexNumParallelWrites;   // number of parallel write units (write threads split evenly)
 
   // Lockstep-only fields
-  std::optional<int> lockstepNumBuffers;    // number of shared memory ring buffers
-  std::optional<int> lockstepNumParallel;   // number of parallel read/write units
-  std::optional<bool> lockstepMulticast;    // use multimem.cp.async.bulk for writes
+  std::optional<int> lockstepNumBuffers;  // number of shared memory ring buffers
+  std::optional<int> lockstepNumParallel; // number of parallel read/write units
+  std::optional<bool> lockstepMulticast;  // use multimem.cp.async.bulk for writes
 
   // IPC direction (applies to all engine types)
   std::optional<bool> copyWrite; // true: push (write to remote dst), false: pull (read from remote src)
+
+  // Ring copy: chain copies through ring instead of all reading from source
+  std::optional<bool> copyRing; // true: ring topology, false: direct (default)
 
   // Factory functions for constructing engine-specific configs
   static CopyKernelConfig reg(int depth, size_t blockSize, size_t gridSize, const char* loadOp) {
@@ -104,8 +103,7 @@ struct CopyKernelConfig {
   }
 
   static CopyKernelConfig lockstep(
-      size_t gridSize, size_t chunkSize, size_t blockSize, int numBuffers, int numParallel,
-      bool multicast = false) {
+      size_t gridSize, size_t chunkSize, size_t blockSize, int numBuffers, int numParallel, bool multicast = false) {
     CopyKernelConfig c;
     c.copyEngine = "lockstep";
     c.gridSize = gridSize;
