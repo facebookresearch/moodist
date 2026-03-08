@@ -126,6 +126,13 @@ struct Group {
   AllocatedArray cudaMemSync;
   std::array<PeerArrayRef, 8> peerCudaMemSync;
 
+  // // Per-descriptor signal buffer for fine-grained copy synchronization.
+  // // Lazily allocated during compile_op. Grows if a new op needs more slots.
+  // // Layout: buffer[concurrencyIndex][blockIdx][descriptorIndex] → uint32_t stepValue
+  // AllocatedArray cudaDescriptorSignal;
+  // std::array<PeerArrayRef, 8> peerCudaDescriptorSignal;
+  // Vector<AllocatedArray> oldDescriptorSignalBuffers; // kept alive + reset after growth
+
   std::vector<AllocatedArray*> buffersToReset;
 
   IVector<size_t> ipcRanks;
@@ -181,7 +188,7 @@ struct Group {
   void init(Function<void()> f, Function<void()> pghandle);
   Function<void()> init2;
 
-  size_t getPeerIndex(size_t rank) {
+  size_t getPeerIndex(size_t rank) const {
     for (size_t i = 0; i != ipcRanks.size(); ++i) {
       if (ipcRanks[i] == rank) {
         return i;

@@ -428,6 +428,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
 
+  compile_op::CompileContext persistentCompileContext;
+
   ProcessGroupImpl(void* c10dStore, int rank_, int size_) : rank(rank_), size(size_), c10dStore_(c10dStore) {
     CHECK(rank_ >= 0 && size_ > 0 && rank_ < size_);
 
@@ -1085,7 +1087,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
       TensorPtr* outputs, size_t nOutputs, CUstream stream);
 
   // executeLocalOnly - fast path for all-local custom ops (no CPU thread)
-  SharedPtr<ApiFuture> executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op, std::vector<TensorDataPtr>& inputs,
+  SharedPtr<ApiFuture> executeLocalOnly(const CustomOpDescriptor& op, std::vector<TensorDataPtr>& inputs,
       std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
       uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream);
 
@@ -3070,30 +3072,6 @@ void destroy(CustomOp* op) {
 
 namespace {
 
-// Helper to serialize data to a CPU TensorPtr for queue operations
-template<typename... T>
-TensorPtr serializeToTensorPtr(const T&... v) {
-  auto buffer = serializeToBuffer(v...);
-  size_t size = buffer->size();
-  // Create a 1D uint8 CPU tensor and copy data into it
-  int64_t shape = static_cast<int64_t>(size);
-  CHECK(moodist::wrapperApi.tensorEmpty != nullptr);
-  Tensor* t = moodist::wrapperApi.tensorEmpty(&shape, 1, DType::UInt8, -1);
-  CHECK(t != nullptr);
-  // Copy serialized data into tensor
-  void* tensorData = moodist::wrapperApi.tensorDataPtr(t);
-  std::memcpy(tensorData, buffer->data(), size);
-  return TensorPtr(t);
-}
-
-// Helper to deserialize from TensorPtr
-template<typename... T>
-void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
-  void* ptr = tensor.data_ptr();
-  size_t size = static_cast<size_t>(tensor.numel());
-  deserializeBuffer(ptr, size, result...);
-}
-
 // TInput structure for serializing distributed input information
 template<typename T>
 struct TInput {
@@ -3115,749 +3093,7 @@ struct TInput {
   }
 };
 
-// Packet for exchanging reads among local ranks
-struct LocalReadsPacket {
-  size_t localRankIndex;
-  IVector<CustomOpDescriptor::Read> reads;
-
-  template<typename X>
-  void serialize(X& x) {
-    x(localRankIndex, reads);
-  }
-};
-
-// Compute NVLink-optimized read plan by splitting overlapping reads
-// into sub-regions for maximum local sharing
-void computeNvlinkPlan(CustomOpDescriptor* op, const IVector<IVector<CustomOpDescriptor::Read>>& allLocalReads,
-    const Vector<size_t>& nodeRanks, // global ranks on my node
-    size_t myLocalRank, size_t numLocalRanks,
-    const Vector<size_t>& rankLocalRank, // maps global rank -> local rank index
-    size_t myGlobalRank) {
-  using Read = CustomOpDescriptor::Read;
-
-  // Helper to check if a rank is local
-  auto isLocalRank = [&](size_t r) {
-    for (size_t lr : nodeRanks) {
-      if (lr == r) {
-        return true;
-      }
-    }
-    return false;
-  };
-
-  // Track which read each reference came from
-  struct ReadRef {
-    size_t localRankIdx;
-    const Read* read;
-  };
-
-  // Group reads by (sourceRank, inputIndex)
-  HashMap<std::pair<uint32_t, uint32_t>, IVector<ReadRef>, PairHash> readsBySource;
-
-  for (size_t localIdx : range(numLocalRanks)) {
-    for (const Read& r : allLocalReads[localIdx]) {
-      auto key = std::make_pair(r.rank, r.inputIndex);
-      readsBySource[key].push_back({localIdx, &r});
-    }
-  }
-
-  // Process each source group
-  for (auto& [sourceKey, refs] : readsBySource) {
-    auto [sourceRank, inputIndex] = sourceKey;
-
-    // Check if source is on the same node
-    bool sourceIsLocal = isLocalRank(sourceRank);
-
-    // Collect all interval boundaries
-    IVector<size_t> boundaries;
-    for (const auto& ref : refs) {
-      boundaries.push_back(ref.read->inputOffset);
-      boundaries.push_back(ref.read->inputOffset + ref.read->bytes);
-    }
-    std::ranges::sort(boundaries);
-    auto [newEnd, oldEnd] = std::ranges::unique(boundaries);
-    boundaries.erase(newEnd, boundaries.end());
-
-    // For each interval, find which reads contain it
-    for (size_t i = 0; i + 1 < boundaries.size(); ++i) {
-      size_t intervalStart = boundaries[i];
-      size_t intervalEnd = boundaries[i + 1];
-      size_t intervalBytes = intervalEnd - intervalStart;
-
-      if (intervalBytes == 0) {
-        continue;
-      }
-
-      // Find reads that contain this interval
-      IVector<ReadRef> containingRefs;
-      for (const auto& ref : refs) {
-        size_t readStart = ref.read->inputOffset;
-        size_t readEnd = readStart + ref.read->bytes;
-        if (readStart <= intervalStart && intervalEnd <= readEnd) {
-          containingRefs.push_back(ref);
-        }
-      }
-
-      if (containingRefs.empty()) {
-        continue;
-      }
-
-      // Check if I have a read in this interval
-      const ReadRef* myRef = nullptr;
-      for (const auto& ref : containingRefs) {
-        if (ref.localRankIdx == myLocalRank) {
-          myRef = &ref;
-          break;
-        }
-      }
-
-      if (!myRef) {
-        continue; // I don't need this interval
-      }
-
-      // Compute my sub-read's output offset
-      size_t myOutputOffset = myRef->read->outputOffset + (intervalStart - myRef->read->inputOffset);
-
-      if (sourceIsLocal) {
-        // Source is on same node - copy directly from source's input via NVLink
-        // (skip if source is myself - that's handled by inputCopies)
-        if (sourceRank != myGlobalRank) {
-          CustomOpDescriptor::LocalInputCopy lic;
-          lic.sourceRank = sourceRank;
-          lic.sourceInputIndex = inputIndex;
-          lic.sourceInputOffset = intervalStart;
-          lic.bytes = intervalBytes;
-          lic.myOutputIndex = myRef->read->outputIndex;
-          lic.myOutputOffset = myOutputOffset;
-          op->localInputCopies.push_back(lic);
-        }
-      } else if (containingRefs.size() == 1) {
-        // Only I need this interval from remote - direct IB read
-        Read r;
-        r.rank = sourceRank;
-        r.inputIndex = inputIndex;
-        r.inputOffset = intervalStart;
-        r.bytes = intervalBytes;
-        r.outputIndex = myRef->read->outputIndex;
-        r.outputOffset = myOutputOffset;
-        op->directReads.push_back(r);
-      } else {
-        // Multiple local ranks need this interval from remote
-        // Pick gateway from among those who need it, preferring rail-aligned
-        size_t sourceLocalRank = rankLocalRank[sourceRank];
-        size_t preferredGatewayLocalIdx = sourceLocalRank % numLocalRanks;
-
-        // Find if preferred gateway is among readers, otherwise use first
-        size_t actualGatewayLocalIdx = containingRefs[0].localRankIdx;
-        for (const auto& ref : containingRefs) {
-          if (ref.localRankIdx == preferredGatewayLocalIdx) {
-            actualGatewayLocalIdx = preferredGatewayLocalIdx;
-            break;
-          }
-        }
-        size_t gatewayGlobalRank = nodeRanks[actualGatewayLocalIdx];
-
-        if (myLocalRank == actualGatewayLocalIdx) {
-          // I'm the gateway - fetch via IB
-          CustomOpDescriptor::GatewayRead gr;
-          gr.sourceRank = sourceRank;
-          gr.inputIndex = inputIndex;
-          gr.inputOffset = intervalStart;
-          gr.bytes = intervalBytes;
-          gr.outputIndex = myRef->read->outputIndex;
-          gr.outputOffset = myOutputOffset;
-          op->gatewayReads.push_back(gr);
-        } else {
-          // I receive from gateway's output via NVLink
-          const ReadRef* gatewayRef = nullptr;
-          for (const auto& ref : containingRefs) {
-            if (ref.localRankIdx == actualGatewayLocalIdx) {
-              gatewayRef = &ref;
-              break;
-            }
-          }
-          CHECK(gatewayRef != nullptr);
-
-          size_t gatewayOutputOffset = gatewayRef->read->outputOffset + (intervalStart - gatewayRef->read->inputOffset);
-
-          CustomOpDescriptor::LocalCopy lc;
-          lc.gatewayRank = static_cast<uint32_t>(gatewayGlobalRank);
-          lc.gatewayOutputIndex = gatewayRef->read->outputIndex;
-          lc.gatewayOutputOffset = gatewayOutputOffset;
-          lc.bytes = intervalBytes;
-          lc.myOutputIndex = myRef->read->outputIndex;
-          lc.myOutputOffset = myOutputOffset;
-          op->localCopies.push_back(lc);
-        }
-      }
-    }
-  }
-}
-
 } // namespace
-
-// ============================================================================
-// ProcessGroupImpl::compileOpFullImpl_OLD - template implementation
-// OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
-// ============================================================================
-
-template<int ndim>
-SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFullImpl_OLD(std::span<const int64_t> shape_arg, DType dtype,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
-    std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg) {
-  using T = std::array<int64_t, ndim>;
-  T shape;
-  std::ranges::copy(shape_arg, shape.begin());
-
-  struct TDescr {
-    uint32_t rank;
-    uint32_t index;
-    T shape;
-    T offset;
-    size_t numel;
-  };
-
-  const size_t numInputs = inputs_arg.size();
-  const size_t numOutputs = outputs_arg.size();
-
-  constexpr auto numel = [](const T& v) {
-    size_t n = 1;
-    for (int64_t x : v) {
-      n *= x;
-    }
-    return n;
-  };
-
-  constexpr auto linearOffset = [](const T& offset, const T& shape) {
-    size_t result = 0;
-    size_t stride = 1;
-    for (int i = ndim - 1; i >= 0; --i) {
-      result += offset[i] * stride;
-      stride *= shape[i];
-    }
-    return result;
-  };
-
-  IVector<TDescr> descrs;
-  descrs.reserve(numInputs + numOutputs);
-  IVector<TDescr*> inputs(numInputs);
-  IVector<TDescr*> outputs(numOutputs);
-  IVector<size_t> indexCounter(size);
-
-  for (size_t i = 0; i < numInputs; ++i) {
-    const auto& [r, off, nshape] = inputs_arg[i];
-    descrs.emplace_back();
-    TDescr& d = descrs.back();
-    d.rank = r;
-    std::ranges::copy(off, d.offset.begin());
-    std::ranges::copy(nshape, d.shape.begin());
-    d.numel = numel(d.shape);
-    d.index = indexCounter[r]++;
-    inputs[i] = &d;
-  }
-
-  std::ranges::fill(indexCounter, 0);
-  for (size_t i = 0; i < numOutputs; ++i) {
-    const auto& [r, off, nshape] = outputs_arg[i];
-    descrs.emplace_back();
-    TDescr& d = descrs.back();
-    d.rank = r;
-    std::ranges::copy(off, d.offset.begin());
-    std::ranges::copy(nshape, d.shape.begin());
-    d.numel = numel(d.shape);
-    d.index = indexCounter[r]++;
-    outputs[i] = &d;
-  }
-
-  auto ref = [&](auto& v) {
-    return std::views::transform(v, [](auto& x) -> decltype(auto) {
-      if constexpr (std::is_pointer_v<std::remove_reference_t<decltype(x)>>) {
-        return *x;
-      } else {
-        return x;
-      }
-    });
-  };
-
-  IVector<IVector<const TDescr*>> outputsPerRank(size);
-  for (const TDescr& dst : ref(outputs)) {
-    CHECK(dst.index == outputsPerRank[dst.rank].size());
-    outputsPerRank[dst.rank].push_back(&dst);
-  }
-  for (size_t i = 0; i < size; ++i) {
-    CHECK(outputsPerRank[i].size() == indexCounter[i]);
-  }
-
-  constexpr auto intersecting = [](const auto& a, const auto& b) {
-    for (int i = 0; i < ndim; ++i) {
-      if (a.offset[i] >= b.offset[i] + b.shape[i]) {
-        return false;
-      }
-      if (b.offset[i] >= a.offset[i] + a.shape[i]) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  constexpr auto contiguous = [](const T& a, const T& b) {
-    for (int i = 0; i < ndim; ++i) {
-      if (i && a[i] != b[i]) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  struct FindResult {
-    T offset;
-    T shape;
-    size_t index;
-  };
-
-  auto find = [&](const auto& dst, const auto& list) -> IVector<FindResult> {
-    IVector<FindResult> rv;
-    size_t i = 0;
-    for (const auto& src : ref(list)) {
-      size_t index = i++;
-      if (!intersecting(src, dst)) {
-        continue;
-      }
-      T low, high, nshape;
-      for (int j = 0; j < ndim; ++j) {
-        low[j] = std::max(src.offset[j], dst.offset[j]);
-        high[j] = std::min(src.offset[j] + src.shape[j], dst.offset[j] + dst.shape[j]);
-        CHECK(low[j] <= high[j]);
-        nshape[j] = high[j] - low[j];
-      }
-      FindResult r;
-      r.offset = low;
-      r.shape = nshape;
-      r.index = index;
-      rv.push_back(r);
-    }
-    return rv;
-  };
-
-  using Input = TInput<T>;
-  IVector<Input> distInputs;
-  IVector<FindResult> copyInputs;
-
-  IVector<TDescr*> myInputs;
-  for (auto& v : ref(inputs)) {
-    if (v.rank == rank) {
-      myInputs.push_back(&v);
-    }
-  }
-
-  constexpr auto sub = [](const T& a, const T& b) {
-    T r;
-    for (int i = 0; i < ndim; ++i) {
-      r[i] = a[i] - b[i];
-    }
-    return r;
-  };
-
-  for (const TDescr& dst : ref(outputs)) {
-    if (dst.numel == 0) {
-      continue;
-    }
-    auto r = find(dst, myInputs);
-
-    for (const FindResult& x : r) {
-      auto& src = *myInputs[x.index];
-      bool inputContiguous = contiguous(x.shape, src.shape);
-
-      if (!inputContiguous) {
-        auto rr = find(dst, copyInputs);
-        if (!rr.empty() && rr.size() < 4) {
-          size_t n = 0;
-          bool cc = true;
-          for (auto& x2 : rr) {
-            n += numel(x2.shape);
-            cc &= contiguous(x2.shape, copyInputs[x2.index].shape);
-            if (!cc) {
-              break;
-            }
-          }
-          if (cc && n == numel(x.shape)) {
-            for (auto& x2 : rr) {
-              distInputs.emplace_back();
-              Input& inp = distInputs.back();
-              inp.offset = x2.offset;
-              inp.shape = x2.shape;
-              inp.inputRank = rank;
-              inp.outputRank = dst.rank;
-              inp.inputIndex = myInputs.size() + x2.index;
-              inp.outputIndex = dst.index;
-              CHECK(inp.inputIndex < myInputs.size() + copyInputs.size());
-              CHECK(&dst == outputsPerRank[inp.outputRank][inp.outputIndex]);
-              inp.inputOffset = linearOffset(sub(x2.offset, copyInputs[x2.index].offset), copyInputs[x2.index].shape);
-              inp.outputOffset = linearOffset(sub(x2.offset, dst.offset), dst.shape);
-              inp.outputContiguous = contiguous(x2.shape, dst.shape);
-            }
-            continue;
-          }
-        }
-      }
-
-      distInputs.emplace_back();
-      Input& inp = distInputs.back();
-      inp.offset = x.offset;
-      inp.shape = x.shape;
-      inp.inputRank = rank;
-      inp.outputRank = dst.rank;
-      inp.inputIndex = x.index;
-      inp.outputIndex = dst.index;
-      CHECK(inp.inputIndex < myInputs.size());
-      CHECK(&dst == outputsPerRank[inp.outputRank][inp.outputIndex]);
-      inp.inputOffset = linearOffset(sub(x.offset, src.offset), src.shape);
-      inp.outputOffset = linearOffset(sub(x.offset, dst.offset), dst.shape);
-
-      if (!inputContiguous) {
-        inp.inputIndex = myInputs.size() + copyInputs.size();
-        inp.inputOffset = 0;
-        copyInputs.push_back(x);
-      }
-      inp.outputContiguous = contiguous(x.shape, dst.shape);
-    }
-  }
-
-  auto op = std::make_shared<CustomOpDescriptor>();
-  op->id = nextCustomOpId++;
-  op->dtype = dtype;
-
-  size_t itemsize = wrapperApi.dtypeSize(dtype);
-
-  for (auto& x : ref(inputs)) {
-    if (x.rank == rank) {
-      op->inputs.push_back(itemsize * numel(x.shape));
-      op->inputShapes.emplace_back(x.shape.begin(), x.shape.end());
-    }
-  }
-  for (auto& x : ref(outputs)) {
-    if (x.rank == rank) {
-      op->outputs.push_back(itemsize * numel(x.shape));
-      op->outputShapes.emplace_back(x.shape.begin(), x.shape.end());
-    }
-  }
-
-  // Barrier before queue operations
-  barrier();
-
-  // Create internal queues for compileOpFull communication
-  if (queues.empty()) {
-    for (size_t i = 0; i < size; ++i) {
-      auto handle = makeQueue(group, i, false, {});
-      CHECK(handle.get() != nullptr);
-      // Transfer ownership from ApiHandle to SharedPtr
-      Queue* q = static_cast<Queue*>(handle.release());
-      CHECK(q->impl != nullptr);
-      queues.push_back(SharedPtr<Queue>(q));
-    }
-  }
-  CHECK(queues.size() == size);
-
-  // Exchange distribution info via queues
-  IVector<IVector<Input>> s(size);
-  for (const Input& x : distInputs) {
-    s[x.outputRank].push_back(x);
-  }
-
-  for (size_t i = 0; i < size; ++i) {
-    CHECK(i < queues.size());
-    CHECK(queues[i].get() != nullptr);
-    CHECK(queues[i]->impl != nullptr);
-    TensorPtr tensor = serializeToTensorPtr(s[i]);
-    queues[i]->put(std::move(tensor), 0);
-  }
-
-  // Step 1: Gather inputs that matched our outputs (from all source ranks)
-  IVector<Input> matchedInputs;
-  for (size_t i = 0; i < size; ++i) {
-    CHECK(rank < queues.size());
-    CHECK(queues[rank].get() != nullptr);
-    CHECK(queues[rank]->impl != nullptr);
-    auto [tensor, qsize] = queues[rank]->get();
-    IVector<Input> n;
-    deserializeFromTensorPtr(tensor, n);
-
-    for (const Input& x : n) {
-      CHECK(x.outputRank == rank);
-      matchedInputs.push_back(x);
-    }
-  }
-
-  // Debug: print matched inputs and outputs
-  log.debug(
-      "compile_op_full: rank %zu, %zu matched inputs, %zu outputs\n", rank, matchedInputs.size(), op->outputs.size());
-  for (size_t i : indices(matchedInputs)) {
-    const auto& x = matchedInputs[i];
-    log.debug("  input[%zu]: from rank %u, outputIndex=%u, offset=%s, shape=%s, outputOffset=%zu, contiguous=%d\n", i,
-        x.inputRank, x.outputIndex, fmt::to_string(fmt::join(x.offset, ",")).c_str(),
-        fmt::to_string(fmt::join(x.shape, ",")).c_str(), x.outputOffset, x.outputContiguous);
-  }
-  for (size_t i : indices(op->outputs)) {
-    log.debug("  output[%zu]: %zu bytes, shape=%s\n", i, op->outputs[i],
-        fmt::to_string(fmt::join(op->outputShapes[i], ",")).c_str());
-  }
-
-  // Step 2: Validate inputs - check for overlaps using N-dim intersection
-  {
-    // Group inputs by output index
-    IVector<IVector<size_t>> inputsPerOutput(op->outputs.size());
-    for (size_t i : indices(matchedInputs)) {
-      inputsPerOutput[matchedInputs[i].outputIndex].push_back(i);
-    }
-
-    // Check for overlapping inputs within each output
-    std::string overlapDetails;
-    size_t overlapCount = 0;
-    constexpr size_t maxReportedRegions = 5;
-
-    for (size_t outIdx : indices(op->outputs)) {
-      const auto& idxs = inputsPerOutput[outIdx];
-      for (size_t i = 0; i < idxs.size(); ++i) {
-        for (size_t j = i + 1; j < idxs.size(); ++j) {
-          const auto& a = matchedInputs[idxs[i]];
-          const auto& b = matchedInputs[idxs[j]];
-          if (intersecting(a, b)) {
-            overlapCount++;
-            if (overlapCount <= maxReportedRegions) {
-              overlapDetails += fmt::sprintf("\n  output[%zu]: overlap between input from rank %u at [%s] shape [%s] "
-                                             "and input from rank %u at [%s] shape [%s]",
-                  outIdx, a.inputRank, fmt::to_string(fmt::join(a.offset, ",")).c_str(),
-                  fmt::to_string(fmt::join(a.shape, ",")).c_str(), b.inputRank,
-                  fmt::to_string(fmt::join(b.offset, ",")).c_str(), fmt::to_string(fmt::join(b.shape, ",")).c_str());
-            }
-          }
-        }
-      }
-    }
-
-    if (overlapCount > 0) {
-      std::string msg = "moodist.compile_op_full: overlapping inputs detected";
-      if (overlapCount > maxReportedRegions) {
-        msg += fmt::sprintf(" (%zu regions, showing first %zu):", overlapCount, maxReportedRegions);
-      } else {
-        msg += ":";
-      }
-      msg += overlapDetails;
-      throw std::runtime_error(msg);
-    }
-
-    // Gap detection: first do quick numel check, then detailed cell decomposition if needed
-    IVector<size_t> outputsWithGaps;
-    for (size_t outIdx : indices(op->outputs)) {
-      size_t inputNumel = 0;
-      for (size_t i : inputsPerOutput[outIdx]) {
-        inputNumel += numel(matchedInputs[i].shape);
-      }
-      size_t outputNumel = op->outputs[outIdx] / itemsize;
-      if (inputNumel != outputNumel) {
-        outputsWithGaps.push_back(outIdx);
-      }
-    }
-
-    if (!outputsWithGaps.empty()) {
-      // Detailed gap detection using cell decomposition
-      std::string gapDetails;
-      size_t gapCount = 0;
-
-      for (size_t outIdx : outputsWithGaps) {
-        const auto& outDescr = *outputsPerRank[rank][outIdx];
-        const auto& idxs = inputsPerOutput[outIdx];
-
-        // Collect boundaries in each dimension
-        std::array<IVector<int64_t>, ndim> boundaries;
-        for (int d = 0; d < ndim; ++d) {
-          boundaries[d].push_back(outDescr.offset[d]);
-          boundaries[d].push_back(outDescr.offset[d] + outDescr.shape[d]);
-          for (size_t i : idxs) {
-            const auto& inp = matchedInputs[i];
-            boundaries[d].push_back(inp.offset[d]);
-            boundaries[d].push_back(inp.offset[d] + inp.shape[d]);
-          }
-          std::sort(boundaries[d].begin(), boundaries[d].end());
-          boundaries[d].erase(std::unique(boundaries[d].begin(), boundaries[d].end()), boundaries[d].end());
-        }
-
-        // Compute total number of cells
-        std::array<size_t, ndim> numIntervals;
-        size_t totalCells = 1;
-        for (int d = 0; d < ndim; ++d) {
-          numIntervals[d] = boundaries[d].size() - 1;
-          totalCells *= numIntervals[d];
-        }
-
-        // Iterate through all cells
-        for (size_t cellIdx = 0; cellIdx < totalCells; ++cellIdx) {
-          // Convert cellIdx to multi-dimensional index and compute cell offset/shape
-          T cellOffset, cellShape;
-          size_t remaining = cellIdx;
-          for (int d = ndim - 1; d >= 0; --d) {
-            size_t intervalIdx = remaining % numIntervals[d];
-            remaining /= numIntervals[d];
-            cellOffset[d] = boundaries[d][intervalIdx];
-            cellShape[d] = boundaries[d][intervalIdx + 1] - boundaries[d][intervalIdx];
-          }
-
-          // Check if cell is inside output
-          bool insideOutput = true;
-          for (int d = 0; d < ndim; ++d) {
-            if (cellOffset[d] < outDescr.offset[d] ||
-                cellOffset[d] + cellShape[d] > outDescr.offset[d] + outDescr.shape[d]) {
-              insideOutput = false;
-              break;
-            }
-          }
-          if (!insideOutput) {
-            continue;
-          }
-
-          // Check if cell is covered by any input
-          bool covered = false;
-          for (size_t i : idxs) {
-            const auto& inp = matchedInputs[i];
-            bool inputCovers = true;
-            for (int d = 0; d < ndim; ++d) {
-              if (cellOffset[d] < inp.offset[d] || cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
-                inputCovers = false;
-                break;
-              }
-            }
-            if (inputCovers) {
-              covered = true;
-              break;
-            }
-          }
-
-          if (!covered) {
-            gapCount++;
-            if (gapCount <= maxReportedRegions) {
-              gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
-                  fmt::to_string(fmt::join(cellOffset, ",")).c_str(),
-                  fmt::to_string(fmt::join(cellShape, ",")).c_str());
-            }
-          }
-        }
-      }
-
-      std::string msg = "moodist.compile_op_full: missing input coverage";
-      if (gapCount > maxReportedRegions) {
-        msg += fmt::sprintf(" (%zu regions, showing first %zu):", gapCount, maxReportedRegions);
-      } else {
-        msg += ":";
-      }
-      msg += gapDetails;
-      throw std::runtime_error(msg);
-    }
-  }
-
-  // Step 3: Generate Read/Copy from validated inputs
-  for (const Input& x : matchedInputs) {
-    CustomOpDescriptor::Read r;
-    r.rank = x.inputRank;
-    r.inputIndex = x.inputIndex;
-    r.outputIndex = x.outputIndex;
-    r.inputOffset = itemsize * x.inputOffset;
-    r.outputOffset = itemsize * x.outputOffset;
-    size_t num = numel(x.shape);
-    r.bytes = itemsize * num;
-
-    if (!x.outputContiguous) {
-      CustomOpDescriptor::Copy c;
-      c.index = r.outputIndex;
-      auto off = sub(x.offset, outputsPerRank[rank][x.outputIndex]->offset);
-      c.offset = {off.begin(), off.end()};
-      c.shape = {x.shape.begin(), x.shape.end()};
-      r.outputIndex = op->outputs.size() + op->outputCopies.size();
-      op->outputCopies.push_back(c);
-      r.outputOffset = 0;
-    }
-
-    op->reads.push_back(r);
-  }
-
-  // NVLink optimization: exchange reads among local ranks and compute plan
-  size_t myNodeIndex = group->rankToNodeIndex[rank];
-  auto& myNode = group->nodeRanks[myNodeIndex];
-  size_t myLocalRank = group->rankLocalRank[rank];
-  size_t numLocalRanks = myNode.size();
-
-  if (false && numLocalRanks > 1) {
-    // Exchange reads among local ranks
-    LocalReadsPacket myPacket{myLocalRank, op->reads};
-    TensorPtr myPacketTensor = serializeToTensorPtr(myPacket);
-
-    // Put to all local ranks except self
-    for (size_t lr : myNode) {
-      if (lr != rank) {
-        queues[lr]->put(TensorPtr(myPacketTensor), 0);
-      }
-    }
-
-    // Collect from all local ranks
-    IVector<IVector<CustomOpDescriptor::Read>> allLocalReads(numLocalRanks);
-    allLocalReads[myLocalRank] = op->reads;
-
-    for (size_t i = 1; i < numLocalRanks; ++i) {
-      auto [tensor, qsize] = queues[rank]->get();
-      LocalReadsPacket packet;
-      deserializeFromTensorPtr(tensor, packet);
-      allLocalReads[packet.localRankIndex] = std::move(packet.reads);
-    }
-
-    // Compute the NVLink-optimized plan (for future use and logging)
-    // Note: we keep op->reads intact for now - execution still uses it
-    computeNvlinkPlan(op.get(), allLocalReads, myNode, myLocalRank, numLocalRanks, group->rankLocalRank, rank);
-  } else {
-    // Single rank on node - all reads are direct
-    op->directReads = op->reads; // copy, don't move - execution still uses op->reads
-  }
-
-  // Log the NVLink plan
-  log.debug("compile_op plan: rank %zu, directReads=%zu, gatewayReads=%zu, localCopies=%zu, localInputCopies=%zu\n",
-      rank, op->directReads.size(), op->gatewayReads.size(), op->localCopies.size(), op->localInputCopies.size());
-  for (const auto& r : op->directReads) {
-    log.debug("  directRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.rank, r.inputIndex,
-        r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
-  }
-  for (const auto& r : op->gatewayReads) {
-    log.debug("  gatewayRead: src=%u input=%u offset=%zu bytes=%zu -> output=%u offset=%zu\n", r.sourceRank,
-        r.inputIndex, r.inputOffset, r.bytes, r.outputIndex, r.outputOffset);
-  }
-  for (const auto& lc : op->localCopies) {
-    log.debug("  localCopy: gateway=%u gatewayOut=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lc.gatewayRank,
-        lc.gatewayOutputIndex, lc.gatewayOutputOffset, lc.bytes, lc.myOutputIndex, lc.myOutputOffset);
-  }
-  for (const auto& lic : op->localInputCopies) {
-    log.debug("  localInputCopy: src=%u srcInput=%u offset=%zu bytes=%zu -> myOut=%u offset=%zu\n", lic.sourceRank,
-        lic.sourceInputIndex, lic.sourceInputOffset, lic.bytes, lic.myOutputIndex, lic.myOutputOffset);
-  }
-
-  // Barrier after queue operations
-  barrier();
-
-  for (auto& x : copyInputs) {
-    CustomOpDescriptor::Copy c;
-    c.index = x.index;
-    auto off = sub(x.offset, myInputs[x.index]->offset);
-    c.offset = {off.begin(), off.end()};
-    c.shape = {x.shape.begin(), x.shape.end()};
-    op->inputCopies.push_back(c);
-  }
-
-  // Create the CustomOpImpl with a closure that calls customOp
-  auto result = makeShared<CustomOpImpl>();
-  auto selfPtr = share(this);
-  result->call = [op, selfPtr](TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs,
-                     CUstream stream) -> SharedPtr<ApiFuture> {
-    return selfPtr->customOp(op, inputs, nInputs, outputs, nOutputs, stream);
-  };
-
-  return result;
-}
 
 // ============================================================================
 // ProcessGroupImpl::compileOpFull - compile a distributed tensor operation
@@ -3879,7 +3115,7 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   CHECK(queues.size() == size);
 
   // Build compile context
-  compile_op::CompileContext ctx;
+  compile_op::CompileContext& ctx = persistentCompileContext;
   ctx.group = group.get();
   ctx.queues = std::span<SharedPtr<Queue>>(queues.data(), queues.size());
   ctx.barrier = [this]() {
@@ -3990,37 +3226,34 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   }
 
   // Fast path: all-local, all-CUDA, no copies — skip CPU thread entirely
-  if (op->allLocal) {
-    return executeLocalOnly(
-        op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs, concurrencyIndex, stepValue, stream);
-  }
+  // if (op->allLocal) {
+  // if (true) {
+  //   return executeLocalOnly(
+  //       *op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs, concurrencyIndex, stepValue, stream);
+  // }
 
-  // Slow path: dispatch to CPU thread
+  sync(stepValue);
+
+  // for (size_t peerIndex : group->peerIndices) {
+  //   peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
+  // }
+  // for (size_t peerIndex : group->peerIndices) {
+  //   peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
+  // }
+  // freePendingIpcEvents();
+
   auto future = FutureImplSharedPtr::make();
 
-  StreamData& sd = group->getCpuStreamData(concurrencyIndex);
-  QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
-  e->task = taskCustom;
-  e->stepValue = stepValue;
-  e->concurrencyIndex = concurrencyIndex;
-  e->sd = &sd;
-  e->op = op;
-  e->future = future;
   bool anyCuda = false;
   bool anyCpu = false;
-
-  CHECK(e->inputs.empty());
-  CHECK(e->outputs.empty());
 
   for (auto& t : inputTDs) {
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
-    e->inputs.push_back(std::move(t));
   }
   for (auto& t : outputTDs) {
     anyCuda |= t->isCuda;
     anyCpu |= !t->isCuda;
-    e->outputs.push_back(std::move(t));
   }
 
   // Create and return ApiFuture early so we can store tensors in it
@@ -4038,7 +3271,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     auto td = getTensorDataFromPtr(t, group.get());
     anyCuda |= td->isCuda;
     anyCpu |= !td->isCuda;
-    e->inputs.push_back(std::move(td));
+    inputTDs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
   }
@@ -4054,20 +3287,19 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     auto td = getTensorDataFromPtr(t, group.get());
     anyCuda |= td->isCuda;
     anyCpu |= !td->isCuda;
-    e->outputs.push_back(std::move(td));
+    outputTDs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
   }
 
-  // Force CPU sync if requested by the compiled op
+  bool anyRdma = !op->rdmaEdges.empty();
+
   if (op->cpuSync) {
     anyCpu = true;
+    CHECK(anyRdma);
   }
 
-  e->anyCuda = anyCuda;
-  e->anyCpu = anyCpu;
-
-  if (anyCuda) {
+  if (anyCuda && anyRdma) {
     memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
     memFlush(stream);
   }
@@ -4076,7 +3308,65 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     future->done = 1;
   }
 
-  group->cpuThread->enqueue(e);
+  if (op->tunedKernel) {
+    EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
+    StreamGuard sg(stream, group->deviceIndex);
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+    std::shared_lock unmapLock(unmapMemoryMutex);
+
+    Vector<uintptr_t> tensorAddrs;
+    tensorAddrs.reserve(inputTDs.size() + outputTDs.size());
+    for (auto& v : inputTDs) {
+      tensorAddrs.push_back(v->data());
+    }
+    for (auto& v : outputTDs) {
+      tensorAddrs.push_back(v->data());
+    }
+
+    Vector<uintptr_t> mappedAddrs(op->remoteCudaTensorMappings.size());
+    for (size_t i : indices(mappedAddrs)) {
+      auto& m = op->remoteCudaTensorMappings[i];
+      auto& tensor =
+          m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
+      ipcMapper->requestAddress(group->getPeerIndex(m.rank), tensor->data(), tensor->bytes(), &mappedAddrs[i]);
+    }
+    ipcMapper->wait();
+
+    if (tensorAddrs.empty()) {
+      tensorAddrs.push_back(0);
+    }
+    if (mappedAddrs.empty()) {
+      mappedAddrs.push_back(0);
+    }
+
+    CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
+    std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
+    CHECK_CU(cuLaunchKernel(op->tunedKernel->function, op->tunedConfig.gridSize, 1, 1, op->tunedConfig.blockSize, 1, 1,
+        0, stream, kparams.data(), nullptr));
+  }
+
+  if (anyRdma) {
+    CHECK(!op->ibReads.empty());
+
+    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+    QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
+    e->task = taskCustom;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->op = op;
+    e->future = future;
+    e->anyCuda = anyCuda;
+    e->anyCpu = anyCpu;
+
+    CHECK(e->inputs.empty());
+    CHECK(e->outputs.empty());
+
+    e->inputs = std::move(inputTDs);
+    e->outputs = std::move(outputTDs);
+
+    group->cpuThread->enqueue(e);
+  }
 
   result->impl = std::move(future);
   // Hold original tensors alive
@@ -4092,10 +3382,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     // Capture copies of the output TensorPtrs since the outputs pointer may be invalid later
     std::vector<TensorPtr> outputsCopy(outputs, outputs + nOutputs);
     auto selfPtr = share(this);
-    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue, anyCuda,
+    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue, anyCuda, anyRdma,
                                    copyTensors = std::move(outputCopyTensors), op,
                                    outputsCopy = std::move(outputsCopy)]() {
-      if (anyCuda) {
+      if (anyCuda && anyRdma) {
         selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
         selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
       }
@@ -4112,7 +3402,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
         dst.copy_(src);
       }
     };
-  } else if (anyCuda) {
+  } else if (anyCuda && anyRdma) {
     auto selfPtr = share(this);
     result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue]() {
       selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
@@ -4127,7 +3417,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 // ProcessGroupImpl::executeLocalOnly - fast path for all-local custom ops
 // ============================================================================
 
-SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOpDescriptor> op,
+SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(const CustomOpDescriptor& op,
     std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs,
     TensorPtr* outputPtrs, size_t nOutputs, uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream) {
 
@@ -4140,353 +3430,84 @@ SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(std::shared_ptr<CustomOp
   std::shared_lock unmapLock(unmapMemoryMutex);
   sync(stepValue);
 
-  int kernelVersion = group->compileOpKernels->version;
-  bool copyWriteMode = false;
-  if (op->tunedConfig.copyWrite.has_value()) {
-    copyWriteMode = op->tunedConfig.copyWrite.value();
-  } else if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
-    copyWriteMode = !strcmp(env, "1");
-  }
-
-  // ==========================================================================
-  // Multicast path: O(1) delivery via NVSwitch multicast.
-  // Scratch buffers are permanently bound — no per-call rebinding.
-  // multicastSources/multicastDests are cleanly separated from localInputCopies.
-  // ==========================================================================
-  if ((!op->multicastSources.empty() || !op->multicastDests.empty()) &&
-      (kernelVersion == 3 ||
-       (kernelVersion == 9 && op->tunedConfig.lockstepMulticast.value_or(false)))) {
-    bool isLockstepMulticast = kernelVersion == 9 && op->tunedConfig.lockstepMulticast.value_or(false);
-
-    if (!isLockstepMulticast) {
-      // Lazy compile of multicast kernel (version 3 path)
-      if (!group->compileOpKernels->cuMulticastKernel) {
-        group->compileOpKernels->compileMulticast();
-      }
-    }
-
-    // Peer sync for collective mismatch detection
-    for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
-    }
-    for (size_t peerIndex : peerIndices) {
-      peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
-    }
-
-    freePendingIpcEvents();
-
-    // Source writes input data to multicast VA.
-    CompileOpCopyParameters params;
-    params.stepValue = stepValue;
-    params.concurrencyIndex = concurrencyIndex;
-    params.numDescriptors = 0;
-    params._pad = 0;
-
-    for (const auto& ms : op->multicastSources) {
-      if (ms.bytes == 0) {
-        continue;
-      }
-      CHECK(params.numDescriptors < kMaxCopyDescriptors);
-      auto& d = params.descriptors[params.numDescriptors++];
-      d.src = inputs[ms.sourceInputIndex]->data() + ms.sourceInputOffset;
-      d.dst = ms.mcVA;
-      d.bytes = ms.bytes;
-    }
-
-    if (params.numDescriptors > 0) {
-      std::array<void*, 1> kparams = {&params};
-      if (isLockstepMulticast) {
-        launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize,
-            params.descriptors, params.numDescriptors, stepValue, concurrencyIndex, stream);
-      } else {
-        CHECK_CU(cuLaunchKernel(group->compileOpKernels->cuMulticastKernel, group->compileOpKernels->gridSize, 1, 1,
-            group->compileOpKernels->blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
-      }
-    }
-
-    // Step M2: Copy from scratch VA to output tensors.
-    // Data has arrived in each peer's scratch buffer via the multicast.
-    for (const auto& md : op->multicastDests) {
-      if (md.bytes == 0) {
-        continue;
-      }
-      CHECK(md.myOutputIndex < outputs.size());
-      uintptr_t dst = outputs[md.myOutputIndex]->data() + md.myOutputOffset;
-      uintptr_t src = md.scratchVA;
-      CHECK_CU(cuMemcpyDtoDAsync(dst, src, md.bytes, stream));
-    }
-
-    // Self-copies remaining in localInputCopies (sourceRank == rank).
-    for (const auto& lic : op->localInputCopies) {
-      if (lic.sourceRank != rank || lic.bytes == 0) {
-        continue;
-      }
-      CHECK(lic.myOutputIndex < outputs.size());
-      CHECK(lic.sourceInputIndex < inputs.size());
-      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
-      if (dst != src) {
-        CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
-      }
-    }
-
-    // Step M4: Return result
-    auto result = makeShared<ApiFuture>();
-    auto future = FutureImplSharedPtr::make();
-    future->done = 1;
-    result->impl = std::move(future);
-
-    for (size_t i = 0; i < nInputs; ++i) {
-      result->holdTensors.push_back(inputPtrs[i]);
-    }
-    for (size_t i = 0; i < nOutputs; ++i) {
-      result->holdTensors.push_back(outputPtrs[i]);
-    }
-
-    return result;
-  }
-
-  // ==========================================================================
-  // Copy path: O(N²) peer copies via kernel or cuMemcpy
-  // ==========================================================================
-
-  // Step 1: Self-copies (v0 path only — kernel path includes them in the launch)
-  if (kernelVersion == 0) {
-    for (const auto& lic : op->localInputCopies) {
-      if (lic.sourceRank != rank) {
-        continue;
-      }
-      CHECK(lic.myOutputIndex < outputs.size());
-      CHECK(lic.sourceInputIndex < inputs.size());
-      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
-      if (dst != src && lic.bytes > 0) {
-        CHECK_CU(cuMemcpyDtoDAsync(dst, src, lic.bytes, stream));
-      }
-    }
-  }
-
-  // Step 2: IPC-map addresses for peers
-  // Read mode: map my input addresses so peers can read from me
-  // Write mode: map my output addresses so peers can write to me
-  Vector<uintptr_t> mappedAddrs;
-  if (copyWriteMode) {
-    // Map output addresses for each localInputCopy (peers will write here)
-    mappedAddrs.resize(op->localInputCopies.size());
-    for (size_t i : indices(op->localInputCopies)) {
-      const auto& lic = op->localInputCopies[i];
-      if (lic.sourceRank == rank) {
-        continue;
-      }
-      size_t peerIndex = group->getPeerIndex(lic.sourceRank);
-      CHECK(lic.myOutputIndex < outputs.size());
-      uintptr_t myAddr = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-      ipcMapper->requestAddress(peerIndex, myAddr, lic.bytes, &mappedAddrs[i]);
-    }
-  } else {
-    // Map input addresses for each localInputProvide (peers will read from me)
-    mappedAddrs.resize(op->localInputProvides.size());
-    for (size_t i : indices(op->localInputProvides)) {
-      const auto& lip = op->localInputProvides[i];
-      size_t peerIndex = group->getPeerIndex(lip.readerRank);
-      CHECK(lip.myInputIndex < inputs.size());
-      uintptr_t myAddr = inputs[lip.myInputIndex]->data() + lip.inputOffset;
-      ipcMapper->requestAddress(peerIndex, myAddr, lip.bytes, &mappedAddrs[i]);
-    }
-  }
-  ipcMapper->wait();
-
-  // Step 3: Exchange addresses via peerWriteDyn + ipcMapper push/pop
-  // Signal and wait all peers (each pushes/pops a sync pair on the FIFO)
   for (size_t peerIndex : peerIndices) {
     peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
   }
+
+  Vector<uintptr_t> inputAddrs;
+  for (auto& v : inputs) {
+    inputAddrs.push_back(v->data());
+  }
+  for (auto& v : outputs) {
+    inputAddrs.push_back(v->data());
+  }
+
+  Vector<uintptr_t> mappedAddrs(op.remoteCudaTensorMappings.size());
+  for (size_t i : indices(mappedAddrs)) {
+    auto& m = op.remoteCudaTensorMappings[i];
+    auto& tensor =
+        m.tensorIndex >= inputs.size() ? outputs.at(m.tensorIndex - inputs.size()) : inputs.at(m.tensorIndex);
+    size_t peerIndex = group->getPeerIndex(m.rank);
+    ipcMapper->requestAddress(peerIndex, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
+  }
+  ipcMapper->wait();
+
   for (size_t peerIndex : peerIndices) {
     peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
   }
 
-  // Read mode: source pushes input addrs, reader pops them.
-  // Write mode: reader pushes output addrs, writer pops them.
-  // In both cases, the 1:1 per-peer correspondence is preserved.
-  Vector<uintptr_t> remoteAddrs; // srcAddrs in read mode, dstAddrs in write mode
-
-  if (copyWriteMode) {
-    // Writer pops destination addresses from localInputProvides.
-    // Reader pushes output addresses from localInputCopies.
-    Vector<Vector<size_t>> copiesByPeer(group->size); // push side (reader)
-    for (size_t i : indices(op->localInputCopies)) {
-      if (op->localInputCopies[i].sourceRank == rank) {
-        continue;
-      }
-      size_t peerIndex = group->getPeerIndex(op->localInputCopies[i].sourceRank);
-      copiesByPeer[peerIndex].push_back(i);
-    }
-
-    Vector<Vector<size_t>> providesByPeer(group->size); // pop side (writer)
-    for (size_t i : indices(op->localInputProvides)) {
-      size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
-      providesByPeer[peerIndex].push_back(i);
-    }
-
-    remoteAddrs.resize(op->localInputProvides.size());
-    Vector<size_t> pushProg(group->size);
-    Vector<size_t> popProg(group->size);
-
-    for (bool done = false; !done;) {
-      done = true;
-      // Reader pushes its mapped output addresses
-      for (size_t peerIndex : peerIndices) {
-        if (pushProg[peerIndex] < copiesByPeer[peerIndex].size()) {
-          size_t i = copiesByPeer[peerIndex][pushProg[peerIndex]++];
-          ipcMapper->push(peerIndex, mappedAddrs[i]);
-          done = false;
-        }
-      }
-      // Writer pops destination addresses
-      for (size_t peerIndex : peerIndices) {
-        if (popProg[peerIndex] < providesByPeer[peerIndex].size()) {
-          size_t i = providesByPeer[peerIndex][popProg[peerIndex]++];
-          remoteAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
-          done = false;
-        }
-      }
-    }
-  } else {
-    // Source pushes input addresses from localInputProvides.
-    // Reader pops source addresses from localInputCopies.
-    Vector<Vector<size_t>> providesByPeer(group->size); // push side (source)
-    for (size_t i : indices(op->localInputProvides)) {
-      size_t peerIndex = group->getPeerIndex(op->localInputProvides[i].readerRank);
-      providesByPeer[peerIndex].push_back(i);
-    }
-
-    Vector<Vector<size_t>> copiesByPeer(group->size); // pop side (reader)
-    for (size_t i : indices(op->localInputCopies)) {
-      if (op->localInputCopies[i].sourceRank == rank) {
-        continue;
-      }
-      size_t peerIndex = group->getPeerIndex(op->localInputCopies[i].sourceRank);
-      copiesByPeer[peerIndex].push_back(i);
-    }
-
-    remoteAddrs.resize(op->localInputCopies.size());
-    Vector<size_t> pushProg(group->size);
-    Vector<size_t> popProg(group->size);
-
-    for (bool done = false; !done;) {
-      done = true;
-      for (size_t peerIndex : peerIndices) {
-        if (pushProg[peerIndex] < providesByPeer[peerIndex].size()) {
-          size_t i = providesByPeer[peerIndex][pushProg[peerIndex]++];
-          ipcMapper->push(peerIndex, mappedAddrs[i]);
-          done = false;
-        }
-      }
-      for (size_t peerIndex : peerIndices) {
-        if (popProg[peerIndex] < copiesByPeer[peerIndex].size()) {
-          size_t i = copiesByPeer[peerIndex][popProg[peerIndex]++];
-          remoteAddrs[i] = ipcMapper->pop<uintptr_t>(peerIndex);
-          done = false;
-        }
-      }
-    }
-  }
-
   freePendingIpcEvents();
 
-  // Step 4: GPU copies (with synchronization)
-  if (kernelVersion > 0) {
-    // Kernel path: compile kernel if not yet done (not needed for v9 — uses per-op tuned kernels)
-    if (!group->compileOpKernels->cuCopyKernel && kernelVersion != 9) {
-      group->compileOpKernels->compile();
-    }
+  CompileOpCopyParameters params;
+  params.stepValue = stepValue;
+  params.concurrencyIndex = concurrencyIndex;
+  std::array<void*, 3> kparams = {&params, inputAddrs.data() ? inputAddrs.data() : (void*)&params,
+      mappedAddrs.data() ? mappedAddrs.data() : (void*)&params};
+  CHECK_CU(cuLaunchKernel(op.tunedKernel->function, op.tunedConfig.gridSize, 1, 1, op.tunedConfig.blockSize, 1, 1, 0,
+      stream, kparams.data(), nullptr));
 
-    // Build descriptor table (both self-copies and peer copies)
-    CopyDescriptor descriptors[kMaxCopyDescriptors];
-    uint32_t numDescriptors = 0;
+  // CopyDescriptor descriptors[kMaxCopyDescriptors];
+  // uint32_t numDescriptors = 0;
+  // std::string descrs;
 
-    // Add self-copies (same in both read and write mode)
-    for (const auto& lic : op->localInputCopies) {
-      if (lic.sourceRank != rank) {
-        continue;
-      }
-      uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-      uintptr_t src = inputs[lic.sourceInputIndex]->data() + lic.sourceInputOffset;
-      if (dst != src && lic.bytes > 0) {
-        CHECK(numDescriptors < kMaxCopyDescriptors);
-        auto& d = descriptors[numDescriptors++];
-        d.src = src;
-        d.dst = dst;
-        d.bytes = lic.bytes;
-      }
-    }
-    if (copyWriteMode) {
-      // Write mode: src=local input, dst=remote output (from remoteAddrs)
-      for (size_t i : indices(op->localInputProvides)) {
-        const auto& lip = op->localInputProvides[i];
-        if (lip.bytes > 0) {
-          CHECK(numDescriptors < kMaxCopyDescriptors);
-          auto& d = descriptors[numDescriptors++];
-          d.src = inputs[lip.myInputIndex]->data() + lip.inputOffset;
-          d.dst = remoteAddrs[i];
-          d.bytes = lip.bytes;
-        }
-      }
-    } else {
-      // Read mode: src=remote input (from remoteAddrs), dst=local output
-      for (size_t i : indices(op->localInputCopies)) {
-        const auto& lic = op->localInputCopies[i];
-        if (lic.sourceRank == rank) {
-          continue;
-        }
-        if (lic.bytes > 0) {
-          CHECK(numDescriptors < kMaxCopyDescriptors);
-          auto& d = descriptors[numDescriptors++];
-          d.src = remoteAddrs[i];
-          d.dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-          d.bytes = lic.bytes;
-        }
-      }
-    }
+  // for (size_t i : indices(templates)) {
+  //   const auto& dt = templates[i];
 
-    // Single kernel launch replaces syncPeers + copies + syncPeers
-    if (numDescriptors > 0) {
-      if (op->tunedKernel) {
-        // Use per-op auto-tuned kernel
-        launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize, descriptors,
-            numDescriptors, stepValue, concurrencyIndex, stream);
-      } else {
-        launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
-            group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
-            group->compileOpKernels->dynamicSmemBytes);
-      }
-    }
-  } else {
-    // v0: existing cuMemcpyDtoDAsync path (self-copies already done in step 1)
-    syncPeers(stream);
-    if (copyWriteMode) {
-      for (size_t i : indices(op->localInputProvides)) {
-        const auto& lip = op->localInputProvides[i];
-        if (lip.bytes > 0) {
-          CHECK_CU(
-              cuMemcpyDtoDAsync(remoteAddrs[i], inputs[lip.myInputIndex]->data() + lip.inputOffset, lip.bytes, stream));
-        }
-      }
-    } else {
-      for (size_t i : indices(op->localInputCopies)) {
-        const auto& lic = op->localInputCopies[i];
-        if (lic.sourceRank == rank) {
-          continue;
-        }
-        CHECK(lic.myOutputIndex < outputs.size());
-        uintptr_t dst = outputs[lic.myOutputIndex]->data() + lic.myOutputOffset;
-        if (lic.bytes > 0) {
-          CHECK_CU(cuMemcpyDtoDAsync(dst, remoteAddrs[i], lic.bytes, stream));
-        }
-      }
-    }
-    syncPeers(stream);
-  }
+  //   uintptr_t src, dst;
+
+  //   if (dt.srcRank == rank) {
+  //     src = (dt.srcIsOutput ? outputs : inputs)[dt.srcTensorIndex]->data() + dt.srcOffset;
+  //   } else {
+  //     src = remoteAddrs[i];
+  //   }
+
+  //   if (dt.dstRank == rank) {
+  //     dst = (dt.dstIsOutput ? outputs : inputs)[dt.dstTensorIndex]->data() + dt.dstOffset;
+  //   } else {
+  //     dst = remoteAddrs[i];
+  //   }
+
+  //   // descrs += fmt::sprintf("%zu bytes from rank %u to rank %u, ", dt.bytes, dt.srcRank, dt.dstRank);
+
+  //   CHECK(numDescriptors < kMaxCopyDescriptors);
+  //   auto& d = descriptors[numDescriptors++];
+  //   d.src = src;
+  //   d.dst = dst;
+  //   d.bytes = dt.bytes;
+  // }
+  // // log.info("rank %zu has %u descriptors: %s\n", rank, numDescriptors, descrs);
+  // //  CHECK(false);
+
+  // if (numDescriptors > 0) {
+  //   if (op->tunedKernel) {
+  //     launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize, descriptors,
+  //         numDescriptors, stepValue, concurrencyIndex, stream);
+  //   } else {
+  //     launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
+  //         group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
+  //         group->compileOpKernels->dynamicSmemBytes);
+  //   }
+  // }
 
   // Step 5: Return result — CPU-side immediately done, GPU work is on stream
   auto result = makeShared<ApiFuture>();

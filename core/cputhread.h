@@ -303,7 +303,33 @@ struct QueueEntryCallback : QueueEntry {
 
 struct CustomOpDescriptor {
   uint32_t id;
-  struct Read {
+
+  struct Node {
+    uint32_t rank;
+    uint32_t tensorIndex;
+    size_t offset;
+    bool filled;
+  };
+
+  struct Edge {
+    Vector<Node> sources;
+    Vector<Node> destinations;
+    size_t bytes;
+    uint32_t cellIndex;
+
+    template<typename X>
+    void serialize(X& x) {
+      x(sources, destinations, bytes, cellIndex);
+    }
+  };
+
+  struct Copy {
+    uint32_t index;
+    Vector<int64_t> offset;
+    Vector<int64_t> shape;
+  };
+
+  struct IbRead {
     uint32_t rank;
     uint32_t inputIndex;
     uint32_t outputIndex;
@@ -316,90 +342,45 @@ struct CustomOpDescriptor {
       x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes);
     }
   };
-  struct Copy {
-    uint32_t index;
-    IVector<int64_t> offset;
-    IVector<int64_t> shape;
+
+  Vector<Edge> rdmaEdges;
+  Vector<Edge> cudaEdges;
+
+  Vector<Copy> inputCopies;
+  Vector<Copy> outputCopies;
+
+  Vector<size_t> inputs;
+  Vector<size_t> outputs;
+
+  struct CudaTensorMapping {
+    uint32_t rank;
+    uint32_t tensorIndex;
+    size_t destinationSlot;
+    size_t stride;
   };
 
-  // NVLink optimization: gateway fetches via IB, others copy locally
-  struct GatewayRead {
-    uint32_t sourceRank;
-    uint32_t inputIndex;
-    size_t inputOffset;
-    size_t bytes;
-    uint32_t outputIndex;
-    size_t outputOffset;
-  };
+  Vector<CudaTensorMapping> remoteCudaTensorMappings;
+  Vector<CudaTensorMapping> localCudaTensorMappings;
 
-  struct LocalCopy {
-    uint32_t gatewayRank;        // global rank of gateway
-    uint32_t gatewayOutputIndex; // gateway's output tensor
-    size_t gatewayOutputOffset;
-    size_t bytes;
-    uint32_t myOutputIndex;
-    size_t myOutputOffset;
-  };
+  Vector<IbRead> ibReads;
 
-  // Copy directly from a local rank's input tensor (no IB)
-  struct LocalInputCopy {
-    uint32_t sourceRank;       // source rank (must be local)
-    uint32_t sourceInputIndex; // source's input tensor index
-    size_t sourceInputOffset;
-    size_t bytes;
-    uint32_t myOutputIndex;
-    size_t myOutputOffset;
-  };
-
-  // Reverse mapping: tells this rank which peers will read its inputs (for allLocal fast path)
-  struct LocalInputProvide {
-    uint32_t readerRank;   // Global rank that will read this input
-    uint32_t myInputIndex; // Which of my inputs they read
-    size_t inputOffset;    // Byte offset within my input
-    size_t bytes;
-  };
-
-  IVector<Read> reads;
-  IVector<Read> directReads;                     // IB reads with no local sharing
-  IVector<GatewayRead> gatewayReads;             // I fetch via IB for local group
-  IVector<LocalCopy> localCopies;                // I copy from gateway's output via NVLink
-  IVector<LocalInputCopy> localInputCopies;      // I copy from local rank's input via NVLink
-  IVector<LocalInputProvide> localInputProvides; // Peers that will read my inputs (allLocal path)
-  IVector<Copy> inputCopies;
-  IVector<Copy> outputCopies;
-
-  IVector<size_t> inputs;
-  IVector<size_t> outputs;
-
-  IVector<IVector<int64_t>> inputShapes;
-  IVector<IVector<int64_t>> outputShapes;
-  IVector<DeviceType> inputDevices;
-  IVector<DeviceType> outputDevices;
+  Vector<Vector<int64_t>> inputShapes;
+  Vector<Vector<int64_t>> outputShapes;
+  Vector<DeviceType> inputDevices;
+  Vector<DeviceType> outputDevices;
   DType dtype;
   bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
 
-  // Multicast: source writes input data to mcVA, NVSwitch delivers to all peers' scratch buffers.
-  // Source entries: one per multicast region this rank created (kernel writes input → mcVA).
-  struct MulticastSource {
-    uint32_t sourceInputIndex;
-    size_t sourceInputOffset;
-    size_t bytes;
-    CUdeviceptr mcVA = 0;
-  };
-  // Destination entries: one per copy served by multicast (kernel copies scratchVA → output).
-  struct MulticastDest {
-    uint32_t sourceRank;
-    uint32_t sourceInputIndex;
-    size_t sourceInputOffset;
-    size_t bytes;
-    uint32_t myOutputIndex;
-    size_t myOutputOffset;
-    CUdeviceptr scratchVA = 0;
-    size_t allocSize = 0;
-  };
-  IVector<MulticastSource> multicastSources;
-  IVector<MulticastDest> multicastDests;
+  // Per-descriptor signal buffer addresses (stable for op lifetime, baked into PTX).
+  // signalBufferAddr: this rank's buffer base (for polling/waiting).
+  // peerSignalBufferAddrs[peerIndex]: peer's buffer base (for writing signals).
+  // signalBufferItemBytes: bytes per concurrency slot (gridSize * numDescriptors * 4, rounded up).
+  // signalBufferNumDescriptors: max descriptor count across all ranks (indexing stride).
+  uintptr_t signalBufferAddr = 0;
+  std::array<uintptr_t, 8> peerSignalBufferAddrs{};
+  size_t signalBufferItemBytes = 0;
+  uint32_t signalBufferNumDescriptors = 0;
 
   // Per-op compiled copy kernel (auto-tuned for this op's copy sizes).
   // When set, executeLocalOnly uses this instead of the group-wide CompileOpKernels.

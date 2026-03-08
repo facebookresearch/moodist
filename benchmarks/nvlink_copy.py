@@ -51,7 +51,7 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
 
     import moodist
     from moodist import TensorRegion
-    dist.init_process_group(backend="moodist")
+    dist.init_process_group(backend="moodist", init_method="moodist://%s:%s" % (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"]), rank=rank, world_size=world_size)
     moodist.enable_cuda_allocator()
 
     if rank == 0:
@@ -103,9 +103,12 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
         run = lambda: op([input_tensor], output_tensors).wait()
 
         # Warmup
-        for _ in range(warmup):
+        for iteration in range(warmup):
             for t in output_tensors:
-                t.zero_()
+                t.fill_(42)
+            oi = input_tensor
+            input_tensor = input_tensor.clone()
+            oi.fill_(500)
             run()
             output_tensors = [o.clone() for o in output_tensors]
 
@@ -120,7 +123,7 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
                     expected = r + 1.0
                     if not torch.all(chunk == expected):
                         bad = (chunk != expected).sum().item()
-                        print(f"RANK {rank}: CORRECTNESS FAILURE at size "
+                        print(f"RANK {rank}: iteration {iteration} CORRECTNESS FAILURE at size "
                             f"{format_size(size)}, chunk {r}: "
                             f"{bad}/{numel} elements wrong", file=sys.stderr)
                         #sys.exit(1)
@@ -133,7 +136,7 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
                     expected = r + 1.0
                     if not torch.all(chunk == expected):
                         bad = (chunk != expected).sum().item()
-                        print(f"RANK {rank}: CORRECTNESS FAILURE at size "
+                        print(f"RANK {rank}: iteration {iteration} CORRECTNESS FAILURE at size "
                             f"{format_size(size)}, chunk {r}: "
                             f"{bad}/{numel} elements wrong", file=sys.stderr)
                         #sys.exit(1)
@@ -166,13 +169,14 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
 
         for i in range(iterations):
             start_events[i].record()
-            run()
+            for _ in range(16):
+                run()
             end_events[i].record()
 
         torch.cuda.synchronize()
 
         times_us = sorted(
-            s.elapsed_time(e) * 1000
+            s.elapsed_time(e) * 1000 / 16
             for s, e in zip(start_events, end_events))
         n = len(times_us)
         median = times_us[n // 2]

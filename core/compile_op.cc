@@ -13,8 +13,8 @@
 // Phase 7: Multicast setup (source-side analysis, create per-region multicast objects)
 
 #include "compile_op.h"
-#include "codegen.h"
 #include "compile_op_kernel.h"
+#include "cputhread.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "ptx_codegen.h"
@@ -22,6 +22,7 @@
 #include "serialization.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -32,30 +33,6 @@ namespace moodist {
 namespace compile_op {
 
 namespace {
-
-// Helper to serialize data to a CPU TensorPtr for queue operations
-template<typename... T>
-TensorPtr serializeToTensorPtr(const T&... v) {
-  auto buffer = serializeToBuffer(v...);
-  size_t size = buffer->size();
-  // Create a 1D uint8 CPU tensor and copy data into it
-  int64_t shape = static_cast<int64_t>(size);
-  CHECK(moodist::wrapperApi.tensorEmpty != nullptr);
-  Tensor* t = moodist::wrapperApi.tensorEmpty(&shape, 1, DType::UInt8, -1);
-  CHECK(t != nullptr);
-  // Copy serialized data into tensor
-  void* tensorData = moodist::wrapperApi.tensorDataPtr(t);
-  std::memcpy(tensorData, buffer->data(), size);
-  return TensorPtr(t);
-}
-
-// Helper to deserialize from TensorPtr
-template<typename... T>
-void deserializeFromTensorPtr(const TensorPtr& tensor, T&... result) {
-  void* ptr = tensor.data_ptr();
-  size_t size = static_cast<size_t>(tensor.numel());
-  deserializeBuffer(ptr, size, result...);
-}
 
 // Helper to format Coord for logging
 std::string fmtCoord(const Coord& c) {
@@ -105,36 +82,6 @@ DeviceType parseAndValidateDevice(std::string_view device, int expectedCudaIndex
   }
   throw std::runtime_error("Invalid device string: " + std::string(device));
 }
-
-// Phase 6: entry sent from reader to source rank describing what will be read
-struct ProvideEntry {
-  uint32_t readerRank;
-  uint32_t sourceInputIndex;
-  size_t sourceInputOffset;
-  size_t bytes;
-
-  template<typename X>
-  void serialize(X& x) {
-    x(readerRank, sourceInputIndex, sourceInputOffset, bytes);
-  }
-};
-
-// Phase 7: multicast assignment sent from source rank to each reader peer.
-// Tells the reader: "your copy of (sourceInputIndex, sourceInputOffset, bytes)
-// will be delivered via multicast; here is your VA."
-struct MulticastAssignment {
-  uint32_t sourceRank;
-  uint32_t sourceInputIndex;
-  size_t sourceInputOffset;
-  size_t bytes;
-  uintptr_t scratchVA; // Peer's multicast VA (where data arrives)
-  size_t allocSize;    // Granularity-aligned buffer size
-
-  template<typename X>
-  void serialize(X& x) {
-    x(sourceRank, sourceInputIndex, sourceInputOffset, bytes, scratchVA, allocSize);
-  }
-};
 
 // ============================================================================
 // Auto-tuning infrastructure for copy kernel (depth, blockSize)
@@ -260,375 +207,324 @@ std::string formatConfig(const CopyKernelConfig& c) {
   if (c.copyWrite.has_value()) {
     s += c.copyWrite.value() ? " write" : " read";
   }
+  if (c.copyRing.has_value() && c.copyRing.value()) {
+    s += " ring";
+  }
   return s;
 }
 
-// Run the full tuning sweep for a given size category using the real
-// production kernel (with NVLink copies and barriers). All ranks in the
-// group must call this collectively with the same candidate sequence.
-// Returns the best (depth, blockSize) config.
-TuningResult tuneCopyKernel(const CompileContext& ctx, SizeCategory sizeCat) {
-  static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
-  static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
-  size_t gridSize = 8;
-  if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
-    int gs = atoi(env);
-    if (gs >= 1 && gs <= 128) {
-      gridSize = gs;
-    }
-  }
-  static constexpr int warmupIters = 50;
-  static constexpr int measuredIters = 100;
+struct CompileOpConstructor {
 
-  size_t copyBytes = representativeSize(sizeCat);
-  size_t rank = ctx.group->rank;
-  size_t size = ctx.group->size;
-  CUdevice cuDevice = ctx.group->cuDevice;
-  IpcMapper* ipcMapper = &*ctx.group->ipcMapper;
+  CompileContext& ctx;
 
-  bool verbose = false;
-  if (auto* env = std::getenv("MOODIST_TUNE_VERBOSE")) {
-    verbose = !strcmp(env, "1");
-  }
+  const Group* group = ctx.group;
 
-  if (verbose) {
-    log.info("tuning copy kernel for size category %d (%zu bytes), rank %zu/%zu...\n", static_cast<int>(sizeCat),
-        copyBytes, rank, size);
-  }
+  const size_t rank = group->rank;
+  const size_t size = group->size;
 
-  // Allocate synthetic src and dst buffers
-  CUdeviceptr syntheticSrc = 0, syntheticDst = 0;
-  CHECK_CU(cuMemAlloc(&syntheticSrc, copyBytes));
-  CHECK_CU(cuMemAlloc(&syntheticDst, copyBytes));
-  CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
-  CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
-
-  // Build the copy descriptor.
-  // Multi-GPU: IPC-map our syntheticSrc for the reader peer (ring: rank+1 reads from rank).
-  // Single-GPU: local-to-local copy.
-  CopyDescriptor desc;
-  desc.bytes = static_cast<uint32_t>(copyBytes);
-
-  if (size > 1) {
-    // Ring pattern: rank provides syntheticSrc to (rank+1)%size
-    size_t readerRank = (rank + 1) % size;
-    size_t sourceRank = (rank + size - 1) % size;
-    size_t readerPeerIndex = ctx.group->getPeerIndex(readerRank);
-    size_t sourcePeerIndex = ctx.group->getPeerIndex(sourceRank);
-
-    // IPC-map our syntheticSrc so the reader peer can access it
-    uintptr_t mappedAddr = 0;
-    ipcMapper->requestAddress(readerPeerIndex, syntheticSrc, copyBytes, &mappedAddr);
-    ipcMapper->wait();
-
-    // Barrier: all ranks have finished IPC mapping
-    ctx.barrier();
-
-    // Exchange addresses: push our mapped addr to reader, pop source's addr
-    ipcMapper->push(readerPeerIndex, mappedAddr);
-    uintptr_t remoteSrcAddr = ipcMapper->pop<uintptr_t>(sourcePeerIndex);
-
-    desc.src = remoteSrcAddr;
-    desc.dst = syntheticDst;
-  } else {
-    // Single-GPU: local copy
-    desc.src = syntheticSrc;
-    desc.dst = syntheticDst;
-  }
-
-  // Create stream and events for timing
-  CUstream stream = nullptr;
-  CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
-  Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
-
-  auto createEvents = [&](int count) {
-    while ((int)events.size() < count * 2) {
-      CUevent e = nullptr;
-      CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
-      events.push_back(e);
-    }
-  };
-
-  // stepValue counter — starts at 1, increments per launch.
-  // All ranks iterate the same candidates so barriers stay in sync.
-  uint32_t stepValue = 1;
-
-  TuningResult best;
-  best.config.gridSize = gridSize;
-
-  auto tuneStart = std::chrono::steady_clock::now();
-
-  // Generate a single source with all kernel variants, compile once.
-  {
-    codegen::BuilderScope scope;
-    emitPreamble();
-    for (int depth : depths) {
-      for (size_t bs : blockSizes) {
-        emitCopyFunction(fmt::sprintf("copy_d%d_b%zu", depth, bs).c_str(), bs, depth);
-      }
-    }
-    codegen::emit("} // namespace");
-    codegen::emitBlank();
-    for (int depth : depths) {
-      for (size_t bs : blockSizes) {
-        emitMainKernel(ctx.group, gridSize, bs, fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs).c_str(),
-            fmt::sprintf("copy_d%d_b%zu", depth, bs).c_str());
-        codegen::emitBlank();
-      }
-    }
-    std::string source = scope.finalize();
-
-    CompiledModule module = CompiledModule::compile(source, cuDevice);
-
-    for (int depth : depths) {
-      for (size_t bs : blockSizes) {
-        auto name = fmt::sprintf("compile_op_copy_d%d_b%zu", depth, bs);
-        CUfunction fn = module.getFunction(name.c_str());
-
-        // Warmup
-        for (int i = 0; i < warmupIters; i++) {
-          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-        }
-        CHECK_CU(cuStreamSynchronize(stream));
-
-        // Measured runs: record all events without synchronizing
-        createEvents(measuredIters);
-        for (int iter = 0; iter < measuredIters; iter++) {
-          CHECK_CU(cuEventRecord(events[iter * 2], stream));
-          launchCopyKernel(fn, gridSize, bs, &desc, 1, stepValue++, 0, stream);
-          CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
-        }
-        CHECK_CU(cuStreamSynchronize(stream));
-
-        // Query elapsed times
-        float bestMs = INFINITY;
-        for (int iter = 0; iter < measuredIters; iter++) {
-          float ms = 0.0f;
-          CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
-          if (ms < bestMs) {
-            bestMs = ms;
-          }
-        }
-
-        if (verbose) {
-          log.info("  depth=%d blockSize=%zu -> %.3f ms\n", depth, bs, bestMs);
-        }
-
-        if (bestMs < best.ms) {
-          best.ms = bestMs;
-          best.config.depth = depth;
-          best.config.blockSize = bs;
-        }
-      }
-    }
-  }
-
-  // Cleanup
-  for (auto& e : events) {
-    cuEventDestroy(e);
-  }
-  cuStreamDestroy(stream);
-  cuMemFree(syntheticDst);
-  cuMemFree(syntheticSrc);
-
-  double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("tuning complete: best depth=%d blockSize=%zu (%.3f ms) in %.1fs\n", best.config.depth.value(),
-      best.config.blockSize, best.ms, elapsed);
-
-  return best;
-}
-
-// V9 variant: same tuning sweep but using PTX generation + JIT per variant
-// instead of codegen DSL + single NVRTC compilation.
-TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
-  static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
-  static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
-  size_t gridSize = 8;
-  if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
-    int gs = atoi(env);
-    if (gs >= 1 && gs <= 128) {
-      gridSize = gs;
-    }
-  }
-  static constexpr int warmupIters = 2;
-  static constexpr int measuredIters = 6;
-
-  size_t copyBytes = representativeSize(sizeCat);
-  size_t rank = ctx.group->rank;
-  size_t size = ctx.group->size;
-  CUdevice cuDevice = ctx.group->cuDevice;
-  IpcMapper* ipcMapper = &*ctx.group->ipcMapper;
-
-  bool verbose = false;
-  if (auto* env = std::getenv("MOODIST_TUNE_VERBOSE")) {
-    verbose = !strcmp(env, "1");
-  }
-
-  if (verbose) {
-    log.info("tuning v9 copy kernel for size category %d (%zu bytes), rank %zu/%zu...\n", static_cast<int>(sizeCat),
-        copyBytes, rank, size);
-  }
-
-  // Get compute target for PTX generation
-  int computeMajor = 0, computeMinor = 0;
-  CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
-  CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
-  const char* target = computeTarget(computeMajor, computeMinor);
-
-  // Allocate synthetic src and dst buffers
-  CUdeviceptr syntheticSrc = 0, syntheticDst = 0;
-  CHECK_CU(cuMemAlloc(&syntheticSrc, copyBytes));
-  CHECK_CU(cuMemAlloc(&syntheticDst, copyBytes));
-  CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
-  CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
-
-  // Build the copy descriptor
-  CopyDescriptor desc;
-  desc.bytes = static_cast<uint32_t>(copyBytes);
-
-  // Set up IPC mappings for both read and write directions
-  uintptr_t remoteSrcAddr = 0; // for read mode: remote peer's src buffer
-  uintptr_t remoteDstAddr = 0; // for write mode: remote peer's dst buffer
-
-  if (size > 1) {
-    size_t readerRank = (rank + 1) % size;
-    size_t sourceRank = (rank + size - 1) % size;
-    size_t readerPeerIndex = ctx.group->getPeerIndex(readerRank);
-    size_t sourcePeerIndex = ctx.group->getPeerIndex(sourceRank);
-
-    // Map src for read mode (reader pulls from our src)
-    uintptr_t mappedSrcAddr = 0;
-    ipcMapper->requestAddress(readerPeerIndex, syntheticSrc, copyBytes, &mappedSrcAddr);
-    ipcMapper->wait();
-
-    // Map dst for write mode (source pushes to our dst)
-    uintptr_t mappedDstAddr = 0;
-    ipcMapper->requestAddress(sourcePeerIndex, syntheticDst, copyBytes, &mappedDstAddr);
-    ipcMapper->wait();
-
-    ctx.barrier();
-
-    // Exchange read-mode addresses: push our src to reader, pop source's src
-    ipcMapper->push(readerPeerIndex, mappedSrcAddr);
-    remoteSrcAddr = ipcMapper->pop<uintptr_t>(sourcePeerIndex);
-
-    // Exchange write-mode addresses: push our dst to source, pop reader's dst
-    ipcMapper->push(sourcePeerIndex, mappedDstAddr);
-    remoteDstAddr = ipcMapper->pop<uintptr_t>(readerPeerIndex);
-
-    desc.src = remoteSrcAddr;
-    desc.dst = syntheticDst;
-  } else {
-    desc.src = syntheticSrc;
-    desc.dst = syntheticDst;
-  }
-
-  // Create stream and events for timing
-  CUstream stream = nullptr;
-  CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
-  Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
-
-  auto createEvents = [&](int count) {
-    while ((int)events.size() < count * 2) {
-      CUevent e = nullptr;
-      CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
-      events.push_back(e);
-    }
-  };
-
-  uint32_t stepValue = 1;
-
-  TuningResult best;
-  best.config.gridSize = gridSize;
-
-  auto tuneStart = std::chrono::steady_clock::now();
-
-  // Build candidate configs
-  Vector<CopyKernelConfig> candidates;
-
-  // Read env vars for fixed-value settings (applied to all relevant candidates)
-  int envWarppipeDepth = 0;
-  if (auto* env = std::getenv("MOODIST_WARPPIPE_DEPTH")) {
-    int d = atoi(env);
-    if (d >= 0 && d <= 32) {
-      envWarppipeDepth = d;
-    }
-  }
-
-  // Register pipeline variants: loadOp × depth × blockSize
-  static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
-  for (const char* loadOp : loadOps) {
-    for (int depth : depths) {
-      for (size_t bs : blockSizes) {
-        candidates.push_back(CopyKernelConfig::reg(depth, bs, gridSize, loadOp));
-      }
-    }
-  }
-
-  // Bulk copy engine variants: blockSize × chunkSize × dmaMode × bulkMode
-  {
-    int maxSmem = 0;
-    CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
-    // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
-    static constexpr size_t chunkSizes[] = {114688};
-    static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
-    for (size_t chunk : chunkSizes) {
-      for (size_t bs : bulkBlockSizes) {
-        size_t numWarps = bs / 32;
-
-        // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
-        {
-          size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
-          if (totalSmem <= (size_t)maxSmem) {
-            // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
-            if (chunk % (numWarps * 16) == 0) {
-              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, false));
-              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, true));
-            }
-            // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
-            if (chunk % (bs * 16) == 0) {
-              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, false));
-              candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, true));
+  void constructCudaTensorMappings(CustomOpDescriptor& op) {
+    Vector<uint32_t> nranks;
+    for (auto& v : op.cudaEdges) {
+      Vector<uint32_t> tensors;
+      Vector<uint32_t> ranks;
+      for (auto& l : {v.sources, v.destinations}) {
+        for (auto& x : l) {
+          if (x.rank == rank) {
+            tensors.push_back(x.tensorIndex);
+          } else {
+            ranks.push_back(x.rank);
+            if (std::ranges::find(nranks, x.rank) == nranks.end()) {
+              nranks.push_back(x.rank);
             }
           }
         }
+      }
+      for (uint32_t t : tensors) {
+        for (uint32_t r : ranks) {
+          bool found = false;
+          for (auto& v : op.remoteCudaTensorMappings) {
+            if (v.rank == r && v.tensorIndex == t) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            op.remoteCudaTensorMappings.emplace_back();
+            auto& v = op.remoteCudaTensorMappings.back();
+            v.rank = r;
+            v.tensorIndex = t;
+            v.destinationSlot = -1;
+            v.stride = 0;
+          }
+        }
+      }
+    }
+    for (uint32_t rank : nranks) {
+      Vector<uint32_t> c;
+      for (auto& x : op.remoteCudaTensorMappings) {
+        if (x.rank == rank) {
+          c.push_back(x.tensorIndex);
+        }
+      }
+      ctx.send(rank, c);
+    }
+    Vector<CustomOpDescriptor::CudaTensorMapping> localSlots;
+    for (uint32_t rank : nranks) {
+      Vector<uint32_t> c;
+      ctx.receive(rank, c);
+      size_t offset = localSlots.size();
+      for (uint32_t id : c) {
+        CustomOpDescriptor::CudaTensorMapping x;
+        x.rank = rank;
+        x.tensorIndex = id;
+        x.destinationSlot = localSlots.size();
+        x.stride = 0;
+        localSlots.push_back(x);
+      }
+      ctx.send(rank, offset, c.size());
+    }
+    for (uint32_t rank : nranks) {
+      size_t offset;
+      size_t n;
+      ctx.receive(rank, offset, n);
+      for (auto& x : op.remoteCudaTensorMappings) {
+        if (x.rank == rank) {
+          x.destinationSlot = offset++;
+          --n;
+        }
+      }
+      CHECK(n == 0);
+    }
+    op.localCudaTensorMappings = localSlots;
+    for (uint32_t rank : nranks) {
+      ctx.send(rank, localSlots.size());
+    }
+    for (uint32_t rank : nranks) {
+      size_t n;
+      ctx.receive(rank, n);
+      for (auto& x : op.remoteCudaTensorMappings) {
+        if (x.rank == rank) {
+          x.stride = n;
+        }
+      }
+    }
+    for (auto& x : op.remoteCudaTensorMappings) {
+      CHECK(x.stride != 0);
+    }
 
-        // Warppipe: total smem = chunkSize + numWarps * 8
-        // Warppipe uses single-lane DMA (warp leader always), so no dmaMode sweep.
-        // stageChunk = chunk/numWarps must divide cleanly for 16-byte aligned DMAs.
-        {
-          size_t totalSmem = chunk + numWarps * 8;
-          if (totalSmem <= (size_t)maxSmem && (chunk * 2) % (numWarps * 1024) == 0) {
-            static constexpr int pipeDepths[] = {1, 2, 4, 8, 16};
-            // static constexpr int pipeDepths[] = {1};
-            for (int depth : pipeDepths) {
-              if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
-                candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth));
+    for (size_t i : indices(op.localCudaTensorMappings)) {
+      auto& v = op.localCudaTensorMappings[i];
+      log.info(" local slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
+    }
+    for (size_t i : indices(op.remoteCudaTensorMappings)) {
+      auto& v = op.remoteCudaTensorMappings[i];
+      log.info(" remote slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
+    }
+  }
+
+  TuningResult tuneCopyKernel(CompileContext& ctx, SizeCategory sizeCat) {
+    static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
+    static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
+    size_t gridSize = 8;
+    if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
+      int gs = atoi(env);
+      if (gs >= 1 && gs <= 128) {
+        gridSize = gs;
+      }
+    }
+    static constexpr int warmupIters = 2;
+    static constexpr int measuredIters = 6;
+
+    const Group* group = ctx.group;
+
+    const size_t copyBytes = representativeSize(sizeCat);
+    const size_t rank = group->rank;
+    const size_t size = group->size;
+    CUdevice cuDevice = group->cuDevice;
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+
+    bool verbose = false;
+    if (auto* env = std::getenv("MOODIST_TUNE_VERBOSE")) {
+      verbose = !strcmp(env, "1");
+    }
+
+    if (verbose) {
+      log.info("tuning copy kernel for size category %d (%zu bytes), rank %zu/%zu...\n", static_cast<int>(sizeCat),
+          copyBytes, rank, size);
+    }
+
+    // Get compute target for PTX generation
+    int computeMajor = 0, computeMinor = 0;
+    CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+    CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+    const char* target = computeTarget(computeMajor, computeMinor);
+
+    // Allocate synthetic src and dst buffers
+    CUdeviceptr syntheticSrc = 0, syntheticDst = 0;
+    CHECK_CU(cuMemAlloc(&syntheticSrc, copyBytes));
+    CHECK_CU(cuMemAlloc(&syntheticDst, copyBytes));
+    CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
+    CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
+
+    CustomOpDescriptor op;
+    CustomOpDescriptor::Edge edge1;
+    edge1.sources.emplace_back(rank, 0, 0, true);
+    edge1.destinations.emplace_back((rank + 1) % size, 1, 0, false);
+    edge1.bytes = copyBytes;
+    edge1.cellIndex = 0;
+    CustomOpDescriptor::Edge edge2;
+    edge2.sources.emplace_back((rank + size - 1) % size, 0, 0, true);
+    edge2.destinations.emplace_back(rank, 1, 0, false);
+    edge2.bytes = copyBytes;
+    edge2.cellIndex = 0;
+
+    op.cudaEdges.push_back(edge1);
+    if (size != 1) {
+      op.cudaEdges.push_back(edge2);
+    }
+
+    for (size_t i : indices(op.cudaEdges)) {
+      const auto& e = op.cudaEdges[i];
+      std::string srcStr, dstStr;
+      for (const auto& s : e.sources) {
+        if (!srcStr.empty()) {
+          srcStr += ", ";
+        }
+        srcStr += fmt::sprintf("r%u:t%u+%zu", s.rank, s.tensorIndex, s.offset);
+      }
+      for (const auto& d : e.destinations) {
+        if (!dstStr.empty()) {
+          dstStr += ", ";
+        }
+        dstStr += fmt::sprintf("r%u:t%u+%zu", d.rank, d.tensorIndex, d.offset);
+      }
+      log.info(" tuning cudaEdge[%zu]: %zuB cell=%u [%s] -> [%s]\n", i, e.bytes, e.cellIndex, srcStr, dstStr);
+    }
+
+    op.inputs.push_back(copyBytes);
+    op.outputs.push_back(copyBytes);
+
+    constructCudaTensorMappings(op);
+
+    Vector<uintptr_t> tensors;
+    tensors.push_back(syntheticSrc);
+    tensors.push_back(syntheticDst);
+
+    Vector<uintptr_t> mappedAddrs(op.remoteCudaTensorMappings.size());
+    for (size_t i : indices(mappedAddrs)) {
+      auto& m = op.remoteCudaTensorMappings[i];
+      size_t peerIndex = group->getPeerIndex(m.rank);
+      ipcMapper->requestAddress(peerIndex, tensors.at(m.tensorIndex), copyBytes, &mappedAddrs[i]);
+    }
+    ipcMapper->wait();
+
+    // Create stream and events for timing
+    CUstream stream = nullptr;
+    CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
+    Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
+
+    auto createEvents = [&](int count) {
+      while ((int)events.size() < count * 2) {
+        CUevent e = nullptr;
+        CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
+        events.push_back(e);
+      }
+    };
+
+    uint32_t stepValue = 1;
+
+    TuningResult best;
+    best.config.gridSize = gridSize;
+
+    auto tuneStart = std::chrono::steady_clock::now();
+
+    // Build candidate configs
+    Vector<CopyKernelConfig> candidates;
+
+    // Read env vars for fixed-value settings (applied to all relevant candidates)
+    int envWarppipeDepth = 0;
+    if (auto* env = std::getenv("MOODIST_WARPPIPE_DEPTH")) {
+      int d = atoi(env);
+      if (d >= 0 && d <= 32) {
+        envWarppipeDepth = d;
+      }
+    }
+
+    // Register pipeline variants: loadOp × depth × blockSize
+    static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
+    for (const char* loadOp : loadOps) {
+      for (int depth : depths) {
+        for (size_t bs : blockSizes) {
+          candidates.push_back(CopyKernelConfig::reg(depth, bs, gridSize, loadOp));
+        }
+      }
+    }
+
+    // Bulk copy engine variants: blockSize × chunkSize × dmaMode × bulkMode
+    {
+      int maxSmem = 0;
+      CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+      // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
+      static constexpr size_t chunkSizes[] = {114688};
+      static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
+      for (size_t chunk : chunkSizes) {
+        for (size_t bs : bulkBlockSizes) {
+          size_t numWarps = bs / 32;
+
+          // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
+          {
+            size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
+            if (totalSmem <= (size_t)maxSmem) {
+              // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
+              if (chunk % (numWarps * 16) == 0) {
+                candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, false));
+                candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, true));
+              }
+              // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
+              if (chunk % (bs * 16) == 0) {
+                candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, false));
+                candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, true));
               }
             }
           }
-        }
 
-        // Nbuf: single buffer + readBufs mbarriers per warp
-        {
-          if ((chunk * 2) % (numWarps * 1024) == 0) {
-            for (int rb = 2; rb <= 4; rb++) {
-              for (int wb = 0; wb <= 4; wb++) {
-                size_t totalSmem = chunk + numWarps * rb * 8;
-                if (totalSmem <= (size_t)maxSmem) {
-                  candidates.push_back(CopyKernelConfig::nbuf(bs, gridSize, chunk * 2, rb, wb));
+          // Warppipe: total smem = chunkSize + numWarps * 8
+          // Warppipe uses single-lane DMA (warp leader always), so no dmaMode sweep.
+          // stageChunk = chunk/numWarps must divide cleanly for 16-byte aligned DMAs.
+          {
+            size_t totalSmem = chunk + numWarps * 8;
+            if (totalSmem <= (size_t)maxSmem && (chunk * 2) % (numWarps * 1024) == 0) {
+              static constexpr int pipeDepths[] = {1, 2, 4, 8, 16};
+              // static constexpr int pipeDepths[] = {1};
+              for (int depth : pipeDepths) {
+                if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
+                  candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth));
+                }
+              }
+            }
+          }
 
-                  if (bs >= 64) {
-                    CopyKernelConfig c;
-                    c.copyEngine = "bulk";
-                    c.blockSize = bs;
-                    c.gridSize = gridSize;
-                    c.bulkChunkSize = chunk * 2;
-                    c.bulkMode = "nbuf2";
-                    c.nbufReadCount = rb;
-                    c.nbufWriteCount = wb;
-                    c.bulkSkipWriteBack = false;
-                    candidates.push_back(c);
+          // Nbuf: single buffer + readBufs mbarriers per warp
+          {
+            if ((chunk * 2) % (numWarps * 1024) == 0) {
+              for (int rb = 2; rb <= 4; rb++) {
+                for (int wb = 0; wb <= 4; wb++) {
+                  size_t totalSmem = chunk + numWarps * rb * 8;
+                  if (totalSmem <= (size_t)maxSmem) {
+                    candidates.push_back(CopyKernelConfig::nbuf(bs, gridSize, chunk * 2, rb, wb));
+
+                    if (bs >= 64) {
+                      CopyKernelConfig c;
+                      c.copyEngine = "bulk";
+                      c.blockSize = bs;
+                      c.gridSize = gridSize;
+                      c.bulkChunkSize = chunk * 2;
+                      c.bulkMode = "nbuf2";
+                      c.nbufReadCount = rb;
+                      c.nbufWriteCount = wb;
+                      c.bulkSkipWriteBack = false;
+                      candidates.push_back(c);
+                    }
                   }
                 }
               }
@@ -636,1402 +532,1122 @@ TuningResult tuneCopyKernelV9(const CompileContext& ctx, SizeCategory sizeCat) {
           }
         }
       }
-    }
 
-    // Flexbuf: split block into read group + write group, each bulk or reg
-    {
-      static constexpr int flexNumBuffers[] = {2, 4, 8, 16, 32};
-      static constexpr int regThreadCounts[] = {32, 64, 128, 256, 512};
-      for (size_t chunk : chunkSizes) {
-        for (int numBuffers : flexNumBuffers) {
-          size_t totalSmem = chunk + numBuffers * 8;
-          if (totalSmem > (size_t)maxSmem) {
-            continue;
-          }
-          // bulk-read + bulk-write
-          // for (int readParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
-          //   for (int writeParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
-          //     candidates.push_back(CopyKernelConfig::flexbuf(
-          //         gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
-          //   }
-          // }
-          for (int readParallel : {1, 2, 4, 8, 16}) {
-            for (int writeParallel : {1, 2, 4, 8, 16}) {
-              candidates.push_back(CopyKernelConfig::flexbuf(
-                  gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
-              if (candidates.back().blockSize > 1024) {
-                candidates.pop_back();
-              }
-              // for (int p : range(6)) {
-              //   candidates.push_back(CopyKernelConfig::flexbuf(
-              //       gridSize, chunk * 2, "reg", 32 * (1 << p), readParallel, "bulk", 32, writeParallel, numBuffers));
-              //   if (candidates.back().blockSize > 1024) {
-              //     candidates.pop_back();
-              //   }
-              // }
+      // Flexbuf: split block into read group + write group, each bulk or reg
+      {
+        static constexpr int flexNumBuffers[] = {2, 4, 8, 16, 32};
+        static constexpr int regThreadCounts[] = {32, 64, 128, 256, 512};
+        for (size_t chunk : chunkSizes) {
+          for (int numBuffers : flexNumBuffers) {
+            size_t totalSmem = chunk + numBuffers * 8;
+            if (totalSmem > (size_t)maxSmem) {
+              continue;
             }
+            // bulk-read + bulk-write
+            // for (int readParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            //   for (int writeParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            //     candidates.push_back(CopyKernelConfig::flexbuf(
+            //         gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
+            //   }
+            // }
+            for (int readParallel : {1, 2, 4, 8, 16}) {
+              for (int writeParallel : {1, 2, 4, 8, 16}) {
+                candidates.push_back(CopyKernelConfig::flexbuf(
+                    gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
+                if (candidates.back().blockSize > 1024) {
+                  candidates.pop_back();
+                }
+                // for (int p : range(6)) {
+                //   candidates.push_back(CopyKernelConfig::flexbuf(
+                //       gridSize, chunk * 2, "reg", 32 * (1 << p), readParallel, "bulk", 32, writeParallel,
+                //       numBuffers));
+                //   if (candidates.back().blockSize > 1024) {
+                //     candidates.pop_back();
+                //   }
+                // }
+              }
+            }
+            // // bulk-read + reg-write
+            // for (int writeThreads : regThreadCounts) {
+            //   if (32 + writeThreads <= 1024) {
+            //     candidates.push_back(
+            //         CopyKernelConfig::flexbuf(gridSize, chunk, "bulk", 32, 1, "reg", writeThreads, 1, numBuffers));
+            //   }
+            // }
+            // // reg-read + bulk-write
+            // for (int readThreads : regThreadCounts) {
+            //   if (readThreads + 32 <= 1024) {
+            //     candidates.push_back(
+            //         CopyKernelConfig::flexbuf(gridSize, chunk, "reg", readThreads, 1, "bulk", 32, 1, numBuffers));
+            //   }
+            // }
           }
-          // // bulk-read + reg-write
-          // for (int writeThreads : regThreadCounts) {
-          //   if (32 + writeThreads <= 1024) {
-          //     candidates.push_back(
-          //         CopyKernelConfig::flexbuf(gridSize, chunk, "bulk", 32, 1, "reg", writeThreads, 1, numBuffers));
-          //   }
-          // }
-          // // reg-read + bulk-write
-          // for (int readThreads : regThreadCounts) {
-          //   if (readThreads + 32 <= 1024) {
-          //     candidates.push_back(
-          //         CopyKernelConfig::flexbuf(gridSize, chunk, "reg", readThreads, 1, "bulk", 32, 1, numBuffers));
-          //   }
-          // }
         }
       }
     }
-  }
 
-  // Lockstep candidates
-  {
-    static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
-    bool lockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
-    for (size_t bs : lockstepBlockSizes) {
-      candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
-    }
-  }
-
-  // Expand candidates into read + write variants
-  {
-    Vector<CopyKernelConfig> expanded;
-    expanded.reserve(candidates.size() * 2);
-    for (const auto& c : candidates) {
-      CopyKernelConfig read = c;
-      read.copyWrite = false;
-      expanded.push_back(read);
-      CopyKernelConfig write = c;
-      write.copyWrite = true;
-      expanded.push_back(write);
-    }
-    candidates = std::move(expanded);
-  }
-
-  // Filter candidates by env vars
-  if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
-    for (auto& c : candidates) {
-      c.bulkSkipWriteBack = true;
-    } // if (totalSmem > 48 * 1024) {
-      //   CHECK_CU(cuFuncSetAttribute(
-      //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
-      // }
-  }
-  if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                         [env](const CopyKernelConfig& c) {
-                           return strcmp(c.copyEngine, env) != 0;
-                         }),
-        candidates.end());
-  }
-  if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
-    size_t bs = atoi(env);
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                         [bs](const CopyKernelConfig& c) {
-                           return c.blockSize != bs;
-                         }),
-        candidates.end());
-  }
-  if (auto* env = std::getenv("MOODIST_BULK_MODE")) {
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                         [env](const CopyKernelConfig& c) {
-                           return c.bulkMode.has_value() && strcmp(c.bulkMode.value(), env) != 0;
-                         }),
-        candidates.end());
-  }
-  if (std::getenv("MOODIST_BULK_WRITEBACK")) {
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                         [](const CopyKernelConfig& c) {
-                           return c.bulkWriteBack.has_value() && !c.bulkWriteBack.value();
-                         }),
-        candidates.end());
-  }
-  if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
-    bool writeOnly = !strcmp(env, "1");
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                         [writeOnly](const CopyKernelConfig& c) {
-                           return c.copyWrite.value_or(false) != writeOnly;
-                         }),
-        candidates.end());
-  }
-
-  REQUIRE(!candidates.empty(), "No tuning candidates remain after env var filtering");
-
-  if (verbose) {
-    log.info("tuning v9: %zu candidates after env var filtering\n", candidates.size());
-  }
-
-  // Evaluate all candidates
-  for (const auto& cfg : candidates) {
-    // Set descriptor direction based on copyWrite
-    if (size > 1) {
-      if (cfg.copyWrite.value_or(false)) {
-        desc.src = syntheticSrc;
-        desc.dst = remoteDstAddr;
-      } else {
-        desc.src = remoteSrcAddr;
-        desc.dst = syntheticDst;
+    // Lockstep candidates
+    {
+      static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
+      bool lockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
+      for (size_t bs : lockstepBlockSizes) {
+        candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
       }
     }
-
-    auto t0 = std::chrono::steady_clock::now();
-    std::string ptx = generateCopyKernelPtx(ctx.group, cfg, target);
-    double genSec = seconds(std::chrono::steady_clock::now() - t0);
-
-    if (auto* env = std::getenv("MOODIST_DUMP_TUNE_PTX"); env && !strcmp(env, "1")) {
-      fprintf(stderr, "=== PTX for %s ===\n%s\n=== END PTX ===\n", formatConfig(cfg).c_str(), ptx.c_str());
-    }
-
-    t0 = std::chrono::steady_clock::now();
-    CUmodule variantModule = nullptr;
-    char jitErrorLog[4096] = {};
-    CUjit_option jitOpts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
-    void* jitOptVals[] = {jitErrorLog, (void*)(uintptr_t)sizeof(jitErrorLog)};
-    CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 2, jitOpts, jitOptVals);
-    double jitSec = seconds(std::chrono::steady_clock::now() - t0);
-    if (jitErr != CUDA_SUCCESS) {
-      if (verbose) {
-        log.info("  %s -> JIT failed (error %d), skipping\n", formatConfig(cfg), (int)jitErr);
-        if (jitErrorLog[0]) {
-          log.info("  ptxas: %s\n", jitErrorLog);
-        }
-      }
-      continue;
-    }
-
-    CUfunction fn = nullptr;
-    CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
-
-    // Opt in to larger shared memory if needed (bulk copy engine)
-    size_t totalSmem = 0;
-    if (!strcmp(cfg.copyEngine, "bulk")) {
-      size_t chunk = cfg.bulkChunkSize.value();
-      size_t numWarps = cfg.blockSize / 32;
-      if (!strcmp(cfg.bulkMode.value(), "warppipe")) {
-        totalSmem = chunk + numWarps * 2 * 8;
-      } else if (!strcmp(cfg.bulkMode.value(), "nbuf")) {
-        totalSmem = chunk + numWarps * cfg.nbufReadCount.value() * 8;
-      } else {
-        totalSmem = 2 * chunk + 2 * numWarps * 8;
-      }
-    } else if (!strcmp(cfg.copyEngine, "flexbuf")) {
-      totalSmem = cfg.bulkChunkSize.value() + cfg.flexNumBuffers.value() * 8;
-    } else if (!strcmp(cfg.copyEngine, "lockstep")) {
-      totalSmem = cfg.bulkChunkSize.value() + cfg.lockstepNumBuffers.value() * 8;
-    }
-    // if (totalSmem > 48 * 1024) {
-    //   log.info("totalSmem is %d\n", totalSmem);
-    //   CHECK_CU(cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+    // {
+    //   static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
+    //   for (size_t bs : lockstepBlockSizes) {
+    //     candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, false));
+    //     candidates.back().copyEngine = "lockstepg";
+    //   }
     // }
 
-    // Warmup
-    for (int i = 0; i < warmupIters; i++) {
-      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
-    }
-    CHECK_CU(cuStreamSynchronize(stream));
-
-    // Measured runs: record all events without synchronizing
-    t0 = std::chrono::steady_clock::now();
-    createEvents(measuredIters);
-    for (int iter = 0; iter < measuredIters; iter++) {
-      CHECK_CU(cuEventRecord(events[iter * 2], stream));
-      launchCopyKernel(fn, gridSize, cfg.blockSize, &desc, 1, stepValue++, 0, stream);
-      CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
-    }
-    CHECK_CU(cuStreamSynchronize(stream));
-    double measureSec = seconds(std::chrono::steady_clock::now() - t0);
-
-    // Query elapsed times
-    float bestMs = INFINITY;
-    for (int iter = 0; iter < measuredIters; iter++) {
-      float ms = 0.0f;
-      CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
-      if (ms < bestMs) {
-        bestMs = ms;
+    // Expand candidates into read + write variants, and optionally ring variants
+    {
+      Vector<CopyKernelConfig> expanded;
+      expanded.reserve(candidates.size() * 4);
+      for (const auto& c : candidates) {
+        CopyKernelConfig read = c;
+        read.copyWrite = false;
+        expanded.push_back(read);
+        CopyKernelConfig write = c;
+        write.copyWrite = true;
+        expanded.push_back(write);
+        CopyKernelConfig readRing = c;
+        readRing.copyWrite = false;
+        readRing.copyRing = true;
+        expanded.push_back(readRing);
+        CopyKernelConfig writeRing = c;
+        writeRing.copyWrite = true;
+        writeRing.copyRing = true;
+        expanded.push_back(writeRing);
       }
+      candidates = std::move(expanded);
     }
+
+    // Filter candidates by env vars
+    if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
+      for (auto& c : candidates) {
+        c.bulkSkipWriteBack = true;
+      } // if (totalSmem > 48 * 1024) {
+        //   CHECK_CU(cuFuncSetAttribute(
+        //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
+        // }
+    }
+    if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [env](const CopyKernelConfig& c) {
+                             return strcmp(c.copyEngine, env) != 0;
+                           }),
+          candidates.end());
+    }
+    if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
+      size_t bs = atoi(env);
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [bs](const CopyKernelConfig& c) {
+                             return c.blockSize != bs;
+                           }),
+          candidates.end());
+    }
+    if (auto* env = std::getenv("MOODIST_BULK_MODE")) {
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [env](const CopyKernelConfig& c) {
+                             return c.bulkMode.has_value() && strcmp(c.bulkMode.value(), env) != 0;
+                           }),
+          candidates.end());
+    }
+    if (std::getenv("MOODIST_BULK_WRITEBACK")) {
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [](const CopyKernelConfig& c) {
+                             return c.bulkWriteBack.has_value() && !c.bulkWriteBack.value();
+                           }),
+          candidates.end());
+    }
+    if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
+      bool writeOnly = !strcmp(env, "1");
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [writeOnly](const CopyKernelConfig& c) {
+                             return c.copyWrite.value_or(false) != writeOnly;
+                           }),
+          candidates.end());
+    }
+    if (auto* env = std::getenv("MOODIST_COPY_RING")) {
+      bool ringOnly = !strcmp(env, "1");
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                           [ringOnly](const CopyKernelConfig& c) {
+                             return c.copyRing.value_or(false) != ringOnly;
+                           }),
+          candidates.end());
+    }
+
+    REQUIRE(!candidates.empty(), "No tuning candidates remain after env var filtering");
 
     if (verbose) {
-      log.info("  %s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n", formatConfig(cfg), bestMs, genSec, jitSec,
-          measureSec);
+      log.info("tuning: %zu candidates after env var filtering\n", candidates.size());
     }
 
-    if (bestMs < best.ms) {
-      best.ms = bestMs;
-      best.config = cfg;
+    // Evaluate all candidates
+    Vector<float> candidateTimings(candidates.size());
+    for (auto& t : candidateTimings) {
+      t = INFINITY;
+    }
+    for (size_t ci : indices(candidates)) {
+      const auto& cfg = candidates[ci];
+
+      auto t0 = std::chrono::steady_clock::now();
+      std::string ptx = generateCopyKernelPtx(group, cfg, target, op, ctx);
+      double genSec = seconds(std::chrono::steady_clock::now() - t0);
+
+      if (auto* env = std::getenv("MOODIST_DUMP_TUNE_PTX"); env && !strcmp(env, "1")) {
+        fprintf(stderr, "=== PTX for %s ===\n%s\n=== END PTX ===\n", formatConfig(cfg).c_str(), ptx.c_str());
+      }
+
+      t0 = std::chrono::steady_clock::now();
+      CUmodule variantModule = nullptr;
+      char jitErrorLog[4096] = {};
+      CUjit_option jitOpts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+      void* jitOptVals[] = {jitErrorLog, (void*)(uintptr_t)sizeof(jitErrorLog)};
+      CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 2, jitOpts, jitOptVals);
+      double jitSec = seconds(std::chrono::steady_clock::now() - t0);
+      if (jitErr != CUDA_SUCCESS) {
+        if (verbose) {
+          log.info("  %s -> JIT failed (error %d), skipping\n", formatConfig(cfg), (int)jitErr);
+          if (jitErrorLog[0]) {
+            log.info("  ptxas: %s\n", jitErrorLog);
+          }
+        }
+        continue;
+      }
+
+      CUfunction fn = nullptr;
+      CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
+
+      auto run = [&]() {
+        stepValue += 0x1000;
+        CompileOpCopyParameters params;
+        params.stepValue = stepValue;
+        params.concurrencyIndex = 0;
+        std::array<void*, 3> kparams = {
+            &params, tensors.data(), mappedAddrs.data() ? mappedAddrs.data() : (void*)&params};
+        CHECK_CU(cuLaunchKernel(fn, cfg.gridSize, 1, 1, cfg.blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+      };
+
+      // Warmup
+      for (int i = 0; i < warmupIters; i++) {
+        run();
+      }
+      CHECK_CU(cuStreamSynchronize(stream));
+
+      // Measured runs: record all events without synchronizing
+      t0 = std::chrono::steady_clock::now();
+      createEvents(measuredIters);
+      for (int iter : range(measuredIters)) {
+        CHECK_CU(cuEventRecord(events[iter * 2], stream));
+        for (int n : range(4)) {
+          run();
+        }
+        CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
+      }
+      CHECK_CU(cuStreamSynchronize(stream));
+      double measureSec = seconds(std::chrono::steady_clock::now() - t0);
+
+      // Query elapsed times
+      float bestMs = INFINITY;
+      for (int iter = 0; iter < measuredIters; iter++) {
+        float ms = 0.0f;
+        CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
+        if (ms < bestMs) {
+          bestMs = ms;
+        }
+      }
+
+      if (verbose) {
+        log.info("  %s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n", formatConfig(cfg), bestMs, genSec, jitSec,
+            measureSec);
+      }
+
+      candidateTimings[ci] = bestMs;
+
+      cuModuleUnload(variantModule);
     }
 
-    cuModuleUnload(variantModule);
+    // Cleanup
+    for (auto& e : events) {
+      cuEventDestroy(e);
+    }
+    cuStreamDestroy(stream);
+    cuMemFree(syntheticDst);
+    cuMemFree(syntheticSrc);
+
+    // Collective decision: exchange timings across all ranks, sum them,
+    // and pick the candidate with the lowest total time.
+    {
+      ctx.barrier();
+
+      // Send our timings to all ranks
+      for (size_t destRank : range(size)) {
+        ctx.send(destRank, candidateTimings);
+      }
+
+      // Receive timings from all ranks and sum
+      Vector<float> summedTimings(candidates.size());
+      for (auto& t : summedTimings) {
+        t = 0.0f;
+      }
+      for (size_t i : range(size)) {
+        Vector<float> peerTimings;
+        ctx.receive(i, peerTimings);
+        CHECK(peerTimings.size() == candidates.size());
+        for (size_t ci : indices(candidates)) {
+          summedTimings[ci] += peerTimings[ci];
+        }
+      }
+
+      // Pick the best from summed timings
+      for (size_t ci : indices(candidates)) {
+        if (summedTimings[ci] < best.ms) {
+          best.ms = summedTimings[ci];
+          best.config = candidates[ci];
+        }
+      }
+      // Convert summed timing to per-rank average for reporting
+      best.ms /= size;
+
+      ctx.barrier();
+    }
+
+    double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
+    log.info("tuning complete: best %s (%.3f ms) in %.1fs\n", formatConfig(best.config), best.ms, elapsed);
+
+    return best;
   }
+  std::shared_ptr<CustomOpDescriptor> compile(DType dtype, std::span<const api::TensorRegion> inputs,
+      std::span<const api::TensorRegion> outputs, ReduceOp reduce, bool cpuSync) {
+    const Group* group = ctx.group;
 
-  // Cleanup
-  for (auto& e : events) {
-    cuEventDestroy(e);
-  }
-  cuStreamDestroy(stream);
-  cuMemFree(syntheticDst);
-  cuMemFree(syntheticSrc);
+    size_t itemsize = wrapperApi.dtypeSize(dtype);
 
-  double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  log.info("v9 tuning complete: best %s (%.3f ms) in %.1fs\n", formatConfig(best.config), best.ms, elapsed);
+    // Validate per-tensorId ndim consistency
+    // Different tensorIds can have different ndims (e.g., 2D weight vs 1D bias)
+    HashMap<std::string, int> tensorIdNdim;
 
-  return best;
-}
-
-} // namespace
-
-std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dtype,
-    std::span<const api::TensorRegion> inputs, std::span<const api::TensorRegion> outputs, ReduceOp reduce,
-    bool cpuSync) {
-
-  const size_t rank = ctx.group->rank;
-  const size_t size = ctx.group->size;
-  size_t itemsize = wrapperApi.dtypeSize(dtype);
-
-  // Validate per-tensorId ndim consistency
-  // Different tensorIds can have different ndims (e.g., 2D weight vs 1D bias)
-  HashMap<std::string, int> tensorIdNdim;
-
-  auto validateAndRecordNdim = [&](const api::TensorRegion& region, const char* kind, size_t idx) {
-    int ndim = static_cast<int>(region.offset.size());
-    if (region.offset.size() != region.shape.size()) {
-      throw std::runtime_error(fmt::sprintf("moodist.compile_op: %s %zu has mismatched offset/shape sizes (%zu vs %zu)",
-          kind, idx, region.offset.size(), region.shape.size()));
-    }
-    std::string tid(region.tensorId);
-    auto it = tensorIdNdim.find(tid);
-    if (it != tensorIdNdim.end()) {
-      if (it->second != ndim) {
+    auto validateAndRecordNdim = [&](const api::TensorRegion& region, const char* kind, size_t idx) {
+      int ndim = static_cast<int>(region.offset.size());
+      if (region.offset.size() != region.shape.size()) {
         throw std::runtime_error(
-            fmt::sprintf("moodist.compile_op: %s %zu has wrong dimensions for tensorId '%s' (got %d, expected %d)",
-                kind, idx, tid.c_str(), ndim, it->second));
+            fmt::sprintf("moodist.compile_op: %s %zu has mismatched offset/shape sizes (%zu vs %zu)", kind, idx,
+                region.offset.size(), region.shape.size()));
       }
-    } else {
-      tensorIdNdim[tid] = ndim;
-    }
-  };
-
-  for (size_t i : indices(inputs)) {
-    validateAndRecordNdim(inputs[i], "input", i);
-  }
-  for (size_t i : indices(outputs)) {
-    validateAndRecordNdim(outputs[i], "output", i);
-  }
-
-  // Validate device strings for local regions (where rank == this rank)
-  for (const auto& region : inputs) {
-    if (static_cast<size_t>(region.rank) == rank) {
-      parseAndValidateDevice(region.device, ctx.group->deviceIndex);
-    }
-  }
-  for (const auto& region : outputs) {
-    if (static_cast<size_t>(region.rank) == rank) {
-      parseAndValidateDevice(region.device, ctx.group->deviceIndex);
-    }
-  }
-
-  // Parse inputs and outputs into TensorDescr structs
-  Vector<TensorDescr> inputDescrs;
-  Vector<TensorDescr> outputDescrs;
-  Vector<size_t> inputIndexCounter(size);
-  Vector<size_t> outputIndexCounter(size);
-
-  for (const auto& region : inputs) {
-    TensorDescr d;
-    d.rank = region.rank;
-    d.index = inputIndexCounter[region.rank]++;
-    d.tensorId = std::string(region.tensorId);
-    d.device = parseDevice(region.device);
-    int ndim = tensorIdNdim.at(d.tensorId);
-    d.offset = Coord(ndim);
-    d.shape = Coord(ndim);
-    std::ranges::copy(region.offset, d.offset.begin());
-    std::ranges::copy(region.shape, d.shape.begin());
-    d.numel = numel(d.shape);
-    inputDescrs.push_back(std::move(d));
-  }
-
-  for (const auto& region : outputs) {
-    TensorDescr d;
-    d.rank = region.rank;
-    d.index = outputIndexCounter[region.rank]++;
-    d.tensorId = std::string(region.tensorId);
-    d.device = parseDevice(region.device);
-    int ndim = tensorIdNdim.at(d.tensorId);
-    d.offset = Coord(ndim);
-    d.shape = Coord(ndim);
-    std::ranges::copy(region.offset, d.offset.begin());
-    std::ranges::copy(region.shape, d.shape.begin());
-    d.numel = numel(d.shape);
-    outputDescrs.push_back(std::move(d));
-  }
-
-  // Build lookup tables
-  Vector<Vector<size_t>> inputsPerRank(size);
-  Vector<Vector<size_t>> outputsPerRank(size);
-
-  for (size_t i : indices(inputDescrs)) {
-    inputsPerRank[inputDescrs[i].rank].push_back(i);
-  }
-  for (size_t i : indices(outputDescrs)) {
-    outputsPerRank[outputDescrs[i].rank].push_back(i);
-  }
-
-  // Collect my inputs (inputs owned by this rank)
-  Vector<size_t> myInputIndices = inputsPerRank[rank];
-
-  // ============================================================================
-  // Phase 1: Find intersections and exchange logical mappings
-  // ============================================================================
-
-  // For each output (from any rank), find intersecting inputs from myInputs
-  // Create LogicalInput entries and group by destination rank
-  // Only inputs and outputs with matching tensorId can intersect
-  Vector<Vector<LogicalInput>> logicalInputsToSend(size);
-
-  for (size_t outIdx : indices(outputDescrs)) {
-    const TensorDescr& out = outputDescrs[outIdx];
-    if (out.numel == 0) {
-      continue;
-    }
-
-    // Check each of my inputs for intersection with this output
-    for (size_t myInpIdx : myInputIndices) {
-      const TensorDescr& inp = inputDescrs[myInpIdx];
-
-      // Only intersect if tensorIds match
-      if (inp.tensorId != out.tensorId) {
-        continue;
-      }
-
-      // Get ndim for this tensorId (guaranteed to exist after validation)
-      int ndim = tensorIdNdim.at(inp.tensorId);
-
-      // Check intersection
-      bool intersects = true;
-      for (int d = 0; d < ndim; ++d) {
-        if (inp.offset[d] >= out.offset[d] + out.shape[d] || out.offset[d] >= inp.offset[d] + inp.shape[d]) {
-          intersects = false;
-          break;
+      std::string tid(region.tensorId);
+      auto it = tensorIdNdim.find(tid);
+      if (it != tensorIdNdim.end()) {
+        if (it->second != ndim) {
+          throw std::runtime_error(
+              fmt::sprintf("moodist.compile_op: %s %zu has wrong dimensions for tensorId '%s' (got %d, expected %d)",
+                  kind, idx, tid.c_str(), ndim, it->second));
         }
+      } else {
+        tensorIdNdim[tid] = ndim;
       }
+    };
 
-      if (!intersects) {
+    for (size_t i : indices(inputs)) {
+      validateAndRecordNdim(inputs[i], "input", i);
+    }
+    for (size_t i : indices(outputs)) {
+      validateAndRecordNdim(outputs[i], "output", i);
+    }
+
+    // Validate device strings for local regions (where rank == this rank)
+    for (const auto& region : inputs) {
+      if (static_cast<size_t>(region.rank) == rank) {
+        parseAndValidateDevice(region.device, group->deviceIndex);
+      }
+    }
+    for (const auto& region : outputs) {
+      if (static_cast<size_t>(region.rank) == rank) {
+        parseAndValidateDevice(region.device, group->deviceIndex);
+      }
+    }
+
+    // Parse inputs and outputs into TensorDescr structs
+    Vector<TensorDescr> inputDescrs;
+    Vector<TensorDescr> outputDescrs;
+    Vector<size_t> inputIndexCounter(size);
+    Vector<size_t> outputIndexCounter(size);
+
+    for (const auto& region : inputs) {
+      TensorDescr d;
+      d.rank = region.rank;
+      d.index = inputIndexCounter[region.rank]++;
+      d.tensorId = std::string(region.tensorId);
+      d.device = parseDevice(region.device);
+      int ndim = tensorIdNdim.at(d.tensorId);
+      d.offset = Coord(ndim);
+      d.shape = Coord(ndim);
+      std::ranges::copy(region.offset, d.offset.begin());
+      std::ranges::copy(region.shape, d.shape.begin());
+      d.numel = numel(d.shape);
+      inputDescrs.push_back(std::move(d));
+    }
+
+    for (const auto& region : outputs) {
+      TensorDescr d;
+      d.rank = region.rank;
+      d.index = outputIndexCounter[region.rank]++;
+      d.tensorId = std::string(region.tensorId);
+      d.device = parseDevice(region.device);
+      int ndim = tensorIdNdim.at(d.tensorId);
+      d.offset = Coord(ndim);
+      d.shape = Coord(ndim);
+      std::ranges::copy(region.offset, d.offset.begin());
+      std::ranges::copy(region.shape, d.shape.begin());
+      d.numel = numel(d.shape);
+      outputDescrs.push_back(std::move(d));
+    }
+
+    // Build lookup tables
+    Vector<Vector<size_t>> inputsPerRank(size);
+    Vector<Vector<size_t>> outputsPerRank(size);
+
+    for (size_t i : indices(inputDescrs)) {
+      inputsPerRank[inputDescrs[i].rank].push_back(i);
+    }
+    for (size_t i : indices(outputDescrs)) {
+      outputsPerRank[outputDescrs[i].rank].push_back(i);
+    }
+
+    // Collect my inputs (inputs owned by this rank)
+    Vector<size_t> myInputIndices = inputsPerRank[rank];
+
+    // ============================================================================
+    // Phase 1: Find intersections and exchange logical mappings
+    // ============================================================================
+
+    // For each output (from any rank), find intersecting inputs from myInputs
+    // Create LogicalInput entries and group by destination rank
+    // Only inputs and outputs with matching tensorId can intersect
+    Vector<Vector<LogicalInput>> logicalInputsToSend(size);
+
+    for (size_t outIdx : indices(outputDescrs)) {
+      const TensorDescr& out = outputDescrs[outIdx];
+      if (out.numel == 0) {
         continue;
       }
 
-      // Compute intersection region
-      LogicalInput li;
-      li.offset = Coord(ndim);
-      li.shape = Coord(ndim);
-      for (int d = 0; d < ndim; ++d) {
-        int64_t lo = std::max(inp.offset[d], out.offset[d]);
-        int64_t hi = std::min(inp.offset[d] + inp.shape[d], out.offset[d] + out.shape[d]);
-        li.offset[d] = lo;
-        li.shape[d] = hi - lo;
-      }
-      li.inputRank = rank;
-      li.inputIndex = inp.index;
-      li.outputRank = out.rank;
-      li.outputIndex = out.index;
+      // Check each of my inputs for intersection with this output
+      for (size_t myInpIdx : myInputIndices) {
+        const TensorDescr& inp = inputDescrs[myInpIdx];
 
-      logicalInputsToSend[out.rank].push_back(std::move(li));
-    }
-  }
-
-  // Barrier before queue operations
-  ctx.barrier();
-
-  // Send logical inputs to each destination rank
-  for (size_t destRank : range(size)) {
-    TensorPtr tensor = serializeToTensorPtr(logicalInputsToSend[destRank]);
-    ctx.queues[destRank]->put(std::move(tensor), 0);
-  }
-
-  // Receive logical inputs from all source ranks
-  Vector<LogicalInput> receivedInputs;
-  for (size_t i : range(size)) {
-    auto [tensor, qsize] = ctx.queues[rank]->get();
-    Vector<LogicalInput> batch;
-    deserializeFromTensorPtr(tensor, batch);
-
-    for (LogicalInput& li : batch) {
-      CHECK(li.outputRank == rank);
-      receivedInputs.push_back(std::move(li));
-    }
-  }
-
-  // Debug logging
-  log.debug("compile_op phase1: rank %zu, sent to %zu ranks, received %zu logical inputs\n", rank, size,
-      receivedInputs.size());
-
-  // ============================================================================
-  // Phase 2: Overlap resolution via cell decomposition
-  // ============================================================================
-
-  // Group received inputs by output index
-  size_t numMyOutputs = outputsPerRank[rank].size();
-  Vector<Vector<size_t>> inputsPerOutput(numMyOutputs);
-  for (size_t i : indices(receivedInputs)) {
-    inputsPerOutput[receivedInputs[i].outputIndex].push_back(i);
-  }
-
-  // Result: for each output, a list of (cell, source input index) pairs
-  // Each cell will become a ReadRequest in Phase 3
-  struct CellSource {
-    Coord offset;
-    Coord shape;
-    size_t sourceIdx; // Index into receivedInputs
-  };
-  Vector<Vector<CellSource>> cellsPerOutput(numMyOutputs);
-
-  for (size_t outIdx : range(numMyOutputs)) {
-    size_t globalOutIdx = outputsPerRank[rank][outIdx];
-    const TensorDescr& out = outputDescrs[globalOutIdx];
-    const auto& inputIdxs = inputsPerOutput[outIdx];
-
-    if (out.numel == 0) {
-      continue;
-    }
-
-    // Get ndim for this output's tensorId
-    int ndim = tensorIdNdim.at(out.tensorId);
-
-    // Collect boundaries in each dimension from output and all covering inputs
-    Vector<Vector<int64_t>> boundaries(ndim);
-    for (int d = 0; d < ndim; ++d) {
-      boundaries[d].push_back(out.offset[d]);
-      boundaries[d].push_back(out.offset[d] + out.shape[d]);
-      for (size_t i : inputIdxs) {
-        const LogicalInput& inp = receivedInputs[i];
-        boundaries[d].push_back(inp.offset[d]);
-        boundaries[d].push_back(inp.offset[d] + inp.shape[d]);
-      }
-      std::sort(boundaries[d].begin(), boundaries[d].end());
-      boundaries[d].erase(std::unique(boundaries[d].begin(), boundaries[d].end()), boundaries[d].end());
-    }
-
-    // Compute total number of cells
-    Vector<size_t> numIntervals(ndim);
-    size_t totalCells = 1;
-    for (int d = 0; d < ndim; ++d) {
-      numIntervals[d] = boundaries[d].size() - 1;
-      totalCells *= numIntervals[d];
-    }
-
-    // Iterate through all cells
-    std::string gapDetails;
-    std::string overlapDetails;
-    size_t gapCount = 0;
-    size_t overlapCount = 0;
-    constexpr size_t maxReportedRegions = 5;
-
-    for (size_t cellIdx = 0; cellIdx < totalCells; ++cellIdx) {
-      // Convert cellIdx to multi-dimensional index and compute cell offset/shape
-      Coord cellOffset(ndim);
-      Coord cellShape(ndim);
-      size_t remaining = cellIdx;
-      for (int d = ndim - 1; d >= 0; --d) {
-        size_t intervalIdx = remaining % numIntervals[d];
-        remaining /= numIntervals[d];
-        cellOffset[d] = boundaries[d][intervalIdx];
-        cellShape[d] = boundaries[d][intervalIdx + 1] - boundaries[d][intervalIdx];
-      }
-
-      // Check if cell is inside output
-      bool insideOutput = true;
-      for (int d = 0; d < ndim; ++d) {
-        if (cellOffset[d] < out.offset[d] || cellOffset[d] + cellShape[d] > out.offset[d] + out.shape[d]) {
-          insideOutput = false;
-          break;
+        // Only intersect if tensorIds match
+        if (inp.tensorId != out.tensorId) {
+          continue;
         }
-      }
-      if (!insideOutput) {
-        continue;
-      }
 
-      // Find all inputs that cover this cell
-      Vector<size_t> coveringInputs;
-      for (size_t i : inputIdxs) {
-        const LogicalInput& inp = receivedInputs[i];
-        bool covers = true;
+        // Get ndim for this tensorId (guaranteed to exist after validation)
+        int ndim = tensorIdNdim.at(inp.tensorId);
+
+        // Check intersection
+        bool intersects = true;
         for (int d = 0; d < ndim; ++d) {
-          if (cellOffset[d] < inp.offset[d] || cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
-            covers = false;
+          if (inp.offset[d] >= out.offset[d] + out.shape[d] || out.offset[d] >= inp.offset[d] + inp.shape[d]) {
+            intersects = false;
             break;
           }
         }
-        if (covers) {
-          coveringInputs.push_back(i);
+
+        if (!intersects) {
+          continue;
+        }
+
+        // Compute intersection region
+        LogicalInput li;
+        li.offset = Coord(ndim);
+        li.shape = Coord(ndim);
+        for (int d = 0; d < ndim; ++d) {
+          int64_t lo = std::max(inp.offset[d], out.offset[d]);
+          int64_t hi = std::min(inp.offset[d] + inp.shape[d], out.offset[d] + out.shape[d]);
+          li.offset[d] = lo;
+          li.shape[d] = hi - lo;
+        }
+        li.inputRank = rank;
+        li.inputIndex = inp.index;
+        li.outputRank = out.rank;
+        li.outputIndex = out.index;
+
+        logicalInputsToSend[out.rank].push_back(std::move(li));
+      }
+    }
+
+    // Barrier before queue operations
+    ctx.barrier();
+
+    // Send logical inputs to each destination rank
+    for (size_t destRank : range(size)) {
+      ctx.send(destRank, logicalInputsToSend[destRank]);
+    }
+
+    // Receive logical inputs from all source ranks
+    Vector<LogicalInput> receivedInputs;
+    for (size_t i : range(size)) {
+      Vector<LogicalInput> batch;
+      ctx.receive(i, batch);
+
+      for (LogicalInput& li : batch) {
+        CHECK(li.outputRank == rank);
+        receivedInputs.push_back(std::move(li));
+      }
+    }
+
+    // Debug logging
+    log.debug("compile_op phase1: rank %zu, sent to %zu ranks, received %zu logical inputs\n", rank, size,
+        receivedInputs.size());
+
+    // ============================================================================
+    // Phase 2: Overlap resolution via cell decomposition
+    // ============================================================================
+
+    // Group received inputs by output index
+    size_t numMyOutputs = outputsPerRank[rank].size();
+    Vector<Vector<size_t>> inputsPerOutput(numMyOutputs);
+    for (size_t i : indices(receivedInputs)) {
+      inputsPerOutput[receivedInputs[i].outputIndex].push_back(i);
+    }
+
+    // Result: for each output, a list of (cell, source input index) pairs
+    // Each cell will become a ReadRequest in Phase 3
+    struct CellSource {
+      Coord offset;
+      Coord shape;
+      size_t sourceIdx; // Index into receivedInputs
+      uint32_t cellIndex;
+    };
+    Vector<Vector<CellSource>> cellsPerOutput(numMyOutputs);
+
+    struct TensorCells {
+      Vector<Vector<int64_t>> boundaries;
+      Vector<size_t> numIntervals;
+      size_t cellsOffset;
+      size_t totalCells;
+    };
+
+    HashMap<std::string, TensorCells> tensorCells;
+
+    Vector<std::string> tensorIds;
+    for (auto& v : tensorIdNdim) {
+      tensorIds.push_back(v.first);
+    }
+    std::sort(tensorIds.begin(), tensorIds.end());
+
+    size_t numTotalCells = 0;
+
+    for (const auto& tensorId : tensorIds) {
+      const auto& ndim = tensorIdNdim.at(tensorId);
+      auto& tc = tensorCells[tensorId];
+      auto& boundaries = tc.boundaries;
+      boundaries.resize(ndim);
+      for (const auto& descrs : {inputDescrs, outputDescrs}) {
+        for (const auto& v : descrs) {
+          if (v.tensorId == tensorId) {
+            for (int d : range(ndim)) {
+              boundaries[d].push_back(v.offset[d]);
+              boundaries[d].push_back(v.offset[d] + v.shape[d]);
+            }
+          }
         }
       }
+      for (int d : range(ndim)) {
+        std::sort(boundaries[d].begin(), boundaries[d].end());
+        boundaries[d].erase(std::unique(boundaries[d].begin(), boundaries[d].end()), boundaries[d].end());
+      }
 
-      if (coveringInputs.empty()) {
-        // Gap detected
-        gapCount++;
-        if (gapCount <= maxReportedRegions) {
-          gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
-              fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str());
+      // Compute total number of cells
+      auto& numIntervals = tc.numIntervals;
+      numIntervals.resize(ndim);
+      tc.totalCells = 1;
+      for (int d = 0; d < ndim; ++d) {
+        numIntervals[d] = boundaries[d].size() - 1;
+        tc.totalCells *= numIntervals[d];
+      }
+
+      tc.cellsOffset = numTotalCells;
+      numTotalCells += tc.totalCells;
+    }
+
+    for (size_t outIdx : range(numMyOutputs)) {
+      size_t globalOutIdx = outputsPerRank[rank][outIdx];
+      const TensorDescr& out = outputDescrs[globalOutIdx];
+      const auto& inputIdxs = inputsPerOutput[outIdx];
+
+      if (out.numel == 0) {
+        continue;
+      }
+
+      // Get ndim for this output's tensorId
+      int ndim = tensorIdNdim.at(out.tensorId);
+
+      auto& tc = tensorCells[out.tensorId];
+      auto& boundaries = tc.boundaries;
+      CHECK(!boundaries.empty());
+      auto& numIntervals = tc.numIntervals;
+
+      // Iterate through all cells
+      std::string gapDetails;
+      std::string overlapDetails;
+      size_t gapCount = 0;
+      size_t overlapCount = 0;
+      constexpr size_t maxReportedRegions = 5;
+
+      for (size_t cellIdx : range(tc.totalCells)) {
+        // Convert cellIdx to multi-dimensional index and compute cell offset/shape
+        Coord cellOffset(ndim);
+        Coord cellShape(ndim);
+        size_t remaining = cellIdx;
+        for (int d = ndim - 1; d >= 0; --d) {
+          size_t intervalIdx = remaining % numIntervals[d];
+          remaining /= numIntervals[d];
+          cellOffset[d] = boundaries[d][intervalIdx];
+          cellShape[d] = boundaries[d][intervalIdx + 1] - boundaries[d][intervalIdx];
         }
-      } else if (coveringInputs.size() > 1) {
-        // Overlap detected
-        if (reduce == ReduceOp::None) {
-          overlapCount++;
-          if (overlapCount <= maxReportedRegions) {
-            const LogicalInput& a = receivedInputs[coveringInputs[0]];
-            const LogicalInput& b = receivedInputs[coveringInputs[1]];
-            overlapDetails += fmt::sprintf("\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
-                outIdx, fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str(), a.inputRank, b.inputRank);
+
+        // Check if cell is inside output
+        bool insideOutput = true;
+        for (int d = 0; d < ndim; ++d) {
+          if (cellOffset[d] < out.offset[d] || cellOffset[d] + cellShape[d] > out.offset[d] + out.shape[d]) {
+            insideOutput = false;
+            break;
+          }
+        }
+        if (!insideOutput) {
+          continue;
+        }
+
+        // Find all inputs that cover this cell
+        Vector<size_t> coveringInputs;
+        for (size_t i : inputIdxs) {
+          const LogicalInput& inp = receivedInputs[i];
+          bool covers = true;
+          for (int d = 0; d < ndim; ++d) {
+            if (cellOffset[d] < inp.offset[d] || cellOffset[d] + cellShape[d] > inp.offset[d] + inp.shape[d]) {
+              covers = false;
+              break;
+            }
+          }
+          if (covers) {
+            coveringInputs.push_back(i);
+          }
+        }
+
+        if (coveringInputs.empty()) {
+          // Gap detected
+          gapCount++;
+          if (gapCount <= maxReportedRegions) {
+            gapDetails += fmt::sprintf("\n  output[%zu]: missing region at [%s] shape [%s]", outIdx,
+                fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str());
+          }
+        } else if (coveringInputs.size() > 1) {
+          // Overlap detected
+          if (reduce == ReduceOp::None) {
+            overlapCount++;
+            if (overlapCount <= maxReportedRegions) {
+              const LogicalInput& a = receivedInputs[coveringInputs[0]];
+              const LogicalInput& b = receivedInputs[coveringInputs[1]];
+              overlapDetails += fmt::sprintf("\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
+                  outIdx, fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str(), a.inputRank, b.inputRank);
+            }
+          } else {
+            // reduce == Any: pick one randomly
+            size_t pickIdx = random<size_t>(0, coveringInputs.size() - 1);
+            CellSource cs;
+            cs.offset = std::move(cellOffset);
+            cs.shape = std::move(cellShape);
+            cs.sourceIdx = coveringInputs[pickIdx];
+            cs.cellIndex = tc.cellsOffset + cellIdx;
+            cellsPerOutput[outIdx].push_back(std::move(cs));
           }
         } else {
-          // reduce == Any: pick one randomly
-          size_t pickIdx = random<size_t>(0, coveringInputs.size() - 1);
+          // Exactly one covering input
           CellSource cs;
           cs.offset = std::move(cellOffset);
           cs.shape = std::move(cellShape);
-          cs.sourceIdx = coveringInputs[pickIdx];
+          cs.sourceIdx = coveringInputs[0];
+          cs.cellIndex = tc.cellsOffset + cellIdx;
           cellsPerOutput[outIdx].push_back(std::move(cs));
         }
-      } else {
-        // Exactly one covering input
-        CellSource cs;
-        cs.offset = std::move(cellOffset);
-        cs.shape = std::move(cellShape);
-        cs.sourceIdx = coveringInputs[0];
-        cellsPerOutput[outIdx].push_back(std::move(cs));
       }
-    }
 
-    // Report errors
-    if (gapCount > 0) {
-      std::string msg = "moodist.compile_op: missing input coverage";
-      if (gapCount > maxReportedRegions) {
-        msg += fmt::sprintf(" (%zu regions, showing first %zu):", gapCount, maxReportedRegions);
-      } else {
-        msg += ":";
-      }
-      msg += gapDetails;
-      throw std::runtime_error(msg);
-    }
-
-    if (overlapCount > 0) {
-      std::string msg = "moodist.compile_op: overlapping inputs detected";
-      if (overlapCount > maxReportedRegions) {
-        msg += fmt::sprintf(" (%zu regions, showing first %zu):", overlapCount, maxReportedRegions);
-      } else {
-        msg += ":";
-      }
-      msg += overlapDetails;
-      throw std::runtime_error(msg);
-    }
-  }
-
-  log.debug("compile_op phase2: rank %zu, completed cell decomposition\n", rank);
-
-  // ============================================================================
-  // Phase 3: Send read requests (receiver → sender)
-  // ============================================================================
-
-  // Convert cells to ReadRequests, grouped by source rank
-  Vector<Vector<ReadRequest>> requestsToSend(size);
-
-  for (size_t outIdx : range(numMyOutputs)) {
-    for (const auto& cell : cellsPerOutput[outIdx]) {
-      const LogicalInput& src = receivedInputs[cell.sourceIdx];
-
-      ReadRequest req;
-      req.offset = cell.offset;
-      req.shape = cell.shape;
-      req.requesterRank = static_cast<uint32_t>(rank);
-      req.inputIndex = src.inputIndex;
-      req.outputIndex = static_cast<uint32_t>(outIdx);
-
-      requestsToSend[src.inputRank].push_back(std::move(req));
-    }
-  }
-
-  // Barrier before queue operations
-  ctx.barrier();
-
-  // Send read requests to each source rank
-  for (size_t destRank : range(size)) {
-    TensorPtr tensor = serializeToTensorPtr(requestsToSend[destRank]);
-    ctx.queues[destRank]->put(std::move(tensor), 0);
-  }
-
-  // Receive read requests from all ranks (as a sender)
-  Vector<ReadRequest> receivedRequests;
-  for (size_t i : range(size)) {
-    (void)i;
-    auto [tensor, qsize] = ctx.queues[rank]->get();
-    Vector<ReadRequest> batch;
-    deserializeFromTensorPtr(tensor, batch);
-    for (auto& req : batch) {
-      receivedRequests.push_back(std::move(req));
-    }
-  }
-
-  log.debug("compile_op phase3: rank %zu, received %zu read requests\n", rank, receivedRequests.size());
-
-  // ============================================================================
-  // Phase 4: Process requests, generate copies, send responses (sender)
-  // ============================================================================
-
-  // Track copies needed for non-contiguous reads from my inputs
-  struct InputCopy {
-    uint32_t inputIndex; // Which of my inputs
-    Coord offset;        // Offset within that input
-    Coord shape;         // Shape of the region
-  };
-  Vector<InputCopy> inputCopies;
-
-  // Deduplication map: (inputIndex, offset, shape) -> copyIndex
-  // Using a vector of (key, value) pairs with linear search since copy count is typically small
-  struct InputCopyKey {
-    uint32_t inputIndex;
-    Coord offset;
-    Coord shape;
-
-    bool operator==(const InputCopyKey& other) const {
-      return inputIndex == other.inputIndex && offset == other.offset && shape == other.shape;
-    }
-  };
-  Vector<std::pair<InputCopyKey, uint32_t>> inputCopyDedup;
-
-  // Process each request and build responses
-  Vector<Vector<ReadResponse>> responsesToSend(size);
-
-  for (const auto& req : receivedRequests) {
-    // Find my input
-    CHECK(req.inputIndex < myInputIndices.size());
-    size_t globalInputIdx = myInputIndices[req.inputIndex];
-    const TensorDescr& inp = inputDescrs[globalInputIdx];
-
-    // Compute offset within input (request offset is in global coords)
-    Coord relOffset = req.offset - inp.offset;
-
-    // Check if this region is contiguous within the input tensor
-    bool isContiguous = contiguous(req.shape, inp.shape);
-
-    ReadResponse resp;
-    resp.requesterRank = req.requesterRank;
-    resp.outputIndex = req.outputIndex;
-    resp.requestOffset = req.offset;
-    resp.requestShape = req.shape;
-    resp.senderRank = static_cast<uint32_t>(rank);
-    resp.inputDevice = inp.device;
-
-    if (isContiguous) {
-      // Can read directly from input
-      resp.tensorIndex = req.inputIndex;
-      resp.inputOffset = linearOffset(relOffset, inp.shape);
-      resp.tensorShape = inp.shape;
-      resp.isCopy = false;
-    } else {
-      // Need to make a contiguous copy - check for deduplication first
-      InputCopyKey key{req.inputIndex, relOffset, req.shape};
-
-      // Search for existing copy with same key
-      uint32_t copyIndex = 0;
-      bool found = false;
-      for (const auto& [existingKey, existingIdx] : inputCopyDedup) {
-        if (existingKey == key) {
-          copyIndex = existingIdx;
-          found = true;
-          break;
+      // Report errors
+      if (gapCount > 0) {
+        std::string msg = "moodist.compile_op: missing input coverage";
+        if (gapCount > maxReportedRegions) {
+          msg += fmt::sprintf(" (%zu regions, showing first %zu):", gapCount, maxReportedRegions);
+        } else {
+          msg += ":";
         }
+        msg += gapDetails;
+        throw std::runtime_error(msg);
       }
 
-      if (!found) {
-        // Create new copy
-        copyIndex = static_cast<uint32_t>(myInputIndices.size() + inputCopies.size());
-
-        InputCopy copy;
-        copy.inputIndex = req.inputIndex;
-        copy.offset = relOffset;
-        copy.shape = req.shape;
-        inputCopies.push_back(std::move(copy));
-
-        inputCopyDedup.push_back({key, copyIndex});
-
-        // log.debug("compile_op: input copy: inputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n", req.inputIndex,
-        //     fmtCoord(relOffset).c_str(), fmtCoord(req.shape).c_str(), fmtCoord(inp.shape).c_str());
-      }
-
-      resp.tensorIndex = copyIndex;
-      resp.inputOffset = 0;         // Copy is contiguous, starts at 0
-      resp.tensorShape = req.shape; // Copy has same shape as request
-      resp.isCopy = true;
-    }
-
-    responsesToSend[req.requesterRank].push_back(std::move(resp));
-  }
-
-  // Barrier before sending responses
-  ctx.barrier();
-
-  // Send responses to each requester
-  for (size_t destRank : range(size)) {
-    TensorPtr tensor = serializeToTensorPtr(responsesToSend[destRank]);
-    ctx.queues[destRank]->put(std::move(tensor), 0);
-  }
-
-  // Receive responses from all ranks
-  Vector<ReadResponse> receivedResponses;
-  for (size_t i : range(size)) {
-    (void)i;
-    auto [tensor, qsize] = ctx.queues[rank]->get();
-    Vector<ReadResponse> batch;
-    deserializeFromTensorPtr(tensor, batch);
-    for (auto& resp : batch) {
-      receivedResponses.push_back(std::move(resp));
-    }
-  }
-
-  log.debug("compile_op phase4: rank %zu, %zu input copies, received %zu responses\n", rank, inputCopies.size(),
-      receivedResponses.size());
-
-  // ============================================================================
-  // Phase 5: Finalize and build CustomOpDescriptor (receiver)
-  // ============================================================================
-
-  auto op = std::make_shared<CustomOpDescriptor>();
-  op->id = (*ctx.nextOpId)++;
-  op->dtype = dtype;
-  op->cpuSync = cpuSync;
-
-  // Populate inputs (my inputs) - sizes in bytes
-  for (size_t idx : myInputIndices) {
-    op->inputs.push_back(itemsize * inputDescrs[idx].numel);
-    const Coord& sh = inputDescrs[idx].shape;
-    op->inputShapes.emplace_back(sh.begin(), sh.end());
-    op->inputDevices.push_back(inputDescrs[idx].device);
-  }
-
-  // Populate outputs (my outputs) - sizes in bytes
-  for (size_t idx : outputsPerRank[rank]) {
-    op->outputs.push_back(itemsize * outputDescrs[idx].numel);
-    const Coord& sh = outputDescrs[idx].shape;
-    op->outputShapes.emplace_back(sh.begin(), sh.end());
-    op->outputDevices.push_back(outputDescrs[idx].device);
-  }
-
-  // Add inputCopies from Phase 4
-  for (const auto& copy : inputCopies) {
-    CustomOpDescriptor::Copy c;
-    c.index = copy.inputIndex;
-    c.offset = {copy.offset.begin(), copy.offset.end()};
-    c.shape = {copy.shape.begin(), copy.shape.end()};
-    op->inputCopies.push_back(std::move(c));
-  }
-
-  // Track output copies needed for non-contiguous writes
-  struct OutputCopy {
-    uint32_t outputIndex;
-    Coord offset; // Relative to output
-    Coord shape;
-  };
-  Vector<OutputCopy> outputCopyList;
-
-  // Process responses and build reads
-  for (const auto& resp : receivedResponses) {
-    // Find my output
-    CHECK(resp.outputIndex < outputsPerRank[rank].size());
-    size_t globalOutputIdx = outputsPerRank[rank][resp.outputIndex];
-    const TensorDescr& out = outputDescrs[globalOutputIdx];
-
-    // Compute output offset (request offset is in global coords)
-    Coord relOutOffset = resp.requestOffset - out.offset;
-    size_t outputOffset = linearOffset(relOutOffset, out.shape);
-
-    // Check if this region is contiguous within the output tensor
-    bool outputContiguous = contiguous(resp.requestShape, out.shape);
-
-    // Compute bytes
-    size_t bytes = itemsize * numel(resp.requestShape);
-
-    // Check if input side is contiguous (for the Read entry)
-    bool inputContiguous = contiguous(resp.requestShape, resp.tensorShape);
-
-    CustomOpDescriptor::Read read;
-    read.rank = resp.senderRank;
-    read.inputIndex = resp.tensorIndex;
-    read.outputIndex = resp.outputIndex;
-    read.inputOffset = itemsize * resp.inputOffset; // Convert to bytes
-    read.bytes = bytes;
-
-    if (outputContiguous) {
-      read.outputOffset = itemsize * outputOffset; // Convert to bytes
-    } else {
-      // Need to copy to a contiguous region, then write to output
-      uint32_t copyIdx = static_cast<uint32_t>(outputsPerRank[rank].size() + outputCopyList.size());
-
-      OutputCopy oc;
-      oc.outputIndex = resp.outputIndex;
-      oc.offset = relOutOffset;
-      oc.shape = resp.requestShape;
-      outputCopyList.push_back(std::move(oc));
-
-      // log.debug("compile_op: output copy: outputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
-      // resp.outputIndex,
-      //     fmtCoord(relOutOffset).c_str(), fmtCoord(resp.requestShape).c_str(), fmtCoord(out.shape).c_str());
-
-      // Read into the copy buffer (which will be contiguous)
-      read.outputIndex = copyIdx;
-      read.outputOffset = 0;
-    }
-
-    // For CUDA-to-CUDA transfers: use local copy (NVLink/same-GPU) instead of RDMA read
-    // when source is on the same node (IPC-accessible) or is this rank itself.
-    // For CPU tensors, IB DMA engines are faster than memcpy, so keep as RDMA reads.
-    bool bothCuda = out.device == DeviceType::CUDA && resp.inputDevice == DeviceType::CUDA;
-    bool sourceIsLocal =
-        read.rank == rank || (read.rank < ctx.group->ipcAccess.size() && ctx.group->ipcAccess[read.rank]);
-    if (sourceIsLocal && bothCuda) {
-      CustomOpDescriptor::LocalInputCopy lic;
-      lic.sourceRank = read.rank;
-      lic.sourceInputIndex = read.inputIndex;
-      lic.sourceInputOffset = read.inputOffset;
-      lic.bytes = read.bytes;
-      lic.myOutputIndex = read.outputIndex;
-      lic.myOutputOffset = read.outputOffset;
-      op->localInputCopies.push_back(lic);
-    } else {
-      op->reads.push_back(read);
-    }
-
-    (void)inputContiguous; // Used by execution path, not stored in descriptor
-  }
-
-  // Split large peer copies into chunks and interleave across peers.
-  // Without splitting (threshold=0), this is equivalent to staggered rotation.
-  // With splitting, reads from different peers are interleaved so that
-  // timing drift between ranks doesn't cause NVLink contention.
-  // MOODIST_COPY_CHUNK_SIZE sets the max chunk size in bytes (0 = no splitting).
-  {
-    size_t chunkThreshold = 0;
-    if (auto* env = std::getenv("MOODIST_COPY_CHUNK_SIZE")) {
-      chunkThreshold = (size_t)atol(env);
-    }
-
-    // Group entries by peer, splitting large ones into chunks
-    Vector<CustomOpDescriptor::LocalInputCopy> selfCopies;
-    Vector<Vector<CustomOpDescriptor::LocalInputCopy>> peerChunks(size);
-
-    for (auto& lic : op->localInputCopies) {
-      if (lic.sourceRank == rank) {
-        selfCopies.push_back(lic);
-        continue;
-      }
-      if (chunkThreshold > 0 && lic.bytes > chunkThreshold) {
-        size_t offset = 0;
-        while (offset < lic.bytes) {
-          size_t chunkBytes = std::min(chunkThreshold, lic.bytes - offset);
-          CustomOpDescriptor::LocalInputCopy chunk = lic;
-          chunk.sourceInputOffset += offset;
-          chunk.myOutputOffset += offset;
-          chunk.bytes = chunkBytes;
-          peerChunks[lic.sourceRank].push_back(chunk);
-          offset += chunkBytes;
+      if (overlapCount > 0) {
+        std::string msg = "moodist.compile_op: overlapping inputs detected";
+        if (overlapCount > maxReportedRegions) {
+          msg += fmt::sprintf(" (%zu regions, showing first %zu):", overlapCount, maxReportedRegions);
+        } else {
+          msg += ":";
         }
-      } else {
-        peerChunks[lic.sourceRank].push_back(lic);
+        msg += overlapDetails;
+        throw std::runtime_error(msg);
       }
     }
 
-    // Build rotated peer order: (rank+1)%N, (rank+2)%N, ...
-    Vector<uint32_t> peerOrder;
-    for (uint32_t i = 1; i < (uint32_t)size; i++) {
-      peerOrder.push_back((rank + i) % size);
-    }
+    log.debug("compile_op phase2: rank %zu, completed cell decomposition, %d total cells\n", rank, numTotalCells);
 
-    size_t maxRounds = 0;
-    for (uint32_t peer : peerOrder) {
-      maxRounds = std::max(maxRounds, peerChunks[peer].size());
-    }
+    // ============================================================================
+    // Phase 3: Send read requests (receiver → sender)
+    // ============================================================================
 
-    // Rebuild: self-copies first, then interleaved peer copies
-    op->localInputCopies.clear();
-    for (auto& lic : selfCopies) {
-      op->localInputCopies.push_back(std::move(lic));
-    }
-    for (size_t round = 0; round < maxRounds; round++) {
-      for (uint32_t peer : peerOrder) {
-        if (round < peerChunks[peer].size()) {
-          op->localInputCopies.push_back(std::move(peerChunks[peer][round]));
-        }
+    // Convert cells to ReadRequests, grouped by source rank
+    Vector<Vector<ReadRequest>> requestsToSend(size);
+
+    for (size_t outIdx : range(numMyOutputs)) {
+      for (const auto& cell : cellsPerOutput[outIdx]) {
+        const LogicalInput& src = receivedInputs[cell.sourceIdx];
+
+        ReadRequest req;
+        req.offset = cell.offset;
+        req.shape = cell.shape;
+        req.cellIndex = cell.cellIndex;
+        req.requesterRank = static_cast<uint32_t>(rank);
+        req.inputIndex = src.inputIndex;
+        req.outputIndex = static_cast<uint32_t>(outIdx);
+
+        requestsToSend[src.inputRank].push_back(std::move(req));
       }
     }
 
-    // Log
-    size_t peerCopyCount = op->localInputCopies.size() - selfCopies.size();
-    if (chunkThreshold > 0 && maxRounds > 1) {
-      log.info("rank %zu: %zu peer copies, %zu rounds (chunk %zuB)\n", rank, peerCopyCount, maxRounds, chunkThreshold);
-    } else {
-      std::string order;
-      for (const auto& lic : op->localInputCopies) {
-        if (lic.sourceRank == rank) {
-          continue;
-        }
-        if (!order.empty()) {
-          order += ", ";
-        }
-        order += fmt::sprintf("r%u(%zuB)", lic.sourceRank, lic.bytes);
-      }
-      log.info("rank %zu: peer read order: [%s]\n", rank, order);
-    }
-  }
-
-  // Add outputCopies
-  for (const auto& oc : outputCopyList) {
-    CustomOpDescriptor::Copy c;
-    c.index = oc.outputIndex;
-    c.offset = {oc.offset.begin(), oc.offset.end()};
-    c.shape = {oc.shape.begin(), oc.shape.end()};
-    op->outputCopies.push_back(std::move(c));
-  }
-
-  // Final barrier
-  ctx.barrier();
-
-  log.debug("compile_op phase5: rank %zu, %zu reads, %zu local copies, %zu output copies\n", rank, op->reads.size(),
-      op->localInputCopies.size(), op->outputCopies.size());
-
-  // ============================================================================
-  // Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
-  // ============================================================================
-
-  // This rank is all-local if it has no IB reads, no non-contiguous copies, and no CPU sync
-  bool myAllLocal = op->reads.empty() && op->inputCopies.empty() && op->outputCopies.empty() && !cpuSync;
-
-  // Build messages to source ranks: tell each source what I will read from their inputs
-  Vector<Vector<ProvideEntry>> providesToSend(size);
-  for (const auto& lic : op->localInputCopies) {
-    if (lic.sourceRank == rank) {
-      continue; // Self-copies don't need to be communicated
-    }
-    ProvideEntry pe;
-    pe.readerRank = static_cast<uint32_t>(rank);
-    pe.sourceInputIndex = lic.sourceInputIndex;
-    pe.sourceInputOffset = lic.sourceInputOffset;
-    pe.bytes = lic.bytes;
-    providesToSend[lic.sourceRank].push_back(pe);
-  }
-
-  // Barrier before queue operations
-  ctx.barrier();
-
-  // Send (myAllLocal, provides) to each rank
-  for (size_t destRank : range(size)) {
-    TensorPtr tensor = serializeToTensorPtr(myAllLocal, providesToSend[destRank]);
-    ctx.queues[destRank]->put(std::move(tensor), 0);
-  }
-
-  // Receive from all ranks
-  bool allAllLocal = myAllLocal;
-  for (size_t i : range(size)) {
-    (void)i;
-    auto [tensor, qsize] = ctx.queues[rank]->get();
-    bool peerAllLocal;
-    Vector<ProvideEntry> entries;
-    deserializeFromTensorPtr(tensor, peerAllLocal, entries);
-    allAllLocal = allAllLocal && peerAllLocal;
-
-    for (const auto& pe : entries) {
-      CustomOpDescriptor::LocalInputProvide lip;
-      lip.readerRank = pe.readerRank;
-      lip.myInputIndex = pe.sourceInputIndex;
-      lip.inputOffset = pe.sourceInputOffset;
-      lip.bytes = pe.bytes;
-      op->localInputProvides.push_back(lip);
-    }
-  }
-
-  op->allLocal = allAllLocal;
-
-  // Final barrier after Phase 6
-  ctx.barrier();
-
-  log.debug(
-      "compile_op phase6: rank %zu, allLocal=%d, %zu provides\n", rank, op->allLocal, op->localInputProvides.size());
-
-  // ============================================================================
-  // Phase 7: Multicast setup (if eligible)
-  // ============================================================================
-
-  bool useLockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
-
-  if (op->allLocal && ctx.group->supportsMulticast &&
-      (ctx.group->compileOpKernels->version == 3 || useLockstepMulticast)) {
-    // Analyze localInputProvides (source-side view): group by source region.
-    // If a region is read by ≥2 peers, create a multicast object for it.
-    // The source rank creates the multicast object and sends the handle to each reader.
-
-    struct RegionKey {
-      uint32_t inputIndex;
-      size_t inputOffset;
-      size_t bytes;
-
-      bool operator==(const RegionKey& other) const {
-        return inputIndex == other.inputIndex && inputOffset == other.inputOffset && bytes == other.bytes;
-      }
-    };
-
-    // Group localInputProvides by source region → list of reader ranks
-    Vector<std::pair<RegionKey, Vector<uint32_t>>> regionToReaders;
-
-    for (const auto& lip : op->localInputProvides) {
-      RegionKey key{lip.myInputIndex, lip.inputOffset, lip.bytes};
-
-      bool found = false;
-      for (auto& [k, readers] : regionToReaders) {
-        if (k == key) {
-          readers.push_back(lip.readerRank);
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        Vector<uint32_t> readers;
-        readers.push_back(lip.readerRank);
-        regionToReaders.emplace_back(key, std::move(readers));
-      }
-    }
-
-    // Pending multicast objects: Phase 7a stores these, Phase 7b completes them.
-    struct PendingMulticast {
-      RegionKey key;
-      CUmemGenericAllocationHandle mcHandle;
-      size_t mcSize; // mcProp.size (rounded up to multicast granularity)
-      size_t mcGranularity;
-      Vector<uint32_t> readers;
-      HashMap<uint32_t, size_t> readerHandleIndices; // readerRank → handleIndex from Phase 1
-    };
-    Vector<PendingMulticast> pendingMulticasts;
-
-    bool useFabric = ctx.group->supportsFabric;
-
-    // Phase 7a: Create multicast objects, add source device, send addDevice to peers.
-    // After this phase + wait(), ALL devices have been added to each multicast object.
-    for (const auto& [key, readers] : regionToReaders) {
-      if (readers.size() < 1) {
-        continue;
-      }
-
-      // numDevices = source + all readers
-      CUmulticastObjectProp mcProp;
-      std::memset(&mcProp, 0, sizeof(mcProp));
-      mcProp.numDevices = static_cast<unsigned int>(readers.size() + 1);
-      mcProp.size = key.bytes;
-      mcProp.handleTypes =
-          useFabric ? (unsigned long long)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC)
-                    : (unsigned long long)CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-      mcProp.flags = 0;
-
-      size_t mcGranularity = 0;
-      CHECK_CU(cuMulticastGetGranularity(&mcGranularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
-      mcProp.size = (mcProp.size + mcGranularity - 1) / mcGranularity * mcGranularity;
-
-      CUdevice dev;
-      CHECK_CU(cuCtxGetDevice(&dev));
-
-      CUmemGenericAllocationHandle mcHandle;
-      log.info("compile_op phase7a: cuMulticastCreate numDevices=%u size=%zu handleTypes=%#llx flags=%#llx\n",
-          mcProp.numDevices, mcProp.size, mcProp.handleTypes, mcProp.flags);
-      CHECK_CU(cuMulticastCreate(&mcHandle, &mcProp));
-
-      // Source adds its own device
-      CHECK_CU(cuMulticastAddDevice(mcHandle, dev));
-
-      // Send addDevice requests to all readers (Phase 1 — import + addDevice only)
-      PendingMulticast pm;
-      pm.key = key;
-      pm.mcHandle = mcHandle;
-      pm.mcSize = mcProp.size;
-      pm.mcGranularity = mcGranularity;
-      pm.readers = readers;
-
-      for (uint32_t readerRank : readers) {
-        size_t peerIndex = ctx.group->getPeerIndex(readerRank);
-        ++ctx.group->ipcMapper->waitCount;
-        ctx.group->ipcMapper->sendMulticastHandle(peerIndex, mcHandle, mcProp.size,
-            [ipcMapper = ctx.group->ipcMapper.get(), readerRank, &pm](uintptr_t handleIndex) {
-              pm.readerHandleIndices[readerRank] = handleIndex;
-              --ipcMapper->waitCount;
-            });
-      }
-
-      // Wait for all addDevice callbacks for this MC object before moving pm
-      ctx.group->ipcMapper->wait();
-
-      pendingMulticasts.push_back(std::move(pm));
-    }
-
-    log.info("compile_op phase7a: all addDevice complete, %zu multicast objects\n", pendingMulticasts.size());
-
-    // Phase 7b: Now that all devices are added, bind scratch and map on all devices.
-    struct CreatedRegion {
-      RegionKey key;
-      CUdeviceptr sourceVA;
-      size_t allocSize;
-      HashMap<uint32_t, CUdeviceptr> readerVAs; // readerRank → peer's multicast VA
-    };
-    Vector<CreatedRegion> createdRegions;
-
-    for (auto& pm : pendingMulticasts) {
-      CUdevice dev;
-      CHECK_CU(cuCtxGetDevice(&dev));
-
-      // Source's scratch buffer
-      CUmemAllocationProp allocProp;
-      std::memset(&allocProp, 0, sizeof(allocProp));
-      allocProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-      allocProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-      allocProp.location.id = dev;
-      allocProp.requestedHandleTypes = useFabric ? CU_MEM_HANDLE_TYPE_FABRIC : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-
-      size_t allocGranularity = 0;
-      CHECK_CU(cuMemGetAllocationGranularity(&allocGranularity, &allocProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-      size_t allocSize = (pm.mcSize + allocGranularity - 1) / allocGranularity * allocGranularity;
-
-      CUmemGenericAllocationHandle scratchHandle;
-      CHECK_CU(cuMemCreate(&scratchHandle, allocSize, &allocProp, 0));
-      CHECK_CU(cuMulticastBindMem(pm.mcHandle, 0, scratchHandle, 0, allocSize, 0));
-
-      // Map the multicast object on source
-      CUdeviceptr mcVA = 0;
-      CHECK_CU(cuMemAddressReserve(&mcVA, allocSize, pm.mcGranularity, 0, 0));
-      CHECK_CU(cuMemMap(mcVA, allocSize, 0, pm.mcHandle, 0));
-
-      CUmemAccessDesc accessDesc;
-      std::memset(&accessDesc, 0, sizeof(accessDesc));
-      accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-      accessDesc.location.id = dev;
-      accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-      CHECK_CU(cuMemSetAccess(mcVA, allocSize, &accessDesc, 1));
-
-      // Send bind requests to each reader peer (Phase 2 — scratch + bind + map)
-      CreatedRegion cr;
-      cr.key = pm.key;
-      cr.sourceVA = mcVA;
-      cr.allocSize = allocSize;
-
-      for (uint32_t readerRank : pm.readers) {
-        size_t peerIndex = ctx.group->getPeerIndex(readerRank);
-        size_t handleIndex = pm.readerHandleIndices.at(readerRank);
-        ++ctx.group->ipcMapper->waitCount;
-        ctx.group->ipcMapper->sendMulticastBind(peerIndex, handleIndex, pm.mcSize,
-            [ipcMapper = ctx.group->ipcMapper.get(), readerRank, &cr](uintptr_t peerVA) {
-              cr.readerVAs[readerRank] = peerVA;
-              --ipcMapper->waitCount;
-            });
-      }
-
-      ctx.group->ipcMapper->wait();
-      createdRegions.push_back(std::move(cr));
-
-      log.info("compile_op phase7b: created multicast for input[%u]+%zu (%zu bytes), "
-               "%zu readers, VA=%#llx\n",
-          pm.key.inputIndex, pm.key.inputOffset, pm.key.bytes, pm.readers.size(), (unsigned long long)mcVA);
-    }
-
-    // Barrier: ensure all ipc_mapper handler work is complete on all ranks
+    // Barrier before queue operations
     ctx.barrier();
 
-    // Exchange multicast assignments via queues.
-    // Each source sends assignments to each peer; non-sources send empty lists.
-    Vector<Vector<MulticastAssignment>> assignmentsToSend(size);
-
-    for (const auto& cr : createdRegions) {
-      for (const auto& [readerRank, peerVA] : cr.readerVAs) {
-        MulticastAssignment ma;
-        ma.sourceRank = static_cast<uint32_t>(rank);
-        ma.sourceInputIndex = cr.key.inputIndex;
-        ma.sourceInputOffset = cr.key.inputOffset;
-        ma.bytes = cr.key.bytes;
-        ma.scratchVA = peerVA;
-        ma.allocSize = cr.allocSize;
-        assignmentsToSend[readerRank].push_back(ma);
-      }
-    }
-
-    ctx.barrier();
-
+    // Send read requests to each source rank
     for (size_t destRank : range(size)) {
-      TensorPtr tensor = serializeToTensorPtr(assignmentsToSend[destRank]);
-      ctx.queues[destRank]->put(std::move(tensor), 0);
+      ctx.send(destRank, requestsToSend[destRank]);
     }
 
-    // Receive assignments from all ranks
-    Vector<MulticastAssignment> receivedAssignments;
+    // Receive read requests from all ranks (as a sender)
+    Vector<ReadRequest> receivedRequests;
     for (size_t i : range(size)) {
-      (void)i;
-      auto [tensor, qsize] = ctx.queues[rank]->get();
-      Vector<MulticastAssignment> entries;
-      deserializeFromTensorPtr(tensor, entries);
-      for (auto& ma : entries) {
-        receivedAssignments.push_back(std::move(ma));
+      Vector<ReadRequest> batch;
+      ctx.receive(i, batch);
+      for (auto& req : batch) {
+        receivedRequests.push_back(std::move(req));
       }
     }
 
-    // Build MulticastSource entries (one per created region on this rank).
-    // Build MulticastDest entries from received assignments; remove from localInputCopies.
-    // Self-copies (sourceRank == rank) stay in localInputCopies — handled by the copy path.
+    log.debug("compile_op phase3: rank %zu, received %zu read requests\n", rank, receivedRequests.size());
 
-    for (const auto& cr : createdRegions) {
-      CustomOpDescriptor::MulticastSource ms;
-      ms.sourceInputIndex = cr.key.inputIndex;
-      ms.sourceInputOffset = cr.key.inputOffset;
-      ms.bytes = cr.key.bytes;
-      ms.mcVA = cr.sourceVA;
-      op->multicastSources.push_back(ms);
+    // ============================================================================
+    // Phase 4: Process requests, generate copies, send responses (sender)
+    // ============================================================================
+
+    // Track copies needed for non-contiguous reads from my inputs
+    struct InputCopy {
+      uint32_t inputIndex; // Which of my inputs
+      Coord offset;        // Offset within that input
+      Coord shape;         // Shape of the region
+    };
+    Vector<InputCopy> inputCopies;
+
+    // Deduplication map: (inputIndex, offset, shape) -> copyIndex
+    // Using a vector of (key, value) pairs with linear search since copy count is typically small
+    struct InputCopyKey {
+      uint32_t inputIndex;
+      Coord offset;
+      Coord shape;
+
+      bool operator==(const InputCopyKey& other) const {
+        return inputIndex == other.inputIndex && offset == other.offset && shape == other.shape;
+      }
+    };
+    Vector<std::pair<InputCopyKey, uint32_t>> inputCopyDedup;
+
+    // Process each request and build responses
+    Vector<Vector<ReadResponse>> responsesToSend(size);
+
+    for (const auto& req : receivedRequests) {
+      // Find my input
+      CHECK(req.inputIndex < myInputIndices.size());
+      size_t globalInputIdx = myInputIndices[req.inputIndex];
+      const TensorDescr& inp = inputDescrs[globalInputIdx];
+
+      // Compute offset within input (request offset is in global coords)
+      Coord relOffset = req.offset - inp.offset;
+
+      // Check if this region is contiguous within the input tensor
+      bool isContiguous = contiguous(req.shape, inp.shape);
+
+      ReadResponse resp;
+      resp.requesterRank = req.requesterRank;
+      resp.outputIndex = req.outputIndex;
+      resp.cellIndex = req.cellIndex;
+      resp.requestOffset = req.offset;
+      resp.requestShape = req.shape;
+      resp.senderRank = static_cast<uint32_t>(rank);
+      resp.inputDevice = inp.device;
+
+      if (isContiguous) {
+        // Can read directly from input
+        resp.tensorIndex = req.inputIndex;
+        resp.inputOffset = linearOffset(relOffset, inp.shape);
+        resp.tensorShape = inp.shape;
+        resp.isCopy = false;
+      } else {
+        // Need to make a contiguous copy - check for deduplication first
+        InputCopyKey key{req.inputIndex, relOffset, req.shape};
+
+        // Search for existing copy with same key
+        uint32_t copyIndex = 0;
+        bool found = false;
+        for (const auto& [existingKey, existingIdx] : inputCopyDedup) {
+          if (existingKey == key) {
+            copyIndex = existingIdx;
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          // Create new copy
+          copyIndex = static_cast<uint32_t>(myInputIndices.size() + inputCopies.size());
+
+          InputCopy copy;
+          copy.inputIndex = req.inputIndex;
+          copy.offset = relOffset;
+          copy.shape = req.shape;
+          inputCopies.push_back(std::move(copy));
+
+          inputCopyDedup.push_back({key, copyIndex});
+
+          // log.debug("compile_op: input copy: inputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
+          // req.inputIndex,
+          //     fmtCoord(relOffset).c_str(), fmtCoord(req.shape).c_str(), fmtCoord(inp.shape).c_str());
+        }
+
+        resp.tensorIndex = copyIndex;
+        resp.inputOffset = 0;         // Copy is contiguous, starts at 0
+        resp.tensorShape = req.shape; // Copy has same shape as request
+        resp.isCopy = true;
+      }
+
+      responsesToSend[req.requesterRank].push_back(std::move(resp));
     }
 
-    for (const auto& ma : receivedAssignments) {
-      bool matched = false;
-      for (auto it = op->localInputCopies.begin(); it != op->localInputCopies.end(); ++it) {
-        if (it->sourceRank == ma.sourceRank && it->sourceInputIndex == ma.sourceInputIndex &&
-            it->sourceInputOffset == ma.sourceInputOffset && it->bytes == ma.bytes) {
-          CustomOpDescriptor::MulticastDest md;
-          md.sourceRank = ma.sourceRank;
-          md.sourceInputIndex = ma.sourceInputIndex;
-          md.sourceInputOffset = ma.sourceInputOffset;
-          md.bytes = ma.bytes;
-          md.myOutputIndex = it->myOutputIndex;
-          md.myOutputOffset = it->myOutputOffset;
-          md.scratchVA = ma.scratchVA;
-          md.allocSize = ma.allocSize;
-          op->multicastDests.push_back(md);
-          op->localInputCopies.erase(it);
-          matched = true;
-          break;
+    // Barrier before sending responses
+    ctx.barrier();
+
+    // Send responses to each requester
+    for (size_t destRank : range(size)) {
+      ctx.send(destRank, responsesToSend[destRank]);
+    }
+
+    // Receive responses from all ranks
+    Vector<ReadResponse> receivedResponses;
+    for (size_t i : range(size)) {
+      Vector<ReadResponse> batch;
+      ctx.receive(i, batch);
+      for (auto& resp : batch) {
+        receivedResponses.push_back(std::move(resp));
+      }
+    }
+
+    log.debug("compile_op phase4: rank %zu, %zu input copies, received %zu responses\n", rank, inputCopies.size(),
+        receivedResponses.size());
+
+    // ============================================================================
+    // Phase 5: Finalize and build CustomOpDescriptor (receiver)
+    // ============================================================================
+
+    auto op = std::make_shared<CustomOpDescriptor>();
+    op->id = (*ctx.nextOpId)++;
+    op->dtype = dtype;
+    op->cpuSync = cpuSync;
+
+    // Populate inputs (my inputs) - sizes in bytes
+    for (size_t idx : myInputIndices) {
+      op->inputs.push_back(itemsize * inputDescrs[idx].numel);
+      const Coord& sh = inputDescrs[idx].shape;
+      op->inputShapes.emplace_back(sh.begin(), sh.end());
+      op->inputDevices.push_back(inputDescrs[idx].device);
+    }
+
+    // Populate outputs (my outputs) - sizes in bytes
+    for (size_t idx : outputsPerRank[rank]) {
+      op->outputs.push_back(itemsize * outputDescrs[idx].numel);
+      const Coord& sh = outputDescrs[idx].shape;
+      op->outputShapes.emplace_back(sh.begin(), sh.end());
+      op->outputDevices.push_back(outputDescrs[idx].device);
+    }
+
+    // Add inputCopies from Phase 4
+    for (const auto& copy : inputCopies) {
+      CustomOpDescriptor::Copy c;
+      c.index = copy.inputIndex;
+      c.offset = {copy.offset.begin(), copy.offset.end()};
+      c.shape = {copy.shape.begin(), copy.shape.end()};
+      op->inputCopies.push_back(std::move(c));
+    }
+
+    // Track output copies needed for non-contiguous writes
+    struct OutputCopy {
+      uint32_t outputIndex;
+      Coord offset; // Relative to output
+      Coord shape;
+    };
+    Vector<OutputCopy> outputCopyList;
+
+    // Process responses and build reads
+    for (const auto& resp : receivedResponses) {
+      // Find my output
+      CHECK(resp.outputIndex < outputsPerRank[rank].size());
+      size_t globalOutputIdx = outputsPerRank[rank][resp.outputIndex];
+      const TensorDescr& out = outputDescrs[globalOutputIdx];
+
+      // Compute output offset (request offset is in global coords)
+      Coord relOutOffset = resp.requestOffset - out.offset;
+      size_t outputOffset = linearOffset(relOutOffset, out.shape);
+
+      // Check if this region is contiguous within the output tensor
+      bool outputContiguous = contiguous(resp.requestShape, out.shape);
+
+      // Compute bytes
+      size_t bytes = itemsize * numel(resp.requestShape);
+
+      CustomOpDescriptor::Edge edge;
+      edge.sources.emplace_back(resp.senderRank, resp.tensorIndex, itemsize * resp.inputOffset);
+      edge.destinations.emplace_back(
+          rank, myInputIndices.size() + inputCopies.size() + resp.outputIndex, itemsize * outputOffset);
+      edge.bytes = bytes;
+      edge.cellIndex = resp.cellIndex;
+
+      if (!outputContiguous) {
+        // Need to copy to a contiguous region, then write to output
+        uint32_t copyIdx = static_cast<uint32_t>(outputsPerRank[rank].size() + outputCopyList.size());
+
+        OutputCopy oc;
+        oc.outputIndex = resp.outputIndex;
+        oc.offset = relOutOffset;
+        oc.shape = resp.requestShape;
+        outputCopyList.push_back(std::move(oc));
+
+        // log.debug("compile_op: output copy: outputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
+        // resp.outputIndex,
+        //     fmtCoord(relOutOffset).c_str(), fmtCoord(resp.requestShape).c_str(), fmtCoord(out.shape).c_str());
+
+        // Read into the copy buffer (which will be contiguous)
+        edge.destinations.back().tensorIndex = myInputIndices.size() + inputCopies.size() + copyIdx;
+        edge.destinations.back().offset = 0;
+      }
+
+      // For CUDA-to-CUDA transfers: use local copy (NVLink/same-GPU) instead of RDMA read
+      // when source is on the same node (IPC-accessible) or is this rank itself.
+      // For CPU tensors, IB DMA engines are faster than memcpy, so keep as RDMA reads.
+      bool bothCuda = out.device == DeviceType::CUDA && resp.inputDevice == DeviceType::CUDA;
+      bool sourceIsLocal = resp.senderRank == rank || group->ipcAccess.at(resp.senderRank);
+      if (sourceIsLocal && bothCuda) {
+        op->cudaEdges.push_back(std::move(edge));
+      } else {
+        op->rdmaEdges.push_back(std::move(edge));
+      }
+    }
+
+    auto rankIn = [&](uint32_t rank, auto& list) {
+      for (auto& x : list) {
+        if (x.rank == rank) {
+          return true;
         }
       }
-      CHECK(matched);
+      return false;
+    };
+
+    for (size_t i : range(size)) {
+      if (i == rank) {
+        continue;
+      }
+      Vector<CustomOpDescriptor::Edge> cuda;
+      Vector<CustomOpDescriptor::Edge> rdma;
+      for (auto& v : op->cudaEdges) {
+        if (rankIn(i, v.sources)) {
+          cuda.push_back(v);
+        }
+      }
+      for (auto& v : op->rdmaEdges) {
+        if (rankIn(i, v.sources)) {
+          rdma.push_back(v);
+        }
+      }
+      ctx.send(i, cuda, rdma);
     }
-
-    log.info("compile_op phase7: rank %zu, %zu multicast sources, %zu multicast dests, "
-             "%zu remaining localInputCopies\n",
-        rank, op->multicastSources.size(), op->multicastDests.size(), op->localInputCopies.size());
-
-    // Final barrier after Phase 7
-    ctx.barrier();
-  }
-
-  // Compute byte counts for logging
-  size_t inputBytes = 0, outputBytes = 0, readBytes = 0;
-  for (const auto& d : inputDescrs) {
-    if (d.rank == rank) {
-      inputBytes += d.numel * itemsize;
-    }
-  }
-  for (const auto& d : outputDescrs) {
-    if (d.rank == rank) {
-      outputBytes += d.numel * itemsize;
-    }
-  }
-  size_t localCopyBytes = 0;
-  for (const auto& r : op->reads) {
-    readBytes += r.bytes;
-  }
-  for (const auto& lc : op->localInputCopies) {
-    localCopyBytes += lc.bytes;
-  }
-
-  log.info("compile_op[%u]: rank %zu/%zu, %zu inputs (%zu bytes), %zu outputs (%zu bytes), %zu tensor_ids "
-           "-> %zu reads (%zu bytes), %zu local copies (%zu bytes), %zu input copies, %zu output copies\n",
-      op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes,
-      tensorIdNdim.size(), op->reads.size(), readBytes, op->localInputCopies.size(), localCopyBytes,
-      op->inputCopies.size(), op->outputCopies.size());
-
-  // ============================================================================
-  // Auto-tuning: compile a per-op copy kernel with tuned (depth, blockSize)
-  // ============================================================================
-  // For v8 (codegen DSL) and v9 (PTX) all-local ops with CUDA copies.
-  // Tuning runs microbenchmarks on this GPU and caches results by (arch, size category).
-
-  int kernelVersion = ctx.group->compileOpKernels->version;
-
-  if ((kernelVersion == 8 || kernelVersion == 9) && op->allLocal &&
-      (!op->localInputCopies.empty() || !op->multicastSources.empty())) {
-    // Find the dominant size category (largest total bytes per category)
-    size_t bytesPerCat[4] = {};
-    for (const auto& lic : op->localInputCopies) {
-      SizeCategory cat = sizeCategoryFor(lic.bytes);
-      bytesPerCat[static_cast<int>(cat)] += lic.bytes;
-    }
-    for (const auto& ms : op->multicastSources) {
-      SizeCategory cat = sizeCategoryFor(ms.bytes);
-      bytesPerCat[static_cast<int>(cat)] += ms.bytes;
-    }
-    SizeCategory dominantCat = SizeCategory::Small;
-    size_t maxBytes = 0;
-    for (int i = 0; i < 4; i++) {
-      if (bytesPerCat[i] > maxBytes) {
-        maxBytes = bytesPerCat[i];
-        dominantCat = static_cast<SizeCategory>(i);
+    for (size_t i : range(size)) {
+      if (i == rank) {
+        continue;
+      }
+      Vector<CustomOpDescriptor::Edge> cuda;
+      Vector<CustomOpDescriptor::Edge> rdma;
+      ctx.receive(i, cuda, rdma);
+      for (auto& v : cuda) {
+        op->cudaEdges.push_back(v);
+      }
+      for (auto& v : rdma) {
+        op->rdmaEdges.push_back(v);
       }
     }
-
-    // Get compute arch for cache key
-    CUdevice cuDevice = ctx.group->cuDevice;
-    int computeMajor = 0, computeMinor = 0;
-    CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
-    CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
-    int computeArch = computeMajor * 10 + computeMinor;
-
-    // Use separate cache keys for v8 and v9 so they don't interfere
-    TuningKey key{computeArch * 100 + kernelVersion, dominantCat};
-    TuningResult result;
-    bool needsTuning = false;
 
     {
-      std::lock_guard lock(tuningCacheMutex);
-      needsTuning = !tuningCacheLookup(key, result);
+      // fixme sort
+
+      // Log RDMA edges
+      for (size_t i : indices(op->rdmaEdges)) {
+        const auto& e = op->rdmaEdges[i];
+        std::string srcStr, dstStr;
+        for (const auto& s : e.sources) {
+          if (!srcStr.empty()) {
+            srcStr += ", ";
+          }
+          srcStr += fmt::sprintf("r%u:t%u+%zu", s.rank, s.tensorIndex, s.offset);
+        }
+        for (const auto& d : e.destinations) {
+          if (!dstStr.empty()) {
+            dstStr += ", ";
+          }
+          dstStr += fmt::sprintf("r%u:t%u+%zu", d.rank, d.tensorIndex, d.offset);
+        }
+        log.info("  rdmaEdge[%zu]: %zuB cell=%u [%s] -> [%s]\n", i, e.bytes, e.cellIndex, srcStr, dstStr);
+      }
+
+      // Log CUDA edges
+      for (size_t i : indices(op->cudaEdges)) {
+        const auto& e = op->cudaEdges[i];
+        std::string srcStr, dstStr;
+        for (const auto& s : e.sources) {
+          if (!srcStr.empty()) {
+            srcStr += ", ";
+          }
+          srcStr += fmt::sprintf("r%u:t%u+%zu", s.rank, s.tensorIndex, s.offset);
+        }
+        for (const auto& d : e.destinations) {
+          if (!dstStr.empty()) {
+            dstStr += ", ";
+          }
+          dstStr += fmt::sprintf("r%u:t%u+%zu", d.rank, d.tensorIndex, d.offset);
+        }
+        log.info("  cudaEdge[%zu]: %zuB cell=%u [%s] -> [%s]\n", i, e.bytes, e.cellIndex, srcStr, dstStr);
+      }
     }
 
-    if (needsTuning) {
-      // Reset barrier arrays before tuning — tuning kernels use the same
-      // barrier memory as production kernels and would leave stale values.
-      ctx.resetBarriers();
+    // Add outputCopies
+    for (const auto& oc : outputCopyList) {
+      CustomOpDescriptor::Copy c;
+      c.index = oc.outputIndex;
+      c.offset = {oc.offset.begin(), oc.offset.end()};
+      c.shape = {oc.shape.begin(), oc.shape.end()};
+      op->outputCopies.push_back(std::move(c));
+    }
 
-      if (kernelVersion == 9) {
-        result = tuneCopyKernelV9(ctx, dominantCat);
-      } else {
+    // Final barrier
+    ctx.barrier();
+
+    log.debug("compile_op phase5: rank %d, %d rdma, %d cuda, %d local copies, %d output copies\n", rank,
+        op->rdmaEdges.size(), op->cudaEdges.size(), op->inputCopies.size(), op->outputCopies.size());
+
+    constructCudaTensorMappings(*op);
+
+    // // Compute byte counts for logging
+    // size_t inputBytes = 0, outputBytes = 0, readBytes = 0;
+    // for (const auto& d : inputDescrs) {
+    //   if (d.rank == rank) {
+    //     inputBytes += d.numel * itemsize;
+    //   }
+    // }
+    // for (const auto& d : outputDescrs) {
+    //   if (d.rank == rank) {
+    //     outputBytes += d.numel * itemsize;
+    //   }
+    // }
+    // size_t localCopyBytes = 0;
+    // for (const auto& r : op->reads) {
+    //   readBytes += r.bytes;
+    // }
+    // for (const auto& lc : op->localInputCopies) {
+    //   localCopyBytes += lc.bytes;
+    // }
+
+    // log.info("compile_op[%u]: rank %zu/%zu, %zu inputs (%zu bytes), %zu outputs (%zu bytes), %zu tensor_ids "
+    //          "-> %zu reads (%zu bytes), %zu local copies (%zu bytes), %zu input copies, %zu output copies\n",
+    //     op->id, rank, size, myInputIndices.size(), inputBytes, outputsPerRank[rank].size(), outputBytes,
+    //     tensorIdNdim.size(), op->reads.size(), readBytes, op->localInputCopies.size(), localCopyBytes,
+    //     op->inputCopies.size(), op->outputCopies.size());
+
+    if (!op->cudaEdges.empty()) {
+      size_t bytesPerCat[4] = {};
+      for (auto& v : op->cudaEdges) {
+        bytesPerCat[(size_t)sizeCategoryFor(v.bytes)] += v.bytes;
+      }
+      SizeCategory dominantCat = SizeCategory::Small;
+      size_t maxBytes = 0;
+      for (int i = 0; i < 4; i++) {
+        if (bytesPerCat[i] > maxBytes) {
+          maxBytes = bytesPerCat[i];
+          dominantCat = static_cast<SizeCategory>(i);
+        }
+      }
+
+      // Get compute arch for cache key
+      CUdevice cuDevice = group->cuDevice;
+      int computeMajor = 0, computeMinor = 0;
+      CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+      CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+      int computeArch = computeMajor * 10 + computeMinor;
+
+      TuningKey key{computeArch, dominantCat};
+      TuningResult result;
+      bool needsTuning = false;
+
+      {
+        std::lock_guard lock(tuningCacheMutex);
+        needsTuning = !tuningCacheLookup(key, result);
+      }
+
+      if (needsTuning) {
+        // Reset barrier arrays before tuning — tuning kernels use the same
+        // barrier memory as production kernels and would leave stale values.
+        ctx.resetBarriers();
+
         result = tuneCopyKernel(ctx, dominantCat);
+
+        // Reset barrier arrays after tuning — clear residual step values
+        // from tuning iterations before production kernels start.
+        ctx.resetBarriers();
+        std::lock_guard lock(tuningCacheMutex);
+        // Double-check: another thread might have tuned while we were running
+        TuningResult existing;
+        if (!tuningCacheLookup(key, existing)) {
+          tuningCacheStore(key, result);
+        } else {
+          result = existing;
+        }
       }
 
-      // Reset barrier arrays after tuning — clear residual step values
-      // from tuning iterations before production kernels start.
-      ctx.resetBarriers();
-      std::lock_guard lock(tuningCacheMutex);
-      // Double-check: another thread might have tuned while we were running
-      TuningResult existing;
-      if (!tuningCacheLookup(key, existing)) {
-        tuningCacheStore(key, result);
-      } else {
-        result = existing;
-      }
+      log.info("compile_op[%u]: auto-tuned kernel %s (%.3f ms)\n", op->id, formatConfig(result.config), result.ms);
+      op->tunedConfig = result.config;
     }
 
-    // Debug override: skip shared→global write-back (applied post-tuning since
-    // it doesn't affect tuning performance — the write-back is just skipped).
-    if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
-      result.config.bulkSkipWriteBack = true;
-    }
+    if (!op->cudaEdges.empty()) {
+      CUdevice cuDevice = group->cuDevice;
+      int computeMajor = 0, computeMinor = 0;
+      CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+      CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
 
-    // Generate and compile the final kernel with the tuned config
-    log.info("compile_op[%u]: auto-tuned kernel %s (%.3f ms)\n", op->id, formatConfig(result.config), result.ms);
-
-    if (kernelVersion == 9) {
       const char* target = computeTarget(computeMajor, computeMinor);
-      std::string ptx = generateCopyKernelPtx(ctx.group, result.config, target);
+      std::string ptx = generateCopyKernelPtx(group, op->tunedConfig, target, *op, ctx);
       if (std::getenv("MOODIST_DUMP_KERNELS")) {
         std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
         FILE* f = fopen(fn.c_str(), "wb");
@@ -2042,39 +1658,18 @@ std::shared_ptr<CustomOpDescriptor> compile(const CompileContext& ctx, DType dty
         }
       }
       op->tunedKernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-      // Opt in to larger shared memory if needed
-      if (!strcmp(result.config.copyEngine, "bulk")) {
-        size_t chunk = result.config.bulkChunkSize.value();
-        size_t numWarps = result.config.blockSize / 32;
-        size_t totalSmem;
-        if (!strcmp(result.config.bulkMode.value(), "warppipe")) {
-          totalSmem = chunk + numWarps * 2 * 8;
-        } else if (!strcmp(result.config.bulkMode.value(), "nbuf")) {
-          totalSmem = chunk + numWarps * result.config.nbufReadCount.value() * 8;
-        } else {
-          totalSmem = 2 * chunk + 2 * numWarps * 8;
-        }
-        // if (totalSmem > 48 * 1024) {
-        //   CHECK_CU(cuFuncSetAttribute(
-        //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
-        // }
-      } else if (!strcmp(result.config.copyEngine, "flexbuf")) {
-        // size_t totalSmem = result.config.bulkChunkSize.value() + result.config.flexNumBuffers.value() * 8;
-        // if (totalSmem > 48 * 1024) {
-        //   CHECK_CU(cuFuncSetAttribute(
-        //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
-        // }
-      }
-    } else {
-      std::string finalSource =
-          generateCopyKernel(ctx.group, result.config.gridSize, result.config.blockSize, result.config.depth.value());
-      op->tunedKernel = std::make_unique<CompiledKernel>(compileKernel(
-          finalSource, "compile_op_copy", cuDevice, fmt::sprintf("moodist-tuned-rank%zu-op%u", rank, op->id).c_str()));
     }
-    op->tunedConfig = result.config;
-  }
 
-  return op;
+    return op;
+  }
+};
+
+} // namespace
+
+std::shared_ptr<CustomOpDescriptor> compile(CompileContext& ctx, DType dtype, std::span<const api::TensorRegion> inputs,
+    std::span<const api::TensorRegion> outputs, ReduceOp reduce, bool cpuSync) {
+
+  return CompileOpConstructor(ctx).compile(dtype, inputs, outputs, reduce, cpuSync);
 }
 
 } // namespace compile_op
