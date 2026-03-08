@@ -175,7 +175,6 @@ set(core_sources
   core/async.cc
   core/compile_op.cc
   core/compile_op_kernel.cc
-  core/codegen.cc
   core/connection.cc
   core/cpu_allocator.cc
   core/cputhread.cc
