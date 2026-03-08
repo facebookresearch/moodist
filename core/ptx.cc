@@ -31,9 +31,16 @@ Value addShared(int align, int sizeBytes, const char* suffix) {
   std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
   return globalAddr(sym.c_str());
 }
-Value addGlobalVar(const char* type, int count, const char* suffix) {
-  std::string sym = currentModule->addGlobal(type, count, suffix);
-  return globalAddr(sym.c_str());
+Value addGlobalVar(int align, int sizeBytes, const char* suffix) {
+  static int counter = 0;
+  std::string name = std::string("global_") + (suffix ? suffix : std::to_string(counter++));
+  std::string decl = ".global .align " + std::to_string(align) + " .b8 " + name + "[" + std::to_string(sizeBytes) + "]";
+  currentModule->globals.push_back(decl);
+  return globalAddr(name.c_str());
+}
+Value addConst32(int align, const void* data, size_t size, const char* name) {
+  currentModule->addConst(align, data, size, name);
+  return constAddr(name);
 }
 void setBlock(Block* b) {
   currentBlock = b;
@@ -204,6 +211,21 @@ std::string Module::addGlobal(const char* type, int count, const char* name) {
   if (count > 1) {
     decl += "[" + std::to_string(count) + "]";
   }
+  globals.push_back(decl);
+  return name;
+}
+
+std::string Module::addConst(int align, const void* data, size_t size, const char* name) {
+  // Emit: .const .align A .b8 name[SIZE] = {b0, b1, b2, ...};
+  std::string decl = ".const .align " + std::to_string(align) + " .b8 " + name + "[" + std::to_string(size) + "] = {";
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; i++) {
+    if (i > 0) {
+      decl += ',';
+    }
+    decl += std::to_string(bytes[i]);
+  }
+  decl += "}";
   globals.push_back(decl);
   return name;
 }
@@ -432,6 +454,15 @@ void ld_global_u32(const Value& d, const Value& addr) {
 void ld_global_u64(const Value& d, const Value& addr) {
   emitInst("ld.global.u64 " + d.str() + ", [" + addr.str() + "]");
 }
+void ld_const_u32(const Value& d, const Value& addr) {
+  emitInst("ld.const.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+void ld_const_u64(const Value& d, const Value& addr) {
+  emitInst("ld.const.u64 " + d.str() + ", [" + addr.str() + "]");
+}
+void ld_const_u8(const Value& d, const Value& addr) {
+  emitInst("ld.const.u8 " + d.str() + ", [" + addr.str() + "]");
+}
 void ld_global_volatile_u32(const Value& d, const Value& addr) {
   emitInst("ld.global.volatile.u32 " + d.str() + ", [" + addr.str() + "]");
 }
@@ -527,10 +558,22 @@ void bra(const Block* target) {
   emitInst("bra " + target->label);
 }
 void bra(const Value& pred, const Block* target) {
-  emitInst("@" + pred.str() + " bra " + target->label);
+  emitInst("@" + pred.str() + " bra.uni " + target->label);
 }
 void bra_not(const Value& pred, const Block* target) {
-  emitInst("@!" + pred.str() + " bra " + target->label);
+  emitInst("@!" + pred.str() + " bra.uni " + target->label);
+}
+void brx_idx(const Value& index, const std::vector<Label>& targets) {
+  std::string targetList;
+  for (const auto& t : targets) {
+    if (!targetList.empty()) {
+      targetList += ", ";
+    }
+    targetList += t.rawPtr->label;
+  }
+  std::string tsLabel = "ts_" + std::to_string(currentFunction->brxCounter++);
+  emitInst(tsLabel + ": .branchtargets " + targetList);
+  emitInst("brx.idx.uni " + index.str() + ", " + tsLabel);
 }
 void ret() {
   emitInst("ret");
@@ -651,7 +694,8 @@ void cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value
 }
 
 void multimem_cp_async_bulk_global_shared(const Value& dst, const Value& src, const Value& size) {
-  emitInst("multimem.cp.async.bulk.global.shared::cta.bulk_group [" + dst.str() + "], [" + src.str() + "], " + size.str());
+  emitInst(
+      "multimem.cp.async.bulk.global.shared::cta.bulk_group [" + dst.str() + "], [" + src.str() + "], " + size.str());
 }
 
 void cp_async_bulk_prefetch_l2(const Value& src, const Value& size) {
@@ -753,11 +797,6 @@ void emit(const std::string& inst) {
 // DSL layer
 // ---------------------------------------------------------------------------
 
-// TLS state for DSL register allocation
-static thread_local std::vector<int> freeRegs[4];
-static thread_local int regHighWater[4] = {};
-static thread_local int labelCounter = 0;
-
 // --- ValType ---
 
 RegType regTypeFor(ValType type) {
@@ -787,31 +826,33 @@ RegType regTypeFor(ValType type) {
 
 Value::Value(ValType t) : type(t), kind(Register) {
   RegType rt = regTypeFor(t);
-  auto& free = freeRegs[(int)rt];
-  int id;
-  if (!free.empty()) {
-    id = free.back();
-    free.pop_back();
-  } else {
-    id = regHighWater[(int)rt]++;
-  }
+  // auto& free = currentFunction->freeRegs[(int)rt];
+  // int id;
+  // if (!free.empty() && false) {
+  //   id = free.back();
+  //   free.pop_back();
+  // } else {
+  //   id = currentFunction->regHighWater[(int)rt]++;
+  // }
+  int id = currentFunction->regHighWater[(int)rt]++;
   reg.type = rt;
   reg.id = id;
   reg.name = std::string(regPrefix(rt)) + std::to_string(id);
   valid = true;
 }
 
-Value::Value(int32_t v) : type(ValType::U32), kind(Immediate), immStr(std::to_string(v)) {}
-
-Value::Value(uint32_t v) : type(ValType::U32), kind(Immediate), immStr(std::to_string(v)) {}
-
-Value::Value(int64_t v) : type(ValType::U64), kind(Immediate), immStr(std::to_string(v)) {}
-
-Value::Value(uint64_t v) : type(ValType::U64), kind(Immediate), immStr(std::to_string(v)) {}
-
-Value::Value(const char* s) : type(ValType::U64), kind(Immediate), immStr(s) {}
+Value::Value(ValType type, std::string s) : type(type), kind(Immediate), immStr(s), valid(true) {}
 
 Value::Value(const Reg& r, ValType t) : reg(r), type(t), valid(true), kind(Register) {}
+
+Value Value::imm(ValType type, int64_t v) {
+  Value r;
+  r.type = type;
+  r.kind = Immediate;
+  r.immStr = std::to_string(v);
+  r.valid = true;
+  return r;
+}
 
 const std::string& Value::str() const {
   if (kind == Register) {
@@ -822,19 +863,19 @@ const std::string& Value::str() const {
 
 Value::~Value() {
   if (valid && kind == Register) {
-    freeRegs[(int)reg.type].push_back(reg.id);
+    // currentFunction->freeRegs[(int)reg.type].push_back(reg.id);
   }
 }
 
-Value::Value(Value&& o) noexcept
+Value::Value(Value&& o)
     : reg(std::move(o.reg)), type(o.type), valid(o.valid), kind(o.kind), immStr(std::move(o.immStr)) {
   o.valid = false;
   o.kind = None;
 }
 
-Value& Value::operator=(Value&& o) noexcept {
+Value& Value::operator=(Value&& o) {
   if (this != &o) {
-    if (valid && kind == Register && o.valid && o.kind == Register) {
+    if (valid && kind == Register && o.valid) {
       // Already has a register in emitted PTX — emit mov to preserve it
       if (regTypeFor(type) == regTypeFor(o.type)) {
         switch (regTypeFor(type)) {
@@ -847,16 +888,18 @@ Value& Value::operator=(Value&& o) noexcept {
         default:
           break;
         }
+      } else {
+        throw std::runtime_error("bad assignment");
       }
       // Free the source register
-      freeRegs[(int)o.reg.type].push_back(o.reg.id);
+      // currentFunction->freeRegs[(int)o.reg.type].push_back(o.reg.id);
       o.valid = false;
       o.kind = None;
     } else {
-      // Uninitialized destination — just transfer ownership
-      if (valid && kind == Register) {
-        freeRegs[(int)reg.type].push_back(reg.id);
-      }
+      // // Uninitialized destination — just transfer ownership
+      // if (valid && kind == Register) {
+      //   currentFunction->freeRegs[(int)reg.type].push_back(reg.id);
+      // }
       reg = std::move(o.reg);
       type = o.type;
       valid = o.valid;
@@ -875,10 +918,10 @@ Value& Value::operator=(int64_t v) {
     emitInst("setp.ne.u32 " + str() + ", " + std::to_string(v) + ", 0");
     break;
   case RegType::B32:
-    mov_u32(*this, Value((int32_t)v));
+    mov_u32(*this, Value::imm(type, v));
     break;
   case RegType::B64:
-    mov_u64(*this, Value(v));
+    mov_u64(*this, Value::imm(type, v));
     break;
   default:
     unsupported("=(imm)", type);
@@ -1321,16 +1364,11 @@ void Value::operator^=(const Value& b) {
 
 FunctionScope::FunctionScope(Function* f) : fn(f) {
   setFunction(f);
-  for (int i = 0; i < 4; i++) {
-    freeRegs[i].clear();
-    regHighWater[i] = 0;
-  }
-  labelCounter = 0;
 }
 
 FunctionScope::~FunctionScope() {
   for (int i = 0; i < 4; i++) {
-    fn->regCounts[i] = regHighWater[i];
+    fn->regCounts[i] = fn->regHighWater[i];
   }
   setFunction(nullptr);
 }
@@ -1338,7 +1376,7 @@ FunctionScope::~FunctionScope() {
 // --- Block activation ---
 
 static std::string genLabel(const char* prefix) {
-  return std::string("L_") + prefix + "_" + std::to_string(labelCounter++);
+  return std::string("L_") + prefix + "_" + std::to_string(currentFunction->labelCounter++);
 }
 
 static void activateBlock(std::unique_ptr<Block> block) {
@@ -1400,7 +1438,7 @@ ScopeGuard _Else() {
   // Insert unconditional branch to endif at end of previous block (then block)
   auto& blocks = currentFunction->blocks;
   Block* prevBlock = blocks[blocks.size() - 2].get();
-  prevBlock->emit("bra " + sg.pendingBlock->label);
+  prevBlock->emit("bra.uni " + sg.pendingBlock->label);
   // Current block (the IF's skip target) becomes the else block — already active
   return sg;
 }
@@ -1456,28 +1494,32 @@ PredGuard::~PredGuard() {
 
 // --- Convenience functions ---
 
-Value threadIdx_x() {
-  Value v(ValType::U32);
-  mov_u32(v, "%tid.x");
-  return v;
+u32 special32(std::string name) {
+  u32 r;
+  r = Value(ValType::U32, name);
+  return r;
 }
 
-Value blockIdx_x() {
-  Value v(ValType::U32);
-  mov_u32(v, "%ctaid.x");
-  return v;
+u64 special64(std::string name) {
+  u64 r;
+  r = Value(ValType::U64, name);
+  return r;
 }
 
-Value blockDim_x() {
-  Value v(ValType::U32);
-  mov_u32(v, "%ntid.x");
-  return v;
+u32 threadIdx_x() {
+  return special32("%tid.x");
 }
 
-Value clock64() {
-  Value v(ValType::U64);
-  mov_u64(v, Value("%clock64"));
-  return v;
+u32 blockIdx_x() {
+  return special32("%ctaid.x");
+}
+
+u32 blockDim_x() {
+  return special32("%ntid.x");
+}
+
+u64 clock64() {
+  return special64("%clock64");
 }
 
 Value loadParam(int index, ValType type) {
@@ -1497,8 +1539,8 @@ Value loadParam(int index, ValType type) {
 }
 
 Value paramBase(int index) {
-  Value v(ValType::U64);
-  mov_b64(v, Value(currentFunction->param(index).c_str()));
+  Value v(ValType::U32);
+  mov_u32(v, Value(ValType::U32, currentFunction->param(index).c_str()));
   return v;
 }
 
@@ -1700,7 +1742,13 @@ Value atomicInc(const Value& addr, const Value& modulo) {
 
 Value globalAddr(const char* name) {
   Value v(ValType::U64);
-  mov_u64(v, Value(name));
+  mov_u64(v, Value(ValType::U64, name));
+  return v;
+}
+
+Value constAddr(const char* name) {
+  Value v(ValType::U32);
+  emitInst(std::string("mov.u32 ") + v.str() + ", " + name);
   return v;
 }
 
@@ -1715,174 +1763,11 @@ Value addShared32(int align, int sizeBytes, const char* suffix) {
   return sharedAddr(sym.c_str());
 }
 
-Value hexImm(uintptr_t value) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)value);
-  return Value(buf);
-}
-
-// ---------------------------------------------------------------------------
-// ptxTest
-// ---------------------------------------------------------------------------
-
-std::string ptxTest(const char* target) {
-  Module mod;
-  mod.target = target;
-  setModule(&mod);
-
-  // --- Test 1: simple tid write ---
-  auto* fn = mod.newFunction("test_write_tid");
-  {
-    FunctionScope fnScope(fn);
-    fn->maxThreads = 256;
-    fn->addParam(".u64"); // output pointer
-    fn->addParam(".u32"); // count
-
-    activateNewBlock("entry");
-
-    auto outPtr = loadParam(0, ValType::U64);
-    auto count = loadParam(1, ValType::U32);
-    auto tid = threadIdx_x();
-
-    IF(tid < count) {
-      auto addr = outPtr + widen(tid) * 4;
-      storeGlobal(addr, tid);
-    }
-
-    ret();
-  }
-
-  // --- Test 2: vectorized copy (4 x u32 per thread) ---
-  auto* fn2 = mod.newFunction("test_copy_v4");
-  {
-    FunctionScope fnScope(fn2);
-    fn2->maxThreads = 256;
-    fn2->addParam(".u64"); // dst pointer
-    fn2->addParam(".u64"); // src pointer
-    fn2->addParam(".u32"); // count (number of u32 elements)
-
-    activateNewBlock("entry");
-
-    auto dst = loadParam(0, ValType::U64);
-    auto src = loadParam(1, ValType::U64);
-    auto count = loadParam(2, ValType::U32);
-
-    // Global thread ID
-    auto tid = threadIdx_x();
-    auto bid = blockIdx_x();
-    auto bdim = blockDim_x();
-    auto gid = bid * bdim + tid;
-
-    // Each thread handles 4 elements
-    auto base = gid * 4;
-
-    IF(base < count) {
-      // Byte offset for v4 u32 (16 bytes per group)
-      auto byteOff = widen(base) * 4;
-      auto srcAddr = src + byteOff;
-      auto dstAddr = dst + byteOff;
-
-      // Load 4 x u32 from src
-      Value v0(ValType::U32);
-      Value v1(ValType::U32);
-      Value v2(ValType::U32);
-      Value v3(ValType::U32);
-      ld_global_cv_v4_u32(v0, v1, v2, v3, srcAddr);
-
-      // Store 4 x u32 to dst
-      st_global_wt_v4_u32(dstAddr, v0, v1, v2, v3);
-    }
-    ELSE {
-      // Out of bounds — write zeros to dst
-      auto byteOff = widen(base) * 4;
-      auto dstAddr = dst + byteOff;
-      Value zero(ValType::U32);
-      zero = 0;
-      st_global_wt_v4_u32(dstAddr, zero, zero, zero, zero);
-    }
-
-    // Second bounds check — flush after copy
-    IF(gid == 0) {
-      membar_sys();
-    }
-
-    ret();
-  }
-
-  // --- Test 3: strided loop (WHILE test) ---
-  auto* fn3 = mod.newFunction("test_strided_copy");
-  {
-    FunctionScope fnScope(fn3);
-    fn3->maxThreads = 256;
-    fn3->addParam(".u64"); // dst pointer
-    fn3->addParam(".u64"); // src pointer
-    fn3->addParam(".u32"); // count (number of u32 elements)
-
-    activateNewBlock("entry");
-
-    auto dst = loadParam(0, ValType::U64);
-    auto src = loadParam(1, ValType::U64);
-    auto count = loadParam(2, ValType::U32);
-
-    auto tid = threadIdx_x();
-    auto bdim = blockDim_x();
-    auto bid = blockIdx_x();
-    auto i = bid * bdim + tid;
-
-    WHILE(i < count) {
-      auto byteOff = widen(i) * 4;
-      auto srcAddr = src + byteOff;
-      auto dstAddr = dst + byteOff;
-      auto val = Value(ValType::U32);
-      ld_global_u32(val, srcAddr);
-      st_global_u32(dstAddr, val);
-      i += bdim;
-    }
-
-    ret();
-  }
-
-  // --- Test 4: struct param loading ---
-  // Mimics loading from CompileOpCopyParameters:
-  //   offset 0: u32 stepValue
-  //   offset 4: u32 concurrencyIndex
-  //   offset 8: u32 numDescriptors
-  //   offset 16: CopyDescriptor descriptors[] (each 24 bytes: u64 src, u64 dst, u32 bytes)
-  auto* fn4 = mod.newFunction("test_struct_param");
-  {
-    FunctionScope fnScope(fn4);
-    fn4->maxThreads = 256;
-    fn4->addParamBytes(8, 4816); // .param .align 8 .b8 param[4816]
-
-    activateNewBlock("entry");
-
-    auto params = paramBase(0);
-    auto numDesc = loadParamField(params, 8, ValType::U32);
-    auto tid = threadIdx_x();
-
-    // Load first descriptor's src and dst
-    auto descBase = params + 16; // offset of descriptors[0]
-    auto src = loadParamField(descBase, 0, ValType::U64);
-    auto dst = loadParamField(descBase, 8, ValType::U64);
-    auto bytes = loadParamField(descBase, 16, ValType::U32);
-
-    // Simple copy: each thread copies one u32
-    IF(tid < bytes) {
-      auto off = widen(tid);
-      auto srcAddr = src + off;
-      auto dstAddr = dst + off;
-      Value v(ValType::U32);
-      ld_global_u32(v, srcAddr);
-      st_global_u32(dstAddr, v);
-    }
-
-    ret();
-  }
-
-  std::string ptx = mod.finalize();
-  printf("=== PTX Test Output ===\n%s\n", ptx.c_str());
-  return ptx;
-}
+// Value hexImm(uintptr_t value) {
+//   char buf[32];
+//   snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)value);
+//   return Value(buf);
+// }
 
 } // namespace ptx
 } // namespace moodist
