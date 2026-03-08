@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "buffer.h"
 #include "common.h"
 
 #include <array>
@@ -10,6 +11,7 @@ namespace moodist {
 
 struct TensorData {
   AllocatedCpuBufferSharedPtr buffer;
+  SharedBufferHandle bufferHandle;
   uintptr_t dataPtr;
   size_t dataBytes;
   int dtype; // Stores torch::ScalarType value (matches moodist::DType in moodist_api.h)
@@ -18,6 +20,7 @@ struct TensorData {
 
   void clear() {
     buffer = {};
+    bufferHandle = {};
     dtype = -1;
     shape.clear();
     dataPtr = 0;

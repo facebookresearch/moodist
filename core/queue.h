@@ -4,8 +4,9 @@
 
 #include "api/tensor_ptr.h"
 #include "api/types.h"
-#include "commondefs.h"
+#include "buffer.h"
 #include "shared_ptr.h"
+#include "tensor_types.h"
 
 #include <memory>
 #include <optional>
@@ -41,9 +42,11 @@ struct Queue : api::Queue {
   Queue& operator=(Queue) = delete;
   ~Queue();
   // Returns (tensor, queue_size). Returns empty TensorPtr if no data.
-  std::pair<TensorPtr, size_t> get(bool block = true, std::optional<float> timeout = {});
+  TensorPtr getTensor(bool block = true, std::optional<float> timeout = {}, size_t* queueSize = nullptr);
+  TensorDataPtr get(bool block = true, std::optional<float> timeout = {}, size_t* queueSize = nullptr);
   // Takes a copy of the TensorPtr (refcount handled automatically).
-  QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true);
+  QueueWork putTensor(TensorPtr value, uint32_t transactionKey = 0, bool waitOnDestroy = true);
+  QueueWork putBuffer(BufferHandle value, uint32_t transactionKey = 0, bool waitOnDestroy = false);
   size_t qsize() const;
   bool wait(std::optional<float> timeout) const;
 
