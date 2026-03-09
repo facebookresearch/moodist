@@ -1132,13 +1132,13 @@ struct EmitLockstep : EmitSingleCopy {
     //   GOTO(alldone);
     // }
 
-    IF(laneIndex == 0) {
+    Value isLeader = laneIndex == 0;
+
+    IF_D(isLeader) {
       st_shared_release_cta_u32(sharedOffset, blockIndex * bufferSize);
       mbarrier_init(barrier, 1);
     }
     barrier_sync();
-
-    Value isLeader = laneIndex == 0;
 
     IF(pairIndex != 0) {
       GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
@@ -1165,7 +1165,7 @@ struct EmitLockstep : EmitSingleCopy {
 
       u32 size = min_u32(bytes - offset, bufferSize);
 
-      IF(isLeader) {
+      IF_D(isLeader) {
         cp_async_bulk_wait_group_read(0);
         mbarrier_expect_tx(barrier, size);
         mbarrier_arrive_noComplete(barrier);
@@ -1174,7 +1174,7 @@ struct EmitLockstep : EmitSingleCopy {
 
       bar_red_or(syncIndex, 64, 0);
 
-      IF(isLeader) {
+      IF_D(isLeader) {
         mbarrier_wait_parity(barrier, parity);
         cp_async_bulk_global_shared(dstaddr, buffer, size);
         // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
@@ -1187,7 +1187,7 @@ struct EmitLockstep : EmitSingleCopy {
     GOTO(loop);
 
     LABEL(alldone);
-    IF(isLeader) {
+    IF_D(isLeader) {
       cp_async_bulk_wait_group_read(0);
     }
     barrier_sync();
@@ -1331,6 +1331,7 @@ KernelMappedBuffers mapn(
   Vector<uintptr_t> mapped(ranks.size());
   for (size_t i : indices(ranks)) {
     if (ranks[i] == rank) {
+      mapped[i] = local->buffer.cudaPointer;
       continue;
     }
     size_t peerIndex = ctx.group->getPeerIndex(ranks[i]);
@@ -1339,7 +1340,6 @@ KernelMappedBuffers mapn(
   ctx.group->ipcMapper->wait();
 
   for (size_t i : indices(ranks)) {
-    log.info("%d: put mapped %d -> %#x\n", rank, ranks[i], mapped[i]);
     ctx.send(ranks[i], mapped[i], local->itembytes);
   }
   r.remote.resize(ranks.size());
@@ -1347,8 +1347,6 @@ KernelMappedBuffers mapn(
     size_t itembytes;
     ctx.receive(ranks[i], r.remote[i].base, itembytes);
     r.remote[i].itembytes = itembytes;
-
-    log.info("%d: got mapped %d -> %#x\n", rank, ranks[i], r.remote[i].base);
   }
 
   return r;
@@ -1380,22 +1378,50 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     mod.addGlobal(".u64", 1, "debug_clock_ref");
   }
 
+  CHECK(!op.cudaEdges.empty());
+
   Vector<uint32_t> ranks;
+  Vector<uint64_t> localNodes;
   for (auto& v : op.cudaEdges) {
-    for (auto& l : {v.sources, v.destinations}) {
-      for (auto& x : l) {
+    for (auto& l : {&v.sources, &v.destinations}) {
+      for (auto& x : *l) {
         if (std::ranges::find(ranks, x.rank) == ranks.end()) {
           ranks.push_back(x.rank);
+        }
+        if (std::ranges::find(localNodes, x.id) == localNodes.end()) {
+          localNodes.push_back(x.id);
         }
       }
     }
   }
   std::ranges::sort(ranks);
 
-  CHECK(!op.cudaEdges.empty());
+  using Edge = CustomOpDescriptor::Edge;
+  using Node = CustomOpDescriptor::Node;
+
+  // HashMap<uint32_t, Vector<Node>> sourceNodes;
+  // HashMap<uint32_t, Vector<Node>> destinationNodes;
+
+  // for (auto& e : op.cudaEdges) {
+  //   CHECK(e.sources.size() >= 1);
+  //   CHECK(e.destinations.size() >= 1);
+  //   bool outgoing = e.sources[0].rank == rank;
+  //   bool filled = e.sources[0].filled;
+  //   for (auto& n : e.sources) {
+  //     CHECK((n.rank == rank) == outgoing);
+  //     CHECK(n.filled == filled);
+  //   }
+  //   for (auto& n : e.sources) {
+  //     sourceNodes[n.rank].push_back(n);
+  //   }
+  //   for (auto& n : e.destinations) {
+  //   }
+  // }
 
   auto rankIndex = [&](uint32_t rank) {
-    return std::ranges::find(ranks, rank) - ranks.begin();
+    auto it = std::ranges::find(ranks, rank);
+    CHECK(it != ranks.end());
+    return it - ranks.begin();
   };
 
   size_t myIndex = rankIndex(rank);
@@ -1409,12 +1435,44 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     ctx.receive(ranks[i], myPeerIndex[i]);
   }
 
+  struct SyncIndex {
+    size_t index;
+    size_t stride;
+  };
+
+  HashMap<uint32_t, HashMap<uint64_t, SyncIndex>> dependencyIndices;
+
+  for (size_t r : ranks) {
+    ctx.send(r, localNodes);
+  }
+  for (size_t r : ranks) {
+    Vector<uint64_t> nn;
+    ctx.receive(r, nn);
+    for (size_t i : indices(nn)) {
+      uint64_t id = nn[i];
+      SyncIndex si;
+      si.index = i;
+      si.stride = nn.size();
+      CHECK(!dependencyIndices[r].contains(id));
+      dependencyIndices[r][id] = si;
+    }
+  }
+
   auto map = [&](std::string name, size_t bytes) {
     return mapn(ctx, name, ranks, bytes);
   };
 
   auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
   auto addrAddrs = map("addresses", sizeof(uint64_t) * op.localCudaTensorMappings.size() * numBlocks);
+
+  auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
+
+  auto busyWait = [&](u64 addr, u32 value) {
+    IF(ld_global_acquire_sys_u32(addr) < value) {
+      WHILE(ld_global_relaxed_sys_u32(addr) < value) {}
+      fence_acquire_sys();
+    }
+  };
 
   auto* fn = mod.newFunction("compile_op_copy");
   {
@@ -1475,7 +1533,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     }
     CHECK(emit != nullptr);
     emit->init();
-    IF(threadIndex == 0) {
+    IF_D(threadIndex == 0) {
       for (size_t i : indices(op.remoteCudaTensorMappings)) {
         auto& v = op.remoteCudaTensorMappings[i];
         u64 addr = concurrency(addrAddrs.remote[rankIndex(v.rank)]) +
@@ -1510,9 +1568,10 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       auto lane = threadIndex & 31;
 
       // Each warp leader atomicInc's the counter
-      IF(lane == 0) {
+      IF_D(lane == 0) {
         atomicInc(counterAddr, (uint32_t)(totalWarps - 1));
       }
+      warp_sync();
       // Spin until all warps have arrived (counter wraps to 0)
       {
         auto v = Val(ValType::U32);
@@ -1524,7 +1583,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
 
       // Grid0/thread0 writes reference clock
       IF(blockIndex == 0) {
-        IF(threadIndex == 0) {
+        IF_D(threadIndex == 0) {
           st_global_u64(refAddr, clock64());
         }
       }
@@ -1542,7 +1601,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       (void)clockOffset; // TODO: use for instrumentation
     }
 
-    Vector<const CustomOpDescriptor::Edge*> singleCopies;
+    Vector<const Edge*> singleCopies;
 
     for (auto& v : op.cudaEdges) {
       CHECK(v.sources.size() == 1);
@@ -1565,7 +1624,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       }
     }
 
-    auto getaddr = [&](const CustomOpDescriptor::Node& n) {
+    auto getaddr = [&](const Node& n) {
       if (n.rank == rank) {
         return ld_param_u64(inputAddrs, sizeof(uint64_t) * n.tensorIndex) + n.offset;
       } else {
@@ -1584,18 +1643,90 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
 
     std::vector<Label> rets;
 
-    for (auto& e : singleCopies) {
-      auto& src = e->sources[0];
-      auto& dst = e->destinations[0];
+    WHILE(true) {
 
-      srcaddr = getaddr(src);
-      dstaddr = getaddr(dst);
-      bytes = e->bytes;
-      index = rets.size();
-      GOTO(copy);
-      Label ret;
-      LABEL(ret);
-      rets.push_back(std::move(ret));
+      u32 numDone = 0;
+
+      for (auto& e : singleCopies) {
+        auto& src = e->sources[0];
+        auto& dst = e->destinations[0];
+
+        Label skip;
+        Label sync;
+        u32 pred = 0;
+        IF_D(threadIndex == 0) {
+          u32 ready = 1;
+          if (!src.filled) {
+            auto it = std::ranges::find(localNodes, src.id);
+            CHECK(it != localNodes.end());
+            IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
+                                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
+                                                                      localNodes.size() * blockIndex))) < stepValue) {
+              ready = 0;
+            }
+          }
+
+          IF(ready != 0) {
+            auto it = std::ranges::find(localNodes, dst.id);
+            CHECK(it != localNodes.end());
+            IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
+                                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
+                                                                      localNodes.size() * blockIndex))) == stepValue) {
+              numDone += 1;
+            }
+            ELSE {
+              fence_acquire_sys();
+              pred = 1;
+            }
+          }
+        }
+        GOTO_IF_NOT(bar_red_or(15, blockSize, pred != 0), skip);
+
+        srcaddr = getaddr(src);
+        dstaddr = getaddr(dst);
+        bytes = e->bytes;
+        index = rets.size();
+        GOTO(copy);
+        Label ret;
+        LABEL(ret);
+        rets.push_back(std::move(ret));
+
+        barrier_sync();
+        IF_D(threadIndex == 0) {
+          fence_release_sys();
+          HashMap<uint32_t, bool> signalRanks;
+          signalRanks[rank] = true;
+          signalRanks[dst.rank] = true;
+          for (auto& e : op.cudaEdges) {
+            bool concerned = false;
+            for (auto& n : e.sources) {
+              if (n.id == dst.id) {
+                concerned = true;
+              }
+            }
+            if (concerned) {
+              for (auto& n : e.destinations) {
+                signalRanks[n.rank] = true;
+              }
+            }
+          }
+          for (auto& v : signalRanks) {
+            uint32_t r = v.first;
+            auto it = dependencyIndices[r].find(dst.id);
+            CHECK(it != dependencyIndices[r].end());
+            st_global_relaxed_sys_u32(concurrency(depFilled.remote.at(rankIndex(r))) +
+                                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
+                stepValue);
+          }
+        }
+        numDone += 1;
+        LABEL(skip);
+        warp_sync();
+      }
+
+      IF(bar_red_or(14, blockSize, numDone == singleCopies.size())) {
+        BREAK;
+      }
     }
 
     CHECK(!rets.empty());
@@ -1734,7 +1865,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     // Exit barrier (per-block, no atomics)
     // =================================================================
     barrier_sync();
-    IF(threadIndex == 0) {
+    IF_D(threadIndex == 0) {
       // // Write copyDone to each peer at this block's slot.
       // // release.sys: ensures all prior data copy stores are visible before
       // // the copyDone signal becomes visible to peers.

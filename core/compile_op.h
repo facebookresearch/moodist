@@ -220,6 +220,7 @@ struct CompileContext {
 
   template<typename... T>
   void send(uint32_t torank, const T&... v) {
+    CHECK(torank < queues.size());
     auto& q = queues[torank];
     uint32_t t = q->transactionBegin();
     q->putBuffer(serializeToBuffer((uint32_t)group->rank), t);

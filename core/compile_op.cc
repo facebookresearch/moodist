@@ -227,8 +227,8 @@ struct CompileOpConstructor {
     for (auto& v : op.cudaEdges) {
       Vector<uint32_t> tensors;
       Vector<uint32_t> ranks;
-      for (auto& l : {v.sources, v.destinations}) {
-        for (auto& x : l) {
+      for (auto& l : {&v.sources, &v.destinations}) {
+        for (auto& x : *l) {
           if (x.rank == rank) {
             tensors.push_back(x.tensorIndex);
           } else {
@@ -366,15 +366,19 @@ struct CompileOpConstructor {
     CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
     CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
 
+    auto nodeId = [](uint32_t rank, uint32_t localIndex) -> uint64_t {
+      return ((uint64_t)(rank + 1) << 32) + localIndex;
+    };
+
     CustomOpDescriptor op;
     CustomOpDescriptor::Edge edge1;
-    edge1.sources.emplace_back(rank, 0, 0, true);
-    edge1.destinations.emplace_back((rank + 1) % size, 1, 0, false);
+    edge1.sources.emplace_back(nodeId(rank, 0), rank, 0, 0, true);
+    edge1.destinations.emplace_back(nodeId((rank + 1) % size, 1), (rank + 1) % size, 1, 0, false);
     edge1.bytes = copyBytes;
     edge1.cellIndex = 0;
     CustomOpDescriptor::Edge edge2;
-    edge2.sources.emplace_back((rank + size - 1) % size, 0, 0, true);
-    edge2.destinations.emplace_back(rank, 1, 0, false);
+    edge2.sources.emplace_back(nodeId((rank + size - 1) % size, 0), (rank + size - 1) % size, 0, 0, true);
+    edge2.destinations.emplace_back(nodeId(rank, 1), rank, 1, 0, false);
     edge2.bytes = copyBytes;
     edge2.cellIndex = 0;
 
@@ -613,14 +617,14 @@ struct CompileOpConstructor {
         CopyKernelConfig write = c;
         write.copyWrite = true;
         expanded.push_back(write);
-        CopyKernelConfig readRing = c;
-        readRing.copyWrite = false;
-        readRing.copyRing = true;
-        expanded.push_back(readRing);
-        CopyKernelConfig writeRing = c;
-        writeRing.copyWrite = true;
-        writeRing.copyRing = true;
-        expanded.push_back(writeRing);
+        // CopyKernelConfig readRing = c;
+        // readRing.copyWrite = false;
+        // readRing.copyRing = true;
+        // expanded.push_back(readRing);
+        // CopyKernelConfig writeRing = c;
+        // writeRing.copyWrite = true;
+        // writeRing.copyRing = true;
+        // expanded.push_back(writeRing);
       }
       candidates = std::move(expanded);
     }
@@ -1046,8 +1050,8 @@ struct CompileOpConstructor {
       auto& tc = tensorCells[tensorId];
       auto& boundaries = tc.boundaries;
       boundaries.resize(ndim);
-      for (const auto& descrs : {inputDescrs, outputDescrs}) {
-        for (const auto& v : descrs) {
+      for (const auto& descrs : {&inputDescrs, &outputDescrs}) {
+        for (const auto& v : *descrs) {
           if (v.tensorId == tensorId) {
             for (int d : range(ndim)) {
               boundaries[d].push_back(v.offset[d]);
@@ -1404,6 +1408,8 @@ struct CompileOpConstructor {
     };
     Vector<OutputCopy> outputCopyList;
 
+    Vector<CustomOpDescriptor::Edge> edges;
+
     // Process responses and build reads
     for (const auto& resp : receivedResponses) {
       // Find my output
@@ -1422,37 +1428,240 @@ struct CompileOpConstructor {
       size_t bytes = itemsize * numel(resp.requestShape);
 
       CustomOpDescriptor::Edge edge;
-      edge.sources.emplace_back(resp.senderRank, resp.tensorIndex, itemsize * resp.inputOffset);
-      edge.destinations.emplace_back(
-          rank, myInputIndices.size() + inputCopies.size() + resp.outputIndex, itemsize * outputOffset);
+      CustomOpDescriptor::Node source;
+      CustomOpDescriptor::Node destination;
+
+      source.id = 0;
+      source.rank = resp.senderRank;
+      source.tensorIndex = resp.tensorIndex;
+      source.offset = itemsize * resp.inputOffset;
+      source.filled = true;
+      source.device = resp.inputDevice;
+
+      destination.id = 0;
+      destination.rank = rank;
+      destination.tensorIndex = myInputIndices.size() + inputCopies.size() + resp.outputIndex;
+      destination.offset = itemsize * outputOffset;
+      destination.filled = false;
+      destination.device = out.device;
+
       edge.bytes = bytes;
       edge.cellIndex = resp.cellIndex;
 
       if (!outputContiguous) {
-        // Need to copy to a contiguous region, then write to output
-        uint32_t copyIdx = static_cast<uint32_t>(outputsPerRank[rank].size() + outputCopyList.size());
+        destination.tensorIndex =
+            myInputIndices.size() + inputCopies.size() + outputsPerRank[rank].size() + outputCopyList.size();
+        destination.offset = 0;
 
         OutputCopy oc;
         oc.outputIndex = resp.outputIndex;
         oc.offset = relOutOffset;
         oc.shape = resp.requestShape;
         outputCopyList.push_back(std::move(oc));
-
-        // log.debug("compile_op: output copy: outputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
-        // resp.outputIndex,
-        //     fmtCoord(relOutOffset).c_str(), fmtCoord(resp.requestShape).c_str(), fmtCoord(out.shape).c_str());
-
-        // Read into the copy buffer (which will be contiguous)
-        edge.destinations.back().tensorIndex = myInputIndices.size() + inputCopies.size() + copyIdx;
-        edge.destinations.back().offset = 0;
       }
 
-      // For CUDA-to-CUDA transfers: use local copy (NVLink/same-GPU) instead of RDMA read
-      // when source is on the same node (IPC-accessible) or is this rank itself.
-      // For CPU tensors, IB DMA engines are faster than memcpy, so keep as RDMA reads.
-      bool bothCuda = out.device == DeviceType::CUDA && resp.inputDevice == DeviceType::CUDA;
-      bool sourceIsLocal = resp.senderRank == rank || group->ipcAccess.at(resp.senderRank);
-      if (sourceIsLocal && bothCuda) {
+      edge.sources.push_back(source);
+      edge.destinations.push_back(destination);
+
+      edges.push_back(std::move(edge));
+    }
+
+    using Edge = CustomOpDescriptor::Edge;
+    using Node = CustomOpDescriptor::Node;
+
+    {
+      ctx.barrier();
+
+      Vector<Node> localNodes;
+      HashMap<uint32_t, Vector<Node*>> remoteNodes;
+      auto equal = [](const Node& a, const Node& b) {
+        if (a.rank == b.rank && a.tensorIndex == b.tensorIndex && a.offset == b.offset) {
+          CHECK(a.device == b.device && a.filled == b.filled);
+          return true;
+        }
+        return false;
+      };
+      for (auto& e : edges) {
+        for (auto& l : {&e.sources, &e.destinations}) {
+          for (auto& n : *l) {
+            remoteNodes[n.rank].push_back(&n);
+            // if (n.rank != rank) {
+            //   remoteNodes[n.rank].push_back(&n);
+            //   continue;
+            // }
+            // bool found = false;
+            // for (auto* w : localNodes) {
+            //   if (equal(*w, n)) {
+            //     CHECK(!found);
+            //     found = true;
+            //     n.id = w->id;
+            //   }
+            // }
+            // if (!found) {
+            //   n.id = (((uint64_t)rank + 1) << 32) + localNodes.size();
+            //   localNodes.push_back(&n);
+            // }
+          }
+        }
+      }
+
+      Vector<Node> l;
+      Vector<uint64_t> ids;
+      for (size_t i : range(size)) {
+        auto it = remoteNodes.find(i);
+        if (it != remoteNodes.end()) {
+          for (auto* w : it->second) {
+            l.push_back(*w);
+          }
+          CHECK(!l.empty());
+        }
+        ctx.send(i, l);
+        l.clear();
+      }
+      for (size_t i : range(size)) {
+        ctx.receive(i, l);
+        if (l.empty()) {
+          continue;
+        }
+        ids.clear();
+        for (auto& n : l) {
+          bool found = false;
+          for (auto& w : localNodes) {
+            if (equal(n, w)) {
+              CHECK(!found);
+              found = true;
+              ids.push_back(w.id);
+            }
+          }
+          // CHECK(found);
+          if (!found) {
+            n.id = (((uint64_t)rank + 1) << 32) + localNodes.size();
+            localNodes.push_back(n);
+            ids.push_back(n.id);
+          }
+        }
+        ctx.send(i, ids);
+      }
+
+      for (auto& v : remoteNodes) {
+        ctx.receive(v.first, ids);
+        CHECK(ids.size() == v.second.size());
+        for (size_t i : indices(ids)) {
+          v.second[i]->id = ids[i];
+        }
+      }
+
+      ctx.barrier();
+    }
+
+    Vector<size_t> cudaRanks = group->ipcRanks;
+    if (std::ranges::find(cudaRanks, rank) == cudaRanks.end()) {
+      cudaRanks.push_back(rank);
+    }
+    std::ranges::sort(cudaRanks);
+
+    bool buildCudaRing = true;
+
+    if (buildCudaRing) {
+
+      Vector<std::tuple<uint32_t, uint32_t, Node>> myReceives;
+      HashMap<uint32_t, Edge> edgeMap;
+
+      for (auto& edge : edges) {
+        // we could, technically, have multiple overlapping outputs.
+        // these should not all go into the ring, though - instead all but one
+        // should be leaf nodes going off of the one that is part of the ring
+        // fixme: these should probably not be separate edges at this point.
+        //        we need some passes that merge sources and destinations on the same edge
+        //        and also consider splitting cuda and cpu destinations on the same edge
+        //        mixed cpu & cuda sources is a problem for later (reductions)
+        CHECK(!edgeMap.contains(edge.cellIndex));
+        edgeMap[edge.cellIndex] = edge;
+        for (auto& d : edge.destinations) {
+          CHECK(d.rank == rank);
+          if (d.device == DeviceType::CUDA) {
+            myReceives.emplace_back(edge.cellIndex, edge.bytes, d);
+            break;
+          }
+        }
+      }
+
+      for (size_t i : cudaRanks) {
+        ctx.send(i, myReceives);
+      }
+
+      HashMap<uint32_t, Vector<Node>> groups;
+
+      for (size_t i : cudaRanks) {
+        Vector<std::tuple<uint32_t, uint32_t, Node>> nReceives;
+        ctx.receive(i, nReceives);
+
+        for (auto [cell, bytes, node] : nReceives) {
+          if (!edgeMap.contains(cell)) {
+            continue;
+          }
+          CHECK(edgeMap[cell].bytes == bytes);
+          CHECK(node.rank == i);
+          groups[cell].push_back(node);
+        }
+      }
+
+      for (auto& [cell, ranks] : groups) {
+        CHECK(ranks.size() != 0);
+        if (ranks.size() == 1) {
+          continue;
+        }
+        auto proj = [](Node& x) {
+          return x.rank;
+        };
+        std::ranges::sort(ranks, {}, proj);
+
+        // TEMPORARY rotate around source rank
+        // works okay for local-only,
+        // TERRIBLE for remote sources
+        // FIXME proper load distribution
+        CHECK(edgeMap.contains(cell));
+        auto& edge = edgeMap.at(cell);
+        CHECK(!edge.sources.empty());
+        uint32_t sourceRank = edge.sources[0].rank;
+        std::ranges::rotate(ranks, std::ranges::lower_bound(ranks, sourceRank, {}, proj));
+
+        Vector<uint32_t> rankns;
+        for (auto& v : ranks) {
+          rankns.push_back(v.rank);
+        }
+        log.info("%d: ranks for cell %d is [%s]\n", rank, cell, fmt::to_string(fmt::join(rankns, ", ")));
+
+        auto it = std::ranges::find(ranks, rank, proj);
+        CHECK(it != ranks.end());
+        if (it != ranks.begin()) {
+          auto prev = *std::prev(it);
+          edge.sources.clear();
+          edge.sources.push_back(prev);
+          CHECK(!prev.filled);
+        }
+      }
+
+      edges.clear();
+      for (auto& v : edgeMap) {
+        edges.push_back(v.second);
+      }
+    }
+
+    for (auto& edge : edges) {
+      bool cuda = true;
+      bool local = true;
+      for (auto& l : {&edge.sources, &edge.destinations}) {
+        for (auto& n : *l) {
+          if (n.device != DeviceType::CUDA) {
+            cuda = false;
+          }
+          if (n.rank != rank && std::ranges::find(cudaRanks, n.rank) == cudaRanks.end()) {
+            local = false;
+          }
+        }
+      }
+      if (local & cuda) {
         op->cudaEdges.push_back(std::move(edge));
       } else {
         op->rdmaEdges.push_back(std::move(edge));
@@ -1502,8 +1711,6 @@ struct CompileOpConstructor {
     }
 
     {
-      // fixme sort
-
       // Log RDMA edges
       for (size_t i : indices(op->rdmaEdges)) {
         const auto& e = op->rdmaEdges[i];

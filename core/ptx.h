@@ -505,12 +505,20 @@ inline Value ld_const_u8(const Value& addr) {
   return result;
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr);
+void ld_global_relaxed_sys_u32(const Value& d, const Value& addr);
+inline Value ld_global_relaxed_sys_u32(const Value& addr) {
+  Value result(ValType::U32);
+  ld_global_relaxed_sys_u32(result, addr);
+  return result;
+}
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
 inline Value ld_global_acquire_sys_u32(const Value& addr) {
   Value result(ValType::U32);
   ld_global_acquire_sys_u32(result, addr);
   return result;
 }
+void fence_acquire_sys();
+void fence_release_sys();
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
 void st_global_release_sys_u32(const Value& addr, const Value& val);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
@@ -609,6 +617,7 @@ struct ScopeGuard {
 };
 
 ScopeGuard _If(const Value& pred);
+ScopeGuard _IfD(const Value& pred); // divergent IF: uses bra (not bra.uni)
 ScopeGuard _Else();
 ScopeGuard _WhileImpl(Block* header, const Value& pred);
 
@@ -629,6 +638,7 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
 }
 
 #define IF(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_If(pred); true)
+#define IF_D(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_IfD(pred); true)
 #define ELSE if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Else(); true)
 #define WHILE(cond)                                                                                                    \
   if ([[maybe_unused]] auto _ptx_while_scope_ = ::moodist::ptx::_While([&]() {                                         \
@@ -636,6 +646,7 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
       });                                                                                                              \
       true)
 #define BREAK ::moodist::ptx::bra(_ptx_while_scope_.pendingBlock.get())
+#define CONTINUE ::moodist::ptx::bra(_ptx_while_scope_.backEdgeTarget)
 #define FOR(init, cond, step)                                                                                          \
   if (init; true)                                                                                                      \
     if ([[maybe_unused]] auto _ptx_while_scope_ = ::moodist::ptx::_For(                                                \

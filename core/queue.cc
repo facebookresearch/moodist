@@ -615,7 +615,7 @@ struct QueueImpl {
   QueueWork putBuffer(BufferHandle value, uint32_t transactionKey, bool waitOnDestroy = true) {
     TensorDataPtr td = TensorDataPtr::make();
     td->dtype = 0;
-    td->shape = {value->size()};
+    td->shape.push_back(value->size());
     td->dataPtr = (uintptr_t)value->data();
     td->dataBytes = value->size();
     td->isCuda = false;

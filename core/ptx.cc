@@ -519,8 +519,17 @@ void st_global_u64(const Value& addr, const Value& val) {
 void st_global_volatile_u32(const Value& addr, const Value& val) {
   emitInst("st.global.volatile.u32 [" + addr.str() + "], " + val.str());
 }
+void ld_global_relaxed_sys_u32(const Value& d, const Value& addr) {
+  emitInst("ld.relaxed.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
+}
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.acquire.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+void fence_acquire_sys() {
+  emitInst("fence.acquire.sys");
+}
+void fence_release_sys() {
+  emitInst("fence.release.sys");
 }
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
   emitInst("st.relaxed.sys.global.u32 [" + addr.str() + "], " + val.str());
@@ -555,7 +564,7 @@ void cvt_u32_u64(const Value& d, const Value& a) {
 
 // Control flow
 void bra(const Block* target) {
-  emitInst("bra " + target->label);
+  emitInst("bra.uni " + target->label);
 }
 void bra(const Value& pred, const Block* target) {
   emitInst("@" + pred.str() + " bra.uni " + target->label);
@@ -1426,6 +1435,16 @@ ScopeGuard _If(const Value& pred) {
   // Emit conditional branch: skip body when pred is false
   bra_not(pred, sg.pendingBlock.get());
   // Create and activate body block
+  activateNewBlock("then");
+  return sg;
+}
+
+ScopeGuard _IfD(const Value& pred) {
+  ScopeGuard sg;
+  sg.pendingBlock = std::make_unique<Block>();
+  sg.pendingBlock->label = genLabel("endif");
+  // Divergent branch: use bra (not bra.uni) so ptxas inserts reconvergence
+  emitInst("@!" + pred.str() + " bra " + sg.pendingBlock->label);
   activateNewBlock("then");
   return sg;
 }
