@@ -107,7 +107,6 @@ def test_compile_op_gather(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    [chunk_size * ctx.world_size]
     dtype = torch.float32
 
     # Each rank contributes its chunk
@@ -152,7 +151,6 @@ def test_compile_op_scatter(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    [chunk_size * ctx.world_size]
     dtype = torch.float32
 
     # Only rank 0 provides input (full tensor)
@@ -195,7 +193,6 @@ def test_compile_op_allgather(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    [chunk_size * ctx.world_size]
     dtype = torch.float32
 
     # Each rank contributes its chunk

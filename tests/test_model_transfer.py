@@ -433,12 +433,10 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
 
         # Determine inner group parameters
         if is_trainer:
-            list(range(num_trainers))
             inner_rank = ctx.rank
             inner_size = num_trainers
             prefix = "trainers"
         else:
-            list(range(num_trainers, ctx.world_size))
             inner_rank = ctx.rank - num_trainers
             inner_size = num_workers
             prefix = "workers"
