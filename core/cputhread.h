@@ -305,10 +305,12 @@ struct CustomOpDescriptor {
   uint32_t id;
 
   struct Node {
+    uint64_t id;
     uint32_t rank;
     uint32_t tensorIndex;
     size_t offset;
     bool filled;
+    DeviceType device;
   };
 
   struct Edge {
