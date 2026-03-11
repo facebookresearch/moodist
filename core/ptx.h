@@ -370,6 +370,11 @@ inline TValue<T> operator*(int64_t a, const TValue<T>& b) {
   return Value::imm(T, a) * b;
 }
 
+template<ValType T>
+inline TValue<ValType::Pred> operator<(int64_t a, const TValue<T>& b) {
+  return Value::imm(T, a) < b;
+}
+
 inline Value to_u16() {
   return Value(ValType::U16);
 }

@@ -161,7 +161,7 @@ void tuningCacheStore(const TuningKey& key, const TuningResult& result) {
 
 // Format a CopyKernelConfig for log output, printing only populated fields.
 std::string formatConfig(const CopyKernelConfig& c) {
-  std::string s = c.copyEngine;
+  std::string s = c.copyEngine ? c.copyEngine : "<null>";
   if (c.depth.has_value()) {
     s += fmt::sprintf(" depth=%d", c.depth.value());
   }
@@ -312,14 +312,22 @@ struct CompileOpConstructor {
       CHECK(x.stride != 0);
     }
 
-    for (size_t i : indices(op.localCudaTensorMappings)) {
-      auto& v = op.localCudaTensorMappings[i];
-      log.info(" local slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
-    }
-    for (size_t i : indices(op.remoteCudaTensorMappings)) {
-      auto& v = op.remoteCudaTensorMappings[i];
-      log.info(" remote slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
-    }
+    // for (size_t i : indices(op.localCudaTensorMappings)) {
+    //   auto& v = op.localCudaTensorMappings[i];
+    //   log.info(" local slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
+    // }
+    // for (size_t i : indices(op.remoteCudaTensorMappings)) {
+    //   auto& v = op.remoteCudaTensorMappings[i];
+    //   log.info(" remote slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
+    // }
+  }
+
+  uint64_t nodeId(uint32_t rank, uint32_t localIndex) {
+    return ((uint64_t)(rank + 1) << 32) + localIndex;
+  }
+  uint64_t edgeIdCounter = 0;
+  uint64_t nextEdgeId() {
+    return (1ull << 63) + ((uint64_t)(rank + 1) << 32) + edgeIdCounter++;
   }
 
   TuningResult tuneCopyKernel(CompileContext& ctx, SizeCategory sizeCat) {
@@ -366,21 +374,19 @@ struct CompileOpConstructor {
     CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
     CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
 
-    auto nodeId = [](uint32_t rank, uint32_t localIndex) -> uint64_t {
-      return ((uint64_t)(rank + 1) << 32) + localIndex;
-    };
-
     CustomOpDescriptor op;
     CustomOpDescriptor::Edge edge1;
     edge1.sources.emplace_back(nodeId(rank, 0), rank, 0, 0, true);
     edge1.destinations.emplace_back(nodeId((rank + 1) % size, 1), (rank + 1) % size, 1, 0, false);
     edge1.bytes = copyBytes;
     edge1.cellIndex = 0;
+    edge1.id = (1ull << 63) + rank;
     CustomOpDescriptor::Edge edge2;
     edge2.sources.emplace_back(nodeId((rank + size - 1) % size, 0), (rank + size - 1) % size, 0, 0, true);
     edge2.destinations.emplace_back(nodeId(rank, 1), rank, 1, 0, false);
     edge2.bytes = copyBytes;
     edge2.cellIndex = 0;
+    edge2.id = (1ull << 63) + (rank + size - 1) % size;
 
     op.cudaEdges.push_back(edge1);
     if (size != 1) {
@@ -595,7 +601,12 @@ struct CompileOpConstructor {
       static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
       bool lockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
       for (size_t bs : lockstepBlockSizes) {
-        candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
+        // candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
+        // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688, 229376};
+        static constexpr size_t chunkSizes[] = {229376};
+        for (size_t cs : chunkSizes) {
+          candidates.push_back(CopyKernelConfig::lockstep(gridSize, cs, bs, 1, 1, lockstepMulticast));
+        }
       }
     }
     // {
@@ -780,8 +791,8 @@ struct CompileOpConstructor {
       cuEventDestroy(e);
     }
     cuStreamDestroy(stream);
-    cuMemFree(syntheticDst);
-    cuMemFree(syntheticSrc);
+    // cuMemFree(syntheticDst);
+    // cuMemFree(syntheticSrc);
 
     // Collective decision: exchange timings across all ranks, sum them,
     // and pick the candidate with the lowest total time.
@@ -818,6 +829,10 @@ struct CompileOpConstructor {
       best.ms /= size;
 
       ctx.barrier();
+    }
+
+    if (best.config.copyEngine == nullptr) {
+      throw std::runtime_error("Tuning failed to find any working copy kernel");
     }
 
     double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
@@ -1447,6 +1462,7 @@ struct CompileOpConstructor {
 
       edge.bytes = bytes;
       edge.cellIndex = resp.cellIndex;
+      edge.id = nextEdgeId();
 
       if (!outputContiguous) {
         destination.tensorIndex =
@@ -1485,22 +1501,6 @@ struct CompileOpConstructor {
         for (auto& l : {&e.sources, &e.destinations}) {
           for (auto& n : *l) {
             remoteNodes[n.rank].push_back(&n);
-            // if (n.rank != rank) {
-            //   remoteNodes[n.rank].push_back(&n);
-            //   continue;
-            // }
-            // bool found = false;
-            // for (auto* w : localNodes) {
-            //   if (equal(*w, n)) {
-            //     CHECK(!found);
-            //     found = true;
-            //     n.id = w->id;
-            //   }
-            // }
-            // if (!found) {
-            //   n.id = (((uint64_t)rank + 1) << 32) + localNodes.size();
-            //   localNodes.push_back(&n);
-            // }
           }
         }
       }
@@ -1533,7 +1533,6 @@ struct CompileOpConstructor {
               ids.push_back(w.id);
             }
           }
-          // CHECK(found);
           if (!found) {
             n.id = (((uint64_t)rank + 1) << 32) + localNodes.size();
             localNodes.push_back(n);
@@ -1560,10 +1559,47 @@ struct CompileOpConstructor {
     }
     std::ranges::sort(cudaRanks);
 
-    bool buildCudaRing = true;
+    bool buildCudaRing = false;
+    bool createMulticastNodes = true;
+
+    if (createMulticastNodes) {
+      HashMap<uint32_t, Vector<Edge>> singleSourceNodes;
+      for (auto i = edges.begin(); i != edges.end();) {
+        auto& e = *i;
+        if (e.sources.size() != 1) {
+          continue;
+        }
+        CHECK(e.destinations.size() == 1);
+        singleSourceNodes[e.sources[0].rank].push_back(e);
+        i = edges.erase(i);
+      }
+      for (size_t i : range(size)) {
+        ctx.send(i, singleSourceNodes[i]);
+      }
+      HashMap<uint64_t, size_t> nodeEdgeIndex;
+      Vector<Edge> el;
+      for (size_t i : range(size)) {
+        ctx.receive(i, el);
+        for (const Edge& e : el) {
+          CHECK(e.sources.size() == 1 && e.sources[0].rank == rank);
+          CHECK(e.destinations.size() == 1);
+          uint64_t sourceNode = e.sources[0].id;
+          auto it = nodeEdgeIndex.find(sourceNode);
+          if (it == nodeEdgeIndex.end()) {
+            nodeEdgeIndex[sourceNode] = edges.size();
+            edges.push_back(e);
+            edges.back().id = nextEdgeId();
+          } else {
+            auto& targetEdge = edges[it->second];
+            CHECK(targetEdge.cellIndex == e.cellIndex && targetEdge.bytes == e.bytes);
+            CHECK(targetEdge.sources[0].id == e.sources[0].id);
+            targetEdge.destinations.push_back(e.destinations[0]);
+          }
+        }
+      }
+    }
 
     if (buildCudaRing) {
-
       Vector<std::tuple<uint32_t, uint32_t, Node>> myReceives;
       HashMap<uint32_t, Edge> edgeMap;
 
@@ -1575,6 +1611,10 @@ struct CompileOpConstructor {
         //        we need some passes that merge sources and destinations on the same edge
         //        and also consider splitting cuda and cpu destinations on the same edge
         //        mixed cpu & cuda sources is a problem for later (reductions)
+
+        // fixme: why is this done by cell indices at all?
+        //        this should be done by node ids. we know exactly the node id of the source(s),
+        //        and this is what we should group on, not cell index.
         CHECK(!edgeMap.contains(edge.cellIndex));
         edgeMap[edge.cellIndex] = edge;
         for (auto& d : edge.destinations) {
@@ -1636,8 +1676,10 @@ struct CompileOpConstructor {
         CHECK(it != ranks.end());
         if (it != ranks.begin()) {
           auto prev = *std::prev(it);
+          CHECK(edge.sources.size() == 1);
           edge.sources.clear();
           edge.sources.push_back(prev);
+          edge.id = nextEdgeId();
           CHECK(!prev.filled);
         }
       }
@@ -1645,6 +1687,35 @@ struct CompileOpConstructor {
       edges.clear();
       for (auto& v : edgeMap) {
         edges.push_back(v.second);
+      }
+    }
+
+    {
+      HashMap<uint32_t, Vector<Edge>> edgePerRank;
+      HashMap<uint64_t, size_t> localEdges;
+      for (const Edge& e : edges) {
+        CHECK(!localEdges.contains(e.id));
+        localEdges[e.id] = &e - edges.data();
+        for (auto* l : {&e.sources, &e.destinations}) {
+          for (const Node& n : *l) {
+            if (n.rank != rank) {
+              edgePerRank[n.rank].push_back(e);
+            }
+          }
+        }
+      }
+
+      for (size_t i : range(size)) {
+        ctx.send(i, edgePerRank[i]);
+      }
+      Vector<Edge> el;
+      for (size_t i : range(size)) {
+        ctx.receive(i, el);
+        for (const Edge& e : el) {
+          CHECK(!localEdges.contains(e.id));
+          localEdges[e.id] = edges.size();
+          edges.push_back(e);
+        }
       }
     }
 
@@ -1668,47 +1739,47 @@ struct CompileOpConstructor {
       }
     }
 
-    auto rankIn = [&](uint32_t rank, auto& list) {
-      for (auto& x : list) {
-        if (x.rank == rank) {
-          return true;
-        }
-      }
-      return false;
-    };
+    // auto rankIn = [&](uint32_t rank, auto& list) {
+    //   for (auto& x : list) {
+    //     if (x.rank == rank) {
+    //       return true;
+    //     }
+    //   }
+    //   return false;
+    // };
 
-    for (size_t i : range(size)) {
-      if (i == rank) {
-        continue;
-      }
-      Vector<CustomOpDescriptor::Edge> cuda;
-      Vector<CustomOpDescriptor::Edge> rdma;
-      for (auto& v : op->cudaEdges) {
-        if (rankIn(i, v.sources)) {
-          cuda.push_back(v);
-        }
-      }
-      for (auto& v : op->rdmaEdges) {
-        if (rankIn(i, v.sources)) {
-          rdma.push_back(v);
-        }
-      }
-      ctx.send(i, cuda, rdma);
-    }
-    for (size_t i : range(size)) {
-      if (i == rank) {
-        continue;
-      }
-      Vector<CustomOpDescriptor::Edge> cuda;
-      Vector<CustomOpDescriptor::Edge> rdma;
-      ctx.receive(i, cuda, rdma);
-      for (auto& v : cuda) {
-        op->cudaEdges.push_back(v);
-      }
-      for (auto& v : rdma) {
-        op->rdmaEdges.push_back(v);
-      }
-    }
+    // for (size_t i : range(size)) {
+    //   if (i == rank) {
+    //     continue;
+    //   }
+    //   Vector<CustomOpDescriptor::Edge> cuda;
+    //   Vector<CustomOpDescriptor::Edge> rdma;
+    //   for (auto& v : op->cudaEdges) {
+    //     if (rankIn(i, v.sources)) {
+    //       cuda.push_back(v);
+    //     }
+    //   }
+    //   for (auto& v : op->rdmaEdges) {
+    //     if (rankIn(i, v.sources)) {
+    //       rdma.push_back(v);
+    //     }
+    //   }
+    //   ctx.send(i, cuda, rdma);
+    // }
+    // for (size_t i : range(size)) {
+    //   if (i == rank) {
+    //     continue;
+    //   }
+    //   Vector<CustomOpDescriptor::Edge> cuda;
+    //   Vector<CustomOpDescriptor::Edge> rdma;
+    //   ctx.receive(i, cuda, rdma);
+    //   for (auto& v : cuda) {
+    //     op->cudaEdges.push_back(v);
+    //   }
+    //   for (auto& v : rdma) {
+    //     op->rdmaEdges.push_back(v);
+    //   }
+    // }
 
     {
       // Log RDMA edges

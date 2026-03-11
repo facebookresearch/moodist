@@ -314,6 +314,7 @@ struct CustomOpDescriptor {
   };
 
   struct Edge {
+    uint64_t id;
     Vector<Node> sources;
     Vector<Node> destinations;
     size_t bytes;
@@ -321,7 +322,7 @@ struct CustomOpDescriptor {
 
     template<typename X>
     void serialize(X& x) {
-      x(sources, destinations, bytes, cellIndex);
+      x(id, sources, destinations, bytes, cellIndex);
     }
   };
 

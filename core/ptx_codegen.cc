@@ -870,6 +870,13 @@ struct EmitSingleCopy {
   virtual void emit(u64 src, u64 dst, u32 bytes) = 0;
 };
 
+struct EmitMultiCopy {
+  virtual ~EmitMultiCopy() = default;
+  virtual void init() {}
+  virtual void initPostSync() {}
+  virtual void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) = 0;
+};
+
 // struct EmitFlexBuf : EmitSingleCopy {
 //   const CopyKernelConfig& config;
 //   const Value& blockIndex;
@@ -1084,7 +1091,7 @@ struct EmitSingleCopy {
 //   }
 // };
 
-struct EmitLockstep : EmitSingleCopy {
+struct EmitLockstep : EmitMultiCopy {
   const CopyKernelConfig& config;
   u32 blockIndex;
   u32 warpIndex;
@@ -1125,7 +1132,7 @@ struct EmitLockstep : EmitSingleCopy {
     // st_shared_release_cta_u32(sharedOffset, blockIndex * bufferSize);
   }
 
-  void emit(u64 src, u64 dst, u32 bytes) override {
+  void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
     Label alldone;
     // IF(laneIndex != 0) {
     //   WHILE(!bar_red_or(syncIndex, 64, 0)) {}
@@ -1146,7 +1153,9 @@ struct EmitLockstep : EmitSingleCopy {
 
     PRED(bytes % 16 != 0) trap();
     PRED(src % 16 != 0) trap();
-    PRED(dst % 16 != 0) trap();
+    for (size_t i : indices(dst)) {
+      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+    }
 
     Label loop;
     LABEL(loop);
@@ -1161,7 +1170,7 @@ struct EmitLockstep : EmitSingleCopy {
       }
 
       u64 srcaddr = src + widen(offset);
-      u64 dstaddr = dst + widen(offset);
+      // u64 dstaddr = dst + widen(offset);
 
       u32 size = min_u32(bytes - offset, bufferSize);
 
@@ -1176,8 +1185,13 @@ struct EmitLockstep : EmitSingleCopy {
 
       IF_D(isLeader) {
         mbarrier_wait_parity(barrier, parity);
-        cp_async_bulk_global_shared(dstaddr, buffer, size);
-        // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
+        for (size_t i : indices(dst)) {
+          IF(i < ndst) {
+            u64 dstaddr = dst[i] + widen(offset);
+            cp_async_bulk_global_shared(dstaddr, buffer, size);
+            // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
+          }
+        }
         cp_async_bulk_commit_group();
       }
 
@@ -1523,7 +1537,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       CHECK(false);
     };
 
-    std::unique_ptr<EmitSingleCopy> emit;
+    std::unique_ptr<EmitMultiCopy> emit;
     // if (useFlexbuf) {
     //   emit = std::make_unique<EmitFlexBuf>(config, blockIndex, warpIdx, laneIdx, smemBufSharedAddr,
     //   smemMbarSharedAddr);
@@ -1540,21 +1554,23 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
                    widen(sizeof(uint64_t) * (v.destinationSlot + v.stride * blockIndex));
         st_global_u64(addr, ld_param_u64(mappedAddrs, sizeof(uint64_t) * i));
       }
+      fence_release_sys();
       for (size_t i : indices(ranks)) {
         if (i == myIndex) {
           continue;
         }
         u64 addr =
             concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranks.size() * blockIndex));
-        st_global_release_sys_u32(addr, stepValue);
+        st_global_relaxed_sys_u32(addr, stepValue);
       }
       for (size_t i : indices(ranks)) {
         if (i == myIndex) {
           continue;
         }
         u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranks.size() * blockIndex));
-        WHILE(ld_global_acquire_sys_u32(addr) < stepValue) {}
+        WHILE(ld_global_relaxed_sys_u32(addr) < stepValue) {}
       }
+      fence_acquire_sys();
     }
     barrier_sync();
 
@@ -1601,25 +1617,60 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       (void)clockOffset; // TODO: use for instrumentation
     }
 
-    Vector<const Edge*> singleCopies;
+    Vector<Edge> localCopies;
 
     for (auto& v : op.cudaEdges) {
       CHECK(v.sources.size() == 1);
-      CHECK(v.destinations.size() == 1);
+      CHECK(v.destinations.size() >= 1);
       auto& src = v.sources[0];
-      auto& dst = v.destinations[0];
-      CHECK(!dst.filled);
-      CHECK(src.rank == rank || dst.rank == rank);
+      const Node* localdst = nullptr;
+      for (const Node& n : v.destinations) {
+        CHECK(!n.filled);
+        // gotta decide some things about the cudaEdges, rdmaEdges split
+        // are these expected to be completely sepatate, such that
+        // the following CHECK always passes?
+        // this separation is perhaps broken by design
+        //    what happens to reductions with mixed cuda and rdma sources?
+        //    well, we could set up a temporary buffer with a dependency chain
+        // feasible for destination, though...
+        CHECK(std::ranges::find(ranks, n.rank) != ranks.end());
+        if (n.rank == rank) {
+          // fixme: we could have multiple outputs that map to the same cell.
+          //        not really sure if that should be handled here, though.
+          //        might be better to have a pass in compile_op.cc which sets
+          //        up a dependency chain.
+          CHECK(localdst == nullptr);
+          localdst = &n;
+        }
+      }
+      CHECK(src.rank == rank || localdst);
       CHECK(std::ranges::find(ranks, src.rank) != ranks.end());
-      CHECK(std::ranges::find(ranks, dst.rank) != ranks.end());
 
       if (src.rank == rank) {
-        if (*config.copyWrite || dst.rank == rank) {
-          singleCopies.push_back(&v);
+        if (*config.copyWrite) {
+          localCopies.push_back(v);
+        } else if (localdst) {
+          Edge copy = v;
+          for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
+            if (i->rank == rank) {
+              ++i;
+            } else {
+              i = copy.destinations.erase(i);
+            }
+          }
+          localCopies.push_back(v);
         }
       } else {
         if (!*config.copyWrite) {
-          singleCopies.push_back(&v);
+          Edge copy = v;
+          for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
+            if (i->rank != src.rank) {
+              ++i;
+            } else {
+              i = copy.destinations.erase(i);
+            }
+          }
+          localCopies.push_back(v);
         }
       }
     }
@@ -1635,111 +1686,182 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       }
     };
 
-    Label copy;
-    u64 srcaddr = 0;
-    u64 dstaddr = 0;
-    u32 bytes = 0;
-    u32 index = 0;
-
-    std::vector<Label> rets;
-
-    WHILE(true) {
-
-      u32 numDone = 0;
-
-      for (auto& e : singleCopies) {
-        auto& src = e->sources[0];
-        auto& dst = e->destinations[0];
-
-        Label skip;
-        Label sync;
-        u32 pred = 0;
-        IF_D(threadIndex == 0) {
-          u32 ready = 1;
-          if (!src.filled) {
-            auto it = std::ranges::find(localNodes, src.id);
-            CHECK(it != localNodes.end());
-            IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
-                                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
-                                                                      localNodes.size() * blockIndex))) < stepValue) {
-              ready = 0;
-            }
-          }
-
-          IF(ready != 0) {
-            auto it = std::ranges::find(localNodes, dst.id);
-            CHECK(it != localNodes.end());
-            IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
-                                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
-                                                                      localNodes.size() * blockIndex))) == stepValue) {
-              numDone += 1;
-            }
-            ELSE {
-              fence_acquire_sys();
-              pred = 1;
-            }
-          }
-        }
-        GOTO_IF_NOT(bar_red_or(15, blockSize, pred != 0), skip);
-
-        srcaddr = getaddr(src);
-        dstaddr = getaddr(dst);
-        bytes = e->bytes;
-        index = rets.size();
-        GOTO(copy);
-        Label ret;
-        LABEL(ret);
-        rets.push_back(std::move(ret));
-
-        barrier_sync();
-        IF_D(threadIndex == 0) {
-          fence_release_sys();
-          HashMap<uint32_t, bool> signalRanks;
-          signalRanks[rank] = true;
-          signalRanks[dst.rank] = true;
-          for (auto& e : op.cudaEdges) {
-            bool concerned = false;
-            for (auto& n : e.sources) {
-              if (n.id == dst.id) {
-                concerned = true;
-              }
-            }
-            if (concerned) {
-              for (auto& n : e.destinations) {
-                signalRanks[n.rank] = true;
-              }
-            }
-          }
-          for (auto& v : signalRanks) {
-            uint32_t r = v.first;
-            auto it = dependencyIndices[r].find(dst.id);
-            CHECK(it != dependencyIndices[r].end());
-            st_global_relaxed_sys_u32(concurrency(depFilled.remote.at(rankIndex(r))) +
-                                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
-                stepValue);
-          }
-        }
-        numDone += 1;
-        LABEL(skip);
-        warp_sync();
-      }
-
-      IF(bar_red_or(14, blockSize, numDone == singleCopies.size())) {
-        BREAK;
-      }
+    size_t maxDestinations = 0;
+    for (const Edge& e : localCopies) {
+      maxDestinations = std::max(maxDestinations, e.destinations.size());
     }
 
-    CHECK(!rets.empty());
+    if (true) {
 
-    Label done;
-    GOTO(done);
+      for (const Edge& e : localCopies) {
+        CHECK(e.sources.size() == 1);
+        CHECK(e.destinations.size() >= 1);
 
-    LABEL(copy);
-    emit->emit(srcaddr, dstaddr, bytes);
+        u64 srcaddr = getaddr(e.sources[0]);
+        Vector<u64> dstaddrs(e.destinations.size());
+        for (size_t i : indices(dstaddrs)) {
+          dstaddrs[i] = getaddr(e.destinations[i]);
+        }
 
-    brx_idx(index, rets);
+        emit->emit(srcaddr, dstaddrs, dstaddrs.size(), e.bytes);
+      }
 
-    LABEL(done);
+      fence_release_sys();
+
+    } else {
+
+      Label copy;
+      u64 srcaddr = 0;
+      Vector<u64> dstaddrs(maxDestinations);
+      u32 ndst = 0;
+      u32 bytes = 0;
+      u32 index = 0;
+
+      std::vector<Label> rets;
+
+      WHILE(true) {
+
+        u32 numDone = 0;
+
+        for (const Edge& e : localCopies) {
+          CHECK(e.sources.size() == 1);
+          CHECK(e.destinations.size() >= 1);
+          auto& src = e.sources[0];
+
+          Label skip;
+          Label sync;
+          u32 pred = 0;
+          IF_D(threadIndex == 0) {
+            u32 ready = 1;
+            if (!src.filled) {
+              auto it = std::ranges::find(localNodes, src.id);
+              CHECK(it != localNodes.end());
+              IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
+                                           widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
+                                                                        localNodes.size() * blockIndex))) < stepValue) {
+                ready = 0;
+              }
+            }
+
+            IF(ready != 0) {
+              auto& dst0 = e.destinations[0];
+              auto it = std::ranges::find(localNodes, dst0.id);
+              CHECK(it != localNodes.end());
+              IF(ld_global_relaxed_sys_u32(
+                     concurrency(depFilled.local) +
+                     widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) ==
+                  stepValue) {
+                numDone += 1;
+              }
+              ELSE {
+                fence_acquire_sys();
+                pred = 1;
+              }
+            }
+          }
+          GOTO_IF_NOT(bar_red_or(15, blockSize, pred != 0), skip);
+
+          srcaddr = getaddr(src);
+          for (size_t i : indices(e.destinations)) {
+            dstaddrs[i] = getaddr(e.destinations[i]);
+          }
+          ndst = e.destinations.size();
+          // dstaddr = getaddr(dst);
+          bytes = e.bytes;
+          index = rets.size();
+          GOTO(copy);
+          Label ret;
+          LABEL(ret);
+          rets.push_back(std::move(ret));
+
+          barrier_sync();
+          IF_D(threadIndex == 0) {
+            fence_release_sys();
+            HashMap<uint32_t, bool> signalRanks;
+            signalRanks[rank] = true;
+            // signalRanks[dst.rank] = true;
+            for (const Node& n : e.destinations) {
+              signalRanks[n.rank] = true;
+            }
+            for (auto& ne : op.cudaEdges) {
+              bool concerned = false;
+              for (auto& n : ne.sources) {
+                for (auto& n2 : e.destinations) {
+                  if (n.id == n2.id) {
+                    concerned = true;
+                  }
+                }
+              }
+              if (concerned) {
+                for (auto& n : ne.destinations) {
+                  signalRanks[n.rank] = true;
+                }
+              }
+            }
+            for (auto& v : signalRanks) {
+              uint32_t r = v.first;
+              for (const Node& n : e.destinations) {
+                auto it = dependencyIndices[r].find(n.id);
+                if (it != dependencyIndices[r].end()) {
+                  st_global_relaxed_sys_u32(
+                      concurrency(depFilled.remote.at(rankIndex(r))) +
+                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
+                      stepValue);
+                }
+              }
+              IF_D(threadIndex == 0) {
+                u32 ready = 1;
+                if (!src.filled) {
+                  auto it = std::ranges::find(localNodes, src.id);
+                  CHECK(it != localNodes.end());
+                  IF(ld_global_relaxed_sys_u32(
+                         concurrency(depFilled.local) +
+                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) <
+                      stepValue) {
+                    ready = 0;
+                  }
+                }
+
+                IF(ready != 0) {
+                  auto& dst0 = e.destinations[0];
+                  auto it = std::ranges::find(localNodes, dst0.id);
+                  CHECK(it != localNodes.end());
+                  IF(ld_global_relaxed_sys_u32(
+                         concurrency(depFilled.local) +
+                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) ==
+                      stepValue) {
+                    numDone += 1;
+                  }
+                  ELSE {
+                    fence_acquire_sys();
+                    pred = 1;
+                  }
+                }
+              }
+            }
+          }
+          numDone += 1;
+          LABEL(skip);
+          warp_sync();
+        }
+
+        IF(bar_red_or(14, blockSize, numDone == localCopies.size())) {
+          BREAK;
+        }
+      }
+
+      CHECK(!rets.empty());
+
+      Label done;
+      GOTO(done);
+
+      LABEL(copy);
+      emit->emit(srcaddr, dstaddrs, ndst, bytes);
+
+      brx_idx(index, rets);
+
+      LABEL(done);
+    }
 
     // bool copyWriteMode = *config.copyWrite;
     // std::vector<int64_t> signals;
@@ -1885,20 +2007,21 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       //   WHILE(loadGlobalAcquireSys(addr, ValType::U32) < stepValue) {}
       // }
 
+      // fence_release_sys();
       for (size_t i : indices(ranks)) {
         if (i == myIndex) {
           continue;
         }
         u64 addr =
             concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranks.size() * blockIndex));
-        st_global_release_sys_u32(addr, stepValue + 1);
+        st_global_relaxed_sys_u32(addr, stepValue + 1);
       }
       for (size_t i : indices(ranks)) {
         if (i == myIndex) {
           continue;
         }
         u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranks.size() * blockIndex));
-        WHILE(ld_global_acquire_sys_u32(addr) < stepValue + 1) {}
+        WHILE(ld_global_relaxed_sys_u32(addr) < stepValue + 1) {}
       }
     }
 
