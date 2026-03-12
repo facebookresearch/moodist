@@ -5450,25 +5450,31 @@ struct CpuThreadImpl {
     uint32_t location;
     bool streaming;
     deserializeBufferPart(view, key, address, location, streaming);
-    CHECK(queueCreateOutgoing.contains(key));
-    auto& params = *queueCreateOutgoing[key];
+    enqueueCallback([this, key, address, location, streaming] {
+      auto it = queueCreateOutgoing.find(key);
+      CHECK(it != queueCreateOutgoing.end());
+      auto& params = *it->second;
+      queueCreateOutgoing.erase(it);
 
-    *params.outAddress = address;
-    if (params.location != location || params.streaming != streaming) {
-      std::string err = fmt::sprintf(
-          "Queue creation found mismatched parameters for named queue '%s'. Local: location %d, streaming %d. "
-          "Remote: "
-          "location %d, streaming %d\n",
-          *params.name, params.location, params.streaming, location, streaming);
-      if (params.outError) {
-        *params.outError = err;
-      } else {
-        fatal("%s", err);
+      *params.outAddress = address;
+      if (params.location != location || params.streaming != streaming) {
+        std::string err = fmt::sprintf(
+            "Queue creation found mismatched parameters for named queue '%s'. Local: location %d, streaming %d. "
+            "Remote: "
+            "location %d, streaming %d\n",
+            *params.name, params.location, params.streaming, location, streaming);
+        if (params.outError) {
+          *params.outError = err;
+        } else {
+          fatal("%s", err);
+        }
       }
-    }
 
-    params.cpuDone->store(1);
-    futexWakeAll(params.cpuDone);
+      cpuThread->freelistCreateQueue.push(&params);
+
+      params.cpuDone->store(1);
+      futexWakeAll(params.cpuDone);
+    });
   }
 
   void onRecvMessageShutdown(std::string_view view, uint32_t sourceRank) {
