@@ -28,13 +28,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <libibverbs/verbs.h>
 #include <memory>
 #include <random>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -6398,10 +6398,17 @@ bool RdmaCpuThreadApi::suppressErrors() {
 CpuThread::CpuThread(Group* group) : group(group) {}
 CpuThread::~CpuThread() {
   kill();
+  if (thread.joinable()) {
+    if (thread.get_id() == std::this_thread::get_id()) {
+      thread.detach();
+    } else {
+      thread.join();
+    }
+  }
 }
 
-void CpuThread::kill(bool wait) {
-  if (thread.joinable()) {
+void CpuThread::kill() {
+  if (thread.joinable() && !killed.exchange(true)) {
     QueueEntry* e = freelistShutdown.pop();
     e->task = taskShutdown;
     e->concurrencyIndex = 0;
@@ -6411,31 +6418,30 @@ void CpuThread::kill(bool wait) {
     l.unlock();
     ++queueSize;
     futexWakeAll(&queueSize);
-
-    if (wait) {
-      thread.join();
-    }
   }
 }
 
-void CpuThread::start() {
-  thread = std::thread([this] {
-    try {
-      async::setCurrentThreadName("moodist-cputhread");
-      numa_run_on_node(group->allocationNode);
-      numa_membind(group->allocationNode);
-      CHECK_CU(cuCtxSetCurrent(group->cuContext));
+void CpuThread::start(Function<void()> pghandle) {
+  thread = std::thread(
+      [this](Function<void()> pghandle) {
+        try {
+          async::setCurrentThreadName("moodist-cputhread");
+          numa_run_on_node(group->allocationNode);
+          numa_membind(group->allocationNode);
+          CHECK_CU(cuCtxSetCurrent(group->cuContext));
 
-      group->init2();
-    } catch (const std::exception& e) {
-      initExceptionPtr = std::current_exception();
-      initException = true;
-      return;
-    }
+          group->init2();
+        } catch (const std::exception& e) {
+          initExceptionPtr = std::current_exception();
+          initException = true;
+          return;
+        }
 
-    CpuThreadImpl impl(this);
-    impl.entry();
-  });
+        CpuThreadImpl impl(this);
+        impl.entry();
+        pghandle();
+      },
+      std::move(pghandle));
 }
 
 } // namespace moodist

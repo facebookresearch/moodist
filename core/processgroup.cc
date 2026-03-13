@@ -218,7 +218,7 @@ struct WorkStreams {
   SpinMutex mutex;
   Vector<std::unique_ptr<WorkStream>> all;
   IntrusiveList<WorkStream, &WorkStream::link> free;
-  std::atomic<int> refcount; // For SharedPtr
+  std::atomic_size_t refcount = 1;
 };
 
 struct ThreadUnsafe {
@@ -371,6 +371,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
   size_t size = 0;
 
+  std::atomic_bool cpuThreadRunning = false;
   SharedPtr<Group> group;
 
   ThreadUnsafe threadUnsafe;
@@ -460,8 +461,16 @@ struct ProcessGroupImpl : api::ProcessGroup {
   }
 
   ~ProcessGroupImpl() {
+    CHECK(refcount == 0);
     std::lock_guard l(activeProcessGroupsMutex);
+    size_t presize = activeProcessGroups.size();
     activeProcessGroups.erase(activeId);
+  }
+
+  void shutdown() {
+    if (group && group->cpuThread) {
+      group->cpuThread->kill();
+    }
   }
 
   void init();
@@ -1036,6 +1045,42 @@ struct ProcessGroupImpl : api::ProcessGroup {
   api::FutureHandle cat(const int* indices, const TensorPtr* tensors, size_t count, TensorPtr* out);
 };
 
+namespace {
+
+struct GlobalDtor {
+  ~GlobalDtor() {
+    std::unique_lock l(activeProcessGroupsMutex, std::defer_lock);
+    Vector<SharedPtr<ProcessGroupImpl>> list;
+    auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (size_t i = 0;; ++i) {
+      l.lock();
+      for (auto& v : activeProcessGroups) {
+        if (v.second->refcount >= 1 && v.second->cpuThreadRunning) {
+          list.push_back(share(v.second));
+        }
+      }
+      l.unlock();
+      if (list.empty()) {
+        break;
+      }
+      for (auto& ptr : list) {
+        ptr->shutdown();
+      }
+      list.clear();
+      l.lock();
+      if (i >= 5 && std::chrono::steady_clock::now() > timeout) {
+        log.error("Timed out waiting for process group shutdown (%d process groups still active).",
+            activeProcessGroups.size());
+        break;
+      }
+      l.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+} globalDtor;
+
+} // namespace
+
 // ============================================================================
 // ProcessGroupImpl::init() - initialization using c10d::Store
 // ============================================================================
@@ -1122,7 +1167,22 @@ void ProcessGroupImpl::init() {
     log.verbose("init took %gs\n", seconds(std::chrono::steady_clock::now() - start));
   };
 
-  group->init(f);
+  struct H {
+    SharedPtr<ProcessGroupImpl> self;
+    H(ProcessGroupImpl* impl) : self(share(impl)) {
+      self->cpuThreadRunning = true;
+    }
+    ~H() {
+      if (self) {
+        self->cpuThreadRunning = false;
+      }
+    }
+    H(H&&) = default;
+    H(const H&) = delete;
+    H& operator=(H&&) = default;
+    H& operator=(const H&) = default;
+  };
+  group->init(f, [handle = H(this)] {});
 }
 
 // ============================================================================
@@ -2691,10 +2751,7 @@ void processGroupDestroy(api::ProcessGroup* pg) {
 }
 
 void processGroupShutdown(api::ProcessGroup* pg) {
-  auto* impl = static_cast<ProcessGroupImpl*>(pg);
-  if (impl && impl->group && impl->group->cpuThread) {
-    impl->group->cpuThread->kill(false);
-  }
+  ((ProcessGroupImpl*)pg)->shutdown();
 }
 
 int processGroupRank(api::ProcessGroup* pg) {

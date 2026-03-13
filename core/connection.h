@@ -39,7 +39,7 @@ struct TcpContext {
 };
 
 struct Listener {
-  std::atomic_size_t refcount = 0;
+  std::atomic_size_t refcount = 1;
   Socket socket;
   Listener(Socket socket) : socket(std::move(socket)) {}
 
@@ -53,7 +53,7 @@ struct Listener {
 };
 
 struct Connection {
-  std::atomic_size_t refcount = 0;
+  std::atomic_size_t refcount = 1;
   Socket socket;
 
   Connection(Socket socket);

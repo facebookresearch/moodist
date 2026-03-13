@@ -42,7 +42,7 @@ using namespace cuda;
 // Objects inheriting from this get shared ownership semantics in ApiHandle.
 // Objects NOT inheriting get unique ownership semantics (move-only).
 struct ApiRefCounted {
-  std::atomic_size_t refcount;
+  std::atomic_size_t refcount = 1;
 };
 
 // Forward declare TensorPtr for Queue proxy
@@ -186,11 +186,13 @@ public:
   ApiHandle() = default;
 
   // Create new handle (for core creating new objects)
-  // For refcounted types, sets refcount to 1
   static ApiHandle create(T* p) {
     if constexpr (IsRefCounted) {
       if (p) {
-        p->refcount.store(1, std::memory_order_relaxed);
+        if (p->refcount < 1) {
+          throw std::runtime_error(
+              "ApiHandle<" + std::string(typeid(T).name()) + ">::create refcount=" + std::to_string(p->refcount));
+        }
       }
     }
     return ApiHandle(p, AdoptTag{});

@@ -445,7 +445,7 @@ std::pair<std::string_view, int> decodeIpAddress(std::string_view address) {
 uint32_t writeFdFlag = 0x413ffc3f;
 
 struct SocketImpl {
-  std::atomic_size_t refcount = 0;
+  std::atomic_size_t refcount = 1;
   int af = -1;
   int fd = -1;
   std::atomic_bool closed = false;

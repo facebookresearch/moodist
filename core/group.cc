@@ -55,13 +55,12 @@ Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
 
 Group::~Group() {
   if (cpuThread) {
-    cpuThread->~CpuThread();
-    internalFree(cpuThread);
+    internalDelete(cpuThread);
     cpuThread = nullptr;
   }
 }
 
-void Group::init(Function<void()> f) {
+void Group::init(Function<void()> f, Function<void()> pghandle) {
 
   auto start = std::chrono::steady_clock::now();
 
@@ -163,7 +162,7 @@ void Group::init(Function<void()> f) {
   log.debug("%d: allocationNode is %d\n", rank, allocationNode);
 
   internalAllocatorSetNode(allocationNode);
-  cpuThread = new (internalAlloc(sizeof(CpuThread))) CpuThread(this);
+  cpuThread = internalNew<CpuThread>(this);
 
   init2 = [&]() {
     f();
@@ -782,7 +781,7 @@ void Group::init(Function<void()> f) {
     log.debug("%d: init synchronized!\n", rank);
   };
 
-  cpuThread->start();
+  cpuThread->start(std::move(pghandle));
   while (!cpuThread->ready) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (cpuThread->initException) {

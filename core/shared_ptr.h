@@ -76,7 +76,7 @@ struct SharedPtrDefaultPolicy {
   template<typename T, typename... Args>
   static T* create(Args&&... args) {
     T* ptr = internalNew<T>(std::forward<Args>(args)...);
-    ptr->refcount = 1;
+    CHECK(ptr->refcount >= 1);
     return ptr;
   }
 

@@ -151,7 +151,7 @@ struct Group {
 
   std::string name;
 
-  std::atomic<int> refcount; // For SharedPtr
+  std::atomic_size_t refcount = 1;
 
   template<typename T>
   size_t getSharedOffset(T* myVar) const {
@@ -168,7 +168,7 @@ struct Group {
   Group(size_t rank, size_t size);
   ~Group();
 
-  void init(Function<void()> f);
+  void init(Function<void()> f, Function<void()> pghandle);
   Function<void()> init2;
 
   size_t getPeerIndex(size_t rank) {

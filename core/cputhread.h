@@ -440,11 +440,13 @@ struct CpuThread {
   std::exception_ptr initExceptionPtr;
   std::atomic_bool initException = false;
 
+  std::atomic_bool killed = false;
+
   CpuThread(Group*);
   ~CpuThread();
-  void kill(bool wait = true);
+  void kill();
 
-  void start();
+  void start(Function<void()> pghandle);
   void enqueue(QueueEntry* e) {
     std::unique_lock l(mutex);
     busy.store(true, std::memory_order_relaxed);

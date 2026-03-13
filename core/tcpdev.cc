@@ -32,7 +32,7 @@ struct TcpDevImpl {
   HashMap<uint32_t, Vector<QueuedSend>> queuedSends;
 
   struct ConnectionInfo {
-    std::atomic_size_t refcount = 0;
+    std::atomic_size_t refcount = 1;
     uint32_t rank = unconnected;
     SharedPtr<Connection> connection;
 

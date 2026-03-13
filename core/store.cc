@@ -206,7 +206,7 @@ struct StoreImpl : api::Store {
   // external references. When api::Store::refcount hits 0, destroy() is called
   // which calls close() and decrements this refcount. When this refcount hits 0
   // (after thread exits), the object is deleted.
-  std::atomic_size_t refcount = 0;
+  std::atomic_size_t refcount = 1;
 
   Vector<Socket> udps;
 
@@ -232,7 +232,7 @@ struct StoreImpl : api::Store {
   Vector<Callback> queuedCallbacks;
 
   struct ConnectionInfo {
-    std::atomic_size_t refcount = 0;
+    std::atomic_size_t refcount = 1;
     SharedPtr<Connection> connection;
     std::chrono::steady_clock::time_point lastReceive;
     uint32_t sourceRank = -1;
@@ -1745,7 +1745,7 @@ struct StoreImpl : api::Store {
   std::atomic_uint32_t nextId = 1;
 
   struct Wait {
-    std::atomic_size_t refcount = 0;
+    std::atomic_size_t refcount = 1;
     bool b = false;
     std::vector<uint8_t> data;
     std::atomic_uint32_t futex = 0;
