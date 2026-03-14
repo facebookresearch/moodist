@@ -54,6 +54,7 @@ Tensor* tensorMulScalar(Tensor* t, double scalar);
 void tensorMulScalar_(Tensor* t, double scalar);
 void tensorRecordStream(Tensor* t, CUstream stream);
 void tensorCopy_(Tensor* dst, Tensor* src);
+void tensorZero_(Tensor* dst);
 void tensorSumOut(Tensor* dst, Tensor* src, int dim);
 void tensorAmaxOut(Tensor* dst, Tensor* src, int dim);
 void tensorAminOut(Tensor* dst, Tensor* src, int dim);
@@ -287,6 +288,10 @@ public:
   TensorPtr& copy_(const TensorPtr& src) {
     W tensorCopy_(ptr_, src.ptr_);
     return *this;
+  }
+
+  void zero_() {
+    W tensorZero_(ptr_);
   }
 
   void record_stream(CUstream stream) {

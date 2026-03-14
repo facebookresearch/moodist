@@ -3153,10 +3153,12 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   CHECK(stepValue < 0x80000000);
 
   if (nInputs != op->inputs.size()) {
-    throw std::runtime_error("moodist: custom op expected different number of inputs");
+    throw std::runtime_error(
+        fmt::sprintf("moodist: custom op expected %d inputs, but got %d", op->inputs.size(), nInputs));
   }
   if (nOutputs != op->outputs.size()) {
-    throw std::runtime_error("moodist: custom op expected different number of outputs");
+    throw std::runtime_error(
+        fmt::sprintf("moodist: custom op expected %d outputs, but got %d", op->outputs.size(), nOutputs));
   }
 
   auto formatShape = [](const auto& shape) {
@@ -3194,32 +3196,32 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   std::vector<TensorDataPtr> inputTDs;
   std::vector<TensorDataPtr> outputTDs;
 
-  for (size_t i = 0; i < nInputs; ++i) {
+  for (size_t i : range(nInputs)) {
     auto t = getTensorDataFromPtr(inputs[i], group.get());
+    const auto& ot = op->inputs[i];
     REQUIRE(t->dtype == static_cast<int>(op->dtype),
         "moodist: custom op input[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
         formatDType(static_cast<int>(op->dtype)));
-    REQUIRE(t->shape == op->inputShapes[i], "moodist: custom op input[%zu] has wrong shape: got %s, expected %s", i,
-        formatShape(t->shape), formatShape(op->inputShapes[i]));
-    REQUIRE(t->bytes() == op->inputs[i],
-        "moodist: custom op input[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
-        op->inputs[i]);
-    bool expectedCuda = op->inputDevices[i] == DeviceType::CUDA;
+    REQUIRE(t->shape == ot.shape, "moodist: custom op input[%zu] has wrong shape: got %s, expected %s", i,
+        formatShape(t->shape), formatShape(ot.shape));
+    REQUIRE(t->bytes() == ot.bytes, "moodist: custom op input[%zu] has wrong size: got %zu bytes, expected %zu bytes",
+        i, t->bytes(), ot.bytes);
+    bool expectedCuda = ot.device == DeviceType::CUDA;
     REQUIRE(t->isCuda == expectedCuda, "moodist: custom op input[%zu] has wrong device: got %s, expected %s", i,
         t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
     inputTDs.push_back(std::move(t));
   }
   for (size_t i = 0; i < nOutputs; ++i) {
     auto t = getTensorDataFromPtr(outputs[i], group.get());
+    const auto& ot = op->outputs[i];
     REQUIRE(t->dtype == static_cast<int>(op->dtype),
         "moodist: custom op output[%zu] has wrong dtype: got %s, expected %s", i, formatDType(t->dtype),
         formatDType(static_cast<int>(op->dtype)));
-    REQUIRE(t->shape == op->outputShapes[i], "moodist: custom op output[%zu] has wrong shape: got %s, expected %s", i,
-        formatShape(t->shape), formatShape(op->outputShapes[i]));
-    REQUIRE(t->bytes() == op->outputs[i],
-        "moodist: custom op output[%zu] has wrong size: got %zu bytes, expected %zu bytes", i, t->bytes(),
-        op->outputs[i]);
-    bool expectedCuda = op->outputDevices[i] == DeviceType::CUDA;
+    REQUIRE(t->shape == ot.shape, "moodist: custom op output[%zu] has wrong shape: got %s, expected %s", i,
+        formatShape(t->shape), formatShape(ot.shape));
+    REQUIRE(t->bytes() == ot.bytes, "moodist: custom op output[%zu] has wrong size: got %zu bytes, expected %zu bytes",
+        i, t->bytes(), ot.bytes);
+    bool expectedCuda = ot.device == DeviceType::CUDA;
     REQUIRE(t->isCuda == expectedCuda, "moodist: custom op output[%zu] has wrong device: got %s, expected %s", i,
         t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
     outputTDs.push_back(std::move(t));
@@ -3292,7 +3294,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     result->holdTensors.push_back(std::move(t));
   }
 
-  bool anyRdma = !op->rdmaEdges.empty();
+  bool anyRdma = !op->graph.rdmaEdges.empty();
 
   if (op->cpuSync) {
     anyCpu = true;
@@ -3308,7 +3310,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     future->done = 1;
   }
 
-  if (op->tunedKernel) {
+  if (op->kernel) {
     EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
     StreamGuard sg(stream, group->deviceIndex);
     IpcMapper* ipcMapper = &*group->ipcMapper;
@@ -3323,9 +3325,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       tensorAddrs.push_back(v->data());
     }
 
-    Vector<uintptr_t> mappedAddrs(op->remoteCudaTensorMappings.size());
+    Vector<uintptr_t> mappedAddrs(op->graph.remoteCudaTensorMappings.size());
     for (size_t i : indices(mappedAddrs)) {
-      auto& m = op->remoteCudaTensorMappings[i];
+      auto& m = op->graph.remoteCudaTensorMappings[i];
       auto& tensor =
           m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
       ipcMapper->requestAddress(group->getPeerIndex(m.rank), tensor->data(), tensor->bytes(), &mappedAddrs[i]);
@@ -3341,8 +3343,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
     CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
     std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
-    CHECK_CU(cuLaunchKernel(op->tunedKernel->function, op->tunedConfig.gridSize, 1, 1, op->tunedConfig.blockSize, 1, 1,
-        0, stream, kparams.data(), nullptr));
+    CHECK_CU(cuLaunchKernel(op->kernel->function, op->config.gridSize, 1, 1, op->config.blockSize, 1, 1, 0, stream,
+        kparams.data(), nullptr));
   }
 
   if (anyRdma) {
@@ -3408,119 +3410,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
       selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
     };
-  }
-
-  return result;
-}
-
-// ============================================================================
-// ProcessGroupImpl::executeLocalOnly - fast path for all-local custom ops
-// ============================================================================
-
-SharedPtr<ApiFuture> ProcessGroupImpl::executeLocalOnly(const CustomOpDescriptor& op,
-    std::vector<TensorDataPtr>& inputs, std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs,
-    TensorPtr* outputPtrs, size_t nOutputs, uint32_t concurrencyIndex, uint32_t stepValue, CUstream stream) {
-
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-  const auto& peerIndices = group->peerIndices;
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  for (size_t peerIndex : peerIndices) {
-    peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
-  }
-
-  Vector<uintptr_t> inputAddrs;
-  for (auto& v : inputs) {
-    inputAddrs.push_back(v->data());
-  }
-  for (auto& v : outputs) {
-    inputAddrs.push_back(v->data());
-  }
-
-  Vector<uintptr_t> mappedAddrs(op.remoteCudaTensorMappings.size());
-  for (size_t i : indices(mappedAddrs)) {
-    auto& m = op.remoteCudaTensorMappings[i];
-    auto& tensor =
-        m.tensorIndex >= inputs.size() ? outputs.at(m.tensorIndex - inputs.size()) : inputs.at(m.tensorIndex);
-    size_t peerIndex = group->getPeerIndex(m.rank);
-    ipcMapper->requestAddress(peerIndex, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
-  }
-  ipcMapper->wait();
-
-  for (size_t peerIndex : peerIndices) {
-    peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
-  }
-
-  freePendingIpcEvents();
-
-  CompileOpCopyParameters params;
-  params.stepValue = stepValue;
-  params.concurrencyIndex = concurrencyIndex;
-  std::array<void*, 3> kparams = {&params, inputAddrs.data() ? inputAddrs.data() : (void*)&params,
-      mappedAddrs.data() ? mappedAddrs.data() : (void*)&params};
-  CHECK_CU(cuLaunchKernel(op.tunedKernel->function, op.tunedConfig.gridSize, 1, 1, op.tunedConfig.blockSize, 1, 1, 0,
-      stream, kparams.data(), nullptr));
-
-  // CopyDescriptor descriptors[kMaxCopyDescriptors];
-  // uint32_t numDescriptors = 0;
-  // std::string descrs;
-
-  // for (size_t i : indices(templates)) {
-  //   const auto& dt = templates[i];
-
-  //   uintptr_t src, dst;
-
-  //   if (dt.srcRank == rank) {
-  //     src = (dt.srcIsOutput ? outputs : inputs)[dt.srcTensorIndex]->data() + dt.srcOffset;
-  //   } else {
-  //     src = remoteAddrs[i];
-  //   }
-
-  //   if (dt.dstRank == rank) {
-  //     dst = (dt.dstIsOutput ? outputs : inputs)[dt.dstTensorIndex]->data() + dt.dstOffset;
-  //   } else {
-  //     dst = remoteAddrs[i];
-  //   }
-
-  //   // descrs += fmt::sprintf("%zu bytes from rank %u to rank %u, ", dt.bytes, dt.srcRank, dt.dstRank);
-
-  //   CHECK(numDescriptors < kMaxCopyDescriptors);
-  //   auto& d = descriptors[numDescriptors++];
-  //   d.src = src;
-  //   d.dst = dst;
-  //   d.bytes = dt.bytes;
-  // }
-  // // log.info("rank %zu has %u descriptors: %s\n", rank, numDescriptors, descrs);
-  // //  CHECK(false);
-
-  // if (numDescriptors > 0) {
-  //   if (op->tunedKernel) {
-  //     launchCopyKernel(op->tunedKernel->function, op->tunedConfig.gridSize, op->tunedConfig.blockSize, descriptors,
-  //         numDescriptors, stepValue, concurrencyIndex, stream);
-  //   } else {
-  //     launchCopyKernel(group->compileOpKernels->cuCopyKernel, group->compileOpKernels->gridSize,
-  //         group->compileOpKernels->blockSize, descriptors, numDescriptors, stepValue, concurrencyIndex, stream,
-  //         group->compileOpKernels->dynamicSmemBytes);
-  //   }
-  // }
-
-  // Step 5: Return result — CPU-side immediately done, GPU work is on stream
-  auto result = makeShared<ApiFuture>();
-  auto future = FutureImplSharedPtr::make();
-  future->done = 1;
-  result->impl = std::move(future);
-
-  // Hold original tensors alive until the future is consumed
-  for (size_t i = 0; i < nInputs; ++i) {
-    result->holdTensors.push_back(inputPtrs[i]);
-  }
-  for (size_t i = 0; i < nOutputs; ++i) {
-    result->holdTensors.push_back(outputPtrs[i]);
   }
 
   return result;

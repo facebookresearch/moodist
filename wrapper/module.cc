@@ -1144,7 +1144,9 @@ static PyObject* queue_put(PyObject* self, PyObject* args, PyObject* kwds) {
     return nullptr;
   }
   try {
+    printf("hello, unpacking tensor\n");
     const auto& tensor = THPVariable_Unpack(tensor_obj);
+    printf("impl -> %p\n", tensor.unsafeGetTensorImpl());
     MoodistQueueWork work;
     {
       GilRelease gil;

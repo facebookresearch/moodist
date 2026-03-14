@@ -3,6 +3,7 @@
 #pragma once
 
 #include "api/moodist_api.h"
+#include "compile_op.h"
 #include "compile_op_kernel.h"
 #include "group.h"
 #include "intrusive_list.h"
@@ -41,12 +42,6 @@ constexpr uint8_t taskCallback = 22;
 constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
-
-// Device type for tensor regions in compile_op
-enum class DeviceType : int8_t {
-  CPU = 0,
-  CUDA = 1,
-};
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -304,28 +299,6 @@ struct QueueEntryCallback : QueueEntry {
 struct CustomOpDescriptor {
   uint32_t id;
 
-  struct Node {
-    uint64_t id;
-    uint32_t rank;
-    uint32_t tensorIndex;
-    size_t offset;
-    bool filled;
-    DeviceType device;
-  };
-
-  struct Edge {
-    uint64_t id;
-    Vector<Node> sources;
-    Vector<Node> destinations;
-    size_t bytes;
-    uint32_t cellIndex;
-
-    template<typename X>
-    void serialize(X& x) {
-      x(id, sources, destinations, bytes, cellIndex);
-    }
-  };
-
   struct Copy {
     uint32_t index;
     Vector<int64_t> offset;
@@ -346,49 +319,28 @@ struct CustomOpDescriptor {
     }
   };
 
-  Vector<Edge> rdmaEdges;
-  Vector<Edge> cudaEdges;
-
   Vector<Copy> inputCopies;
   Vector<Copy> outputCopies;
 
-  Vector<size_t> inputs;
-  Vector<size_t> outputs;
-
-  struct CudaTensorMapping {
-    uint32_t rank;
-    uint32_t tensorIndex;
-    size_t destinationSlot;
-    size_t stride;
-  };
-
-  Vector<CudaTensorMapping> remoteCudaTensorMappings;
-  Vector<CudaTensorMapping> localCudaTensorMappings;
+  // Vector<size_t> inputs;
+  // Vector<size_t> outputs;
 
   Vector<IbRead> ibReads;
 
-  Vector<Vector<int64_t>> inputShapes;
-  Vector<Vector<int64_t>> outputShapes;
-  Vector<DeviceType> inputDevices;
-  Vector<DeviceType> outputDevices;
+  Vector<compile_op::Graph::TensorDescr> inputs;
+  Vector<compile_op::Graph::TensorDescr> outputs;
+
+  // Vector<Vector<int64_t>> inputShapes;
+  // Vector<Vector<int64_t>> outputShapes;
+  // Vector<DeviceType> inputDevices;
+  // Vector<DeviceType> outputDevices;
   DType dtype;
   bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
 
-  // Per-descriptor signal buffer addresses (stable for op lifetime, baked into PTX).
-  // signalBufferAddr: this rank's buffer base (for polling/waiting).
-  // peerSignalBufferAddrs[peerIndex]: peer's buffer base (for writing signals).
-  // signalBufferItemBytes: bytes per concurrency slot (gridSize * numDescriptors * 4, rounded up).
-  // signalBufferNumDescriptors: max descriptor count across all ranks (indexing stride).
-  uintptr_t signalBufferAddr = 0;
-  std::array<uintptr_t, 8> peerSignalBufferAddrs{};
-  size_t signalBufferItemBytes = 0;
-  uint32_t signalBufferNumDescriptors = 0;
-
-  // Per-op compiled copy kernel (auto-tuned for this op's copy sizes).
-  // When set, executeLocalOnly uses this instead of the group-wide CompileOpKernels.
-  std::unique_ptr<CompiledKernel> tunedKernel;
-  CopyKernelConfig tunedConfig;
+  compile_op::Graph graph;
+  std::unique_ptr<CompiledKernel> kernel;
+  KernelConfig config;
 };
 
 struct QueueEntryCustom : QueueEntry {

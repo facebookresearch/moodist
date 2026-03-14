@@ -1092,25 +1092,22 @@ struct EmitMultiCopy {
 // };
 
 struct EmitLockstep : EmitMultiCopy {
-  const CopyKernelConfig& config;
+  const KernelConfig& config;
   u32 blockIndex;
   u32 warpIndex;
   u32 laneIndex;
 
-  EmitLockstep(const CopyKernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
-      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {}
+  EmitLockstep(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
+      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
+    CHECK(numBuffers > 0);
+    CHECK(bufferSize > 0);
+    CHECK(config.blockSize / 64 < 15);
+    CHECK(config.blockSize % 64 == 0);
+  }
 
-  // Inputs (set before init())
   uint32_t numBlocks = config.gridSize;
-  uint32_t inputSharedSize = *config.bulkChunkSize;
+  uint32_t inputSharedSize = config.sharedMemory;
 
-  // uint32_t numParallel = *config.lockstepNumParallel;
-
-  // Computed in init()
-  // uint32_t numWarps;
-  // uint32_t numWarpsTotal;
-
-  // uint32_t numBuffers = config.lockstepNumBuffers.value();
   uint32_t numBuffers = config.blockSize / 32;
   uint32_t blockSharedAlignment = numBuffers * 256;
   uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
@@ -1366,20 +1363,12 @@ KernelMappedBuffers mapn(
   return r;
 }
 
-std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& config, const char* target,
-    const CustomOpDescriptor& op, compile_op::CompileContext& ctx) {
+std::string generateKernel(const Group* group, const KernelConfig& config, std::string target,
+    const compile_op::Graph& graph, compile_op::CompileContext& ctx) {
   using namespace ptx;
 
   uint32_t blockSize = config.blockSize;
   uint32_t numBlocks = config.gridSize;
-
-  bool useBulk = !strcmp(config.copyEngine, "bulk");
-  bool useFlexbuf = !strcmp(config.copyEngine, "flexbuf");
-  bool useLockstep = !strcmp(config.copyEngine, "lockstep");
-  bool useLockstepg = !strcmp(config.copyEngine, "lockstepg");
-  bool useWarppipe = useBulk && !strcmp(config.bulkMode.value(), "warppipe");
-  bool useNbuf = useBulk && !strcmp(config.bulkMode.value(), "nbuf");
-  bool useNbuf2 = useBulk && !strcmp(config.bulkMode.value(), "nbuf2");
 
   size_t rank = group->rank;
 
@@ -1392,11 +1381,11 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     mod.addGlobal(".u64", 1, "debug_clock_ref");
   }
 
-  CHECK(!op.cudaEdges.empty());
+  CHECK(!graph.cudaEdges.empty());
 
   Vector<uint32_t> ranks;
   Vector<uint64_t> localNodes;
-  for (auto& v : op.cudaEdges) {
+  for (auto& v : graph.cudaEdges) {
     for (auto& l : {&v.sources, &v.destinations}) {
       for (auto& x : *l) {
         if (std::ranges::find(ranks, x.rank) == ranks.end()) {
@@ -1410,8 +1399,8 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
   }
   std::ranges::sort(ranks);
 
-  using Edge = CustomOpDescriptor::Edge;
-  using Node = CustomOpDescriptor::Node;
+  using Edge = compile_op::Graph::Edge;
+  using Node = compile_op::Graph::Node;
 
   // HashMap<uint32_t, Vector<Node>> sourceNodes;
   // HashMap<uint32_t, Vector<Node>> destinationNodes;
@@ -1477,7 +1466,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
   };
 
   auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
-  auto addrAddrs = map("addresses", sizeof(uint64_t) * op.localCudaTensorMappings.size() * numBlocks);
+  auto addrAddrs = map("addresses", sizeof(uint64_t) * graph.localCudaTensorMappings.size() * numBlocks);
 
   auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
 
@@ -1493,10 +1482,8 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     FunctionScope fnScope(fn);
     fn->maxThreads = blockSize;
     fn->addParamBytes(8, sizeof(CompileOpCopyParameters));
-    fn->addParamBytes(8,
-        sizeof(uint64_t) *
-            std::max(op.inputs.size() + op.inputCopies.size() + op.outputs.size() + op.outputCopies.size(), (size_t)1));
-    fn->addParamBytes(8, sizeof(uint64_t) * std::max(op.remoteCudaTensorMappings.size(), (size_t)1));
+    fn->addParamBytes(8, sizeof(uint64_t) * std::max(graph.tensors.size(), (size_t)1));
+    fn->addParamBytes(8, sizeof(uint64_t) * std::max(graph.remoteCudaTensorMappings.size(), (size_t)1));
 
     activateNewBlock("entry");
 
@@ -1523,33 +1510,27 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
     };
 
     auto findLocalMapping = [&](const auto& r) {
-      for (size_t i : indices(op.localCudaTensorMappings)) {
-        auto& v = op.localCudaTensorMappings[i];
+      for (size_t i : indices(graph.localCudaTensorMappings)) {
+        auto& v = graph.localCudaTensorMappings[i];
         if (v.rank == r.rank && v.tensorIndex == r.tensorIndex) {
           return i;
         }
       }
       log.error("failed to find mapping for %d %d\n", r.rank, r.tensorIndex);
-      for (size_t i : indices(op.localCudaTensorMappings)) {
-        auto& v = op.localCudaTensorMappings[i];
+      for (size_t i : indices(graph.localCudaTensorMappings)) {
+        auto& v = graph.localCudaTensorMappings[i];
         log.error(" index %d: %d %d\n", i, v.rank, v.tensorIndex);
       }
       CHECK(false);
     };
 
     std::unique_ptr<EmitMultiCopy> emit;
-    // if (useFlexbuf) {
-    //   emit = std::make_unique<EmitFlexBuf>(config, blockIndex, warpIdx, laneIdx, smemBufSharedAddr,
-    //   smemMbarSharedAddr);
-    // }
-    if (useLockstep) {
-      emit = std::make_unique<EmitLockstep>(config, blockIndex, warpIndex, laneIndex);
-    }
+    emit = std::make_unique<EmitLockstep>(config, blockIndex, warpIndex, laneIndex);
     CHECK(emit != nullptr);
     emit->init();
     IF_D(threadIndex == 0) {
-      for (size_t i : indices(op.remoteCudaTensorMappings)) {
-        auto& v = op.remoteCudaTensorMappings[i];
+      for (size_t i : indices(graph.remoteCudaTensorMappings)) {
+        auto& v = graph.remoteCudaTensorMappings[i];
         u64 addr = concurrency(addrAddrs.remote[rankIndex(v.rank)]) +
                    widen(sizeof(uint64_t) * (v.destinationSlot + v.stride * blockIndex));
         st_global_u64(addr, ld_param_u64(mappedAddrs, sizeof(uint64_t) * i));
@@ -1619,7 +1600,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
 
     Vector<Edge> localCopies;
 
-    for (auto& v : op.cudaEdges) {
+    for (auto& v : graph.cudaEdges) {
       CHECK(v.sources.size() == 1);
       CHECK(v.destinations.size() >= 1);
       auto& src = v.sources[0];
@@ -1646,42 +1627,46 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       CHECK(src.rank == rank || localdst);
       CHECK(std::ranges::find(ranks, src.rank) != ranks.end());
 
-      if (src.rank == rank) {
-        if (*config.copyWrite) {
-          localCopies.push_back(v);
-        } else if (localdst) {
-          Edge copy = v;
-          for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
-            if (i->rank == rank) {
-              ++i;
-            } else {
-              i = copy.destinations.erase(i);
-            }
-          }
-          localCopies.push_back(v);
-        }
-      } else {
-        if (!*config.copyWrite) {
-          Edge copy = v;
-          for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
-            if (i->rank != src.rank) {
-              ++i;
-            } else {
-              i = copy.destinations.erase(i);
-            }
-          }
-          localCopies.push_back(v);
-        }
+      if (v.executorRank == rank) {
+        localCopies.push_back(v);
       }
+
+      // if (src.rank == rank) {
+      //   if (*config.copyWrite) {
+      //     localCopies.push_back(v);
+      //   } else if (localdst) {
+      //     Edge copy = v;
+      //     for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
+      //       if (i->rank == rank) {
+      //         ++i;
+      //       } else {
+      //         i = copy.destinations.erase(i);
+      //       }
+      //     }
+      //     localCopies.push_back(v);
+      //   }
+      // } else {
+      //   if (!*config.copyWrite) {
+      //     Edge copy = v;
+      //     for (auto i = copy.destinations.begin(); i != copy.destinations.end();) {
+      //       if (i->rank != src.rank) {
+      //         ++i;
+      //       } else {
+      //         i = copy.destinations.erase(i);
+      //       }
+      //     }
+      //     localCopies.push_back(v);
+      //   }
+      // }
     }
 
     auto getaddr = [&](const Node& n) {
       if (n.rank == rank) {
         return ld_param_u64(inputAddrs, sizeof(uint64_t) * n.tensorIndex) + n.offset;
       } else {
-        return ld_global_u64(
-                   concurrency(addrAddrs.local) +
-                   widen(sizeof(uint64_t) * (findLocalMapping(n) + op.localCudaTensorMappings.size() * blockIndex))) +
+        return ld_global_u64(concurrency(addrAddrs.local) +
+                             widen(sizeof(uint64_t) *
+                                   (findLocalMapping(n) + graph.localCudaTensorMappings.size() * blockIndex))) +
                n.offset;
       }
     };
@@ -1691,7 +1676,16 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
       maxDestinations = std::max(maxDestinations, e.destinations.size());
     }
 
-    if (true) {
+    bool nowaits = true;
+    for (const Edge& e : localCopies) {
+      for (const Node& n : e.sources) {
+        if (!n.filled) {
+          nowaits = false;
+        }
+      }
+    }
+
+    if (nowaits) {
 
       for (const Edge& e : localCopies) {
         CHECK(e.sources.size() == 1);
@@ -1783,7 +1777,7 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
             for (const Node& n : e.destinations) {
               signalRanks[n.rank] = true;
             }
-            for (auto& ne : op.cudaEdges) {
+            for (auto& ne : graph.cudaEdges) {
               bool concerned = false;
               for (auto& n : ne.sources) {
                 for (auto& n2 : e.destinations) {
@@ -1807,35 +1801,6 @@ std::string generateCopyKernelPtx(const Group* group, const CopyKernelConfig& co
                       concurrency(depFilled.remote.at(rankIndex(r))) +
                           widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
                       stepValue);
-                }
-              }
-              IF_D(threadIndex == 0) {
-                u32 ready = 1;
-                if (!src.filled) {
-                  auto it = std::ranges::find(localNodes, src.id);
-                  CHECK(it != localNodes.end());
-                  IF(ld_global_relaxed_sys_u32(
-                         concurrency(depFilled.local) +
-                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) <
-                      stepValue) {
-                    ready = 0;
-                  }
-                }
-
-                IF(ready != 0) {
-                  auto& dst0 = e.destinations[0];
-                  auto it = std::ranges::find(localNodes, dst0.id);
-                  CHECK(it != localNodes.end());
-                  IF(ld_global_relaxed_sys_u32(
-                         concurrency(depFilled.local) +
-                         widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) ==
-                      stepValue) {
-                    numDone += 1;
-                  }
-                  ELSE {
-                    fence_acquire_sys();
-                    pred = 1;
-                  }
                 }
               }
             }

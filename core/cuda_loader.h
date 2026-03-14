@@ -36,6 +36,9 @@ using CUmodule = CUmod_st*;
 struct CUfunc_st;
 using CUfunction = CUfunc_st*;
 
+struct CUlinkState_st;
+using CUlinkState = CUlinkState_st*;
+
 // CUstream is defined in global namespace and aliased above
 
 struct CUevent_st;
@@ -197,6 +200,15 @@ constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
 constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER = 3;
 constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
 
+using CUjitInputType = int;
+constexpr CUjitInputType CU_JIT_INPUT_CUBIN = 0;
+constexpr CUjitInputType CU_JIT_INPUT_PTX = 1;
+constexpr CUjitInputType CU_JIT_INPUT_FATBINARY = 2;
+constexpr CUjitInputType CU_JIT_INPUT_OBJECT = 3;
+constexpr CUjitInputType CU_JIT_INPUT_LIBRARY = 4;
+constexpr CUjitInputType CU_JIT_INPUT_NVVM = 5;
+constexpr CUjitInputType CU_JIT_NUM_INPUT_TYPES = 6;
+
 // Event flags
 constexpr unsigned int CU_EVENT_DEFAULT = 0x0;
 constexpr unsigned int CU_EVENT_BLOCKING_SYNC = 0x1;
@@ -294,6 +306,12 @@ using cuCtxGetDevice_t = CUresult (*)(CUdevice* device);
 using cuDevicePrimaryCtxRetain_t = CUresult (*)(CUcontext* pctx, CUdevice dev);
 
 // Module management
+using cuLinkCreate_t = CUresult (*)(
+    unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut);
+using cuLinkAddData_t = CUresult (*)(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+    unsigned int numOptions, CUjit_option* options, void** optionValues);
+using cuLinkComplete_t = CUresult (*)(CUlinkState state, void** cubinOut, size_t* sizeOut);
+using cuLinkDestroy_t = CUresult (*)(CUlinkState state);
 using cuModuleLoadDataEx_t = CUresult (*)(
     CUmodule* module, const void* image, unsigned int numOptions, int* options, void** optionValues);
 using cuModuleUnload_t = CUresult (*)(CUmodule hmod);
@@ -410,6 +428,10 @@ struct CudaApi {
   cuDevicePrimaryCtxRetain_t devicePrimaryCtxRetain = nullptr;
 
   // Module management
+  cuLinkCreate_t linkCreate = nullptr;
+  cuLinkAddData_t linkAddData = nullptr;
+  cuLinkComplete_t linkComplete = nullptr;
+  cuLinkDestroy_t linkDestroy = nullptr;
   cuModuleLoadDataEx_t moduleLoadDataEx = nullptr;
   cuModuleUnload_t moduleUnload = nullptr;
   cuModuleGetFunction_t moduleGetFunction = nullptr;
@@ -535,6 +557,20 @@ inline CUresult cuCtxGetDevice(CUdevice* device) {
 }
 inline CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
   return cudaApi.devicePrimaryCtxRetain(pctx, dev);
+}
+inline CUresult cuLinkCreate(
+    unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut) {
+  return cudaApi.linkCreate(numOptions, options, optionValues, stateOut);
+}
+inline CUresult cuLinkAddData(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+    unsigned int numOptions, CUjit_option* options, void** optionValues) {
+  return cudaApi.linkAddData(state, type, data, size, name, numOptions, options, optionValues);
+}
+inline CUresult cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut) {
+  return cudaApi.linkComplete(state, cubinOut, sizeOut);
+}
+inline CUresult cuLinkDestroy(CUlinkState state) {
+  return cudaApi.linkDestroy(state);
 }
 inline CUresult cuModuleLoadDataEx(
     CUmodule* module, const void* image, unsigned int numOptions, int* options, void** optionValues) {

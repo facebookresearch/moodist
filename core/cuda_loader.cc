@@ -175,6 +175,10 @@ bool loadCuda() {
     cudaApi.ipcOpenEventHandle = (cuIpcOpenEventHandle_t)loadSym(lib, "cuIpcOpenEventHandle", name, ok, failed);
 
     // Kernel launch
+    cudaApi.linkCreate = (cuLinkCreate_t)loadSym(lib, "cuLinkCreate_v2", name, ok, failed);
+    cudaApi.linkAddData = (cuLinkAddData_t)loadSym(lib, "cuLinkAddData_v2", name, ok, failed);
+    cudaApi.linkComplete = (cuLinkComplete_t)loadSym(lib, "cuLinkComplete", name, ok, failed);
+    cudaApi.linkDestroy = (cuLinkDestroy_t)loadSym(lib, "cuLinkDestroy", name, ok, failed);
     cudaApi.launchKernel = (cuLaunchKernel_t)loadSym(lib, "cuLaunchKernel", name, ok, failed);
     cudaApi.launchHostFunc = (cuLaunchHostFunc_t)loadSym(lib, "cuLaunchHostFunc", name, ok, failed);
 

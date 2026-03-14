@@ -214,6 +214,10 @@ void tensorCopy_(Tensor* dst, Tensor* src) {
   dst->tensor.copy_(src->tensor);
 }
 
+void tensorZero_(Tensor* dst) {
+  dst->tensor.zero_();
+}
+
 // Tensor reduction operations
 void tensorSumOut(Tensor* dst, Tensor* src, int dim) {
   torch::sum_out(dst->tensor, src->tensor, dim);
@@ -347,6 +351,7 @@ void initMoodistApi() {
       .tensorMulScalar_ = wrappers::tensorMulScalar_,
       .tensorRecordStream = wrappers::tensorRecordStream,
       .tensorCopy_ = wrappers::tensorCopy_,
+      .tensorZero_ = wrappers::tensorZero_,
       .tensorSumOut = wrappers::tensorSumOut,
       .tensorAmaxOut = wrappers::tensorAmaxOut,
       .tensorAminOut = wrappers::tensorAminOut,
