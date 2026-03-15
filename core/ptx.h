@@ -769,6 +769,7 @@ Value addConst32(const std::vector<T>& vec, const char* name) {
 
 // mbarrier operations (sm_90+)
 void mbarrier_init(const Value& addr, int count);
+void mbarrier_inval(const Value& addr);
 Value mbarrier_arrive(const Value& addr); // returns state token (u64)
 Value mbarrier_arrive_noComplete(
     const Value& addr); // arrive with .noComplete hint (caller guarantees this won't complete the phase)

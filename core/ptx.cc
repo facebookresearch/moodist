@@ -669,6 +669,9 @@ void trap() {
 void mbarrier_init(const Value& addr, int count) {
   emitInst("mbarrier.init.shared::cta.b64 [" + addr.str() + "], " + std::to_string(count));
 }
+void mbarrier_inval(const Value& addr) {
+  emitInst("mbarrier.inval.shared::cta.b64 [" + addr.str() + "]");
+}
 
 Value mbarrier_arrive(const Value& addr) {
   Value state(ValType::U64);

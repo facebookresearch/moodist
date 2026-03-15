@@ -1200,8 +1200,94 @@ struct EmitLockstep : EmitMultiCopy {
     LABEL(alldone);
     IF_D(isLeader) {
       cp_async_bulk_wait_group_read(0);
+      mbarrier_inval(barrier);
     }
     barrier_sync();
+  }
+};
+
+struct EmitSimple : EmitMultiCopy {
+  const KernelConfig& config;
+  u32 blockIndex;
+  u32 warpIndex;
+  u32 laneIndex;
+
+  EmitSimple(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
+      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
+    CHECK(numBuffers > 0);
+    CHECK(bufferSize > 0);
+    CHECK(config.blockSize % 32 == 0);
+  }
+
+  uint32_t numBlocks = config.gridSize;
+  uint32_t inputSharedSize = config.sharedMemory;
+
+  uint32_t numBuffers = config.blockSize / 32;
+  uint32_t blockSharedAlignment = numBuffers * 256;
+  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
+  uint32_t bufferSize = blockSharedSize / numBuffers;
+
+  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
+  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
+
+  u32 bufferIndex = warpIndex;
+
+  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
+  u32 barrier = barrierBaseAddr + bufferIndex * 8;
+
+  void init() override {
+  }
+
+  void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
+    Label alldone;
+    Value isLeader = laneIndex == 0;
+    IF_D(isLeader) {
+      mbarrier_init(barrier, 1);
+    }
+    //barrier_sync();
+
+    // fixme: these seem to emit a function call to a software 64-bit division. oof
+    PRED(bytes % 16 != 0) trap();
+    PRED(src % 16 != 0) trap();
+    for (size_t i : indices(dst)) {
+      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+    }
+
+    u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
+
+    Label loop;
+    LABEL(loop);
+    for (uint32_t parity : range(2)) {
+      IF(offset >= bytes) {
+        GOTO(alldone);
+      }
+      u64 srcaddr = src + widen(offset);
+      u32 size = min_u32(bytes - offset, bufferSize);
+      IF_D(isLeader) {
+        cp_async_bulk_wait_group_read(0);
+        mbarrier_expect_tx(barrier, size);
+        mbarrier_arrive_noComplete(barrier);
+        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
+      }
+      IF_D(isLeader) {
+        mbarrier_wait_parity(barrier, parity);
+        for (size_t i : indices(dst)) {
+          IF(i < ndst) {
+            u64 dstaddr = dst[i] + widen(offset);
+            cp_async_bulk_global_shared(dstaddr, buffer, size);
+            // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
+          }
+        }
+        cp_async_bulk_commit_group();
+      }
+      offset += numBlocks * blockSharedSize;
+    }
+    GOTO(loop);
+    LABEL(alldone);
+    IF_D(isLeader) {
+      cp_async_bulk_wait_group_read(0);
+      mbarrier_inval(barrier);
+    }
   }
 };
 
@@ -1525,7 +1611,13 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     };
 
     std::unique_ptr<EmitMultiCopy> emit;
-    emit = std::make_unique<EmitLockstep>(config, blockIndex, warpIndex, laneIndex);
+    if (config.copyEngine == "simple") {
+      emit = std::make_unique<EmitSimple>(config, blockIndex, warpIndex, laneIndex);
+    } else if (config.copyEngine == "lockstep") {
+      emit = std::make_unique<EmitLockstep>(config, blockIndex, warpIndex, laneIndex);
+    } else {
+      CHECK(false);
+    }
     CHECK(emit != nullptr);
     emit->init();
     IF_D(threadIndex == 0) {

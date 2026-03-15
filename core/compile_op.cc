@@ -743,6 +743,15 @@ struct CompileOpConstructor {
         configs.push_back(config);
       }
     }
+    for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
+      for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
+        KernelConfig config;
+        config.copyEngine = "simple";
+        config.blockSize = blockSize;
+        config.sharedMemory = sharedSize;
+        configs.push_back(config);
+      }
+    }
 
     Vector<Setting> settings;
     for (const Graph& graph : graphs) {
@@ -846,6 +855,8 @@ struct CompileOpConstructor {
       const Setting& setting = settings[i];
       const Graph& graph = setting.graph;
       const KernelConfig& config = setting.config;
+
+      log.info("run %d\n", i);
 
       Vector<TensorPtr> tensors;
       Vector<uintptr_t> tensorAddrs;
@@ -2219,10 +2230,10 @@ struct CompileOpConstructor {
 
     Vector<Graph> graphs;
 
-    // graphs.push_back(buildNothing(ictx, baseGraph));
+    graphs.push_back(buildNothing(ictx, baseGraph));
     graphs.push_back(buildMulticast(ictx, baseGraph));
-    // graphs.push_back(buildRing(ictx, baseGraph, true));
-    // graphs.push_back(buildRing(ictx, baseGraph, false));
+    graphs.push_back(buildRing(ictx, baseGraph, true));
+    graphs.push_back(buildRing(ictx, baseGraph, false));
 
     // Final barrier
     ctx.barrier();

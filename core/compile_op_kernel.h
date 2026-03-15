@@ -19,7 +19,7 @@ struct CompileOpCopyParameters {
 };
 
 struct KernelConfig {
-  const char* copyEngine = nullptr;
+  std::string copyEngine;
 
   uint32_t blockSize = 256;
   uint32_t gridSize = 8;
