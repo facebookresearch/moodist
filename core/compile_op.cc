@@ -370,6 +370,10 @@ struct GraphBuilder {
       cudaRanks.push_back(rank);
     }
     std::ranges::sort(cudaRanks);
+
+    if (!group->fabricDomainRanks.empty()) {
+      cudaRanks = group->fabricDomainRanks;
+    }
   }
 
   void multicast() {
@@ -753,6 +757,23 @@ struct CompileOpConstructor {
       }
     }
 
+    {
+      auto tmp = configs;
+      configs.clear();
+      for (KernelConfig c : tmp) {
+        c.gridSize = 8;
+        configs.push_back(c);
+        c.gridSize = 12;
+        configs.push_back(c);
+        c.gridSize = 16;
+        configs.push_back(c);
+        // c.gridSize = 32;
+        // configs.push_back(c);
+        // c.gridSize = 64;
+        // configs.push_back(c);
+      }
+    }
+
     Vector<Setting> settings;
     for (const Graph& graph : graphs) {
       Setting s;
@@ -873,8 +894,8 @@ struct CompileOpConstructor {
       Vector<uintptr_t> mappedAddrs(graph.remoteCudaTensorMappings.size());
       for (size_t i : indices(mappedAddrs)) {
         auto& m = graph.remoteCudaTensorMappings[i];
-        ipcMapper->requestAddress(group->getPeerIndex(m.rank), tensorAddrs.at(m.tensorIndex),
-            graph.tensors.at(m.tensorIndex).bytes, &mappedAddrs[i]);
+        ipcMapper->requestAddressRank(
+            m.rank, tensorAddrs.at(m.tensorIndex), graph.tensors.at(m.tensorIndex).bytes, &mappedAddrs[i]);
       }
       ipcMapper->wait();
 

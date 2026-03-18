@@ -118,6 +118,8 @@ bool loadCuda() {
     cudaApi.memAllocManaged = (cuMemAllocManaged_t)loadSym(lib, "cuMemAllocManaged", name, ok, failed);
     cudaApi.memGetInfo = (cuMemGetInfo_t)loadSym(lib, "cuMemGetInfo_v2", name, ok, failed);
     cudaApi.memGetAddressRange = (cuMemGetAddressRange_t)loadSym(lib, "cuMemGetAddressRange_v2", name, ok, failed);
+    cudaApi.memGetHandleForAddressRange =
+        (cuMemGetHandleForAddressRange_t)loadSym(lib, "cuMemGetHandleForAddressRange", name, ok, failed);
     cudaApi.memHostAlloc = (cuMemHostAlloc_t)loadSym(lib, "cuMemHostAlloc", name, ok, failed);
     cudaApi.memFreeHost = (cuMemFreeHost_t)loadSym(lib, "cuMemFreeHost", name, ok, failed);
     cudaApi.memHostRegister = (cuMemHostRegister_t)loadSym(lib, "cuMemHostRegister_v2", name, ok, failed);
@@ -143,8 +145,8 @@ bool loadCuda() {
         (cuMemGetAllocationGranularity_t)loadSym(lib, "cuMemGetAllocationGranularity", name, ok, failed);
     cudaApi.memExportToShareableHandle =
         (cuMemExportToShareableHandle_t)loadSym(lib, "cuMemExportToShareableHandle", name, ok, failed);
-    cudaApi.memImportShareableHandle =
-        (cuMemImportShareableHandle_t)loadSym(lib, "cuMemImportFromShareableHandle", name, ok, failed);
+    cudaApi.memImportFromShareableHandle =
+        (cuMemImportFromShareableHandle_t)loadSym(lib, "cuMemImportFromShareableHandle", name, ok, failed);
 
     // Pointer attributes
     cudaApi.pointerGetAttribute = (cuPointerGetAttribute_t)loadSym(lib, "cuPointerGetAttribute", name, ok, failed);
@@ -223,6 +225,8 @@ bool loadNvml() {
     nvmlApi.deviceGetMemoryAffinity =
         (nvmlDeviceGetMemoryAffinity_t)loadSym(lib, "nvmlDeviceGetMemoryAffinity", name, ok, failed);
     nvmlApi.deviceGetP2PStatus = (nvmlDeviceGetP2PStatus_t)loadSym(lib, "nvmlDeviceGetP2PStatus", name, ok, failed);
+    nvmlApi.deviceGetGpuFabricInfoV =
+        (nvmlDeviceGetGpuFabricInfoV_t)loadSym(lib, "nvmlDeviceGetGpuFabricInfoV", name, ok, failed);
     if (!ok) {
       log.error("Failed to load NVML symbols from %s: %s\n", name, failed.c_str());
       nvmlApi = {};

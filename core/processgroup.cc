@@ -3330,7 +3330,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       auto& m = op->graph.remoteCudaTensorMappings[i];
       auto& tensor =
           m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
-      ipcMapper->requestAddress(group->getPeerIndex(m.rank), tensor->data(), tensor->bytes(), &mappedAddrs[i]);
+      ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
     }
     ipcMapper->wait();
 

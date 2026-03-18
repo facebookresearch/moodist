@@ -1235,8 +1235,7 @@ struct EmitSimple : EmitMultiCopy {
   u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
   u32 barrier = barrierBaseAddr + bufferIndex * 8;
 
-  void init() override {
-  }
+  void init() override {}
 
   void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
     Label alldone;
@@ -1244,7 +1243,7 @@ struct EmitSimple : EmitMultiCopy {
     IF_D(isLeader) {
       mbarrier_init(barrier, 1);
     }
-    //barrier_sync();
+    // barrier_sync();
 
     // fixme: these seem to emit a function call to a software 64-bit division. oof
     PRED(bytes % 16 != 0) trap();
@@ -1431,8 +1430,7 @@ KernelMappedBuffers mapn(
       mapped[i] = local->buffer.cudaPointer;
       continue;
     }
-    size_t peerIndex = ctx.group->getPeerIndex(ranks[i]);
-    ctx.group->ipcMapper->requestAddress(peerIndex, local->buffer.cudaPointer, local->buffer.bytes, &mapped[i]);
+    ctx.group->ipcMapper->requestAddressRank(ranks[i], local->buffer.cudaPointer, local->buffer.bytes, &mapped[i]);
   }
   ctx.group->ipcMapper->wait();
 

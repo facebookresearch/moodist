@@ -5,6 +5,7 @@
 #include "api/allocator.h"
 #include "api/allocator_api.h"
 #include "common.h"
+#include "cputhread.h"
 #include "function.h"
 #include "hash_map.h"
 #include "synchronization.h"
@@ -78,6 +79,18 @@ struct IpcMapper {
     std::vector<PendingCallback> pendingCallbacks;
   };
   std::array<VMMPeerState, 8> vmmPeers;
+
+  struct FabricMapState {
+    uintptr_t base = 0;
+    uintptr_t size = 0;
+    size_t nextChunkIndex = 0;
+    struct Waiter {
+      Function<void()> callback;
+    };
+    Vector<size_t> inFlightChunks;
+    Vector<Waiter> waiters;
+  };
+  Vector<FabricMapState> fabricMap;
 
   virtual ~IpcMapper() {}
 
@@ -353,6 +366,72 @@ struct IpcMapper {
           *ptr = value;
         },
         unmappable);
+  }
+
+  void requestAddressRank(size_t rank, uintptr_t address, size_t length, uintptr_t* ptr) {
+    if (group->ipcAccess.at(rank)) {
+      return requestAddress(group->getPeerIndex(rank), address, length, ptr);
+    }
+    uintptr_t base = allocatorGetReservedBase();
+    auto region = allocator::mappedRegion(address);
+    CHECK(base != 0);
+    if (region.first == 0) {
+      throw std::runtime_error(
+          fmt::sprintf("Attempting to fabric map memory (%#x) which is not owned by the moodist cuda allocator. This "
+                       "is not supported - enable the moodist cuda allocator through moodist.enable_cuda_allocator().",
+              address));
+    }
+    std::lock_guard l(mutex);
+    if (fabricMap.size() <= rank) {
+      fabricMap.resize(group->size);
+    }
+    uintptr_t addressOffset = address - base;
+    uintptr_t regionOffset = region.first - base;
+    uintptr_t regionEnd = regionOffset + region.second;
+    auto& im = fabricMap.at(rank);
+    if (im.inFlightChunks.empty() && im.base != 0) {
+      if (im.size >= regionEnd) {
+        *ptr = im.base + addressOffset;
+        return;
+      }
+    }
+    while (im.size < regionEnd) {
+      size_t i = im.nextChunkIndex;
+      unsigned long long chunkHandle;
+      size_t chunkOffset;
+      size_t chunkSize;
+      CHECK(allocatorGetChunk(i, &chunkHandle, &chunkOffset, &chunkSize));
+      CHECK(chunkOffset == im.size);
+
+      CUmemFabricHandle fabricHandle;
+      CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, chunkHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+
+      log.info("sending export handle yey, chunk %d at %d+%d to %d\n", i, chunkOffset, chunkSize, rank);
+
+      CHECK(!std::ranges::contains(im.inFlightChunks, i));
+      im.inFlightChunks.push_back(i);
+      im.nextChunkIndex = i + 1;
+      im.size += chunkSize;
+
+      QueueEntryFabricMap* e = group->cpuThread->freelistFabricMap.pop();
+      e->task = taskFabricMap;
+      e->targetRank = rank;
+      e->chunkIndex = i;
+      e->handle = fabricHandle;
+      e->offset = chunkOffset;
+      e->bytes = chunkSize;
+      group->cpuThread->enqueue(e);
+    }
+    ++waitCount;
+    FabricMapState::Waiter w;
+    w.callback = [this, ptr, rank, addressOffset, length]() {
+      auto& im = fabricMap[rank];
+      CHECK(im.base != 0);
+      CHECK(im.size >= addressOffset + length);
+      *ptr = im.base + addressOffset;
+      --waitCount;
+    };
+    im.waiters.push_back(w);
   }
 
   template<typename Callback>

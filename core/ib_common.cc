@@ -63,14 +63,20 @@ static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum)
     if (std::memcmp(&entry.gid, &zero, sizeof(zero)) == 0) {
       continue;
     }
+    log.info("gid %d is %s of type %d    -- %d %d %d\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
+        entry.port_num, entry.ndev_ifindex);
     int priority = gidTypePriority(entry.gid_type);
-    if (priority < bestPriority) {
+    // if (i == 3) {
+    //   priority -= 100;
+    // }
+    if (priority <= bestPriority) {
       bestPriority = priority;
       bestIndex = i;
       bestGid = entry.gid;
       bestGidType = entry.gid_type;
       found = true;
     }
+    // break;
   }
 
   if (!found) {
@@ -91,9 +97,11 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
-  log.debug("Init IB\n");
+  log.debug("Init IB port %d\n", portNum);
 
   auto [gidIndex, gid] = selectGid(context, portNum);
+
+  log.info("gid for index %d is %s\n", gidIndex, hexstr(&gid, 16));
 
   IbAddress loopbackAddress;
 
@@ -194,6 +202,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     std::memset(&attr.ah_attr, 0, sizeof(attr.ah_attr));
+    log.info("REMOTE gid for index %d is %s\n", gidIndex, hexstr(&remoteAddress.gid, 16));
     attr.ah_attr.grh.dgid = remoteAddress.gid;
     attr.ah_attr.grh.sgid_index = gidIndex;
     attr.ah_attr.grh.hop_limit = 64;
@@ -373,6 +382,20 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
       throwErrno(errno, "ibv_alloc_pd");
     }
   }
+
+  // std::thread at([this]() {
+  //   log.info("started async event loop\n");
+  //   while (true) {
+  //     ibv_async_event event;
+  //     int err = ibv_get_async_event(context, &event);
+  //     log.info("async err %d\n", err);
+  //     if (err) {
+  //       break;
+  //     }
+  //     log.info("async event %d\n", event.event_type);
+  //   }
+  // });
+  // at.detach();
 
   cq = ibv_create_cq(context, maxCqEntries, nullptr, nullptr, 0);
   if (!cq) {

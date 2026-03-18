@@ -4,6 +4,8 @@
 #include "api/allocator_api.h"
 #include "async.h"
 #include "common.h"
+#include "cputhread.h"
+#include "cuda_loader.h"
 #include "group.h"
 #include "setup_comms.h"
 #include "socket.h"
@@ -491,7 +493,7 @@ struct IpcMapperImpl : IpcMapper {
               int fd = recvFdFromSocket(vmmRecvFds[peerIndex]);
 
               CUmemGenericAllocationHandle importedHandle;
-              CHECK_CU(cuMemImportShareableHandle(
+              CHECK_CU(cuMemImportFromShareableHandle(
                   &importedHandle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
               ::close(fd);
 
@@ -503,7 +505,7 @@ struct IpcMapperImpl : IpcMapper {
                   v.requestBytes, v.requestVMMOffset, sourceRank);
 
               CUmemGenericAllocationHandle importedHandle;
-              CHECK_CU(cuMemImportShareableHandle(&importedHandle, &v.requestMapFabric, CU_MEM_HANDLE_TYPE_FABRIC));
+              CHECK_CU(cuMemImportFromShareableHandle(&importedHandle, &v.requestMapFabric, CU_MEM_HANDLE_TYPE_FABRIC));
 
               v.response = mapVMMHandle(handlerVMMPeers[peerIndex], importedHandle, v.requestBytes, v.requestVMMOffset,
                   peerIndex, sourceRank);
@@ -514,8 +516,8 @@ struct IpcMapperImpl : IpcMapper {
 
               int fd = recvFdFromSocket(vmmRecvFds[peerIndex]);
               CUmemGenericAllocationHandle mcHandle;
-              CHECK_CU(
-                  cuMemImportShareableHandle(&mcHandle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+              CHECK_CU(cuMemImportFromShareableHandle(
+                  &mcHandle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
               ::close(fd);
 
               v.response = addDeviceToMulticast(mcHandle, v.requestBytes);
@@ -524,7 +526,7 @@ struct IpcMapperImpl : IpcMapper {
                   v.requestBytes, sourceRank);
 
               CUmemGenericAllocationHandle mcHandle;
-              CHECK_CU(cuMemImportShareableHandle(&mcHandle, &v.requestMapFabric, CU_MEM_HANDLE_TYPE_FABRIC));
+              CHECK_CU(cuMemImportFromShareableHandle(&mcHandle, &v.requestMapFabric, CU_MEM_HANDLE_TYPE_FABRIC));
 
               v.response = addDeviceToMulticast(mcHandle, v.requestBytes);
             } else if (v.kind == requestMulticastBind) {
@@ -796,7 +798,100 @@ struct IpcMapperImpl : IpcMapper {
     }
   }
 
+  struct RemoteFabricMap {
+    uintptr_t base = 0;
+    Vector<size_t> mappedChunks;
+  };
+  Vector<RemoteFabricMap> remoteFabricMaps;
+
+  uintptr_t onFabricMap(uint32_t source, QueueEntryFabricMap info) {
+    std::lock_guard l(mutex);
+    CHECK(source != group->rank && source < group->size);
+
+    log.info("waa got fabric map request of chunk %d from rank %d\n", info.chunkIndex, source);
+    // CHECK(false);
+
+    constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024;
+    CHECK(info.offset + info.bytes <= reserveSize);
+
+    if (remoteFabricMaps.size() != group->size) {
+      remoteFabricMaps.resize(group->size);
+    }
+
+    auto& m = remoteFabricMaps.at(source);
+    CHECK(!std::ranges::contains(m.mappedChunks, info.chunkIndex));
+    m.mappedChunks.push_back(info.chunkIndex);
+
+    CHECK_CU(cuCtxSetCurrent(group->cuContext));
+
+    if (m.base == 0) {
+      CUmemAllocationProp prop;
+      std::memset(&prop, 0, sizeof(prop));
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      CUdevice dev;
+      CHECK_CU(cuCtxGetDevice(&dev));
+      prop.location.id = dev;
+      size_t granularity = 0;
+      CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+      CUdeviceptr base;
+      CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+      m.base = base;
+
+      log.info("Fabric map reserved memory for rank %d at %#x\n", source, m.base);
+    }
+
+    CUmemGenericAllocationHandle importedHandle;
+    CHECK_CU(cuMemImportFromShareableHandle(&importedHandle, &info.handle, CU_MEM_HANDLE_TYPE_FABRIC));
+
+    uintptr_t address = m.base + info.offset;
+    CHECK_CU(cuMemMap(address, info.bytes, 0, importedHandle, 0));
+
+    CUmemAccessDesc accessDesc;
+    std::memset(&accessDesc, 0, sizeof(accessDesc));
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    CUdevice dev;
+    CHECK_CU(cuCtxGetDevice(&dev));
+    accessDesc.location.id = dev;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CHECK_CU(cuMemSetAccess(address, info.bytes, &accessDesc, 1));
+
+    log.info("Fabric map successfully mapped chunk %d for rank %d\n", info.chunkIndex, source);
+
+    return m.base;
+  }
+
+  void onFabricMapDone(uint32_t source, size_t chunkIndex, uintptr_t base) {
+    std::lock_guard l(mutex);
+    log.info("got fabric map done!? source %d chunk %d base %#x\n", source, chunkIndex, base);
+
+    auto& im = fabricMap.at(source);
+    if (im.base == 0) {
+      im.base = base;
+    }
+
+    auto it = std::ranges::find(im.inFlightChunks, chunkIndex);
+    CHECK(it != im.inFlightChunks.end());
+    im.inFlightChunks.erase(it);
+
+    if (im.inFlightChunks.empty()) {
+      auto waiters = std::move(im.waiters);
+      im.waiters.clear();
+      for (auto& v : waiters) {
+        v.callback();
+      }
+    }
+  }
+
   void init(int node) {
+
+    CHECK(group->cpuThread != nullptr);
+    group->cpuThread->onFabricMap = [this](uint32_t source, QueueEntryFabricMap info) {
+      return onFabricMap(source, info);
+    };
+    group->cpuThread->onFabricMapDone = [this](uint32_t source, size_t chunkIndex, uintptr_t base) {
+      onFabricMapDone(source, chunkIndex, base);
+    };
 
     mymem = Memfd::create(memsize, node);
 

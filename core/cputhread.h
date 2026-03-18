@@ -5,6 +5,7 @@
 #include "api/moodist_api.h"
 #include "compile_op.h"
 #include "compile_op_kernel.h"
+#include "cuda_loader.h"
 #include "group.h"
 #include "intrusive_list.h"
 #include "simple_vector.h"
@@ -42,6 +43,7 @@ constexpr uint8_t taskCallback = 22;
 constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
+constexpr uint8_t taskFabricMap = 26;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -99,6 +101,9 @@ OPTYPE(Custom);
 OPTYPE(CompileOpLocal);
 
 OPTYPE(MessageShutdown);
+
+OPTYPE(FabricMap);
+OPTYPE(FabricMapDone);
 
 template<typename DynamicAddresses>
 inline void badOp(const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
@@ -353,6 +358,14 @@ struct QueueEntryCustom : QueueEntry {
   std::vector<TensorDataPtr> outputs;
 };
 
+struct QueueEntryFabricMap : QueueEntry {
+  uint32_t targetRank;
+  size_t chunkIndex;
+  CUmemFabricHandle handle;
+  size_t offset;
+  size_t bytes;
+};
+
 template<typename T>
 struct QueueEntryFreeList {
   SpinMutex mutex;
@@ -387,6 +400,9 @@ struct CpuThread {
   IntrusiveList<QueueEntry, &QueueEntry::link> queue;
   std::atomic_uint32_t queueSize = 0;
 
+  Function<uintptr_t(uint32_t, QueueEntryFabricMap)> onFabricMap;
+  Function<void(uint32_t, size_t, uintptr_t)> onFabricMapDone;
+
   std::atomic_bool ready = false;
   std::atomic_bool busy = false;
 
@@ -411,6 +427,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCached> freelistCached;
   QueueEntryFreeList<QueueEntryCallback> freelistCallback;
   QueueEntryFreeList<QueueEntryCustom> freelistCustom;
+  QueueEntryFreeList<QueueEntryFabricMap> freelistFabricMap;
 
   std::exception_ptr initExceptionPtr;
   std::atomic_bool initException = false;

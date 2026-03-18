@@ -86,6 +86,15 @@ enum CUmemAllocationGranularity_flags {
   CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 1,
 };
 
+enum CUmemRangeFlags {
+  CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE = 1,
+};
+
+enum CUmemRangeHandleType {
+  CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1,
+  CU_MEM_RANGE_HANDLE_TYPE_MAX = 0x7FFFFFFF,
+};
+
 // Virtual memory management structs
 struct CUmemLocation {
   CUmemLocationType type;
@@ -177,6 +186,7 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 124;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132;
 
@@ -327,6 +337,8 @@ using cuMemFree_t = CUresult (*)(CUdeviceptr dptr);
 using cuMemAllocManaged_t = CUresult (*)(CUdeviceptr* dptr, size_t bytesize, unsigned int flags);
 using cuMemGetInfo_t = CUresult (*)(size_t* free, size_t* total);
 using cuMemGetAddressRange_t = CUresult (*)(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr);
+using cuMemGetHandleForAddressRange_t = CUresult (*)(
+    void* handle, CUdeviceptr dptr, size_t size, CUmemRangeHandleType handleType, unsigned long long flags);
 using cuMemHostAlloc_t = CUresult (*)(void** pp, size_t bytesize, unsigned int flags);
 using cuMemFreeHost_t = CUresult (*)(void* p);
 using cuMemHostRegister_t = CUresult (*)(void* p, size_t bytesize, unsigned int flags);
@@ -357,7 +369,7 @@ using cuMemGetAllocationGranularity_t = CUresult (*)(
     size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option);
 using cuMemExportToShareableHandle_t = CUresult (*)(void* shareableHandle, CUmemGenericAllocationHandle handle,
     CUmemAllocationHandleType handleType, unsigned long long flags);
-using cuMemImportShareableHandle_t = CUresult (*)(
+using cuMemImportFromShareableHandle_t = CUresult (*)(
     CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType);
 
 // Multicast management (optional, Hopper+ with NVSwitch)
@@ -446,6 +458,7 @@ struct CudaApi {
   cuMemAllocManaged_t memAllocManaged = nullptr;
   cuMemGetInfo_t memGetInfo = nullptr;
   cuMemGetAddressRange_t memGetAddressRange = nullptr;
+  cuMemGetHandleForAddressRange_t memGetHandleForAddressRange = nullptr;
   cuMemHostAlloc_t memHostAlloc = nullptr;
   cuMemFreeHost_t memFreeHost = nullptr;
   cuMemHostRegister_t memHostRegister = nullptr;
@@ -470,7 +483,7 @@ struct CudaApi {
   cuMemSetAccess_t memSetAccess = nullptr;
   cuMemGetAllocationGranularity_t memGetAllocationGranularity = nullptr;
   cuMemExportToShareableHandle_t memExportToShareableHandle = nullptr;
-  cuMemImportShareableHandle_t memImportShareableHandle = nullptr;
+  cuMemImportFromShareableHandle_t memImportFromShareableHandle = nullptr;
 
   // Multicast (optional)
   cuMulticastCreate_t multicastCreate = nullptr;
@@ -603,6 +616,10 @@ inline CUresult cuMemGetInfo(size_t* free, size_t* total) {
 inline CUresult cuMemGetAddressRange(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr) {
   return cudaApi.memGetAddressRange(pbase, psize, dptr);
 }
+inline CUresult cuMemGetHandleForAddressRange(
+    void* handle, CUdeviceptr dptr, size_t size, CUmemRangeHandleType handleType, unsigned long long flags) {
+  return cudaApi.memGetHandleForAddressRange(handle, dptr, size, handleType, flags);
+}
 inline CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int flags) {
   return cudaApi.memHostAlloc(pp, bytesize, flags);
 }
@@ -662,9 +679,9 @@ inline CUresult cuMemExportToShareableHandle(void* shareableHandle, CUmemGeneric
     CUmemAllocationHandleType handleType, unsigned long long flags) {
   return cudaApi.memExportToShareableHandle(shareableHandle, handle, handleType, flags);
 }
-inline CUresult cuMemImportShareableHandle(
+inline CUresult cuMemImportFromShareableHandle(
     CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType) {
-  return cudaApi.memImportShareableHandle(handle, osHandle, shHandleType);
+  return cudaApi.memImportFromShareableHandle(handle, osHandle, shHandleType);
 }
 inline CUresult cuMulticastCreate(CUmemGenericAllocationHandle* handle, const CUmulticastObjectProp* prop) {
   return cudaApi.multicastCreate(handle, prop);
@@ -781,6 +798,15 @@ constexpr nvmlGpuP2PCapsIndex_t NVML_P2P_CAPS_INDEX_NVLINK = 2;
 using nvmlAffinityScope_t = unsigned int;
 constexpr nvmlAffinityScope_t NVML_AFFINITY_SCOPE_NODE = 0;
 
+struct nvmlGpuFabricInfo_t {
+  unsigned int version = sizeof(nvmlGpuFabricInfo_t) | (2 << 24);
+  unsigned char clusterUuid[16];
+  nvmlReturn_t status;
+  unsigned int cliqueId;
+  unsigned char state;
+  unsigned int healthMask;
+};
+
 using nvmlInit_v2_t = nvmlReturn_t (*)();
 using nvmlErrorString_t = const char* (*)(nvmlReturn_t);
 using nvmlDeviceGetCount_t = nvmlReturn_t (*)(unsigned int*);
@@ -790,6 +816,7 @@ using nvmlDeviceGetPciInfo_v3_t = nvmlReturn_t (*)(nvmlDevice_t, nvmlPciInfo_t*)
 using nvmlDeviceGetMemoryAffinity_t = nvmlReturn_t (*)(nvmlDevice_t, unsigned int, unsigned long*, nvmlAffinityScope_t);
 using nvmlDeviceGetP2PStatus_t = nvmlReturn_t (*)(
     nvmlDevice_t, nvmlDevice_t, nvmlGpuP2PCapsIndex_t, nvmlGpuP2PStatus_t*);
+using nvmlDeviceGetGpuFabricInfoV_t = nvmlReturn_t (*)(nvmlDevice_t, nvmlGpuFabricInfo_t*);
 
 struct NvmlApi {
   nvmlInit_v2_t init = nullptr;
@@ -800,6 +827,7 @@ struct NvmlApi {
   nvmlDeviceGetPciInfo_v3_t deviceGetPciInfo = nullptr;
   nvmlDeviceGetMemoryAffinity_t deviceGetMemoryAffinity = nullptr;
   nvmlDeviceGetP2PStatus_t deviceGetP2PStatus = nullptr;
+  nvmlDeviceGetGpuFabricInfoV_t deviceGetGpuFabricInfoV = nullptr;
 
   bool available() const {
     return init != nullptr;

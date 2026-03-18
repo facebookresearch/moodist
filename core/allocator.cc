@@ -1073,16 +1073,26 @@ struct CudaAllocCleanupCtx {
 // Global allocator impl pointer for allocator::owns/mappedRegion
 CudaAllocatorImpl* globalCudaAllocatorImpl = nullptr;
 
+namespace {
+std::once_flag initFlag;
+void init() {
+  globalCudaAllocatorImpl = internalNew<CudaAllocatorImpl>();
+}
+} // namespace
+
 // CoreApi function implementations
 CudaAllocatorImpl* createCudaAllocatorImpl() {
-  return internalNew<CudaAllocatorImpl>();
+  // return internalNew<CudaAllocatorImpl>();
+  return nullptr;
 }
 
 void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
-  globalCudaAllocatorImpl = impl;
+  // globalCudaAllocatorImpl = impl;
 }
 
 CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
+  std::call_once(initFlag, init);
+  impl = globalCudaAllocatorImpl;
   std::lock_guard l(impl->mutex);
 
   if (!loadCuda()) {
@@ -1260,9 +1270,6 @@ std::pair<uintptr_t, size_t> allocatorMappedRegion(uintptr_t address) {
   return {0, 0};
 }
 
-// C-style API wrappers for CoreApi function pointers
-// These use out params to avoid ABI issues with returning structs
-
 void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
     uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex) {
   CudaAllocation alloc = cudaAllocatorImplAllocate(impl, bytes, stream, deviceIndex);
@@ -1316,47 +1323,6 @@ bool allocatorSupportsFabric() {
     return false;
   }
   return globalCudaAllocatorImpl->fabricSupported;
-}
-
-size_t allocatorGetChunksForRange(uintptr_t addr, size_t len, AllocatorChunkBinding* out, size_t maxOut) {
-  if (!globalCudaAllocatorImpl || len == 0) {
-    return 0;
-  }
-  std::lock_guard l(globalCudaAllocatorImpl->mutex);
-  auto& handles = globalCudaAllocatorImpl->cuMemHandles;
-  uintptr_t base = globalCudaAllocatorImpl->reservedBase.load(std::memory_order_relaxed);
-  if (base == 0) {
-    return 0;
-  }
-
-  // addr is a VA within the reserved range. Compute offset from base.
-  CHECK(addr >= base);
-  size_t allocOffset = addr - base;
-  size_t allocEnd = allocOffset + len;
-
-  // Walk chunks to find overlapping ones
-  size_t chunkStart = 0;
-  size_t nBindings = 0;
-  for (size_t i = 0; i < handles.size() && nBindings < maxOut; ++i) {
-    size_t chunkSize = handles[i].first;
-    size_t chunkEnd = chunkStart + chunkSize;
-
-    // Check overlap with [allocOffset, allocEnd)
-    if (chunkEnd > allocOffset && chunkStart < allocEnd) {
-      size_t overlapStart = std::max(chunkStart, allocOffset);
-      size_t overlapEnd = std::min(chunkEnd, allocEnd);
-
-      auto& b = out[nBindings++];
-      b.handle = handles[i].second;
-      b.mcOffset = overlapStart - allocOffset; // Relative to addr
-      b.memOffset = overlapStart - chunkStart; // Offset within the chunk
-      b.size = overlapEnd - overlapStart;
-    }
-
-    chunkStart = chunkEnd;
-  }
-
-  return nBindings;
 }
 
 // allocator namespace functions that are in core

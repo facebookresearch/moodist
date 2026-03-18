@@ -143,6 +143,8 @@ struct Group {
   Vector<size_t> rankToNodeIndex;
   Vector<size_t> rankLocalRank;
 
+  Vector<size_t> fabricDomainRanks;
+
   int allocationNode = -1;
 
   void* mySharedMem = nullptr;
@@ -197,7 +199,7 @@ struct Group {
   }
 
   AllocatedBuffer allocateManaged(size_t bytes);
-  AllocatedBuffer allocateDevice(size_t bytes);
+  AllocatedBuffer allocateDevice(size_t bytes, bool useAllocator = true);
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);

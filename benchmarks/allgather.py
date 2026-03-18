@@ -40,9 +40,14 @@ DEFAULT_SIZES = [1024, 4096, 16384, 65536, 262144, 1024**2, 4 * 1024**2,
 
 
 def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int,
-                    profile: bool = False):
+                    profile: bool = False, world_size: int = None):
     rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size is not None:
+        if rank >= world_size:
+            return
+        os.environ["WORLD_SIZE"] = str(world_size)
+    else:
+        world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
@@ -151,10 +156,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--profile", action="store_true",
                         help="Generate Chrome traces in traces/<backend>/")
+    parser.add_argument("--world_size", type=int, default=None)
     args = parser.parse_args()
 
     sizes = [parse_size(s) for s in args.sizes.split(",")] if args.sizes else DEFAULT_SIZES
-    bench_allgather(args.backend, sizes, args.iterations, args.warmup, args.profile)
+    bench_allgather(args.backend, sizes, args.iterations, args.warmup, args.profile, args.world_size)
 
 
 if __name__ == "__main__":

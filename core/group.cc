@@ -157,6 +157,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   log.verbose("device async engines: %d\n", asyncEngines);
 
+  int dmaBufSupported;
+  CHECK_CU(cuDeviceGetAttribute(&dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice));
+  log.info("dmabuf supported: %d\n", dmaBufSupported);
+
   if (!loadNvml()) {
     throw std::runtime_error("NVML not available");
   }
@@ -309,6 +313,11 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
           if (ibv_query_device(ctx, &attributes) != 0) {
             continue;
           }
+
+          // char directPath[256];
+          // std::memset(directPath, 0, 256);
+          // log.info("direct: %d\n", mlx5dv_get_data_direct_sysfs_path(ctx, directPath, 256));
+          // log.info("direct path: %s\n", (const char*)directPath);
 
           log.debug("max_mr_size is %d\n", attributes.max_mr_size);
           log.debug("max_mr is %d\n", attributes.max_mr);
@@ -591,7 +600,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       rankLocalRank.push_back(localRank);
     }
 
-    AllocatedBuffer testMemory = allocateDevice(0x1000);
+    AllocatedBuffer testMemory = allocateDevice(0x1000, false);
 
     CUipcMemHandle testIpcHandle;
     CHECK_CU(cuIpcGetMemHandle(&testIpcHandle, testMemory.cudaPointer));
@@ -616,6 +625,157 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     }
 
     CHECK(peerIndices.size() <= 8);
+
+    if (true) {
+      auto tmp = allocateDevice(0x1000);
+
+      unsigned long long handle;
+      size_t offset;
+      size_t bytes;
+      CHECK(allocatorGetChunk(0, &handle, &offset, &bytes));
+      CHECK(offset == 0);
+
+      uintptr_t localBase = allocatorGetReservedBase();
+      size_t localOffset = tmp.cudaPointer - localBase;
+      CHECK(localOffset >= offset && localOffset + 0x1000 < offset + bytes);
+
+      char localBuf[0x1000];
+      std::memset(localBuf, 0, 0x1000);
+      uint64_t magic = 0x44550102;
+      uint32_t localRank = rank;
+      std::memcpy(&localBuf[0], &magic, 8);
+      std::memcpy(&localBuf[8], &localRank, 4);
+      CHECK_CU(cuMemcpyAsync(tmp.cudaPointer, (uintptr_t)localBuf, 0x1000, 0));
+      CHECK_CU(cuCtxSynchronize());
+      // std::memcpy((void*)tmp.cudaPointer, localBuf, 0x1000);
+
+      // CUmemFabricHandle fabricHandle;
+      // CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+
+      nvmlGpuFabricInfo_t localFabricInfo;
+      CHECK_NVML(nvmlApi.deviceGetGpuFabricInfoV(nvmlDevice, &localFabricInfo));
+
+      log.info("local fabric clique: %#x, clusterUuid: %s\n", localFabricInfo.cliqueId,
+          hexstr(localFabricInfo.clusterUuid, 16));
+
+      struct FabricId {
+        unsigned int clique;
+        std::array<unsigned char, 16> cluster;
+        bool operator==(const FabricId& n) const = default;
+      };
+      FabricId localFabricId;
+      localFabricId.clique = localFabricInfo.cliqueId;
+      std::ranges::copy(localFabricInfo.clusterUuid, localFabricId.cluster.begin());
+
+      struct Info {
+        CUmemFabricHandle handle;
+        size_t bytes;
+        size_t offset;
+        FabricId fabric;
+      };
+      // info.handle = fabricHandle;
+      // info.bytes = bytes;
+
+      Vector<Info> infolist;
+      for (size_t i : range(size)) {
+        CUmemFabricHandle fabricHandle;
+        CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        log.info("fabric handle %d is %s\n", i, hexstr(&fabricHandle, sizeof(fabricHandle)));
+        Info info;
+        info.handle = fabricHandle;
+        info.bytes = bytes;
+        info.offset = localOffset;
+        info.fabric = localFabricId;
+        infolist.push_back(info);
+      }
+
+      auto allinfos = setupComms->allgather(infolist);
+
+      Vector<size_t> fabricDomain;
+      fabricDomain.push_back(rank);
+
+      for (size_t i : range(size)) {
+        if (i == rank) {
+          continue;
+        }
+
+        auto& ii = allinfos.at(i).at(rank);
+
+        bool connected = ii.fabric == localFabricId;
+
+        log.info("try %d  connected? %d\n", i, connected);
+
+        bool worked = false;
+
+        CUmemGenericAllocationHandle importedHandle;
+        auto err = cuMemImportFromShareableHandle(&importedHandle, &ii.handle, CU_MEM_HANDLE_TYPE_FABRIC);
+        if (err == CUDA_SUCCESS) {
+          CUdeviceptr nbase;
+          CHECK_CU(cuMemAddressReserve(&nbase, ii.bytes, 1024 * 1024 * 2, 0, 0));
+          err = cuMemMap(nbase, ii.bytes, 0, importedHandle, 0);
+          if (err != CUDA_SUCCESS) {
+            const char* str = nullptr;
+            cudaApi.getErrorString(err, &str);
+            log.info("fabric error during map %d: %s\n", err, str);
+          } else {
+
+            CUmemAccessDesc accessDesc;
+            std::memset(&accessDesc, 0, sizeof(accessDesc));
+            accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            CUdevice dev;
+            CHECK_CU(cuCtxGetDevice(&dev));
+            accessDesc.location.id = dev;
+            accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            CHECK_CU(cuMemSetAccess(nbase, ii.bytes, &accessDesc, 1));
+
+            char nbuffer[0x1000];
+            std::memset(nbuffer, 0, sizeof(nbuffer));
+
+            CHECK_CU(cuMemcpyAsync((uintptr_t)nbuffer, nbase + ii.offset, 0x1000, 0));
+            CHECK_CU(cuCtxSynchronize());
+
+            uint64_t nmagic;
+            uint32_t nrank;
+            std::memcpy(&nmagic, &nbuffer[0], 8);
+            std::memcpy(&nrank, &nbuffer[8], 4);
+
+            if (nmagic != magic || nrank != i) {
+              fatal("got from rank %d:  magic %#x rank %d\n", i, nmagic, nrank);
+            }
+            log.info("magic ok! rank %d really is rank %d\n", i, i);
+
+            CHECK_CU(cuMemRelease(importedHandle));
+            fabricDomain.push_back(i);
+
+            log.info("fabric %d connected\n", i);
+
+            worked = true;
+          }
+        } else {
+          const char* str = nullptr;
+          cudaApi.getErrorString(err, &str);
+          log.info("fabric error %d: %s\n", err, str);
+        }
+
+        CHECK(worked == connected);
+      }
+      std::ranges::sort(fabricDomain);
+
+      if (!fabricDomain.empty()) {
+        log.info("The following %d ranks are in my fabric domain: %s\n", fabricDomain.size(),
+            fmt::to_string(fmt::join(fabricDomain, ", ")));
+      }
+
+      auto allDomains = setupComms->allgather(fabricDomain);
+
+      for (size_t i : fabricDomain) {
+        CHECK(allDomains[i] == fabricDomain);
+      }
+
+      fabricDomainRanks = fabricDomain;
+
+      log.info("ALL FABRIC OK!\n");
+    }
 
     if (rank == 0) {
       log.debug("initial connection setup took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
@@ -795,10 +955,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
     cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
 
-    {
-      unsigned int value = 1;
-      CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
-    }
+    // {
+    //   unsigned int value = 1;
+    //   CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
+    // }
 
     auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
       peerPtrs.fill({});
@@ -883,6 +1043,18 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     setupComms->allgather(0);
 
     log.debug("%d: init synchronized!\n", rank);
+
+    // auto test = allocateDevice(1024 * 1024);
+
+    // int fd = -1;
+    // CUresult err = cuMemGetHandleForAddressRange(&fd, (uintptr_t)test.cudaPointer, test.bytes,
+    // CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0); log.info("dmabuf err -> %d\n", err); log.info("fd -> %d\n", fd);
+
+    // auto alloc = cudaAllocatorImplAllocate(nullptr, 1024 * 1024, 0, -1);
+
+    // fd = -1;
+    // err = cuMemGetHandleForAddressRange(&fd, (uintptr_t)alloc.ptr, test.bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+    // 0); log.info("dmabuf err -> %d\n", err); log.info("fd -> %d\n", fd); CHECK_CU(err);
   };
 
   cpuThread->start(std::move(pghandle));
@@ -912,14 +1084,22 @@ AllocatedBuffer Group::allocateManaged(size_t bytes) {
   reportBytes();
   return r;
 }
-AllocatedBuffer Group::allocateDevice(size_t bytes) {
+AllocatedBuffer Group::allocateDevice(size_t bytes, bool useAllocator) {
   if (bytes < 4096) {
     bytes = 4096;
   }
   AllocatedBuffer r;
   r.bytes = bytes;
   CUdeviceptr ptr;
-  CHECK_CU(cuMemAlloc(&ptr, bytes));
+  if (useAllocator) {
+    auto alloc = cudaAllocatorImplAllocate(nullptr, bytes, 0, -1);
+    r.externalAlloc = DeferredCleanup(Function<void()>([alloc]() {
+      cudaAllocatorImplFree(alloc.cleanupCtx, 0);
+    }));
+    ptr = alloc.ptr;
+  } else {
+    CHECK_CU(cuMemAlloc(&ptr, bytes));
+  }
   CHECK_CU(cuMemsetD8(ptr, 0, bytes));
   r.hostAllocated = false;
   r.cudaPointer = ptr;

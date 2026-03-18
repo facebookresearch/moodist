@@ -644,6 +644,12 @@ struct CpuThreadImpl {
         case opTypeMessageShutdown:
           onRecvMessageShutdown(view, source);
           break;
+        case opTypeFabricMap:
+          onRecvFabricMap(view, source);
+          break;
+        case opTypeFabricMapDone:
+          onRecvFabricMapDone(view, source);
+          break;
         default:
           fatal("Received unknown message type %#x", type);
         }
@@ -966,9 +972,11 @@ struct CpuThreadImpl {
 
       log.debug("rank %d CPU test done!\n", rank);
     }
-    if (std::ranges::all_of(devices, [](auto& v) {
-          return v.rdma->supportsCuda();
-        })) {
+    if (std::ranges::all_of(devices,
+            [](auto& v) {
+              return v.rdma->supportsCuda();
+            }) &&
+        false) {
       for (size_t i = 0; i != 1; ++i) {
         log.debug("rank %d starting CUDA test %d!\n", rank, i);
         AllocatedBuffer testBuffer = group->allocateDevice(0x1000 * size);
@@ -5894,6 +5902,33 @@ struct CpuThreadImpl {
     }
   };
 
+  void executeFabricMap(QueueEntryFabricMap& params) {
+    auto buffer = allocateTemporaryBuffer(4096);
+    size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeFabricMap, params.targetRank),
+        params.chunkIndex, params.handle, params.offset, params.bytes);
+    sendBuffer(params.targetRank, std::move(buffer), bytes);
+  }
+
+  void onRecvFabricMap(std::string_view view, uint32_t source) {
+    QueueEntryFabricMap p;
+    deserializeBufferPart(view, p.chunkIndex, p.handle, p.offset, p.bytes);
+    CHECK(cpuThread->onFabricMap != nullptr);
+    uintptr_t base = cpuThread->onFabricMap(source, p);
+    enqueueCallback([this, base, source, chunkIndex = p.chunkIndex] {
+      auto buffer = allocateTemporaryBuffer(4096);
+      size_t bytes = serializeToUnchecked(buffer->cpuPointer, header(opTypeFabricMapDone, source), chunkIndex, base);
+      sendBuffer(source, std::move(buffer), bytes);
+    });
+  }
+
+  void onRecvFabricMapDone(std::string_view view, uint32_t source) {
+    size_t chunkIndex;
+    uintptr_t base;
+    deserializeBufferPart(view, chunkIndex, base);
+    CHECK(cpuThread->onFabricMapDone != nullptr);
+    cpuThread->onFabricMapDone(source, chunkIndex, base);
+  }
+
   template<typename T>
   struct WorkAllocator {
     PoolAllocator<T> allocator;
@@ -6106,252 +6141,245 @@ struct CpuThreadImpl {
   }
 
   void entry() {
-    try {
 
-      sendRankInfo();
+    sendRankInfo();
 
-      runTests();
+    runTests();
 
-      initReceives();
+    initReceives();
 
-      log.info("%s started", groupName());
+    log.info("%s started", groupName());
 
-      cpuThread->ready = true;
+    cpuThread->ready = true;
 
-      Vector<IntrusiveList<WorkBase, &WorkBase::concurrencyLink>> concurrency;
-      concurrency.resize(Group::maxConcurrency);
-      Vector<IntrusiveList<WorkBase, &WorkBase::streamLink>> streams;
-      IntrusiveList<WorkBase, &WorkBase::workLink> activeWorks;
+    Vector<IntrusiveList<WorkBase, &WorkBase::concurrencyLink>> concurrency;
+    concurrency.resize(Group::maxConcurrency);
+    Vector<IntrusiveList<WorkBase, &WorkBase::streamLink>> streams;
+    IntrusiveList<WorkBase, &WorkBase::workLink> activeWorks;
 
-      auto enqueue = [&](auto& allocator, auto& params) {
-        CHECK(params.concurrencyIndex < Group::maxConcurrency);
-        if (params.sd->cpuThreadIndex == -1) {
-          params.sd->cpuThreadIndex = streams.size();
-          streams.resize(streams.size() + 1);
-        }
-        auto* work = allocator.allocate(*this, params);
-        work->stepPtr = work->template getStepPtr<std::remove_pointer_t<decltype(work)>>();
-        CHECK(work->streamIndex < streams.size());
-        if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
-          activeWorks.push_back(*work);
-          ++numActiveWorks;
-        }
-        streams[work->streamIndex].push_back(*work);
-        concurrency[work->concurrencyIndex].push_back(*work);
-      };
-
-      std::chrono::steady_clock::time_point prevHeartbeatTime = std::chrono::steady_clock::now();
-
-      auto prevRunTime = std::chrono::steady_clock::now();
-
-      bool debugCpuTime = false;
-      bool heartbeatEnabled = true;
-      {
-        const char* c = std::getenv("MOODIST_DEBUG_CPU");
-        if (c && !strcmp(c, "1")) {
-          debugCpuTime = true;
-        }
-        c = std::getenv("MOODIST_DISABLE_HEARTBEAT");
-        if (c && !strcmp(c, "1")) {
-          heartbeatEnabled = false;
-        }
+    auto enqueue = [&](auto& allocator, auto& params) {
+      CHECK(params.concurrencyIndex < Group::maxConcurrency);
+      if (params.sd->cpuThreadIndex == -1) {
+        params.sd->cpuThreadIndex = streams.size();
+        streams.resize(streams.size() + 1);
       }
+      auto* work = allocator.allocate(*this, params);
+      work->stepPtr = work->template getStepPtr<std::remove_pointer_t<decltype(work)>>();
+      CHECK(work->streamIndex < streams.size());
+      if (concurrency[work->concurrencyIndex].empty() && streams[work->streamIndex].empty()) {
+        activeWorks.push_back(*work);
+        ++numActiveWorks;
+      }
+      streams[work->streamIndex].push_back(*work);
+      concurrency[work->concurrencyIndex].push_back(*work);
+    };
 
-      while (true) {
-        auto now = std::chrono::steady_clock::now();
-        if (now - prevHeartbeatTime >= heartbeatInterval) {
-          prevHeartbeatTime = now;
-          if (heartbeatEnabled) {
-            heartbeat(now);
-          }
-          if (debugCpuTime) {
-            checkPreemptions(true);
-          }
-          if (errorState && now - errorTime >= std::chrono::seconds(60)) {
-            fatal("Moodist is terminating the process due to the aforementioned errors\n");
-          }
+    std::chrono::steady_clock::time_point prevHeartbeatTime = std::chrono::steady_clock::now();
+
+    auto prevRunTime = std::chrono::steady_clock::now();
+
+    bool debugCpuTime = false;
+    bool heartbeatEnabled = true;
+    {
+      const char* c = std::getenv("MOODIST_DEBUG_CPU");
+      if (c && !strcmp(c, "1")) {
+        debugCpuTime = true;
+      }
+      c = std::getenv("MOODIST_DISABLE_HEARTBEAT");
+      if (c && !strcmp(c, "1")) {
+        heartbeatEnabled = false;
+      }
+    }
+
+    while (true) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - prevHeartbeatTime >= heartbeatInterval) {
+        prevHeartbeatTime = now;
+        if (heartbeatEnabled) {
+          heartbeat(now);
         }
         if (debugCpuTime) {
-          auto now = std::chrono::steady_clock::now();
-          if (now - prevRunTime >= std::chrono::milliseconds(1)) {
-            log.info("lost %gms\n", seconds(now - prevRunTime) * 1000);
-          }
-          prevRunTime = now;
+          checkPreemptions(true);
         }
-        if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
-          if (activeWorks.empty()) {
-            if (activeDevices.empty()) {
-              {
-                std::unique_lock l(cpuThread->mutex);
-                if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
-                  continue;
-                }
-                cpuThread->busy.store(false, std::memory_order_relaxed);
-              }
-              if (shutdownInProgress) {
-                break;
-              }
-              ++waitCount;
-              futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
-              if (debugCpuTime) {
-                prevRunTime = std::chrono::steady_clock::now();
-              }
-              continue;
-            } else {
-              if (shutdownInProgress) {
-                break;
-              }
-            }
-          }
+        if (errorState && now - errorTime >= std::chrono::seconds(60)) {
+          fatal("Moodist is terminating the process due to the aforementioned errors\n");
         }
-        for (int i = 0; i != 256; ++i) {
-          if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
-            --cpuThread->queueSize;
-
-            std::unique_lock l(cpuThread->mutex);
-            CHECK(!cpuThread->queue.empty());
-            QueueEntry& queueEntry = cpuThread->queue.front();
-            cpuThread->queue.pop_front();
-            l.unlock();
-
-            CHECK(queueEntry.stepValue < (1ul << 31));
-
-            if (shutdownScheduled && queueEntry.task != taskCallback) [[unlikely]] {
-              if (queueEntry.task != taskShutdown) {
-                log.error("Work (%d) has been scheduled in a process group after shutdown. This work cannot complete.",
-                    queueEntry.task);
-                setErrorState();
+      }
+      if (debugCpuTime) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - prevRunTime >= std::chrono::milliseconds(1)) {
+          log.info("lost %gms\n", seconds(now - prevRunTime) * 1000);
+        }
+        prevRunTime = now;
+      }
+      if (cpuThread->queueSize.load(std::memory_order_relaxed) == 0) {
+        if (activeWorks.empty()) {
+          if (activeDevices.empty()) {
+            {
+              std::unique_lock l(cpuThread->mutex);
+              if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
+                continue;
               }
-            } else {
-              switch (queueEntry.task) {
-              case taskBarrier:
-                enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
-                break;
-              case taskAllGather:
-                enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
-                break;
-              case taskReduceScatter:
-                enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
-                break;
-              case taskShutdown:
-                shutdownScheduled = true;
-                enqueue(allocatorShutdown, queueEntry);
-                break;
-              case taskBroadcast:
-                enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
-                break;
-              case taskAllGatherCpu:
-                enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
-                break;
-              case taskReduceScatterCpu:
-                enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
-                break;
-              case taskGatherCpu:
-                enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
-                break;
-              case taskBroadcastCpu:
-                enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
-                break;
-              case taskInternalBarrier:
-                enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
-                break;
-              case taskReduce:
-                enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
-                break;
-              case taskCreateQueue:
-                enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
-                break;
-              case taskCreateQueueNamed:
-                executeCreateQueueNamed((QueueEntryCreateQueue&)queueEntry);
-                break;
-              case taskQueuePut:
-                executeQueuePut((QueueEntryQueuePut&)queueEntry);
-                break;
-              case taskQueueRead:
-                executeQueueRead((QueueEntryQueueRead&)queueEntry);
-                break;
-              case taskQueueReadFinished:
-                executeQueueReadFinished((QueueEntryQueueReadFinished&)queueEntry);
-                break;
-              case taskQueueGet:
-                executeQueueGet((QueueEntryQueueGet&)queueEntry);
-                break;
-              case taskQueueTransaction:
-                executeQueueTransaction((QueueEntryQueueTransaction&)queueEntry);
-                break;
-              case taskCat:
-                enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
-                break;
-              case taskCopy:
-                executeCopy((QueueEntryCopy&)queueEntry);
-                break;
-              case taskCached:
-                enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
-                break;
-              case taskReduceScatterDirect:
-                enqueue(allocatorReduceScatterDirectRead, (QueueEntryReduceScatter&)queueEntry);
-                break;
-              case taskAllGatherBroadcast:
-                enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
-                break;
-              case taskCallback:
-                executeCallback((QueueEntryCallback&)queueEntry);
-                break;
-              case taskAllGatherDirect:
-                enqueue(allocatorAllGatherDirectRead, (QueueEntryAllGather&)queueEntry);
-                break;
-              case taskCustom:
-                enqueue(allocatorCustom, (QueueEntryCustom&)queueEntry);
-                break;
-              default:
-                throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
-              }
+              cpuThread->busy.store(false, std::memory_order_relaxed);
             }
-          }
-          poll();
-
-          for (auto i = activeWorks.begin(); i != activeWorks.end();) {
-            Work* w = (Work*)&*i;
-            CHECK(!w->done);
-            w->stepPtr(w);
-            if (w->done) {
-              uint32_t concurrencyIndex = w->concurrencyIndex;
-              uint32_t streamIndex = w->streamIndex;
-              CHECK(&concurrency[concurrencyIndex].front() == w);
-              concurrency[concurrencyIndex].pop_front();
-              CHECK(&streams[streamIndex].front() == w);
-              streams[streamIndex].pop_front();
-              bool queuedThisConcurrency = false;
-              if (!streams[streamIndex].empty()) {
-                Work* nextWork = (Work*)&streams[streamIndex].front();
-                if (&concurrency[nextWork->concurrencyIndex].front() == nextWork) {
-                  queuedThisConcurrency = nextWork->concurrencyIndex == concurrencyIndex;
-                  activeWorks.push_back(*nextWork);
-                  ++numActiveWorks;
-                }
-              }
-              if (!queuedThisConcurrency && !concurrency[concurrencyIndex].empty()) {
-                Work* nextWork = (Work*)&concurrency[concurrencyIndex].front();
-                if (&streams[nextWork->streamIndex].front() == nextWork) {
-                  activeWorks.push_back(*nextWork);
-                  ++numActiveWorks;
-                }
-              }
-              i = activeWorks.erase(i);
-              --numActiveWorks;
-            } else {
-              ++i;
+            if (shutdownInProgress) {
+              break;
+            }
+            ++waitCount;
+            futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+            if (debugCpuTime) {
+              prevRunTime = std::chrono::steady_clock::now();
+            }
+            continue;
+          } else {
+            if (shutdownInProgress) {
+              break;
             }
           }
         }
       }
+      for (int i = 0; i != 256; ++i) {
+        if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
+          --cpuThread->queueSize;
 
-    } catch (const std::exception& e) {
-      const CudaError* ce = dynamic_cast<const CudaError*>(&e);
-      if (ce && ce->error == CUDA_ERROR_DEINITIALIZED) {
-        log.verbose("CPU thread got a CUDA deinitialized error.\n");
-      } else {
-        fatal("CPU thread error: %s\n", e.what());
+          std::unique_lock l(cpuThread->mutex);
+          CHECK(!cpuThread->queue.empty());
+          QueueEntry& queueEntry = cpuThread->queue.front();
+          cpuThread->queue.pop_front();
+          l.unlock();
+
+          CHECK(queueEntry.stepValue < (1ul << 31));
+
+          if (shutdownScheduled && queueEntry.task != taskCallback) [[unlikely]] {
+            if (queueEntry.task != taskShutdown) {
+              log.error("Work (%d) has been scheduled in a process group after shutdown. This work cannot complete.",
+                  queueEntry.task);
+              setErrorState();
+            }
+          } else {
+            switch (queueEntry.task) {
+            case taskBarrier:
+              enqueue(allocatorBarrier, (QueueEntryBarrier&)queueEntry);
+              break;
+            case taskAllGather:
+              enqueue(allocatorAllGatherRingRead4, (QueueEntryAllGather&)queueEntry);
+              break;
+            case taskReduceScatter:
+              enqueue(allocatorReduceScatterRingRead, (QueueEntryReduceScatter&)queueEntry);
+              break;
+            case taskShutdown:
+              shutdownScheduled = true;
+              enqueue(allocatorShutdown, queueEntry);
+              break;
+            case taskBroadcast:
+              enqueue(allocatorBroadcast, (QueueEntryBroadcast&)queueEntry);
+              break;
+            case taskAllGatherCpu:
+              enqueue(allocatorAllGatherCpu, (QueueEntryAllGatherCpu&)queueEntry);
+              break;
+            case taskReduceScatterCpu:
+              enqueue(allocatorReduceScatterCpu, (QueueEntryReduceScatterCpu&)queueEntry);
+              break;
+            case taskGatherCpu:
+              enqueue(allocatorGatherCpu, (QueueEntryGatherCpu&)queueEntry);
+              break;
+            case taskBroadcastCpu:
+              enqueue(allocatorBroadcastRingCpu, (QueueEntryBroadcastCpu&)queueEntry);
+              break;
+            case taskInternalBarrier:
+              enqueue(allocatorInternalBarrier, (QueueEntryBarrier&)queueEntry);
+              break;
+            case taskReduce:
+              enqueue(allocatorReduce, (QueueEntryReduce&)queueEntry);
+              break;
+            case taskCreateQueue:
+              enqueue(allocatorCreateQueue, (QueueEntryCreateQueue&)queueEntry);
+              break;
+            case taskCreateQueueNamed:
+              executeCreateQueueNamed((QueueEntryCreateQueue&)queueEntry);
+              break;
+            case taskQueuePut:
+              executeQueuePut((QueueEntryQueuePut&)queueEntry);
+              break;
+            case taskQueueRead:
+              executeQueueRead((QueueEntryQueueRead&)queueEntry);
+              break;
+            case taskQueueReadFinished:
+              executeQueueReadFinished((QueueEntryQueueReadFinished&)queueEntry);
+              break;
+            case taskQueueGet:
+              executeQueueGet((QueueEntryQueueGet&)queueEntry);
+              break;
+            case taskQueueTransaction:
+              executeQueueTransaction((QueueEntryQueueTransaction&)queueEntry);
+              break;
+            case taskCat:
+              enqueue(allocatorCat, (QueueEntryCat&)queueEntry);
+              break;
+            case taskCopy:
+              executeCopy((QueueEntryCopy&)queueEntry);
+              break;
+            case taskCached:
+              enqueue(allocatorCached, (QueueEntryCached&)queueEntry);
+              break;
+            case taskReduceScatterDirect:
+              enqueue(allocatorReduceScatterDirectRead, (QueueEntryReduceScatter&)queueEntry);
+              break;
+            case taskAllGatherBroadcast:
+              enqueue(allocatorAllGatherBroadcast, (QueueEntryAllGather&)queueEntry);
+              break;
+            case taskCallback:
+              executeCallback((QueueEntryCallback&)queueEntry);
+              break;
+            case taskAllGatherDirect:
+              enqueue(allocatorAllGatherDirectRead, (QueueEntryAllGather&)queueEntry);
+              break;
+            case taskCustom:
+              enqueue(allocatorCustom, (QueueEntryCustom&)queueEntry);
+              break;
+            case taskFabricMap:
+              executeFabricMap((QueueEntryFabricMap&)queueEntry);
+              break;
+            default:
+              throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));
+            }
+          }
+        }
+        poll();
+
+        for (auto i = activeWorks.begin(); i != activeWorks.end();) {
+          Work* w = (Work*)&*i;
+          CHECK(!w->done);
+          w->stepPtr(w);
+          if (w->done) {
+            uint32_t concurrencyIndex = w->concurrencyIndex;
+            uint32_t streamIndex = w->streamIndex;
+            CHECK(&concurrency[concurrencyIndex].front() == w);
+            concurrency[concurrencyIndex].pop_front();
+            CHECK(&streams[streamIndex].front() == w);
+            streams[streamIndex].pop_front();
+            bool queuedThisConcurrency = false;
+            if (!streams[streamIndex].empty()) {
+              Work* nextWork = (Work*)&streams[streamIndex].front();
+              if (&concurrency[nextWork->concurrencyIndex].front() == nextWork) {
+                queuedThisConcurrency = nextWork->concurrencyIndex == concurrencyIndex;
+                activeWorks.push_back(*nextWork);
+                ++numActiveWorks;
+              }
+            }
+            if (!queuedThisConcurrency && !concurrency[concurrencyIndex].empty()) {
+              Work* nextWork = (Work*)&concurrency[concurrencyIndex].front();
+              if (&streams[nextWork->streamIndex].front() == nextWork) {
+                activeWorks.push_back(*nextWork);
+                ++numActiveWorks;
+              }
+            }
+            i = activeWorks.erase(i);
+            --numActiveWorks;
+          } else {
+            ++i;
+          }
+        }
       }
     }
   }
@@ -6438,9 +6466,20 @@ void CpuThread::start(Function<void()> pghandle) {
           return;
         }
 
-        CpuThreadImpl impl(this);
-        impl.entry();
-        pghandle();
+        try {
+
+          CpuThreadImpl impl(this);
+          impl.entry();
+          pghandle();
+
+        } catch (const std::exception& e) {
+          const CudaError* ce = dynamic_cast<const CudaError*>(&e);
+          if (ce && ce->error == CUDA_ERROR_DEINITIALIZED) {
+            log.verbose("CPU thread got a CUDA deinitialized error.\n");
+          } else {
+            fatal("CPU thread error: %s\n", e.what());
+          }
+        }
       },
       std::move(pghandle));
 }

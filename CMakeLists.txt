@@ -96,8 +96,6 @@ endif()
 if(MOODIST_BUILD_CORE OR MOODIST_BUILD_WRAPPER)
   find_package(CUDAToolkit REQUIRED)
   message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
-
-  find_library(CUDADEVRT libcudadevrt.a HINTS ${CUDAToolkit_LIBRARY_DIR})
 endif()
 
 find_package(Threads REQUIRED)
@@ -228,7 +226,6 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}  # For api/ includes (e.g., #include "api/types.h")
   )
   target_compile_definitions(moodist PRIVATE
-    CUDADEVRT_PATH="${CUDADEVRT}"
     _STATIC_LIBRARY_BUILD_
     $<$<BOOL:${ENABLE_ALLOCATOR_GUARDS}>:MOODIST_ALLOCATOR_GUARDS>
     $<$<OR:$<BOOL:${ENABLE_ASAN}>,$<BOOL:${ENABLE_TSAN}>,$<BOOL:${ENABLE_STDLIB_ALLOCATOR}>>:MOODIST_USE_STDLIB_ALLOCATOR>
