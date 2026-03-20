@@ -17,7 +17,11 @@ using namespace ptx;
 
 const char* computeTarget(int computeMajor, int computeMinor) {
   if (computeMajor >= 10) {
-    return "sm_100a";
+    if (computeMinor >= 3) {
+      return "sm_103a";
+    } else {
+      return "sm_100a";
+    }
   } else if (computeMajor == 9) {
     return "sm_90a";
   } else if (computeMajor == 8 && computeMinor >= 9) {
@@ -1148,11 +1152,11 @@ struct EmitLockstep : EmitMultiCopy {
       GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
     }
 
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
-    }
+    // PRED(bytes % 16 != 0) trap();
+    // PRED(src % 16 != 0) trap();
+    // for (size_t i : indices(dst)) {
+    //   PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+    // }
 
     Label loop;
     LABEL(loop);
@@ -1186,9 +1190,20 @@ struct EmitLockstep : EmitMultiCopy {
           IF(i < ndst) {
             u64 dstaddr = dst[i] + widen(offset);
             cp_async_bulk_global_shared(dstaddr, buffer, size);
-            // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
           }
         }
+        // for (size_t i : indices(dst)) {
+        //   u32 ii = (blockIndex + i) % dst.size();
+        //   IF(ii < ndst) {
+        //     u64 dstaddr = 0;
+        //     for (size_t z : indices(dst)) {
+        //       PRED(ii == z) dstaddr = dst[z];
+        //     }
+        //     dstaddr = dstaddr + widen(offset);
+        //     cp_async_bulk_global_shared(dstaddr, buffer, size);
+        //     // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
+        //   }
+        // }
         cp_async_bulk_commit_group();
       }
 
@@ -1246,11 +1261,11 @@ struct EmitSimple : EmitMultiCopy {
     // barrier_sync();
 
     // fixme: these seem to emit a function call to a software 64-bit division. oof
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
-    }
+    // PRED(bytes % 16 != 0) trap();
+    // PRED(src % 16 != 0) trap();
+    // for (size_t i : indices(dst)) {
+    //   PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+    // }
 
     u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
 
@@ -1262,31 +1277,32 @@ struct EmitSimple : EmitMultiCopy {
       }
       u64 srcaddr = src + widen(offset);
       u32 size = min_u32(bytes - offset, bufferSize);
+      cp_async_bulk_wait_group_read(0);
+      warp_sync();
       IF_D(isLeader) {
-        cp_async_bulk_wait_group_read(0);
         mbarrier_expect_tx(barrier, size);
         mbarrier_arrive_noComplete(barrier);
         cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-      }
-      IF_D(isLeader) {
         mbarrier_wait_parity(barrier, parity);
-        for (size_t i : indices(dst)) {
-          IF(i < ndst) {
-            u64 dstaddr = dst[i] + widen(offset);
-            cp_async_bulk_global_shared(dstaddr, buffer, size);
-            // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
-          }
-        }
-        cp_async_bulk_commit_group();
       }
+      warp_sync();
+      for (size_t i : indices(dst)) {
+        IF(i < ndst) {
+          u64 dstaddr = dst[i] + widen(offset);
+          cp_async_bulk_global_shared(dstaddr, buffer, size);
+          // multimem_cp_async_bulk_global_shared(dstaddr, buffer, size);
+        }
+      }
+      cp_async_bulk_commit_group();
       offset += numBlocks * blockSharedSize;
     }
     GOTO(loop);
     LABEL(alldone);
+    cp_async_bulk_wait_group_read(0);
     IF_D(isLeader) {
-      cp_async_bulk_wait_group_read(0);
       mbarrier_inval(barrier);
     }
+    barrier_sync();
   }
 };
 
@@ -1458,6 +1474,9 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
 
   Module mod;
   mod.target = target;
+  mod.topLevelComments.push_back(fmt::sprintf("block size: %d  grid size: %d", config.blockSize, config.gridSize));
+  mod.topLevelComments.push_back(fmt::sprintf("copy engine: %s", config.copyEngine));
+  mod.topLevelComments.push_back(fmt::sprintf("shared memory: %d", config.sharedMemory));
   setModule(&mod);
   if (false) {
     mod.addGlobal(".u8", 4 * 1024 * 1024, "debug_buf");
@@ -1522,6 +1541,17 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     ctx.receive(ranks[i], myPeerIndex[i]);
   }
 
+  size_t ranksStride = 0;
+
+  for (uint32_t r : ranks) {
+    ctx.send(r, ranks.size());
+  }
+  for (uint32_t r : ranks) {
+    size_t s;
+    ctx.receive(r, s);
+    ranksStride = std::max(ranksStride, s);
+  }
+
   struct SyncIndex {
     size_t index;
     size_t stride;
@@ -1549,7 +1579,7 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     return mapn(ctx, name, ranks, bytes);
   };
 
-  auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
+  auto syncAddrs = map("syncs", sizeof(uint32_t) * ranksStride * numBlocks);
   auto addrAddrs = map("addresses", sizeof(uint64_t) * graph.localCudaTensorMappings.size() * numBlocks);
 
   auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
@@ -1618,32 +1648,348 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     }
     CHECK(emit != nullptr);
     emit->init();
-    IF_D(threadIndex == 0) {
+    // IF_D(threadIndex == 0) {
+    //   for (size_t i : indices(graph.remoteCudaTensorMappings)) {
+    //     auto& v = graph.remoteCudaTensorMappings[i];
+    //     u64 addr = concurrency(addrAddrs.remote[rankIndex(v.rank)]) +
+    //                widen(sizeof(uint64_t) * (v.destinationSlot + v.stride * blockIndex));
+    //     //st_global_u64(addr, ld_param_u64(mappedAddrs, sizeof(uint64_t) * i));
+    //     st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs, sizeof(uint64_t) * i));
+    //   }
+    //   //fence_release_sys();
+    // }
+
+    struct AddrSetup {
+      uint64_t base;
+      uint32_t itembytes;
+      uint32_t paramOffset;
+      uint32_t stride;
+      uint32_t slot;
+    };
+
+    struct SyncSetup {
+      uint64_t stbase;
+      uint32_t itembytes;
+      uint32_t ldoffset;
+    };
+
+    std::vector<SyncSetup> syncsetup;
+    for (size_t i : indices(ranks)) {
+      auto& r = syncAddrs.remote[i];
+      SyncSetup s;
+      s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
+      s.itembytes = r.itembytes;
+      s.ldoffset = sizeof(uint32_t) * i;
+      syncsetup.push_back(s);
+    }
+
+    u32 csyncaddr = addConst32(syncsetup, "syncsetup");
+
+    if (true) {
+      std::vector<AddrSetup> addrsetup;
       for (size_t i : indices(graph.remoteCudaTensorMappings)) {
         auto& v = graph.remoteCudaTensorMappings[i];
-        u64 addr = concurrency(addrAddrs.remote[rankIndex(v.rank)]) +
-                   widen(sizeof(uint64_t) * (v.destinationSlot + v.stride * blockIndex));
-        st_global_u64(addr, ld_param_u64(mappedAddrs, sizeof(uint64_t) * i));
+        auto& r = addrAddrs.remote[rankIndex(v.rank)];
+
+        AddrSetup s;
+        s.base = r.base;
+        s.itembytes = r.itembytes;
+        s.paramOffset = sizeof(uint64_t) * i;
+        s.stride = sizeof(uint64_t) * v.stride;
+        s.slot = sizeof(uint64_t) * v.destinationSlot;
+        addrsetup.push_back(s);
       }
-      fence_release_sys();
-      for (size_t i : indices(ranks)) {
-        if (i == myIndex) {
-          continue;
-        }
-        u64 addr =
-            concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranks.size() * blockIndex));
-        st_global_relaxed_sys_u32(addr, stepValue);
+      CHECK(blockSize >= graph.remoteCudaTensorMappings.size());
+      IF (threadIndex < graph.remoteCudaTensorMappings.size()) {
+        u32 caddr = addConst32(addrsetup, "addrsetup") + threadIndex * sizeof(AddrSetup);
+        u64 base = ld_const_u64(caddr);
+        u32 itembytes = ld_const_u32(caddr + 8);
+        u32 paramOffset = ld_const_u32(caddr + 12);
+        u32 stride = ld_const_u32(caddr + 16);
+        u32 slot = ld_const_u32(caddr + 20);
+        u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
+        st_global_wt_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0));
       }
-      for (size_t i : indices(ranks)) {
-        if (i == myIndex) {
-          continue;
-        }
-        u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranks.size() * blockIndex));
-        WHILE(ld_global_relaxed_sys_u32(addr) < stepValue) {}
-      }
-      fence_acquire_sys();
     }
+
+    if (false) {
+      log.info("remoteCudaTensorMappings.size() is %d\n", graph.remoteCudaTensorMappings.size());
+      CHECK(blockSize >= graph.remoteCudaTensorMappings.size());
+      HashMap<size_t, u32> commonOffsets;
+      for (auto& v : addrAddrs.remote) {
+        if (!commonOffsets.contains(v.itembytes)) {
+          commonOffsets[v.itembytes] = v.itembytes * concurrencyIndex;
+        }
+      }
+      u64 base;
+      u32 offset;
+      u32 paramOffset;
+      u32 stride;
+      u32 slot;
+      u32 doSomething = 0;
+      for (size_t i : indices(graph.remoteCudaTensorMappings)) {
+        auto& v = graph.remoteCudaTensorMappings[i];
+        auto& r = addrAddrs.remote[rankIndex(v.rank)];
+
+        IF_D(threadIndex == i) {
+          paramOffset = sizeof(uint64_t) * i;
+          base = r.base;
+          offset = commonOffsets[r.itembytes];
+          slot = sizeof(uint64_t) * v.destinationSlot;
+          stride = sizeof(uint64_t) * v.stride;
+          doSomething = 1;
+        }
+
+        // u64 addr = r.base + widen(r.itembytes * concurrencyIndex) +
+        //            widen(sizeof(uint64_t) * (v.destinationSlot + v.stride * blockIndex));
+      }
+      IF_D(doSomething != 0) {
+        u64 addr = base + widen(offset + slot + stride * blockIndex);
+        // st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0));
+        st_global_wt_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0));
+        // fence_release_sys();
+        // fence_release_gpu();
+      }
+    }
+    fence_release_gpu();
     barrier_sync();
+
+    // std::vector<uintptr_t> remoteBase;
+    // std::vector<uint32_t> remoteItemBytes;
+    // std::vector<uint32_t> remoteMyPeerIndex;
+    // for (size_t i : indices(ranks)) {
+    //   if (i == myIndex) {
+    //     continue;
+    //   }
+    //   remoteBase.push_back(syncAddrs.remote[i].base);
+    //   remoteItemBytes.push_back(syncAddrs.remote[i].itembytes);
+    //   remoteMyPeerIndex.push_back(myPeerIndex[i]);
+    // }
+    // u32 remoteBaseAddr = addConst32(remoteBase, "remoteBase");
+    // u32 remoteItemBytesAddr = addConst32(remoteItemBytes, "remoteItemBytes");
+    // u32 remoteMyPeerIndexAddr = addConst32(remoteMyPeerIndex, "remoteMyPeerIndex");
+
+    // for (size_t i : range((remoteBase.size() + blockSize - 1) / blockSize)) {
+    //   u32 index = blockSize * i + threadIndex;
+    //   IF_D(index < remoteBase.size()) {
+    //     u64 addr =
+    //         ld_const_u64(remoteBaseAddr + 8 * index) +
+    //         widen(ld_const_u32(remoteItemBytesAddr + 4 * index) * concurrencyIndex) +
+    //         widen(sizeof(uint32_t) * (ld_const_u32(remoteMyPeerIndexAddr + 4 * index) + ranksStride * blockIndex));
+    //     st_global_relaxed_sys_u32(addr, stepValue);
+    //   }
+    // }
+
+    // if (false) {
+    //   // CseScope sce;
+    //   //  u64 staddr = 0;
+    //   //  u64 ldaddr = 0;
+    //   //  u64 localBase = concurrency(syncAddrs.local);
+    //   //  u64 boo = widen(sizeof(uint32_t) * (ranksStride * blockIndex));
+    //   //  HashMap<size_t, u64> tt;
+    //   //  for (auto& v : syncAddrs.remote) {
+    //   //    if (!tt.contains(v.itembytes)) {
+    //   //      tt[v.itembytes] = widen(v.itembytes * concurrencyIndex);
+    //   //    }
+    //   //  }
+    //   //  auto seti = [&](size_t i) {
+    //   //    auto& r = syncAddrs.remote[i];
+    //   //    staddr = r.base + sizeof(uint32_t) * myPeerIndex[i] + tt[r.itembytes];
+    //   //    ldaddr = localBase + sizeof(uint32_t) * i;
+    //   //  };
+    //   //  // SWITCH_D(threadIndex) {
+    //   //  //   size_t n = 0;
+    //   //  //   for (size_t i : indices(ranks)) {
+    //   //  //     if (i == myIndex) {
+    //   //  //       continue;
+    //   //  //     }
+    //   //  //     CASE(n++) {
+    //   //  //         seti(i);
+    //   //  //     }
+    //   //  //   }
+    //   //  // }
+    //   //  size_t n = 0;
+    //   //  for (size_t i : indices(ranks)) {
+    //   //    if (i == myIndex) {
+    //   //      continue;
+    //   //    }
+    //   //    IF_D(threadIndex == n++) {
+    //   //        seti(i);
+    //   //     //   // fence_release_sys();
+    //   //   for (size_t i : indices(ranks)) {
+    //   //     if (i == myIndex) {
+    //   //       continue;
+    //   //     }
+    //   //     u64 addr =
+    //   //         concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranksStride *
+    //   //         blockIndex));
+    //   //     st_global_relaxed_sys_u32(addr, stepValue + 1);
+    //   //   }
+    //   //   for (size_t i : indices(ranks)) {
+    //   //     if (i == myIndex) {
+    //   //       continue;
+    //   //     }
+    //   //     u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+    //   //    }
+    //   // }
+    //   // Label done;
+    //   // size_t n = 0;
+    //   // for (size_t i : indices(ranks)) {
+    //   //   if (i == myIndex) {
+    //   //     continue;
+    //   //   }
+    //   //   seti(i);
+    //   //   GOTO_IF_D(threadIndex == n++, done);
+    //   // }
+    //   // LABEL(done);
+    //   // for (size_t i : indices(ranks)) {
+    //   //   if (i == myIndex) {
+    //   //     continue;
+    //   //   }
+    //   //   u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+    //   //   WHILE(ld_global_relaxed_sys_u32(addr) < stepValue) {}
+    //   // }
+    //   HashMap<size_t, u32> commonOffsets;
+    //   for (auto& v : syncAddrs.remote) {
+    //     if (!commonOffsets.contains(v.itembytes)) {
+    //       commonOffsets[v.itembytes] = v.itembytes * concurrencyIndex;
+    //     }
+    //   }
+    //   u64 stbase;
+    //   u32 stoffset;
+    //   u32 ldoffset;
+    //   u32 doSomething = 0;
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     IF_D(threadIndex == i) {
+    //       auto& r = syncAddrs.remote[i];
+    //       stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
+    //       stoffset = commonOffsets[r.itembytes];
+    //       ldoffset = sizeof(uint32_t) * i;
+    //       doSomething = 1;
+    //     }
+    //   }
+    //   warp_sync();
+    //   IF_D(doSomething != 0) {
+    //     u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
+    //     st_global_relaxed_sys_u32(stbase + widen(stoffset + blockStride), stepValue);
+    //     u64 ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+    //     WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue) {}
+    //   }
+    //   fence_acquire_sys();
+    // }
+
+    auto execSync = [&](uint32_t stepOffset) {
+      CHECK(blockSize >= syncsetup.size());
+      IF_D(threadIndex < syncsetup.size()) {
+        u32 addr = csyncaddr + threadIndex * sizeof(SyncSetup);
+        u64 stbase = ld_const_u64(addr);
+        u32 itembytes = ld_const_u32(addr + 8);
+        u32 ldoffset = ld_const_u32(addr + 12);
+        u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
+        st_global_relaxed_sys_u32(stbase + widen(itembytes * concurrencyIndex + blockStride), stepValue + stepOffset);
+        u64 ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+        WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue + stepOffset) {}
+      }
+      // for (size_t i : indices(ranks)) {
+      //   if (i == myIndex) {
+      //     continue;
+      //   }
+      //   u64 addr =
+      //       concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranksStride * blockIndex));
+      //   st_global_relaxed_sys_u32(addr, stepValue + stepOffset);
+      // }
+      // for (size_t i : indices(ranks)) {
+      //   if (i == myIndex) {
+      //     continue;
+      //   }
+      //   u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+      //   WHILE(ld_global_relaxed_sys_u32(addr) < stepValue + stepOffset) {}
+      // }
+    };
+
+    // auto execSync = [&](uint32_t stepOffset) {
+    //   HashMap<size_t, u32> commonOffsets;
+    //   for (auto& v : syncAddrs.remote) {
+    //     if (!commonOffsets.contains(v.itembytes)) {
+    //       commonOffsets[v.itembytes] = v.itembytes * concurrencyIndex;
+    //     }
+    //   }
+    //   u64 stbase = 0;
+    //   u32 stoffset = 0;
+    //   u32 ldoffset = 0;
+    //   u32 doSomething = 0;
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     IF_D(threadIndex == i) {
+    //       auto& r = syncAddrs.remote[i];
+    //       stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
+    //       stoffset = commonOffsets[r.itembytes];
+    //       ldoffset = sizeof(uint32_t) * i;
+    //       doSomething = 1;
+    //     }
+    //   }
+    //   warp_sync();
+    //   IF_D(doSomething != 0) {
+    //     u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
+    //     st_global_relaxed_sys_u32(stbase + widen(stoffset + blockStride), stepValue + stepOffset);
+    //     u64 ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+    //     WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue + stepOffset) {}
+    //   }
+    //   // for (size_t i : indices(ranks)) {
+    //   //   if (i == myIndex) {
+    //   //     continue;
+    //   //   }
+    //   //   u64 addr =
+    //   //       concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranksStride * blockIndex));
+    //   //   st_global_relaxed_sys_u32(addr, stepValue + stepOffset);
+    //   // }
+    //   // for (size_t i : indices(ranks)) {
+    //   //   if (i == myIndex) {
+    //   //     continue;
+    //   //   }
+    //   //   u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+    //   //   WHILE(ld_global_relaxed_sys_u32(addr) < stepValue + stepOffset) {}
+    //   // }
+    // };
+
+    auto entrySync = [&]() {
+      execSync(0);
+      //fence_acquire_sys();
+      //fence_acquire_gpu();
+      barrier_sync();
+    };
+    auto exitSync = [&]() {
+      //fence_release_sys();
+      execSync(1);
+    };
+
+    entrySync();
+
+    // IF_D(threadIndex == 0) {
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     u64 addr =
+    //         concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranksStride *
+    //         blockIndex));
+    //     st_global_relaxed_sys_u32(addr, stepValue);
+    //   }
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+    //     WHILE(ld_global_relaxed_sys_u32(addr) < stepValue) {}
+    //   }
+    //   fence_acquire_sys();
+    // }
+    // barrier_sync();
 
     // =================================================================
     // Clock synchronization: normalize clock64() across SMs
@@ -1754,17 +2100,61 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
       if (n.rank == rank) {
         return ld_param_u64(inputAddrs, sizeof(uint64_t) * n.tensorIndex) + n.offset;
       } else {
-        return ld_global_u64(concurrency(addrAddrs.local) +
-                             widen(sizeof(uint64_t) *
-                                   (findLocalMapping(n) + graph.localCudaTensorMappings.size() * blockIndex))) +
+        // return ld_global_u64(concurrency(addrAddrs.local) +
+        // return ld_global_relaxed_sys_u64(
+        return ld_global_cv_u64(concurrency(addrAddrs.local) +
+                                widen(sizeof(uint64_t) *
+                                      (findLocalMapping(n) + graph.localCudaTensorMappings.size() * blockIndex))) +
                n.offset;
       }
+    };
+
+    struct NodeSetup {
+      uint32_t slot;
+      uint32_t offsetLow;
+      uint32_t offsetHigh;
     };
 
     size_t maxDestinations = 0;
     for (const Edge& e : localCopies) {
       maxDestinations = std::max(maxDestinations, e.destinations.size());
     }
+
+    CHECK(blockSize >= maxDestinations);
+
+    u64 addrAddrsLocalBase = concurrency(addrAddrs.local) + widen(sizeof(uint64_t) * graph.localCudaTensorMappings.size() * blockIndex);
+
+    std::vector<NodeSetup> nodesetup;
+    for (const Edge& e : localCopies) {
+      for (auto& n : e.destinations) {
+        NodeSetup s;
+        s.offsetLow = n.offset;
+        s.offsetHigh = n.offset >> 32;
+        if (n.rank == rank) {
+          s.slot = sizeof(uint64_t) * n.tensorIndex | 1;
+        } else {
+          s.slot = sizeof(uint64_t) * findLocalMapping(n);
+        }
+        nodesetup.push_back(s);
+      }
+    }
+
+    u32 cnodesetupaddr = addConst32(nodesetup, "nodesetup");
+
+    auto nodeaddr = [&](u32 index) {
+      u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
+      u32 slot = ld_const_u32(caddr);
+      u32 offsetlo = ld_const_u32(caddr + 4);
+      u32 offsethi = ld_const_u32(caddr + 8);
+      u64 r;
+      IF_D ((slot & 1) != 0) {
+        r = ld_param_u64(inputAddrs + (slot & ~1u), 0);
+      } ELSE {
+        r = ld_global_cv_u64(addrAddrsLocalBase + widen(slot));
+      }
+      r += widen(offsetlo) | (widen(offsethi) << 32);
+      return r;
+    };
 
     bool nowaits = true;
     for (const Edge& e : localCopies) {
@@ -1776,23 +2166,41 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     }
 
     if (nowaits) {
+      
+      CHECK(localCopies.size() == 1);
 
+      u32 nodeoffset = 0;
       for (const Edge& e : localCopies) {
         CHECK(e.sources.size() == 1);
         CHECK(e.destinations.size() >= 1);
 
         u64 srcaddr = getaddr(e.sources[0]);
-        Vector<u64> dstaddrs(e.destinations.size());
-        for (size_t i : indices(dstaddrs)) {
-          dstaddrs[i] = getaddr(e.destinations[i]);
-        }
+        // Vector<u64> dstaddrs(e.destinations.size());
+        // for (size_t i : indices(dstaddrs)) {
+        //   //dstaddrs[i] = getaddr(e.destinations[i]);
+        //   dstaddrs[i] = nodeaddr(i);
+        // }
 
-        emit->emit(srcaddr, dstaddrs, dstaddrs.size(), e.bytes);
+        // emit->emit(srcaddr, dstaddrs, dstaddrs.size(), e.bytes);
+        Vector<u64> dstaddrs((e.destinations.size() + 31) / 32);
+        u32 ndst = 0;
+        for (size_t i : indices(dstaddrs)) {
+          //dstaddrs[i] = getaddr(e.destinations[i]);
+          u32 index = nodeoffset + laneIndex + 32 * i;
+          IF_D (index < nodesetup.size()) {
+            dstaddrs[i] = nodeaddr(index);
+            ndst += 1;
+          }
+        }
+        nodeoffset += e.destinations.size();
+
+        emit->emit(srcaddr, dstaddrs, ndst, e.bytes);
       }
 
-      fence_release_sys();
+      // fence_release_sys();
 
     } else {
+      CHECK(false);
 
       Label copy;
       u64 srcaddr = 0;
@@ -2038,47 +2446,49 @@ std::string generateKernel(const Group* group, const KernelConfig& config, std::
     //   }
     // }
 
+    exitSync();
     // =================================================================
     // Exit barrier (per-block, no atomics)
     // =================================================================
-    barrier_sync();
-    IF_D(threadIndex == 0) {
-      // // Write copyDone to each peer at this block's slot.
-      // // release.sys: ensures all prior data copy stores are visible before
-      // // the copyDone signal becomes visible to peers.
-      // for (size_t i : peerIndices) {
-      //   auto& arr = group->peerCudaBlockDone[i];
-      //   auto offset = widen(blockIndex + (uint32_t)(group->peerMyRemoteIndex[i] * maxBlocks)) * 4;
-      //   auto addr = barrierAddr(arr.base, arr.itembytes, 0, concurrencyIndex) + offset;
-      //   storeGlobalReleaseSys(addr, stepValue);
-      // }
-      // // Wait for each peer's corresponding block.
-      // // acquire.sys: ensures the peer's data copies are visible to us.
-      // for (size_t i : peerIndices) {
-      //   auto offset = widen(blockIndex + (uint32_t)(i * maxBlocks)) * 4;
-      //   auto addr =
-      //       barrierAddr(group->cudaBlockDone.buffer.cudaPointer, group->cudaBlockDone.itembytes, 0, concurrencyIndex)
-      //       + offset;
-      //   WHILE(loadGlobalAcquireSys(addr, ValType::U32) < stepValue) {}
-      // }
+    // barrier_sync();
+    // IF_D(threadIndex == 0) {
+    //   // // Write copyDone to each peer at this block's slot.
+    //   // // release.sys: ensures all prior data copy stores are visible before
+    //   // // the copyDone signal becomes visible to peers.
+    //   // for (size_t i : peerIndices) {
+    //   //   auto& arr = group->peerCudaBlockDone[i];
+    //   //   auto offset = widen(blockIndex + (uint32_t)(group->peerMyRemoteIndex[i] * maxBlocks)) * 4;
+    //   //   auto addr = barrierAddr(arr.base, arr.itembytes, 0, concurrencyIndex) + offset;
+    //   //   storeGlobalReleaseSys(addr, stepValue);
+    //   // }
+    //   // // Wait for each peer's corresponding block.
+    //   // // acquire.sys: ensures the peer's data copies are visible to us.
+    //   // for (size_t i : peerIndices) {
+    //   //   auto offset = widen(blockIndex + (uint32_t)(i * maxBlocks)) * 4;
+    //   //   auto addr =
+    //   //       barrierAddr(group->cudaBlockDone.buffer.cudaPointer, group->cudaBlockDone.itembytes, 0,
+    //   concurrencyIndex)
+    //   //       + offset;
+    //   //   WHILE(loadGlobalAcquireSys(addr, ValType::U32) < stepValue) {}
+    //   // }
 
-      // fence_release_sys();
-      for (size_t i : indices(ranks)) {
-        if (i == myIndex) {
-          continue;
-        }
-        u64 addr =
-            concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranks.size() * blockIndex));
-        st_global_relaxed_sys_u32(addr, stepValue + 1);
-      }
-      for (size_t i : indices(ranks)) {
-        if (i == myIndex) {
-          continue;
-        }
-        u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranks.size() * blockIndex));
-        WHILE(ld_global_relaxed_sys_u32(addr) < stepValue + 1) {}
-      }
-    }
+    //   // fence_release_sys();
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     u64 addr =
+    //         concurrency(syncAddrs.remote[i]) + widen(sizeof(uint32_t) * (myPeerIndex[i] + ranksStride * blockIndex));
+    //     st_global_relaxed_sys_u32(addr, stepValue + 1);
+    //   }
+    //   for (size_t i : indices(ranks)) {
+    //     if (i == myIndex) {
+    //       continue;
+    //     }
+    //     u64 addr = concurrency(syncAddrs.local) + widen(sizeof(uint32_t) * (i + ranksStride * blockIndex));
+    //     WHILE(ld_global_relaxed_sys_u32(addr) < stepValue + 1) {}
+    //   }
+    // }
 
     ret();
   }

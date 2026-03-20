@@ -738,17 +738,18 @@ struct CompileOpConstructor {
   Setting tuneKernels(Vector<Graph> graphs, std::string target) {
     auto start = std::chrono::steady_clock::now();
     Vector<KernelConfig> configs;
-    for (uint32_t blockSize : {64, 256, 448, 896}) {
-      for (uint32_t sharedSize : {1024 * 64, 1024 * 224}) {
-        KernelConfig config;
-        config.copyEngine = "lockstep";
-        config.blockSize = blockSize;
-        config.sharedMemory = sharedSize;
-        configs.push_back(config);
-      }
-    }
-    for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-      for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
+    // for (uint32_t blockSize : {64, 128, 256, 448, 896}) {
+    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 224}) {
+    //     KernelConfig config;
+    //     config.copyEngine = "lockstep";
+    //     config.blockSize = blockSize;
+    //     config.sharedMemory = sharedSize;
+    //     configs.push_back(config);
+    //   }
+    // }
+    // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
+    for (uint32_t blockSize : {256, 512, 1024}) {
+      for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
         KernelConfig config;
         config.copyEngine = "simple";
         config.blockSize = blockSize;
@@ -767,8 +768,8 @@ struct CompileOpConstructor {
         configs.push_back(c);
         c.gridSize = 16;
         configs.push_back(c);
-        // c.gridSize = 32;
-        // configs.push_back(c);
+        c.gridSize = 32;
+        configs.push_back(c);
         // c.gridSize = 64;
         // configs.push_back(c);
       }
@@ -2251,10 +2252,10 @@ struct CompileOpConstructor {
 
     Vector<Graph> graphs;
 
-    graphs.push_back(buildNothing(ictx, baseGraph));
+    // graphs.push_back(buildNothing(ictx, baseGraph));
     graphs.push_back(buildMulticast(ictx, baseGraph));
-    graphs.push_back(buildRing(ictx, baseGraph, true));
-    graphs.push_back(buildRing(ictx, baseGraph, false));
+    // graphs.push_back(buildRing(ictx, baseGraph, true));
+    // graphs.push_back(buildRing(ictx, baseGraph, false));
 
     // Final barrier
     ctx.barrier();
@@ -2263,6 +2264,8 @@ struct CompileOpConstructor {
     int computeMajor = 0, computeMinor = 0;
     CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
     CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+
+    log.info("cuda compute capacity is %d.%d\n", computeMajor, computeMinor);
 
     const char* target = computeTarget(computeMajor, computeMinor);
 

@@ -237,6 +237,11 @@ std::string Module::finalize() const {
   s += ".address_size " + std::to_string(addressSize) + "\n";
   s += "\n";
 
+  for (auto& c : topLevelComments) {
+    s += "// " + c + "\n";
+  }
+  s += "\n";
+
   for (const auto& g : globals) {
     s += g + ";\n";
   }
@@ -377,6 +382,10 @@ void shr_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shr.s32", d, a, b));
 }
 
+void neg_s32(const Value& d, const Value& a) {
+  emitInst(fmt2("neg.s32", d, a));
+}
+
 // Comparison
 void setp_eq_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.eq.u32", p, a, b));
@@ -509,6 +518,15 @@ void ld_u8(const Value& d, const Value& addr) {
   emitInst("ld.u8 " + d.str() + ", [" + addr.str() + "]");
 }
 
+u64 ld_global_cv_u64(const u64& addr) {
+  u64 r;
+  emitInst("ld.global.cv.u64 " + r.inner.str() + ", [" + addr.inner.str() + "]");
+  return r;
+}
+void st_global_wt_u64(const u64& addr, const u64& value) {
+  emitInst("st.global.wt.u64 [" + addr.inner.str() + "], " + value.inner.str());
+}
+
 // Store
 void st_global_u32(const Value& addr, const Value& val) {
   emitInst("st.global.u32 [" + addr.str() + "], " + val.str());
@@ -522,8 +540,14 @@ void st_global_volatile_u32(const Value& addr, const Value& val) {
 void ld_global_relaxed_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.relaxed.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
 }
+void ld_global_relaxed_sys_u64(const Value& d, const Value& addr) {
+  emitInst("ld.relaxed.sys.global.u64 " + d.str() + ", [" + addr.str() + "]");
+}
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.acquire.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+void fence() {
+  emitInst("fence.cta");
 }
 void fence_acquire_sys() {
   emitInst("fence.acquire.sys");
@@ -531,8 +555,17 @@ void fence_acquire_sys() {
 void fence_release_sys() {
   emitInst("fence.release.sys");
 }
+void fence_acquire_gpu() {
+  emitInst("fence.acquire.gpu");
+}
+void fence_release_gpu() {
+  emitInst("fence.release.gpu");
+}
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
   emitInst("st.relaxed.sys.global.u32 [" + addr.str() + "], " + val.str());
+}
+void st_global_relaxed_sys_u64(const Value& addr, const Value& val) {
+  emitInst("st.relaxed.sys.global.u64 [" + addr.str() + "], " + val.str());
 }
 void st_global_release_sys_u32(const Value& addr, const Value& val) {
   emitInst("st.release.sys.global.u32 [" + addr.str() + "], " + val.str());
@@ -569,10 +602,13 @@ void bra(const Block* target) {
 void bra(const Value& pred, const Block* target) {
   emitInst("@" + pred.str() + " bra.uni " + target->label);
 }
+void bra_div(const Value& pred, const Block* target) {
+  emitInst("@" + pred.str() + " bra " + target->label);
+}
 void bra_not(const Value& pred, const Block* target) {
   emitInst("@!" + pred.str() + " bra.uni " + target->label);
 }
-void brx_idx(const Value& index, const std::vector<Label>& targets) {
+void brx_idx(const Value& index, const std::vector<Label>& targets, bool divergent) {
   std::string targetList;
   for (const auto& t : targets) {
     if (!targetList.empty()) {
@@ -582,7 +618,11 @@ void brx_idx(const Value& index, const std::vector<Label>& targets) {
   }
   std::string tsLabel = "ts_" + std::to_string(currentFunction->brxCounter++);
   emitInst(tsLabel + ": .branchtargets " + targetList);
-  emitInst("brx.idx.uni " + index.str() + ", " + tsLabel);
+  if (divergent) {
+    emitInst("brx.idx " + index.str() + ", " + tsLabel);
+  } else {
+    emitInst("brx.idx.uni " + index.str() + ", " + tsLabel);
+  }
 }
 void ret() {
   emitInst("ret");
@@ -591,6 +631,9 @@ void ret() {
 // Atomic
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b) {
   emitInst("atom.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
+}
+void atom_global_relaxed_inc_u32(const Value& d, const Value& addr, const Value& b) {
+  emitInst("atom.relaxed.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
 }
 
 static Value atomAdd(const char* space, const char* sem, const char* scope, const Value& addr, const Value& b) {
@@ -1156,6 +1199,18 @@ Value Value::operator!() const {
   return result;
 }
 
+Value Value::operator-() const {
+  Value result(ValType::S32);
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    neg_s32(result, *this);
+    break;
+  default:
+    unsupported("-", type);
+  }
+  return result;
+}
+
 Value Value::operator<<(const Value& b) const {
   Value result(type);
   switch (regTypeFor(type)) {
@@ -1417,7 +1472,7 @@ ScopeGuard::ScopeGuard(ScopeGuard&& o) noexcept
 ScopeGuard::~ScopeGuard() {
   if (!closed) {
     if (stepFn) {
-      stepFn();
+      stepFn(*this);
     }
     if (backEdgeTarget) {
       bra(backEdgeTarget);
@@ -1479,6 +1534,56 @@ ScopeGuard _WhileImpl(Block* header, const Value& cond) {
   }
   // Create and activate body block
   activateNewBlock("while_body");
+  return sg;
+}
+
+ScopeGuard _Skip() {
+  ScopeGuard sg;
+  sg.pendingBlock = std::make_unique<Block>();
+  sg.pendingBlock->label = genLabel("postskip");
+  emitInst("bra.uni " + sg.pendingBlock->label);
+  activateNewBlock("skip");
+  return sg;
+}
+
+ScopeGuard _Switch(const u32& index, bool divergent) {
+  ScopeGuard sg;
+  sg.pendingBlock = std::make_unique<Block>();
+  sg.pendingBlock->label = genLabel("endswitch");
+
+  u32 index_value = index;
+
+  Label label("switch");
+  GOTO(label);
+  sg.stepFn = [label = std::move(label), index_value = std::move(index_value), divergent](ScopeGuard& sg) mutable {
+    LABEL(label);
+    for (auto& v : sg.caseLabels) {
+      if (v.rawPtr == nullptr) {
+        v.rawPtr = &*sg.pendingBlock;
+      }
+    }
+    if (!sg.caseLabels.empty()) {
+      IF(index_value < sg.caseLabels.size()) {
+        brx_idx(index_value, sg.caseLabels, divergent);
+      }
+    }
+  };
+  activateNewBlock("switch_body");
+  return sg;
+}
+ScopeGuard _Case(ScopeGuard& scope, uint32_t value) {
+  if (value >= 65536) {
+    throw std::runtime_error("case value is to large");
+  }
+  Label label("case");
+  LABEL(label);
+  if (scope.caseLabels.size() <= value) {
+    scope.caseLabels.resize(value + 1);
+    scope.caseLabels[value] = std::move(label);
+  }
+
+  ScopeGuard sg;
+  sg.backEdgeTarget = &*scope.pendingBlock;
   return sg;
 }
 

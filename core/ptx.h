@@ -2,8 +2,9 @@
 
 #pragma once
 
+#include "common.h"
+
 #include <array>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -68,12 +69,13 @@ struct Function {
 
 // Top-level PTX module containing globals and functions.
 struct Module {
-  std::string version = "8.7";
+  std::string version = "8.8";
   std::string target;
   int addressSize = 64;
 
   std::vector<std::string> globals;
   std::vector<std::unique_ptr<Function>> functions;
+  std::vector<std::string> topLevelComments;
 
   Function* newFunction(const char* name);
 
@@ -185,6 +187,8 @@ struct Value {
   void operator/=(const Value& b);
   void operator%=(const Value& b);
   void operator^=(const Value& b);
+
+  Value operator-() const;
 };
 
 // Backward compatibility alias
@@ -253,6 +257,8 @@ struct TValue {
   Value operator>=(const Operand<T>& b) const;
   Value operator==(const Operand<T>& b) const;
   Value operator!=(const Operand<T>& b) const;
+
+  TValue operator-() const;
 };
 
 // Operand proxy — used as argument type for TValue arithmetic operators.
@@ -358,7 +364,13 @@ Value TValue<T>::operator!=(const Operand<T>& b) const {
   return inner != b.get();
 }
 
+template<ValType T>
+TValue<T> TValue<T>::operator-() const {
+  return -inner;
+}
+
 using u32 = TValue<ValType::U32>;
+using s32 = TValue<ValType::S32>;
 using u64 = TValue<ValType::U64>;
 
 template<ValType T>
@@ -447,6 +459,8 @@ void shl_b64(const Value& d, const Value& a, const Value& b);
 void shr_u32(const Value& d, const Value& a, const Value& b);
 void shr_s32(const Value& d, const Value& a, const Value& b);
 
+void neg_s32(const Value& d, const Value& a);
+
 // Comparison
 void setp_eq_u32(const Value& p, const Value& a, const Value& b);
 void setp_ne_u32(const Value& p, const Value& a, const Value& b);
@@ -492,7 +506,7 @@ inline u64 ld_global_u64(const u64& addr) {
   return result;
 }
 void ld_const_u32(const Value& d, const Value& addr);
-inline Value ld_const_u32(const Value& addr) {
+inline u32 ld_const_u32(const Value& addr) {
   u32 result;
   ld_const_u32(result, addr);
   return result;
@@ -511,9 +525,15 @@ inline Value ld_const_u8(const Value& addr) {
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr);
 void ld_global_relaxed_sys_u32(const Value& d, const Value& addr);
-inline Value ld_global_relaxed_sys_u32(const Value& addr) {
-  Value result(ValType::U32);
+inline u32 ld_global_relaxed_sys_u32(const Value& addr) {
+  u32 result;
   ld_global_relaxed_sys_u32(result, addr);
+  return result;
+}
+void ld_global_relaxed_sys_u64(const Value& d, const Value& addr);
+inline u64 ld_global_relaxed_sys_u64(const Value& addr) {
+  u64 result;
+  ld_global_relaxed_sys_u64(result, addr);
   return result;
 }
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
@@ -522,9 +542,13 @@ inline Value ld_global_acquire_sys_u32(const Value& addr) {
   ld_global_acquire_sys_u32(result, addr);
   return result;
 }
+void fence();
 void fence_acquire_sys();
 void fence_release_sys();
+void fence_acquire_gpu();
+void fence_release_gpu();
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
+void st_global_relaxed_sys_u64(const Value& addr, const Value& val);
 void st_global_release_sys_u32(const Value& addr, const Value& val);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
 void ld_u8(const Value& d, const Value& addr);
@@ -536,6 +560,9 @@ inline Value ld_shared_acquire_cta_u32(const Value& addr) {
 }
 void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr);
 void st_shared_v4_u32(const Value& addr, const std::array<Value, 4>& v);
+
+u64 ld_global_cv_u64(const u64& addr);
+void st_global_wt_u64(const u64& addr, const u64& value);
 
 // Store
 void st_global_u32(const Value& addr, const Value& val);
@@ -553,12 +580,14 @@ void cvt_u32_u64(const Value& d, const Value& a);
 struct Label;
 void bra(const Block* target);
 void bra(const Value& pred, const Block* target);
+void bra_div(const Value& pred, const Block* target);
 void bra_not(const Value& pred, const Block* target);
-void brx_idx(const Value& index, const std::vector<Label>& targets);
+void brx_idx(const Value& index, const std::vector<Label>& targets, bool divergent = false);
 void ret();
 
 // Atomic
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b);
+void atom_global_relaxed_inc_u32(const Value& d, const Value& addr, const Value& b);
 // Atomic add (global, all semantics × {cta,gpu,sys} scopes)
 Value atom_global_relaxed_cta_add_u32(const Value& addr, const Value& b);
 Value atom_global_relaxed_gpu_add_u32(const Value& addr, const Value& b);
@@ -610,9 +639,11 @@ Block* activateNewBlock(const char* prefix);
 // Owns a pending block that is activated when the scope closes.
 struct ScopeGuard {
   std::unique_ptr<Block> pendingBlock;
-  Block* backEdgeTarget = nullptr; // WHILE: emit bra before activating exit
-  std::function<void()> stepFn;    // FOR: emit step before back-edge
+  Block* backEdgeTarget = nullptr;             // WHILE: emit bra before activating exit
+  moodist::Function<void(ScopeGuard&)> stepFn; // FOR: emit step before back-edge
   bool closed = false;
+
+  std::vector<Label> caseLabels;
 
   ScopeGuard() = default;
   ScopeGuard(ScopeGuard&& o) noexcept;
@@ -625,6 +656,10 @@ ScopeGuard _If(const Value& pred);
 ScopeGuard _IfD(const Value& pred); // divergent IF: uses bra (not bra.uni)
 ScopeGuard _Else();
 ScopeGuard _WhileImpl(Block* header, const Value& pred);
+ScopeGuard _Skip();
+
+ScopeGuard _Switch(const u32& index, bool divergent);
+ScopeGuard _Case(ScopeGuard& scope, uint32_t value);
 
 template<typename F>
 ScopeGuard _While(F&& condFn) {
@@ -642,6 +677,8 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
   return sg;
 }
 
+#define SKIP if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Skip(); true)
+
 #define IF(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_If(pred); true)
 #define IF_D(pred) if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_IfD(pred); true)
 #define ELSE if ([[maybe_unused]] auto _ptx_scope_ = ::moodist::ptx::_Else(); true)
@@ -658,10 +695,14 @@ ScopeGuard _For(CondFn&& condFn, StepFn&& stepFn) {
             [&]() {                                                                                                    \
               return (cond);                                                                                           \
             },                                                                                                         \
-            [&]() {                                                                                                    \
+            [&](ScopeGuard&) {                                                                                         \
               step;                                                                                                    \
             });                                                                                                        \
         true)
+
+#define SWITCH(index) if ([[maybe_unused]] auto _ptx_switch_scope = ::moodist::ptx::_Switch(index, false); true)
+#define SWITCH_D(index) if ([[maybe_unused]] auto _ptx_switch_scope = ::moodist::ptx::_Switch(index, true); true)
+#define CASE(index) if ([[maybe_unused]] auto _ptx_case_scope = ::moodist::ptx::_Case(_ptx_switch_scope, index); true)
 
 // Predicated execution — all instructions in body are prefixed with @pred.
 
@@ -686,6 +727,7 @@ void activateLabel(Label& label);
 
 #define GOTO(label) ::moodist::ptx::bra((label).rawPtr)
 #define GOTO_IF(pred, label) ::moodist::ptx::bra(pred, (label).rawPtr)
+#define GOTO_IF_D(pred, label) ::moodist::ptx::bra_div(pred, (label).rawPtr)
 #define GOTO_IF_NOT(pred, label) ::moodist::ptx::bra_not(pred, (label).rawPtr)
 #define LABEL(label) ::moodist::ptx::activateLabel(label)
 
@@ -761,6 +803,10 @@ Value addConst32(
 
 template<typename T>
 Value addConst32(const std::vector<T>& vec, const char* name) {
+  if (vec.empty()) {
+    char zero = 0;
+    return addConst32(alignof(T), &zero, 1, name);
+  }
   return addConst32(alignof(T), vec.data(), vec.size() * sizeof(T), name);
 }
 
