@@ -8,6 +8,7 @@
 #include "cuda_loader.h"
 #include "group.h"
 #include "intrusive_list.h"
+#include "ptx_codegen.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "tensor_types.h"
@@ -344,6 +345,7 @@ struct CustomOpDescriptor {
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
 
   compile_op::Graph graph;
+  std::shared_ptr<KernelHandle> kernelHandle;
   std::unique_ptr<CompiledKernel> kernel;
   KernelConfig config;
 };

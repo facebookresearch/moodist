@@ -3343,8 +3343,18 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
     CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
     std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
-    CHECK_CU(cuLaunchKernel(op->kernel->function, op->config.gridSize, 1, 1, op->config.blockSize, 1, 1, 0, stream,
-        kparams.data(), nullptr));
+    CUlaunchConfig launchConfig;
+    CUlaunchAttribute attr;
+    std::memset(&launchConfig, 0, sizeof(launchConfig));
+    launchConfig.grid = {op->config.gridSize, 1, 1};
+    launchConfig.block = {op->config.blockSize, 1, 1};
+    launchConfig.sharedMemBytes = 0;
+    launchConfig.hStream = stream;
+    launchConfig.attrs = &attr;
+    launchConfig.numAttrs = 1;
+    attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
+    attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
+    CHECK_CU(cuLaunchKernelEx(&launchConfig, op->kernel->function, kparams.data(), nullptr));
   }
 
   if (anyRdma) {

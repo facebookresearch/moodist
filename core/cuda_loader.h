@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -291,6 +292,32 @@ union CUstreamBatchMemOpParams {
 // Host function callback type
 using CUhostFn = void (*)(void* userData);
 
+using CUlaunchAttributeID = unsigned long;
+
+constexpr CUlaunchAttributeID CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN = 10;
+
+constexpr unsigned long CU_LAUNCH_MEM_SYNC_DOMAIN_DEFAULT = 0;
+constexpr unsigned long CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE = 1;
+
+union CUlaunchAttributeValue {
+  char pad[64];
+  unsigned long value;
+};
+
+struct CUlaunchAttribute {
+  CUlaunchAttributeID id;
+  CUlaunchAttributeValue value;
+};
+
+struct CUlaunchConfig {
+  std::array<unsigned int, 3> grid;
+  std::array<unsigned int, 3> block;
+  unsigned int sharedMemBytes;
+  CUstream hStream;
+  CUlaunchAttribute* attrs;
+  unsigned int numAttrs;
+};
+
 // ============================================================================
 // CUDA Driver API function pointer types
 // ============================================================================
@@ -412,6 +439,7 @@ using cuIpcOpenEventHandle_t = CUresult (*)(CUevent* phEvent, CUipcEventHandle h
 using cuLaunchKernel_t = CUresult (*)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
     CUstream hStream, void** kernelParams, void** extra);
+using cuLaunchKernelEx_t = CUresult (*)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 using cuLaunchHostFunc_t = CUresult (*)(CUstream hStream, CUhostFn fn, void* userData);
 
 // ============================================================================
@@ -521,6 +549,7 @@ struct CudaApi {
 
   // Kernel launch
   cuLaunchKernel_t launchKernel = nullptr;
+  cuLaunchKernelEx_t launchKernelEx = nullptr;
   cuLaunchHostFunc_t launchHostFunc = nullptr;
 
   bool available() const {
@@ -763,6 +792,9 @@ inline CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int
     CUstream hStream, void** kernelParams, void** extra) {
   return cudaApi.launchKernel(
       f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+}
+inline CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+  return cudaApi.launchKernelEx(config, f, kernelParams, extra);
 }
 inline CUresult cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void* userData) {
   return cudaApi.launchHostFunc(hStream, fn, userData);

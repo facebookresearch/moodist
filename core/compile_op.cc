@@ -747,9 +747,21 @@ struct CompileOpConstructor {
     //     configs.push_back(config);
     //   }
     // }
+
     // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-    for (uint32_t blockSize : {256, 512, 1024}) {
+    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+    //     KernelConfig config;
+    //     config.copyEngine = "buffered";
+    //     config.blockSize = blockSize;
+    //     config.sharedMemory = sharedSize;
+    //     configs.push_back(config);
+    //   }
+    // }
+
+    for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
       for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+    // for (uint32_t blockSize : {32}) {
+    //   for (uint32_t sharedSize : {1024 * 16}) {
         KernelConfig config;
         config.copyEngine = "simple";
         config.blockSize = blockSize;
@@ -768,8 +780,8 @@ struct CompileOpConstructor {
         configs.push_back(c);
         c.gridSize = 16;
         configs.push_back(c);
-        c.gridSize = 32;
-        configs.push_back(c);
+        // c.gridSize = 32;
+        // configs.push_back(c);
         // c.gridSize = 64;
         // configs.push_back(c);
       }
@@ -801,7 +813,7 @@ struct CompileOpConstructor {
       std::ranges::sort(v.second);
     }
 
-    Vector<std::string> sources;
+    Vector<std::shared_ptr<KernelHandle>> sources;
     Vector<CompiledKernel> kernels;
 
     for (const auto& s : settings) {
@@ -811,8 +823,8 @@ struct CompileOpConstructor {
     log.info("Generated %d kernels in %gs\n", sources.size(), seconds(std::chrono::steady_clock::now() - start));
     start = std::chrono::steady_clock::now();
 
-    for (const auto& ptx : sources) {
-      kernels.push_back(compileKernelPtx(ptx, "compile_op_copy"));
+    for (const auto& h : sources) {
+      kernels.push_back(compileKernelPtx(h->ptx, "compile_op_copy"));
     }
 
     // {
@@ -909,12 +921,23 @@ struct CompileOpConstructor {
 
       CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
       std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
+      CUlaunchConfig launchConfig;
+      CUlaunchAttribute attr;
+      launchConfig.grid = {config.gridSize, 1, 1};
+      launchConfig.block = {config.blockSize, 1, 1};
+      launchConfig.sharedMemBytes = 0;
+      launchConfig.hStream = stream;
+      launchConfig.attrs = &attr;
+      launchConfig.numAttrs = 1;
+      attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
+      attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
 
       auto run = [&]() {
-        CHECK_CU(cuLaunchKernel(
-            kernels.at(i).function, config.gridSize, 1, 1, config.blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
+        CHECK_CU(cuLaunchKernelEx(&launchConfig, kernels.at(i).function, kparams.data(), nullptr));
         stepValue += 0x1000;
+        concurrencyIndex = (concurrencyIndex + 1) % maxConcurrency;
         params.stepValue = stepValue;
+        params.concurrencyIndex = concurrencyIndex;
       };
 
       ctx.barrier();
@@ -2284,7 +2307,8 @@ struct CompileOpConstructor {
     }
 
     if (!setting.graph.cudaEdges.empty()) {
-      std::string ptx = generateKernel(group, setting.config, target, setting.graph, ctx);
+      std::shared_ptr<KernelHandle> kernelHandle = generateKernel(group, setting.config, target, setting.graph, ctx);
+      const std::string& ptx = kernelHandle->ptx;
       if (std::getenv("MOODIST_DUMP_KERNELS")) {
         std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
         FILE* f = fopen(fn.c_str(), "wb");
@@ -2295,6 +2319,7 @@ struct CompileOpConstructor {
         }
       }
       op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+      op->kernelHandle = std::move(kernelHandle);
     }
 
     return op;

@@ -635,23 +635,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       CHECK(allocatorGetChunk(0, &handle, &offset, &bytes));
       CHECK(offset == 0);
 
-      uintptr_t localBase = allocatorGetReservedBase();
-      size_t localOffset = tmp.cudaPointer - localBase;
-      CHECK(localOffset >= offset && localOffset + 0x1000 < offset + bytes);
-
-      char localBuf[0x1000];
-      std::memset(localBuf, 0, 0x1000);
-      uint64_t magic = 0x44550102;
-      uint32_t localRank = rank;
-      std::memcpy(&localBuf[0], &magic, 8);
-      std::memcpy(&localBuf[8], &localRank, 4);
-      CHECK_CU(cuMemcpyAsync(tmp.cudaPointer, (uintptr_t)localBuf, 0x1000, 0));
-      CHECK_CU(cuCtxSynchronize());
-      // std::memcpy((void*)tmp.cudaPointer, localBuf, 0x1000);
-
-      // CUmemFabricHandle fabricHandle;
-      // CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
-
       nvmlGpuFabricInfo_t localFabricInfo;
       CHECK_NVML(nvmlApi.deviceGetGpuFabricInfoV(nvmlDevice, &localFabricInfo));
 
@@ -667,97 +650,51 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       localFabricId.clique = localFabricInfo.cliqueId;
       std::ranges::copy(localFabricInfo.clusterUuid, localFabricId.cluster.begin());
 
+      CUmemFabricHandle fabricHandle;
+      bool hasFabric = false;
+      if (!std::ranges::all_of(localFabricId.cluster, [](auto& v) {
+            return v == 0;
+          })) {
+        hasFabric = cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0) == CUDA_SUCCESS;
+      }
+      if (!hasFabric) {
+        std::memset(&fabricHandle, 0, sizeof(fabricHandle));
+      }
+
       struct Info {
         CUmemFabricHandle handle;
         size_t bytes;
         size_t offset;
         FabricId fabric;
-      };
-      // info.handle = fabricHandle;
-      // info.bytes = bytes;
+      } info;
+      info.handle = fabricHandle;
+      info.bytes = bytes;
 
-      Vector<Info> infolist;
-      for (size_t i : range(size)) {
-        CUmemFabricHandle fabricHandle;
-        CHECK_CU(cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
-        log.info("fabric handle %d is %s\n", i, hexstr(&fabricHandle, sizeof(fabricHandle)));
-        Info info;
-        info.handle = fabricHandle;
-        info.bytes = bytes;
-        info.offset = localOffset;
-        info.fabric = localFabricId;
-        infolist.push_back(info);
-      }
-
-      auto allinfos = setupComms->allgather(infolist);
+      auto allinfos = setupComms->allgather(info);
 
       Vector<size_t> fabricDomain;
-      fabricDomain.push_back(rank);
 
-      for (size_t i : range(size)) {
-        if (i == rank) {
-          continue;
-        }
-
-        auto& ii = allinfos.at(i).at(rank);
-
-        bool connected = ii.fabric == localFabricId;
-
-        log.info("try %d  connected? %d\n", i, connected);
-
-        bool worked = false;
-
-        CUmemGenericAllocationHandle importedHandle;
-        auto err = cuMemImportFromShareableHandle(&importedHandle, &ii.handle, CU_MEM_HANDLE_TYPE_FABRIC);
-        if (err == CUDA_SUCCESS) {
-          CUdeviceptr nbase;
-          CHECK_CU(cuMemAddressReserve(&nbase, ii.bytes, 1024 * 1024 * 2, 0, 0));
-          err = cuMemMap(nbase, ii.bytes, 0, importedHandle, 0);
-          if (err != CUDA_SUCCESS) {
-            const char* str = nullptr;
-            cudaApi.getErrorString(err, &str);
-            log.info("fabric error during map %d: %s\n", err, str);
-          } else {
-
-            CUmemAccessDesc accessDesc;
-            std::memset(&accessDesc, 0, sizeof(accessDesc));
-            accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            CUdevice dev;
-            CHECK_CU(cuCtxGetDevice(&dev));
-            accessDesc.location.id = dev;
-            accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CHECK_CU(cuMemSetAccess(nbase, ii.bytes, &accessDesc, 1));
-
-            char nbuffer[0x1000];
-            std::memset(nbuffer, 0, sizeof(nbuffer));
-
-            CHECK_CU(cuMemcpyAsync((uintptr_t)nbuffer, nbase + ii.offset, 0x1000, 0));
-            CHECK_CU(cuCtxSynchronize());
-
-            uint64_t nmagic;
-            uint32_t nrank;
-            std::memcpy(&nmagic, &nbuffer[0], 8);
-            std::memcpy(&nrank, &nbuffer[8], 4);
-
-            if (nmagic != magic || nrank != i) {
-              fatal("got from rank %d:  magic %#x rank %d\n", i, nmagic, nrank);
-            }
-            log.info("magic ok! rank %d really is rank %d\n", i, i);
-
-            CHECK_CU(cuMemRelease(importedHandle));
-            fabricDomain.push_back(i);
-
-            log.info("fabric %d connected\n", i);
-
-            worked = true;
+      if (hasFabric) {
+        for (size_t i : range(size)) {
+          if (i == rank) {
+            continue;
           }
-        } else {
-          const char* str = nullptr;
-          cudaApi.getErrorString(err, &str);
-          log.info("fabric error %d: %s\n", err, str);
-        }
+          auto& ii = allinfos.at(i);
+          bool connected = ii.fabric == localFabricId;
+          if (std::ranges::all_of(ii.fabric.cluster, [](auto& v) {
+                return v == 0;
+              })) {
+            connected = false;
+          }
+          if (!connected) {
+            continue;
+          }
 
-        CHECK(worked == connected);
+          fabricDomain.push_back(i);
+        }
+      }
+      if (!fabricDomain.empty()) {
+        fabricDomain.push_back(rank);
       }
       std::ranges::sort(fabricDomain);
 
@@ -769,7 +706,12 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       auto allDomains = setupComms->allgather(fabricDomain);
 
       for (size_t i : fabricDomain) {
-        CHECK(allDomains[i] == fabricDomain);
+        if (allDomains[i] != fabricDomain) {
+          throw std::runtime_error(fmt::sprintf(
+              "moodist: Fabric domain mismatch error. Two ranks have detected a mismatching set of CUDA "
+              "fabric connected ranks. Rank %d set: [%s], rank %d set: [%s].\n",
+              rank, fmt::to_string(fmt::join(fabricDomain, ", ")), i, fmt::to_string(fmt::join(allDomains[i], ", "))));
+        }
       }
 
       fabricDomainRanks = fabricDomain;

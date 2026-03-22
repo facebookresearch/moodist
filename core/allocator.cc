@@ -576,6 +576,11 @@ struct CudaAllocatorImpl {
 
       log.info(
           "Moodist CUDA Allocator reserved %d bytes of VA at %#x (granularity %d)\n", reserveSize, base, granularity);
+
+      if (reservedBase & (1ull << 63)) {
+        throw std::runtime_error(
+            "Oh no, CUDA returned memory with bit 63 set! This should not happen. Moodist needs this bit for tagging.");
+      }
     }
 
     // Round up to allocation granularity

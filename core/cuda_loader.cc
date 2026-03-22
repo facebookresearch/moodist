@@ -182,6 +182,7 @@ bool loadCuda() {
     cudaApi.linkComplete = (cuLinkComplete_t)loadSym(lib, "cuLinkComplete", name, ok, failed);
     cudaApi.linkDestroy = (cuLinkDestroy_t)loadSym(lib, "cuLinkDestroy", name, ok, failed);
     cudaApi.launchKernel = (cuLaunchKernel_t)loadSym(lib, "cuLaunchKernel", name, ok, failed);
+    cudaApi.launchKernelEx = (cuLaunchKernelEx_t)loadSym(lib, "cuLaunchKernelEx", name, ok, failed);
     cudaApi.launchHostFunc = (cuLaunchHostFunc_t)loadSym(lib, "cuLaunchHostFunc", name, ok, failed);
 
     // Multicast (Hopper+ with NVSwitch)

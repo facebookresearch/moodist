@@ -5,6 +5,7 @@
 #include "common.h"
 
 #include <array>
+#include <bit>
 #include <memory>
 #include <string>
 #include <vector>
@@ -124,6 +125,7 @@ struct Value {
   enum Kind { None, Register, Immediate };
   Kind kind = None;
   std::string immStr; // string representation for immediates
+  std::optional<int64_t> immValue;
 
   // --- Constructors ---
   Value() = default;
@@ -187,6 +189,10 @@ struct Value {
   void operator/=(const Value& b);
   void operator%=(const Value& b);
   void operator^=(const Value& b);
+  void operator&=(const Value& b);
+  void operator|=(const Value& b);
+  void operator<<=(const Value& b);
+  void operator>>=(const Value& b);
 
   Value operator-() const;
 };
@@ -239,9 +245,9 @@ struct TValue {
   TValue operator&(const Operand<T>& b) const;
   TValue operator|(const Operand<T>& b) const;
   TValue operator^(const Operand<T>& b) const;
-  // TValue operator~() const {
-  //   return ~inner;
-  // }
+  TValue operator~() const {
+    return ~inner;
+  }
   TValue operator<<(const Operand<T>& b) const;
   TValue operator>>(const Operand<T>& b) const;
 
@@ -250,6 +256,11 @@ struct TValue {
   void operator*=(const Operand<T>& b);
   void operator/=(const Operand<T>& b);
   void operator%=(const Operand<T>& b);
+  void operator&=(const Operand<T>& b);
+  void operator|=(const Operand<T>& b);
+  void operator^=(const Operand<T>& b);
+  void operator<<=(const Operand<T>& b);
+  void operator>>=(const Operand<T>& b);
 
   Value operator<(const Operand<T>& b) const;
   Value operator<=(const Operand<T>& b) const;
@@ -293,10 +304,24 @@ TValue<T> TValue<T>::operator*(const Operand<T>& b) const {
 }
 template<ValType T>
 TValue<T> TValue<T>::operator/(const Operand<T>& b) const {
+  auto& bv = b.get();
+  if ((inner.type == ValType::U32 || inner.type == ValType::U64) && bv.kind == Value::Immediate && bv.immValue) {
+    uint64_t uv = *bv.immValue;
+    if ((int64_t)uv > 0 && std::popcount(uv) == 1) {
+      return inner >> std::countr_zero(uv);
+    }
+  }
   return inner / b.get();
 }
 template<ValType T>
 TValue<T> TValue<T>::operator%(const Operand<T>& b) const {
+  auto& bv = b.get();
+  if ((inner.type == ValType::U32 || inner.type == ValType::U64) && bv.kind == Value::Immediate && bv.immValue) {
+    uint64_t uv = *bv.immValue;
+    if ((int64_t)uv > 0 && std::popcount(uv) == 1) {
+      return inner & (uv - 1);
+    }
+  }
   return inner % b.get();
 }
 template<ValType T>
@@ -338,6 +363,26 @@ void TValue<T>::operator/=(const Operand<T>& b) {
 template<ValType T>
 void TValue<T>::operator%=(const Operand<T>& b) {
   inner %= b.get();
+}
+template<ValType T>
+void TValue<T>::operator&=(const Operand<T>& b) {
+  inner &= b.get();
+}
+template<ValType T>
+void TValue<T>::operator|=(const Operand<T>& b) {
+  inner |= b.get();
+}
+template<ValType T>
+void TValue<T>::operator^=(const Operand<T>& b) {
+  inner ^= b.get();
+}
+template<ValType T>
+void TValue<T>::operator<<=(const Operand<T>& b) {
+  inner <<= b.get();
+}
+template<ValType T>
+void TValue<T>::operator>>=(const Operand<T>& b) {
+  inner >>= b.get();
 }
 template<ValType T>
 Value TValue<T>::operator<(const Operand<T>& b) const {
@@ -542,6 +587,7 @@ inline Value ld_global_acquire_sys_u32(const Value& addr) {
   ld_global_acquire_sys_u32(result, addr);
   return result;
 }
+void fence_proxy();
 void fence();
 void fence_acquire_sys();
 void fence_release_sys();
@@ -795,9 +841,9 @@ Value atomicInc(const Value& addr, const Value& modulo);
 Value globalAddr(const char* name); // mov.u64 of global symbol address, returns U64
 Value constAddr(const char* name);  // mov.u32 of const symbol address, returns U32
 Value sharedAddr(const char* name); // mov.u32 of shared symbol address, returns U32 (native shared-space address)
-Value addShared(int align, int sizeBytes, const char* suffix = nullptr);    // declare shared mem, return U64 address
-Value addShared32(int align, int sizeBytes, const char* suffix = nullptr);  // declare shared mem, return U32 address
-Value addGlobalVar(int align, int sizeBytes, const char* suffix = nullptr); // declare global var, return U64 address
+Value addShared(int align, int sizeBytes, const char* suffix = nullptr);   // declare shared mem, return U64 address
+Value addShared32(int align, int sizeBytes, const char* suffix = nullptr); // declare shared mem, return U32 address
+u64 addGlobalVar(int align, int sizeBytes, const char* suffix = nullptr);  // declare global var, return U64 address
 Value addConst32(
     int align, const void* data, size_t size, const char* name); // declare initialized const, return U32 address
 

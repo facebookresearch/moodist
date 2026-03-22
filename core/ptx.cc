@@ -31,7 +31,7 @@ Value addShared(int align, int sizeBytes, const char* suffix) {
   std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
   return globalAddr(sym.c_str());
 }
-Value addGlobalVar(int align, int sizeBytes, const char* suffix) {
+u64 addGlobalVar(int align, int sizeBytes, const char* suffix) {
   static int counter = 0;
   std::string name = std::string("global_") + (suffix ? suffix : std::to_string(counter++));
   std::string decl = ".global .align " + std::to_string(align) + " .b8 " + name + "[" + std::to_string(sizeBytes) + "]";
@@ -546,6 +546,9 @@ void ld_global_relaxed_sys_u64(const Value& d, const Value& addr) {
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.acquire.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
 }
+void fence_proxy() {
+  emitInst("fence.proxy.async");
+}
 void fence() {
   emitInst("fence.cta");
 }
@@ -904,6 +907,7 @@ Value Value::imm(ValType type, int64_t v) {
   Value r;
   r.type = type;
   r.kind = Immediate;
+  r.immValue = v;
   r.immStr = std::to_string(v);
   r.valid = true;
   return r;
@@ -1424,6 +1428,55 @@ void Value::operator^=(const Value& b) {
     break;
   default:
     unsupported("^=", type);
+  }
+}
+
+void Value::operator&=(const Value& b) {
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    and_b32(*this, *this, b);
+    break;
+  case RegType::B64:
+    and_b64(*this, *this, b);
+    break;
+  default:
+    unsupported("&=", type);
+  }
+}
+
+void Value::operator|=(const Value& b) {
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    or_b32(*this, *this, b);
+    break;
+  case RegType::B64:
+    or_b64(*this, *this, b);
+    break;
+  default:
+    unsupported("|=", type);
+  }
+}
+
+void Value::operator<<=(const Value& b) {
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    shl_b32(*this, *this, b);
+    break;
+  case RegType::B64:
+    shl_b64(*this, *this, b);
+    break;
+  default:
+    unsupported("<<=", type);
+  }
+}
+
+void Value::operator>>=(const Value& b) {
+  switch (regTypeFor(type)) {
+  case RegType::B32:
+    shr_u32(*this, *this, b);
+    break;
+  default:
+    unsupported(">>=", type);
   }
 }
 
