@@ -237,6 +237,10 @@ struct TValue {
     return *this;
   }
 
+  const std::string& str() const {
+    return inner.str();
+  }
+
   TValue operator+(const Operand<T>& b) const;
   TValue operator-(const Operand<T>& b) const;
   TValue operator*(const Operand<T>& b) const;
@@ -634,7 +638,7 @@ void ret();
 
 // Atomic
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b);
-void atom_global_relaxed_inc_u32(const Value& d, const Value& addr, const Value& b);
+u32 atom_global_relaxed_inc_u32(const u64& addr, const u32& b);
 // Atomic add (global, all semantics × {cta,gpu,sys} scopes)
 Value atom_global_relaxed_cta_add_u32(const Value& addr, const Value& b);
 Value atom_global_relaxed_gpu_add_u32(const Value& addr, const Value& b);
@@ -795,6 +799,8 @@ u32 blockDim_x();
 u64 clock64();
 u32 laneid();
 
+void nanosleep(u32 t);
+
 // Parameter loading — emits ld.param, returns typed Value
 Value loadParam(int index, ValType type);
 
@@ -871,7 +877,9 @@ Value mbarrier_arrive_noComplete(
 void mbarrier_expect_tx(const Value& addr, const Value& txCount);
 Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity); // returns pred
 inline void mbarrier_wait_parity(const Value& addr, const Value& phaseParity) {
-  WHILE(!mbarrier_try_wait_parity(addr, phaseParity)) {}
+  WHILE(!mbarrier_try_wait_parity(addr, phaseParity)) {
+    nanosleep(10);
+  }
 }
 
 // cp.async.bulk (sm_90+)

@@ -13,6 +13,7 @@ Uses compile_op to express the pattern:
 """
 
 import argparse
+from datetime import timedelta
 import os
 import sys
 
@@ -55,7 +56,8 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
 
     import moodist
     from moodist import TensorRegion
-    dist.init_process_group(backend="moodist", init_method="moodist://%s:%s" % (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"]), rank=rank, world_size=world_size)
+    dist.init_process_group(backend="moodist", init_method="moodist://%s:%s" % (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"]), rank=rank, world_size=world_size, timeout=timedelta(seconds=20))
+    #dist.init_process_group(backend="moodist", init_method="tcp://%s:%s" % (os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"]), rank=rank, world_size=world_size, timeout=timedelta(seconds=20))
     moodist.enable_cpu_allocator()
     moodist.enable_cuda_allocator()
 
@@ -107,14 +109,19 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
         op = compiled_ops[size]
         run = lambda: op([input_tensor], output_tensors).wait()
 
+        input_tensor_0 = input_tensor.clone()
+
         # Warmup
         for iteration in range(warmup):
             for t in output_tensors:
                 t.fill_(42)
-            oi = input_tensor
-            input_tensor = input_tensor.clone()
+            oi = input_tensor_0.clone()
+            input_tensor = oi.clone()
             oi.fill_(500)
+            if rank == 1:
+                assert torch.all(input_tensor == input_tensor.clone())
             run()
+            input_tensor.zero_()
             output_tensors = [o.clone() for o in output_tensors]
 
             # Correctness check
@@ -131,7 +138,7 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
                         print(f"RANK {rank}: iteration {iteration} CORRECTNESS FAILURE at size "
                             f"{format_size(size)}, chunk {r}: "
                             f"{bad}/{numel} elements wrong", file=sys.stderr)
-                        #sys.exit(1)
+                        sys.exit(1)
                 oidx += 1
             if rank < world_size - 1:
                 out = output_tensors[oidx]
@@ -144,7 +151,7 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
                         print(f"RANK {rank}: iteration {iteration} CORRECTNESS FAILURE at size "
                             f"{format_size(size)}, chunk {r}: "
                             f"{bad}/{numel} elements wrong", file=sys.stderr)
-                        #sys.exit(1)
+                        sys.exit(1)
 
         torch.cuda.synchronize()
 

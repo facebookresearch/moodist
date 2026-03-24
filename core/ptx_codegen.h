@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "common.h"
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -29,6 +30,11 @@ struct KernelHandle {
   }
   KernelHandle(const KernelHandle&) = delete;
   KernelHandle& operator=(const KernelHandle&) = delete;
+
+  AllocatedBuffer profilingData;
+  size_t profilingBytesPerThread = 0;
+  Vector<std::string> profilingNames;
+  size_t profilingCountdown = 0;
 };
 
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,

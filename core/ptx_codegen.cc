@@ -142,6 +142,81 @@ struct EmitLockstep : EmitMultiCopy {
   }
 };
 
+struct Profiling {
+  bool enabled = false;
+  HashMap<std::string, size_t> nameToIndex;
+  size_t nextIndex = 0;
+  std::optional<u64> clockOffset;
+
+  std::optional<u64> addrData;
+
+  std::optional<u32> nextEntryIndex;
+  std::optional<u32> dataOffset;
+
+  static constexpr size_t maxBytesPerThread = 1024 * 128;
+
+  size_t dataSize(const KernelConfig& config) {
+    return maxBytesPerThread * config.blockSize * config.gridSize;
+  }
+
+  void start(const KernelConfig& config, u32 stepValue, u64 addrData) {
+    u64 addr = addGlobalVar(4, 4, "profiling_atomic");
+    // u64 addrClock = addGlobalVar(8, 8, "profiling_base_clock");
+    u64 addrStepValue = addGlobalVar(4, 4, "profiling_step_value");
+    IF_D(threadIdx_x() == 0) {
+      IF(atom_global_relaxed_inc_u32(addr, config.gridSize - 1) == config.gridSize - 1) {
+        // st_global_u64(addrClock, clock64());
+        // fence_release_gpu();
+        st_global_relaxed_sys_u32(addrStepValue, stepValue);
+      }
+    }
+    u64 myclock;
+    WHILE(true) {
+      myclock = clock64();
+      IF(ld_global_relaxed_sys_u32(addrStepValue) == stepValue) {
+        BREAK;
+      }
+      nanosleep(10);
+    }
+    fence_acquire_gpu();
+    // atomicOffset = ld_global_relaxed_sys_u64(addrClock) - myclock;
+    clockOffset = -myclock;
+    enabled = true;
+
+    this->addrData = addrData;
+    nextEntryIndex = 0;
+    dataOffset = maxBytesPerThread * (config.blockSize * blockIdx_x() + threadIdx_x());
+
+    nameToIndex["<invalid>"] = nextIndex++;
+  }
+  void finish() {
+    if (!enabled) {
+      return;
+    }
+    st_global_u32(*addrData + widen(*dataOffset), *nextEntryIndex);
+  }
+  void enter(std::string name, std::optional<u32> arg = {}) {
+    if (!enabled) {
+      return;
+    }
+    if (!nameToIndex.contains(name)) {
+      nameToIndex[name] = nextIndex++;
+    }
+    u32 o = 8 + 16 * *nextEntryIndex;
+    PRED(o + 16 > maxBytesPerThread) trap();
+    u32 a = *dataOffset + o;
+    st_global_u64(*addrData + widen(a), clock64() + *clockOffset);
+    st_global_u32(*addrData + widen(a) + 8, nameToIndex[name]);
+    st_global_u32(*addrData + widen(a + 12), arg ? *arg : 0);
+    *nextEntryIndex = *nextEntryIndex + 1;
+  }
+  void leave() {
+    enter("");
+  }
+};
+
+static thread_local Profiling profiling;
+
 struct EmitSimple : EmitMultiCopy {
   const KernelConfig& config;
   u32 blockIndex;
@@ -172,6 +247,9 @@ struct EmitSimple : EmitMultiCopy {
   u32 barrier = barrierBaseAddr + bufferIndex * 8;
 
   void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
+    profiling.enter("emit warp_sync");
+    warp_sync();
+    profiling.leave();
     Label alldone;
     Value isLeader = laneIndex == 0;
     IF_D(isLeader) {
@@ -194,31 +272,47 @@ struct EmitSimple : EmitMultiCopy {
       }
       u64 srcaddr = src + widen(offset);
       u32 size = min_u32(bytes - offset, bufferSize);
+      profiling.enter("emit wait for write");
       cp_async_bulk_wait_group_read(0);
+      profiling.enter("emit warp_sync");
       warp_sync();
+      profiling.leave();
       IF_D(isLeader) {
+        profiling.enter("src copy", size);
         mbarrier_expect_tx(barrier, size);
         mbarrier_arrive_noComplete(barrier);
         cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
         mbarrier_wait_parity(barrier, parity);
+        profiling.leave();
       }
+      profiling.enter("emit warp_sync");
       warp_sync();
+      profiling.leave();
       for (size_t i : indices(dst)) {
         IF_D(i < ndst) {
+          profiling.enter("dst copy", size);
           u64 dstaddr = dst[i] + widen(offset);
           cp_async_bulk_global_shared(dstaddr, buffer, size);
+          profiling.leave();
         }
       }
+      profiling.enter("emit warp_sync");
+      warp_sync();
+      profiling.leave();
       cp_async_bulk_commit_group();
       offset += numBlocks * blockSharedSize;
     }
     GOTO(loop);
     LABEL(alldone);
+    profiling.enter("final wait for write");
     cp_async_bulk_wait_group(0);
+    profiling.leave();
     IF_D(isLeader) {
       mbarrier_inval(barrier);
     }
+    profiling.enter("emit exit barrier_sync");
     barrier_sync(3);
+    profiling.leave();
   }
 };
 
@@ -558,6 +652,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 warpIndex = threadIndex / 32;
     u32 laneIndex = laneid();
 
+    if (true) {
+      auto profilingBuffer = ctx.group->allocateDevice(Profiling::maxBytesPerThread * config.blockSize * config.gridSize);
+      profiling = Profiling();
+      profiling.start(config, stepValue, profilingBuffer.cudaPointer);
+      rv->profilingData = std::move(profilingBuffer);
+      rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
+      rv->profilingCountdown = 100;
+    }
+
+    profiling.enter("parity setup");
+
     u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
                      widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
     u32 parityBit = 0;
@@ -570,6 +675,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     }
 
     u64 parityTag = widen(parityBit) << 63;
+
+    profiling.leave();
 
     auto concurrency = [&](const auto& v) {
       if constexpr (std::is_same_v<std::decay_t<decltype(v)>, PeerArrayRef>) {
@@ -632,6 +739,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     u32 csyncaddr = addConst32(syncsetup, "syncsetup");
 
+    profiling.enter("syncsetup");
+
     std::vector<AddrSetup> addrsetup;
     for (size_t i : indices(graph.remoteCudaTensorMappings)) {
       auto& v = graph.remoteCudaTensorMappings[i];
@@ -648,7 +757,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 caddrsetup = addConst32(addrsetup, "addrsetup");
     for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
       u32 index = blockSize * i + threadIndex;
-      IF(index < graph.remoteCudaTensorMappings.size()) {
+      IF_D(index < graph.remoteCudaTensorMappings.size()) {
         u32 caddr = caddrsetup + index * sizeof(AddrSetup);
         u64 base = ld_const_u64(caddr);
         u32 itembytes = ld_const_u32(caddr + 8);
@@ -659,6 +768,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0) | parityTag);
       }
     }
+
+    profiling.leave();
+
+    profiling.enter("syncsetup warp_sync");
+    warp_sync();
+    profiling.leave();
 
     Vector<Edge> localCopies;
 
@@ -715,7 +830,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     auto execSync = [&](uint32_t stepOffset) {
       for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
-        u32 index = blockSize * i + threadIndex;
+        // u32 index = blockSize * i + threadIndex;
+        u32 index = blockSize * i + warpIndex + laneIndex * (blockSize / 32);
         IF_D(index < syncsetup.size()) {
           u32 addr = csyncaddr + index * sizeof(SyncSetup);
           u64 stbase = ld_const_u64(addr);
@@ -724,7 +840,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
           st_global_relaxed_sys_u32(stbase + widen(itembytes * concurrencyIndex + blockStride), stepValue + stepOffset);
           u64 ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
-          WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue + stepOffset) {}
+          WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue + stepOffset) {
+            nanosleep(10);
+          }
+          profiling.leave();
+          profiling.finish();
+          ret();
+        }
+        ELSE {
+          profiling.leave();
+          profiling.finish();
+          ret();
         }
       }
     };
@@ -737,14 +863,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       if (hasRemoteWrites) {
         // I am quite certain that this fence.release.sys is unnecessary on current archs.
         // In practice, removing it is fine - correctness tests pass.
-        // Basically, because remote nvlink memory is not cached, local thread ordering 
+        // Basically, because remote nvlink memory is not cached, local thread ordering
         // (provided by cp.async.bulk.wait_group) means that nvlink data must also
         // be ordered, and we only require the order of cp.async.bulk and exitSync to be preserved.
         // However, technically, the fence is required, and it is possible that a future
         // multi-device-cache-coherent gpu could require it.
         // It has a small performance penalty, as it makes us actually wait for the writes
         // to be fully landed and visible on the remote gpu.
-        IF(threadIndex == 0) {
+        IF_D(threadIndex == 0) {
           fence_release_sys();
         }
       }
@@ -760,6 +886,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       } else {
         u64 r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + sizeof(uint64_t) * findLocalMapping(n));
         WHILE((r & (1ull << 63)) != parityTag) {
+          nanosleep(10);
           r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + sizeof(uint64_t) * findLocalMapping(n));
         }
         r &= ~(1ull << 63);
@@ -808,6 +935,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         // WHILE(((r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot))) & (1ull << 63)) != parityTag) {}
         r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot));
         WHILE((r & (1ull << 63)) != parityTag) {
+          nanosleep(10);
           r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot));
         }
         r &= ~(1ull << 63);
@@ -864,14 +992,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
 
     } else {
-      Label copy;
       u64 srcaddr = 0;
       Vector<u64> dstaddrs((maxDestinations + 31) / 32);
       u32 ndst = 0;
       u32 bytes = 0;
       u32 index = 0;
-
-      std::vector<Label> rets;
 
       WHILE(true) {
 
@@ -921,17 +1046,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           srcaddr = getaddr(src);
           ndst = setdst(e, nodeoffset, dstaddrs);
           bytes = e.bytes;
-          index = rets.size();
-          //GOTO(copy);
           if (hasRemoteReads) {
             IF_D(threadIndex == 0) {
               fence_acquire_sys();
             }
           }
           emit->emit(srcaddr, dstaddrs, ndst, bytes);
-          Label ret;
-          LABEL(ret);
-          rets.push_back(std::move(ret));
 
           IF_D(threadIndex == 0) {
             // fixme: this fence is only needed if signalranks has a != rank member
@@ -978,25 +1098,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           BREAK;
         }
       }
-
-      CHECK(!rets.empty());
-
-      SKIP {
-        LABEL(copy);
-        if (hasRemoteReads) {
-          IF_D(threadIndex == 0) {
-            fence_acquire_sys();
-          }
-        }
-        //emit->emit(srcaddr, dstaddrs, ndst, bytes);
-        barrier_sync(9);
-
-        //PRED(index != 0) trap();
-        brx_idx(index, rets);
-      }
     }
 
+    profiling.enter("exit sync");
     exitSync();
+    profiling.leave();
+    profiling.finish();
+    rv->profilingNames.resize(profiling.nextIndex);
+    for (auto& v : profiling.nameToIndex) {
+      rv->profilingNames.at(v.second) = v.first;
+    }
     ret();
   }
 

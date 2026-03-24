@@ -13,6 +13,7 @@
 #include "compile_op_kernel.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
+#include "cuda_loader.h"
 #include "group.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
@@ -3093,6 +3094,69 @@ struct TInput {
   }
 };
 
+void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
+  size_t blockSize = op->config.blockSize;
+  size_t gridSize = op->config.gridSize;
+  Vector<char> data;
+  data.resize(op->kernelHandle->profilingBytesPerThread * blockSize * gridSize);
+
+  cudaCopy((uintptr_t)data.data(), op->kernelHandle->profilingData.cudaPointer, data.size(), 0);
+  CHECK_CU(cuCtxSynchronize());
+
+  CUdevice cuDevice;
+  CHECK_CU(cuCtxGetDevice(&cuDevice));
+  int clockRate;
+  CHECK_CU(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, cuDevice));
+
+  uint64_t clockFreq = (uint64_t)clockRate * 1000;
+  uint64_t clockDiv = (clockFreq + 1000000 - 1) / 1000000;
+
+  std::string fn = fmt::sprintf("moodist-trace-cuda-%d.json", group->rank);
+  FILE* f = fopen(fn.c_str(), "wb");
+  CHECK(f != nullptr);
+  fmt::fprintf(f, R"({"traceEvents": [)"
+                  "\n");
+
+  bool first = true;
+  for (size_t blockIndex : range(gridSize)) {
+    for (size_t threadIndex : range(blockSize)) {
+      size_t dataOffset = op->kernelHandle->profilingBytesPerThread * ((blockSize * blockIndex) + threadIndex);
+
+      uint32_t numEntries;
+      std::memcpy(&numEntries, data.data() + dataOffset, sizeof(uint32_t));
+
+      log.info("Block %d thread %d has %d entries\n", blockIndex, threadIndex, numEntries);
+
+      for (size_t i : range(numEntries)) {
+        uint64_t clock;
+        std::memcpy(&clock, data.data() + dataOffset + 8 + 16 * i, sizeof(uint64_t));
+        if (i == numEntries - 1) {
+          break;
+        }
+        uint64_t nextClock;
+        std::memcpy(&nextClock, data.data() + dataOffset + 8 + 16 * (i + 1), sizeof(uint64_t));
+        uint64_t duration = nextClock - clock;
+        uint32_t index;
+        std::memcpy(&index, data.data() + dataOffset + 8 + 16 * i + 8, sizeof(uint32_t));
+        if (index) {
+          std::string name = op->kernelHandle->profilingNames.at(index);
+          if (!first) {
+            fmt::fprintf(f, ",\n");
+          } else {
+            first = false;
+          }
+          fmt::fprintf(f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", name, clock,
+              duration, blockIndex * blockSize + threadIndex, blockIndex);
+        }
+      }
+    }
+  }
+
+  fmt::fprintf(f, "]}\n");
+  fclose(f);
+  log.info("Chrome trace dumped to %s\n", fn);
+}
+
 } // namespace
 
 // ============================================================================
@@ -3355,6 +3419,13 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
     attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
     CHECK_CU(cuLaunchKernelEx(&launchConfig, op->kernel->function, kparams.data(), nullptr));
+
+    if (op->kernelHandle->profilingBytesPerThread != 0) {
+      if (op->kernelHandle->profilingCountdown-- == 0) {
+        CHECK_CU(cuCtxSynchronize());
+        dumpProfiling(&*group, op);
+      }
+    }
   }
 
   if (anyRdma) {

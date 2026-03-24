@@ -386,6 +386,10 @@ void neg_s32(const Value& d, const Value& a) {
   emitInst(fmt2("neg.s32", d, a));
 }
 
+void neg_s64(const Value& d, const Value& a) {
+  emitInst(fmt2("neg.s64", d, a));
+}
+
 // Comparison
 void setp_eq_u32(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.eq.u32", p, a, b));
@@ -491,13 +495,13 @@ void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr) {
            addr.str() + "]");
 }
 void st_shared_v4_u32(const Value& addr, const std::array<u32, 4>& v) {
-  emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " + v[2].inner.str() + ", " +
-           v[3].inner.str() + "}");
+  emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " +
+           v[2].inner.str() + ", " + v[3].inner.str() + "}");
 }
 std::array<u32, 4> ld_shared_v4_u32(const Value& addr) {
   std::array<u32, 4> v;
-  emitInst("ld.shared.v4.u32 {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " + v[2].inner.str() + ", " + v[3].inner.str() + "}, [" +
-           addr.str() + "]");
+  emitInst("ld.shared.v4.u32 {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " + v[2].inner.str() + ", " +
+           v[3].inner.str() + "}, [" + addr.str() + "]");
   return v;
 }
 void ld_global_nc_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
@@ -644,8 +648,10 @@ void ret() {
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b) {
   emitInst("atom.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
 }
-void atom_global_relaxed_inc_u32(const Value& d, const Value& addr, const Value& b) {
+u32 atom_global_relaxed_inc_u32(const u64& addr, const u32& b) {
+  u32 d;
   emitInst("atom.relaxed.global.inc.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
+  return d;
 }
 
 static Value atomAdd(const char* space, const char* sem, const char* scope, const Value& addr, const Value& b) {
@@ -1213,13 +1219,16 @@ Value Value::operator!() const {
 }
 
 Value Value::operator-() const {
-  Value result(ValType::S32);
+  Value result(type);
   switch (regTypeFor(type)) {
   case RegType::B32:
     neg_s32(result, *this);
     break;
+  case RegType::B64:
+    neg_s64(result, *this);
+    break;
   default:
-    unsupported("-", type);
+    unsupported("neg", type);
   }
   return result;
 }
@@ -1713,6 +1722,10 @@ u64 clock64() {
 
 u32 laneid() {
   return special32("%laneid");
+}
+
+void nanosleep(u32 t) {
+  emitInst("nanosleep.u32 " + t.str());
 }
 
 Value loadParam(int index, ValType type) {

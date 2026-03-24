@@ -758,8 +758,12 @@ struct CompileOpConstructor {
     //   }
     // }
 
-    for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-      for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+    // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
+    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+    for (uint32_t blockSize : {32, 64}) {
+      //for (uint32_t sharedSize : {1024 * 1, 1024 * 2, 1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+      for (uint32_t sharedSize : {1024 * 32, 1024 * 64, 1024 * 226}) {
+      //for (uint32_t sharedSize : {1024 * 1}) {
         // for (uint32_t blockSize : {32}) {
         //   for (uint32_t sharedSize : {1024 * 16}) {
         KernelConfig config;
@@ -2276,9 +2280,9 @@ struct CompileOpConstructor {
     Vector<Graph> graphs;
 
     // graphs.push_back(buildNothing(ictx, baseGraph));
-    graphs.push_back(buildMulticast(ictx, baseGraph));
-    // graphs.push_back(buildRing(ictx, baseGraph, true));
-    // graphs.push_back(buildRing(ictx, baseGraph, false));
+    //graphs.push_back(buildMulticast(ictx, baseGraph));
+    //graphs.push_back(buildRing(ictx, baseGraph, true));
+    graphs.push_back(buildRing(ictx, baseGraph, false));
 
     // Final barrier
     ctx.barrier();
