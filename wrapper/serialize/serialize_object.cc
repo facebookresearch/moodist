@@ -767,10 +767,10 @@ template<typename X>
       if (Py_TYPE(o.ptr()) != &PyTuple_Type || ConstructorTuple::size(o.ptr()) != 2) {
         throw std::runtime_error("Moodist serialize: dict item is not a tuple of size 2");
       }
-      x(ConstructorTuple::get(o.ptr(), 0), ConstructorTuple::get(o.ptr(), 1));
+      x((py::handle)ConstructorTuple::get(o.ptr(), 0), (py::handle)ConstructorTuple::get(o.ptr(), 1));
       ++n;
     }
-    std::memcpy((char*)x.data() + x.tell() - x.tell() + sizeOffset, &n, sizeof(n));
+    std::memcpy((char*)x.data() - x.tell() + sizeOffset, &n, sizeof(n));
   }
 }
 
@@ -841,7 +841,6 @@ template<typename X>
 
   if (bits & 4) {
     size_t nitems = x.template read<size_t>();
-    CHECK(nitems);
     while (nitems) {
       py::object key;
       py::object value;

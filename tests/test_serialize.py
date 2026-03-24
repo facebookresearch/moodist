@@ -383,3 +383,29 @@ def test_serialize_cross_rank(ctx: TestContext):
         ctx.assert_equal(result["from"], 0)
         ctx.assert_equal(result["data"], [1, 2, 3])
         ctx.assert_equal(result["nested"], {"a": True, "b": None})
+
+def defaultdict_dict():
+    from collections import defaultdict
+    return defaultdict(dict)
+
+@test
+def test_serialize_defaultdict(ctx: TestContext):
+    from collections import defaultdict
+    for x in [{}, {"a": 1}, {"a": 1, "b": 2}, {1: "one", "two": 2, (3,): [3]}]:
+        val = defaultdict(list)
+        val.update(x)
+        result = roundtrip(val)
+        ctx.assert_equal(result, val, f"defaultdict {val!r}")
+        val["foo"].append(42)
+        result = roundtrip(val)
+        ctx.assert_equal(result, val, f"defaultdict {val!r}")
+    val = defaultdict(defaultdict_dict)
+    val["a"]["b"]["c"] = 42
+    val["a"]["b"]["d"] = 43
+    result = roundtrip(val)
+    ctx.assert_equal(result, val, f"defaultdict {val!r}")
+    val = defaultdict()
+    result = roundtrip(val)
+    ctx.assert_equal(result, val, f"defaultdict {val!r}")
+    val = defaultdict(defaultdict_dict)
+    ctx.assert_equal(result, val, f"defaultdict {val!r}")
