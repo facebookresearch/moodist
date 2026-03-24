@@ -663,12 +663,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
       struct Info {
         CUmemFabricHandle handle;
-        size_t bytes;
-        size_t offset;
         FabricId fabric;
       } info;
       info.handle = fabricHandle;
-      info.bytes = bytes;
+      info.fabric = localFabricId;
 
       auto allinfos = setupComms->allgather(info);
 

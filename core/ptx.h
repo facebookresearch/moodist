@@ -605,7 +605,8 @@ inline Value ld_shared_acquire_cta_u32(const Value& addr) {
   return result;
 }
 void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr);
-void st_shared_v4_u32(const Value& addr, const std::array<Value, 4>& v);
+void st_shared_v4_u32(const Value& addr, const std::array<u32, 4>& v);
+std::array<u32, 4> ld_shared_v4_u32(const Value& addr);
 
 u64 ld_global_cv_u64(const u64& addr);
 void st_global_wt_u64(const u64& addr, const u64& value);
@@ -792,6 +793,7 @@ u32 threadIdx_x();
 u32 blockIdx_x();
 u32 blockDim_x();
 u64 clock64();
+u32 laneid();
 
 // Parameter loading — emits ld.param, returns typed Value
 Value loadParam(int index, ValType type);
@@ -824,6 +826,7 @@ void ld_global_nc_v4_u32(std::array<Value, 4>& v, const Value& addr);
 void ld_global_cs_v4_u32(std::array<Value, 4>& v, const Value& addr);
 void ld_v4_u32(std::array<Value, 4>& v, const Value& addr); // generic addressing (no cache qualifier)
 void st_global_wt_v4_u32(const Value& addr, const std::array<Value, 4>& v);
+void st_global_wt_v4_u32(const Value& addr, const std::array<u32, 4>& v);
 void ldcv_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr);
 void ldcv_v4(std::array<Value, 4>& v, const Value& addr);
 void ldnc_v4(Value& v0, Value& v1, Value& v2, Value& v3, const Value& addr);

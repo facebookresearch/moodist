@@ -218,7 +218,7 @@ struct EmitSimple : EmitMultiCopy {
     IF_D(isLeader) {
       mbarrier_inval(barrier);
     }
-    barrier_sync();
+    barrier_sync(3);
   }
 };
 
@@ -556,7 +556,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 blockIndex = blockIdx_x();
 
     u32 warpIndex = threadIndex / 32;
-    u32 laneIndex = threadIndex & 31;
+    u32 laneIndex = laneid();
 
     u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
                      widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
@@ -735,6 +735,15 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // };
     auto exitSync = [&]() {
       if (hasRemoteWrites) {
+        // I am quite certain that this fence.release.sys is unnecessary on current archs.
+        // In practice, removing it is fine - correctness tests pass.
+        // Basically, because remote nvlink memory is not cached, local thread ordering 
+        // (provided by cp.async.bulk.wait_group) means that nvlink data must also
+        // be ordered, and we only require the order of cp.async.bulk and exitSync to be preserved.
+        // However, technically, the fence is required, and it is possible that a future
+        // multi-device-cache-coherent gpu could require it.
+        // It has a small performance penalty, as it makes us actually wait for the writes
+        // to be fully landed and visible on the remote gpu.
         IF(threadIndex == 0) {
           fence_release_sys();
         }
@@ -810,19 +819,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     auto setdst = [&](const Edge& e, u32 nodeoffset, Vector<u64>& dstaddrs) {
       u32 ndst = 0;
       if (e.destinations.size() == 1) {
-        IF_D(laneIndex == 0) {
-          dstaddrs.at(0) = getaddr(e.destinations[0]);
-          ndst = 1;
+        for (size_t i : indices(dstaddrs)) {
+          u32 index = laneIndex + 32 * i;
+          for (size_t z : indices(e.destinations)) {
+            IF_D(index == z) {
+              dstaddrs.at(i) = getaddr(e.destinations[z]);
+              ndst += 1;
+            }
+          }
         }
       } else {
         for (size_t i : indices(dstaddrs)) {
-          u32 index = nodeoffset + laneIndex + 32 * i;
-          IF_D(index < nodesetup.size()) {
-            dstaddrs[i] = nodeaddr(index);
+          u32 index = laneIndex + 32 * i;
+          IF_D(index < e.destinations.size()) {
+            dstaddrs[i] = nodeaddr(nodeoffset + index);
             ndst += 1;
-          }
-          ELSE {
-            dstaddrs[i] = 0;
           }
         }
       }
@@ -844,7 +855,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         nodeoffset += e.destinations.size();
 
         if (hasRemoteReads) {
-          fence_acquire_sys();
+          IF_D(threadIndex == 0) {
+            fence_acquire_sys();
+          }
         }
 
         emit->emit(srcaddr, dstaddrs, ndst, e.bytes);
@@ -909,13 +922,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           ndst = setdst(e, nodeoffset, dstaddrs);
           bytes = e.bytes;
           index = rets.size();
-          GOTO(copy);
+          //GOTO(copy);
+          if (hasRemoteReads) {
+            IF_D(threadIndex == 0) {
+              fence_acquire_sys();
+            }
+          }
+          emit->emit(srcaddr, dstaddrs, ndst, bytes);
           Label ret;
           LABEL(ret);
           rets.push_back(std::move(ret));
 
-          barrier_sync();
           IF_D(threadIndex == 0) {
+            // fixme: this fence is only needed if signalranks has a != rank member
             fence_release_sys();
             HashMap<uint32_t, bool> signalRanks;
             signalRanks[rank] = true;
@@ -952,7 +971,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
           numDone += 1;
           LABEL(skip);
-          warp_sync();
+          // warp_sync();
         }
 
         IF(bar_red_or(14, blockSize, numDone == localCopies.size())) {
@@ -962,18 +981,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
       CHECK(!rets.empty());
 
-      Label done;
-      GOTO(done);
+      SKIP {
+        LABEL(copy);
+        if (hasRemoteReads) {
+          IF_D(threadIndex == 0) {
+            fence_acquire_sys();
+          }
+        }
+        //emit->emit(srcaddr, dstaddrs, ndst, bytes);
+        barrier_sync(9);
 
-      LABEL(copy);
-      if (hasRemoteReads) {
-        fence_acquire_sys();
+        //PRED(index != 0) trap();
+        brx_idx(index, rets);
       }
-      emit->emit(srcaddr, dstaddrs, ndst, bytes);
-
-      brx_idx(index, rets);
-
-      LABEL(done);
     }
 
     exitSync();

@@ -760,8 +760,8 @@ struct CompileOpConstructor {
 
     for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
       for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-    // for (uint32_t blockSize : {32}) {
-    //   for (uint32_t sharedSize : {1024 * 16}) {
+        // for (uint32_t blockSize : {32}) {
+        //   for (uint32_t sharedSize : {1024 * 16}) {
         KernelConfig config;
         config.copyEngine = "simple";
         config.blockSize = blockSize;
@@ -780,10 +780,10 @@ struct CompileOpConstructor {
         configs.push_back(c);
         c.gridSize = 16;
         configs.push_back(c);
-        // c.gridSize = 32;
-        // configs.push_back(c);
-        // c.gridSize = 64;
-        // configs.push_back(c);
+        c.gridSize = 32;
+        configs.push_back(c);
+        c.gridSize = 64;
+        configs.push_back(c);
       }
     }
 

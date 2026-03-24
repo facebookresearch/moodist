@@ -490,9 +490,15 @@ void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr) {
   emitInst("ld.shared.v4.u32 {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " + v[3].str() + "}, [" +
            addr.str() + "]");
 }
-void st_shared_v4_u32(const Value& addr, const std::array<Value, 4>& v) {
-  emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " +
-           v[3].str() + "}");
+void st_shared_v4_u32(const Value& addr, const std::array<u32, 4>& v) {
+  emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " + v[2].inner.str() + ", " +
+           v[3].inner.str() + "}");
+}
+std::array<u32, 4> ld_shared_v4_u32(const Value& addr) {
+  std::array<u32, 4> v;
+  emitInst("ld.shared.v4.u32 {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " + v[2].inner.str() + ", " + v[3].inner.str() + "}, [" +
+           addr.str() + "]");
+  return v;
 }
 void ld_global_nc_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr) {
   emitInst("ld.global.nc.v4.u32 {" + d0.str() + ", " + d1.str() + ", " + d2.str() + ", " + d3.str() + "}, [" +
@@ -584,6 +590,9 @@ void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, co
            s3.str() + "}");
 }
 void st_global_wt_v4_u32(const Value& addr, const std::array<Value, 4>& v) {
+  st_global_wt_v4_u32(addr, v[0], v[1], v[2], v[3]);
+}
+void st_global_wt_v4_u32(const Value& addr, const std::array<u32, 4>& v) {
   st_global_wt_v4_u32(addr, v[0], v[1], v[2], v[3]);
 }
 void st_u8(const Value& addr, const Value& val) {
@@ -696,7 +705,7 @@ Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b) {
 
 // Synchronization
 void barrier_sync(int n) {
-  emitInst("barrier.sync " + std::to_string(n));
+  emitInst("barrier.cta.sync.aligned " + std::to_string(n));
 }
 void membar_sys() {
   emitInst("membar.sys");
@@ -781,14 +790,14 @@ void bar_sync(const Value& barrierId, int threadCount) {
 
 static Value barRed(const char* op, const std::string& barrier, int threadCount, const Value& pred) {
   Value d(ValType::U32);
-  emitInst("bar.red." + std::string(op) + ".u32 " + d.str() + ", " + barrier + ", " + std::to_string(threadCount) +
-           ", " + pred.str());
+  emitInst("barrier.cta.red." + std::string(op) + ".aligned.u32 " + d.str() + ", " + barrier + ", " +
+           std::to_string(threadCount) + ", " + pred.str());
   return d;
 }
 static Value barRedPred(const char* op, const std::string& barrier, int threadCount, const Value& pred) {
   Value d(ValType::Pred);
-  emitInst("bar.red." + std::string(op) + ".pred " + d.str() + ", " + barrier + ", " + std::to_string(threadCount) +
-           ", " + pred.str());
+  emitInst("barrier.cta.red." + std::string(op) + ".aligned.pred " + d.str() + ", " + barrier + ", " +
+           std::to_string(threadCount) + ", " + pred.str());
   return d;
 }
 Value bar_red_popc(int barrierId, int threadCount, const Value& pred) {
@@ -1700,6 +1709,10 @@ u32 blockDim_x() {
 
 u64 clock64() {
   return special64("%clock64");
+}
+
+u32 laneid() {
+  return special32("%laneid");
 }
 
 Value loadParam(int index, ValType type) {
