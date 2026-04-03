@@ -244,6 +244,9 @@ void create(Group* group, const SimpleVector<int>& locations, QueueStorage*& qs,
       }
       remoteAddress[i] = a;
     }
+    if (!qs) {
+      qs = internalNew<QueueStorage>();
+    }
   } else {
     qs = internalNew<QueueStorage>();
 
