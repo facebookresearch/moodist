@@ -157,7 +157,8 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
 
         # Profiling
         if profile:
-            trace_dir = "traces/nvlink_copy"
+            #trace_dir = "traces/nvlink_copy"
+            trace_dir = "./"
             os.makedirs(trace_dir, exist_ok=True)
             with torch.profiler.profile(
                 activities=[

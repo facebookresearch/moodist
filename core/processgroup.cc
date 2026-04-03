@@ -3125,7 +3125,7 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
       uint32_t numEntries;
       std::memcpy(&numEntries, data.data() + dataOffset, sizeof(uint32_t));
 
-      log.info("Block %d thread %d has %d entries\n", blockIndex, threadIndex, numEntries);
+      // log.info("Block %d thread %d has %d entries\n", blockIndex, threadIndex, numEntries);
 
       for (size_t i : range(numEntries)) {
         uint64_t clock;
@@ -3133,11 +3133,13 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
         if (i == numEntries - 1) {
           break;
         }
+        uint64_t clockMask = (1ull << 48) - 1;
         uint64_t nextClock;
         std::memcpy(&nextClock, data.data() + dataOffset + 8 + 16 * (i + 1), sizeof(uint64_t));
-        uint64_t duration = nextClock - clock;
+        uint64_t duration = (nextClock & clockMask) - (clock & clockMask);
         uint32_t index;
-        std::memcpy(&index, data.data() + dataOffset + 8 + 16 * i + 8, sizeof(uint32_t));
+        // std::memcpy(&index, data.data() + dataOffset + 8 + 16 * i + 8, sizeof(uint32_t));
+        index = clock >> 48;
         if (index) {
           std::string name = op->kernelHandle->profilingNames.at(index);
           if (!first) {
@@ -3145,8 +3147,8 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
           } else {
             first = false;
           }
-          fmt::fprintf(f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", name, clock,
-              duration, blockIndex * blockSize + threadIndex, blockIndex);
+          fmt::fprintf(f, R"({"ph": "X", "name": "%s", "ts": %d, "dur": %d, "tid": %d, "pid": %d})", name,
+              clock & clockMask, duration, blockIndex * blockSize + threadIndex, blockIndex);
         }
       }
     }

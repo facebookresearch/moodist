@@ -33,8 +33,11 @@ const char* computeTarget(int computeMajor, int computeMinor) {
 }
 
 struct EmitMultiCopy {
+  virtual size_t groupSize() {
+    return 32;
+  }
   virtual ~EmitMultiCopy() = default;
-  virtual void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) = 0;
+  virtual void emit(u64 src, Vector<u64> dst, u32 bytes) = 0;
 };
 
 struct EmitLockstep : EmitMultiCopy {
@@ -71,7 +74,7 @@ struct EmitLockstep : EmitMultiCopy {
   u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
   u32 barrier = barrierBaseAddr + bufferIndex * 8;
 
-  void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
+  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
     Label alldone;
     Value isLeader = laneIndex == 0;
 
@@ -88,7 +91,7 @@ struct EmitLockstep : EmitMultiCopy {
     PRED(bytes % 16 != 0) trap();
     PRED(src % 16 != 0) trap();
     for (size_t i : indices(dst)) {
-      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+      PRED(dst[i] % 16 != 0) trap();
     }
 
     Label loop;
@@ -121,7 +124,7 @@ struct EmitLockstep : EmitMultiCopy {
       }
       warp_sync();
       for (size_t i : indices(dst)) {
-        IF_D(i < ndst) {
+        IF_D(dst[i] != 0) {
           u64 dstaddr = dst[i] + widen(offset);
           cp_async_bulk_global_shared(dstaddr, buffer, size);
         }
@@ -163,22 +166,23 @@ struct Profiling {
     u64 addr = addGlobalVar(4, 4, "profiling_atomic");
     // u64 addrClock = addGlobalVar(8, 8, "profiling_base_clock");
     u64 addrStepValue = addGlobalVar(4, 4, "profiling_step_value");
-    IF_D(threadIdx_x() == 0) {
-      IF(atom_global_relaxed_inc_u32(addr, config.gridSize - 1) == config.gridSize - 1) {
-        // st_global_u64(addrClock, clock64());
-        // fence_release_gpu();
-        st_global_relaxed_sys_u32(addrStepValue, stepValue);
-      }
-    }
-    u64 myclock;
-    WHILE(true) {
-      myclock = clock64();
-      IF(ld_global_relaxed_sys_u32(addrStepValue) == stepValue) {
-        BREAK;
-      }
-      nanosleep(10);
-    }
-    fence_acquire_gpu();
+    // IF_D(threadIdx_x() == 0) {
+    //   IF(atom_global_relaxed_inc_u32(addr, config.gridSize - 1) == config.gridSize - 1) {
+    //     // st_global_u64(addrClock, clock64());
+    //     // fence_release_gpu();
+    //     st_global_relaxed_sys_u32(addrStepValue, stepValue);
+    //   }
+    // }
+    // u64 myclock;
+    // WHILE(true) {
+    //   myclock = clock64();
+    //   IF(ld_global_relaxed_sys_u32(addrStepValue) == stepValue) {
+    //     BREAK;
+    //   }
+    //   nanosleep(10);
+    // }
+    // fence_acquire_gpu();
+    u64 myclock = clock64();
     // atomicOffset = ld_global_relaxed_sys_u64(addrClock) - myclock;
     clockOffset = -myclock;
     enabled = true;
@@ -193,6 +197,8 @@ struct Profiling {
     if (!enabled) {
       return;
     }
+    u32 o = 8 + 16 * *nextEntryIndex;
+    PRED(o + 16 > maxBytesPerThread) trap();
     st_global_u32(*addrData + widen(*dataOffset), *nextEntryIndex);
   }
   void enter(std::string name, std::optional<u32> arg = {}) {
@@ -203,12 +209,15 @@ struct Profiling {
       nameToIndex[name] = nextIndex++;
     }
     u32 o = 8 + 16 * *nextEntryIndex;
-    PRED(o + 16 > maxBytesPerThread) trap();
+    // PRED(o + 16 > maxBytesPerThread) trap();
     u32 a = *dataOffset + o;
-    st_global_u64(*addrData + widen(a), clock64() + *clockOffset);
-    st_global_u32(*addrData + widen(a) + 8, nameToIndex[name]);
-    st_global_u32(*addrData + widen(a + 12), arg ? *arg : 0);
+    st_global_u64(*addrData + widen(a), clock64() + *clockOffset + (nameToIndex[name] << 48));
+    // st_global_u32(*addrData + widen(a) + 8, nameToIndex[name]);
+    // st_global_u32(*addrData + widen(a + 12), arg ? *arg : 0);
     *nextEntryIndex = *nextEntryIndex + 1;
+
+    // fence_release_gpu();
+    // fence_acquire_gpu();
   }
   void leave() {
     enter("");
@@ -235,7 +244,8 @@ struct EmitSimple : EmitMultiCopy {
 
   uint32_t numBuffers = config.blockSize / 32;
   uint32_t blockSharedAlignment = numBuffers * 256;
-  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
+  uint32_t blockSharedSize =
+      std::max(inputSharedSize / blockSharedAlignment * blockSharedAlignment, blockSharedAlignment);
   uint32_t bufferSize = blockSharedSize / numBuffers;
 
   u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
@@ -246,10 +256,14 @@ struct EmitSimple : EmitMultiCopy {
   u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
   u32 barrier = barrierBaseAddr + bufferIndex * 8;
 
-  void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
+  void sync() {
     profiling.enter("emit warp_sync");
     warp_sync();
     profiling.leave();
+  }
+
+  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
+    sync();
     Label alldone;
     Value isLeader = laneIndex == 0;
     IF_D(isLeader) {
@@ -259,7 +273,7 @@ struct EmitSimple : EmitMultiCopy {
     PRED(bytes % 16 != 0) trap();
     PRED(src % 16 != 0) trap();
     for (size_t i : indices(dst)) {
-      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+      PRED(dst[i] % 16 != 0) trap();
     }
 
     u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
@@ -274,9 +288,7 @@ struct EmitSimple : EmitMultiCopy {
       u32 size = min_u32(bytes - offset, bufferSize);
       profiling.enter("emit wait for write");
       cp_async_bulk_wait_group_read(0);
-      profiling.enter("emit warp_sync");
-      warp_sync();
-      profiling.leave();
+      sync();
       IF_D(isLeader) {
         profiling.enter("src copy", size);
         mbarrier_expect_tx(barrier, size);
@@ -285,20 +297,49 @@ struct EmitSimple : EmitMultiCopy {
         mbarrier_wait_parity(barrier, parity);
         profiling.leave();
       }
-      profiling.enter("emit warp_sync");
-      warp_sync();
-      profiling.leave();
+      sync();
+
       for (size_t i : indices(dst)) {
-        IF_D(i < ndst) {
+        IF_D(dst[i] != 0) {
           profiling.enter("dst copy", size);
           u64 dstaddr = dst[i] + widen(offset);
           cp_async_bulk_global_shared(dstaddr, buffer, size);
+          // cp_async_bulk_commit_group();
+          // cp_async_bulk_wait_group_read(0);
           profiling.leave();
         }
       }
-      profiling.enter("emit warp_sync");
-      warp_sync();
-      profiling.leave();
+
+      // for (size_t i : indices(dst)) {
+      //   for (uint32_t r : range(32)) {
+      //     IF_D(laneIndex == r) {
+      //       IF_D(dst[i] != 0) {
+      //         profiling.enter("dst copy", size);
+      //         u64 dstaddr = dst[i] + widen(offset);
+      //         cp_async_bulk_global_shared(dstaddr, buffer, size);
+      //         // cp_async_bulk_commit_group();
+      //         // cp_async_bulk_wait_group_read(0);
+      //         profiling.leave();
+      //       }
+      //     }
+      //     warp_sync();
+      //   }
+      // }
+      // for (size_t i : indices(dst)) {
+      //   for (uint32_t r : range(32)) {
+      //     IF_D(laneIndex == r) {
+      //       IF_D(dst[i] != 0) {
+      //         profiling.enter("dst copy", size);
+      //         u64 dstaddr = dst[i] + widen(offset);
+      //         cp_async_bulk_global_shared(dstaddr, buffer, size);
+      //         cp_async_bulk_commit_group();
+      //         cp_async_bulk_wait_group_read(0);
+      //         profiling.leave();
+      //       }
+      //     }
+      //   }
+      // }
+
       cp_async_bulk_commit_group();
       offset += numBlocks * blockSharedSize;
     }
@@ -312,6 +353,202 @@ struct EmitSimple : EmitMultiCopy {
     }
     profiling.enter("emit exit barrier_sync");
     barrier_sync(3);
+    profiling.enter("emit exit barrier_sync wait");
+    profiling.leave();
+  }
+};
+
+struct EmitGrouped : EmitMultiCopy {
+  const KernelConfig& config;
+  u32 blockIndex;
+  u32 warpIndex;
+  u32 laneIndex;
+
+  EmitGrouped(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
+      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
+    CHECK(numBuffers > 0);
+    CHECK(bufferSize > 0);
+    CHECK(config.blockSize % groupSize() == 0);
+    CHECK(config.blockSize / groupSize() < 15);
+  }
+
+  size_t groupSize() override {
+    // return 576 / 2;
+    return 128;
+  }
+
+  uint32_t numBlocks = config.gridSize;
+  uint32_t inputSharedSize = config.sharedMemory;
+
+  uint32_t numBuffers = config.blockSize / groupSize();
+  uint32_t blockSharedAlignment = numBuffers * 256;
+  uint32_t blockSharedSize =
+      std::max(inputSharedSize / blockSharedAlignment * blockSharedAlignment, blockSharedAlignment);
+  uint32_t bufferSize = blockSharedSize / numBuffers;
+
+  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
+  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
+
+  u32 writeSyncAddr = addShared32(8, 4 * numBuffers);
+
+  u32 bufferIndex = warpIndex / (groupSize() / 32);
+
+  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
+  u32 barrier = barrierBaseAddr + bufferIndex * 8;
+
+  void sync() {
+    profiling.enter("emit sync");
+    barrier_sync(bufferIndex, groupSize());
+    profiling.enter("emit sync wait");
+    profiling.leave();
+  }
+
+  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
+    sync();
+    Label alldone;
+    u32 myIndex = (warpIndex * 32 + laneIndex) % groupSize();
+    Value isLeader = myIndex == 0;
+    IF_D(isLeader) {
+      mbarrier_init(barrier, 1);
+      st_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex, 0);
+    }
+
+    PRED(bytes % 16 != 0) trap();
+    PRED(src % 16 != 0) trap();
+    for (size_t i : indices(dst)) {
+      PRED(dst[i] % 16 != 0) trap();
+    }
+
+    u32 offset = (bufferIndex * numBlocks + blockIndex) * bufferSize;
+
+    u64 srcaddr = src + widen(offset);
+    u32 size = min_u32(bytes - offset, bufferSize);
+
+    GOTO_IF(offset >= bytes, alldone);
+
+    PRED(isLeader) {
+      profiling.enter("initial src copy");
+      mbarrier_expect_tx(barrier, size);
+      mbarrier_arrive_noComplete(barrier);
+      cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
+      profiling.leave();
+    }
+
+    u32 parity = 0;
+    WHILE(true) {
+      IF_D(isLeader) {
+        profiling.enter("wait for read");
+        mbarrier_wait_parity(barrier, parity);
+      }
+      sync();
+      for (size_t i : indices(dst)) {
+        u64 dstaddr = dst[i] + widen(offset);
+        PRED(dst[i] != 0) {
+          profiling.enter("write", size);
+          cp_async_bulk_global_shared(dstaddr, buffer, size);
+          profiling.leave();
+        }
+      }
+      offset += numBlocks * blockSharedSize;
+      srcaddr += numBlocks * blockSharedSize;
+      size = min_u32(bytes - offset, bufferSize);
+      IF(offset >= bytes) {
+        BREAK;
+      }
+      parity ^= 1;
+      PRED(isLeader) {
+        profiling.enter("prepare read");
+        mbarrier_expect_tx(barrier, size);
+        mbarrier_arrive_noComplete(barrier);
+      }
+      profiling.enter("wait for write");
+      //profiling.enter("commit write");
+      cp_async_bulk_commit_group();
+      cp_async_bulk_wait_group_read(0);
+      sync();
+      PRED(isLeader) {
+        //profiling.enter("wait for write");
+        //cp_async_bulk_wait_group_read(0);
+        profiling.enter("read");
+        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
+        profiling.leave();
+      }
+    }
+
+    // Label loop;
+    // LABEL(loop);
+    // for (uint32_t parity : range(2)) {
+    //   IF(offset >= bytes) {
+    //     GOTO(alldone);
+    //   }
+    //   u64 srcaddr = src + widen(offset);
+    //   u32 size = min_u32(bytes - offset, bufferSize);
+    //   profiling.enter("emit wait for write");
+    //   cp_async_bulk_wait_group_read(0);
+    //   sync();
+    //   IF_D(isLeader) {
+    //     profiling.enter("src copy", size);
+    //     mbarrier_expect_tx(barrier, size);
+    //     mbarrier_arrive_noComplete(barrier);
+    //     cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
+    //     mbarrier_wait_parity(barrier, parity);
+    //     profiling.leave();
+    //   }
+    //   sync();
+    //   // for (size_t i : indices(dst)) {
+    //   //   for (uint32_t r : range(groupSize())) {
+    //   //     sync();
+    //   //     IF_D(myIndex == r) {
+    //   //       IF_D(dst[i] != 0) {
+    //   //         profiling.enter("dst copy", size);
+    //   //         u64 dstaddr = dst[i] + widen(offset);
+    //   //         cp_async_bulk_global_shared(dstaddr, buffer, size);
+    //   //         cp_async_bulk_commit_group();
+    //   //         cp_async_bulk_wait_group_read(0);
+    //   //         profiling.leave();
+    //   //       }
+    //   //     }
+    //   //   }
+    //   // }
+    //   // IF_D(laneIndex == 0) {
+    //   //   WHILE (ld_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex) != myIndex / 32) {
+    //   //     nanosleep(10);
+    //   //   }
+    //   // }
+    //   warp_sync();
+    //   for (size_t i : indices(dst)) {
+    //     IF_D(dst[i] != 0) {
+    //       profiling.enter("dst copy", size);
+    //       u64 dstaddr = dst[i] + widen(offset);
+    //       cp_async_bulk_global_shared(dstaddr, buffer, size);
+    //       // cp_async_bulk_commit_group();
+    //       profiling.leave();
+    //     }
+    //   }
+    //   // sync();
+    //   warp_sync();
+    //   cp_async_bulk_commit_group();
+    //   offset += numBlocks * blockSharedSize;
+
+    //   // IF_D(laneIndex == 0) {
+    //   //   st_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex, (myIndex / 32 + 1) % (groupSize() / 32));
+    //   // }
+    // }
+    // GOTO(loop);
+    LABEL(alldone);
+    IF_D(isLeader) {
+      mbarrier_inval(barrier);
+    }
+    // sync();
+    profiling.enter("final wait for write");
+    cp_async_bulk_wait_group(0);
+    profiling.leave();
+    // IF_D(isLeader) {
+    //   mbarrier_inval(barrier);
+    // }
+    profiling.enter("emit exit barrier_sync");
+    barrier_sync(15);
+    profiling.enter("emit exit barrier_sync wait");
     profiling.leave();
   }
 };
@@ -345,7 +582,7 @@ struct EmitBuffered : EmitMultiCopy {
   u32 buffers[2] = {bufferBaseAddr + bufferIndex * bufferSize, bufferBaseAddr + (bufferIndex + 1) * bufferSize};
   u32 barriers[2] = {barrierBaseAddr + bufferIndex * 8, barrierBaseAddr + (bufferIndex + 1) * 8};
 
-  void emit(u64 src, Vector<u64> dst, u32 ndst, u32 bytes) override {
+  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
     Value isLeader = laneIndex == 0;
     IF_D(isLeader) {
       mbarrier_init(barriers[0], 1);
@@ -355,7 +592,7 @@ struct EmitBuffered : EmitMultiCopy {
     PRED(bytes % 16 != 0) trap();
     PRED(src % 16 != 0) trap();
     for (size_t i : indices(dst)) {
-      PRED((i < ndst) & (dst[i] % 16 != 0)) trap();
+      PRED(dst[i] % 16 != 0) trap();
     }
 
     u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
@@ -378,7 +615,7 @@ struct EmitBuffered : EmitMultiCopy {
           }
           warp_sync();
           for (size_t i : indices(dst)) {
-            IF_D(i < ndst) {
+            IF_D(dst[i] != 0) {
               u64 dstaddr = dst[i] + widen(offset);
               cp_async_bulk_global_shared(dstaddr, buffers[index], size);
             }
@@ -454,30 +691,25 @@ struct MemoryKeyCounter {
 }& memoryKeyCounter = Global();
 
 void returnKernelMemory(size_t key) {
-  log.info("return memory key %#x\n", key);
   return memoryKeyCounter.put(key);
 }
 size_t acquireMemoryKey() {
   auto key = memoryKeyCounter.get();
-  log.info("acquire memory key %#x\n", key);
   return key;
 }
 
 KernelMappedBuffers mapn(size_t memoryKey, compile_op::CompileContext& ctx, std::string name, Vector<uint32_t> ranks,
     size_t bytesPerConcurrencyIndex) {
   bytesPerConcurrencyIndex = std::max(std::bit_ceil(bytesPerConcurrencyIndex), (size_t)16);
-  log.info("mapn %s\n", name);
   auto& x = ctx.cachedBuffers[""];
   AllocatedArray* local = nullptr;
   for (auto& v : x) {
     if (v->itembytes == bytesPerConcurrencyIndex && memoryKeyCounter.isFree(ctx.group, &*v)) {
-      log.info("reuse free %d bytes for %s\n", bytesPerConcurrencyIndex, name);
       local = &*v;
       break;
     }
   }
   if (!local) {
-    log.info("allocate new %d bytes for %s\n", bytesPerConcurrencyIndex, name);
     auto arr =
         std::make_unique<AllocatedArray>(ctx.group->allocateArrayDevice(bytesPerConcurrencyIndex, maxConcurrency));
     local = &*arr;
@@ -652,27 +884,46 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 warpIndex = threadIndex / 32;
     u32 laneIndex = laneid();
 
-    if (true) {
-      auto profilingBuffer = ctx.group->allocateDevice(Profiling::maxBytesPerThread * config.blockSize * config.gridSize);
+    if (false) {
+      auto profilingBuffer =
+          ctx.group->allocateDevice(Profiling::maxBytesPerThread * config.blockSize * config.gridSize);
       profiling = Profiling();
       profiling.start(config, stepValue, profilingBuffer.cudaPointer);
       rv->profilingData = std::move(profilingBuffer);
       rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
-      rv->profilingCountdown = 100;
+      rv->profilingCountdown = 400;
     }
+
+    u64 indeterminate = addGlobalVar(128, 128);
+
+    auto predicated = [&](auto pred, auto f) {
+      return [&, pred = std::move(pred), f = std::move(f)](auto&&... args) {
+        if constexpr (std::is_same_v<decltype(f(args...)), void>) {
+          PRED(pred) f(args...);
+        } else {
+          decltype(f(args...)) tmp;
+          PRED(pred) tmp = f(args...);
+          return tmp;
+        }
+      };
+    };
 
     profiling.enter("parity setup");
 
     u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
                      widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
     u32 parityBit = 0;
-    IF_D(threadIndex == 0) {
-      parityBit = ld_global_u32(parityAddr) ^ 1;
-      st_global_u32(parityAddr, parityBit);
-    }
-    IF(bar_red_or(0, blockSize, parityBit != 0)) {
-      parityBit = 1;
-    }
+    // IF_D(threadIndex == 0) {
+    //   parityBit = ld_global_u32(parityAddr) ^ 1;
+    //   st_global_u32(parityAddr, parityBit);
+    // }
+    auto isThreadZero = threadIndex == 0;
+    parityBit = predicated(isThreadZero, ld_global_u32)(parityAddr) ^ 1;
+    profiling.enter("parity setup bar");
+    auto parityPred = bar_red_or(0, blockSize, (parityBit != 0) & isThreadZero);
+    profiling.enter("parity setup post-bar");
+    predicated(isThreadZero, st_global_u32)(parityAddr, parityBit);
+    parityBit = selp_u32(1, 0, parityPred);
 
     u64 parityTag = widen(parityBit) << 63;
 
@@ -704,6 +955,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     std::unique_ptr<EmitMultiCopy> emit;
     if (config.copyEngine == "simple") {
       emit = std::make_unique<EmitSimple>(config, blockIndex, warpIndex, laneIndex);
+    } else if (config.copyEngine == "grouped") {
+      emit = std::make_unique<EmitGrouped>(config, blockIndex, warpIndex, laneIndex);
     } else if (config.copyEngine == "buffered") {
       emit = std::make_unique<EmitBuffered>(config, blockIndex, warpIndex, laneIndex);
     } else if (config.copyEngine == "lockstep") {
@@ -729,6 +982,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     std::vector<SyncSetup> syncsetup;
     for (size_t i : indices(ranks)) {
+      if (ranks[i] == rank) {
+        continue;
+      }
       auto& r = syncAddrs.remote[i];
       SyncSetup s;
       s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
@@ -757,16 +1013,26 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 caddrsetup = addConst32(addrsetup, "addrsetup");
     for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
       u32 index = blockSize * i + threadIndex;
-      IF_D(index < graph.remoteCudaTensorMappings.size()) {
-        u32 caddr = caddrsetup + index * sizeof(AddrSetup);
-        u64 base = ld_const_u64(caddr);
-        u32 itembytes = ld_const_u32(caddr + 8);
-        u32 paramOffset = ld_const_u32(caddr + 12);
-        u32 stride = ld_const_u32(caddr + 16);
-        u32 slot = ld_const_u32(caddr + 20);
-        u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
-        st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0) | parityTag);
-      }
+      // IF_D(index < graph.remoteCudaTensorMappings.size()) {
+      //   u32 caddr = caddrsetup + index * sizeof(AddrSetup);
+      //   u64 base = ld_const_u64(caddr);
+      //   u32 itembytes = ld_const_u32(caddr + 8);
+      //   u32 paramOffset = ld_const_u32(caddr + 12);
+      //   u32 stride = ld_const_u32(caddr + 16);
+      //   u32 slot = ld_const_u32(caddr + 20);
+      //   u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
+      //   st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0) | parityTag);
+      // }
+      auto pred = index < graph.remoteCudaTensorMappings.size();
+      u32 caddr = caddrsetup + index * sizeof(AddrSetup);
+      u64 base = predicated(pred, ld_const_u64)(caddr);
+      u32 itembytes = predicated(pred, ld_const_u32)(caddr + 8);
+      u32 paramOffset = predicated(pred, ld_const_u32)(caddr + 12);
+      u32 stride = predicated(pred, ld_const_u32)(caddr + 16);
+      u32 slot = predicated(pred, ld_const_u32)(caddr + 20);
+      u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
+      predicated(pred, st_global_relaxed_sys_u64)(
+          addr, predicated(pred, ld_param_u64)(mappedAddrs + paramOffset, 0) | parityTag);
     }
 
     profiling.leave();
@@ -828,56 +1094,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
 
-    auto execSync = [&](uint32_t stepOffset) {
-      for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
-        // u32 index = blockSize * i + threadIndex;
-        u32 index = blockSize * i + warpIndex + laneIndex * (blockSize / 32);
-        IF_D(index < syncsetup.size()) {
-          u32 addr = csyncaddr + index * sizeof(SyncSetup);
-          u64 stbase = ld_const_u64(addr);
-          u32 itembytes = ld_const_u32(addr + 8);
-          u32 ldoffset = ld_const_u32(addr + 12);
-          u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
-          st_global_relaxed_sys_u32(stbase + widen(itembytes * concurrencyIndex + blockStride), stepValue + stepOffset);
-          u64 ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
-          WHILE(ld_global_relaxed_sys_u32(ldaddr) < stepValue + stepOffset) {
-            nanosleep(10);
-          }
-          profiling.leave();
-          profiling.finish();
-          ret();
-        }
-        ELSE {
-          profiling.leave();
-          profiling.finish();
-          ret();
-        }
-      }
-    };
-
-    // auto entrySync = [&]() {
-    //   execSync(0);
-    //   barrier_sync();
-    // };
-    auto exitSync = [&]() {
-      if (hasRemoteWrites) {
-        // I am quite certain that this fence.release.sys is unnecessary on current archs.
-        // In practice, removing it is fine - correctness tests pass.
-        // Basically, because remote nvlink memory is not cached, local thread ordering
-        // (provided by cp.async.bulk.wait_group) means that nvlink data must also
-        // be ordered, and we only require the order of cp.async.bulk and exitSync to be preserved.
-        // However, technically, the fence is required, and it is possible that a future
-        // multi-device-cache-coherent gpu could require it.
-        // It has a small performance penalty, as it makes us actually wait for the writes
-        // to be fully landed and visible on the remote gpu.
-        IF_D(threadIndex == 0) {
-          fence_release_sys();
-        }
-      }
-      barrier_sync();
-      execSync(1);
-    };
-
     u64 addrAddrsLocalBase = concurrency(addrAddrs.local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
 
     auto getaddr = [&](const Node& n) {
@@ -923,6 +1139,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 cnodesetupaddr = addConst32(nodesetup, "nodesetup");
 
     auto nodeaddr = [&](u32 index) {
+      profiling.enter("nodeaddr");
       u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
       u32 slot = ld_const_u32(caddr);
       u32 offsetlo = ld_const_u32(caddr + 4);
@@ -941,34 +1158,249 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         r &= ~(1ull << 63);
       }
       r += widen(offsetlo) | (widen(offsethi) << 32);
+      profiling.leave();
       return r;
     };
 
+    auto nodeaddrpred = [&](Value pred, u32 index) {
+      profiling.enter("nodeaddr");
+      u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
+      u32 slot = predicated(pred, ld_const_u32)(caddr);
+      u32 offsetlo = predicated(pred, ld_const_u32)(caddr + 4);
+      u32 offsethi = predicated(pred, ld_const_u32)(caddr + 8);
+      u64 r;
+      Value done = !pred;
+      Value isParam = (slot & 1) != 0;
+      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~1u), 0);
+      done |= isParam;
+      u64 gaddr = addrAddrsLocalBase + widen(slot);
+      r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
+      done |= (r & (1ull << 63)) == parityTag;
+      profiling.enter("nodeaddr loop");
+      WHILE(vote_sync_any(!done)) {
+        nanosleep(10);
+        fence_acquire_sys();
+        r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
+        done |= (r & (1ull << 63)) == parityTag;
+      }
+      profiling.enter("nodeaddr post");
+      r &= ~(1ull << 63);
+
+      r += widen(offsetlo) | (widen(offsethi) << 32);
+      profiling.leave();
+      return selp_u64(r, 0, pred);
+    };
+
+
+    size_t groupSize = emit->groupSize();
+
+    std::vector<uint32_t> shuffledIndices;
+    size_t shuffledEntriesPerGroup = (maxDestinations + groupSize - 1) / groupSize * groupSize;
+    CHECK(config.gridSize * config.blockSize % groupSize == 0);
+    size_t numGroupsGlobally = config.gridSize * config.blockSize / groupSize;
+
+    for (size_t i : range(numGroupsGlobally)) {
+      std::vector<uint32_t> v(shuffledEntriesPerGroup);
+      std::ranges::iota(v, 0);
+      std::ranges::shuffle(v, getRng());
+      for (auto& x : v) {
+        shuffledIndices.push_back(x);
+      }
+    }
+
+    // uint32_t randomizedConstant = 0;
+    // uint32_t randomizedOffset = 0;
+
+    // while (true) {
+    //   uint32_t o = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   uint32_t x = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   uint32_t c = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   bool failed = false;
+    //   std::vector<uint32_t> v;
+    //   std::vector<uint32_t> collisions(shuffledEntriesPerGroup * shuffledEntriesPerGroup);
+    //   for (size_t i : range(numGroupsGlobally)) {
+    //     v.clear();
+    //     for (size_t n : range(shuffledEntriesPerGroup)) {
+    //       // //uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
+    //       // shuffledEntriesPerGroup) >> 32; uint32_t x = ((uint64_t)(uint32_t)((n + shuffledEntriesPerGroup * i) *
+    //       c) *
+    //       // shuffledEntriesPerGroup) >> 32;
+    //       // //uint32_t x = ((__uint128_t)((n + shuffledEntriesPerGroup * i) * 0x9E3779B97F4A7C15ul) *
+    //       // shuffledEntriesPerGroup) >> 64;
+    //       // //CHECK(!std::ranges::contains(v, x));
+
+    //       uint32_t halfBits = (std::bit_width(shuffledEntriesPerGroup - 1) + 1) / 2;
+    //       uint32_t halfMask = (1 << halfBits) - 1;
+
+    //       uint32_t x = n;
+    //       uint32_t seed = (i + o) * 0x9e3779b9;
+
+    //       do {
+    //         uint32_t lo = x & halfMask;
+    //         uint32_t hi = (x >> halfBits) & halfMask;
+    //         for (uint32_t round : range(4)) {
+    //           hi ^= ((lo * 0x45d9f3b + seed + round) >> 4) & halfMask;
+    //           std::swap(lo, hi);
+    //         }
+    //         x = (hi << halfBits) | lo;
+    //       } while (x >= shuffledEntriesPerGroup);
+
+    //       CHECK(x < shuffledEntriesPerGroup);
+    //       if (std::ranges::contains(v, x)) {
+    //         CHECK(false);
+    //         failed = true;
+    //         break;
+    //       }
+    //       collisions[v.size() * shuffledEntriesPerGroup + x] += 1;
+    //       v.push_back(x);
+    //     }
+    //     if (failed) {
+    //       break;
+    //     }
+    //   }
+    //   if (failed) {
+    //     continue;
+    //   }
+    //   uint32_t nCollisions = *std::ranges::max_element(collisions);
+    //   log.info("collisions: %d\n", nCollisions);
+    //   if (nCollisions > 32) {
+    //     continue;
+    //   }
+
+    //   log.info("Success for %#x %#x %#x! indices: %s\n", o, x, c, fmt::to_string(fmt::join(v, ", ")));
+    //   // CHECK(false);
+
+    //   for (size_t i : range(numGroupsGlobally)) {
+    //     v.clear();
+    //     for (size_t n : range(shuffledEntriesPerGroup)) {
+    //       uint32_t x = ((uint64_t)(uint32_t)((n + shuffledEntriesPerGroup * i) * c) * shuffledEntriesPerGroup) >> 32;
+    //       // uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
+    //       // shuffledEntriesPerGroup) >> 32;
+    //       v.push_back(x);
+    //     }
+    //     log.info("For %d: %s\n", i, fmt::to_string(fmt::join(v, ", ")));
+    //   }
+    //   CHECK(false);
+    //   randomizedConstant = c;
+    //   break;
+    // }
+
+    // while (true) {
+    //   uint32_t o = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   uint32_t x = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   uint32_t c = random((uint32_t)0, (uint32_t)0xffffffff);
+    //   bool failed = false;
+    //   std::vector<uint32_t> v;
+    //   std::vector<uint32_t> collisions(shuffledEntriesPerGroup * shuffledEntriesPerGroup);
+    //   for (size_t i : range(numGroupsGlobally)) {
+    //     v.clear();
+    //     for (size_t n : range(shuffledEntriesPerGroup)) {
+    //       uint32_t x = ((uint64_t)(uint32_t)((n + o) * c) * shuffledEntriesPerGroup) >> 32;
+
+    //       x = (x + i) % shuffledEntriesPerGroup;
+
+    //       CHECK(x < shuffledEntriesPerGroup);
+    //       if (std::ranges::contains(v, x)) {
+    //         failed = true;
+    //         break;
+    //       }
+    //       collisions[v.size() * shuffledEntriesPerGroup + x] += 1;
+    //       v.push_back(x);
+    //     }
+    //     if (failed) {
+    //       break;
+    //     }
+    //   }
+    //   if (failed) {
+    //     continue;
+    //   }
+    //   uint32_t nCollisions = *std::ranges::max_element(collisions);
+    //   log.info("collisions: %d\n", nCollisions);
+    //   if (nCollisions > 32) {
+    //     continue;
+    //   }
+
+    //   log.info("Success for %#x %#x %#x! indices: %s\n", o, x, c, fmt::to_string(fmt::join(v, ", ")));
+    //   // CHECK(false);
+
+    //   for (size_t i : range(numGroupsGlobally)) {
+    //     v.clear();
+    //     for (size_t n : range(shuffledEntriesPerGroup)) {
+    //       uint32_t x = ((uint64_t)(uint32_t)((n + o) * c) * shuffledEntriesPerGroup) >> 32;
+    //       x = (x + i) % shuffledEntriesPerGroup;
+    //       // uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
+    //       // shuffledEntriesPerGroup) >> 32;
+    //       v.push_back(x);
+    //     }
+    //     log.info("For %d: %s\n", i, fmt::to_string(fmt::join(v, ", ")));
+    //   }
+    //   //CHECK(false);
+    //   randomizedConstant = c;
+    //   randomizedOffset = o;
+    //   break;
+    // }
+
+    // u32 shuffledIndicesAddr = addConst32(shuffledIndices, "shuffledIndices");
+
     auto setdst = [&](const Edge& e, u32 nodeoffset, Vector<u64>& dstaddrs) {
-      u32 ndst = 0;
-      if (e.destinations.size() == 1) {
+      auto gindex = [&](size_t i) {
+        if (groupSize == 32) {
+          return (laneIndex + groupSize * i);
+          // return (threadIndex % groupSize + groupSize * i + blockIndex) % shuffledEntriesPerGroup;
+        }
+        // CHECK(false);
+        //  CHECK(groupSize - 1 + groupSize * i +
+        //        (shuffledEntriesPerGroup *
+        //                (((config.gridSize - 1) * config.blockSize + (config.blockSize - 1)) / groupSize) <
+        //            shuffledIndices.size()));
+
+        // u32 index = narrow((widen((threadIndex % groupSize + groupSize * i + randomizedOffset) * randomizedConstant)
+        // * shuffledEntriesPerGroup) >> 32); index = (index + ((blockIndex * config.blockSize + threadIndex) /
+        // groupSize)) % shuffledEntriesPerGroup; return index;
+
+        // u32 index = (threadIndex % groupSize + groupSize * i) +
+        //             (shuffledEntriesPerGroup * ((blockIndex * config.blockSize + threadIndex) / groupSize));
+        // // return narrow((widen((threadIndex % groupSize + groupSize * i)) * shuffledEntriesPerGroup) >> 32);
+        // // return ld_const_u32(shuffledIndicesAddr + 4 * index);
+        // return narrow((widen(index * randomizedConstant) * shuffledEntriesPerGroup) >> 32);
+        // return narrow(((widen(index) * 0x9e3779b9) * shuffledEntriesPerGroup) >> 32);
+
+        // return (warpIndex + laneIndex * (config.blockSize / 32)) % groupSize + groupSize * i;
+        u32 index = (threadIndex + 32) % groupSize;
+        return (index / 32 + index % 32 * (groupSize / 32)) + groupSize * i;
+        // return threadIndex % groupSize + groupSize * i;
+        //  return index * 1234;
+      };
+      if (e.destinations.size() == 1 && false) {
         for (size_t i : indices(dstaddrs)) {
-          u32 index = laneIndex + 32 * i;
+          // u32 index = laneIndex + 32 * i;
+          u32 index = gindex(i);
           for (size_t z : indices(e.destinations)) {
             IF_D(index == z) {
-              dstaddrs.at(i) = getaddr(e.destinations[z]);
-              ndst += 1;
+              dstaddrs[i] = getaddr(e.destinations[z]);
+            }
+            ELSE {
+              dstaddrs[i] = 0;
             }
           }
         }
       } else {
         for (size_t i : indices(dstaddrs)) {
-          u32 index = laneIndex + 32 * i;
-          IF_D(index < e.destinations.size()) {
-            dstaddrs[i] = nodeaddr(nodeoffset + index);
-            ndst += 1;
-          }
+          // u32 index = laneIndex + 32 * i;
+          u32 index = gindex(i);
+          dstaddrs[i] = nodeaddrpred(index < e.destinations.size(), nodeoffset + index);
+          // IF_D(index < e.destinations.size()) {
+          //   dstaddrs[i] = nodeaddr(nodeoffset + index);
+          // }
+          // ELSE {
+          //   dstaddrs[i] = 0;
+          // }
         }
       }
-      return ndst;
     };
 
     if (nowaits) {
+      profiling.enter("nowaits");
 
       CHECK(localCopies.size() == 1);
 
@@ -978,8 +1410,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         CHECK(e.destinations.size() >= 1);
 
         u64 srcaddr = getaddr(e.sources[0]);
-        Vector<u64> dstaddrs((e.destinations.size() + 31) / 32);
-        u32 ndst = setdst(e, nodeoffset, dstaddrs);
+        Vector<u64> dstaddrs((e.destinations.size() + emit->groupSize() - 1) / emit->groupSize());
+        // Vector<u64> dstaddrs(16);
+        setdst(e, nodeoffset, dstaddrs);
         nodeoffset += e.destinations.size();
 
         if (hasRemoteReads) {
@@ -988,13 +1421,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
         }
 
-        emit->emit(srcaddr, dstaddrs, ndst, e.bytes);
+        profiling.enter("call emit");
+
+        emit->emit(srcaddr, dstaddrs, e.bytes);
       }
 
     } else {
       u64 srcaddr = 0;
-      Vector<u64> dstaddrs((maxDestinations + 31) / 32);
-      u32 ndst = 0;
+      Vector<u64> dstaddrs((maxDestinations + emit->groupSize() - 1) / emit->groupSize());
       u32 bytes = 0;
       u32 index = 0;
 
@@ -1044,14 +1478,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           GOTO_IF_NOT(bar_red_or(15, blockSize, pred != 0), skip);
 
           srcaddr = getaddr(src);
-          ndst = setdst(e, nodeoffset, dstaddrs);
+          setdst(e, nodeoffset, dstaddrs);
           bytes = e.bytes;
           if (hasRemoteReads) {
             IF_D(threadIndex == 0) {
               fence_acquire_sys();
             }
           }
-          emit->emit(srcaddr, dstaddrs, ndst, bytes);
+          emit->emit(srcaddr, dstaddrs, bytes);
 
           IF_D(threadIndex == 0) {
             // fixme: this fence is only needed if signalranks has a != rank member
@@ -1100,8 +1534,101 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
 
-    profiling.enter("exit sync");
-    exitSync();
+
+    auto execSync = [&](uint32_t stepOffset) {
+      Vector<u64> ldaddrs;
+      Vector<u64> staddrs;
+      Vector<Value> preds;
+      uint32_t numWarps = blockSize / 32;
+      for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
+        profiling.enter("sync setup");
+        ldaddrs.emplace_back();
+        staddrs.emplace_back();
+        preds.emplace_back();
+        // u32 index = blockSize * i + threadIndex;
+        u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
+        u64& ldaddr = ldaddrs.back();
+        u64& staddr = staddrs.back();
+        Value& pred = preds.back();
+        pred = index < syncsetup.size();
+        PRED(pred) {
+          u32 addr = csyncaddr + index * sizeof(SyncSetup);
+          u64 stbase = ld_const_u64(addr);
+          u32 itembytes = ld_const_u32(addr + 8);
+          u32 ldoffset =  ld_const_u32(addr + 12);
+          u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
+          staddr = stbase + widen(itembytes * concurrencyIndex + blockStride);
+          ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+        }
+      }
+      // for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
+      //   profiling.enter("sync setup");
+      //   // u32 index = blockSize * i + threadIndex;
+      //   u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
+      //   ldaddrs.emplace_back();
+      //   staddrs.emplace_back();
+      //   u64& ldaddr = ldaddrs.back();
+      //   u64& staddr = staddrs.back();
+      //   preds.emplace_back();
+      //   Value& pred = preds.back();
+      //   pred = index < syncsetup.size();
+      //   u32 addr = csyncaddr + index * sizeof(SyncSetup);
+      //   u64 stbase = predicated(pred, ld_const_u64)(addr);
+      //   u32 itembytes = predicated(pred, ld_const_u32)(addr + 8);
+      //   u32 ldoffset = predicated(pred, ld_const_u32)(addr + 12);
+      //   u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
+      //   staddr = stbase + widen(itembytes * concurrencyIndex + blockStride);
+      //   ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+      // }
+      u32 targetValue = stepValue + stepOffset;
+      profiling.enter("exit sync barrier");
+      barrier_sync();
+      profiling.enter("exit sync barrier wait");
+      for (size_t i : indices(staddrs)) {
+        profiling.enter("sync st");
+        PRED(preds[i]) st_global_relaxed_sys_u32(staddrs[i], targetValue);
+      }
+      for (size_t i : indices(ldaddrs)) {
+        profiling.enter("sync ld");
+        u64 ldaddr = ldaddrs[i];
+        Value pred = preds[i];
+        // IF_D(!pred) {
+        //   pred = ld_global_relaxed_sys_u32(ldaddr) < targetValue;
+        //   IF_D(!pred) {
+        //     BREAK;
+        //   }
+        //   nanosleep(10);
+        //   CONTINUE;
+        // }
+        // pred &= predicated(pred, ld_global_relaxed_sys_u32)(ldaddr) < targetValue;
+        // WHILE(vote_sync_any(pred)) {
+        //   nanosleep(10);
+        //   pred &= predicated(pred, ld_global_relaxed_sys_u32)(ldaddr) < targetValue;
+        // }
+        Label loop;
+        Label done;
+        GOTO_IF_NOT(pred, done);
+        LABEL(loop);
+        pred = ld_global_relaxed_sys_u32(ldaddr) < targetValue;
+        GOTO_IF_NOT(pred, done);
+        nanosleep(10);
+        GOTO(loop);
+        LABEL(done);
+      }
+    };
+
+    profiling.enter("exit sync entry");
+    if (hasRemoteWrites) {
+      IF_D(threadIndex == 0) {
+        profiling.enter("fence.release.sys");
+        fence_release_sys();
+      }
+    }
+    // profiling.enter("exit sync barrier");
+    // barrier_sync();
+    // profiling.enter("exit sync");
+    execSync(1);
+
     profiling.leave();
     profiling.finish();
     rv->profilingNames.resize(profiling.nextIndex);

@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "ptx.h"
+#include "common.h"
 
 #include <cassert>
 #include <cstdio>
@@ -260,8 +261,13 @@ std::string Module::finalize() const {
 // Instruction formatting helpers (private)
 // ---------------------------------------------------------------------------
 
-static void emitInst(const std::string& inst) {
-  currentBlock->emit(currentPred + inst);
+template<typename... Args>
+static void emitInst(const std::string& inst, Args&&... args) {
+  if constexpr (sizeof...(args)) {
+    currentBlock->emit(currentPred + fmt::sprintf(inst, args.str()...));
+  } else {
+    currentBlock->emit(currentPred + inst);
+  }
 }
 
 static std::string fmt3(const char* op, const Value& d, const Value& a, const Value& b) {
@@ -381,6 +387,12 @@ void shr_u32(const Value& d, const Value& a, const Value& b) {
 void shr_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("shr.s32", d, a, b));
 }
+void shr_u64(const Value& d, const Value& a, const Value& b) {
+  emitInst(fmt3("shr.u64", d, a, b));
+}
+void shr_s64(const Value& d, const Value& a, const Value& b) {
+  emitInst(fmt3("shr.s64", d, a, b));
+}
 
 void neg_s32(const Value& d, const Value& a) {
   emitInst(fmt2("neg.s32", d, a));
@@ -438,6 +450,9 @@ void setp_ge_s64(const Value& p, const Value& a, const Value& b) {
 }
 
 // Move
+void mov_pred(const Value& d, const Value& a) {
+  emitInst(fmt2("mov.pred", d, a));
+}
 void mov_u32(const Value& d, const Value& a) {
   emitInst(fmt2("mov.u32", d, a));
 }
@@ -461,8 +476,18 @@ void ld_param_u32(const Value& d, const Value& addr, int offset) {
 void ld_param_u64(const Value& d, const Value& addr, int offset) {
   emitInst("ld.param.u64 " + d.str() + ", [" + addr.str() + "+" + std::to_string(offset) + "]");
 }
+u64 ld_param_u64(const Value& addr, int offset) {
+  u64 result;
+  ld_param_u64(result, addr, offset);
+  return result;
+}
 void ld_global_u32(const Value& d, const Value& addr) {
   emitInst("ld.global.u32 " + d.str() + ", [" + addr.str() + "]");
+}
+u32 ld_global_u32(const Value& addr) {
+  u32 result;
+  ld_global_u32(result, addr);
+  return result;
 }
 void ld_global_u64(const Value& d, const Value& addr) {
   emitInst("ld.global.u64 " + d.str() + ", [" + addr.str() + "]");
@@ -472,6 +497,16 @@ void ld_const_u32(const Value& d, const Value& addr) {
 }
 void ld_const_u64(const Value& d, const Value& addr) {
   emitInst("ld.const.u64 " + d.str() + ", [" + addr.str() + "]");
+}
+u32 ld_const_u32(const Value& addr) {
+  u32 result;
+  ld_const_u32(result, addr);
+  return result;
+}
+u64 ld_const_u64(const Value& addr) {
+  u64 result;
+  ld_const_u64(result, addr);
+  return result;
 }
 void ld_const_u8(const Value& d, const Value& addr) {
   emitInst("ld.const.u8 " + d.str() + ", [" + addr.str() + "]");
@@ -550,8 +585,18 @@ void st_global_volatile_u32(const Value& addr, const Value& val) {
 void ld_global_relaxed_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.relaxed.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
 }
+u32 ld_global_relaxed_sys_u32(const Value& addr) {
+  u32 result;
+  ld_global_relaxed_sys_u32(result, addr);
+  return result;
+}
 void ld_global_relaxed_sys_u64(const Value& d, const Value& addr) {
   emitInst("ld.relaxed.sys.global.u64 " + d.str() + ", [" + addr.str() + "]");
+}
+u64 ld_global_relaxed_sys_u64(const Value& addr) {
+  u64 result;
+  ld_global_relaxed_sys_u64(result, addr);
+  return result;
 }
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
   emitInst("ld.acquire.sys.global.u32 " + d.str() + ", [" + addr.str() + "]");
@@ -603,6 +648,23 @@ void st_u8(const Value& addr, const Value& val) {
   emitInst("st.u8 [" + addr.str() + "], " + val.str());
 }
 
+u32 ld_shared_u32(const u32& addr) {
+  u32 r;
+  emitInst("ld.shared.u32 " + r.str() + ", [" + addr.str() + "]");
+  return r;
+}
+void st_shared_u32(const u32& addr, const u32& value) {
+  emitInst("st.shared.u32 [" + addr.str() + "], " + value.str());
+}
+u32 ld_shared_relaxed_u32(const u32& addr) {
+  u32 r;
+  emitInst("ld.relaxed.cta.shared.u32 " + r.str() + ", [" + addr.str() + "]");
+  return r;
+}
+void st_shared_relaxed_u32(const u32& addr, const u32& value) {
+  emitInst("st.relaxed.cta.shared.u32 [" + addr.str() + "], " + value.str());
+}
+
 // Conversion
 void cvt_u64_u32(const Value& d, const Value& a) {
   emitInst(fmt2("cvt.u64.u32", d, a));
@@ -624,6 +686,9 @@ void bra_div(const Value& pred, const Block* target) {
 void bra_not(const Value& pred, const Block* target) {
   emitInst("@!" + pred.str() + " bra.uni " + target->label);
 }
+void bra_not_div(const Value& pred, const Block* target) {
+  emitInst("@!" + pred.str() + " bra " + target->label);
+}
 void brx_idx(const Value& index, const std::vector<Label>& targets, bool divergent) {
   std::string targetList;
   for (const auto& t : targets) {
@@ -642,6 +707,27 @@ void brx_idx(const Value& index, const std::vector<Label>& targets, bool diverge
 }
 void ret() {
   emitInst("ret");
+}
+
+u32 selp_u32(const u32& a, const u32& b, const Value& pred) {
+  u32 result;
+  emitInst("selp.u32 %s, %s, %s, %s", result, a, b, pred);
+  return result;
+}
+u64 selp_u64(const u64& a, const u64& b, const Value& pred) {
+  u64 result;
+  emitInst("selp.u64 %s, %s, %s, %s", result, a, b, pred);
+  return result;
+}
+
+Value vote_sync_any(const Value& pred) {
+  Value result(ValType::Pred);
+  emitInst("vote.sync.any.pred %s, %s, 0xffffffff", result, pred);
+  return result;
+}
+
+void discard(const u64& address) {
+  emitInst("discard.global.L2 [%s], 128", address);
 }
 
 // Atomic
@@ -712,6 +798,9 @@ Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b) {
 // Synchronization
 void barrier_sync(int n) {
   emitInst("barrier.cta.sync.aligned " + std::to_string(n));
+}
+void barrier_sync(u32 a, u32 b) {
+  emitInst("barrier.cta.sync.aligned " + a.str() + ", " + b.str());
 }
 void membar_sys() {
   emitInst("membar.sys");
@@ -958,6 +1047,9 @@ Value& Value::operator=(Value&& o) {
           break;
         case RegType::B64:
           mov_u64(*this, o);
+          break;
+        case RegType::Pred:
+          mov_pred(*this, o);
           break;
         default:
           break;
@@ -1257,6 +1349,12 @@ Value Value::operator>>(const Value& b) const {
   case ValType::S32:
     shr_s32(result, *this, b);
     break;
+  case ValType::U64:
+    shr_u64(result, *this, b);
+    break;
+  case ValType::S64:
+    shr_s64(result, *this, b);
+    break;
   default:
     unsupported(">>", type);
   }
@@ -1457,6 +1555,9 @@ void Value::operator&=(const Value& b) {
   case RegType::B64:
     and_b64(*this, *this, b);
     break;
+  case RegType::Pred:
+    and_pred(*this, *this, b);
+    break;
   default:
     unsupported("&=", type);
   }
@@ -1469,6 +1570,9 @@ void Value::operator|=(const Value& b) {
     break;
   case RegType::B64:
     or_b64(*this, *this, b);
+    break;
+  case RegType::Pred:
+    or_pred(*this, *this, b);
     break;
   default:
     unsupported("|=", type);

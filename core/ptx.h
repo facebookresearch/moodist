@@ -528,44 +528,49 @@ void setp_lt_s64(const Value& p, const Value& a, const Value& b);
 void setp_ge_s64(const Value& p, const Value& a, const Value& b);
 
 // Move
+void mov_pred(const Value& d, const Value& a);
 void mov_u32(const Value& d, const Value& a);
 void mov_u64(const Value& d, const Value& a);
 void mov_b64(const Value& d, const Value& a);
 
 // Load
 void ld_param_u32(const Value& d, const std::string& paramName);
-void ld_param_u64(const Value& d, const std::string& paramName);
+// void ld_param_u64(const Value& d, const std::string& paramName);
 void ld_param_u32(const Value& d, const Value& addr, int offset);
-void ld_param_u64(const Value& d, const Value& addr, int offset);
-inline u64 ld_param_u64(const Value& addr, int offset) {
-  u64 result;
-  ld_param_u64(result, addr, offset);
-  return result;
-}
-void ld_global_u32(const Value& d, const Value& addr);
-inline Value ld_global_u32(const Value& addr) {
-  u32 result;
-  ld_global_u32(result, addr);
-  return result;
-}
+// void ld_param_u64(const Value& d, const Value& addr, int offset);
+// inline u64 ld_param_u64(const Value& addr, int offset) {
+//   u64 result;
+//   ld_param_u64(result, addr, offset);
+//   return result;
+// }
+u64 ld_param_u64(const Value& addr, int offset);
+// void ld_global_u32(const Value& d, const Value& addr);
+// inline Value ld_global_u32(const Value& addr) {
+//   u32 result;
+//   ld_global_u32(result, addr);
+//   return result;
+// }
+u32 ld_global_u32(const Value& addr);
 void ld_global_u64(const Value& d, const Value& addr);
 inline u64 ld_global_u64(const u64& addr) {
   u64 result;
   ld_global_u64(result, addr);
   return result;
 }
-void ld_const_u32(const Value& d, const Value& addr);
-inline u32 ld_const_u32(const Value& addr) {
-  u32 result;
-  ld_const_u32(result, addr);
-  return result;
-}
-void ld_const_u64(const Value& d, const Value& addr);
-inline u64 ld_const_u64(const Value& addr) {
-  u64 result;
-  ld_const_u64(result, addr);
-  return result;
-}
+// void ld_const_u32(const Value& d, const Value& addr);
+// inline u32 ld_const_u32(const Value& addr) {
+//   u32 result;
+//   ld_const_u32(result, addr);
+//   return result;
+// }
+// void ld_const_u64(const Value& d, const Value& addr);
+// inline u64 ld_const_u64(const Value& addr) {
+//   u64 result;
+//   ld_const_u64(result, addr);
+//   return result;
+// }
+u32 ld_const_u32(const Value& addr);
+u64 ld_const_u64(const Value& addr);
 void ld_const_u8(const Value& d, const Value& addr);
 inline Value ld_const_u8(const Value& addr) {
   Value result(ValType::U32);
@@ -573,18 +578,20 @@ inline Value ld_const_u8(const Value& addr) {
   return result;
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr);
-void ld_global_relaxed_sys_u32(const Value& d, const Value& addr);
-inline u32 ld_global_relaxed_sys_u32(const Value& addr) {
-  u32 result;
-  ld_global_relaxed_sys_u32(result, addr);
-  return result;
-}
-void ld_global_relaxed_sys_u64(const Value& d, const Value& addr);
-inline u64 ld_global_relaxed_sys_u64(const Value& addr) {
-  u64 result;
-  ld_global_relaxed_sys_u64(result, addr);
-  return result;
-}
+// void ld_global_relaxed_sys_u32(const Value& d, const Value& addr);
+// inline u32 ld_global_relaxed_sys_u32(const Value& addr) {
+//   u32 result;
+//   ld_global_relaxed_sys_u32(result, addr);
+//   return result;
+// }
+u32 ld_global_relaxed_sys_u32(const Value& addr);
+// void ld_global_relaxed_sys_u64(const Value& d, const Value& addr);
+// inline u64 ld_global_relaxed_sys_u64(const Value& addr) {
+//   u64 result;
+//   ld_global_relaxed_sys_u64(result, addr);
+//   return result;
+// }
+u64 ld_global_relaxed_sys_u64(const Value& addr);
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
 inline Value ld_global_acquire_sys_u32(const Value& addr) {
   Value result(ValType::U32);
@@ -623,6 +630,12 @@ void st_global_wt_v4_u32(const Value& addr, const Value& s0, const Value& s1, co
 void st_u8(const Value& addr, const Value& val);
 void st_shared_release_cta_u32(const Value& addr, const Value& val);
 
+u32 ld_shared_u32(const u32& addr);
+void st_shared_u32(const u32& addr, const u32& value);
+
+u32 ld_shared_relaxed_u32(const u32& addr);
+void st_shared_relaxed_u32(const u32& addr, const u32& value);
+
 // Conversion
 void cvt_u64_u32(const Value& d, const Value& a);
 void cvt_u32_u64(const Value& d, const Value& a);
@@ -633,8 +646,22 @@ void bra(const Block* target);
 void bra(const Value& pred, const Block* target);
 void bra_div(const Value& pred, const Block* target);
 void bra_not(const Value& pred, const Block* target);
+void bra_not_div(const Value& pred, const Block* target);
 void brx_idx(const Value& index, const std::vector<Label>& targets, bool divergent = false);
 void ret();
+
+u32 selp_u32(const u32& a, const u32& b, const Value& pred);
+u64 selp_u64(const u64& a, const u64& b, const Value& pred);
+inline u32 selp(const u32& a, const u32& b, const Value& pred) {
+  return selp_u32(a, b, pred);
+}
+inline u64 selp(const u64& a, const u64& b, const Value& pred) {
+  return selp_u64(a, b, pred);
+}
+
+Value vote_sync_any(const Value& pred);
+
+void discard(const u64& address);
 
 // Atomic
 void atom_global_inc_u32(const Value& d, const Value& addr, const Value& b);
@@ -660,6 +687,7 @@ Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b);
 
 // Synchronization
 void barrier_sync(int n = 0);
+void barrier_sync(u32 a, u32 b);
 void membar_sys();
 void warp_sync(uint32_t membermask = 0xFFFFFFFF);
 
@@ -779,6 +807,7 @@ void activateLabel(Label& label);
 #define GOTO(label) ::moodist::ptx::bra((label).rawPtr)
 #define GOTO_IF(pred, label) ::moodist::ptx::bra(pred, (label).rawPtr)
 #define GOTO_IF_D(pred, label) ::moodist::ptx::bra_div(pred, (label).rawPtr)
+#define GOTO_IF_NOT_D(pred, label) ::moodist::ptx::bra_not_div(pred, (label).rawPtr)
 #define GOTO_IF_NOT(pred, label) ::moodist::ptx::bra_not(pred, (label).rawPtr)
 #define LABEL(label) ::moodist::ptx::activateLabel(label)
 

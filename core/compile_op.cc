@@ -754,20 +754,27 @@ struct CompileOpConstructor {
     //     config.copyEngine = "buffered";
     //     config.blockSize = blockSize;
     //     config.sharedMemory = sharedSize;
-    //     configs.push_back(config);
+    //     configs.push_back(config);for (uint32_t blockSize : {32, 64, 128, 256}) {
     //   }
     // }
 
     // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-    for (uint32_t blockSize : {32, 64}) {
-      //for (uint32_t sharedSize : {1024 * 1, 1024 * 2, 1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-      for (uint32_t sharedSize : {1024 * 32, 1024 * 64, 1024 * 226}) {
-      //for (uint32_t sharedSize : {1024 * 1}) {
-        // for (uint32_t blockSize : {32}) {
-        //   for (uint32_t sharedSize : {1024 * 16}) {
+    //    for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+    // for (uint32_t blockSize : {32, 64, 128, 256}) {
+    for (uint32_t blockSize : {128, 256}) {
+      // for (uint32_t blockSize : {288, 576}) {
+      // for (uint32_t blockSize : {256}) {
+      //  for (uint32_t blockSize : {1024}) {
+      // for (uint32_t blockSize : {864}) {
+      //  for (uint32_t sharedSize : {1024 * 1, 1024 * 2, 1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 *
+      //  226}) { for (uint32_t sharedSize : {1024 * 32, 1024 * 64, 1024 * 226}) {
+      for (uint32_t sharedSize : {1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+        // for (uint32_t sharedSize : {1024 * 1}) {
+        //  for (uint32_t blockSize : {32}) {
+        //    for (uint32_t sharedSize : {1024 * 16}) {
         KernelConfig config;
-        config.copyEngine = "simple";
+        // config.copyEngine = "simple";
+        config.copyEngine = "grouped";
         config.blockSize = blockSize;
         config.sharedMemory = sharedSize;
         configs.push_back(config);
@@ -778,16 +785,16 @@ struct CompileOpConstructor {
       auto tmp = configs;
       configs.clear();
       for (KernelConfig c : tmp) {
-        c.gridSize = 8;
-        configs.push_back(c);
-        c.gridSize = 12;
-        configs.push_back(c);
-        c.gridSize = 16;
-        configs.push_back(c);
+        // c.gridSize = 8;
+        // configs.push_back(c);
+        // c.gridSize = 12;
+        // configs.push_back(c);
+        // c.gridSize = 16;
+        // configs.push_back(c);
         c.gridSize = 32;
         configs.push_back(c);
-        c.gridSize = 64;
-        configs.push_back(c);
+        // c.gridSize = 64;
+        // configs.push_back(c);
       }
     }
 
@@ -872,9 +879,9 @@ struct CompileOpConstructor {
     uint32_t stepValue = 1;
     uint32_t concurrencyIndex = 0;
 
-    static constexpr size_t nWarmup = 4;
-    static constexpr size_t nRuns = 6;
-    static constexpr size_t nBatch = 4;
+    static constexpr size_t nWarmup = 12;
+    static constexpr size_t nRuns = 2;
+    static constexpr size_t nBatch = 12;
 
     Vector<std::pair<Event, Event>> events;
     for (size_t i : range(nRuns)) {
@@ -963,6 +970,9 @@ struct CompileOpConstructor {
       for (size_t i : range(nRuns)) {
         float t = 0.0f;
         CHECK_CU(cuEventElapsedTime(&t, events[i].first, events[i].second));
+
+        // // t *= 1.0f + (0.0025f * config.gridSize) + (0.0001f * config.blockSize);
+        // t *= 1.0f + (0.0005f * config.gridSize) + (0.000005f * config.blockSize);
 
         auto ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<float, std::ratio<1, 1000>>(t));
@@ -2280,9 +2290,9 @@ struct CompileOpConstructor {
     Vector<Graph> graphs;
 
     // graphs.push_back(buildNothing(ictx, baseGraph));
-    //graphs.push_back(buildMulticast(ictx, baseGraph));
-    //graphs.push_back(buildRing(ictx, baseGraph, true));
-    graphs.push_back(buildRing(ictx, baseGraph, false));
+    graphs.push_back(buildMulticast(ictx, baseGraph));
+    // graphs.push_back(buildRing(ictx, baseGraph, true));
+    // graphs.push_back(buildRing(ictx, baseGraph, false));
 
     // Final barrier
     ctx.barrier();
