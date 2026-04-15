@@ -966,6 +966,7 @@ struct CudaAllocatorImpl {
       if (!i->events.empty()) {
         auto& e = i->events.front();
         if (cuEventQuery(e.event) != CUDA_SUCCESS) {
+          ++i;
           continue;
         }
       }
@@ -1191,15 +1192,14 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
   auto it = impl->streamUses.find(ctx->ptr);
   if (it != impl->streamUses.end()) {
     auto& list = it->second;
-    // Add the free stream to the list
-    list->insert(list->begin(), freeStream);
+    list->insert(list->begin(), ctx->allocStream);
     impl->deallocate<false>(ctx->ptr, ctx->bytes, *list);
     list->clear();
     impl->streamListFree.push_back(std::move(list));
     impl->streamUses.erase(it);
   } else {
-    // No recorded streams, just use the free stream
-    CUstream streams[1] = {freeStream};
+    // No recorded streams, just use the alloc stream
+    CUstream streams[1] = {ctx->allocStream};
     struct StreamArrayView {
       CUstream* data;
       size_t count;
