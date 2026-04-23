@@ -5882,10 +5882,8 @@ struct CpuThreadImpl {
         self.writeCpuOut(concurrencyIndex, 0, 0);
       }
 
-      if (params.anyCpu) {
-        params.future->done = 1;
-        futexWakeAll(&params.future->done);
-      }
+      params.future->done = 1;
+      futexWakeAll(&params.future->done);
       params.future.reset();
 
       params.op.reset();

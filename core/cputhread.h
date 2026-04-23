@@ -343,6 +343,7 @@ struct CustomOpDescriptor {
   DType dtype;
   bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
+  bool anyRankNeedsRdma = false;
 
   compile_op::Graph graph;
   std::shared_ptr<KernelHandle> kernelHandle;

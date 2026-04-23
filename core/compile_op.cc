@@ -347,6 +347,18 @@ struct InternalContext {
   }
 };
 
+static Vector<size_t> computeCudaRanks(const Group* group) {
+  Vector<size_t> cudaRanks = group->ipcRanks;
+  if (std::ranges::find(cudaRanks, group->rank) == cudaRanks.end()) {
+    cudaRanks.push_back(group->rank);
+  }
+  std::ranges::sort(cudaRanks);
+  if (!group->fabricDomainRanks.empty()) {
+    cudaRanks = group->fabricDomainRanks;
+  }
+  return cudaRanks;
+}
+
 struct GraphBuilder {
   InternalContext& ictx;
   CompileContext& ctx = ictx.ctx;
@@ -363,17 +375,7 @@ struct GraphBuilder {
 
   GraphBuilder(InternalContext& ictx, const Graph& baseGraph) : ictx(ictx) {
     graph = baseGraph;
-
-    // fixme
-    cudaRanks = group->ipcRanks;
-    if (std::ranges::find(cudaRanks, rank) == cudaRanks.end()) {
-      cudaRanks.push_back(rank);
-    }
-    std::ranges::sort(cudaRanks);
-
-    if (!group->fabricDomainRanks.empty()) {
-      cudaRanks = group->fabricDomainRanks;
-    }
+    cudaRanks = computeCudaRanks(group);
   }
 
   void multicast() {
@@ -2289,6 +2291,68 @@ struct CompileOpConstructor {
 
     Vector<Graph> graphs;
 
+    // Generate ibReads for edges that cannot be handled by the CUDA kernel
+    // (remote ranks not reachable via NVLink, or CPU tensors).
+    // Remove those edges from baseGraph so only kernel-eligible edges remain.
+    {
+      Vector<size_t> cudaRanks = computeCudaRanks(group);
+      size_t numInputsAndCopies = op->inputs.size() + op->inputCopies.size();
+
+      for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
+        auto& edge = *it;
+        bool cuda = true;
+        bool local = true;
+        for (auto& l : {&edge.sources, &edge.destinations}) {
+          for (auto& n : *l) {
+            if (n.device != DeviceType::CUDA) {
+              cuda = false;
+            }
+            if (n.rank != rank && std::ranges::find(cudaRanks, n.rank) == cudaRanks.end()) {
+              local = false;
+            }
+          }
+        }
+        if (local && cuda) {
+          ++it;
+          continue;
+        }
+        for (auto& dest : edge.destinations) {
+          if (dest.rank != rank) {
+            continue;
+          }
+          for (auto& src : edge.sources) {
+            CustomOpDescriptor::IbRead read;
+            read.rank = src.rank;
+            read.inputIndex = src.tensorIndex;
+            read.outputIndex = dest.tensorIndex - numInputsAndCopies;
+            read.inputOffset = src.offset;
+            read.outputOffset = dest.offset;
+            read.bytes = edge.bytes;
+            op->ibReads.push_back(read);
+            log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes\n", read.rank, read.inputIndex,
+                read.inputOffset, read.outputIndex, read.outputOffset, read.bytes);
+          }
+        }
+        it = baseGraph.edges.erase(it);
+      }
+
+      bool localNeedsRdma = !op->ibReads.empty();
+      for (size_t i : range(size)) {
+        ctx.send(i, localNeedsRdma);
+      }
+      bool anyRankNeedsRdma = false;
+      for (size_t i : range(size)) {
+        bool v;
+        ctx.receive(i, v);
+        anyRankNeedsRdma |= v;
+      }
+      op->anyRankNeedsRdma = anyRankNeedsRdma;
+    }
+
+    for (auto& edge : baseGraph.edges) {
+      REQUIRE(edge.bytes % 16 == 0, "compile_op: edge size %zu is not a multiple of 16 bytes", edge.bytes);
+    }
+
     // graphs.push_back(buildNothing(ictx, baseGraph));
     graphs.push_back(buildMulticast(ictx, baseGraph));
     // graphs.push_back(buildRing(ictx, baseGraph, true));
@@ -2297,30 +2361,30 @@ struct CompileOpConstructor {
     // Final barrier
     ctx.barrier();
 
-    CUdevice cuDevice = group->cuDevice;
-    int computeMajor = 0, computeMinor = 0;
-    CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
-    CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
+    if (!baseGraph.edges.empty()) {
+      CUdevice cuDevice = group->cuDevice;
+      int computeMajor = 0, computeMinor = 0;
+      CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
+      CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
 
-    log.info("cuda compute capacity is %d.%d\n", computeMajor, computeMinor);
+      log.info("cuda compute capacity is %d.%d\n", computeMajor, computeMinor);
 
-    const char* target = computeTarget(computeMajor, computeMinor);
+      const char* target = computeTarget(computeMajor, computeMinor);
 
-    Setting setting = tuneKernels(graphs, target);
+      Setting setting = tuneKernels(graphs, target);
 
-    op->graph = setting.graph;
-    op->config = setting.config;
+      op->graph = setting.graph;
+      op->config = setting.config;
 
-    for (size_t i : range(size)) {
-      ctx.barrier();
-      if (i == rank) {
-        log.info("Rank %d graph:\n", rank);
-        logGraph(setting.graph);
+      for (size_t i : range(size)) {
+        ctx.barrier();
+        if (i == rank) {
+          log.info("Rank %d graph:\n", rank);
+          logGraph(setting.graph);
+        }
+        ctx.barrier();
       }
-      ctx.barrier();
-    }
 
-    if (!setting.graph.cudaEdges.empty()) {
       std::shared_ptr<KernelHandle> kernelHandle = generateKernel(group, setting.config, target, setting.graph, ctx);
       const std::string& ptx = kernelHandle->ptx;
       if (std::getenv("MOODIST_DUMP_KERNELS")) {
@@ -2334,6 +2398,8 @@ struct CompileOpConstructor {
       }
       op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
       op->kernelHandle = std::move(kernelHandle);
+    } else {
+      op->graph = graphs[0];
     }
 
     return op;

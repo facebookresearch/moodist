@@ -3360,7 +3360,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     result->holdTensors.push_back(std::move(t));
   }
 
-  bool anyRdma = !op->graph.rdmaEdges.empty();
+  bool anyRdma = op->anyRankNeedsRdma;
 
   if (op->cpuSync) {
     anyCpu = true;
@@ -3372,7 +3372,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     memFlush(stream);
   }
 
-  if (!anyCpu) {
+  if (!anyRdma && !anyCpu) {
     future->done = 1;
   }
 
@@ -3430,9 +3430,12 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     }
   }
 
-  if (anyRdma) {
-    CHECK(!op->ibReads.empty());
+  if (anyCuda && anyRdma) {
+    memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+    memFlush(stream);
+  }
 
+  if (anyRdma) {
     StreamData& sd = group->getCpuStreamData(concurrencyIndex);
     QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
     e->task = taskCustom;
