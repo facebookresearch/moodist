@@ -1402,8 +1402,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     if (nowaits) {
       profiling.enter("nowaits");
 
-      CHECK(localCopies.size() == 1);
-
       u32 nodeoffset = 0;
       for (const Edge& e : localCopies) {
         CHECK(e.sources.size() == 1);
