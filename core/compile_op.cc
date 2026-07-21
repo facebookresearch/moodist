@@ -770,7 +770,8 @@ struct CompileOpConstructor {
       // for (uint32_t blockSize : {864}) {
       //  for (uint32_t sharedSize : {1024 * 1, 1024 * 2, 1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 *
       //  226}) { for (uint32_t sharedSize : {1024 * 32, 1024 * 64, 1024 * 226}) {
-      for (uint32_t sharedSize : {1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+      //for (uint32_t sharedSize : {1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
+      for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
         // for (uint32_t sharedSize : {1024 * 1}) {
         //  for (uint32_t blockSize : {32}) {
         //    for (uint32_t sharedSize : {1024 * 16}) {
@@ -787,14 +788,14 @@ struct CompileOpConstructor {
       auto tmp = configs;
       configs.clear();
       for (KernelConfig c : tmp) {
-        // c.gridSize = 8;
-        // configs.push_back(c);
-        // c.gridSize = 12;
-        // configs.push_back(c);
-        // c.gridSize = 16;
-        // configs.push_back(c);
-        c.gridSize = 32;
+        c.gridSize = 8;
         configs.push_back(c);
+        c.gridSize = 12;
+        configs.push_back(c);
+        c.gridSize = 16;
+        configs.push_back(c);
+        // c.gridSize = 32;
+        // configs.push_back(c);
         // c.gridSize = 64;
         // configs.push_back(c);
       }
