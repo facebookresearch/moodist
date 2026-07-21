@@ -305,7 +305,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       for (ibv_device** i = list; *i; ++i) {
         ibv_device* di = *i;
 
-        // fmt::printf("device %s\n", di->name);
         IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
         if (ctx) {
           ibv_device_attr attributes;
@@ -313,11 +312,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
           if (ibv_query_device(ctx, &attributes) != 0) {
             continue;
           }
-
-          // char directPath[256];
-          // std::memset(directPath, 0, 256);
-          // log.info("direct: %d\n", mlx5dv_get_data_direct_sysfs_path(ctx, directPath, 256));
-          // log.info("direct path: %s\n", (const char*)directPath);
 
           log.debug("max_mr_size is %d\n", attributes.max_mr_size);
           log.debug("max_mr is %d\n", attributes.max_mr);
@@ -344,7 +338,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
                 portAttributes = attributes;
               }
             }
-            // fmt::printf("queried port %d\n", 1 + i);
           }
           if (portNum == -1) {
             continue;
@@ -357,7 +350,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             free(path);
           }
           ibPath = removePciPathPrefix(ibPath);
-          // fmt::printf("ib path is %s\n", ibPath);
 
           auto getScore = [&](std::string cudaPath) {
             int nmatch = 0;

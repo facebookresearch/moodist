@@ -10,6 +10,9 @@
 #include <sys/eventfd.h>
 #include <sys/fcntl.h>
 
+#include <cstdlib>
+#include <cstring>
+
 extern "C" bool is_efa_dev(ibv_device* device);
 
 namespace moodist {
@@ -18,22 +21,27 @@ IbCommon::IbCommon(Group* group) : group(group) {}
 
 IbCommon::~IbCommon() {}
 
+// Parse an integer environment variable, validating that it lies within [minValue, maxValue].
+// Returns fallback if the variable is unset, empty, or invalid.
+static int intEnv(const char* name, int fallback, int minValue, int maxValue) {
+  const char* c = std::getenv(name);
+  if (!c || !*c) {
+    return fallback;
+  }
+  char* end = nullptr;
+  long value = std::strtol(c, &end, 10);
+  if (end == c || *end != '\0' || value < minValue || value > maxValue) {
+    log.error("Ignoring invalid value '%s' for %s (expected an integer in [%d, %d])\n", c, name, minValue, maxValue);
+    return fallback;
+  }
+  return (int)value;
+}
+
 // Select the best GID index for the given port.
-// Preference order: IB > RoCE v2 > RoCE v1.
+// Preference order: IB > RoCE v2 > RoCE v1. Among GIDs of the best type, the last one is
+// preferred (tuned for IPv6-only RoCE fabrics). Can be overridden with MOODIST_IB_GID_INDEX.
 // Returns the GID index and the resolved GID value.
 static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum) {
-  auto gidTypePriority = [](uint32_t gid_type) -> int {
-    switch (gid_type) {
-    case IBV_GID_TYPE_IB:
-      return 0;
-    case IBV_GID_TYPE_ROCE_V2:
-      return 1;
-    case IBV_GID_TYPE_ROCE_V1:
-      return 2;
-    default:
-      return 3;
-    }
-  };
   auto gidTypeName = [](uint32_t gid_type) -> const char* {
     switch (gid_type) {
     case IBV_GID_TYPE_IB:
@@ -44,6 +52,35 @@ static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum)
       return "RoCE v2";
     default:
       return "unknown";
+    }
+  };
+
+  // Explicit override via environment variable.
+  int gidOverride = intEnv("MOODIST_IB_GID_INDEX", -1, 0, 255);
+  if (gidOverride >= 0) {
+    ibv_gid_entry entry;
+    int error = ibv_query_gid_ex(context, portNum, (uint32_t)gidOverride, &entry, 0);
+    ibv_gid zero{};
+    if (error || std::memcmp(&entry.gid, &zero, sizeof(zero)) == 0) {
+      log.error("MOODIST_IB_GID_INDEX=%d is not a valid GID on port %d; falling back to automatic selection\n",
+          gidOverride, portNum);
+    } else {
+      log.info("selectGid: using GID index %d (%s) [MOODIST_IB_GID_INDEX override]\n", gidOverride,
+          gidTypeName(entry.gid_type));
+      return {(uint32_t)gidOverride, entry.gid};
+    }
+  }
+
+  auto gidTypePriority = [](uint32_t gid_type) -> int {
+    switch (gid_type) {
+    case IBV_GID_TYPE_IB:
+      return 0;
+    case IBV_GID_TYPE_ROCE_V2:
+      return 1;
+    case IBV_GID_TYPE_ROCE_V1:
+      return 2;
+    default:
+      return 3;
     }
   };
 
@@ -63,12 +100,10 @@ static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum)
     if (std::memcmp(&entry.gid, &zero, sizeof(zero)) == 0) {
       continue;
     }
-    log.info("gid %d is %s of type %d    -- %d %d %d\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
+    log.debug("gid %d is %s of type %d    -- %d %d %d\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
         entry.port_num, entry.ndev_ifindex);
     int priority = gidTypePriority(entry.gid_type);
-    // if (i == 3) {
-    //   priority -= 100;
-    // }
+    // Prefer the last GID of the best priority (tuned for IPv6-only RoCE fabrics).
     if (priority <= bestPriority) {
       bestPriority = priority;
       bestIndex = i;
@@ -76,7 +111,6 @@ static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum)
       bestGidType = entry.gid_type;
       found = true;
     }
-    // break;
   }
 
   if (!found) {
@@ -87,7 +121,7 @@ static std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum)
       throwErrno(errno, "ibv_query_gid");
     }
   } else {
-    log.debug("selectGid: using GID index %d (%s)\n", bestIndex, gidTypeName(bestGidType));
+    log.info("selectGid: using GID index %d (%s)\n", bestIndex, gidTypeName(bestGidType));
   }
 
   return {bestIndex, bestGid};
@@ -101,7 +135,11 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
   auto [gidIndex, gid] = selectGid(context, portNum);
 
-  log.info("gid for index %d is %s\n", gidIndex, hexstr(&gid, 16));
+  int trafficClass = intEnv("MOODIST_IB_TC", 0, 0, 255);
+  int serviceLevel = intEnv("MOODIST_IB_SL", 0, 0, 15);
+  if (trafficClass != 0 || serviceLevel != 0) {
+    log.info("Using RoCE traffic_class %d, service level %d\n", trafficClass, serviceLevel);
+  }
 
   IbAddress loopbackAddress;
 
@@ -187,10 +225,6 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   }
 
   for (size_t i = 0; i != size; ++i) {
-    // if (i == rank) {
-    //   continue;
-    // }
-
     auto& qp = qps.at(i);
 
     auto remoteAddress = i == rank ? loopbackAddress : group->setupComms->recvFrom<IbAddress>(i);
@@ -202,11 +236,13 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     std::memset(&attr.ah_attr, 0, sizeof(attr.ah_attr));
-    log.info("REMOTE gid for index %d is %s\n", gidIndex, hexstr(&remoteAddress.gid, 16));
+    log.debug("REMOTE gid for index %d is %s\n", gidIndex, hexstr(&remoteAddress.gid, 16));
     attr.ah_attr.grh.dgid = remoteAddress.gid;
     attr.ah_attr.grh.sgid_index = gidIndex;
     attr.ah_attr.grh.hop_limit = 64;
+    attr.ah_attr.grh.traffic_class = trafficClass;
     attr.ah_attr.is_global = true;
+    attr.ah_attr.sl = serviceLevel;
     attr.ah_attr.port_num = portNum;
     attr.ah_attr.dlid = remoteAddress.lid;
     attr.path_mtu = portAttributes.active_mtu;
@@ -214,7 +250,6 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     attr.rq_psn = 4979;
     attr.max_dest_rd_atomic = 8;
     attr.min_rnr_timer = 5; // 0.06ms
-    // attr.min_rnr_timer = 22;
     error = ibv_modify_qp(qp, &attr,
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
             IBV_QP_MIN_RNR_TIMER);
@@ -228,12 +263,6 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     attr.timeout = 5; // ?ms
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
-    // attr.retry_cnt = 2;
-    // attr.rnr_retry = 2;
-    // attr.rnr_retry = 7; // infinite
-    // attr.timeout = 17;
-    // attr.retry_cnt = 7;
-    // attr.rnr_retry = 7; // infinite
     attr.max_rd_atomic = 8;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
     error = ibv_modify_qp(qp, &attr,
@@ -242,8 +271,6 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     if (error) {
       throwErrno(errno, "ibv_modify_qp");
     }
-
-    // fmt::printf("connected, yey!\n");
   }
 }
 
@@ -382,20 +409,6 @@ void IbCommon::init(int portNum, ibv_port_attr portAttributes) {
       throwErrno(errno, "ibv_alloc_pd");
     }
   }
-
-  // std::thread at([this]() {
-  //   log.info("started async event loop\n");
-  //   while (true) {
-  //     ibv_async_event event;
-  //     int err = ibv_get_async_event(context, &event);
-  //     log.info("async err %d\n", err);
-  //     if (err) {
-  //       break;
-  //     }
-  //     log.info("async event %d\n", event.event_type);
-  //   }
-  // });
-  // at.detach();
 
   cq = ibv_create_cq(context, maxCqEntries, nullptr, nullptr, 0);
   if (!cq) {
