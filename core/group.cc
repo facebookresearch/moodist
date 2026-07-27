@@ -16,10 +16,12 @@
 #include "setup_comms.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 #include <execinfo.h>
 #include <signal.h>
@@ -101,6 +103,279 @@ struct RankForIbSetup {
     x(bootId, ibDevices);
   }
 };
+
+// Command sent from the driving reference rank (refA) to the responding reference rank (refB)
+// during rail probing. `done == 1` ends the probe; otherwise refB brings up its NICs whose PCI
+// paths are `candidateIbPaths` (in slot order) and responds to one batched probe wave.
+struct WaveCmd {
+  uint8_t done = 0;
+  std::vector<std::string> candidateIbPaths;
+  template<typename X>
+  void serialize(X& x) {
+    x(done, candidateIbPaths);
+  }
+};
+
+// Process-global rail cache: ibPath -> canonical rail id, for this process's node. Rail
+// membership is a physical property of the node, independent of which process group is being
+// initialized, so once discovered it is reused across all subsequent (including sub-world)
+// process groups instead of re-probing. The numbering is canonical (rails are ordered by the
+// lexicographically smallest ibPath in each rail), which makes it identical no matter which
+// process group or which reference rank first discovered it — so cached values stay globally
+// consistent across process groups.
+namespace {
+std::mutex railCacheMutex;
+std::unordered_map<std::string, int> railCache;
+
+bool railProbeEnabled() {
+  const char* c = std::getenv("MOODIST_IB_RAIL_PROBE");
+  return !(c && c[0] == '0' && c[1] == 0);
+}
+} // namespace
+
+// Empirically determine which of this rank's local NICs are on the same routable rail, by
+// probing real RDMA connectivity across two nodes (never by inspecting device names or GID
+// subnets). Returns a rail id per entry in `localDevices` (same id => same rail; ids are
+// canonical, i.e. rails are numbered by their smallest ibPath). Returns an empty vector to
+// signal "fall back to legacy selection" (probing disabled, single-node group, or a node
+// whose NIC set does not match the reference — i.e. non-homogeneous topology).
+//
+// Only two ranks (the lowest rank on each of the two lowest nodes) do any probing; every
+// other rank simply waits at the broadcast allgather. Probing is skipped entirely when the
+// driving rank already has the rail map cached from an earlier process group.
+static std::vector<int> detectRailPartition(Group* group, std::vector<LocalDevice>& localDevices,
+    const std::vector<std::string>& allRanksBootId) {
+  const size_t rank = group->rank;
+  const size_t size = group->size;
+  SetupComms* sc = group->setupComms.get();
+  const size_t numNics = localDevices.size();
+
+  // Reference nodes: refA = lowest rank overall; refB = lowest rank on a different node.
+  const size_t refA = 0;
+  size_t refB = ~(size_t)0;
+  for (size_t i = 0; i != size; ++i) {
+    if (allRanksBootId[i] != allRanksBootId[refA]) {
+      refB = i;
+      break;
+    }
+  }
+  if (refB == ~(size_t)0) {
+    // Single-node process group: there is no cross-node routing, so rail membership is
+    // irrelevant to correctness. Let the caller use legacy selection.
+    return {};
+  }
+
+  const bool amRefA = rank == refA;
+  const bool amRefB = rank == refB;
+
+  // Hoist the (relatively expensive) 256-entry GID scan out of the probe: each reference rank
+  // resolves its own NICs' GIDs once and reuses them across every probe wave.
+  std::vector<uint32_t> myGidIndex(numNics, 0);
+  std::vector<ibv_gid> myGid(numNics);
+  if (amRefA || amRefB) {
+    for (size_t i = 0; i != numNics; ++i) {
+      try {
+        auto g = selectGid(localDevices[i].ctx, localDevices[i].portNum, /*quiet=*/true);
+        myGidIndex[i] = g.first;
+        myGid[i] = g.second;
+      } catch (const std::exception&) {
+        // Leave zero; the probe simply marks this slot invalid if its QP cannot be set up.
+      }
+    }
+  }
+
+  // refA authors this: (ibPath, canonical rail id) for every NIC on the reference node.
+  std::vector<std::pair<std::string, int>> authoredMap;
+
+  if (amRefA) {
+    bool warm = true;
+    {
+      std::lock_guard l(railCacheMutex);
+      for (auto& d : localDevices) {
+        auto it = railCache.find(d.ibPath);
+        if (it == railCache.end()) {
+          warm = false;
+          break;
+        }
+      }
+      if (warm) {
+        for (auto& d : localDevices) {
+          authoredMap.emplace_back(d.ibPath, railCache.at(d.ibPath));
+        }
+      }
+    }
+    if (warm) {
+      // Skip probing entirely; tell refB immediately that there is nothing to do.
+      WaveCmd cmd;
+      cmd.done = 1;
+      sc->sendTo(refB, cmd);
+    } else {
+      // Discover the rail equivalence classes empirically. Two NICs are on the same rail iff a
+      // test write between them succeeds. Rather than probe every pair serially, each "wave"
+      // probes one still-unclassified representative NIC against all other still-unclassified
+      // NICs at once (one QP per candidate, one shared poll), so discovery costs ~one wave per
+      // rail instead of ~one round-trip per pair. This gives the same partition: "same rail" is
+      // an equivalence relation, so testing each candidate directly against the representative
+      // needs no transitive closure.
+      const auto probeStart = std::chrono::steady_clock::now();
+      std::vector<int> disc(numNics, -1);
+      std::vector<size_t> unclassified;
+      for (size_t i = 0; i != numNics; ++i) {
+        unclassified.push_back(i);
+      }
+      int nextRail = 0;
+      size_t probeCount = 0;
+      while (!unclassified.empty()) {
+        const size_t rep = unclassified.front();
+        const std::vector<size_t> cands(unclassified.begin() + 1, unclassified.end());
+
+        WaveCmd cmd;
+        cmd.done = 0;
+        for (size_t c : cands) {
+          cmd.candidateIbPaths.push_back(localDevices[c].ibPath);
+        }
+        sc->sendTo(refB, cmd);
+
+        // The initiator side of every slot is the representative NIC (one QP per candidate).
+        std::vector<ProbeEndpoint> eps(cands.size());
+        for (size_t k = 0; k != cands.size(); ++k) {
+          eps[k].context = localDevices[rep].ctx;
+          eps[k].portNum = localDevices[rep].portNum;
+          eps[k].portAttributes = localDevices[rep].portAttributes;
+          eps[k].gidIndex = myGidIndex[rep];
+          eps[k].gid = myGid[rep];
+        }
+        const std::vector<uint8_t> ok = probeIbRailBatch(group, eps, refB, /*initiator=*/true);
+        probeCount += cands.size();
+
+        disc[rep] = nextRail;
+        for (size_t k = 0; k != cands.size(); ++k) {
+          if (k < ok.size() && ok[k]) {
+            disc[cands[k]] = nextRail;
+          }
+        }
+        ++nextRail;
+
+        std::vector<size_t> next;
+        for (size_t u : unclassified) {
+          if (disc[u] == -1) {
+            next.push_back(u);
+          }
+        }
+        unclassified = std::move(next);
+      }
+      {
+        WaveCmd cmd;
+        cmd.done = 1;
+        sc->sendTo(refB, cmd);
+      }
+
+      // Canonicalize: number rails by the smallest ibPath in each class, so the numbering is
+      // deterministic and matches any other process group that discovers the same hardware.
+      const int numRails = nextRail;
+      std::vector<std::string> classMinPath(numRails);
+      for (int c = 0; c != numRails; ++c) {
+        for (size_t i = 0; i != numNics; ++i) {
+          if (disc[i] == c && (classMinPath[c].empty() || localDevices[i].ibPath < classMinPath[c])) {
+            classMinPath[c] = localDevices[i].ibPath;
+          }
+        }
+      }
+      std::vector<int> order(numRails);
+      for (int c = 0; c != numRails; ++c) {
+        order[c] = c;
+      }
+      std::sort(order.begin(), order.end(), [&](int x, int y) { return classMinPath[x] < classMinPath[y]; });
+      std::vector<int> canonicalOf(numRails);
+      for (int newId = 0; newId != numRails; ++newId) {
+        canonicalOf[order[newId]] = newId;
+      }
+
+      for (size_t i = 0; i != numNics; ++i) {
+        authoredMap.emplace_back(localDevices[i].ibPath, canonicalOf[disc[i]]);
+      }
+
+      std::string summary;
+      for (int newId = 0; newId != numRails; ++newId) {
+        summary += fmt::sprintf("\n  rail %d:", newId);
+        for (size_t i = 0; i != numNics; ++i) {
+          if (canonicalOf[disc[i]] == newId) {
+            summary += " " + localDevices[i].ibPath;
+          }
+        }
+      }
+      const auto probeMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probeStart).count();
+      log.info("Rail connectivity probe found %d rail(s) among %d NIC(s) on the reference node "
+               "(%zu probe(s) across %d wave(s) in %lldms):%s\n",
+          numRails, numNics, probeCount, numRails, (long long)probeMs, summary);
+    }
+  } else if (amRefB) {
+    // Respond to refA's probe waves until told to stop. For each wave, bring up one QP per
+    // requested candidate NIC (matching refA's slot order); refA drives the writes.
+    while (true) {
+      WaveCmd cmd = sc->recvFrom<WaveCmd>(refA);
+      if (cmd.done) {
+        break;
+      }
+      std::vector<ProbeEndpoint> eps(cmd.candidateIbPaths.size());
+      for (size_t k = 0; k != cmd.candidateIbPaths.size(); ++k) {
+        LocalDevice* dev = nullptr;
+        for (auto& d : localDevices) {
+          if (d.ibPath == cmd.candidateIbPaths[k]) {
+            dev = &d;
+            break;
+          }
+        }
+        if (dev) {
+          const size_t di = (size_t)(dev - localDevices.data());
+          eps[k].context = dev->ctx;
+          eps[k].portNum = dev->portNum;
+          eps[k].portAttributes = dev->portAttributes;
+          eps[k].gidIndex = myGidIndex[di];
+          eps[k].gid = myGid[di];
+        }
+        // else: leave context == nullptr — the slot stays in lockstep and resolves to "no rail".
+      }
+      probeIbRailBatch(group, eps, refA, /*initiator=*/false);
+    }
+  }
+
+  // Broadcast the reference node's rail map to everyone. Non-authoring ranks send an empty map.
+  std::vector<std::vector<std::pair<std::string, int>>> allMaps = sc->allgather(authoredMap);
+  const std::vector<std::pair<std::string, int>>& refMap = allMaps.at(refA);
+  if (refMap.empty()) {
+    return {};
+  }
+
+  std::unordered_map<std::string, int> ibPathToRail;
+  for (auto& [path, railId] : refMap) {
+    ibPathToRail[path] = railId;
+  }
+
+  // Map this rank's NICs through the reference map. A missing entry means this node's NIC set
+  // differs from the reference node's (non-homogeneous) — fall back rather than guess.
+  std::vector<int> railOf(numNics, -1);
+  for (size_t i = 0; i != numNics; ++i) {
+    auto it = ibPathToRail.find(localDevices[i].ibPath);
+    if (it == ibPathToRail.end()) {
+      log.error("Rail probe: local NIC %s is not present in the reference node's rail map (node topology "
+                "mismatch); falling back to legacy device selection.\n",
+          localDevices[i].ibPath);
+      return {};
+    }
+    railOf[i] = it->second;
+  }
+
+  {
+    std::lock_guard l(railCacheMutex);
+    for (size_t i = 0; i != numNics; ++i) {
+      railCache[localDevices[i].ibPath] = railOf[i];
+    }
+  }
+
+  return railOf;
+}
 
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
@@ -412,7 +687,51 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
       std::vector<std::pair<LocalDeviceNode*, LocalDevice*>> useDevices;
 
-      {
+      // Rail-aware device selection (see detectRailPartition). When it succeeds, device index k
+      // is the same routable rail on every rank, which is what makes moodist's corresponding-
+      // index QP pairing (rank i's device k <-> rank j's device k) actually route on rail-
+      // optimized fabrics. When it declines (probing disabled, single-node group, or a non-
+      // homogeneous node) useDevices is left empty and the legacy PCI-locality selection below
+      // runs instead.
+      std::vector<int> railOf;
+      if (railProbeEnabled()) {
+        railOf = detectRailPartition(this, localDevices, allRanksBootId);
+      }
+      if (!railOf.empty()) {
+        int numRails = 0;
+        for (int r : railOf) {
+          numRails = std::max(numRails, r + 1);
+        }
+        std::vector<std::vector<size_t>> railMembers(numRails);
+        for (size_t i : indices(localDevices)) {
+          railMembers[railOf[i]].push_back(i);
+        }
+        bool ok = true;
+        for (int r = 0; r != numRails; ++r) {
+          if (railMembers[r].empty()) {
+            // This node is missing a rail that the reference node has: not homogeneous.
+            ok = false;
+            break;
+          }
+          std::sort(railMembers[r].begin(), railMembers[r].end(),
+              [&](size_t x, size_t y) { return localDevices[x].ibPath < localDevices[y].ibPath; });
+        }
+        if (ok) {
+          // Iterating rails in ascending canonical id makes device index k == rail k. Within a
+          // rail, local-rank L takes the L-th NIC (by ibPath) so the node's ranks land on
+          // distinct physical NICs (one card each on GB300) for bandwidth.
+          std::string summary;
+          for (int r = 0; r != numRails && useDevices.size() != maxDevices; ++r) {
+            size_t pick = railMembers[r][localRankIndex % railMembers[r].size()];
+            useDevices.emplace_back(&localDeviceNodes[pick], &localDevices[pick]);
+            summary +=
+                fmt::sprintf("\n  device %d: %s (rail %d)", useDevices.size() - 1, localDevices[pick].ibPath, r);
+          }
+          log.verbose("rank %d rail-aware device selection:%s\n", rank, summary);
+        }
+      }
+
+      if (useDevices.empty()) {
         HashMap<std::string, bool> taken;
         while (true) {
           std::vector<LocalDeviceNode*> current;
