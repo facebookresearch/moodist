@@ -526,15 +526,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
     log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
 
-    size_t localRankIndex = ~(size_t)0;
-    for (size_t i = 0; i != localRanksByBootId.size(); ++i) {
-      if (localRanksByBootId[i] == rank) {
-        localRankIndex = i;
-        break;
-      }
-    }
-    CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
-
     std::unordered_map<size_t, int> localNvlink;
 
     std::vector<std::string> allRanksCudaPciBus = setupComms->allgather(std::string(cudaPciBus.data()));
@@ -687,6 +678,135 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
       std::vector<std::pair<LocalDeviceNode*, LocalDevice*>> useDevices;
 
+      // Whole-node NIC assignment. Chooses one NIC per *physical* GPU on this node (indexed like
+      // allDeviceNodes / allCudaPaths, i.e. node-absolute — independent of which ranks are in this
+      // process group) so total GPU<->NIC PCI affinity is maximized, with a contention penalty that
+      // spreads GPUs across distinct cards when several are equidistant. `eligible(ibPath)` filters
+      // the candidate NICs, which is how callers restrict to a single rail and/or drop NICs already
+      // consumed by an earlier round. Returns one entry per GPU (pointer into allDeviceNodes), or
+      // empty if some GPU has no eligible NIC.
+      //
+      // Determinism across ranks is essential: every rank on an identical node must produce the
+      // same assignment, so same-index QP pairs (rank i device k <-> rank j device k) land on the
+      // same rail and card. The inputs are identical on such ranks and ties break on ibPath (never
+      // on pointer identity), so the result is identical too.
+      auto assignWholeNode = [&](const std::string& what, auto&& eligible) -> std::vector<LocalDeviceNode*> {
+        const size_t n = allDeviceNodes.size();
+        // Per-GPU candidate NICs, best score first (ties broken by ibPath). The branch factor is
+        // capped so this exhaustive search stays bounded on unusually large nodes: <=10 GPUs keep
+        // their top 4 NICs each (real rail/HGX hardware is <=8), 11..16 the top 2, and beyond that
+        // a single greedy choice. This stops a 16-GPU DGX-2 or a dense PCIe box from stalling setup
+        // with a 4^N search.
+        const size_t branchCap = n <= 10 ? 4 : (n <= 16 ? 2 : 1);
+        std::vector<std::vector<LocalDeviceNode*>> cand(n);
+        HashMap<std::string_view, bool> eligiblePaths;
+        for (size_t index : range(n)) {
+          for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
+            if (eligible(v.ibPath)) {
+              cand[index].push_back(&v);
+              eligiblePaths[v.ibPath] = true;
+            }
+          }
+          std::sort(cand[index].begin(), cand[index].end(), [](LocalDeviceNode* a, LocalDeviceNode* b) {
+            if (a->score != b->score) {
+              return a->score > b->score;
+            }
+            return a->ibPath < b->ibPath;
+          });
+          if (cand[index].size() > branchCap) {
+            cand[index].resize(branchCap);
+          }
+          if (cand[index].empty()) {
+            return {};
+          }
+        }
+
+        std::vector<LocalDeviceNode*> current(n);
+        HashMap<std::string_view, int> useCount;
+        std::vector<LocalDeviceNode*> best;
+        std::tuple<int, int, int> bestScore = {0, 0, 0};
+        std::function<void(size_t)> visit = [&](size_t index) {
+          if (index == n) {
+            std::tuple<int, int, int> score = {0, 0, 0};
+            for (LocalDeviceNode* node : current) {
+              auto s = node->score;
+              const int uc = useCount[node->ibPath];
+              if (uc > 1) {
+                std::get<2>(s) -= uc;
+                if (std::get<2>(s) > 0) {
+                  std::get<2>(s) /= uc;
+                }
+              }
+              std::get<0>(score) += std::get<0>(s);
+              std::get<1>(score) += std::get<1>(s);
+              std::get<2>(score) += std::get<2>(s);
+            }
+            // Score the *complete* leaf (the old code updated best inside this accumulation loop and
+            // could latch onto a partial sum once the contention penalty drove a term negative).
+            if (best.empty() || score > bestScore) {
+              bestScore = score;
+              best = current;
+            }
+            return;
+          }
+          for (LocalDeviceNode* v : cand[index]) {
+            ++useCount[v->ibPath];
+            current[index] = v;
+            visit(index + 1);
+            --useCount[v->ibPath];
+          }
+        };
+        visit(0);
+
+        if (!best.empty()) {
+          // Dump the *whole-node* solution, not just this rank's slice. Every rank on the node must
+          // arrive at an identical assignment for same-index QP pairing to land on the same rail and
+          // card, and this line is what makes that invariant checkable on hardware: collect it from
+          // every rank on a node and confirm the strings are identical.
+          std::string assignment;
+          HashMap<std::string_view, bool> chosen;
+          for (size_t i : indices(best)) {
+            assignment += fmt::sprintf(" [%d]=%s", i, best[i]->ibPath);
+            chosen[best[i]->ibPath] = true;
+          }
+          log.verbose("rank %d whole-node NIC assignment (%s):%s\n", rank, what, assignment);
+          log.debug("rank %d whole-node NIC assignment (%s) has score %d %d %d\n", rank, what,
+              std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
+
+          // A distinct NIC per GPU falls out of the contention penalty, which is a soft term in the
+          // score rather than a hard constraint -- so it can quietly fail to hold. Only report it
+          // when there were actually enough NICs to go around: with fewer eligible NICs than GPUs,
+          // or once branchCap has trimmed the candidate lists on a large node, sharing is expected.
+          if (chosen.size() < n && eligiblePaths.size() >= n) {
+            log.info(
+                "rank %d: whole-node NIC assignment (%s) placed %d GPUs on only %d distinct NICs, "
+                "though %d were eligible; per-GPU network bandwidth may be reduced\n",
+                rank, what, n, chosen.size(), eligiblePaths.size());
+          }
+        }
+        return best;
+      };
+
+      // Map a chosen node (pointer into allDeviceNodes, identified by ibPath) to the owning
+      // localDeviceNodes / localDevices entries and append it to useDevices.
+      auto appendUseDevice = [&](LocalDeviceNode* picked) {
+        const size_t before = useDevices.size();
+        for (auto& ldn : localDeviceNodes) {
+          if (ldn.ibPath == picked->ibPath) {
+            for (auto& ld : localDevices) {
+              if (ld.ibPath == ldn.ibPath) {
+                useDevices.emplace_back(&ldn, &ld);
+              }
+            }
+          }
+        }
+        // Exactly one match is guaranteed: ibPath is unique within localDeviceNodes and within
+        // localDevices (checked as they are built), and every ibPath in allDeviceNodes was added
+        // to both. Pin it here anyway -- callers rely on the count advancing by exactly one to
+        // bound their loops and to index the summary line.
+        CHECK(useDevices.size() == before + 1);
+      };
+
       // Rail-aware device selection (see detectRailPartition). When it succeeds, device index k
       // is the same routable rail on every rank, which is what makes moodist's corresponding-
       // index QP pairing (rank i's device k <-> rank j's device k) actually route on rail-
@@ -717,102 +837,52 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
               [&](size_t x, size_t y) { return localDevices[x].ibPath < localDevices[y].ibPath; });
         }
         if (ok) {
-          // Iterating rails in ascending canonical id makes device index k == rail k. Within a
-          // rail, local-rank L takes the L-th NIC (by ibPath) so the node's ranks land on
-          // distinct physical NICs (one card each on GB300) for bandwidth.
+          // Iterate rails in ascending canonical id so device index k == rail k: a device-k QP then
+          // always connects the same rail on every rank (moodist uses full per-index all-to-all
+          // connectivity, not just same-local-rank pairs). For each rail we run the whole-node NIC
+          // assignment restricted to that rail's NICs and take this rank's own GPU's pick. Because
+          // that assignment ranges over *all* physical GPUs on the node (not just this process
+          // group's ranks), a GPU never takes the NIC a lower-indexed GPU would get, even when that
+          // GPU is absent from this process group.
           std::string summary;
           for (int r = 0; r != numRails && useDevices.size() != maxDevices; ++r) {
-            size_t pick = railMembers[r][localRankIndex % railMembers[r].size()];
-            useDevices.emplace_back(&localDeviceNodes[pick], &localDevices[pick]);
-            summary +=
-                fmt::sprintf("\n  device %d: %s (rail %d)", useDevices.size() - 1, localDevices[pick].ibPath, r);
+            HashMap<std::string_view, bool> railPaths;
+            for (size_t i : railMembers[r]) {
+              railPaths[localDevices[i].ibPath] = true;
+            }
+            std::vector<LocalDeviceNode*> best = assignWholeNode(
+                fmt::sprintf("rail %d", r), [&](const std::string& ibPath) { return railPaths.contains(ibPath); });
+            CHECK(!best.empty());
+            LocalDeviceNode* pick = best.at(localAllCudaPathsIndex);
+            appendUseDevice(pick);
+            summary += fmt::sprintf("\n  device %d: %s (rail %d)", useDevices.size() - 1, pick->ibPath, r);
           }
           log.verbose("rank %d rail-aware device selection:%s\n", rank, summary);
         }
       }
 
       if (useDevices.empty()) {
+        // Legacy PCI-locality selection (rails not detected: single-node group, probing disabled,
+        // or a non-homogeneous node). Assign NICs across the whole node, then repeat with the
+        // chosen NICs removed so each rank collects several distinct NICs (striped for bandwidth)
+        // up to maxDevices. Ranging over all physical GPUs keeps the choice node-absolute, so a
+        // subset process group still lands on the same NICs it would on the full node.
         HashMap<std::string, bool> taken;
-        while (true) {
-          std::vector<LocalDeviceNode*> current;
-          HashMap<std::string_view, int> useCount;
-          current.resize(allDeviceNodes.size());
-          std::vector<LocalDeviceNode*> best;
-          std::tuple<int, int, int> bestScore = {0, 0, 0};
-          int solutions = 0;
-          std::function<void(size_t)> visit = [&](size_t index) {
-            if (index == allDeviceNodes.size()) {
-              std::tuple<int, int, int> score = {0, 0, 0};
-              for (LocalDeviceNode* n : current) {
-                auto s = n->score;
-                if (useCount[n->ibPath] > 1) {
-                  std::get<2>(s) -= useCount[n->ibPath];
-                  if (std::get<2>(s) > 0) {
-                    std::get<2>(s) /= useCount[n->ibPath];
-                  }
-                }
-                std::get<0>(score) += std::get<0>(s);
-                std::get<1>(score) += std::get<1>(s);
-                std::get<2>(score) += std::get<2>(s);
-                if (best.empty() || score > bestScore) {
-                  bestScore = score;
-                  best = current;
-                }
-              }
-              ++solutions;
-              return;
-            }
-            std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
-            for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
-              if (!taken[v.ibPath]) {
-                sorted.emplace_back(v.score, &v);
-              }
-            }
-            if (sorted.empty()) {
-              return;
-            }
-            std::sort(sorted.begin(), sorted.end());
-            std::reverse(sorted.begin(), sorted.end());
-            if (sorted.size() > 4) {
-              sorted.resize(4);
-            }
-            for (auto& v : sorted) {
-              ++useCount[v.second->ibPath];
-              current[index] = v.second;
-              visit(index + 1);
-              --useCount[v.second->ibPath];
-            }
-          };
-          visit(0);
-
+        for (size_t round = 0; useDevices.size() != maxDevices; ++round) {
+          std::vector<LocalDeviceNode*> best = assignWholeNode(
+              fmt::sprintf("round %d", round), [&](const std::string& ibPath) { return !taken[ibPath]; });
           if (best.empty()) {
-            if (!useDevices.empty()) {
-              break;
-            }
-            throw std::runtime_error(
-                fmt::sprintf("No usable InfiniBand device found for rank %d (unreachable?)", rank));
+            break;
           }
-
-          for (auto* v : best) {
+          for (LocalDeviceNode* v : best) {
             taken[v->ibPath] = true;
           }
-
-          log.debug("evaluated %d solutions\n", solutions);
-          log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
-
-          for (size_t i = 0; i != best.size(); ++i) {
-            log.debug("best device for %d is %s with score %d\n", i, best[i]->ibPath, std::get<0>(best[i]->score));
-          }
-
-          for (auto& v : localDeviceNodes) {
-            if (v.ibPath == best.at(localAllCudaPathsIndex)->ibPath) {
-              for (auto& v2 : localDevices) {
-                if (v2.ibPath == v.ibPath) {
-                  useDevices.emplace_back(&v, &v2);
-                }
-              }
-            }
-          }
+          LocalDeviceNode* pick = best.at(localAllCudaPathsIndex);
+          log.debug("legacy device selection: rank %d device %d is %s\n", rank, useDevices.size(), pick->ibPath);
+          appendUseDevice(pick);
+        }
+        if (useDevices.empty()) {
+          throw std::runtime_error(fmt::sprintf("No usable InfiniBand device found for rank %d (unreachable?)", rank));
         }
       }
 
