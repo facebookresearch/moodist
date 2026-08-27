@@ -9,7 +9,6 @@ import torch
 import torch.distributed
 
 from ._core import MoodistProcessGroup, TcpStore
-from .options import MoodistOptions, MoodistOptionsContext
 
 
 _name_to_group = weakref.WeakValueDictionary()

@@ -6,7 +6,7 @@ import importlib
 
 import torch
 
-from .version import __version__, cversions
+from .version import cversions
 
 _torchversion = torch.__version__
 

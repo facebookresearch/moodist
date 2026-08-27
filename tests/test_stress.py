@@ -10,7 +10,7 @@ Pattern: pre-allocate inputs/outputs, run ops in tight loop, verify after.
 """
 
 import torch
-from framework import TestContext, test, test_cpu_cuda, create_process_group
+from framework import TestContext, test_cpu_cuda, create_process_group
 
 
 @test_cpu_cuda

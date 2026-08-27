@@ -220,7 +220,7 @@ def test_wrapper_cleanup_on_destroy(ctx: TestContext):
     )
 
     # Get references before destruction
-    default_pg = dist.distributed_c10d._world.default_pg
+    _default_pg = dist.distributed_c10d._world.default_pg
 
     # Find the wrapper (it's a different type than MoodistProcessGroup)
     wrappers_before = [
@@ -596,4 +596,3 @@ def test_dtensor_2d_mesh_shard(ctx: TestContext):
 
     finally:
         _cleanup_distributed()
-

@@ -17,7 +17,7 @@ import moodist
 from moodist import TensorRegion
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from framework import TestContext, test
 
@@ -433,12 +433,12 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
 
         # Determine inner group parameters
         if is_trainer:
-            inner_ranks = list(range(num_trainers))
+            _inner_ranks = list(range(num_trainers))
             inner_rank = ctx.rank
             inner_size = num_trainers
             prefix = "trainers"
         else:
-            inner_ranks = list(range(num_trainers, ctx.world_size))
+            _inner_ranks = list(range(num_trainers, ctx.world_size))
             inner_rank = ctx.rank - num_trainers
             inner_size = num_workers
             prefix = "workers"

@@ -256,7 +256,7 @@ def run_file_worker(conn, test_file: Path, start_test_id: int, start_barrier_cou
 
     results = []
     final_test_id = start_test_id
-    final_barrier_count = start_barrier_count
+    _final_barrier_count = start_barrier_count
     file_passed = True
 
     if not test_file.exists():
@@ -468,7 +468,7 @@ def main():
         print(f"Running tests with {ctx.world_size} processes")
         print(f"Master: {ctx.master_addr}:{ctx.master_port}")
         if per_rank_logs:
-            print(f"Per-rank logs: test_logs/rank_*.log")
+            print("Per-rank logs: test_logs/rank_*.log")
         print()
 
     # Determine which test files to run

@@ -250,7 +250,6 @@ def test_store_graceful_shutdown(ctx: TestContext):
 @test
 def test_store_clone(ctx: TestContext):
     """Test that clone() shares the underlying store and refcounting works."""
-    import time
 
     store = moodist.TcpStore(
         ctx.master_addr,

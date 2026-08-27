@@ -10,7 +10,7 @@ tensor's placement strategy.
 
 from dataclasses import dataclass
 from itertools import product
-from typing import List, Tuple
+from typing import List
 
 from torch.distributed.tensor.placement_types import Shard, Replicate
 
