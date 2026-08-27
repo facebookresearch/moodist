@@ -4,8 +4,6 @@ build/
 *.egg-info
 .cache
 .vscode
-.claude/
 wheels
 py/moodist/version.py
 
-CLAUDE.md
