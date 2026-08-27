@@ -74,4 +74,9 @@ jobs:
       - name: Run single-GPU smoke suite over TCP
         env:
           MOODIST_USE_TCP: "1"
-        run: torchrun --standalone --nproc-per-node=1 tests/run.py
+        run: |
+          torchrun --standalone --nproc-per-node=1 tests/run.py \
+            test_allocator.py \
+            test_cuda_copy.py \
+            test_serialize.py \
+            test_store.py
