@@ -110,7 +110,6 @@ def test_nvlink_plan_partial_overlap(ctx: TestContext):
     pg = create_process_group(ctx)
 
     # Global shape: [1, 4096]
-    _shape = [1, 4096]
     dtype = torch.float32
 
     # Only rank 0 provides input
@@ -166,10 +165,9 @@ def test_nvlink_plan_distributed_inputs(ctx: TestContext):
 
     pg = create_process_group(ctx)
 
-    # Global shape: [1, 2048] - split evenly across ranks
+    # Global shape: [1, chunk_size * world_size]
     chunk_size = 1024
     total_size = chunk_size * ctx.world_size
-    _shape = [1, total_size]
     dtype = torch.float32
 
     # Each rank provides its chunk
@@ -229,10 +227,9 @@ def test_nvlink_plan_subset_reads(ctx: TestContext):
 
     pg = create_process_group(ctx)
 
-    # Global shape: large enough for each rank to get a unique slice
+    # Global shape: [1, slice_size * world_size]
     slice_size = 512
     total_size = slice_size * ctx.world_size
-    _shape = [1, total_size]
     dtype = torch.float32
 
     # Only rank 0 provides the full input (contiguous, no inputCopy needed)

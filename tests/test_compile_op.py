@@ -27,7 +27,7 @@ def test_compile_op_point_to_point(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    _shape = [4]
+    # Global shape: [4]
     dtype = torch.float32
 
     if ctx.rank == 0:
@@ -70,7 +70,7 @@ def test_compile_op_broadcast(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    _shape = [8]
+    # Global shape: [8]
     dtype = torch.float32
 
     # Rank 0 is the source, all ranks receive
@@ -109,7 +109,7 @@ def test_compile_op_gather(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    _shape = [chunk_size * ctx.world_size]
+    # Global shape: [chunk_size * world_size]
     dtype = torch.float32
 
     # Each rank contributes its chunk
@@ -154,7 +154,7 @@ def test_compile_op_scatter(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    _shape = [chunk_size * ctx.world_size]
+    # Global shape: [chunk_size * world_size]
     dtype = torch.float32
 
     # Only rank 0 provides input (full tensor)
@@ -197,7 +197,7 @@ def test_compile_op_allgather(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     chunk_size = 4
-    _shape = [chunk_size * ctx.world_size]
+    # Global shape: [chunk_size * world_size]
     dtype = torch.float32
 
     # Each rank contributes its chunk
@@ -232,7 +232,6 @@ def test_compile_op_2d_tensor(ctx: TestContext, device: str):
     pg = create_process_group(ctx)
 
     # Global shape: [world_size, 4] - each rank contributes one row
-    _shape = [ctx.world_size, 4]
     dtype = torch.float32
 
     # Each rank contributes its row
@@ -267,7 +266,7 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    _shape = [4]
+    # Global shape: [4]
     dtype = torch.float32
 
     # Rank 0 provides two separate input tensors that together cover the full output
@@ -318,8 +317,8 @@ def test_compile_op_different_dtypes(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
+    # Global shape: [4]
     for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
-        _shape = [4]
 
         if ctx.rank == 0:
             inputs = [TensorRegion(offset=[0], shape=[4], device=device)]
@@ -352,7 +351,7 @@ def test_compile_op_reuse(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    _shape = [4]
+    # Global shape: [4]
     dtype = torch.float32
 
     if ctx.rank == 0:
@@ -388,7 +387,7 @@ def test_compile_op_no_inputs_no_outputs(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    _shape = [4]
+    # Global shape: [4]
     dtype = torch.float32
 
     if ctx.rank == 0:
