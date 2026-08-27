@@ -34,7 +34,7 @@ jobs:
         run: pre-commit run --all-files
 
       - name: Syntax check
-        run: python -m compileall --quiet py/ tests/ benchmarks/ setup.py
+        run: python -m compileall -q py/ tests/ benchmarks/ setup.py
 
   gpu-smoke:
     name: GPU Smoke (PyTorch ${{ matrix.torch-version }})
