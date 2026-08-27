@@ -78,5 +78,6 @@ jobs:
           torchrun --standalone --nproc-per-node=1 tests/run.py \
             test_allocator.py \
             test_cuda_copy.py \
-            test_serialize.py \
-            test_store.py
+            test_serialize.py
+          torchrun --standalone --nproc-per-node=1 tests/run.py \
+            test_store.py::test_store_basic_set_get
