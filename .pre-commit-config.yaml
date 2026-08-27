@@ -6,8 +6,8 @@ repos:
     hooks:
       - id: clang-format
         files: ^(api|core|wrapper)/.*\.(h|cc|cpp|c)$
-        # TODO(pr-02): these files have pre-existing clang-format violations;
-        # excluded here to keep this PR minimal and will be fixed in a follow-up PR.
+        # Keep the initial hook rollout non-disruptive. Remove these exclusions in
+        # a dedicated C++ formatting change so that this PR stays reviewable.
         exclude: |
           (?x)^(
             fmt/|
