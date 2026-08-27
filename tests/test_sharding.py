@@ -653,7 +653,7 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             outputs = [TensorRegion(offset=[0] * len(shape), shape=list(shape), device=device)]
 
             try:
-                moodist.compile_op(
+                _op = moodist.compile_op(
                     pg,
                     dtype=global_tensor.dtype,
                     inputs=inputs,
@@ -685,7 +685,7 @@ def test_replicate_1d_mesh(ctx: TestContext, device: str):
             outputs = [TensorRegion(offset=[0], shape=list(shape), device=device)]  # All ranks want full tensor
 
             try:
-                moodist.compile_op(
+                _op = moodist.compile_op(
                     pg,
                     dtype=global_tensor.dtype,
                     inputs=inputs,
@@ -1309,5 +1309,4 @@ def test_local_reshard_error_on_invalid_conversion(ctx: TestContext):
     except ValueError as e:
         ctx.assert_true("requires communication" in str(e))
         ctx.log(f"PASS: correctly rejected Shard -> Replicate: {e}")
-
 

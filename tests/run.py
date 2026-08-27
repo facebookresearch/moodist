@@ -256,6 +256,7 @@ def run_file_worker(conn, test_file: Path, start_test_id: int, start_barrier_cou
 
     results = []
     final_test_id = start_test_id
+    _final_barrier_count = start_barrier_count
     file_passed = True
 
     if not test_file.exists():
