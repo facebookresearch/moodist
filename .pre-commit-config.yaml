@@ -1,24 +1,9 @@
-exclude: ^fmt/
-
 repos:
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v15.0.7
+    rev: v21.1.2
     hooks:
       - id: clang-format
         files: ^(api|core|wrapper)/.*\.(h|cc|cpp|c)$
-        # Keep the initial hook rollout non-disruptive. Remove these exclusions in
-        # a dedicated C++ formatting change so that this PR stays reviewable.
-        exclude: |
-          (?x)^(
-            fmt/|
-            core/collective_base\.h|
-            core/cputhread\.cc|
-            core/cputhread\.h|
-            core/internal_allocator\.cc|
-            core/intrusive_list\.h|
-            core/moo_allocator_impl\.h|
-            core/synchronization\.h
-          )$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.4
