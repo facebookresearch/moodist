@@ -47,6 +47,16 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Install CUDA toolkit
+        run: |
+          conda create --yes --quiet --prefix "$RUNNER_TEMP/cuda-toolkit" \
+            --override-channels \
+            --channel nvidia/label/cuda-12.8.1 \
+            --channel conda-forge \
+            cuda-nvcc=12.8 cuda-cudart-dev=12.8
+          echo "$RUNNER_TEMP/cuda-toolkit/bin" >> "$GITHUB_PATH"
+          echo "CUDAToolkit_ROOT=$RUNNER_TEMP/cuda-toolkit" >> "$GITHUB_ENV"
+
       - name: Install PyTorch
         run: |
           python -m pip install --upgrade pip
