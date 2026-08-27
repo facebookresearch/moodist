@@ -1114,6 +1114,7 @@ struct CpuThreadImpl {
     }                                                                                                                  \
     WAIT_CONTROL                                                                                                       \
   }
+  // clang-format off
 // #define YIELD                                                                                                          \
 //   if (self.numActiveWorks != 1 || self.cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {                    \
 //     this->state = &&CAT(s, __LINE__);                                                                                  \
@@ -1154,6 +1155,7 @@ struct CpuThreadImpl {
 //   }                                                                                                                    \
 //   sendStepValue = &self.sendStepValues2[32 * 1024 * concurrencyIndex + 32 * ((self.sendStepValues2Counter++) % 1024)]; \
 //   *sendStepValue = stepValue;
+  // clang-format on
 
   // size_t allocateIndices(size_t n) {
   //   if (numUniqueIndices - uniqueIndexOffset <= n) {

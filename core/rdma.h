@@ -23,9 +23,9 @@ struct TemplatedOps {
     ((F&)self->storage)();
   };
   void (*dtor)(SmallFunction*) = std::is_trivially_destructible_v<F> ? (void (*)(SmallFunction*)) nullptr
-                                                                     : (void (*)(SmallFunction*))[](SF * self) {
-    ((F&)self->storage).~F();
-  };
+                                                                     : (void (*)(SmallFunction*)) [](SF* self) {
+                                                                         ((F&)self->storage).~F();
+                                                                       };
   void (*callAndDtor)(SmallFunction*) = [](SF* self) {
     ((F&)self->storage)();
     ((F&)self->storage).~F();

@@ -23,9 +23,12 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    import moodist
 
 
 @dataclass
@@ -410,7 +413,6 @@ def create_process_group(ctx: TestContext, fresh: bool = False, **options):
     """
     global _cached_pg, _cached_pg_store
     from datetime import timedelta
-    import torch
     import moodist
 
     if fresh or _cached_pg is None:
