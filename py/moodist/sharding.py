@@ -271,7 +271,7 @@ def compute_local_reshard(
         return None
 
     for curr, tgt, idx_size in zip(current_placements, target_placements, indices_and_sizes):
-        if type(curr) == type(tgt):
+        if type(curr) == type(tgt):  # noqa: E721
             # Same type - must be identical
             if is_shard_like(curr) and get_shard_key(curr) != get_shard_key(tgt):
                 raise ValueError(

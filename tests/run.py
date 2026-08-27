@@ -40,7 +40,7 @@ from pathlib import Path
 tests_dir = Path(__file__).parent
 sys.path.insert(0, str(tests_dir))
 
-from framework import TestRunner, create_context_from_env, get_tests, clear_tests, clear_process_group_cache
+from framework import TestRunner, create_context_from_env, get_tests, clear_tests, clear_process_group_cache  # noqa: E402
 
 
 def setup_per_rank_logging(rank: int, log_dir: str):
