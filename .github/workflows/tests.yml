@@ -18,11 +18,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Ruff
-        run: python -m pip install ruff==0.15.4
+      - name: Install pre-commit
+        run: python -m pip install pre-commit==4.3.0
 
-      - name: Run Ruff
-        run: ruff check py/ tests/ benchmarks/ setup.py
+      - name: Run pre-commit checks
+        run: pre-commit run --all-files
 
       - name: Syntax check
         run: python -m compileall -q py/ tests/ benchmarks/ setup.py
