@@ -30,7 +30,7 @@ jobs:
   gpu-smoke:
     name: GPU Smoke (PyTorch ${{ matrix.torch-version }})
     if: github.repository == 'facebookresearch/moodist'
-    runs-on: ubuntu-latest-gpu
+    runs-on: 4-core-ubuntu-gpu-t4
 
     strategy:
       matrix:
