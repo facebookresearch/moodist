@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     import moodist
 
 
-
 @dataclass
 class TestContext:
     """Context passed to each test function."""
