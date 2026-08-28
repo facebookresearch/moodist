@@ -18,6 +18,7 @@ jobs:
   lint-and-syntax:
     name: Lint & Syntax Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v5
@@ -39,6 +40,7 @@ jobs:
     name: Single-GPU TCP Smoke (PyTorch ${{ matrix.torch-version }}.x)
     if: github.repository == 'facebookresearch/moodist'
     runs-on: 4-core-ubuntu-gpu-t4
+    timeout-minutes: 60
 
     strategy:
       fail-fast: false
@@ -86,10 +88,23 @@ jobs:
       - name: Run single-GPU smoke suite over TCP
         env:
           MOODIST_USE_TCP: "1"
+          TORCHRUN_TIMEOUT_SECONDS: "600"
         run: |
           torchrun --standalone --nproc-per-node=1 tests/run.py \
+            --timeout "$TORCHRUN_TIMEOUT_SECONDS" \
+            --per-rank-logs \
             test_allocator.py \
             test_cuda_copy.py \
             test_serialize.py
           torchrun --standalone --nproc-per-node=1 tests/run.py \
+            --timeout "$TORCHRUN_TIMEOUT_SECONDS" \
+            --per-rank-logs \
             test_store.py::test_store_basic_set_get
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-pytorch-${{ matrix.torch-version }}
+          path: test_logs/
+          if-no-files-found: ignore
