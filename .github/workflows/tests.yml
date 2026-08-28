@@ -88,15 +88,16 @@ jobs:
       - name: Run single-GPU smoke suite over TCP
         env:
           MOODIST_USE_TCP: "1"
+          TORCHRUN_TIMEOUT_SECONDS: "600"
         run: |
           torchrun --standalone --nproc-per-node=1 tests/run.py \
-            --timeout 600 \
+            --timeout "$TORCHRUN_TIMEOUT_SECONDS" \
             --per-rank-logs \
             test_allocator.py \
             test_cuda_copy.py \
             test_serialize.py
           torchrun --standalone --nproc-per-node=1 tests/run.py \
-            --timeout 600 \
+            --timeout "$TORCHRUN_TIMEOUT_SECONDS" \
             --per-rank-logs \
             test_store.py::test_store_basic_set_get
 
