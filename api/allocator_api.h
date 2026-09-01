@@ -71,4 +71,30 @@ void allocatorRemoveFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress,
 // Get the device index the allocator is initialized on (-1 if not yet initialized)
 int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl);
 
+// Get the reserved VA base address (0 if not initialized)
+uintptr_t allocatorGetReservedBase();
+
+// Get number of cuMemCreate chunks
+size_t allocatorGetChunkCount();
+
+// Get chunk info by index: handle, offset within reserved range, size.
+// Returns true if index is valid, false otherwise.
+bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize);
+
+// Check if the allocator supports fabric handles
+bool allocatorSupportsFabric();
+
+// Chunk binding info for multicast
+struct AllocatorChunkBinding {
+  unsigned long long handle; // cuMemCreate handle
+  size_t mcOffset;           // Offset within multicast object to bind at
+  size_t memOffset;          // Offset within the chunk handle
+  size_t size;               // Bytes to bind
+};
+
+// Find which physical chunks back the VA range [addr, addr+len).
+// Writes bindings to out[], returns number of entries written.
+// mcOffset is relative to the start of addr (0 for the first byte).
+size_t allocatorGetChunksForRange(uintptr_t addr, size_t len, AllocatorChunkBinding* out, size_t maxOut);
+
 } // namespace moodist

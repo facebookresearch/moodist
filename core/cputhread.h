@@ -3,8 +3,12 @@
 #pragma once
 
 #include "api/moodist_api.h"
+#include "compile_op.h"
+#include "compile_op_kernel.h"
+#include "cuda_loader.h"
 #include "group.h"
 #include "intrusive_list.h"
+#include "ptx_codegen.h"
 #include "simple_vector.h"
 #include "synchronization.h"
 #include "tensor_types.h"
@@ -40,12 +44,7 @@ constexpr uint8_t taskCallback = 22;
 constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
-
-// Device type for tensor regions in compile_op
-enum class DeviceType : int8_t {
-  CPU = 0,
-  CUDA = 1,
-};
+constexpr uint8_t taskFabricMap = 26;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -100,8 +99,12 @@ OPTYPE(CreateQueueNamedResult);
 OPTYPE(Cat);
 OPTYPE(Cached);
 OPTYPE(Custom);
+OPTYPE(CompileOpLocal);
 
 OPTYPE(MessageShutdown);
+
+OPTYPE(FabricMap);
+OPTYPE(FabricMapDone);
 
 template<typename DynamicAddresses>
 inline void badOp(const char* filename, uint32_t line, const DynamicAddresses& dyn, uint32_t opType, uint32_t stepValue,
@@ -301,7 +304,14 @@ struct QueueEntryCallback : QueueEntry {
 
 struct CustomOpDescriptor {
   uint32_t id;
-  struct Read {
+
+  struct Copy {
+    uint32_t index;
+    Vector<int64_t> offset;
+    Vector<int64_t> shape;
+  };
+
+  struct IbRead {
     uint32_t rank;
     uint32_t inputIndex;
     uint32_t outputIndex;
@@ -314,58 +324,31 @@ struct CustomOpDescriptor {
       x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes);
     }
   };
-  struct Copy {
-    uint32_t index;
-    IVector<int64_t> offset;
-    IVector<int64_t> shape;
-  };
 
-  // NVLink optimization: gateway fetches via IB, others copy locally
-  struct GatewayRead {
-    uint32_t sourceRank;
-    uint32_t inputIndex;
-    size_t inputOffset;
-    size_t bytes;
-    uint32_t outputIndex;
-    size_t outputOffset;
-  };
+  Vector<Copy> inputCopies;
+  Vector<Copy> outputCopies;
 
-  struct LocalCopy {
-    uint32_t gatewayRank;        // global rank of gateway
-    uint32_t gatewayOutputIndex; // gateway's output tensor
-    size_t gatewayOutputOffset;
-    size_t bytes;
-    uint32_t myOutputIndex;
-    size_t myOutputOffset;
-  };
+  // Vector<size_t> inputs;
+  // Vector<size_t> outputs;
 
-  // Copy directly from a local rank's input tensor (no IB)
-  struct LocalInputCopy {
-    uint32_t sourceRank;       // source rank (must be local)
-    uint32_t sourceInputIndex; // source's input tensor index
-    size_t sourceInputOffset;
-    size_t bytes;
-    uint32_t myOutputIndex;
-    size_t myOutputOffset;
-  };
+  Vector<IbRead> ibReads;
 
-  IVector<Read> reads;
-  IVector<Read> directReads;                // IB reads with no local sharing
-  IVector<GatewayRead> gatewayReads;        // I fetch via IB for local group
-  IVector<LocalCopy> localCopies;           // I copy from gateway's output via NVLink
-  IVector<LocalInputCopy> localInputCopies; // I copy from local rank's input via NVLink
-  IVector<Copy> inputCopies;
-  IVector<Copy> outputCopies;
+  Vector<compile_op::Graph::TensorDescr> inputs;
+  Vector<compile_op::Graph::TensorDescr> outputs;
 
-  IVector<size_t> inputs;
-  IVector<size_t> outputs;
-
-  IVector<IVector<int64_t>> inputShapes;
-  IVector<IVector<int64_t>> outputShapes;
-  IVector<DeviceType> inputDevices;
-  IVector<DeviceType> outputDevices;
+  // Vector<Vector<int64_t>> inputShapes;
+  // Vector<Vector<int64_t>> outputShapes;
+  // Vector<DeviceType> inputDevices;
+  // Vector<DeviceType> outputDevices;
   DType dtype;
-  bool cpuSync = false; // Force CPU-side wait in customOp before CUDA operations
+  bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
+  bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
+  bool anyRankNeedsRdma = false;
+
+  compile_op::Graph graph;
+  std::shared_ptr<KernelHandle> kernelHandle;
+  std::unique_ptr<CompiledKernel> kernel;
+  KernelConfig config;
 };
 
 struct QueueEntryCustom : QueueEntry {
@@ -376,6 +359,14 @@ struct QueueEntryCustom : QueueEntry {
 
   std::vector<TensorDataPtr> inputs;
   std::vector<TensorDataPtr> outputs;
+};
+
+struct QueueEntryFabricMap : QueueEntry {
+  uint32_t targetRank;
+  size_t chunkIndex;
+  CUmemFabricHandle handle;
+  size_t offset;
+  size_t bytes;
 };
 
 template<typename T>
@@ -412,6 +403,9 @@ struct CpuThread {
   IntrusiveList<QueueEntry, &QueueEntry::link> queue;
   std::atomic_uint32_t queueSize = 0;
 
+  Function<uintptr_t(uint32_t, QueueEntryFabricMap)> onFabricMap;
+  Function<void(uint32_t, size_t, uintptr_t)> onFabricMapDone;
+
   std::atomic_bool ready = false;
   std::atomic_bool busy = false;
 
@@ -436,6 +430,7 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCached> freelistCached;
   QueueEntryFreeList<QueueEntryCallback> freelistCallback;
   QueueEntryFreeList<QueueEntryCustom> freelistCustom;
+  QueueEntryFreeList<QueueEntryFabricMap> freelistFabricMap;
 
   std::exception_ptr initExceptionPtr;
   std::atomic_bool initException = false;

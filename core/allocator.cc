@@ -13,62 +13,6 @@
 
 namespace moodist {
 
-inline LogLevel memLogLevel = []() {
-  const char* c = std::getenv("MOODIST_MEM_LOG_LEVEL");
-  LogLevel r = LOG_INFO;
-  if (c) {
-    std::string s = c;
-    for (auto& c : s) {
-      c = std::toupper(c);
-    }
-    if (s == "NONE") {
-      r = LOG_NONE;
-    } else if (s == "ERROR") {
-      r = LOG_ERROR;
-    } else if (s == "INFO") {
-      r = LOG_INFO;
-    } else if (s == "VERBOSE") {
-      r = LOG_VERBOSE;
-    } else if (s == "DEBUG") {
-      r = LOG_DEBUG;
-    } else {
-      r = (LogLevel)std::atoi(c);
-    }
-    if (currentLogLevel < LOG_ERROR) {
-      r = LOG_ERROR;
-    }
-  }
-  return r;
-}();
-
-inline struct MemLog {
-  template<typename... Args>
-  void error(const char* fmt, Args&&... args) {
-    logat(LOG_ERROR, fmt, std::forward<Args>(args)...);
-  }
-  template<typename... Args>
-  void info(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_INFO) {
-      [[unlikely]];
-      logat(LOG_INFO, fmt, std::forward<Args>(args)...);
-    }
-  }
-  template<typename... Args>
-  void verbose(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_VERBOSE) {
-      [[unlikely]];
-      logat(LOG_VERBOSE, fmt, std::forward<Args>(args)...);
-    }
-  }
-  template<typename... Args>
-  void debug(const char* fmt, Args&&... args) {
-    if (memLogLevel >= LOG_DEBUG) {
-      [[unlikely]];
-      logat(LOG_DEBUG, fmt, std::forward<Args>(args)...);
-    }
-  }
-} memlog;
-
 namespace {
 
 struct Span {
@@ -260,7 +204,7 @@ using RegionSizeMap = std::multiset<RegionSize<std::set<Region, RegionCompare>>,
 void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
   return;
   uintptr_t e = 0;
-  // memlog.info("check map -- \n");
+  // log.info("check map -- \n");
   Vector<Span> tmp;
   HashMap<EventRegion*, bool> exists;
   for (auto& v : map) {
@@ -270,7 +214,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }
   }
   for (auto& v : map) {
-    // memlog.info("span %#x %#x\n", v.span.begin, v.span.end);
+    // log.info("span %#x %#x\n", v.span.begin, v.span.end);
     CHECK(v.span.begin > e);
     CHECK(v.span.end > v.span.begin);
     e = v.span.end;
@@ -284,7 +228,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }));
     uintptr_t ee = v.span.begin;
     for (auto& v2 : v.events) {
-      // memlog.info(" event %#x %#x\n", v2.span.begin, v2.span.end);
+      // log.info(" event %#x %#x\n", v2.span.begin, v2.span.end);
       CHECK(v2.span.end > v2.span.begin);
       CHECK(v2.span.begin >= v.span.begin);
       CHECK(v2.span.end <= v.span.end);
@@ -295,7 +239,7 @@ void checkMap(RegionMap& map, RegionSizeMap& sizeMap) {
     }
 
     // for (auto& v : tmp) {
-    //   memlog.info(" tmp %#x %#x\n", v.begin, v.end);
+    //   log.info(" tmp %#x %#x\n", v.begin, v.end);
     // }
 
     // CHECK(tmp.size() == 1);
@@ -407,6 +351,8 @@ struct CudaAllocatorImpl {
   size_t nextMapBase = 0;
 
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
+  size_t allocationGranularity = 0;
+  bool fabricSupported = false;
 
   LocalFreeList<Vector<CUstream>> freeListStreams;
   LocalFreeList<EventRegion> freeListEventRegions;
@@ -520,7 +466,7 @@ struct CudaAllocatorImpl {
     }
     CHECK(i->events.empty());
     for (auto& v : eventRegionList) {
-      // memlog.info("v event span %#x %#x\n", v->span.begin, v->span.end);
+      // log.info("v event span %#x %#x\n", v->span.begin, v->span.end);
       i->events.push_back(*v);
     }
     // CHECK(std::is_sorted(
@@ -534,10 +480,10 @@ struct CudaAllocatorImpl {
       node.value().regionIterator = i;
       i->sizeIterator = sizeMap.insert(std::move(node));
     }
-    // memlog.info(
+    // log.info(
     //     "added span %#x %#x, size %d, i->sizeIterator bytes is %d\n", i->span.begin, i->span.end,
     //     i->span.end - i->span.begin, i->sizeIterator->bytes);
-    // memlog.info(
+    // log.info(
     //     "added span %#x %#x, size %d, i->sizeIterator bytes is %d\n", span.begin, span.end, span.end - span.begin,
     //     i->sizeIterator->bytes);
     checkMap(map, sizeMap);
@@ -545,27 +491,6 @@ struct CudaAllocatorImpl {
   }
 
   bool mapMoreMemory(size_t minbytes, int currentDeviceIndex, CUstream currentStream) {
-    // if (reservedBase == 0) {
-    //   size_t free = 0;
-    //   size_t total = 0;
-    //   CHECK_CU(cuMemGetInfo(&free, &total));
-    //   memlog.info("Moodist CUDA Allocator initializing. Device has %d free, %d total bytes of memory.\n", free,
-    //   total);
-
-    //   constexpr size_t alignment = (size_t)1024 * 1024 * 1024 * 1024;
-    //   size_t reserveSize = (total + alignment - 1) / alignment * alignment;
-
-    //   memlog.info("Moodist CUDA Allocator reserving %d bytes\n", reserveSize);
-
-    //   CUdeviceptr base = 0;
-    //   CHECK_CU(cuMemAddressReserve(&base, reserveSize, alignment, 0, 0));
-    //   reservedBase = base;
-    //   reservedSize = reserveSize;
-    //   nextMapBase = base;
-
-    //   deviceIndex = currentDeviceIndex;
-    // }
-
     std::lock_guard mrl(mappedRegionsMutex);
 
     size_t free = 0;
@@ -577,86 +502,141 @@ struct CudaAllocatorImpl {
     }
     CHECK(currentDeviceIndex == deviceIndex);
 
-    size_t bytes = free;
     constexpr size_t buffer = (size_t)1024 * 1024 * 512;
+    constexpr size_t minChunkGranularity = (size_t)4 * 1024 * 1024; // 4 MB
+    // Use 1/64 of total GPU memory as chunk granularity, but at least 4MB,
+    // rounded up to CUDA allocation granularity
+    size_t chunkGranularity = std::max(minChunkGranularity, total / 64);
+    if (allocationGranularity > 0) {
+      chunkGranularity = (chunkGranularity + allocationGranularity - 1) / allocationGranularity * allocationGranularity;
+    }
     size_t safebytes = free > buffer ? free - buffer : 0;
-    if (safebytes >= minbytes) {
-      bytes = safebytes;
-    }
-    if (mappedRegions.empty() && free / 2 > minbytes) {
-      bytes = free / 2;
-    }
-    memlog.info(
-        "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
-        bytes, free, total);
-    if (bytes < minbytes) {
+    if (safebytes < chunkGranularity) {
+      log.info("Moodist CUDA Allocator: not enough free memory after buffer reservation. Device has %d free, %d "
+               "total bytes of memory.\n",
+          free, total);
       return false;
     }
-    // // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 1024 * 4));
-    // bytes = std::min(bytes, std::max(minbytes, (size_t)1024 * 1024 * 512));
+    // Allocate minbytes rounded up to chunk granularity, capped at safebytes
+    size_t bytes = (minbytes + chunkGranularity - 1) / chunkGranularity * chunkGranularity;
+    if (bytes > safebytes) {
+      bytes = (safebytes / chunkGranularity) * chunkGranularity;
+    }
+    if (bytes == 0) {
+      return false;
+    }
+    log.info(
+        "Moodist CUDA Allocator attempting to map %d bytes of memory. Device has %d free, %d total bytes of memory.\n",
+        bytes, free, total);
 
-    // CUmemGenericAllocationHandle handle;
-    // CUmemAllocationProp prop;
-    // std::memset(&prop, 0, sizeof(prop));
-    // prop.location.id = deviceIndex;
-    // prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    // prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    // prop.allocFlags.gpuDirectRDMACapable = 1;
+    // Initialize VA reservation on first call
+    if (reservedBase == 0) {
+      // Query fabric handle support
+      int fabricAttr = 0;
+      cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
+      fabricSupported = fabricAttr != 0;
 
-    // constexpr size_t alignment = (size_t)1024 * 1024 * 128;
-    // bytes = (bytes + alignment - 1) / alignment * alignment;
-
-    // CHECK_CU(cuMemCreate(&handle, bytes, &prop, 0));
-
-    // cuMemHandles.emplace_back(bytes, handle);
-
-    // uintptr_t address = nextMapBase;
-    // nextMapBase += bytes;
-
-    // memlog.info("mem map %#x %#x\n", address, bytes);
-
-    // CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
-
-    // int ndevices = 0;
-    // CHECK_CU(cuDeviceGetCount(&ndevices));
-
-    // log.info("device count is %d\n", ndevices);
-
-    // //CHECK(false);
-
-    // for (size_t i = 0; i != ndevices; ++i) {
-    //   std::array<CUmemAccessDesc, 1> desc;
-    //   std::memset(desc.data(), 0, sizeof(CUmemAccessDesc) * desc.size());
-    //   desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    //   desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    //   desc[0].location.id = i;
-    //   CHECK_CU(cuMemSetAccess(address, bytes, desc.data(), 1));
-    //   log.info("access ok for device %d\n", i);
-    // }
-
-    CUdeviceptr ptr;
-    auto err = cuMemAlloc(&ptr, bytes);
-    while (err != CUDA_SUCCESS) {
-      if (bytes > minbytes + 1024 * 1024) {
-        bytes -= 1024 * 1024;
-      } else {
-        bytes = minbytes;
+      CUmemAllocationHandleType handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+      if (fabricSupported) {
+        handleTypes = (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
       }
-      err = cuMemAlloc(&ptr, bytes);
-      if (bytes <= minbytes) {
+
+      CUmemAllocationProp prop;
+      std::memset(&prop, 0, sizeof(prop));
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.requestedHandleTypes = handleTypes;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop.location.id = deviceIndex;
+      prop.allocFlags.gpuDirectRDMACapable = 1;
+
+      size_t granularity = 0;
+      CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+      allocationGranularity = granularity;
+
+      // Probe: verify fabric handles actually work (device may report support
+      // but IMEX daemon may not be running)
+      if (fabricSupported) {
+        CUmemGenericAllocationHandle probeHandle;
+        auto probeErr = cuMemCreate(&probeHandle, granularity, &prop, 0);
+        if (probeErr != CUDA_SUCCESS) {
+          fabricSupported = false;
+          prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+          log.info("Fabric handle probe failed, falling back to POSIX fd for VMM IPC\n");
+        } else {
+          cuMemRelease(probeHandle);
+        }
+      }
+
+      constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+      CUdeviceptr base = 0;
+      CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+      reservedBase = base;
+      reservedSize = reserveSize;
+      nextMapBase = base;
+
+      log.info(
+          "Moodist CUDA Allocator reserved %d bytes of VA at %#x (granularity %d)\n", reserveSize, base, granularity);
+
+      if (reservedBase & (1ull << 63)) {
+        throw std::runtime_error(
+            "Oh no, CUDA returned memory with bit 63 set! This should not happen. Moodist needs this bit for tagging.");
+      }
+    }
+
+    // Round up to allocation granularity
+    size_t granularity = allocationGranularity;
+    bytes = (bytes + granularity - 1) / granularity * granularity;
+
+    CUmemAllocationProp prop;
+    std::memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.requestedHandleTypes =
+        fabricSupported
+            ? (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC)
+            : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = deviceIndex;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
+
+    CUmemGenericAllocationHandle handle;
+    auto err = cuMemCreate(&handle, bytes, &prop, 0);
+    while (err != CUDA_SUCCESS) {
+      if (bytes > minbytes + granularity) {
+        bytes -= granularity;
+      } else {
+        bytes = (minbytes + granularity - 1) / granularity * granularity;
+      }
+      err = cuMemCreate(&handle, bytes, &prop, 0);
+      if (bytes <= (minbytes + granularity - 1) / granularity * granularity) {
         break;
       }
     }
     if (err != CUDA_SUCCESS) {
       const char* str = "unknown cuda error";
       cuGetErrorString(err, &str);
-      memlog.error("CUDA Allocator failed to map %d bytes; %s\n", bytes, str);
+      log.error("CUDA Allocator failed to create %d bytes; %s\n", bytes, str);
       return false;
     }
-    uintptr_t address = ptr;
 
-    memlog.info("Moodist successfully mapped %d bytes at %#x\n", bytes, address);
+    uintptr_t address = nextMapBase;
+    if (address + bytes > reservedBase + reservedSize) {
+      log.error("CUDA Allocator: mapping %d bytes at %#x would exceed 1TB VA reservation\n", bytes, address);
+      cuMemRelease(handle);
+      return false;
+    }
+    CHECK_CU(cuMemMap(address, bytes, 0, handle, 0));
+
+    CUmemAccessDesc accessDesc;
+    std::memset(&accessDesc, 0, sizeof(accessDesc));
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = deviceIndex;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CHECK_CU(cuMemSetAccess(address, bytes, &accessDesc, 1));
+
+    cuMemHandles.emplace_back(bytes, handle);
+    nextMapBase += bytes;
+
+    log.info("Moodist successfully mapped %d bytes at %#x (cuMemCreate + cuMemMap)\n", bytes, address);
 
     add_span(mappedRegions, address, address + bytes);
 
@@ -701,7 +681,7 @@ struct CudaAllocatorImpl {
         if (i->span.begin >= ptrEnd) {
           break;
         }
-        //        memlog.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)(CUevent)i->event, i->span.begin,
+        //        log.debug("wait for event %#x  %#x %#x!\n", (uintptr_t)(CUevent)i->event, i->span.begin,
         //        i->span.end);
 
         if (i->eventStream != stream) {
@@ -725,22 +705,22 @@ struct CudaAllocatorImpl {
         updateSize(regions, r);
       }
 
-      // memlog.debug("span %#x %#x\n", r->span.begin, r->span.end);
+      // log.debug("span %#x %#x\n", r->span.begin, r->span.end);
       // for (auto& v : r->events) {
-      //   memlog.debug("event %#x %#x\n", v.span.begin, v.span.end);
+      //   log.debug("event %#x %#x\n", v.span.begin, v.span.end);
       // }
 
       checkMap(regions.map, regions.sizes);
-      // memlog.debug("ok, returning %#x\n", ptr);
+      // log.debug("ok, returning %#x\n", ptr);
       return ptr;
     }
     return 0;
   }
 
   uintptr_t allocate(size_t bytes, CUstream stream, int deviceIndex) {
-    memlog.debug("allocate %d\n", bytes);
+    log.debug("allocate %d\n", bytes);
     if (!pendingDeallocations.empty()) {
-      // memlog.info("waa %d pending deallocations\n", pendingDeallocations.size());
+      // log.info("waa %d pending deallocations\n", pendingDeallocations.size());
       auto tmp = std::move(pendingDeallocations);
       for (auto& v : tmp) {
         deallocate<true>(std::get<0>(v), std::get<1>(v), *std::get<2>(v));
@@ -768,13 +748,13 @@ struct CudaAllocatorImpl {
       return allocate(bytes, stream, deviceIndex);
     }
 
-    // memlog.info("Prefetcher memory exhausted, moving pending\n");
+    // log.info("Prefetcher memory exhausted, moving pending\n");
     if (!pendingFreeMemory.map.empty()) {
       freePending(pendingFreeMemory);
       return allocate(bytes, stream, deviceIndex);
     }
-    if (memLogLevel >= LOG_VERBOSE) {
-      memlog.verbose(
+    if (currentLogLevel >= LOG_VERBOSE) {
+      log.verbose(
           "Memory exhausted during allocation of %s. Free memory:\n%s\n", this->bytes(bytes), debugFreeMemory());
     }
     for (size_t i = 0; i != streamFreeMemory.size(); ++i) {
@@ -803,7 +783,7 @@ struct CudaAllocatorImpl {
     if (mapMoreMemory(bytes, deviceIndex, stream)) {
       return allocate(bytes, stream, deviceIndex);
     }
-    memlog.verbose("Free memory:\n%s\n", debugFreeMemory());
+    log.verbose("Free memory:\n%s\n", debugFreeMemory());
 
     std::lock_guard mrl(mappedRegionsMutex);
 
@@ -835,7 +815,7 @@ struct CudaAllocatorImpl {
   }
 
   // void deallocateImpl(uintptr_t cudaPtr, size_t alignedbytes, Vector<CUstream>& streams) {
-  //   // memlog.info("deallocate %d\n", alignedbytes);
+  //   // log.info("deallocate %d\n", alignedbytes);
   //   for (CUstream stream : streams) {
   //     MemoryEventHandle me = getMemoryEvent();
   //     CHECK_CU(cuEventRecord(me->event, stream));
@@ -872,7 +852,7 @@ struct CudaAllocatorImpl {
         }
         h->eventStream = stream;
         CHECK_CU(cuEventRecord(h->event, stream));
-        // memlog.debug(
+        // log.debug(
         //     "recorded event (0) for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
         //     (uintptr_t)(CUevent)h->event);
       } else {
@@ -885,11 +865,11 @@ struct CudaAllocatorImpl {
         }
         h->eventStream = stream;
         if (cuEventRecord(h->event, stream) != CUDA_SUCCESS) {
-          memlog.info("failed to record event!\n");
+          log.info("failed to record event!\n");
           failed = true;
           break;
         }
-        // memlog.debug(
+        // log.debug(
         //     "recorded event for ptr %#x stream %#x event %#x\n", cudaPtr, (uintptr_t)stream,
         //     (uintptr_t)(CUevent)h->event);
       }
@@ -983,19 +963,19 @@ struct CudaAllocatorImpl {
       }
       insertRegion(freeMemory, span, tmpEventRegions);
 
-      // memlog.info("free %d bytes of pending\n", span.end - span.begin);
+      // log.info("free %d bytes of pending\n", span.end - span.begin);
 
       retval = true;
     }
     // if (!retval) {
-    //   memlog.info("failed to free any pending\n");
+    //   log.info("failed to free any pending\n");
     // }
     checkMap(freeMemory.map, freeMemory.sizes);
     return retval;
   }
 
   bool freePending(Regions& pendingFreeMemory) {
-    // memlog.info("free pending\n");
+    // log.info("free pending\n");
     //  CHECK(pendingFreeMemoryEvents.size() >= pendingFreeMemory.size());
     checkMap(pendingFreeMemory.map, pendingFreeMemory.sizes);
     checkMap(freeMemory.map, freeMemory.sizes);
@@ -1072,7 +1052,7 @@ struct CudaAllocatorImpl {
 
   // MemoryEventHandle getMemoryEvent() {
   //   if (memoryEventFreelist.empty()) {
-  //     memlog.debug("allocate new memory events!\n");
+  //     log.debug("allocate new memory events!\n");
   //     for (size_t i = 0; i != 0x1000; ++i) {
   //       MemoryEvent* me = memoryEventAllocator.allocate();
   //       CHECK_CU(cuEventCreate(&me->event, CU_EVENT_DISABLE_TIMING));
@@ -1098,16 +1078,26 @@ struct CudaAllocCleanupCtx {
 // Global allocator impl pointer for allocator::owns/mappedRegion
 CudaAllocatorImpl* globalCudaAllocatorImpl = nullptr;
 
+namespace {
+std::once_flag initFlag;
+void init() {
+  globalCudaAllocatorImpl = internalNew<CudaAllocatorImpl>();
+}
+} // namespace
+
 // CoreApi function implementations
 CudaAllocatorImpl* createCudaAllocatorImpl() {
-  return internalNew<CudaAllocatorImpl>();
+  // return internalNew<CudaAllocatorImpl>();
+  return nullptr;
 }
 
 void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
-  globalCudaAllocatorImpl = impl;
+  // globalCudaAllocatorImpl = impl;
 }
 
 CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
+  std::call_once(initFlag, init);
+  impl = globalCudaAllocatorImpl;
   std::lock_guard l(impl->mutex);
 
   if (!loadCuda()) {
@@ -1285,9 +1275,6 @@ std::pair<uintptr_t, size_t> allocatorMappedRegion(uintptr_t address) {
   return {0, 0};
 }
 
-// C-style API wrappers for CoreApi function pointers
-// These use out params to avoid ABI issues with returning structs
-
 void cudaAllocatorImplAllocateApi(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex,
     uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex) {
   CudaAllocation alloc = cudaAllocatorImplAllocate(impl, bytes, stream, deviceIndex);
@@ -1300,6 +1287,47 @@ void allocatorMappedRegionApi(uintptr_t address, uintptr_t* outBase, size_t* out
   auto result = allocatorMappedRegion(address);
   *outBase = result.first;
   *outSize = result.second;
+}
+
+uintptr_t allocatorGetReservedBase() {
+  if (!globalCudaAllocatorImpl) {
+    return 0;
+  }
+  return globalCudaAllocatorImpl->reservedBase.load(std::memory_order_relaxed);
+}
+
+size_t allocatorGetChunkCount() {
+  if (!globalCudaAllocatorImpl) {
+    return 0;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  return globalCudaAllocatorImpl->cuMemHandles.size();
+}
+
+bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize) {
+  if (!globalCudaAllocatorImpl) {
+    return false;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  auto& handles = globalCudaAllocatorImpl->cuMemHandles;
+  if (index >= handles.size()) {
+    return false;
+  }
+  size_t offset = 0;
+  for (size_t i = 0; i < index; ++i) {
+    offset += handles[i].first;
+  }
+  *outHandle = handles[index].second;
+  *outOffset = offset;
+  *outSize = handles[index].first;
+  return true;
+}
+
+bool allocatorSupportsFabric() {
+  if (!globalCudaAllocatorImpl) {
+    return false;
+  }
+  return globalCudaAllocatorImpl->fabricSupported;
 }
 
 // allocator namespace functions that are in core

@@ -96,8 +96,6 @@ endif()
 if(MOODIST_BUILD_CORE OR MOODIST_BUILD_WRAPPER)
   find_package(CUDAToolkit REQUIRED)
   message(STATUS "CUDA: ${CUDAToolkit_INCLUDE_DIRS}, lib: ${CUDAToolkit_LIBRARY_DIR}")
-
-  find_library(CUDADEVRT libcudadevrt.a HINTS ${CUDAToolkit_LIBRARY_DIR})
 endif()
 
 find_package(Threads REQUIRED)
@@ -174,6 +172,7 @@ set(core_sources
   core/alltoall.cc
   core/async.cc
   core/compile_op.cc
+  core/compile_op_kernel.cc
   core/connection.cc
   core/cpu_allocator.cc
   core/cputhread.cc
@@ -195,6 +194,8 @@ set(core_sources
   core/store.cc
   core/tcpdev.cc
   core/processgroup.cc
+  core/ptx.cc
+  core/ptx_codegen.cc
   # Third-party:
   fmt/src/format.cc
   ${rdma_sources}
@@ -225,7 +226,6 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}  # For api/ includes (e.g., #include "api/types.h")
   )
   target_compile_definitions(moodist PRIVATE
-    CUDADEVRT_PATH="${CUDADEVRT}"
     _STATIC_LIBRARY_BUILD_
     $<$<BOOL:${ENABLE_ALLOCATOR_GUARDS}>:MOODIST_ALLOCATOR_GUARDS>
     $<$<OR:$<BOOL:${ENABLE_ASAN}>,$<BOOL:${ENABLE_TSAN}>,$<BOOL:${ENABLE_STDLIB_ALLOCATOR}>>:MOODIST_USE_STDLIB_ALLOCATOR>

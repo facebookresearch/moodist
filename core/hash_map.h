@@ -65,7 +65,7 @@ public:
     size_t ki;
     size_t vi;
     Value* v;
-    mutable std::aligned_storage_t<sizeof(std::pair<Key&, Value&>), alignof(std::pair<Key&, Value&>)> tmp;
+    alignas(std::pair<Key&, Value&>) mutable char tmp[sizeof(std::pair<Key&, Value&>)];
 
   public:
     iterator() = default;

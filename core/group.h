@@ -28,6 +28,7 @@ enum class Reduction { sum, min, max, avg, count };
 static constexpr size_t maxConcurrency = 16;
 static constexpr size_t maxDevices = 4;
 static constexpr size_t maxChunks = 8;
+static constexpr size_t maxBlocks = 1024;
 struct alignas(64) CpuAddresses {
   uint32_t stepValue;
   int pid;
@@ -81,6 +82,7 @@ struct Group {
   static constexpr size_t maxConcurrency = moodist::maxConcurrency;
   static constexpr size_t maxDevices = moodist::maxDevices;
   static constexpr size_t maxChunks = moodist::maxChunks;
+  static constexpr size_t maxBlocks = moodist::maxBlocks;
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
@@ -91,6 +93,9 @@ struct Group {
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   CpuThread* cpuThread = nullptr;
+
+  bool supportsFabric = false;
+  bool supportsMulticast = false;
 
   AllocatedArray cpuOutBuffer;
   AllocatedArray cpuInBuffer;
@@ -113,8 +118,18 @@ struct Group {
   AllocatedArray cudaCopyDone;
   std::array<PeerArrayRef, 8> peerCudaCopyDone;
 
+  AllocatedArray cudaBlockDone;
+  std::array<PeerArrayRef, 8> peerCudaBlockDone;
+
   AllocatedArray cudaMemSync;
   std::array<PeerArrayRef, 8> peerCudaMemSync;
+
+  // // Per-descriptor signal buffer for fine-grained copy synchronization.
+  // // Lazily allocated during compile_op. Grows if a new op needs more slots.
+  // // Layout: buffer[concurrencyIndex][blockIdx][descriptorIndex] → uint32_t stepValue
+  // AllocatedArray cudaDescriptorSignal;
+  // std::array<PeerArrayRef, 8> peerCudaDescriptorSignal;
+  // Vector<AllocatedArray> oldDescriptorSignalBuffers; // kept alive + reset after growth
 
   std::vector<AllocatedArray*> buffersToReset;
 
@@ -127,6 +142,8 @@ struct Group {
   Vector<Vector<size_t>> nodeRanks;
   Vector<size_t> rankToNodeIndex;
   Vector<size_t> rankLocalRank;
+
+  Vector<size_t> fabricDomainRanks;
 
   int allocationNode = -1;
 
@@ -171,7 +188,7 @@ struct Group {
   void init(Function<void()> f, Function<void()> pghandle);
   Function<void()> init2;
 
-  size_t getPeerIndex(size_t rank) {
+  size_t getPeerIndex(size_t rank) const {
     for (size_t i = 0; i != ipcRanks.size(); ++i) {
       if (ipcRanks[i] == rank) {
         return i;
@@ -182,7 +199,7 @@ struct Group {
   }
 
   AllocatedBuffer allocateManaged(size_t bytes);
-  AllocatedBuffer allocateDevice(size_t bytes);
+  AllocatedBuffer allocateDevice(size_t bytes, bool useAllocator = true);
   AllocatedBuffer allocateHostMapped(size_t bytes);
   AllocatedBuffer allocateHost(size_t bytes);
   AllocatedBuffer allocateWriteCombined(size_t bytes);

@@ -1,3 +1,4 @@
+#include "cuda_loader.h"
 #include "group.h"
 #include "ib_common.h"
 #include "rdma.h"
@@ -305,11 +306,12 @@ struct RdmaIb : Rdma {
   void poll() {
     std::array<ibv_wc, 4> wcs;
     int n = ibv_poll_cq(ib->cq, wcs.size(), wcs.data());
+    CHECK(n >= 0);
     for (auto& wc : std::views::take(wcs, n)) {
       if (wc.status) [[unlikely]] {
         NOINLINE_COLD({
           RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
-          if (cpuThreadApi.suppressErrors()) {
+          if (!cpuThreadApi.suppressErrors()) {
             log.error("%s: Error communicating with %s: Work completion with status %d (%s).\n",
                 cpuThreadApi.groupName(), cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
             cpuThreadApi.setError();
@@ -351,8 +353,19 @@ struct RdmaIb : Rdma {
     return std::make_unique<Mr>(mr);
   }
   std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
-    ibv_mr* mr = ibv_reg_mr(ib->protectionDomain, address, bytes,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
+    int fd = -1;
+    CUresult err =
+        cuMemGetHandleForAddressRange(&fd, (uintptr_t)address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    ibv_mr* mr = nullptr;
+    if (err == CUDA_SUCCESS && fd != -1) {
+      // mr = mlx5dv_reg_dmabuf_mr(ib->protectionDomain, 0, bytes, (uintptr_t)address, fd, IBV_ACCESS_LOCAL_WRITE |
+      // IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ, 0);
+      mr = ibv_reg_dmabuf_mr(ib->protectionDomain, 0, bytes, (uintptr_t)address, fd,
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
+    } else {
+      mr = ibv_reg_mr(ib->protectionDomain, address, bytes,
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
+    }
     if (!mr) {
       perror("ibv_reg_mr");
       fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, (uintptr_t)address, bytes);

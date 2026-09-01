@@ -317,6 +317,13 @@ struct Event {
     r.owning = true;
     return r;
   }
+  static Event createTiming() {
+    // log.info("Creating a new event\n");
+    Event r;
+    CHECK_CU(cuEventCreate(&r.event, 0));
+    r.owning = true;
+    return r;
+  }
   static Event tryCreate() noexcept {
     // log.info("Creating a new event\n");
     Event r;
@@ -391,6 +398,10 @@ struct Stream {
     CHECK_CU(cuStreamCreateWithPriority(&r.stream, CU_STREAM_NON_BLOCKING, priority));
     r.owning = true;
     return r;
+  }
+
+  void synchronize() {
+    CHECK_CU(cuStreamSynchronize(stream));
   }
 };
 

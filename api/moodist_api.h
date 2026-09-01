@@ -107,6 +107,7 @@ struct WrapperApi {
   void (*tensorMulScalar_)(Tensor* t, double scalar);
   void (*tensorRecordStream)(Tensor* t, CUstream stream);
   void (*tensorCopy_)(Tensor* dst, Tensor* src);
+  void (*tensorZero_)(Tensor* dst);
 
   // Tensor reduction operations
   void (*tensorSumOut)(Tensor* dst, Tensor* src, int dim);

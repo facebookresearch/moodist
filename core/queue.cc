@@ -2,6 +2,7 @@
 
 #include "queue.h"
 #include "api/tensor_ptr.h"
+#include "buffer.h"
 #include "common.h"
 #include "cputhread.h"
 #include "cuda_copy.h"
@@ -469,7 +470,7 @@ struct QueueImpl {
     qs->multicastRemoteAddresses = multicastRemoteAddresses;
   }
 
-  std::pair<TensorPtr, size_t> get(bool block, std::optional<float> timeout) {
+  std::pair<TensorDataPtr, size_t> get(bool block, std::optional<float> timeout) {
     // fixme: this needs to be refactored such that -
     //        local get is fairly queued alongside remote gets
     //        multi-threaded gets (local & remote) on the same object are also fairly queued
@@ -517,10 +518,7 @@ struct QueueImpl {
       CHECK((result.data != nullptr) == hasData);
       CHECK(result.queueSize != -1);
 
-      if (result.data != nullptr) {
-        return {tensorFromTensorData(std::move(result.data)), result.queueSize};
-      }
-      return {TensorPtr(), result.queueSize};
+      return {std::move(result.data), result.queueSize};
     }
 
     if (isMulticast && !isMulticastLocal) {
@@ -538,7 +536,7 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {tensorFromTensorData(std::move(r)), queueSize};
+        return {std::move(r), queueSize};
       }
     }
 
@@ -551,21 +549,31 @@ struct QueueImpl {
         TensorDataPtr r = std::move(qs->vector.front());
         qs->vector.pop_front();
         --qs->size;
-        return {tensorFromTensorData(std::move(r)), 0};
+        return {std::move(r), 0};
       }
       if (timeouthelper.expired()) {
-        return {TensorPtr(), 0};
+        return {nullptr, 0};
       }
     }
   }
 
-  QueueWork put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true) {
+  TensorDataPtr getTensorData(bool block, std::optional<float> timeout, size_t* queueSize) {
+    auto r = get(block, timeout);
+    if (queueSize) {
+      *queueSize = r.second;
+    }
+    return std::move(r.first);
+  }
+
+  TensorPtr getTensor(bool block, std::optional<float> timeout, size_t* queueSize) {
+    return tensorFromTensorData(getTensorData(block, timeout, queueSize));
+  }
+
+  QueueWork putTensor(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy = true) {
     // CHECK(location != group->rank);
     // CHECK(qs == nullptr);
 
     CHECK(value.is_contiguous());
-
-    auto work = std::make_shared<QueueWorkImpl>();
 
     TensorDataPtr td = TensorDataPtr::make();
 
@@ -576,26 +584,14 @@ struct QueueImpl {
       td->shape[i] = value.size(i);
     }
 
-    int location = this->location;
-    uintptr_t remoteAddress = this->remoteAddress;
-    if (isMulticast) {
-      location = multicastLocations[0];
-      remoteAddress = multicastRemoteAddresses[0];
-    }
-    CHECK(remoteAddress != 0);
-
-    QueueWork r;
-
     uintptr_t tensorAddress = (uintptr_t)value.data_ptr();
 
     td->dataPtr = tensorAddress;
     td->dataBytes = td->itemsize() * td->numel();
 
-    if (tensorAddress == 0 && td->dataBytes != 0) {
-      throw std::runtime_error(fmt::sprintf("Queue.put value is a %d-byte tensor with null address", td->dataBytes));
-    }
+    td->isCuda = !value.is_cpu();
 
-    if (value.is_cpu()) {
+    if (!td->isCuda) {
       if (cpu_allocator::owns(tensorAddress)) {
         // For contiguous tensors, data_ptr() == storage base
         auto handle = cpu_allocator::getCpuBuffer(tensorAddress);
@@ -609,7 +605,44 @@ struct QueueImpl {
 
         CHECK(cpu_allocator::owns(td->data()));
       }
+    }
 
+    auto r = put(std::move(td), transactionKey, waitOnDestroy);
+    r.tensor = std::move(value);
+    return r;
+  }
+
+  QueueWork putBuffer(BufferHandle value, uint32_t transactionKey, bool waitOnDestroy = true) {
+    TensorDataPtr td = TensorDataPtr::make();
+    td->dtype = 0;
+    td->shape.push_back(value->size());
+    td->dataPtr = (uintptr_t)value->data();
+    td->dataBytes = value->size();
+    td->isCuda = false;
+    td->bufferHandle = SharedBufferHandle(value.release());
+    return put(std::move(td), transactionKey, waitOnDestroy);
+  }
+
+  QueueWork put(TensorDataPtr td, uint32_t transactionKey, bool waitOnDestroy = true) {
+    int location = this->location;
+    uintptr_t remoteAddress = this->remoteAddress;
+    if (isMulticast) {
+      location = multicastLocations[0];
+      remoteAddress = multicastRemoteAddresses[0];
+    }
+    CHECK(remoteAddress != 0);
+
+    QueueWork r;
+
+    uintptr_t tensorAddress = td->dataPtr;
+
+    if (tensorAddress == 0 && td->dataBytes != 0) {
+      throw std::runtime_error(fmt::sprintf("Queue.put value is a %d-byte tensor with null address", td->dataBytes));
+    }
+
+    auto work = std::make_shared<QueueWorkImpl>();
+
+    if (!td->isCuda) {
       std::unique_lock l(qs->mutex, std::defer_lock);
 
       if (qs->putQueueSize && (l.lock(), qs->putQueueSize)) {
@@ -697,8 +730,6 @@ struct QueueImpl {
           f.release()));
     }
 
-    // Move tensor into QueueWork to keep it alive during async operation
-    r.tensor = std::move(value);
     r.waitOnDestroy = waitOnDestroy;
     r.impl = std::move(work);
     return r;
@@ -783,11 +814,17 @@ Queue::~Queue() {
   internalDelete((QueueImpl*)impl);
 }
 
-std::pair<TensorPtr, size_t> Queue::get(bool block, std::optional<float> timeout) {
-  return ((QueueImpl*)impl)->get(block, timeout);
+TensorPtr Queue::getTensor(bool block, std::optional<float> timeout, size_t* queueSize) {
+  return ((QueueImpl*)impl)->getTensor(block, timeout, queueSize);
 }
-QueueWork Queue::put(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy) {
-  return ((QueueImpl*)impl)->put(std::move(value), transactionKey, waitOnDestroy);
+TensorDataPtr Queue::get(bool block, std::optional<float> timeout, size_t* queueSize) {
+  return ((QueueImpl*)impl)->getTensorData(block, timeout, queueSize);
+}
+QueueWork Queue::putTensor(TensorPtr value, uint32_t transactionKey, bool waitOnDestroy) {
+  return ((QueueImpl*)impl)->putTensor(std::move(value), transactionKey, waitOnDestroy);
+}
+QueueWork Queue::putBuffer(BufferHandle value, uint32_t transactionKey, bool waitOnDestroy) {
+  return ((QueueImpl*)impl)->putBuffer(std::move(value), transactionKey, waitOnDestroy);
 }
 size_t Queue::qsize() const {
   return ((QueueImpl*)impl)->qsize();

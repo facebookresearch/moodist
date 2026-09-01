@@ -4,21 +4,80 @@
 #include "allgather.h"
 #include "api/tensor_ptr.h"
 #include "common.h"
+#include "compile_op_kernel.h"
 #include "connection.h"
 #include "cputhread.h"
 #include "ib_common.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
+#include "queue.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
 #include "setup_comms.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
+
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 
 namespace moodist {
+
+namespace {
+
+void crashHandler(int sig) {
+  const char* name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : "SIGNAL";
+  // Manual int-to-string (snprintf is not async-signal-safe)
+  char pidbuf[16];
+  char* p = pidbuf + sizeof(pidbuf);
+  pid_t pid = getpid();
+  do {
+    *--p = '0' + (pid % 10);
+    pid /= 10;
+  } while (pid);
+  write(STDERR_FILENO, "\nmoodist[", 9);
+  write(STDERR_FILENO, p, pidbuf + sizeof(pidbuf) - p);
+  write(STDERR_FILENO, "]: ", 3);
+  write(STDERR_FILENO, name, strlen(name));
+  write(STDERR_FILENO, " — backtrace:\n", 14);
+
+  raise(SIGSTOP);
+
+  void* frames[64];
+  int n = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, n, STDERR_FILENO);
+
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+std::once_flag crashHandlerFlag;
+
+void installCrashHandler() {
+  std::call_once(crashHandlerFlag, [] {
+    const char* env = std::getenv("MOODIST_CRASH_HANDLER");
+    if (!env || strcmp(env, "1") != 0) {
+      return;
+    }
+
+    struct sigaction sa = {};
+    sa.sa_handler = crashHandler;
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    log.info("crash handler installed\n");
+  });
+}
+
+} // namespace
 
 struct LocalDevice {
   IbvPtr<ibv_context, ibv_close_device> ctx;
@@ -45,6 +104,279 @@ struct RankForIbSetup {
   }
 };
 
+// Command sent from the driving reference rank (refA) to the responding reference rank (refB)
+// during rail probing. `done == 1` ends the probe; otherwise refB brings up its NICs whose PCI
+// paths are `candidateIbPaths` (in slot order) and responds to one batched probe wave.
+struct WaveCmd {
+  uint8_t done = 0;
+  std::vector<std::string> candidateIbPaths;
+  template<typename X>
+  void serialize(X& x) {
+    x(done, candidateIbPaths);
+  }
+};
+
+// Process-global rail cache: ibPath -> canonical rail id, for this process's node. Rail
+// membership is a physical property of the node, independent of which process group is being
+// initialized, so once discovered it is reused across all subsequent (including sub-world)
+// process groups instead of re-probing. The numbering is canonical (rails are ordered by the
+// lexicographically smallest ibPath in each rail), which makes it identical no matter which
+// process group or which reference rank first discovered it — so cached values stay globally
+// consistent across process groups.
+namespace {
+std::mutex railCacheMutex;
+std::unordered_map<std::string, int> railCache;
+
+bool railProbeEnabled() {
+  const char* c = std::getenv("MOODIST_IB_RAIL_PROBE");
+  return !(c && c[0] == '0' && c[1] == 0);
+}
+} // namespace
+
+// Empirically determine which of this rank's local NICs are on the same routable rail, by
+// probing real RDMA connectivity across two nodes (never by inspecting device names or GID
+// subnets). Returns a rail id per entry in `localDevices` (same id => same rail; ids are
+// canonical, i.e. rails are numbered by their smallest ibPath). Returns an empty vector to
+// signal "fall back to legacy selection" (probing disabled, single-node group, or a node
+// whose NIC set does not match the reference — i.e. non-homogeneous topology).
+//
+// Only two ranks (the lowest rank on each of the two lowest nodes) do any probing; every
+// other rank simply waits at the broadcast allgather. Probing is skipped entirely when the
+// driving rank already has the rail map cached from an earlier process group.
+static std::vector<int> detectRailPartition(Group* group, std::vector<LocalDevice>& localDevices,
+    const std::vector<std::string>& allRanksBootId) {
+  const size_t rank = group->rank;
+  const size_t size = group->size;
+  SetupComms* sc = group->setupComms.get();
+  const size_t numNics = localDevices.size();
+
+  // Reference nodes: refA = lowest rank overall; refB = lowest rank on a different node.
+  const size_t refA = 0;
+  size_t refB = ~(size_t)0;
+  for (size_t i = 0; i != size; ++i) {
+    if (allRanksBootId[i] != allRanksBootId[refA]) {
+      refB = i;
+      break;
+    }
+  }
+  if (refB == ~(size_t)0) {
+    // Single-node process group: there is no cross-node routing, so rail membership is
+    // irrelevant to correctness. Let the caller use legacy selection.
+    return {};
+  }
+
+  const bool amRefA = rank == refA;
+  const bool amRefB = rank == refB;
+
+  // Hoist the (relatively expensive) 256-entry GID scan out of the probe: each reference rank
+  // resolves its own NICs' GIDs once and reuses them across every probe wave.
+  std::vector<uint32_t> myGidIndex(numNics, 0);
+  std::vector<ibv_gid> myGid(numNics);
+  if (amRefA || amRefB) {
+    for (size_t i = 0; i != numNics; ++i) {
+      try {
+        auto g = selectGid(localDevices[i].ctx, localDevices[i].portNum, /*quiet=*/true);
+        myGidIndex[i] = g.first;
+        myGid[i] = g.second;
+      } catch (const std::exception&) {
+        // Leave zero; the probe simply marks this slot invalid if its QP cannot be set up.
+      }
+    }
+  }
+
+  // refA authors this: (ibPath, canonical rail id) for every NIC on the reference node.
+  std::vector<std::pair<std::string, int>> authoredMap;
+
+  if (amRefA) {
+    bool warm = true;
+    {
+      std::lock_guard l(railCacheMutex);
+      for (auto& d : localDevices) {
+        auto it = railCache.find(d.ibPath);
+        if (it == railCache.end()) {
+          warm = false;
+          break;
+        }
+      }
+      if (warm) {
+        for (auto& d : localDevices) {
+          authoredMap.emplace_back(d.ibPath, railCache.at(d.ibPath));
+        }
+      }
+    }
+    if (warm) {
+      // Skip probing entirely; tell refB immediately that there is nothing to do.
+      WaveCmd cmd;
+      cmd.done = 1;
+      sc->sendTo(refB, cmd);
+    } else {
+      // Discover the rail equivalence classes empirically. Two NICs are on the same rail iff a
+      // test write between them succeeds. Rather than probe every pair serially, each "wave"
+      // probes one still-unclassified representative NIC against all other still-unclassified
+      // NICs at once (one QP per candidate, one shared poll), so discovery costs ~one wave per
+      // rail instead of ~one round-trip per pair. This gives the same partition: "same rail" is
+      // an equivalence relation, so testing each candidate directly against the representative
+      // needs no transitive closure.
+      const auto probeStart = std::chrono::steady_clock::now();
+      std::vector<int> disc(numNics, -1);
+      std::vector<size_t> unclassified;
+      for (size_t i = 0; i != numNics; ++i) {
+        unclassified.push_back(i);
+      }
+      int nextRail = 0;
+      size_t probeCount = 0;
+      while (!unclassified.empty()) {
+        const size_t rep = unclassified.front();
+        const std::vector<size_t> cands(unclassified.begin() + 1, unclassified.end());
+
+        WaveCmd cmd;
+        cmd.done = 0;
+        for (size_t c : cands) {
+          cmd.candidateIbPaths.push_back(localDevices[c].ibPath);
+        }
+        sc->sendTo(refB, cmd);
+
+        // The initiator side of every slot is the representative NIC (one QP per candidate).
+        std::vector<ProbeEndpoint> eps(cands.size());
+        for (size_t k = 0; k != cands.size(); ++k) {
+          eps[k].context = localDevices[rep].ctx;
+          eps[k].portNum = localDevices[rep].portNum;
+          eps[k].portAttributes = localDevices[rep].portAttributes;
+          eps[k].gidIndex = myGidIndex[rep];
+          eps[k].gid = myGid[rep];
+        }
+        const std::vector<uint8_t> ok = probeIbRailBatch(group, eps, refB, /*initiator=*/true);
+        probeCount += cands.size();
+
+        disc[rep] = nextRail;
+        for (size_t k = 0; k != cands.size(); ++k) {
+          if (k < ok.size() && ok[k]) {
+            disc[cands[k]] = nextRail;
+          }
+        }
+        ++nextRail;
+
+        std::vector<size_t> next;
+        for (size_t u : unclassified) {
+          if (disc[u] == -1) {
+            next.push_back(u);
+          }
+        }
+        unclassified = std::move(next);
+      }
+      {
+        WaveCmd cmd;
+        cmd.done = 1;
+        sc->sendTo(refB, cmd);
+      }
+
+      // Canonicalize: number rails by the smallest ibPath in each class, so the numbering is
+      // deterministic and matches any other process group that discovers the same hardware.
+      const int numRails = nextRail;
+      std::vector<std::string> classMinPath(numRails);
+      for (int c = 0; c != numRails; ++c) {
+        for (size_t i = 0; i != numNics; ++i) {
+          if (disc[i] == c && (classMinPath[c].empty() || localDevices[i].ibPath < classMinPath[c])) {
+            classMinPath[c] = localDevices[i].ibPath;
+          }
+        }
+      }
+      std::vector<int> order(numRails);
+      for (int c = 0; c != numRails; ++c) {
+        order[c] = c;
+      }
+      std::sort(order.begin(), order.end(), [&](int x, int y) { return classMinPath[x] < classMinPath[y]; });
+      std::vector<int> canonicalOf(numRails);
+      for (int newId = 0; newId != numRails; ++newId) {
+        canonicalOf[order[newId]] = newId;
+      }
+
+      for (size_t i = 0; i != numNics; ++i) {
+        authoredMap.emplace_back(localDevices[i].ibPath, canonicalOf[disc[i]]);
+      }
+
+      std::string summary;
+      for (int newId = 0; newId != numRails; ++newId) {
+        summary += fmt::sprintf("\n  rail %d:", newId);
+        for (size_t i = 0; i != numNics; ++i) {
+          if (canonicalOf[disc[i]] == newId) {
+            summary += " " + localDevices[i].ibPath;
+          }
+        }
+      }
+      const auto probeMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probeStart).count();
+      log.info("Rail connectivity probe found %d rail(s) among %d NIC(s) on the reference node "
+               "(%zu probe(s) across %d wave(s) in %lldms):%s\n",
+          numRails, numNics, probeCount, numRails, (long long)probeMs, summary);
+    }
+  } else if (amRefB) {
+    // Respond to refA's probe waves until told to stop. For each wave, bring up one QP per
+    // requested candidate NIC (matching refA's slot order); refA drives the writes.
+    while (true) {
+      WaveCmd cmd = sc->recvFrom<WaveCmd>(refA);
+      if (cmd.done) {
+        break;
+      }
+      std::vector<ProbeEndpoint> eps(cmd.candidateIbPaths.size());
+      for (size_t k = 0; k != cmd.candidateIbPaths.size(); ++k) {
+        LocalDevice* dev = nullptr;
+        for (auto& d : localDevices) {
+          if (d.ibPath == cmd.candidateIbPaths[k]) {
+            dev = &d;
+            break;
+          }
+        }
+        if (dev) {
+          const size_t di = (size_t)(dev - localDevices.data());
+          eps[k].context = dev->ctx;
+          eps[k].portNum = dev->portNum;
+          eps[k].portAttributes = dev->portAttributes;
+          eps[k].gidIndex = myGidIndex[di];
+          eps[k].gid = myGid[di];
+        }
+        // else: leave context == nullptr — the slot stays in lockstep and resolves to "no rail".
+      }
+      probeIbRailBatch(group, eps, refA, /*initiator=*/false);
+    }
+  }
+
+  // Broadcast the reference node's rail map to everyone. Non-authoring ranks send an empty map.
+  std::vector<std::vector<std::pair<std::string, int>>> allMaps = sc->allgather(authoredMap);
+  const std::vector<std::pair<std::string, int>>& refMap = allMaps.at(refA);
+  if (refMap.empty()) {
+    return {};
+  }
+
+  std::unordered_map<std::string, int> ibPathToRail;
+  for (auto& [path, railId] : refMap) {
+    ibPathToRail[path] = railId;
+  }
+
+  // Map this rank's NICs through the reference map. A missing entry means this node's NIC set
+  // differs from the reference node's (non-homogeneous) — fall back rather than guess.
+  std::vector<int> railOf(numNics, -1);
+  for (size_t i = 0; i != numNics; ++i) {
+    auto it = ibPathToRail.find(localDevices[i].ibPath);
+    if (it == ibPathToRail.end()) {
+      log.error("Rail probe: local NIC %s is not present in the reference node's rail map (node topology "
+                "mismatch); falling back to legacy device selection.\n",
+          localDevices[i].ibPath);
+      return {};
+    }
+    railOf[i] = it->second;
+  }
+
+  {
+    std::lock_guard l(railCacheMutex);
+    for (size_t i = 0; i != numNics; ++i) {
+      railCache[localDevices[i].ibPath] = railOf[i];
+    }
+  }
+
+  return railOf;
+}
+
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
@@ -61,6 +393,8 @@ Group::~Group() {
 }
 
 void Group::init(Function<void()> f, Function<void()> pghandle) {
+
+  installCrashHandler();
 
   auto start = std::chrono::steady_clock::now();
 
@@ -97,6 +431,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
   int asyncEngines;
   CHECK_CU(cuDeviceGetAttribute(&asyncEngines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, cuDevice));
   log.verbose("device async engines: %d\n", asyncEngines);
+
+  int dmaBufSupported;
+  CHECK_CU(cuDeviceGetAttribute(&dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice));
+  log.info("dmabuf supported: %d\n", dmaBufSupported);
 
   if (!loadNvml()) {
     throw std::runtime_error("NVML not available");
@@ -188,15 +526,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
     log.debug("%d: local ranks: [%s]\n", rank, fmt::to_string(fmt::join(localRanksByBootId, ", ")));
 
-    size_t localRankIndex = ~(size_t)0;
-    for (size_t i = 0; i != localRanksByBootId.size(); ++i) {
-      if (localRanksByBootId[i] == rank) {
-        localRankIndex = i;
-        break;
-      }
-    }
-    CHECK(localRankIndex >= 0 && localRankIndex < localRanksByBootId.size());
-
     std::unordered_map<size_t, int> localNvlink;
 
     std::vector<std::string> allRanksCudaPciBus = setupComms->allgather(std::string(cudaPciBus.data()));
@@ -242,7 +571,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       for (ibv_device** i = list; *i; ++i) {
         ibv_device* di = *i;
 
-        // fmt::printf("device %s\n", di->name);
         IbvPtr<ibv_context, ibv_close_device> ctx = ibv_open_device(di);
         if (ctx) {
           ibv_device_attr attributes;
@@ -276,7 +604,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
                 portAttributes = attributes;
               }
             }
-            // fmt::printf("queried port %d\n", 1 + i);
           }
           if (portNum == -1) {
             continue;
@@ -289,7 +616,6 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             free(path);
           }
           ibPath = removePciPathPrefix(ibPath);
-          // fmt::printf("ib path is %s\n", ibPath);
 
           auto getScore = [&](std::string cudaPath) {
             int nmatch = 0;
@@ -352,88 +678,211 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
       std::vector<std::pair<LocalDeviceNode*, LocalDevice*>> useDevices;
 
-      {
-        HashMap<std::string, bool> taken;
-        while (true) {
-          std::vector<LocalDeviceNode*> current;
-          HashMap<std::string_view, int> useCount;
-          current.resize(allDeviceNodes.size());
-          std::vector<LocalDeviceNode*> best;
-          std::tuple<int, int, int> bestScore = {0, 0, 0};
-          int solutions = 0;
-          std::function<void(size_t)> visit = [&](size_t index) {
-            if (index == allDeviceNodes.size()) {
-              std::tuple<int, int, int> score = {0, 0, 0};
-              for (LocalDeviceNode* n : current) {
-                auto s = n->score;
-                if (useCount[n->ibPath] > 1) {
-                  std::get<2>(s) -= useCount[n->ibPath];
-                  if (std::get<2>(s) > 0) {
-                    std::get<2>(s) /= useCount[n->ibPath];
-                  }
-                }
-                std::get<0>(score) += std::get<0>(s);
-                std::get<1>(score) += std::get<1>(s);
-                std::get<2>(score) += std::get<2>(s);
-                if (best.empty() || score > bestScore) {
-                  bestScore = score;
-                  best = current;
-                }
-              }
-              ++solutions;
-              return;
+      // Whole-node NIC assignment. Chooses one NIC per *physical* GPU on this node (indexed like
+      // allDeviceNodes / allCudaPaths, i.e. node-absolute — independent of which ranks are in this
+      // process group) so total GPU<->NIC PCI affinity is maximized, with a contention penalty that
+      // spreads GPUs across distinct cards when several are equidistant. `eligible(ibPath)` filters
+      // the candidate NICs, which is how callers restrict to a single rail and/or drop NICs already
+      // consumed by an earlier round. Returns one entry per GPU (pointer into allDeviceNodes), or
+      // empty if some GPU has no eligible NIC.
+      //
+      // Determinism across ranks is essential: every rank on an identical node must produce the
+      // same assignment, so same-index QP pairs (rank i device k <-> rank j device k) land on the
+      // same rail and card. The inputs are identical on such ranks and ties break on ibPath (never
+      // on pointer identity), so the result is identical too.
+      auto assignWholeNode = [&](const std::string& what, auto&& eligible) -> std::vector<LocalDeviceNode*> {
+        const size_t n = allDeviceNodes.size();
+        // Per-GPU candidate NICs, best score first (ties broken by ibPath). The branch factor is
+        // capped so this exhaustive search stays bounded on unusually large nodes: <=10 GPUs keep
+        // their top 4 NICs each (real rail/HGX hardware is <=8), 11..16 the top 2, and beyond that
+        // a single greedy choice. This stops a 16-GPU DGX-2 or a dense PCIe box from stalling setup
+        // with a 4^N search.
+        const size_t branchCap = n <= 10 ? 4 : (n <= 16 ? 2 : 1);
+        std::vector<std::vector<LocalDeviceNode*>> cand(n);
+        HashMap<std::string_view, bool> eligiblePaths;
+        for (size_t index : range(n)) {
+          for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
+            if (eligible(v.ibPath)) {
+              cand[index].push_back(&v);
+              eligiblePaths[v.ibPath] = true;
             }
-            std::vector<std::pair<std::tuple<int, int, int>, LocalDeviceNode*>> sorted;
-            for (LocalDeviceNode& v : allDeviceNodes.at(index)) {
-              if (!taken[v.ibPath]) {
-                sorted.emplace_back(v.score, &v);
-              }
-            }
-            if (sorted.empty()) {
-              return;
-            }
-            std::sort(sorted.begin(), sorted.end());
-            std::reverse(sorted.begin(), sorted.end());
-            if (sorted.size() > 4) {
-              sorted.resize(4);
-            }
-            for (auto& v : sorted) {
-              ++useCount[v.second->ibPath];
-              current[index] = v.second;
-              visit(index + 1);
-              --useCount[v.second->ibPath];
-            }
-          };
-          visit(0);
-
-          if (best.empty()) {
-            if (!useDevices.empty()) {
-              break;
-            }
-            throw std::runtime_error(
-                fmt::sprintf("No usable InfiniBand device found for rank %d (unreachable?)", rank));
           }
+          std::sort(cand[index].begin(), cand[index].end(), [](LocalDeviceNode* a, LocalDeviceNode* b) {
+            if (a->score != b->score) {
+              return a->score > b->score;
+            }
+            return a->ibPath < b->ibPath;
+          });
+          if (cand[index].size() > branchCap) {
+            cand[index].resize(branchCap);
+          }
+          if (cand[index].empty()) {
+            return {};
+          }
+        }
 
-          for (auto* v : best) {
+        std::vector<LocalDeviceNode*> current(n);
+        HashMap<std::string_view, int> useCount;
+        std::vector<LocalDeviceNode*> best;
+        std::tuple<int, int, int> bestScore = {0, 0, 0};
+        std::function<void(size_t)> visit = [&](size_t index) {
+          if (index == n) {
+            std::tuple<int, int, int> score = {0, 0, 0};
+            for (LocalDeviceNode* node : current) {
+              auto s = node->score;
+              const int uc = useCount[node->ibPath];
+              if (uc > 1) {
+                std::get<2>(s) -= uc;
+                if (std::get<2>(s) > 0) {
+                  std::get<2>(s) /= uc;
+                }
+              }
+              std::get<0>(score) += std::get<0>(s);
+              std::get<1>(score) += std::get<1>(s);
+              std::get<2>(score) += std::get<2>(s);
+            }
+            // Score the *complete* leaf (the old code updated best inside this accumulation loop and
+            // could latch onto a partial sum once the contention penalty drove a term negative).
+            if (best.empty() || score > bestScore) {
+              bestScore = score;
+              best = current;
+            }
+            return;
+          }
+          for (LocalDeviceNode* v : cand[index]) {
+            ++useCount[v->ibPath];
+            current[index] = v;
+            visit(index + 1);
+            --useCount[v->ibPath];
+          }
+        };
+        visit(0);
+
+        if (!best.empty()) {
+          // Dump the *whole-node* solution, not just this rank's slice. Every rank on the node must
+          // arrive at an identical assignment for same-index QP pairing to land on the same rail and
+          // card, and this line is what makes that invariant checkable on hardware: collect it from
+          // every rank on a node and confirm the strings are identical.
+          std::string assignment;
+          HashMap<std::string_view, bool> chosen;
+          for (size_t i : indices(best)) {
+            assignment += fmt::sprintf(" [%d]=%s", i, best[i]->ibPath);
+            chosen[best[i]->ibPath] = true;
+          }
+          log.verbose("rank %d whole-node NIC assignment (%s):%s\n", rank, what, assignment);
+          log.debug("rank %d whole-node NIC assignment (%s) has score %d %d %d\n", rank, what,
+              std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
+
+          // A distinct NIC per GPU falls out of the contention penalty, which is a soft term in the
+          // score rather than a hard constraint -- so it can quietly fail to hold. Only report it
+          // when there were actually enough NICs to go around: with fewer eligible NICs than GPUs,
+          // or once branchCap has trimmed the candidate lists on a large node, sharing is expected.
+          if (chosen.size() < n && eligiblePaths.size() >= n) {
+            log.info(
+                "rank %d: whole-node NIC assignment (%s) placed %d GPUs on only %d distinct NICs, "
+                "though %d were eligible; per-GPU network bandwidth may be reduced\n",
+                rank, what, n, chosen.size(), eligiblePaths.size());
+          }
+        }
+        return best;
+      };
+
+      // Map a chosen node (pointer into allDeviceNodes, identified by ibPath) to the owning
+      // localDeviceNodes / localDevices entries and append it to useDevices.
+      auto appendUseDevice = [&](LocalDeviceNode* picked) {
+        const size_t before = useDevices.size();
+        for (auto& ldn : localDeviceNodes) {
+          if (ldn.ibPath == picked->ibPath) {
+            for (auto& ld : localDevices) {
+              if (ld.ibPath == ldn.ibPath) {
+                useDevices.emplace_back(&ldn, &ld);
+              }
+            }
+          }
+        }
+        // Exactly one match is guaranteed: ibPath is unique within localDeviceNodes and within
+        // localDevices (checked as they are built), and every ibPath in allDeviceNodes was added
+        // to both. Pin it here anyway -- callers rely on the count advancing by exactly one to
+        // bound their loops and to index the summary line.
+        CHECK(useDevices.size() == before + 1);
+      };
+
+      // Rail-aware device selection (see detectRailPartition). When it succeeds, device index k
+      // is the same routable rail on every rank, which is what makes moodist's corresponding-
+      // index QP pairing (rank i's device k <-> rank j's device k) actually route on rail-
+      // optimized fabrics. When it declines (probing disabled, single-node group, or a non-
+      // homogeneous node) useDevices is left empty and the legacy PCI-locality selection below
+      // runs instead.
+      std::vector<int> railOf;
+      if (railProbeEnabled()) {
+        railOf = detectRailPartition(this, localDevices, allRanksBootId);
+      }
+      if (!railOf.empty()) {
+        int numRails = 0;
+        for (int r : railOf) {
+          numRails = std::max(numRails, r + 1);
+        }
+        std::vector<std::vector<size_t>> railMembers(numRails);
+        for (size_t i : indices(localDevices)) {
+          railMembers[railOf[i]].push_back(i);
+        }
+        bool ok = true;
+        for (int r = 0; r != numRails; ++r) {
+          if (railMembers[r].empty()) {
+            // This node is missing a rail that the reference node has: not homogeneous.
+            ok = false;
+            break;
+          }
+          std::sort(railMembers[r].begin(), railMembers[r].end(),
+              [&](size_t x, size_t y) { return localDevices[x].ibPath < localDevices[y].ibPath; });
+        }
+        if (ok) {
+          // Iterate rails in ascending canonical id so device index k == rail k: a device-k QP then
+          // always connects the same rail on every rank (moodist uses full per-index all-to-all
+          // connectivity, not just same-local-rank pairs). For each rail we run the whole-node NIC
+          // assignment restricted to that rail's NICs and take this rank's own GPU's pick. Because
+          // that assignment ranges over *all* physical GPUs on the node (not just this process
+          // group's ranks), a GPU never takes the NIC a lower-indexed GPU would get, even when that
+          // GPU is absent from this process group.
+          std::string summary;
+          for (int r = 0; r != numRails && useDevices.size() != maxDevices; ++r) {
+            HashMap<std::string_view, bool> railPaths;
+            for (size_t i : railMembers[r]) {
+              railPaths[localDevices[i].ibPath] = true;
+            }
+            std::vector<LocalDeviceNode*> best = assignWholeNode(
+                fmt::sprintf("rail %d", r), [&](const std::string& ibPath) { return railPaths.contains(ibPath); });
+            CHECK(!best.empty());
+            LocalDeviceNode* pick = best.at(localAllCudaPathsIndex);
+            appendUseDevice(pick);
+            summary += fmt::sprintf("\n  device %d: %s (rail %d)", useDevices.size() - 1, pick->ibPath, r);
+          }
+          log.verbose("rank %d rail-aware device selection:%s\n", rank, summary);
+        }
+      }
+
+      if (useDevices.empty()) {
+        // Legacy PCI-locality selection (rails not detected: single-node group, probing disabled,
+        // or a non-homogeneous node). Assign NICs across the whole node, then repeat with the
+        // chosen NICs removed so each rank collects several distinct NICs (striped for bandwidth)
+        // up to maxDevices. Ranging over all physical GPUs keeps the choice node-absolute, so a
+        // subset process group still lands on the same NICs it would on the full node.
+        HashMap<std::string, bool> taken;
+        for (size_t round = 0; useDevices.size() != maxDevices; ++round) {
+          std::vector<LocalDeviceNode*> best = assignWholeNode(
+              fmt::sprintf("round %d", round), [&](const std::string& ibPath) { return !taken[ibPath]; });
+          if (best.empty()) {
+            break;
+          }
+          for (LocalDeviceNode* v : best) {
             taken[v->ibPath] = true;
           }
-
-          log.debug("evaluated %d solutions\n", solutions);
-          log.debug("best score %d %d %d\n", std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
-
-          for (size_t i = 0; i != best.size(); ++i) {
-            log.debug("best device for %d is %s with score %d\n", i, best[i]->ibPath, std::get<0>(best[i]->score));
-          }
-
-          for (auto& v : localDeviceNodes) {
-            if (v.ibPath == best.at(localAllCudaPathsIndex)->ibPath) {
-              for (auto& v2 : localDevices) {
-                if (v2.ibPath == v.ibPath) {
-                  useDevices.emplace_back(&v, &v2);
-                }
-              }
-            }
-          }
+          LocalDeviceNode* pick = best.at(localAllCudaPathsIndex);
+          log.debug("legacy device selection: rank %d device %d is %s\n", rank, useDevices.size(), pick->ibPath);
+          appendUseDevice(pick);
+        }
+        if (useDevices.empty()) {
+          throw std::runtime_error(fmt::sprintf("No usable InfiniBand device found for rank %d (unreachable?)", rank));
         }
       }
 
@@ -532,7 +981,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       rankLocalRank.push_back(localRank);
     }
 
-    AllocatedBuffer testMemory = allocateDevice(0x1000);
+    AllocatedBuffer testMemory = allocateDevice(0x1000, false);
 
     CUipcMemHandle testIpcHandle;
     CHECK_CU(cuIpcGetMemHandle(&testIpcHandle, testMemory.cudaPointer));
@@ -557,6 +1006,97 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     }
 
     CHECK(peerIndices.size() <= 8);
+
+    if (true) {
+      auto tmp = allocateDevice(0x1000);
+
+      unsigned long long handle;
+      size_t offset;
+      size_t bytes;
+      CHECK(allocatorGetChunk(0, &handle, &offset, &bytes));
+      CHECK(offset == 0);
+
+      nvmlGpuFabricInfo_t localFabricInfo;
+      CHECK_NVML(nvmlApi.deviceGetGpuFabricInfoV(nvmlDevice, &localFabricInfo));
+
+      log.info("local fabric clique: %#x, clusterUuid: %s\n", localFabricInfo.cliqueId,
+          hexstr(localFabricInfo.clusterUuid, 16));
+
+      struct FabricId {
+        unsigned int clique;
+        std::array<unsigned char, 16> cluster;
+        bool operator==(const FabricId& n) const = default;
+      };
+      FabricId localFabricId;
+      localFabricId.clique = localFabricInfo.cliqueId;
+      std::ranges::copy(localFabricInfo.clusterUuid, localFabricId.cluster.begin());
+
+      CUmemFabricHandle fabricHandle;
+      bool hasFabric = false;
+      if (!std::ranges::all_of(localFabricId.cluster, [](auto& v) {
+            return v == 0;
+          })) {
+        hasFabric = cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0) == CUDA_SUCCESS;
+      }
+      if (!hasFabric) {
+        std::memset(&fabricHandle, 0, sizeof(fabricHandle));
+      }
+
+      struct Info {
+        CUmemFabricHandle handle;
+        FabricId fabric;
+      } info;
+      info.handle = fabricHandle;
+      info.fabric = localFabricId;
+
+      auto allinfos = setupComms->allgather(info);
+
+      Vector<size_t> fabricDomain;
+
+      if (hasFabric) {
+        for (size_t i : range(size)) {
+          if (i == rank) {
+            continue;
+          }
+          auto& ii = allinfos.at(i);
+          bool connected = ii.fabric == localFabricId;
+          if (std::ranges::all_of(ii.fabric.cluster, [](auto& v) {
+                return v == 0;
+              })) {
+            connected = false;
+          }
+          if (!connected) {
+            continue;
+          }
+
+          fabricDomain.push_back(i);
+        }
+      }
+      if (!fabricDomain.empty()) {
+        fabricDomain.push_back(rank);
+      }
+      std::ranges::sort(fabricDomain);
+
+      if (!fabricDomain.empty()) {
+        log.info("The following %d ranks are in my fabric domain: %s\n", fabricDomain.size(),
+            fmt::to_string(fmt::join(fabricDomain, ", ")));
+      }
+
+      auto allDomains = setupComms->allgather(fabricDomain);
+
+      for (size_t i : fabricDomain) {
+        if (allDomains[i] != fabricDomain) {
+          throw std::runtime_error(fmt::sprintf(
+              "moodist: Fabric domain mismatch error. Two ranks have detected a mismatching set of CUDA "
+              "fabric connected ranks. Rank %d set: [%s], rank %d set: [%s].\n",
+              rank, fmt::to_string(fmt::join(fabricDomain, ", ")), i, fmt::to_string(fmt::join(allDomains[i], ", "))));
+        }
+      }
+
+      fabricDomainRanks = fabricDomain;
+
+      log.info("ALL FABRIC OK!\n");
+    }
 
     if (rank == 0) {
       log.debug("initial connection setup took %g ms\n", seconds(std::chrono::steady_clock::now() - start) * 1000);
@@ -625,21 +1165,62 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
     }
 
-    // int localSupportsMulticast = 0;
-    // CHECK_CU(cuDeviceGetAttribute(&localSupportsMulticast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
-    // supportsMulticast = localSupportsMulticast;
-    // for (size_t i : peerIndices) {
-    //   setupComms->sendTo(ipcRanks[i], supportsMulticast);
-    // }
-    // for (size_t i : peerIndices) {
-    //   supportsMulticast &= setupComms->recvFrom<bool>(ipcRanks[i]);
-    // }
+    // Fabric handle support detection — probe with an actual cuMemCreate
+    // since the device attribute alone doesn't guarantee IMEX is running.
+    {
+      bool localSupportsFabric = false;
+      int fabricAttr = 0;
+      cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
+      if (fabricAttr != 0) {
+        CUmemAllocationProp prop;
+        std::memset(&prop, 0, sizeof(prop));
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes =
+            (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = cuDevice;
 
-    // if (supportsMulticast) {
-    //   log.info("Multicast supported by all local devices\n");
-    // } else {
-    //   log.info("Multicast not supported by all local devices\n");
-    // }
+        size_t granularity = 0;
+        CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+        CUmemGenericAllocationHandle probeHandle;
+        auto probeErr = cuMemCreate(&probeHandle, granularity, &prop, 0);
+        if (probeErr == CUDA_SUCCESS) {
+          cuMemRelease(probeHandle);
+          localSupportsFabric = true;
+        }
+      }
+      supportsFabric = localSupportsFabric;
+      for (size_t i : ipcRanks) {
+        setupComms->sendTo(i, localSupportsFabric);
+      }
+      for (size_t i : ipcRanks) {
+        supportsFabric &= setupComms->recvFrom<bool>(i);
+      }
+      if (supportsFabric) {
+        log.info("Fabric handles supported for VMM IPC\n");
+      } else {
+        log.info("Fabric handles not available, using POSIX fd for VMM IPC\n");
+      }
+    }
+
+    // Multicast support detection
+    int mcAttr = 0;
+    CHECK_CU(cuDeviceGetAttribute(&mcAttr, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
+    bool localSupportsMulticast = mcAttr != 0;
+    supportsMulticast = localSupportsMulticast;
+    for (size_t i : ipcRanks) {
+      setupComms->sendTo(i, supportsMulticast);
+    }
+    for (size_t i : ipcRanks) {
+      supportsMulticast &= setupComms->recvFrom<bool>(i);
+    }
+
+    if (supportsMulticast) {
+      log.info("Multicast supported by all local devices\n");
+    } else {
+      log.info("Multicast not supported by all local devices\n");
+    }
 
     if (rank == 0) {
       log.debug(
@@ -695,10 +1276,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
     cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
 
-    {
-      unsigned int value = 1;
-      CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
-    }
+    // {
+    //   unsigned int value = 1;
+    //   CHECK_CU(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, cpuOutBuffer.buffer.cudaPointer));
+    // }
 
     auto mapPeerAddrs = [&](AllocatedArray& localArray, std::array<PeerArrayRef, 8>& peerPtrs) {
       peerPtrs.fill({});
@@ -744,6 +1325,9 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     cudaCopyDone = allocateArrayDevice(sizeof(uint64_t) * 8, Group::maxConcurrency);
     mapPeerAddrs(cudaCopyDone, peerCudaCopyDone);
 
+    cudaBlockDone = allocateArrayDevice(sizeof(uint32_t) * 8 * maxBlocks, Group::maxConcurrency);
+    mapPeerAddrs(cudaBlockDone, peerCudaBlockDone);
+
     cudaStepValuesBuffer = allocateArrayDevice(sizeof(uint32_t) * size, Group::maxConcurrency);
     cudaStepValuesDeviceChunksBuffer =
         allocateArrayDevice(sizeof(uint32_t) * Group::maxChunks * Group::maxDevices * size, Group::maxConcurrency);
@@ -765,6 +1349,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
         &cpuCommsDeviceDataSent2,
         &cudaProxyReady,
         &cudaCopyDone,
+        &cudaBlockDone,
         &cudaStepValuesBuffer,
         &cudaStepValuesDeviceChunksBuffer,
         &cudaMemSync,
@@ -779,6 +1364,18 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     setupComms->allgather(0);
 
     log.debug("%d: init synchronized!\n", rank);
+
+    // auto test = allocateDevice(1024 * 1024);
+
+    // int fd = -1;
+    // CUresult err = cuMemGetHandleForAddressRange(&fd, (uintptr_t)test.cudaPointer, test.bytes,
+    // CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0); log.info("dmabuf err -> %d\n", err); log.info("fd -> %d\n", fd);
+
+    // auto alloc = cudaAllocatorImplAllocate(nullptr, 1024 * 1024, 0, -1);
+
+    // fd = -1;
+    // err = cuMemGetHandleForAddressRange(&fd, (uintptr_t)alloc.ptr, test.bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+    // 0); log.info("dmabuf err -> %d\n", err); log.info("fd -> %d\n", fd); CHECK_CU(err);
   };
 
   cpuThread->start(std::move(pghandle));
@@ -808,14 +1405,22 @@ AllocatedBuffer Group::allocateManaged(size_t bytes) {
   reportBytes();
   return r;
 }
-AllocatedBuffer Group::allocateDevice(size_t bytes) {
+AllocatedBuffer Group::allocateDevice(size_t bytes, bool useAllocator) {
   if (bytes < 4096) {
     bytes = 4096;
   }
   AllocatedBuffer r;
   r.bytes = bytes;
   CUdeviceptr ptr;
-  CHECK_CU(cuMemAlloc(&ptr, bytes));
+  if (useAllocator) {
+    auto alloc = cudaAllocatorImplAllocate(nullptr, bytes, 0, -1);
+    r.externalAlloc = DeferredCleanup(Function<void()>([alloc]() {
+      cudaAllocatorImplFree(alloc.cleanupCtx, 0);
+    }));
+    ptr = alloc.ptr;
+  } else {
+    CHECK_CU(cuMemAlloc(&ptr, bytes));
+  }
   CHECK_CU(cuMemsetD8(ptr, 0, bytes));
   r.hostAllocated = false;
   r.cudaPointer = ptr;

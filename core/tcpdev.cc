@@ -125,16 +125,7 @@ struct TcpDevImpl {
   }
 
   ~TcpDevImpl() {
-    {
-      std::lock_guard l(mutex);
-      dead = true;
-    }
-    closeAll(listeners);
-    closeAll(floatingConnections);
-    closeAll(connections);
-    while (refcount) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    close();
   }
 
   void close() {
@@ -143,16 +134,11 @@ struct TcpDevImpl {
       dead = true;
       queuedSends.clear();
     }
-    for (auto& v : listeners) {
-      v->close();
-    }
-    for (auto& v : floatingConnections) {
-      v->close();
-    }
-    for (auto& v : connections) {
-      if (v) {
-        v->close();
-      }
+    closeAll(listeners);
+    closeAll(floatingConnections);
+    closeAll(connections);
+    while (refcount) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
 
@@ -166,11 +152,12 @@ struct TcpDevImpl {
       if (!e) {
         onRead(std::move(data), ci);
       } else {
-        // if (ci->rank != unconnected) {
-        //   log.error("Moodist tcp connection error (rank %d): %s\n", ci->rank, e->what());
-        // }
         ci->connection->close();
 
+        std::lock_guard l(mutex);
+        if (dead) {
+          return;
+        }
         if (ci->rank != unconnected) {
           tcpOnErrorCallback(onReadHandle, ci->rank, e);
         }
@@ -225,8 +212,10 @@ struct TcpDevImpl {
           queuedSends.erase(it);
         }
       } else {
+        ++refcount;
         l.unlock();
         onMessage(ci->rank, std::move(data));
+        --refcount;
       }
 
     } catch (const SerializationError& e) {

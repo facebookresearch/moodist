@@ -63,7 +63,8 @@ struct MrManager {
     mrs[lkey].active = false;
     freeIndices.push_back(lkey);
   }
-} mrManager;
+};
+MrManager& mrManager = Global();
 
 struct MrHandle {
   uint32_t key = 0;
@@ -90,6 +91,10 @@ struct MrHandle {
 };
 
 struct Mr : RdmaMr {
+  Mr(uint32_t key) {
+    lkey = key;
+    rkey = key;
+  }
   ~Mr() {
     mrManager.dereg(lkey);
   }
@@ -152,12 +157,12 @@ struct RdmaTcp : Rdma {
   }
 
   [[gnu::noinline]] [[gnu::cold]] void setError(size_t sourceRank = -1) {
+    CHECK(tcp != nullptr);
     if (errorState) {
       return;
     }
     errorStateSourceRank = sourceRank;
     errorState = true;
-    tcp->close();
   }
 
   void onRead(size_t i, BufferHandle buffer, void* handle) {
@@ -483,14 +488,10 @@ struct RdmaTcp : Rdma {
   }
 
   std::unique_ptr<RdmaMr> regMrCpu(void* address, size_t bytes) {
-    auto r = std::make_unique<Mr>();
-    r->rkey = r->lkey = mrManager.reg(true, address, bytes);
-    return r;
+    return std::make_unique<Mr>(mrManager.reg(true, address, bytes));
   }
   std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
-    auto r = std::make_unique<Mr>();
-    r->rkey = r->lkey = mrManager.reg(false, address, bytes);
-    return r;
+    return std::make_unique<Mr>(mrManager.reg(false, address, bytes));
   }
 
   constexpr bool supportsCuda() const {

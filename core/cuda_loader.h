@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -36,6 +37,9 @@ using CUmodule = CUmod_st*;
 struct CUfunc_st;
 using CUfunction = CUfunc_st*;
 
+struct CUlinkState_st;
+using CUlinkState = CUlinkState_st*;
+
 // CUstream is defined in global namespace and aliased above
 
 struct CUevent_st;
@@ -53,6 +57,69 @@ using cuuint32_t = uint32_t;
 // Virtual memory management handle
 using CUmemGenericAllocationHandle = unsigned long long;
 
+// Virtual memory management enums
+enum CUmemLocationType {
+  CU_MEM_LOCATION_TYPE_INVALID = 0,
+  CU_MEM_LOCATION_TYPE_DEVICE = 1,
+};
+
+enum CUmemAllocationType {
+  CU_MEM_ALLOCATION_TYPE_INVALID = 0,
+  CU_MEM_ALLOCATION_TYPE_PINNED = 1,
+};
+
+enum CUmemAllocationHandleType {
+  CU_MEM_HANDLE_TYPE_NONE = 0,
+  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1,
+  CU_MEM_HANDLE_TYPE_WIN32 = 2,
+  CU_MEM_HANDLE_TYPE_WIN32_KMT = 4,
+  CU_MEM_HANDLE_TYPE_FABRIC = 8,
+};
+
+enum CUmemAccess_flags {
+  CU_MEM_ACCESS_FLAGS_PROT_NONE = 0,
+  CU_MEM_ACCESS_FLAGS_PROT_READ = 1,
+  CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3,
+};
+
+enum CUmemAllocationGranularity_flags {
+  CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0,
+  CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 1,
+};
+
+enum CUmemRangeFlags {
+  CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE = 1,
+};
+
+enum CUmemRangeHandleType {
+  CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1,
+  CU_MEM_RANGE_HANDLE_TYPE_MAX = 0x7FFFFFFF,
+};
+
+// Virtual memory management structs
+struct CUmemLocation {
+  CUmemLocationType type;
+  int id;
+};
+
+struct CUmemAllocationProp {
+  CUmemAllocationType type;
+  CUmemAllocationHandleType requestedHandleTypes;
+  CUmemLocation location;
+  void* win32HandleMetaData;
+  struct {
+    unsigned char compressionType;
+    unsigned char gpuDirectRDMACapable;
+    unsigned short usage;
+    unsigned char reserved[4];
+  } allocFlags;
+};
+
+struct CUmemAccessDesc {
+  CUmemLocation location;
+  CUmemAccess_flags flags;
+};
+
 constexpr int CU_IPC_HANDLE_SIZE = 64;
 
 struct CUipcMemHandle {
@@ -61,6 +128,23 @@ struct CUipcMemHandle {
 
 struct CUipcEventHandle {
   char reserved[CU_IPC_HANDLE_SIZE];
+};
+
+struct CUmemFabricHandle {
+  unsigned char data[64];
+};
+
+// Multicast types
+struct CUmulticastObjectProp {
+  unsigned int numDevices;
+  size_t size;
+  unsigned long long handleTypes;
+  unsigned long long flags;
+};
+
+enum CUmulticastGranularity_flags {
+  CU_MULTICAST_GRANULARITY_MINIMUM = 0,
+  CU_MULTICAST_GRANULARITY_RECOMMENDED = 1,
 };
 
 // Memory types
@@ -102,6 +186,10 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR 
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 124;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128;
+constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132;
 
 // Pointer attributes
 using CUpointer_attribute = int;
@@ -111,8 +199,26 @@ constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_BUFFER_ID = 7;
 // Function attributes
 using CUfunction_attribute = int;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0;
+constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3;
 constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
+constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
+
+// JIT options
+using CUjit_option = int;
+constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER = 5;
+constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER = 3;
+constexpr CUjit_option CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+
+using CUjitInputType = int;
+constexpr CUjitInputType CU_JIT_INPUT_CUBIN = 0;
+constexpr CUjitInputType CU_JIT_INPUT_PTX = 1;
+constexpr CUjitInputType CU_JIT_INPUT_FATBINARY = 2;
+constexpr CUjitInputType CU_JIT_INPUT_OBJECT = 3;
+constexpr CUjitInputType CU_JIT_INPUT_LIBRARY = 4;
+constexpr CUjitInputType CU_JIT_INPUT_NVVM = 5;
+constexpr CUjitInputType CU_JIT_NUM_INPUT_TYPES = 6;
 
 // Event flags
 constexpr unsigned int CU_EVENT_DEFAULT = 0x0;
@@ -186,6 +292,32 @@ union CUstreamBatchMemOpParams {
 // Host function callback type
 using CUhostFn = void (*)(void* userData);
 
+using CUlaunchAttributeID = unsigned long;
+
+constexpr CUlaunchAttributeID CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN = 10;
+
+constexpr unsigned long CU_LAUNCH_MEM_SYNC_DOMAIN_DEFAULT = 0;
+constexpr unsigned long CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE = 1;
+
+union CUlaunchAttributeValue {
+  char pad[64];
+  unsigned long value;
+};
+
+struct CUlaunchAttribute {
+  CUlaunchAttributeID id;
+  CUlaunchAttributeValue value;
+};
+
+struct CUlaunchConfig {
+  std::array<unsigned int, 3> grid;
+  std::array<unsigned int, 3> block;
+  unsigned int sharedMemBytes;
+  CUstream hStream;
+  CUlaunchAttribute* attrs;
+  unsigned int numAttrs;
+};
+
 // ============================================================================
 // CUDA Driver API function pointer types
 // ============================================================================
@@ -211,6 +343,12 @@ using cuCtxGetDevice_t = CUresult (*)(CUdevice* device);
 using cuDevicePrimaryCtxRetain_t = CUresult (*)(CUcontext* pctx, CUdevice dev);
 
 // Module management
+using cuLinkCreate_t = CUresult (*)(
+    unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut);
+using cuLinkAddData_t = CUresult (*)(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+    unsigned int numOptions, CUjit_option* options, void** optionValues);
+using cuLinkComplete_t = CUresult (*)(CUlinkState state, void** cubinOut, size_t* sizeOut);
+using cuLinkDestroy_t = CUresult (*)(CUlinkState state);
 using cuModuleLoadDataEx_t = CUresult (*)(
     CUmodule* module, const void* image, unsigned int numOptions, int* options, void** optionValues);
 using cuModuleUnload_t = CUresult (*)(CUmodule hmod);
@@ -218,6 +356,7 @@ using cuModuleGetFunction_t = CUresult (*)(CUfunction* hfunc, CUmodule hmod, con
 
 // Function management
 using cuFuncGetAttribute_t = CUresult (*)(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
+using cuFuncSetAttribute_t = CUresult (*)(CUfunction hfunc, CUfunction_attribute attrib, int value);
 
 // Memory management
 using cuMemAlloc_t = CUresult (*)(CUdeviceptr* dptr, size_t bytesize);
@@ -225,6 +364,8 @@ using cuMemFree_t = CUresult (*)(CUdeviceptr dptr);
 using cuMemAllocManaged_t = CUresult (*)(CUdeviceptr* dptr, size_t bytesize, unsigned int flags);
 using cuMemGetInfo_t = CUresult (*)(size_t* free, size_t* total);
 using cuMemGetAddressRange_t = CUresult (*)(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr);
+using cuMemGetHandleForAddressRange_t = CUresult (*)(
+    void* handle, CUdeviceptr dptr, size_t size, CUmemRangeHandleType handleType, unsigned long long flags);
 using cuMemHostAlloc_t = CUresult (*)(void** pp, size_t bytesize, unsigned int flags);
 using cuMemFreeHost_t = CUresult (*)(void* p);
 using cuMemHostRegister_t = CUresult (*)(void* p, size_t bytesize, unsigned int flags);
@@ -243,6 +384,29 @@ using cuMemUnmap_t = CUresult (*)(CUdeviceptr ptr, size_t size);
 using cuMemAddressFree_t = CUresult (*)(CUdeviceptr ptr, size_t size);
 using cuMemRelease_t = CUresult (*)(uint64_t handle);
 
+// Virtual memory management
+using cuMemCreate_t = CUresult (*)(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags);
+using cuMemAddressReserve_t = CUresult (*)(
+    CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
+using cuMemMap_t = CUresult (*)(
+    CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
+using cuMemSetAccess_t = CUresult (*)(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+using cuMemGetAllocationGranularity_t = CUresult (*)(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option);
+using cuMemExportToShareableHandle_t = CUresult (*)(void* shareableHandle, CUmemGenericAllocationHandle handle,
+    CUmemAllocationHandleType handleType, unsigned long long flags);
+using cuMemImportFromShareableHandle_t = CUresult (*)(
+    CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType);
+
+// Multicast management (optional, Hopper+ with NVSwitch)
+using cuMulticastCreate_t = CUresult (*)(CUmemGenericAllocationHandle*, const CUmulticastObjectProp*);
+using cuMulticastAddDevice_t = CUresult (*)(CUmemGenericAllocationHandle, CUdevice);
+using cuMulticastBindMem_t = CUresult (*)(
+    CUmemGenericAllocationHandle, size_t, CUmemGenericAllocationHandle, size_t, size_t, unsigned long long);
+using cuMulticastGetGranularity_t = CUresult (*)(size_t*, const CUmulticastObjectProp*, CUmulticastGranularity_flags);
+using cuMulticastUnbind_t = CUresult (*)(CUmemGenericAllocationHandle, CUdevice, size_t, size_t);
+
 // Pointer attributes
 using cuPointerGetAttribute_t = CUresult (*)(void* data, CUpointer_attribute attribute, CUdeviceptr ptr);
 using cuPointerSetAttribute_t = CUresult (*)(const void* value, CUpointer_attribute attribute, CUdeviceptr ptr);
@@ -250,6 +414,7 @@ using cuPointerSetAttribute_t = CUresult (*)(const void* value, CUpointer_attrib
 // Stream management
 using cuStreamCreateWithPriority_t = CUresult (*)(CUstream* phStream, unsigned int flags, int priority);
 using cuStreamDestroy_t = CUresult (*)(CUstream hStream);
+using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
 using cuStreamWaitEvent_t = CUresult (*)(CUstream hStream, CUevent hEvent, unsigned int flags);
 using cuStreamWaitValue32_t = CUresult (*)(CUstream stream, CUdeviceptr addr, cuuint32_t value, unsigned int flags);
 using cuStreamBatchMemOp_t = CUresult (*)(
@@ -261,6 +426,7 @@ using cuEventDestroy_t = CUresult (*)(CUevent hEvent);
 using cuEventRecord_t = CUresult (*)(CUevent hEvent, CUstream hStream);
 using cuEventQuery_t = CUresult (*)(CUevent hEvent);
 using cuEventSynchronize_t = CUresult (*)(CUevent hEvent);
+using cuEventElapsedTime_t = CUresult (*)(float* pMilliseconds, CUevent hStart, CUevent hEnd);
 
 // IPC
 using cuIpcGetMemHandle_t = CUresult (*)(CUipcMemHandle* pHandle, CUdeviceptr dptr);
@@ -273,6 +439,7 @@ using cuIpcOpenEventHandle_t = CUresult (*)(CUevent* phEvent, CUipcEventHandle h
 using cuLaunchKernel_t = CUresult (*)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
     CUstream hStream, void** kernelParams, void** extra);
+using cuLaunchKernelEx_t = CUresult (*)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 using cuLaunchHostFunc_t = CUresult (*)(CUstream hStream, CUhostFn fn, void* userData);
 
 // ============================================================================
@@ -301,12 +468,17 @@ struct CudaApi {
   cuDevicePrimaryCtxRetain_t devicePrimaryCtxRetain = nullptr;
 
   // Module management
+  cuLinkCreate_t linkCreate = nullptr;
+  cuLinkAddData_t linkAddData = nullptr;
+  cuLinkComplete_t linkComplete = nullptr;
+  cuLinkDestroy_t linkDestroy = nullptr;
   cuModuleLoadDataEx_t moduleLoadDataEx = nullptr;
   cuModuleUnload_t moduleUnload = nullptr;
   cuModuleGetFunction_t moduleGetFunction = nullptr;
 
   // Function management
   cuFuncGetAttribute_t funcGetAttribute = nullptr;
+  cuFuncSetAttribute_t funcSetAttribute = nullptr;
 
   // Memory management
   cuMemAlloc_t memAlloc = nullptr;
@@ -314,6 +486,7 @@ struct CudaApi {
   cuMemAllocManaged_t memAllocManaged = nullptr;
   cuMemGetInfo_t memGetInfo = nullptr;
   cuMemGetAddressRange_t memGetAddressRange = nullptr;
+  cuMemGetHandleForAddressRange_t memGetHandleForAddressRange = nullptr;
   cuMemHostAlloc_t memHostAlloc = nullptr;
   cuMemFreeHost_t memFreeHost = nullptr;
   cuMemHostRegister_t memHostRegister = nullptr;
@@ -331,6 +504,22 @@ struct CudaApi {
   cuMemAddressFree_t memAddressFree = nullptr;
   cuMemRelease_t memRelease = nullptr;
 
+  // Virtual memory management
+  cuMemCreate_t memCreate = nullptr;
+  cuMemAddressReserve_t memAddressReserve = nullptr;
+  cuMemMap_t memMap = nullptr;
+  cuMemSetAccess_t memSetAccess = nullptr;
+  cuMemGetAllocationGranularity_t memGetAllocationGranularity = nullptr;
+  cuMemExportToShareableHandle_t memExportToShareableHandle = nullptr;
+  cuMemImportFromShareableHandle_t memImportFromShareableHandle = nullptr;
+
+  // Multicast (optional)
+  cuMulticastCreate_t multicastCreate = nullptr;
+  cuMulticastAddDevice_t multicastAddDevice = nullptr;
+  cuMulticastBindMem_t multicastBindMem = nullptr;
+  cuMulticastGetGranularity_t multicastGetGranularity = nullptr;
+  cuMulticastUnbind_t multicastUnbind = nullptr;
+
   // Pointer attributes
   cuPointerGetAttribute_t pointerGetAttribute = nullptr;
   cuPointerSetAttribute_t pointerSetAttribute = nullptr;
@@ -338,6 +527,7 @@ struct CudaApi {
   // Stream management
   cuStreamCreateWithPriority_t streamCreateWithPriority = nullptr;
   cuStreamDestroy_t streamDestroy = nullptr;
+  cuStreamSynchronize_t streamSynchronize = nullptr;
   cuStreamWaitEvent_t streamWaitEvent = nullptr;
   cuStreamWaitValue32_t streamWaitValue32 = nullptr;
   cuStreamBatchMemOp_t streamBatchMemOp = nullptr;
@@ -348,6 +538,7 @@ struct CudaApi {
   cuEventRecord_t eventRecord = nullptr;
   cuEventQuery_t eventQuery = nullptr;
   cuEventSynchronize_t eventSynchronize = nullptr;
+  cuEventElapsedTime_t eventElapsedTime = nullptr;
 
   // IPC
   cuIpcGetMemHandle_t ipcGetMemHandle = nullptr;
@@ -358,6 +549,7 @@ struct CudaApi {
 
   // Kernel launch
   cuLaunchKernel_t launchKernel = nullptr;
+  cuLaunchKernelEx_t launchKernelEx = nullptr;
   cuLaunchHostFunc_t launchHostFunc = nullptr;
 
   bool available() const {
@@ -408,6 +600,20 @@ inline CUresult cuCtxGetDevice(CUdevice* device) {
 inline CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
   return cudaApi.devicePrimaryCtxRetain(pctx, dev);
 }
+inline CUresult cuLinkCreate(
+    unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut) {
+  return cudaApi.linkCreate(numOptions, options, optionValues, stateOut);
+}
+inline CUresult cuLinkAddData(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+    unsigned int numOptions, CUjit_option* options, void** optionValues) {
+  return cudaApi.linkAddData(state, type, data, size, name, numOptions, options, optionValues);
+}
+inline CUresult cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut) {
+  return cudaApi.linkComplete(state, cubinOut, sizeOut);
+}
+inline CUresult cuLinkDestroy(CUlinkState state) {
+  return cudaApi.linkDestroy(state);
+}
 inline CUresult cuModuleLoadDataEx(
     CUmodule* module, const void* image, unsigned int numOptions, int* options, void** optionValues) {
   return cudaApi.moduleLoadDataEx(module, image, numOptions, options, optionValues);
@@ -420,6 +626,9 @@ inline CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char
 }
 inline CUresult cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc) {
   return cudaApi.funcGetAttribute(pi, attrib, hfunc);
+}
+inline CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
+  return cudaApi.funcSetAttribute(hfunc, attrib, value);
 }
 inline CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
   return cudaApi.memAlloc(dptr, bytesize);
@@ -435,6 +644,10 @@ inline CUresult cuMemGetInfo(size_t* free, size_t* total) {
 }
 inline CUresult cuMemGetAddressRange(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr) {
   return cudaApi.memGetAddressRange(pbase, psize, dptr);
+}
+inline CUresult cuMemGetHandleForAddressRange(
+    void* handle, CUdeviceptr dptr, size_t size, CUmemRangeHandleType handleType, unsigned long long flags) {
+  return cudaApi.memGetHandleForAddressRange(handle, dptr, size, handleType, flags);
 }
 inline CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int flags) {
   return cudaApi.memHostAlloc(pp, bytesize, flags);
@@ -472,6 +685,50 @@ inline CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
 inline CUresult cuMemRelease(uint64_t handle) {
   return cudaApi.memRelease(handle);
 }
+inline CUresult cuMemCreate(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags) {
+  return cudaApi.memCreate(handle, size, prop, flags);
+}
+inline CUresult cuMemAddressReserve(
+    CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags) {
+  return cudaApi.memAddressReserve(ptr, size, alignment, addr, flags);
+}
+inline CUresult cuMemMap(
+    CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags) {
+  return cudaApi.memMap(ptr, size, offset, handle, flags);
+}
+inline CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count) {
+  return cudaApi.memSetAccess(ptr, size, desc, count);
+}
+inline CUresult cuMemGetAllocationGranularity(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option) {
+  return cudaApi.memGetAllocationGranularity(granularity, prop, option);
+}
+inline CUresult cuMemExportToShareableHandle(void* shareableHandle, CUmemGenericAllocationHandle handle,
+    CUmemAllocationHandleType handleType, unsigned long long flags) {
+  return cudaApi.memExportToShareableHandle(shareableHandle, handle, handleType, flags);
+}
+inline CUresult cuMemImportFromShareableHandle(
+    CUmemGenericAllocationHandle* handle, void* osHandle, CUmemAllocationHandleType shHandleType) {
+  return cudaApi.memImportFromShareableHandle(handle, osHandle, shHandleType);
+}
+inline CUresult cuMulticastCreate(CUmemGenericAllocationHandle* handle, const CUmulticastObjectProp* prop) {
+  return cudaApi.multicastCreate(handle, prop);
+}
+inline CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle handle, CUdevice dev) {
+  return cudaApi.multicastAddDevice(handle, dev);
+}
+inline CUresult cuMulticastBindMem(CUmemGenericAllocationHandle mcHandle, size_t mcOffset,
+    CUmemGenericAllocationHandle memHandle, size_t memOffset, size_t size, unsigned long long flags) {
+  return cudaApi.multicastBindMem(mcHandle, mcOffset, memHandle, memOffset, size, flags);
+}
+inline CUresult cuMulticastGetGranularity(
+    size_t* granularity, const CUmulticastObjectProp* prop, CUmulticastGranularity_flags option) {
+  return cudaApi.multicastGetGranularity(granularity, prop, option);
+}
+inline CUresult cuMulticastUnbind(CUmemGenericAllocationHandle handle, CUdevice dev, size_t offset, size_t size) {
+  return cudaApi.multicastUnbind(handle, dev, offset, size);
+}
 inline CUresult cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr) {
   return cudaApi.pointerGetAttribute(data, attribute, ptr);
 }
@@ -483,6 +740,9 @@ inline CUresult cuStreamCreateWithPriority(CUstream* phStream, unsigned int flag
 }
 inline CUresult cuStreamDestroy(CUstream hStream) {
   return cudaApi.streamDestroy(hStream);
+}
+inline CUresult cuStreamSynchronize(CUstream hStream) {
+  return cudaApi.streamSynchronize(hStream);
 }
 inline CUresult cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int flags) {
   return cudaApi.streamWaitEvent(hStream, hEvent, flags);
@@ -509,6 +769,9 @@ inline CUresult cuEventQuery(CUevent hEvent) {
 inline CUresult cuEventSynchronize(CUevent hEvent) {
   return cudaApi.eventSynchronize(hEvent);
 }
+inline CUresult cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd) {
+  return cudaApi.eventElapsedTime(pMilliseconds, hStart, hEnd);
+}
 inline CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
   return cudaApi.ipcGetMemHandle(pHandle, dptr);
 }
@@ -529,6 +792,9 @@ inline CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int
     CUstream hStream, void** kernelParams, void** extra) {
   return cudaApi.launchKernel(
       f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+}
+inline CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+  return cudaApi.launchKernelEx(config, f, kernelParams, extra);
 }
 inline CUresult cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void* userData) {
   return cudaApi.launchHostFunc(hStream, fn, userData);
@@ -564,6 +830,15 @@ constexpr nvmlGpuP2PCapsIndex_t NVML_P2P_CAPS_INDEX_NVLINK = 2;
 using nvmlAffinityScope_t = unsigned int;
 constexpr nvmlAffinityScope_t NVML_AFFINITY_SCOPE_NODE = 0;
 
+struct nvmlGpuFabricInfo_t {
+  unsigned int version = sizeof(nvmlGpuFabricInfo_t) | (2 << 24);
+  unsigned char clusterUuid[16];
+  nvmlReturn_t status;
+  unsigned int cliqueId;
+  unsigned char state;
+  unsigned int healthMask;
+};
+
 using nvmlInit_v2_t = nvmlReturn_t (*)();
 using nvmlErrorString_t = const char* (*)(nvmlReturn_t);
 using nvmlDeviceGetCount_t = nvmlReturn_t (*)(unsigned int*);
@@ -573,6 +848,7 @@ using nvmlDeviceGetPciInfo_v3_t = nvmlReturn_t (*)(nvmlDevice_t, nvmlPciInfo_t*)
 using nvmlDeviceGetMemoryAffinity_t = nvmlReturn_t (*)(nvmlDevice_t, unsigned int, unsigned long*, nvmlAffinityScope_t);
 using nvmlDeviceGetP2PStatus_t = nvmlReturn_t (*)(
     nvmlDevice_t, nvmlDevice_t, nvmlGpuP2PCapsIndex_t, nvmlGpuP2PStatus_t*);
+using nvmlDeviceGetGpuFabricInfoV_t = nvmlReturn_t (*)(nvmlDevice_t, nvmlGpuFabricInfo_t*);
 
 struct NvmlApi {
   nvmlInit_v2_t init = nullptr;
@@ -583,6 +859,7 @@ struct NvmlApi {
   nvmlDeviceGetPciInfo_v3_t deviceGetPciInfo = nullptr;
   nvmlDeviceGetMemoryAffinity_t deviceGetMemoryAffinity = nullptr;
   nvmlDeviceGetP2PStatus_t deviceGetP2PStatus = nullptr;
+  nvmlDeviceGetGpuFabricInfoV_t deviceGetGpuFabricInfoV = nullptr;
 
   bool available() const {
     return init != nullptr;
