@@ -83,9 +83,13 @@ def bench_allgather(backend: str, sizes: list[int], iterations: int, warmup: int
 
         if backend == "moodist_compile_op":
             op = compiled_ops[size]
-            run = lambda: op([input_tensor], [output_tensor]).wait()
+
+            def run():
+                op([input_tensor], [output_tensor]).wait()
         else:
-            run = lambda: dist.all_gather_into_tensor(output_tensor, input_tensor)
+
+            def run():
+                dist.all_gather_into_tensor(output_tensor, input_tensor)
 
         # Warmup
         for _ in range(warmup):

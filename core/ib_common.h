@@ -187,8 +187,8 @@ struct ProbeEndpoint {
 // in lockstep regardless of how many slots are valid (including an empty `local`). The GID /
 // traffic-class / service level match the real QP setup, so the probe faithfully reflects what
 // production QPs will do. The completion wait is bounded by MOODIST_IB_RAIL_PROBE_TIMEOUT_MS.
-std::vector<uint8_t> probeIbRailBatch(Group* group, const std::vector<ProbeEndpoint>& local, size_t peerRank,
-    bool initiator);
+std::vector<uint8_t> probeIbRailBatch(
+    Group* group, const std::vector<ProbeEndpoint>& local, size_t peerRank, bool initiator);
 
 namespace ib_poll {
 void add(int fd, Function<void()> callback);

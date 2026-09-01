@@ -12,7 +12,6 @@ Runs the allgather benchmark across multiple kernel configs and prints results.
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 
@@ -245,7 +244,7 @@ def main():
 
     # Header
     col_w = max(len(s) for s in sizes) + 2
-    label_w = max((len(l) for l in all_results), default=20)
+    label_w = max((len(label) for label in all_results), default=20)
     header = f"{'config':<{label_w}}"
     for s in sizes:
         header += f"  {s:>{col_w}}"

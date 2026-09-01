@@ -143,8 +143,8 @@ bool railProbeEnabled() {
 // Only two ranks (the lowest rank on each of the two lowest nodes) do any probing; every
 // other rank simply waits at the broadcast allgather. Probing is skipped entirely when the
 // driving rank already has the rail map cached from an earlier process group.
-static std::vector<int> detectRailPartition(Group* group, std::vector<LocalDevice>& localDevices,
-    const std::vector<std::string>& allRanksBootId) {
+static std::vector<int> detectRailPartition(
+    Group* group, std::vector<LocalDevice>& localDevices, const std::vector<std::string>& allRanksBootId) {
   const size_t rank = group->rank;
   const size_t size = group->size;
   SetupComms* sc = group->setupComms.get();
@@ -285,7 +285,9 @@ static std::vector<int> detectRailPartition(Group* group, std::vector<LocalDevic
       for (int c = 0; c != numRails; ++c) {
         order[c] = c;
       }
-      std::sort(order.begin(), order.end(), [&](int x, int y) { return classMinPath[x] < classMinPath[y]; });
+      std::sort(order.begin(), order.end(), [&](int x, int y) {
+        return classMinPath[x] < classMinPath[y];
+      });
       std::vector<int> canonicalOf(numRails);
       for (int newId = 0; newId != numRails; ++newId) {
         canonicalOf[order[newId]] = newId;
@@ -770,17 +772,16 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             chosen[best[i]->ibPath] = true;
           }
           log.verbose("rank %d whole-node NIC assignment (%s):%s\n", rank, what, assignment);
-          log.debug("rank %d whole-node NIC assignment (%s) has score %d %d %d\n", rank, what,
-              std::get<0>(bestScore), std::get<1>(bestScore), std::get<2>(bestScore));
+          log.debug("rank %d whole-node NIC assignment (%s) has score %d %d %d\n", rank, what, std::get<0>(bestScore),
+              std::get<1>(bestScore), std::get<2>(bestScore));
 
           // A distinct NIC per GPU falls out of the contention penalty, which is a soft term in the
           // score rather than a hard constraint -- so it can quietly fail to hold. Only report it
           // when there were actually enough NICs to go around: with fewer eligible NICs than GPUs,
           // or once branchCap has trimmed the candidate lists on a large node, sharing is expected.
           if (chosen.size() < n && eligiblePaths.size() >= n) {
-            log.info(
-                "rank %d: whole-node NIC assignment (%s) placed %d GPUs on only %d distinct NICs, "
-                "though %d were eligible; per-GPU network bandwidth may be reduced\n",
+            log.info("rank %d: whole-node NIC assignment (%s) placed %d GPUs on only %d distinct NICs, "
+                     "though %d were eligible; per-GPU network bandwidth may be reduced\n",
                 rank, what, n, chosen.size(), eligiblePaths.size());
           }
         }
@@ -833,8 +834,9 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             ok = false;
             break;
           }
-          std::sort(railMembers[r].begin(), railMembers[r].end(),
-              [&](size_t x, size_t y) { return localDevices[x].ibPath < localDevices[y].ibPath; });
+          std::sort(railMembers[r].begin(), railMembers[r].end(), [&](size_t x, size_t y) {
+            return localDevices[x].ibPath < localDevices[y].ibPath;
+          });
         }
         if (ok) {
           // Iterate rails in ascending canonical id so device index k == rail k: a device-k QP then
@@ -850,8 +852,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             for (size_t i : railMembers[r]) {
               railPaths[localDevices[i].ibPath] = true;
             }
-            std::vector<LocalDeviceNode*> best = assignWholeNode(
-                fmt::sprintf("rail %d", r), [&](const std::string& ibPath) { return railPaths.contains(ibPath); });
+            std::vector<LocalDeviceNode*> best =
+                assignWholeNode(fmt::sprintf("rail %d", r), [&](const std::string& ibPath) {
+                  return railPaths.contains(ibPath);
+                });
             CHECK(!best.empty());
             LocalDeviceNode* pick = best.at(localAllCudaPathsIndex);
             appendUseDevice(pick);
@@ -869,8 +873,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
         // subset process group still lands on the same NICs it would on the full node.
         HashMap<std::string, bool> taken;
         for (size_t round = 0; useDevices.size() != maxDevices; ++round) {
-          std::vector<LocalDeviceNode*> best = assignWholeNode(
-              fmt::sprintf("round %d", round), [&](const std::string& ibPath) { return !taken[ibPath]; });
+          std::vector<LocalDeviceNode*> best =
+              assignWholeNode(fmt::sprintf("round %d", round), [&](const std::string& ibPath) {
+                return !taken[ibPath];
+              });
           if (best.empty()) {
             break;
           }

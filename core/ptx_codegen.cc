@@ -462,13 +462,13 @@ struct EmitGrouped : EmitMultiCopy {
         mbarrier_arrive_noComplete(barrier);
       }
       profiling.enter("wait for write");
-      //profiling.enter("commit write");
+      // profiling.enter("commit write");
       cp_async_bulk_commit_group();
       cp_async_bulk_wait_group_read(0);
       sync();
       PRED(isLeader) {
-        //profiling.enter("wait for write");
-        //cp_async_bulk_wait_group_read(0);
+        // profiling.enter("wait for write");
+        // cp_async_bulk_wait_group_read(0);
         profiling.enter("read");
         cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
         profiling.leave();
@@ -1191,7 +1191,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       return selp_u64(r, 0, pred);
     };
 
-
     size_t groupSize = emit->groupSize();
 
     std::vector<uint32_t> shuffledIndices;
@@ -1532,7 +1531,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
 
-
     auto execSync = [&](uint32_t stepOffset) {
       Vector<u64> ldaddrs;
       Vector<u64> staddrs;
@@ -1553,7 +1551,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 addr = csyncaddr + index * sizeof(SyncSetup);
           u64 stbase = ld_const_u64(addr);
           u32 itembytes = ld_const_u32(addr + 8);
-          u32 ldoffset =  ld_const_u32(addr + 12);
+          u32 ldoffset = ld_const_u32(addr + 12);
           u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
           staddr = stbase + widen(itembytes * concurrencyIndex + blockStride);
           ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);

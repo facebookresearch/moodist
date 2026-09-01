@@ -107,7 +107,9 @@ def bench_nvlink_copy(sizes: list[int], iterations: int, warmup: int,
                             device="cuda", dtype=torch.float32))
 
         op = compiled_ops[size]
-        run = lambda: op([input_tensor], output_tensors).wait()
+
+        def run():
+            op([input_tensor], output_tensors).wait()
 
         input_tensor_0 = input_tensor.clone()
 
