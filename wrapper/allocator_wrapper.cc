@@ -152,6 +152,9 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
       const std::vector<std::string>&) {}
 
   virtual void attachOutOfMemoryObserver(c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) override {}
+  // Pure virtual since torch 2.12 (c10::cuda::CUDACachingAllocator::OomRejectionObserver). The type is spelled
+  // out and there is no `override` so this still compiles against older torch, where it's just an unused virtual.
+  virtual void attachOomRejectionObserver(std::function<void(int64_t, size_t, size_t, size_t)> observer) {}
   virtual void attachAllocatorTraceTracker(c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) override {}
   virtual void enablePeerAccess(c10::DeviceIndex dev, c10::DeviceIndex dev_to_access) override {}
 
