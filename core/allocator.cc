@@ -353,6 +353,7 @@ struct CudaAllocatorImpl {
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
   size_t allocationGranularity = 0;
   bool fabricSupported = false;
+  bool gpuDirectRdmaSupported = false;
 
   LocalFreeList<Vector<CUstream>> freeListStreams;
   LocalFreeList<EventRegion> freeListEventRegions;
@@ -536,6 +537,15 @@ struct CudaAllocatorImpl {
       cuDeviceGetAttribute(&fabricAttr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice);
       fabricSupported = fabricAttr != 0;
 
+      // cuMemCreate fails with CUDA_ERROR_INVALID_DEVICE if gpuDirectRDMACapable is requested on a device
+      // without GPUDirect RDMA (e.g. GeForce), so only request it where it is supported.
+      int gdrAttr = 0;
+      cuDeviceGetAttribute(&gdrAttr, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, cuDevice);
+      gpuDirectRdmaSupported = gdrAttr != 0;
+      if (!gpuDirectRdmaSupported) {
+        log.info("GPUDirect RDMA with CUDA VMM is not supported on this device; allocating without it\n");
+      }
+
       CUmemAllocationHandleType handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
       if (fabricSupported) {
         handleTypes = (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
@@ -547,7 +557,7 @@ struct CudaAllocatorImpl {
       prop.requestedHandleTypes = handleTypes;
       prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
       prop.location.id = deviceIndex;
-      prop.allocFlags.gpuDirectRDMACapable = 1;
+      prop.allocFlags.gpuDirectRDMACapable = gpuDirectRdmaSupported ? 1 : 0;
 
       size_t granularity = 0;
       CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
@@ -596,7 +606,7 @@ struct CudaAllocatorImpl {
             : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = deviceIndex;
-    prop.allocFlags.gpuDirectRDMACapable = 1;
+    prop.allocFlags.gpuDirectRDMACapable = gpuDirectRdmaSupported ? 1 : 0;
 
     CUmemGenericAllocationHandle handle;
     auto err = cuMemCreate(&handle, bytes, &prop, 0);
