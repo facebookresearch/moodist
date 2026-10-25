@@ -914,6 +914,7 @@ struct CudaAllocatorImpl {
 
   bool freeStreamMemory(size_t reqbytes) {
     checkMap(freeMemory.map, freeMemory.sizes);
+    bool freed = false;
     for (auto& v : streamFreeMemory) {
       Regions& region = *v.second;
       for (auto i = region.map.begin(); i != region.map.end();) {
@@ -929,17 +930,11 @@ struct CudaAllocatorImpl {
           tmpEventRegions.push_back(&v);
         }
         insertRegion(freeMemory, span, tmpEventRegions);
-
-        size_t n = span.end - span.begin;
-        if (n >= reqbytes) {
-          checkMap(freeMemory.map, freeMemory.sizes);
-          return true;
-        }
-        reqbytes -= n;
+        freed = true;
       }
     }
     checkMap(freeMemory.map, freeMemory.sizes);
-    return false;
+    return freed;
   }
 
   bool freeSomePending(Regions& pendingFreeMemory) {
