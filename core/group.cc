@@ -137,8 +137,9 @@ bool railProbeEnabled() {
 // probing real RDMA connectivity across two nodes (never by inspecting device names or GID
 // subnets). Returns a rail id per entry in `localDevices` (same id => same rail; ids are
 // canonical, i.e. rails are numbered by their smallest ibPath). Returns an empty vector to
-// signal "fall back to legacy selection" (probing disabled, single-node group, or a node
-// whose NIC set does not match the reference — i.e. non-homogeneous topology).
+// signal "fall back to legacy selection" (probing disabled, a single-rank group, a single-node
+// group whose NICs all reach each other, or a node whose NIC set does not match the reference —
+// i.e. non-homogeneous topology).
 //
 // Only two ranks (the lowest rank on each of the two lowest nodes) do any probing; every
 // other rank simply waits at the broadcast allgather. Probing is skipped entirely when the
@@ -159,10 +160,19 @@ static std::vector<int> detectRailPartition(
       break;
     }
   }
-  if (refB == ~(size_t)0) {
-    // Single-node process group: there is no cross-node routing, so rail membership is
-    // irrelevant to correctness. Let the caller use legacy selection.
-    return {};
+  const bool singleNode = refB == ~(size_t)0;
+  if (singleNode) {
+    // Single-node process group. Local ranks still talk to each other over the NICs, and the
+    // corresponding-index QP pairs connect *different* local NICs through the switch (legacy
+    // selection gives each GPU its own nearby NICs). On fabrics with a separate subnet/VRF per rail
+    // (e.g. RoCE with one VRF per NIC port index) such a pair is unroutable when the two NICs are on
+    // different rails, even within one node (IBV_WC_RETRY_EXC_ERR on the first message). So probe
+    // this node's NICs against each other, with rank 1 (on this node) as the responder. A single
+    // rank only talks to itself (same NIC), which needs no probe.
+    if (size < 2) {
+      return {};
+    }
+    refB = 1;
   }
 
   const bool amRefA = rank == refA;
@@ -374,6 +384,15 @@ static std::vector<int> detectRailPartition(
     for (size_t i = 0; i != numNics; ++i) {
       railCache[localDevices[i].ibPath] = railOf[i];
     }
+  }
+
+  if (singleNode && std::ranges::all_of(railOf, [](int r) {
+        return r == 0;
+      })) {
+    // Every local NIC reaches every other one, so any pairing is routable: keep the legacy
+    // selection for single-node groups (several distinct NICs per rank) instead of narrowing each
+    // rank to one NIC per rail. The rail map stays cached for later process groups.
+    return {};
   }
 
   return railOf;
@@ -811,9 +830,9 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       // Rail-aware device selection (see detectRailPartition). When it succeeds, device index k
       // is the same routable rail on every rank, which is what makes moodist's corresponding-
       // index QP pairing (rank i's device k <-> rank j's device k) actually route on rail-
-      // optimized fabrics. When it declines (probing disabled, single-node group, or a non-
-      // homogeneous node) useDevices is left empty and the legacy PCI-locality selection below
-      // runs instead.
+      // optimized fabrics. When it declines (probing disabled, a single-rank group, a single-node
+      // group whose NICs all reach each other, or a non-homogeneous node) useDevices is left empty
+      // and the legacy PCI-locality selection below runs instead.
       std::vector<int> railOf;
       if (railProbeEnabled()) {
         railOf = detectRailPartition(this, localDevices, allRanksBootId);
@@ -866,11 +885,12 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       }
 
       if (useDevices.empty()) {
-        // Legacy PCI-locality selection (rails not detected: single-node group, probing disabled,
-        // or a non-homogeneous node). Assign NICs across the whole node, then repeat with the
-        // chosen NICs removed so each rank collects several distinct NICs (striped for bandwidth)
-        // up to maxDevices. Ranging over all physical GPUs keeps the choice node-absolute, so a
-        // subset process group still lands on the same NICs it would on the full node.
+        // Legacy PCI-locality selection (no rail partition: probing disabled, a single-rank group,
+        // a single-node group on one rail, or a non-homogeneous node). Assign NICs across the
+        // whole node, then repeat with the chosen NICs removed so each rank collects several
+        // distinct NICs (striped for bandwidth) up to maxDevices. Ranging over all physical GPUs
+        // keeps the choice node-absolute, so a subset process group still lands on the same NICs
+        // it would on the full node.
         HashMap<std::string, bool> taken;
         for (size_t round = 0; useDevices.size() != maxDevices; ++round) {
           std::vector<LocalDeviceNode*> best =
