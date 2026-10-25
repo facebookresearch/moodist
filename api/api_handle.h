@@ -61,6 +61,7 @@ struct Future;
 struct CustomOp;
 struct ProcessGroup;
 struct QueueWork;
+struct RdmaWork;
 
 // Forward declare ApiHandle for use in ApiProxy specializations
 template<typename T>
@@ -126,6 +127,17 @@ struct ApiProxy<QueueWork> {
   void wait(); // Defined in wrapper
 };
 
+// Specialization for RdmaWork
+template<>
+struct ApiProxy<RdmaWork> {
+  RdmaWork* ptr;
+  ApiProxy* operator->() {
+    return this;
+  }
+
+  void wait(); // Defined in wrapper
+};
+
 // Specialization for Future
 template<>
 struct ApiProxy<Future> {
@@ -158,6 +170,7 @@ void destroy(Future*);
 void destroy(CustomOp*);
 void destroy(ProcessGroup*);
 void destroy(QueueWork*);
+void destroy(RdmaWork*);
 
 // Smart pointer for managing objects across the API boundary.
 //
@@ -315,5 +328,6 @@ using QueueWorkHandle = ApiHandle<QueueWork>;
 using FutureHandle = ApiHandle<Future>;
 using CustomOpHandle = ApiHandle<CustomOp>;
 using ProcessGroupHandle = ApiHandle<ProcessGroup>;
+using RdmaWorkHandle = ApiHandle<RdmaWork>;
 
 } // namespace moodist::api

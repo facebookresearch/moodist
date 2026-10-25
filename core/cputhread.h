@@ -45,6 +45,8 @@ constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
 constexpr uint8_t taskFabricMap = 26;
+constexpr uint8_t taskRdmaRegister = 27;
+constexpr uint8_t taskRdmaRead = 28;
 
 inline HashMap<uint32_t, const char*> opTypeToName;
 #define OPTYPE(name)                                                                                                   \
@@ -302,6 +304,24 @@ struct QueueEntryCallback : QueueEntry {
   Function<void()> callback;
 };
 
+struct QueueEntryRdmaRegister : QueueEntry {
+  uintptr_t address;
+  size_t bytes;
+  bool isCuda;
+  uint32_t* outRkeys; // points to caller's rkey array [maxDevices]
+  std::atomic_uint32_t* cpuDone;
+};
+
+struct QueueEntryRdmaRead : QueueEntry {
+  uintptr_t dstAddress;
+  size_t dstBytes;
+  bool dstIsCuda;
+  uint32_t srcRank;
+  uintptr_t srcAddress;
+  std::array<uint32_t, 4> srcRkeys;
+  std::atomic_uint32_t* done;
+};
+
 struct CustomOpDescriptor {
   uint32_t id;
 
@@ -431,6 +451,8 @@ struct CpuThread {
   QueueEntryFreeList<QueueEntryCallback> freelistCallback;
   QueueEntryFreeList<QueueEntryCustom> freelistCustom;
   QueueEntryFreeList<QueueEntryFabricMap> freelistFabricMap;
+  QueueEntryFreeList<QueueEntryRdmaRegister> freelistRdmaRegister;
+  QueueEntryFreeList<QueueEntryRdmaRead> freelistRdmaRead;
 
   std::exception_ptr initExceptionPtr;
   std::atomic_bool initException = false;

@@ -260,6 +260,13 @@ struct CoreApi {
 
   // CUDA copy with host memory registration
   void (*cudaCopy)(uintptr_t dst, uintptr_t src, size_t bytes, CUstream stream);
+
+  // RDMA direct read API
+  void (*rdmaRegister)(api::ProcessGroup* pg, uintptr_t address, size_t bytes, bool isCuda, api::RdmaEndpoint* out);
+  api::RdmaWorkHandle (*rdmaRead)(
+      api::ProcessGroup* pg, uintptr_t dstAddress, size_t dstBytes, bool dstIsCuda, const api::RdmaEndpoint* src);
+  void (*rdmaWorkDestroy)(api::RdmaWork* work);
+  void (*rdmaWorkWait)(api::RdmaWork* work);
 };
 
 } // namespace moodist
@@ -269,6 +276,8 @@ extern "C" {
 // Returns CoreApi struct if version matches, nullptr otherwise
 // Caller passes WrapperApi which libmoodist copies to its global
 // Caller should verify returned api->magic == kMoodistBuildMagic
+// (This is _C.so's entry point. Separately built C++ extensions instead take the CoreApi from Python,
+// via get_core_api_ptr(kMoodistApiVersion), which checks the layout version.)
 __attribute__((visibility("default"))) moodist::CoreApi* moodistGetApi(
     uint32_t expectedVersion, const moodist::WrapperApi* wrapperApi);
 }

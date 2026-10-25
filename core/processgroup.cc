@@ -2999,6 +2999,102 @@ void destroy(QueueWork* work) {
 }
 } // namespace api
 
+// ============================================================================
+// RDMA direct read API
+// ============================================================================
+
+struct RdmaWorkImpl {
+  std::atomic_uint32_t done = 0;
+  void wait() {
+    while (done.load(std::memory_order_acquire) == 0) {
+      futexWait(&done, 0, std::chrono::seconds(1));
+    }
+  }
+};
+
+struct RdmaWork : api::RdmaWork {
+  std::shared_ptr<RdmaWorkImpl> impl;
+  TensorPtr tensor; // keeps destination tensor alive
+  ~RdmaWork() {
+    if (impl) {
+      impl->wait();
+    }
+  }
+  void wait() {
+    if (impl) {
+      impl->wait();
+    }
+  }
+};
+
+void rdmaRegister(api::ProcessGroup* pg, uintptr_t address, size_t bytes, bool isCuda, api::RdmaEndpoint* out) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
+  auto* cpuThread = impl->group->cpuThread;
+
+  std::atomic_uint32_t cpuDone{0};
+  uint32_t rkeys[Group::maxDevices] = {};
+
+  auto* e = cpuThread->freelistRdmaRegister.pop();
+  e->task = taskRdmaRegister;
+  e->address = address;
+  e->bytes = bytes;
+  e->isCuda = isCuda;
+  e->outRkeys = rkeys;
+  e->cpuDone = &cpuDone;
+  cpuThread->enqueue(e);
+
+  while (cpuDone.load(std::memory_order_acquire) == 0) {
+    futexWait(&cpuDone, 0, std::chrono::seconds(1));
+  }
+
+  out->address = address;
+  out->bytes = bytes;
+  out->rank = impl->rank;
+  out->isCuda = isCuda;
+  for (size_t i = 0; i < 4; ++i) {
+    out->rkeys[i] = rkeys[i];
+  }
+}
+
+api::RdmaWorkHandle rdmaRead(
+    api::ProcessGroup* pg, uintptr_t dstAddress, size_t dstBytes, bool dstIsCuda, const api::RdmaEndpoint* src) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
+  auto* cpuThread = impl->group->cpuThread;
+
+  auto workImpl = std::make_shared<RdmaWorkImpl>();
+
+  auto* e = cpuThread->freelistRdmaRead.pop();
+  e->task = taskRdmaRead;
+  e->dstAddress = dstAddress;
+  e->dstBytes = dstBytes;
+  e->dstIsCuda = dstIsCuda;
+  e->srcRank = src->rank;
+  e->srcAddress = src->address;
+  for (size_t i = 0; i < 4; ++i) {
+    e->srcRkeys[i] = src->rkeys[i];
+  }
+  e->done = &workImpl->done;
+  cpuThread->enqueue(e);
+
+  auto* work = internalNew<RdmaWork>();
+  work->impl = std::move(workImpl);
+  return api::RdmaWorkHandle::create(work);
+}
+
+void rdmaWorkWait(api::RdmaWork* work) {
+  static_cast<RdmaWork*>(work)->wait();
+}
+
+void rdmaWorkDestroy(api::RdmaWork* work) {
+  internalDelete(static_cast<RdmaWork*>(work));
+}
+
+namespace api {
+void destroy(RdmaWork* work) {
+  rdmaWorkDestroy(work);
+}
+} // namespace api
+
 void setProfilingEnabled(bool enabled) {
   profilingEnabled = enabled;
 }

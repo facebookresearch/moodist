@@ -5423,6 +5423,40 @@ struct CpuThreadImpl {
     cpuThread->freelistCallback.push(&params);
   }
 
+  void executeRdmaRegister(QueueEntryRdmaRegister& params) {
+    MemoryRegistration* mr;
+    if (params.isCuda) {
+      mr = regMrCuda(params.address, params.bytes);
+    } else {
+      mr = regMr(params.address, params.bytes);
+    }
+    for (size_t i = 0; i < Group::maxDevices; ++i) {
+      params.outRkeys[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
+    }
+    params.cpuDone->store(1, std::memory_order_release);
+    futexWakeAll(params.cpuDone);
+    cpuThread->freelistRdmaRegister.push(&params);
+  }
+
+  void executeRdmaRead(QueueEntryRdmaRead& params) {
+    MemoryRegistration* dstMr;
+    if (params.dstIsCuda) {
+      dstMr = regMrCuda(params.dstAddress, params.dstBytes);
+    } else {
+      dstMr = regMr(params.dstAddress, params.dstBytes);
+    }
+    std::array<uint32_t, maxDevices> lkeys;
+    for (size_t i = 0; i < maxDevices; ++i) {
+      lkeys[i] = dstMr->mrs[i] ? dstMr->mrs[i]->lkey : 0;
+    }
+    readDataDistributed(params.srcRank, (void*)params.dstAddress, lkeys, (void*)params.srcAddress, params.srcRkeys,
+        params.dstBytes, makeCallback([this, &params] {
+          params.done->store(1, std::memory_order_release);
+          futexWakeAll(params.done);
+          cpuThread->freelistRdmaRead.push(&params);
+        }));
+  }
+
   uint32_t nextCreateQueueKey = random<uint32_t>();
   HashMap<uint32_t, QueueEntryCreateQueue*> queueCreateOutgoing;
 
@@ -6339,6 +6373,12 @@ struct CpuThreadImpl {
               break;
             case taskFabricMap:
               executeFabricMap((QueueEntryFabricMap&)queueEntry);
+              break;
+            case taskRdmaRegister:
+              executeRdmaRegister((QueueEntryRdmaRegister&)queueEntry);
+              break;
+            case taskRdmaRead:
+              executeRdmaRead((QueueEntryRdmaRead&)queueEntry);
               break;
             default:
               throw std::runtime_error(fmt::sprintf("internal error: unknown task %d", queueEntry.task));

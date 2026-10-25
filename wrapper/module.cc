@@ -1586,6 +1586,30 @@ static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
   }
 }
 
+// get_core_api_ptr(version=None) - CoreApi address for separately built C++ extensions. The build magic
+// check doesn't apply to them, so they pass the kMoodistApiVersion they were compiled against instead.
+static PyObject* py_get_core_api_ptr(PyObject*, PyObject* args) {
+  PyObject* versionObj = nullptr;
+  if (!PyArg_ParseTuple(args, "|O", &versionObj)) {
+    return nullptr;
+  }
+  if (versionObj && versionObj != Py_None) {
+    long version = PyLong_AsLong(versionObj);
+    if (version == -1 && PyErr_Occurred()) {
+      return nullptr;
+    }
+    if (version != (long)moodist::kMoodistApiVersion) {
+      PyErr_Format(PyExc_RuntimeError,
+          "moodist CoreApi version mismatch: the caller was built against moodist API version %ld, but this "
+          "moodist provides version %ld. Rebuild the extension against this moodist's headers (or install the "
+          "moodist it was built against).",
+          version, (long)moodist::kMoodistApiVersion);
+      return nullptr;
+    }
+  }
+  return PyLong_FromUnsignedLongLong((uintptr_t)&moodist::coreApi);
+}
+
 static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Returns a greeting"},
     {"enable_cuda_allocator", py_enable_cuda_allocator, METH_NOARGS, "Enable moodist CUDA allocator"},
     {"enable_cpu_allocator", py_enable_cpu_allocator, METH_NOARGS, "Enable moodist CPU allocator"},
@@ -1594,6 +1618,10 @@ static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Retu
     {"cuda_copy", py_cuda_copy, METH_VARARGS, "Copy tensor using moodist memory registration"},
     {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
     {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},
+    {"get_core_api_ptr", py_get_core_api_ptr, METH_VARARGS,
+        "get_core_api_ptr(version=None): address of moodist's CoreApi struct, for C++ extensions built "
+        "against moodist's api/ headers. Pass the moodist::kMoodistApiVersion the extension was compiled "
+        "against; raises RuntimeError if this moodist's CoreApi layout version differs."},
     {nullptr, nullptr, 0, nullptr}};
 
 // =============================================================================

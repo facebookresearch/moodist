@@ -37,6 +37,13 @@ const char* queueName(api::Queue* queue);
 void queueWorkDestroy(api::QueueWork* work);
 void queueWorkWait(api::QueueWork* work);
 
+// Forward declarations for RDMA API functions defined in processgroup.cc
+void rdmaRegister(api::ProcessGroup* pg, uintptr_t address, size_t bytes, bool isCuda, api::RdmaEndpoint* out);
+api::RdmaWorkHandle rdmaRead(
+    api::ProcessGroup* pg, uintptr_t dstAddress, size_t dstBytes, bool dstIsCuda, const api::RdmaEndpoint* src);
+void rdmaWorkDestroy(api::RdmaWork* work);
+void rdmaWorkWait(api::RdmaWork* work);
+
 // Forward declarations for Future, CustomOp, compileOpFull defined in processgroup.cc
 void futureDestroy(api::Future* future);
 void futureWait(api::Future* future);
@@ -155,6 +162,12 @@ static CoreApi coreApi = {
 
     // CUDA copy
     .cudaCopy = cudaCopy,
+
+    // RDMA direct read
+    .rdmaRegister = rdmaRegister,
+    .rdmaRead = rdmaRead,
+    .rdmaWorkDestroy = rdmaWorkDestroy,
+    .rdmaWorkWait = rdmaWorkWait,
 };
 
 } // namespace moodist

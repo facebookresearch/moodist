@@ -24,6 +24,7 @@ from ._core import (
     TcpStore,
     serialize,
     deserialize,
+    get_core_api_ptr,
 )
 
 # Backend (importing triggers registration with torch.distributed)
@@ -79,6 +80,7 @@ __all__ = [
     "TcpStore",
     "serialize",
     "deserialize",
+    "get_core_api_ptr",
     # Queue
     "Queue",
     "TransactionContextManager",

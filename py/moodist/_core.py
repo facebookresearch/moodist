@@ -42,3 +42,8 @@ TcpStore = getattr(_C, "TcpStore", None)
 # Serialize functions - exposed through _C which loads libserialize at runtime
 serialize = getattr(_C, "serialize", None)
 deserialize = getattr(_C, "deserialize", None)
+
+# CoreApi pointer for C++ extensions built against moodist's api/ headers. Call it as
+# get_core_api_ptr(version) with the moodist::kMoodistApiVersion the extension was compiled against;
+# it raises RuntimeError if this moodist's CoreApi layout version differs.
+get_core_api_ptr = getattr(_C, "get_core_api_ptr", None)

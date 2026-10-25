@@ -38,6 +38,20 @@ struct Buffer : ApiRefCounted {};
 // It doesn't inherit from ApiRefCounted, so ApiHandle uses move-only semantics.
 struct QueueWork {};
 
+// RdmaWork uses unique ownership (like QueueWork).
+// Waits for RDMA read completion on destruction.
+struct RdmaWork {};
+
+// RdmaEndpoint — serializable descriptor for a registered memory region.
+// Created by rdmaRegister, sent over a queue, consumed by rdmaRead.
+struct RdmaEndpoint {
+  uintptr_t address = 0;
+  size_t bytes = 0;
+  uint32_t rank = 0;
+  bool isCuda = false;
+  uint32_t rkeys[4] = {}; // one per IB device (maxDevices=4)
+};
+
 // Reduce operation for compile_op - how to handle overlapping inputs
 enum class ReduceOp : int {
   None = 0, // Error on overlap (default)
