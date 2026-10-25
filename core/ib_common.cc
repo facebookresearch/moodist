@@ -373,6 +373,9 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   if (trafficClass != 0 || serviceLevel != 0) {
     log.info("Using RoCE traffic_class %d, service level %d\n", trafficClass, serviceLevel);
   }
+  // Local ACK timeout exponent: 4.096us * 2^timeout per attempt (0 = infinite). The default 14 is ~67ms per
+  // attempt, ~0.5s in total with retry_cnt=7 before IBV_WC_RETRY_EXC_ERR (status 12).
+  const int ackTimeout = intEnv("MOODIST_IB_TIMEOUT", 14, 0, 31);
 
   IbAddress loopbackAddress;
 
@@ -520,7 +523,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 4979;
-    attr.timeout = 5; // ?ms
+    attr.timeout = ackTimeout;
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
     attr.max_rd_atomic = 8;
