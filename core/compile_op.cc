@@ -909,8 +909,14 @@ struct CompileOpConstructor {
       Vector<TensorPtr> tensors;
       Vector<uintptr_t> tensorAddrs;
 
-      for (auto& t : graph.tensors) {
+      for (size_t ti = 0; ti < graph.tensors.size(); ti++) {
+        auto& t = graph.tensors[ti];
+        CHECK(t.device == DeviceType::CUDA);
         auto x = TensorPtr::empty(t.shape, t.dtype, t.device == DeviceType::CUDA ? group->deviceIndex : -1);
+        log.debug("  tensor %d: shape=[%s] dtype=%d deviceIndex=%d data_ptr=%p\n", ti,
+            fmt::to_string(fmt::join(t.shape, ",")), (int)t.dtype, group->deviceIndex,
+            x.defined() ? x.data_ptr() : nullptr);
+        CHECK(x.defined());
         x.zero_();
         tensors.push_back(x);
         tensorAddrs.push_back((uintptr_t)x.data_ptr());
@@ -2299,6 +2305,11 @@ struct CompileOpConstructor {
       Vector<size_t> cudaRanks = computeCudaRanks(group);
       size_t numInputsAndCopies = op->inputs.size() + op->inputCopies.size();
 
+      // Kernel tuning and launch below are collective (sends/barriers across all ranks), so every rank must
+      // agree on whether the kernel path is used at all. Keep kernel-eligible edges only if EVERY rank has at
+      // least one (AND across ranks, despite the name); otherwise all edges become ibReads. E.g. a multi-node
+      // broadcast whose source is on one node leaves the other nodes without any local edges.
+      bool anyCuda = false;
       for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
         auto& edge = *it;
         bool cuda = true;
@@ -2314,6 +2325,35 @@ struct CompileOpConstructor {
           }
         }
         if (local && cuda) {
+          anyCuda = true;
+          break;
+        }
+        ++it;
+      }
+      for (size_t i : range(size)) {
+        ctx.send(i, anyCuda);
+      }
+      for (size_t i : range(size)) {
+        bool v;
+        ctx.receive(i, v);
+        anyCuda &= v;
+      }
+
+      for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
+        auto& edge = *it;
+        bool cuda = true;
+        bool local = true;
+        for (auto& l : {&edge.sources, &edge.destinations}) {
+          for (auto& n : *l) {
+            if (n.device != DeviceType::CUDA) {
+              cuda = false;
+            }
+            if (n.rank != rank && std::ranges::find(cudaRanks, n.rank) == cudaRanks.end()) {
+              local = false;
+            }
+          }
+        }
+        if (local && cuda && anyCuda) {
           ++it;
           continue;
         }
