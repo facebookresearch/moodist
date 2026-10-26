@@ -511,6 +511,20 @@ struct CpuThreadImpl {
       size_t bytes, Callback* callback) {
     CHECK(i >= 0 && i < size);
 
+    // Packets are cut from the start of the read, so if the destination does not start at a page boundary, every
+    // packet straddles two pages of it, which the NIC handles much more slowly (GB300, 1 GiB read: 11.3 ms with the
+    // destination at a page boundary, 14.3 ms with it 1 KiB into a page, 16.5 ms with the source 1 KiB into a page
+    // too; a source alone off a boundary costs nothing). Large reads read their start up to the next page boundary
+    // separately. The callback runs once all parts have completed (postRead counts them).
+    constexpr size_t pageSize = 4096;
+    constexpr size_t alignFrom = 64 * 1024;
+    if (size_t head = -(uintptr_t)localAddress & (pageSize - 1); head != 0 && bytes >= alignFrom) {
+      postRead(dev, i, localAddress, lkey, remoteAddress, rkey, head, callback);
+      localAddress = (void*)((uintptr_t)localAddress + head);
+      remoteAddress = (void*)((uintptr_t)remoteAddress + head);
+      bytes -= head;
+    }
+
     const size_t threshold = 1024ull * 1024 * 896;
     const size_t chunkSize = 1024ull * 1024 * 768;
     if (bytes >= threshold) [[unlikely]] {

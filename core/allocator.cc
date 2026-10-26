@@ -1075,9 +1075,10 @@ struct CudaAllocatorImpl {
 // Cleanup context structure - stored per allocation
 struct CudaAllocCleanupCtx {
   CudaAllocatorImpl* impl;
-  uintptr_t ptr;
+  uintptr_t ptr; // As allocated (with bytes, what is deallocated)
   size_t bytes;
   CUstream allocStream; // Stream used for allocation
+  uintptr_t userPtr; // As returned (see cudaAllocatorImplAllocate): the key of streamUses and freeCallbacks
 };
 
 // Global allocator impl pointer for allocator::owns/mappedRegion
@@ -1148,17 +1149,26 @@ CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, 
     }
   }
 
-  // Align allocation
+  // Align allocation. Allocations are 256-byte aligned; those of at least 64 KiB start at a 4 KiB boundary (a little
+  // more is allocated, and the returned pointer is the first boundary in it). RDMA into memory that starts in the
+  // middle of a page is much slower (GB300, all-gather of 256 MiB per rank between two nodes: 2.9 ms at a page
+  // boundary, 4.4-4.8 ms at a 256-byte or 1 KiB offset), and without this, any small allocation shifts the large ones
+  // after it.
   constexpr size_t alignment = 0x100;
+  constexpr size_t pageAlignment = 0x1000;
+  constexpr size_t pageAlignedFrom = 0x10000;
   size_t alignedBytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
+  const size_t padding = bytes >= pageAlignedFrom ? pageAlignment - alignment : 0;
 
   // Allocate
-  uintptr_t ptr = impl->allocate(alignedBytes, stream, impl->deviceIndex);
+  uintptr_t ptr = impl->allocate(alignedBytes + padding, stream, impl->deviceIndex);
+  uintptr_t userPtr = padding ? (ptr + pageAlignment - 1) & ~(uintptr_t)(pageAlignment - 1) : ptr;
+  CHECK(userPtr + alignedBytes <= ptr + alignedBytes + padding);
 
   // Create cleanup context
-  auto* ctx = internalNew<CudaAllocCleanupCtx>(impl, ptr, alignedBytes, stream);
+  auto* ctx = internalNew<CudaAllocCleanupCtx>(impl, ptr, alignedBytes + padding, stream, userPtr);
 
-  return CudaAllocation{ptr, ctx, impl->deviceIndex};
+  return CudaAllocation{userPtr, ctx, impl->deviceIndex};
 }
 
 void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
@@ -1172,7 +1182,7 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
   std::lock_guard l(impl->mutex);
 
   // Invoke any registered free callbacks for this address
-  auto cbIt = impl->freeCallbacks.find(ctx->ptr);
+  auto cbIt = impl->freeCallbacks.find(ctx->userPtr);
   if (cbIt != impl->freeCallbacks.end()) {
     FunctionPointer head = cbIt->second;
     while (head) {
@@ -1184,7 +1194,7 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
   }
 
   // Collect streams for deallocation
-  auto it = impl->streamUses.find(ctx->ptr);
+  auto it = impl->streamUses.find(ctx->userPtr);
   if (it != impl->streamUses.end()) {
     auto& list = it->second;
     list->insert(list->begin(), ctx->allocStream);

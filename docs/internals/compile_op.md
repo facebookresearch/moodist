@@ -186,56 +186,57 @@ per GPU):
 
 | | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
 |---|---|---|---|---|
-| `multicast`, proxy pass (each rank's data read once per node, then NVLink) | 73 us | 117 us | 266 us | 4.66 ms (461 GB/s) |
-| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 79 us | 207 us | 1.42 ms | 21.6 ms (100 GB/s) |
-| moodist's all-gather (process group) | 36 us | 66 us | 274 us | 4.67 ms (460 GB/s) |
-| NCCL with `NCCL_MNNVL_ENABLE=0` | 94 us | 97 us | 440 us | 5.40 ms (397 GB/s) |
+| `multicast`, proxy pass (each rank's data read once per node, then NVLink) | 75 us | 119 us | 259 us | 2.91 ms (738 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 82 us | 208 us | 1.43 ms | 21.1 ms (102 GB/s) |
+| moodist's all-gather (process group) | 42 us | 69 us | 263 us | 3.51 ms (612 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 95 us | 101 us | 441 us | 5.42 ms (396 GB/s) |
 
-Without Data Direct (`MOODIST_IB_DATA_DIRECT=0`, or before moodist used it: the NICs reach GPU memory through the CPU,
-at about 52 GB/s per GPU):
+One GPU per node (each GPU receives one piece over the network): compile_op 87, 93 and 95 GB/s per GPU at 64 MiB,
+256 MiB and 1 GiB per rank, moodist's all-gather 90, 94 and 95 GB/s, NCCL 73, 81 and 84 GB/s.
+
+Two nodes in different NVL72 domains (in different racks): compile_op 80 us, 126 us, 265 us and 2.93 ms (732 GB/s),
+moodist's all-gather 40 us, 79 us, 277 us and 3.51 ms, NCCL 81 us, 123 us, 481 us and 5.63 ms (381 GB/s).
+
+Earlier states (two nodes, `MOODIST_FABRIC=0`), measured with the large buffers off page boundaries (see the RDMA
+notes under Performance) and, except in the first row, without Data Direct:
 
 | | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
 |---|---|---|---|---|
+| `multicast`, proxy pass, with Data Direct | 73 us | 117 us | 266 us | 4.66 ms (461 GB/s) |
 | `multicast`, proxy pass | 76 us | 119 us | 388 us | 5.12 ms (419 GB/s) |
 | `read`, proxy pass | 76 us | 122 us | 386 us | 5.17 ms (416 GB/s) |
 | `ring_write`, proxy pass | 77 us | 126 us | 387 us | 5.20 ms (413 GB/s) |
 | `multicast`, proxy pass without chunks (each transfer one read) | 74 us | 121 us | 429 us | 6.63 ms (324 GB/s) |
-| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 85 us | 211 us | 1.78 ms | 26.5 ms (81 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 85 us | 211 us | 1.78 ms | 26.5 ms (81 GB/s) |
 | the same before reads were split over the NICs | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
 | moodist's all-gather (process group) | 38 us | 70 us | | 5.51 ms (390 GB/s) |
-| NCCL with `NCCL_IB_DATA_DIRECT=0` | | | | 8.53 ms (252 GB/s) |
 
-Two nodes in different NVL72 domains (in different racks): compile_op 82 us, 126 us, 391 us and 5.30 ms (405 GB/s),
-NCCL 93 us, 122 us, 482 us and 5.63 ms (382 GB/s).
+(NCCL without Data Direct, `NCCL_IB_DATA_DIRECT=0`: 8.53 ms at 256 MiB.)
 
 16 GPUs: four nodes in two NVL72 domains of two nodes each (in different racks):
 
-| | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
-|---|---|---|---|---|
-| `multicast`, proxy pass | 87 us | 135 us | 412 us | 6.01 ms (714 GB/s) |
-| the same without Data Direct | 87 us | 135 us | 551 us | 6.07 ms (708 GB/s) |
-| the same without Data Direct, with the first destination of the source's local rank as proxy (one node of each domain proxies everything) | 88 us | 136 us | 795 us | 11.4 ms (375 GB/s) |
-| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 88 us | 300 us | 2.85 ms | 41.4 ms (104 GB/s) |
-| the same without Data Direct | 123 us | 338 us | 3.10 ms | 49.3 ms (87 GB/s) |
-| NCCL | 93 us | 219 us | 642 us | 6.17 ms (696 GB/s) |
-| moodist's all-gather (process group) | 58 us | 149 us | 714 us | 11.6 ms (372 GB/s) |
-| the same without Data Direct | 59 us | 163 us | 1.03 ms | 15.2 ms (282 GB/s) |
+| | 1 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|
+| `multicast`, proxy pass | 87 us | 135 us | 412 us | 1.54 ms | 5.95 ms (722 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 88 us | 308 us | 2.76 ms | 10.7 ms | 41.9 ms (103 GB/s) |
+| moodist's all-gather (process group) | 57 us | 147 us | 694 us | 2.40 ms | 9.22 ms (466 GB/s) |
+| NCCL | 92 us | 219 us | 644 us | 1.64 ms | 6.19 ms (694 GB/s) |
 
 With `MOODIST_FABRIC=0`, i.e. four domains of one node:
 
-| | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
-|---|---|---|---|---|
-| `multicast`, proxy pass | 92 us | 139 us | 717 us | 12.6 ms (341 GB/s) |
-| the same without Data Direct | 87 us | 148 us | 1.04 ms | 17.4 ms (247 GB/s) |
-| the same without Data Direct, with the same read order in every domain | 89 us | 218 us | 1.74 ms | 28.7 ms (149 GB/s) |
-| NCCL with `NCCL_MNNVL_ENABLE=0` | 96 us | 229 us | 1.03 ms | 11.1 ms (386 GB/s) |
+| | 1 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|
+| `multicast`, proxy pass | 89 us | 136 us | 653 us | 2.28 ms | 9.62 ms (446 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 99 us | 227 us | 997 us | 2.91 ms | 11.1 ms (387 GB/s) |
 
 With two domains of two nodes, the large sizes are bound by NVLink (each GPU receives 14 of the 16 pieces over
-NVLink); with four domains, by the proxies' RDMA reads (each proxy reads 3 pieces, at about 64 GB/s per GPU with
-Data Direct and 46 GB/s without; see the RDMA bandwidth note under Performance). On 16 GPUs, compile_op's small-op
-latency varies between runs (see the known issues): the small sizes are from runs without tails (with Data Direct,
-1 KiB and 1 MiB of the first row are from runs without it, which it does not change: the 10th percentiles of the
-runs with it are 91 us and 136 us; the 1 MiB without proxy pass is a 10th percentile too).
+NVLink); with four domains, by the proxies' RDMA reads (each proxy reads 3 pieces, at 85-95 GB/s). On 16 GPUs,
+compile_op's small-op latency varies between runs (see the known issues): the 1 KiB and 1 MiB values of its first
+two rows are from runs without tails (the 1 MiB without proxy pass is the 10th percentile). Earlier states at
+256 MiB (large buffers off page boundaries, without Data Direct): two domains 6.07 ms, or 11.4 ms with the first
+destination of the source's local rank as proxy (one node of each domain proxied everything); four domains
+17.4 ms, or 28.7 ms with the same read order in every domain; moodist's all-gather 15.2 ms (11.6 ms with Data
+Direct).
 
 Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
 rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
@@ -293,17 +294,25 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   `mlx5dv_reg_dmabuf_mr(..., MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT)` on a dmabuf mapped through PCIe
   (`CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE`; the default mapping goes through the CPU, which the function
   reaches only through its switch's x1 link: 0.4 GB/s, as with the wrong card). With one GPU per node, all-gather
-  then reaches 75-77 GB/s per GPU at 32-64 MiB per rank, but only 62-65 GB/s from about 96 MiB up, where NCCL
-  reaches 84 GB/s (at 1 GiB). NCCL's NICs only touch small staging buffers, moodist's the whole user buffers: maybe
-  the address translation caches of the NIC or of the GPU's BAR1 (512 GiB, so not its size). Not investigated.
-- More reads in flight per NIC make the proxied reads slower (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms at 256 MiB with
-  four domains).
-- On 16 GPUs in two racks, some runs (process lifetimes) have millisecond tails on small ops: 1 KiB all-gather with a
-  median of about 600 us instead of 87 us, p90 about 2 ms, while other runs of the same build have none. NCCL and
-  moodist's all-gather in runs right before and after stay clean, and so did pairs of nodes in one rack. Not
-  investigated yet: candidates are the three exchanges with all ranks per op in `WorkCustom` (the input lists and
-  the two barriers) and the scheduling of the CPU thread. With four domains, 4 MiB all-gathers also have a p90 of
-  about 2 ms (median 0.5-0.8 ms).
+  then reaches 95 GB/s per GPU from 256 MiB per rank (NCCL: 84 GB/s).
+- RDMA reads into a destination that does not start at a page boundary are much slower: packets are cut from the start
+  of the read, so each one straddles two pages of the destination (GB300, 1 GiB read: 11.3 ms with the destination at
+  a page boundary, 14.3 ms with it 1 KiB into a page, 16.5 ms with the source 1 KiB into a page too; the source alone
+  off a boundary costs nothing). `readData` reads the start of reads of 64 KiB or more up to the next page boundary
+  separately, and the CUDA allocator starts allocations of 64 KiB or more at a page boundary. Before both, any small
+  tensor allocated earlier (e.g. a benchmark's 1 KiB step) shifted all later buffers off page boundaries, which
+  capped reads at about 64 GB/s per GPU (or 16 GB/s per queue pair: a second queue pair per NIC hid it). RDMA writes
+  (scattered by the remote NIC into its memory) probably have the same problem; not measured.
+- Without Data Direct, more reads in flight per NIC made the proxied reads slower (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms
+  at 256 MiB with four domains).
+- compile_op is much noisier than NCCL and moodist's all-gather, which share its CPU thread and RDMA (16 GPUs in two
+  racks, the runs of one day: p90 over median 2.8 for ops of up to 1 MiB, 2.1 at 4-16 MiB, 1.1 from 64 MiB, with
+  p90 over 1.5 x median in 47 of 79, 24 of 35 and 4 of 52 runs; NCCL 1.1, 1.05, 1.03 and moodist's all-gather
+  1.04, 1.03, 1.05, never over 1.5). Typically a whole run (process) is clean or not: 1 KiB all-gather with a median
+  of 87 us or of about 600 us with a p90 of about 2 ms. Not the order of the reads (proxied reads go in signal
+  order, and with two domains of 8 GPUs each proxy does one read). Candidates: `WorkCustom`'s exchanges with all
+  ranks per op (the input lists and two barriers, where the all-gather only talks to its ring neighbors), the
+  scheduling of the CPU thread, Python garbage collection; traces of the CPU thread and of the kernel would show.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
 
@@ -318,6 +327,10 @@ in chunks for large transfers. (Before the edge-based model, `computeNvlinkPlan`
 c57c8f4, computed a similar plan with gateway reads and local copies, but it was never executed.) Next:
 1. The write variant: the source writes the data and the signal into the proxy's memory.
 2. An explicit flush before the signal (see Correctness).
+3. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
+   fixed neighbor, which relays the data of the ranks before it): fixed neighbors, synchronization with neighbors
+   only, maybe less noise at scale. It needs a heuristic for when it applies, and measurements against the proxy
+   pass.
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`
