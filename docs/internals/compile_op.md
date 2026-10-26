@@ -51,9 +51,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    group with two or more destinations (CUDA, sizes and destination offsets multiples of 16 bytes, one destination
    per rank), one destination rank, the proxy, keeps its edge, which will be an RDMA read into its own output, and
    the edges of the other destinations now read from the proxy's node instead, which makes them kernel edges. The
-   proxy is preferably the destination with the same local rank as the source (whose NICs are on the same rail),
-   otherwise the one that proxies the fewest bytes so far; every member of the domain computes the same
-   assignment. The proxy's RDMA edge gets a signal index (`rdmaSignal`), and the proxy gets a relay edge: no
+   proxy is a destination with the same local rank as the source if there is one (whose NICs are on the same
+   rail; a domain that spans several nodes has one per node), and among the candidates the one that proxies the
+   fewest bytes so far; every member of the domain computes the same assignment. Each domain takes the sources in
+   rank order starting after its own first rank, which is also the order in which the CPU thread issues a
+   proxy's reads (a few at a time): the domains then read from different sources at the same time instead of all
+   from the same ones first. The proxy's RDMA edge gets a signal index (`rdmaSignal`), and the proxy gets a relay edge: no
    sources, the proxy's node as destination, the same signal index. The relay edge makes the proxy's kernel wait
    until the CPU thread signals that the read has completed, and then mark the node as filled; the copies from the
    node are ordinary dependent edges. Transfers of 8 MiB or more are split into chunks of at least 4 MiB (at most
@@ -188,6 +191,31 @@ With `MOODIST_FABRIC=0`, i.e. two NVLink domains connected by RoCE (4 NICs per G
 | the same before reads were split over the NICs | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
 | NCCL with `NCCL_MNNVL_ENABLE=0` | 94 us | 97 us | 440 us | 5.40 ms (397 GB/s) |
 
+Two nodes in different NVL72 domains (in different racks): compile_op 82 us, 126 us, 391 us and 5.30 ms (405 GB/s),
+NCCL 93 us, 122 us, 482 us and 5.63 ms (382 GB/s).
+
+16 GPUs: four nodes in two NVL72 domains of two nodes each (in different racks):
+
+| | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
+|---|---|---|---|---|
+| `multicast`, proxy pass | 87 us | 135 us | 551 us | 6.07 ms (708 GB/s) |
+| the same, with the first destination of the source's local rank as proxy (one node of each domain proxies everything) | 88 us | 136 us | 795 us | 11.4 ms (375 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 123 us | 338 us | 3.10 ms | 49.3 ms (87 GB/s) |
+| NCCL | 93 us | 219 us | 642 us | 6.17 ms (696 GB/s) |
+| moodist's all-gather (process group) | 59 us | 163 us | 1.03 ms | 15.2 ms (282 GB/s) |
+
+With `MOODIST_FABRIC=0`, i.e. four domains of one node:
+
+| | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
+|---|---|---|---|---|
+| `multicast`, proxy pass | 87 us | 148 us | 1.04 ms | 17.4 ms (247 GB/s) |
+| the same, with the same read order in every domain | 89 us | 218 us | 1.74 ms | 28.7 ms (149 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 96 us | 229 us | 1.03 ms | 11.1 ms (386 GB/s) |
+
+With two domains of two nodes, the large sizes are bound by NVLink (each GPU receives 14 of the 16 pieces over
+NVLink); with four domains, by the proxies' RDMA reads (each proxy reads 3 pieces, at about 46 GB/s per GPU). On 16
+GPUs, compile_op's small-op latency varies between runs; see the known issues.
+
 Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
 rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
 
@@ -236,6 +264,19 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - Edges the proxy pass leaves alone (CPU destinations, unaligned pieces, one destination per domain) are read by
   each destination rank.
 - `WorkCustom` runs two barriers with all ranks per op, including ranks without RDMA work.
+- RDMA reads reach about 46-52 GB/s per GPU (4 x 200 Gb/s RoCE), with or without the proxy pass and with any number
+  of domains. More reads in flight per NIC make it slower (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms at 256 MiB with four
+  domains), which suggests congestion rather than too little concurrency. NCCL, which writes, moves more data over the
+  network on the same NICs: with four domains, its ring all-gather (NCCL 2.30: ring, simple protocol, 16 channels
+  whose rings cross between the nodes at different GPUs) sends 3.75 pieces per GPU over the network in 11.1 ms at
+  256 MiB (about 90 GB/s per GPU), where the proxies read 3 pieces in 17.4 ms. The write variant (see below) would
+  show whether writes do better here.
+- On 16 GPUs in two racks, some runs (process lifetimes) have millisecond tails on small ops: 1 KiB all-gather with a
+  median of about 600 us instead of 87 us, p90 about 2 ms, while other runs of the same build have none. NCCL and
+  moodist's all-gather in runs right before and after stay clean, and so did pairs of nodes in one rack. Not
+  investigated yet: candidates are the three exchanges with all ranks per op in `WorkCustom` (the input lists and
+  the two barriers) and the scheduling of the CPU thread. With four domains, 4 MiB all-gathers also have a p90 of
+  about 2 ms (median 0.5-0.8 ms).
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
 

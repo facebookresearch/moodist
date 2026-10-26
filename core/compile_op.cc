@@ -783,9 +783,9 @@ struct CompileOpConstructor {
   // it run as dependent edges in every graph variant. Large transfers are split into chunks, each with its own
   // read, signal, relay edge and copies (chunkIndex), so that the copies overlap the reads.
   // Proxied are only groups whose copies the kernel can take (CUDA destinations, sizes and destination offsets
-  // multiples of 16 bytes) and that have one destination per rank. The proxy is preferably the destination with
-  // the same local rank as the source (NICs on the same rail), otherwise the one that proxies the fewest bytes
-  // so far. Every member of a domain computes the same assignment from the same exchanged lists.
+  // multiples of 16 bytes) and that have one destination per rank. The proxy is a destination with the same local
+  // rank as the source if there is one (NICs on the same rail), and among the candidates the one that proxies the
+  // fewest bytes so far. Every member of a domain computes the same assignment from the same exchanged lists.
   void proxyRemoteEdges(InternalContext& ictx, Vector<Edge>& edges) {
     Vector<size_t> domain = computeCudaRanks(group, !ctx.collectiveOp);
     auto inDomain = [&](uint32_t r) {
@@ -819,11 +819,18 @@ struct CompileOpConstructor {
         groups[e.sources.at(0).id].push_back(std::move(e));
       }
     }
+    // Each domain takes the sources in rank order starting after its own first rank. The CPU thread issues a
+    // proxy's reads in signal order, i.e. in this order, a few at a time: with the same order in every domain,
+    // all domains would read from the same sources first (e.g. with four domains, three readers on one source and
+    // none on others), with rotated orders they read from different ones.
     Vector<uint64_t> sourceIds;
     for (auto& v : groups) {
       sourceIds.push_back(v.first);
     }
-    std::ranges::sort(sourceIds);
+    std::ranges::sort(sourceIds, {}, [&](uint64_t id) {
+      size_t sourceRank = groups[id].at(0).sources.at(0).rank;
+      return std::make_pair((sourceRank + size - domain.at(0)) % size, id);
+    });
 
     // Signal flags live in cpuOutBuffer after its first 16 slots
     const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
@@ -861,24 +868,26 @@ struct CompileOpConstructor {
         chunkBytes = ((bytes + numChunks - 1) / numChunks + 4095) / 4096 * 4096;
         numChunks = (bytes + chunkBytes - 1) / chunkBytes;
       }
+      // The least loaded destination with the source's local rank (a domain that spans several nodes has one per
+      // node), else the least loaded one
       uint32_t sourceRank = g[0].sources[0].rank;
-      size_t proxyIndex = g.size();
-      for (size_t m : indices(g)) {
-        uint32_t r = g[m].destinations[0].rank;
-        if (proxySignals[r] + numChunks <= maxSignals &&
-            group->rankLocalRank.at(r) == group->rankLocalRank.at(sourceRank)) {
-          proxyIndex = m;
-          break;
-        }
-      }
-      if (proxyIndex == g.size()) {
+      auto pick = [&](bool sameLocalRank) {
+        size_t best = g.size();
         for (size_t m : indices(g)) {
           uint32_t r = g[m].destinations[0].rank;
-          if (proxySignals[r] + numChunks <= maxSignals &&
-              (proxyIndex == g.size() || proxyBytes[r] < proxyBytes[g[proxyIndex].destinations[0].rank])) {
-            proxyIndex = m;
+          if (proxySignals[r] + numChunks > maxSignals ||
+              (sameLocalRank && group->rankLocalRank.at(r) != group->rankLocalRank.at(sourceRank))) {
+            continue;
+          }
+          if (best == g.size() || proxyBytes[r] < proxyBytes[g[best].destinations[0].rank]) {
+            best = m;
           }
         }
+        return best;
+      };
+      size_t proxyIndex = pick(true);
+      if (proxyIndex == g.size()) {
+        proxyIndex = pick(false);
       }
       if (proxyIndex == g.size()) {
         continue;
