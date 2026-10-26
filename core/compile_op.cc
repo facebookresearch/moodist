@@ -645,7 +645,7 @@ struct GraphBuilder {
       for (auto& v : ranks) {
         rankns.push_back(v.rank);
       }
-      log.info("%d: ranks for cell %d is [%s]\n", rank, cell, fmt::to_string(fmt::join(rankns, ", ")));
+      log.debug("%d: ranks for cell %d is [%s]\n", rank, cell, fmt::to_string(fmt::join(rankns, ", ")));
 
       auto it = std::ranges::find(ranks, rank, proj);
       CHECK(it != ranks.end());
@@ -2424,10 +2424,47 @@ struct CompileOpConstructor {
           firstError, firstErrorRank);
     }
 
-    // graphs.push_back(buildNothing(ictx, baseGraph));
-    graphs.push_back(buildMulticast(ictx, baseGraph));
-    // graphs.push_back(buildRing(ictx, baseGraph, true));
-    // graphs.push_back(buildRing(ictx, baseGraph, false));
+    // Graph variants for tuneKernels to choose from, selected by MOODIST_COMPILE_OP_GRAPHS (comma separated,
+    // default "multicast"; every rank must use the same list):
+    //   multicast   the source rank reads each chunk once and writes it to all its destinations
+    //   read        every destination rank reads its chunks itself
+    //   ring_read   the destinations of a chunk form a chain, each reading it from the previous one
+    //   ring_write  the same chain, each rank writing the chunk to the next one
+    {
+      std::string graphNames = "multicast";
+      if (const char* env = std::getenv("MOODIST_COMPILE_OP_GRAPHS")) {
+        graphNames = env;
+      }
+      for (size_t i : range(size)) {
+        ctx.send(i, graphNames);
+      }
+      bool mismatch = false;
+      for (size_t i : range(size)) {
+        std::string s;
+        ctx.receive(i, s);
+        mismatch |= s != graphNames;
+      }
+      REQUIRE(!mismatch, "compile_op: MOODIST_COMPILE_OP_GRAPHS differs between ranks (this rank: '%s')", graphNames);
+      for (size_t pos = 0; pos <= graphNames.size();) {
+        size_t end = std::min(graphNames.find(',', pos), graphNames.size());
+        std::string name = graphNames.substr(pos, end - pos);
+        pos = end + 1;
+        if (name == "multicast") {
+          graphs.push_back(buildMulticast(ictx, baseGraph));
+        } else if (name == "read") {
+          graphs.push_back(buildNothing(ictx, baseGraph));
+        } else if (name == "ring_read") {
+          graphs.push_back(buildRing(ictx, baseGraph, false));
+        } else if (name == "ring_write") {
+          graphs.push_back(buildRing(ictx, baseGraph, true));
+        } else {
+          REQUIRE(false,
+              "compile_op: unknown graph '%s' in MOODIST_COMPILE_OP_GRAPHS (expected multicast, read, ring_read or "
+              "ring_write)",
+              name);
+        }
+      }
+    }
 
     // Final barrier
     ctx.barrier();

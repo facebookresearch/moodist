@@ -1059,7 +1059,14 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
       CUmemFabricHandle fabricHandle;
       bool hasFabric = false;
-      if (!std::ranges::all_of(localFabricId.cluster, [](auto& v) {
+      // MOODIST_FABRIC=0: don't use a multi-node NVLink fabric (e.g. NVL72); compile_op then reaches other nodes
+      // over RDMA, as between separate NVLink domains. Must be set on all ranks.
+      const char* fabricEnv = std::getenv("MOODIST_FABRIC");
+      bool fabricDisabled = fabricEnv && !strcmp(fabricEnv, "0");
+      if (fabricDisabled) {
+        log.info("Multi-node NVLink fabric disabled by MOODIST_FABRIC=0\n");
+      }
+      if (!fabricDisabled && !std::ranges::all_of(localFabricId.cluster, [](auto& v) {
             return v == 0;
           })) {
         hasFabric = cuMemExportToShareableHandle(&fabricHandle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0) == CUDA_SUCCESS;
