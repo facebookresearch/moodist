@@ -3492,17 +3492,28 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     CHECK(anyRdma);
   }
 
+  // On the stream, the whole op (cpuIn write, kernel, cpuOut wait) comes after the previous op of its concurrency
+  // slot, whose cpuIn and cpuOut it reuses (otherwise an op on another stream could satisfy this op's cpuIn wait
+  // before this stream gets here), and records the slot's event when done, which wait() uses (see below).
+  std::optional<EventSerializer> slotSerializer;
+  if (anyCuda) {
+    slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream);
+  }
+
   if (anyCuda && anyRdma) {
     memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
     memFlush(stream);
   }
 
-  if (!anyRdma && !anyCpu) {
+  // Without CPU tensors the op is stream-ordered, RDMA part included: the stream waits for cpuOut below, and wait()
+  // only joins another current stream to it (see below). Blocking the caller until the CPU thread is done would
+  // make every op synchronous: the CPU thread then runs dry and sleeps after each op, and every op pays for waking
+  // it up again on every rank (occasionally milliseconds).
+  if (!anyCpu) {
     future->done = 1;
   }
 
   if (op->kernel) {
-    EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
     StreamGuard sg(stream, group->deviceIndex);
     IpcMapper* ipcMapper = &*group->ipcMapper;
     std::shared_lock unmapLock(unmapMemoryMutex);
@@ -3559,6 +3570,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
     memFlush(stream);
   }
+  slotSerializer.reset();
 
   if (anyRdma) {
     StreamData& sd = group->getCpuStreamData(concurrencyIndex);
@@ -3590,17 +3602,24 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     result->holdTensors.push_back(outputs[i]);
   }
 
+  // wait() (and dropping the future without it): if the current stream is not the one the op ran on, it waits for
+  // the slot's event, which the op recorded when done on its stream (kernel and RDMA part). If the slot has been
+  // reused since, the event is a later op's, which only waits longer. On the op's own stream nothing is needed.
+  auto selfPtr = share(this);
+  auto joinCurrentStream = [selfPtr, concurrencyIndex, stream]() {
+    CUstream current = wrapperApi.cudaGetCurrentStream();
+    if (current != stream) {
+      selfPtr->concurrencyEvents[concurrencyIndex].wait(current);
+    }
+  };
   if (!outputCopyTensors.empty()) {
     // Need to copy temporary outputs back to original output tensors after completion
     // Capture copies of the output TensorPtrs since the outputs pointer may be invalid later
     std::vector<TensorPtr> outputsCopy(outputs, outputs + nOutputs);
-    auto selfPtr = share(this);
-    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue, anyCuda, anyRdma,
-                                   copyTensors = std::move(outputCopyTensors), op,
+    result->waitDoneCallback = [joinCurrentStream, anyCuda, copyTensors = std::move(outputCopyTensors), op,
                                    outputsCopy = std::move(outputsCopy)]() {
-      if (anyCuda && anyRdma) {
-        selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-        selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
+      if (anyCuda) {
+        joinCurrentStream();
       }
       // Copy temporary tensors back to the appropriate slices of original outputs
       CHECK(copyTensors.size() == op->outputCopies.size());
@@ -3615,12 +3634,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
         dst.copy_(src);
       }
     };
-  } else if (anyCuda && anyRdma) {
-    auto selfPtr = share(this);
-    result->waitDoneCallback = [selfPtr, concurrencyIndex, stepValue]() {
-      selfPtr->memWaitGeq(selfPtr->group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-      selfPtr->memFlush(wrapperApi.cudaGetCurrentStream());
-    };
+  } else if (anyCuda) {
+    result->waitDoneCallback = std::move(joinCurrentStream);
   }
 
   return result;

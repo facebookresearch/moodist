@@ -14,7 +14,7 @@ moodist's CPU allocator), and CUDA transfers between NVLink peers use sizes and 
 import torch
 import moodist
 from moodist import TensorRegion
-from framework import TestContext, test_cpu_cuda, create_process_group
+from framework import TestContext, test_cpu_cuda, test_devices, create_process_group
 
 # compile_op takes CPU tensors from moodist's CPU allocator and CUDA tensors from its CUDA allocator
 moodist.enable_cpu_allocator()
@@ -342,6 +342,44 @@ def test_compile_op_different_dtypes(ctx: TestContext, device: str):
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"dtype {dtype}: got {output_tensor}, expected {expected}"
+        )
+
+
+@test_devices("cuda")
+def test_compile_op_wait_other_stream(ctx: TestContext, device: str):
+    """The op runs on the stream that is current when it is called; wait() joins the stream that is current then.
+
+    Run an all-gather on a side stream and wait for it on the main stream, which then reads the output. On several
+    nodes the data of other nodes arrives over RDMA and is then copied on by the kernel, so the main stream must
+    wait for both.
+    """
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+
+    chunk_size = 1 << 20  # 4 MiB per rank
+    dtype = torch.float32
+    inputs = [TensorRegion(offset=[ctx.rank * chunk_size], shape=[chunk_size], device=device)]
+    outputs = [TensorRegion(offset=[0], shape=[chunk_size * ctx.world_size], device=device)]
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+
+    input_tensor = torch.empty(chunk_size, dtype=dtype, device=device)
+    output_tensor = torch.zeros(chunk_size * ctx.world_size, dtype=dtype, device=device)
+    main = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    for i in range(20):
+        # The previous iteration's read of the output (on main) must be done before the op overwrites it
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            input_tensor.fill_(float(i * 100 + ctx.rank))
+            future = op([input_tensor], [output_tensor])
+        future.wait()
+        got = output_tensor.view(ctx.world_size, chunk_size).clone()
+        expected = (torch.arange(ctx.world_size, dtype=dtype, device=device) + i * 100).unsqueeze(1)
+        ctx.assert_true(
+            torch.equal(got, expected.expand_as(got)),
+            f"iteration {i}: {(got != expected).sum().item()} wrong elements"
         )
 
 

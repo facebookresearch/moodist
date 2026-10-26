@@ -144,6 +144,16 @@ on new tensors at every call.
   (`narrow().contiguous()`) and allocates the output copies (copied into the outputs when the op is waited on).
 - Stream order: if any rank needs RDMA, write `cpuIn` = stepValue (the CPU thread may start), then the kernel, then
   wait until `cpuOut` >= stepValue.
+- The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream
+  sees the complete op, RDMA part included, so ops without CPU tensors are done for the caller when the call
+  returns. Each op uses one of 16 concurrency slots (its own `cpuIn`, `cpuOut` and step value exchange areas): on
+  the stream, the whole op waits for the slot's event, which the slot's previous op (possibly on another stream)
+  recorded when it was done, and records it when done itself. `wait()` (or dropping the future) makes the current
+  stream wait for that event if it is not the op's stream (if the slot has been reused since, for the later op,
+  which only waits longer), then makes the output copies. Ops with CPU tensors, or compiled with `cpu_sync=True`,
+  block in `wait()` until the CPU thread is done. (moodist's process group collectives also run on the current
+  stream, but their `Work.wait()` does nothing, so they do not join another stream.) Between April and October
+  2026 (95a48ec) `wait()` blocked for every op with an RDMA part; see the latency noise note under Known issues.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads) publishes the rank's input list (addresses, sizes,
   rkeys; CUDA tensors are registered on first use) to all ranks, registers the outputs, collects all ranks' input
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
@@ -186,22 +196,24 @@ per GPU):
 
 | | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
 |---|---|---|---|---|
-| `multicast`, proxy pass (each rank's data read once per node, then NVLink) | 75 us | 119 us | 259 us | 2.91 ms (738 GB/s) |
-| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 82 us | 208 us | 1.43 ms | 21.1 ms (102 GB/s) |
-| moodist's all-gather (process group) | 42 us | 69 us | 263 us | 3.51 ms (612 GB/s) |
+| `multicast`, proxy pass (each rank's data read once per node, then NVLink) | 35 us | 85 us | 233 us | 2.89 ms (742 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 44 us | 171 us | 1.40 ms | 21.3 ms (101 GB/s) |
+| moodist's all-gather (process group) | 40 us | 68 us | 264 us | 3.51 ms (613 GB/s) |
 | NCCL with `NCCL_MNNVL_ENABLE=0` | 95 us | 101 us | 441 us | 5.42 ms (396 GB/s) |
 
 One GPU per node (each GPU receives one piece over the network): compile_op 87, 93 and 95 GB/s per GPU at 64 MiB,
 256 MiB and 1 GiB per rank, moodist's all-gather 90, 94 and 95 GB/s, NCCL 73, 81 and 84 GB/s.
 
-Two nodes in different NVL72 domains (in different racks): compile_op 80 us, 126 us, 265 us and 2.93 ms (732 GB/s),
+Two nodes in different NVL72 domains (in different racks): compile_op 42 us, 92 us, 241 us and 2.90 ms (740 GB/s),
 moodist's all-gather 40 us, 79 us, 277 us and 3.51 ms, NCCL 81 us, 123 us, 481 us and 5.63 ms (381 GB/s).
 
-Earlier states (two nodes, `MOODIST_FABRIC=0`), measured with the large buffers off page boundaries (see the RDMA
-notes under Performance) and, except in the first row, without Data Direct:
+Earlier states (two nodes, `MOODIST_FABRIC=0`). The first row is with `wait()` blocking until the CPU thread is done
+(see the latency noise note below); the others are also measured with the large buffers off page boundaries (see
+the RDMA notes under Performance) and, except in the second row, without Data Direct:
 
 | | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
 |---|---|---|---|---|
+| `multicast`, proxy pass, `wait()` blocking | 75 us | 119 us | 259 us | 2.91 ms (738 GB/s) |
 | `multicast`, proxy pass, with Data Direct | 73 us | 117 us | 266 us | 4.66 ms (461 GB/s) |
 | `multicast`, proxy pass | 76 us | 119 us | 388 us | 5.12 ms (419 GB/s) |
 | `read`, proxy pass | 76 us | 122 us | 386 us | 5.17 ms (416 GB/s) |
@@ -217,22 +229,22 @@ notes under Performance) and, except in the first row, without Data Direct:
 
 | | 1 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
 |---|---|---|---|---|---|
-| `multicast`, proxy pass | 87 us | 135 us | 412 us | 1.54 ms | 5.95 ms (722 GB/s) |
-| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 88 us | 308 us | 2.76 ms | 10.7 ms | 41.9 ms (103 GB/s) |
-| moodist's all-gather (process group) | 57 us | 147 us | 694 us | 2.40 ms | 9.22 ms (466 GB/s) |
-| NCCL | 92 us | 219 us | 644 us | 1.64 ms | 6.19 ms (694 GB/s) |
+| `multicast`, proxy pass | 46 us | 101 us | 410 us | 1.54 ms | 5.95 ms (722 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` | 48 us | 267 us | 2.59 ms | 10.4 ms | 41.2 ms (104 GB/s) |
+| moodist's all-gather (process group) | 57 us | 147 us | 692 us | 2.40 ms | 9.21 ms (466 GB/s) |
+| NCCL | 91 us | 220 us | 644 us | 1.64 ms | 6.18 ms (695 GB/s) |
 
 With `MOODIST_FABRIC=0`, i.e. four domains of one node:
 
 | | 1 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
 |---|---|---|---|---|---|
-| `multicast`, proxy pass | 89 us | 136 us | 653 us | 2.28 ms | 9.62 ms (446 GB/s) |
-| NCCL with `NCCL_MNNVL_ENABLE=0` | 99 us | 227 us | 997 us | 2.91 ms | 11.1 ms (387 GB/s) |
+| `multicast`, proxy pass | 46 us | 107 us | 597 us | 2.18 ms | 9.67 ms (444 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 97 us | 225 us | 1.01 ms | 2.91 ms | 11.1 ms (386 GB/s) |
 
 With two domains of two nodes, the large sizes are bound by NVLink (each GPU receives 14 of the 16 pieces over
-NVLink); with four domains, by the proxies' RDMA reads (each proxy reads 3 pieces, at 85-95 GB/s). On 16 GPUs,
-compile_op's small-op latency varies between runs (see the known issues): the 1 KiB and 1 MiB values of its first
-two rows are from runs without tails (the 1 MiB without proxy pass is the 10th percentile). Earlier states at
+NVLink); with four domains, by the proxies' RDMA reads (each proxy reads 3 pieces, at 85-95 GB/s). With `wait()`
+blocking until the CPU thread was done (see the latency noise note under Known issues), 1 KiB took 87-89 us in runs
+without tails, 1 MiB 135-136 us and 16 MiB 412 us (two domains) and 653 us (four domains). Earlier states at
 256 MiB (large buffers off page boundaries, without Data Direct): two domains 6.07 ms, or 11.4 ms with the first
 destination of the source's local rank as proxy (one node of each domain proxied everything); four domains
 17.4 ms, or 28.7 ms with the same read order in every domain; moodist's all-gather 15.2 ms (11.6 ms with Data
@@ -305,14 +317,23 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   (scattered by the remote NIC into its memory) probably have the same problem; not measured.
 - Without Data Direct, more reads in flight per NIC made the proxied reads slower (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms
   at 256 MiB with four domains).
-- compile_op is much noisier than NCCL and moodist's all-gather, which share its CPU thread and RDMA (16 GPUs in two
-  racks, the runs of one day: p90 over median 2.8 for ops of up to 1 MiB, 2.1 at 4-16 MiB, 1.1 from 64 MiB, with
-  p90 over 1.5 x median in 47 of 79, 24 of 35 and 4 of 52 runs; NCCL 1.1, 1.05, 1.03 and moodist's all-gather
-  1.04, 1.03, 1.05, never over 1.5). Typically a whole run (process) is clean or not: 1 KiB all-gather with a median
-  of 87 us or of about 600 us with a p90 of about 2 ms. Not the order of the reads (proxied reads go in signal
-  order, and with two domains of 8 GPUs each proxy does one read). Candidates: `WorkCustom`'s exchanges with all
-  ranks per op (the input lists and two barriers, where the all-gather only talks to its ring neighbors), the
-  scheduling of the CPU thread, Python garbage collection; traces of the CPU thread and of the kernel would show.
+- Latency noise (fixed in October 2026): from 95a48ec on, `wait()` (and dropping the future) blocked until the CPU
+  thread had finished every op with an RDMA part, although the stream already waits for it. The caller could not
+  run ahead, so after each op the CPU thread ran out of work and slept, and every op had to wake it up on every
+  rank. On the GB300 nodes a wake-up occasionally left the thread queued for 0.3-3 ms (the kernel's per-thread
+  run-queue wait: 90-170 ms per 300 ops in noisy runs, about 0 in clean ones), behind another thread on the core
+  it had slept on: the CPU thread of another rank of the same NUMA node, or one of the processes outside the job
+  (16 cores of each node were busy with them). With 16 GPUs some rank was late on most ops, and a run tended to
+  stay noisy, as the threads kept sleeping on the same cores. 1 KiB all-gather, 16 GPUs: median 87 us when clean,
+  otherwise up to about 600 us with a p90 of 1-2 ms (p90 over median 2.8 over the runs of one day, with p90 over
+  1.5 x median in 47 of 79 runs; NCCL and moodist's all-gather 1.1 and 1.04, never over 1.5). Pinning the Python
+  thread and the CPU thread to cores of their own also removed it (78-80 us), pinning either alone did not; Python
+  garbage collection and the order of the reads played no part. Now the op is done for the caller at the call
+  (see Runtime), so the CPU thread has the next ops queued while the GPU works: 46 us with a p90 of 52 us.
+- The CPU thread still sleeps when it has nothing to do. A caller that waits for each op on the CPU (ops with CPU
+  tensors or `cpu_sync`, or a `torch.cuda.synchronize()` per op) wakes it for every op, with the same occasional
+  multi-millisecond wake-ups (moodist's all-gather in such a loop: 300-700 us instead of 58 us on 16 GPUs). Spinning
+  for about 200 us before sleeping removed them in that test.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
 
@@ -328,9 +349,9 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
 1. The write variant: the source writes the data and the signal into the proxy's memory.
 2. An explicit flush before the signal (see Correctness).
 3. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
-   fixed neighbor, which relays the data of the ranks before it): fixed neighbors, synchronization with neighbors
-   only, maybe less noise at scale. It needs a heuristic for when it applies, and measurements against the proxy
-   pass.
+   fixed neighbor, which relays the data of the ranks before it): fixed neighbors and synchronization with neighbors
+   only, instead of `WorkCustom`'s exchanges with all ranks. It needs a heuristic for when it applies, and
+   measurements against the proxy pass.
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`
