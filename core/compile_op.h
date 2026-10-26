@@ -58,10 +58,12 @@ struct Graph {
     // the RDMA edge, whose read signals flag rdmaSignal once done, and the relay edge (no sources, the same
     // destination), with which the kernel waits for that flag and then marks the destination as filled.
     int32_t rdmaSignal = -1;
+    // The part of the cell, for cells whose proxied transfer is split into chunks (0 otherwise)
+    uint32_t chunkIndex = 0;
 
     template<typename X>
     void serialize(X& x) {
-      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal);
+      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex);
     }
   };
 

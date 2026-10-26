@@ -565,8 +565,12 @@ struct GraphBuilder {
   }
 
   void ring(bool writeMode) {
-    Vector<std::tuple<uint32_t, uint32_t, Node>> myReceives;
-    HashMap<uint32_t, Edge> edgeMap;
+    // Chains are per cell, and per chunk for cells whose proxied transfer is split into chunks
+    auto key = [](const Edge& e) {
+      return ((uint64_t)e.cellIndex << 32) | e.chunkIndex;
+    };
+    Vector<std::tuple<uint64_t, size_t, Node>> myReceives;
+    HashMap<uint64_t, Edge> edgeMap;
 
     for (auto& edge : edges) {
       // we could, technically, have multiple overlapping outputs.
@@ -580,12 +584,12 @@ struct GraphBuilder {
       // fixme: why is this done by cell indices at all?
       //        this should be done by node ids. we know exactly the node id of the source(s),
       //        and this is what we should group on, not cell index.
-      CHECK(!edgeMap.contains(edge.cellIndex));
-      edgeMap[edge.cellIndex] = edge;
+      CHECK(!edgeMap.contains(key(edge)));
+      edgeMap[key(edge)] = edge;
       for (auto& d : edge.destinations) {
         CHECK(d.rank == rank);
         if (d.device == DeviceType::CUDA) {
-          myReceives.emplace_back(edge.cellIndex, edge.bytes, d);
+          myReceives.emplace_back(key(edge), edge.bytes, d);
           break;
         }
       }
@@ -595,10 +599,10 @@ struct GraphBuilder {
       ctx.send(i, myReceives);
     }
 
-    HashMap<uint32_t, Vector<Node>> groups;
+    HashMap<uint64_t, Vector<Node>> groups;
 
     for (size_t i : cudaRanks) {
-      Vector<std::tuple<uint32_t, uint32_t, Node>> nReceives;
+      Vector<std::tuple<uint64_t, size_t, Node>> nReceives;
       ctx.receive(i, nReceives);
 
       for (auto [cell, bytes, node] : nReceives) {
@@ -636,7 +640,8 @@ struct GraphBuilder {
       for (auto& v : ranks) {
         rankns.push_back(v.rank);
       }
-      log.debug("%d: ranks for cell %d is [%s]\n", rank, cell, fmt::to_string(fmt::join(rankns, ", ")));
+      log.debug("%d: ranks for cell %d chunk %d is [%s]\n", rank, cell >> 32, cell & 0xffffffff,
+          fmt::to_string(fmt::join(rankns, ", ")));
 
       auto it = std::ranges::find(ranks, rank, proj);
       CHECK(it != ranks.end());
@@ -775,7 +780,8 @@ struct CompileOpConstructor {
   // node. The proxy's RDMA edge gets a signal index (rdmaSignal): its CPU thread signals the kernel once the
   // read has completed. A relay edge on the proxy (no sources, the proxy's node as destination, same signal
   // index) makes the kernel wait for that signal and then mark the node as filled, after which the copies from
-  // it run as dependent edges in every graph variant.
+  // it run as dependent edges in every graph variant. Large transfers are split into chunks, each with its own
+  // read, signal, relay edge and copies (chunkIndex), so that the copies overlap the reads.
   // Proxied are only groups whose copies the kernel can take (CUDA destinations, sizes and destination offsets
   // multiples of 16 bytes) and that have one destination per rank. The proxy is preferably the destination with
   // the same local rank as the source (NICs on the same rail), otherwise the one that proxies the fewest bytes
@@ -821,9 +827,13 @@ struct CompileOpConstructor {
 
     // Signal flags live in cpuOutBuffer after its first 16 slots
     const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
+    static constexpr size_t minChunkBytes = 4 << 20;
+    static constexpr size_t maxTransferChunks = 32;
     HashMap<uint32_t, size_t> proxyBytes;
     HashMap<uint32_t, size_t> proxySignals;
+    HashMap<uint32_t, uint32_t> chunkNodeCounter;
     size_t numGroups = 0;
+    size_t numChunksTotal = 0;
     size_t numMine = 0;
     for (uint64_t sourceId : sourceIds) {
       Vector<Edge>& g = groups[sourceId];
@@ -841,58 +851,107 @@ struct CompileOpConstructor {
       if (!eligible) {
         continue;
       }
+      // Split transfers of at least 2 * minChunkBytes into chunks: each chunk is a read with its own signal, a relay
+      // edge and copies, so that the copies of a chunk can start as soon as it has arrived
+      const size_t bytes = g[0].bytes;
+      size_t numChunks = 1;
+      size_t chunkBytes = bytes;
+      if (bytes >= 2 * minChunkBytes) {
+        numChunks = std::min(maxTransferChunks, bytes / minChunkBytes);
+        chunkBytes = ((bytes + numChunks - 1) / numChunks + 4095) / 4096 * 4096;
+        numChunks = (bytes + chunkBytes - 1) / chunkBytes;
+      }
       uint32_t sourceRank = g[0].sources[0].rank;
-      const Edge* proxy = nullptr;
-      for (const Edge& e : g) {
-        uint32_t r = e.destinations[0].rank;
-        if (proxySignals[r] < maxSignals && group->rankLocalRank.at(r) == group->rankLocalRank.at(sourceRank)) {
-          proxy = &e;
+      size_t proxyIndex = g.size();
+      for (size_t m : indices(g)) {
+        uint32_t r = g[m].destinations[0].rank;
+        if (proxySignals[r] + numChunks <= maxSignals &&
+            group->rankLocalRank.at(r) == group->rankLocalRank.at(sourceRank)) {
+          proxyIndex = m;
           break;
         }
       }
-      if (!proxy) {
-        for (const Edge& e : g) {
-          uint32_t r = e.destinations[0].rank;
-          if (proxySignals[r] < maxSignals && (!proxy || proxyBytes[r] < proxyBytes[proxy->destinations[0].rank])) {
-            proxy = &e;
+      if (proxyIndex == g.size()) {
+        for (size_t m : indices(g)) {
+          uint32_t r = g[m].destinations[0].rank;
+          if (proxySignals[r] + numChunks <= maxSignals &&
+              (proxyIndex == g.size() || proxyBytes[r] < proxyBytes[g[proxyIndex].destinations[0].rank])) {
+            proxyIndex = m;
           }
         }
       }
-      if (!proxy) {
+      if (proxyIndex == g.size()) {
         continue;
       }
-      const uint32_t proxyRank = proxy->destinations[0].rank;
-      const Node proxyNode = proxy->destinations[0];
-      const int32_t signal = proxySignals[proxyRank]++;
-      proxyBytes[proxyRank] += proxy->bytes;
+      const uint32_t proxyRank = g[proxyIndex].destinations[0].rank;
+      const int32_t firstSignal = proxySignals[proxyRank];
+      proxySignals[proxyRank] += numChunks;
+      proxyBytes[proxyRank] += bytes;
       ++numGroups;
+      numChunksTotal += numChunks;
 
-      for (const Edge& m : g) {
-        if (m.destinations[0].rank != rank) {
+      // chunkNodes[m][c]: chunk c of member m's destination node. A single chunk keeps the node itself; split
+      // transfers get new nodes, with ids from a range their owner never assigns (bit 31 of the local index),
+      // numbered in the order of this pass, which every member of the domain follows.
+      Vector<Vector<Node>> chunkNodes(g.size());
+      for (size_t c : range(numChunks)) {
+        for (size_t m : indices(g)) {
+          Node node = g[m].destinations[0];
+          if (numChunks > 1) {
+            node.id = ((uint64_t)(node.rank + 1) << 32) | (0x80000000u + chunkNodeCounter[node.rank]++);
+            node.offset += chunkBytes * c;
+          }
+          chunkNodes[m].push_back(node);
+        }
+      }
+
+      for (size_t m : indices(g)) {
+        if (g[m].destinations[0].rank != rank) {
           continue;
         }
         ++numMine;
-        auto it = std::ranges::find(edges, m.id, &Edge::id);
+        auto it = std::ranges::find(edges, g[m].id, &Edge::id);
         CHECK(it != edges.end());
-        if (rank == proxyRank) {
-          it->rdmaSignal = signal;
-          Edge relay;
-          relay.id = ictx.nextEdgeId();
-          relay.destinations.push_back(proxyNode);
-          relay.bytes = m.bytes;
-          relay.cellIndex = m.cellIndex;
-          relay.executorRank = rank;
-          relay.rdmaSignal = signal;
-          edges.push_back(std::move(relay));
-        } else {
-          it->sources.clear();
-          it->sources.push_back(proxyNode);
-          it->id = ictx.nextEdgeId();
+        Edge original = std::move(*it);
+        edges.erase(it);
+        for (size_t c : range(numChunks)) {
+          size_t offset = chunkBytes * c;
+          size_t n = std::min(chunkBytes, bytes - offset);
+          if (rank == proxyRank) {
+            // The RDMA read of the chunk (an ibRead after the split), signaling once done
+            Edge read = original;
+            read.id = ictx.nextEdgeId();
+            read.sources[0].offset += offset;
+            read.destinations[0] = chunkNodes[m][c];
+            read.bytes = n;
+            read.rdmaSignal = firstSignal + c;
+            read.chunkIndex = c;
+            edges.push_back(std::move(read));
+            Edge relay;
+            relay.id = ictx.nextEdgeId();
+            relay.destinations.push_back(chunkNodes[m][c]);
+            relay.bytes = n;
+            relay.cellIndex = original.cellIndex;
+            relay.executorRank = rank;
+            relay.rdmaSignal = firstSignal + c;
+            relay.chunkIndex = c;
+            edges.push_back(std::move(relay));
+          } else {
+            Edge copy = original;
+            copy.id = ictx.nextEdgeId();
+            copy.sources.clear();
+            copy.sources.push_back(chunkNodes[proxyIndex][c]);
+            copy.destinations[0] = chunkNodes[m][c];
+            copy.bytes = n;
+            copy.chunkIndex = c;
+            edges.push_back(std::move(copy));
+          }
         }
       }
     }
-    log.debug("compile_op: rank %zu: %zu proxied groups in a domain of %zu ranks (%zu of my edges, %zu as proxy)\n",
-        rank, numGroups, domain.size(), numMine, proxySignals[rank]);
+    log.debug("compile_op: rank %zu: %zu proxied groups (%zu chunks) in a domain of %zu ranks (%zu of my edges, %zu "
+              "signals as proxy)\n",
+        rank, numGroups, numChunksTotal, domain.size(), numMine, proxySignals[rank]);
   }
 
   Setting tuneKernels(Vector<Graph> graphs, const Vector<std::string>& copyEngines, std::string target) {

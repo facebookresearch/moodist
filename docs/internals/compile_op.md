@@ -56,7 +56,10 @@ Every step is collective: all ranks of the group take part (through per-rank que
    assignment. The proxy's RDMA edge gets a signal index (`rdmaSignal`), and the proxy gets a relay edge: no
    sources, the proxy's node as destination, the same signal index. The relay edge makes the proxy's kernel wait
    until the CPU thread signals that the read has completed, and then mark the node as filled; the copies from the
-   node are ordinary dependent edges.
+   node are ordinary dependent edges. Transfers of 8 MiB or more are split into chunks of at least 4 MiB (at most
+   32): each chunk has its own read, signal, relay edge and copies (`chunkIndex`; the chunk nodes get ids that
+   their owner never assigns, numbered in the same order by every member of the domain), so that the copies of a
+   chunk start as soon as it has arrived.
 8. **Kernel / RDMA split**: an edge goes to the kernel if all its nodes are CUDA, all its ranks are kernel peers
    (`cudaRanks`: the ranks whose memory this rank can map, i.e. CUDA IPC peers on the same node, or all ranks of a
    multi-node NVLink fabric domain such as NVL72), and, for process group collectives built on compile_op
@@ -74,7 +77,7 @@ Every step is collective: all ranks of the group take part (through per-rank que
    - `read` (`buildNothing`): every edge stays with its destination rank, which reads from the source.
    - `ring_read`, `ring_write`: the destinations of a cell form a chain, starting at the source rank, and each
      rank copies the cell from the previous rank's output (read: the receiver executes the copy, write: the
-     sender). A proxy's relay edge heads the chain of its cell.
+     sender). A proxy's relay edge heads the chain of its cell (of each chunk, for chunked transfers).
 
    Edges have unfilled sources, i.e. depend on other edges, in the ring graphs and for proxied transfers (the
    copies from a proxy's node). Relay edges stay with the proxy in every variant.
@@ -141,8 +144,9 @@ on new tensors at every call.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads) publishes the rank's input list (addresses, sizes,
   rkeys; CUDA tensors are registered on first use) to all ranks, registers the outputs, collects all ranks' input
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
-  (reads of 4 MiB or more split into one part per NIC; shuffled, at most 2 in flight per NIC), waits for them,
-  runs a second barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`.
+  (reads of 4 MiB or more split into one part per NIC; reads with a signal first, in signal order, i.e. the chunks
+  of a transfer in order, then the others shuffled; at most 2 in flight per NIC), waits for them, runs a second
+  barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`.
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
@@ -176,11 +180,13 @@ With `MOODIST_FABRIC=0`, i.e. two NVLink domains connected by RoCE (4 NICs per G
 
 | | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
 |---|---|---|---|---|
-| `multicast`, proxy pass (one RDMA read per chunk and node, then NVLink) | 74 us | 121 us | 429 us | 6.63 ms (324 GB/s) |
-| `ring_write`, proxy pass | 79 us | 121 us | 438 us | 6.84 ms (314 GB/s) |
+| `multicast`, proxy pass (each rank's data read once per node, then NVLink) | 76 us | 119 us | 388 us | 5.12 ms (419 GB/s) |
+| `read`, proxy pass | 76 us | 122 us | 386 us | 5.17 ms (416 GB/s) |
+| `ring_write`, proxy pass | 77 us | 126 us | 387 us | 5.20 ms (413 GB/s) |
+| `multicast`, proxy pass without chunks (each transfer one read) | 74 us | 121 us | 429 us | 6.63 ms (324 GB/s) |
 | `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 85 us | 211 us | 1.78 ms | 26.5 ms (81 GB/s) |
 | the same before reads were split over the NICs | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
-| NCCL with `NCCL_MNNVL_ENABLE=0` | 92 us | 102 us | 440 us | 5.42 ms (396 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 94 us | 97 us | 440 us | 5.40 ms (397 GB/s) |
 
 Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
 rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
@@ -227,9 +233,8 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - Per edge, the table-driven kernel is about 12% slower than the old inlined one (address resolution through the
   tables; the sequential path loads the next edge's words while copying the current one). Prefetching one edge
   further ahead, or tables in constant memory when they fit, could close it.
-- Proxied transfers are not pipelined: the proxy's kernel starts the NVLink copies only once the whole RDMA read
-  has completed (6.6 ms against NCCL's 5.4 ms for the 256 MiB all-gather above). Edges the proxy pass leaves
-  alone (CPU destinations, unaligned pieces, one destination per domain) are read by each destination rank.
+- Edges the proxy pass leaves alone (CPU destinations, unaligned pieces, one destination per domain) are read by
+  each destination rank.
 - `WorkCustom` runs two barriers with all ranks per op, including ranks without RDMA work.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
@@ -240,13 +245,11 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   would make it usable without a rebuild.
 
 ### Mixed NVLink and RDMA paths: next steps
-The proxy pass (compile phase step 7) sends data needed by several ranks of an NVLink domain over the network once.
-(Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in c57c8f4, computed a similar plan
-with gateway reads and local copies, but it was never executed.) Next:
-1. Pipelining: large proxied transfers in chunks, each chunk its own read, signal, relay edge and copies (edges no
-   longer cost code size), so that the NVLink copies overlap the RDMA read.
-2. The write variant: the source writes the data and the signal into the proxy's memory.
-3. An explicit flush before the signal (see Correctness).
+The proxy pass (compile phase step 7) sends data needed by several ranks of an NVLink domain over the network once,
+in chunks for large transfers. (Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in
+c57c8f4, computed a similar plan with gateway reads and local copies, but it was never executed.) Next:
+1. The write variant: the source writes the data and the signal into the proxy's memory.
+2. An explicit flush before the signal (see Correctness).
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`

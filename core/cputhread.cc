@@ -5878,6 +5878,11 @@ struct CpuThreadImpl {
         } while (offset < r.bytes);
       }
       std::ranges::shuffle(reads, getRng());
+      // Reads that signal the kernel first, in signal order (the chunks of a transfer in order): copies on this
+      // and other ranks wait for them
+      std::ranges::stable_sort(reads, {}, [](const CustomOpDescriptor::IbRead& r) {
+        return r.signalIndex < 0 ? std::numeric_limits<int32_t>::max() : r.signalIndex;
+      });
 
       if (params.anyCuda) {
         // wait for kernel
