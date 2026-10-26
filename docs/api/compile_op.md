@@ -20,6 +20,7 @@ def compile_op(
 class TensorRegion:
     offset: list[int]
     shape: list[int]
+    device: str | torch.device  # "cpu", "cuda" or "cuda:N" (N must be the process group's device)
     tensor_id: str = "0"
 ```
 
@@ -62,6 +63,11 @@ op([input_dtensor.to_local()], [output_dtensor.to_local()])
 ```
 
 This is useful for tensor redistribution operations where you want to change the sharding of a DTensor. The DTensors can be meta tensors (no actual data) if you only need to specify the sharding pattern.
+
+## Requirements for CUDA tensors
+
+- CUDA tensors must be allocated by the moodist CUDA allocator: call `moodist.enable_cuda_allocator()` before allocating them. Checked when the op runs.
+- Transfers between NVLink peers (GPUs on the same node, or all GPUs of a multi-node NVLink domain such as NVL72) are done by a copy kernel that needs sizes and offsets that are multiples of 16 bytes, and 16-byte aligned tensors. Sizes and offsets are checked by `compile_op` (a `RuntimeError` on all ranks), tensor addresses when the op runs.
 
 ## Parameters
 
@@ -550,9 +556,9 @@ Note that the compiled operation only transfers the data each rank actually need
 
 ### Performance Considerations
 
-- **Compilation overhead**: There is overhead when calling `compile_op` as it involves collective coordination across all ranks. The compiled operation object returned can be reused multiple times to amortize this cost.
-- **Asynchronous execution**: Calling the compiled operation returns immediately with a `Future` object. The actual data transfer happens asynchronously on a background thread.
-- **RDMA-based transfers**: Data is transferred directly between ranks using RDMA (Remote Direct Memory Access), enabling zero-copy transfers without CPU involvement in the data movement.
+- **Compilation overhead**: `compile_op` coordinates all ranks, and when NVLink peers exchange CUDA data it generates, compiles and benchmarks candidate copy kernels, which takes about a second for simple patterns and grows with the number of separate pieces moved. The compiled operation object returned can be reused multiple times to amortize this cost.
+- **Asynchronous execution**: Calling the compiled operation returns immediately with a `Future` object. The actual data transfer happens asynchronously.
+- **Transfers**: CUDA data between NVLink peers is moved by the generated copy kernel; everything else (other nodes, CPU tensors) by RDMA reads (Remote Direct Memory Access) issued from a background thread, zero-copy, without CPU involvement in the data movement.
 - **Memory patterns**: The implementation optimizes for contiguous memory access when possible and handles non-contiguous patterns automatically (may involve intermediate copies).
 
 ## See Also
