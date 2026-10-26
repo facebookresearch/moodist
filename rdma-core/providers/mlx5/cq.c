@@ -128,12 +128,12 @@ static inline uint8_t get_cqe_l3_hdr_type(struct mlx5_cqe64 *cqe)
 
 static void *get_buf_cqe(struct mlx5_buf *buf, int n, int cqe_sz)
 {
-	return buf->buf + n * cqe_sz;
+	return buf->ibv_buf.addr + n * cqe_sz;
 }
 
 static void *get_cqe(struct mlx5_cq *cq, int n)
 {
-	return cq->active_buf->buf + n * cq->cqe_sz;
+	return cq->active_buf->ibv_buf.addr + n * cq->cqe_sz;
 }
 
 static void *get_sw_cqe(struct mlx5_cq *cq, int n)
@@ -530,12 +530,10 @@ static inline int get_cur_rsc(struct mlx5_context *mctx,
 }
 
 static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
-				    struct mlx5_cqe64 **pcqe64,
-				    void **pcqe)
+				    struct mlx5_cqe64 **pcqe64)
 				    ALWAYS_INLINE;
 static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
-				    struct mlx5_cqe64 **pcqe64,
-				    void **pcqe)
+				    struct mlx5_cqe64 **pcqe64)
 {
 	void *cqe;
 	struct mlx5_cqe64 *cqe64;
@@ -568,7 +566,6 @@ static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
 	}
 #endif
 	*pcqe64 = cqe64;
-	*pcqe = cqe;
 
 	return CQ_OK;
 }
@@ -703,7 +700,6 @@ static inline int is_odp_pfault_err(struct mlx5_err_cqe *ecqe)
 
 static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 struct mlx5_cqe64 *cqe64,
-				 void *cqe,
 				 struct mlx5_resource **cur_rsc,
 				 struct mlx5_srq **cur_srq,
 				 struct ibv_wc *wc,
@@ -711,7 +707,6 @@ static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 ALWAYS_INLINE;
 static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 struct mlx5_cqe64 *cqe64,
-				 void *cqe,
 				 struct mlx5_resource **cur_rsc,
 				 struct mlx5_srq **cur_srq,
 				 struct ibv_wc *wc,
@@ -778,10 +773,10 @@ again:
 			scatter_out:
 				if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
 					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe, wc_byte_len);
+					    mqp, wqe_ctr, cqe64, wc_byte_len);
 				else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
 					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe - 1, wc_byte_len);
+					    mqp, wqe_ctr, cqe64 - 1, wc_byte_len);
 				break;
 			}
 
@@ -794,11 +789,11 @@ again:
 			handle_good_req(wc, cqe64, wq, idx);
 
 			if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
-				err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe,
+				err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe64,
 							    wc->byte_len);
 			else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
 				err = mlx5_copy_to_send_wqe(
-				    mqp, wqe_ctr, cqe - 1, wc->byte_len);
+				    mqp, wqe_ctr, cqe64 - 1, wc->byte_len);
 
 			wc->wr_id = wq->wrid[idx];
 			wc->status = err;
@@ -865,7 +860,7 @@ again:
 		get_sig_err_info(sigerr_cqe, &mkey->sig->err_info);
 		pthread_mutex_unlock(&mctx->mkey_table_mutex);
 
-		err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
+		err = mlx5_get_next_cqe(cq, &cqe64);
 		/*
 		 * CQ_POLL_NODATA indicates that CQ was not empty but the polled
 		 * CQE was handled internally and should not processed by the
@@ -924,7 +919,7 @@ again:
 			if (is_srq) {
 				if (is_odp_pfault_err(ecqe)) {
 					mlx5_complete_odp_fault(*cur_srq, wqe_ctr);
-					err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
+					err = mlx5_get_next_cqe(cq, &cqe64);
 					/* CQ_POLL_NODATA indicates that CQ was not empty but the polled CQE
 					 * was handled internally and should not processed by the caller.
 					 */
@@ -964,13 +959,13 @@ again:
 
 static inline int mlx5_parse_lazy_cqe(struct mlx5_cq *cq,
 				      struct mlx5_cqe64 *cqe64,
-				      void *cqe, int cqe_ver)
+				      int cqe_ver)
 				      ALWAYS_INLINE;
 static inline int mlx5_parse_lazy_cqe(struct mlx5_cq *cq,
 				      struct mlx5_cqe64 *cqe64,
-				      void *cqe, int cqe_ver)
+				      int cqe_ver)
 {
-	return mlx5_parse_cqe(cq, cqe64, cqe, &cq->cur_rsc, &cq->cur_srq, NULL, cqe_ver, 1);
+	return mlx5_parse_cqe(cq, cqe64, &cq->cur_rsc, &cq->cur_srq, NULL, cqe_ver, 1);
 }
 
 static inline int mlx5_poll_one(struct mlx5_cq *cq,
@@ -984,14 +979,13 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 				struct ibv_wc *wc, int cqe_ver)
 {
 	struct mlx5_cqe64 *cqe64;
-	void *cqe;
 	int err;
 
-	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
+	err = mlx5_get_next_cqe(cq, &cqe64);
 	if (err == CQ_EMPTY)
 		return err;
 
-	return mlx5_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, cqe_ver, 0);
+	return mlx5_parse_cqe(cq, cqe64, cur_rsc, cur_srq, wc, cqe_ver, 0);
 }
 
 static inline int poll_cq(struct ibv_cq *ibcq, int ne,
@@ -1103,7 +1097,6 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 {
 	struct mlx5_cq *cq = to_mcq(ibv_cq_ex_to_cq(ibcq));
 	struct mlx5_cqe64 *cqe64;
-	void *cqe;
 	int err;
 
 	if (unlikely(attr->comp_mask))
@@ -1125,7 +1118,7 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 	cq->cur_rsc = NULL;
 	cq->cur_srq = NULL;
 
-	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
+	err = mlx5_get_next_cqe(cq, &cqe64);
 	if (err == CQ_EMPTY) {
 		if (lock)
 			mlx5_spin_unlock(&cq->lock);
@@ -1143,10 +1136,21 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		return ENOENT;
 	}
 
+	if (clock_update) {
+		err = mlx5dv_get_clock_info(ibcq->context, &cq->last_clock_info);
+		if (err) {
+			if (err == EBUSY)
+				--cq->cons_index;
+			if (lock)
+				mlx5_spin_unlock(&cq->lock);
+			return err;
+		}
+	}
+
 	if (stall)
 		cq->flags |= MLX5_CQ_FLAGS_FOUND_CQES;
 
-	err = mlx5_parse_lazy_cqe(cq, cqe64, cqe, cqe_version);
+	err = mlx5_parse_lazy_cqe(cq, cqe64, cqe_version);
 	if (lock && err)
 		mlx5_spin_unlock(&cq->lock);
 
@@ -1158,17 +1162,8 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		}
 
 		cq->flags &= ~(MLX5_CQ_FLAGS_FOUND_CQES);
-
-		goto out;
 	}
 
-	if (clock_update && !err) {
-		err = mlx5dv_get_clock_info(ibcq->context, &cq->last_clock_info);
-		if (lock && err)
-			mlx5_spin_unlock(&cq->lock);
-	}
-
-out:
 	return err;
 }
 
@@ -1181,10 +1176,9 @@ static inline int mlx5_next_poll(struct ibv_cq_ex *ibcq,
 {
 	struct mlx5_cq *cq = to_mcq(ibv_cq_ex_to_cq(ibcq));
 	struct mlx5_cqe64 *cqe64;
-	void *cqe;
 	int err;
 
-	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
+	err = mlx5_get_next_cqe(cq, &cqe64);
 	if (err == CQ_EMPTY) {
 		if (stall == POLLING_MODE_STALL_ADAPTIVE)
 			cq->flags |= MLX5_CQ_FLAGS_EMPTY_DURING_POLL;
@@ -1192,7 +1186,7 @@ static inline int mlx5_next_poll(struct ibv_cq_ex *ibcq,
 		return ENOENT;
 	}
 
-	return mlx5_parse_lazy_cqe(cq, cqe64, cqe, cqe_version);
+	return mlx5_parse_lazy_cqe(cq, cqe64, cqe_version);
 }
 
 static inline int mlx5_next_poll_adaptive_v0(struct ibv_cq_ex *ibcq)
@@ -1848,7 +1842,8 @@ void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t rsn, struct mlx5_srq *srq)
 	 * that match our QP by copying older entries on top of them.
 	 */
 	cqe_version = (to_mctx(cq->verbs_cq.cq.context))->cqe_version;
-	while ((int) --prod_index - (int) cq->cons_index >= 0) {
+	while (prod_index != cq->cons_index) {
+		--prod_index;
 		cqe = get_cqe(cq, prod_index & cq->verbs_cq.cq.cqe);
 		cqe64 = (cq->cqe_sz == 64) ? cqe : cqe + 64;
 		if (free_res_cqe(cqe64, rsn, srq, cqe_version)) {
@@ -1954,8 +1949,8 @@ int mlx5_alloc_cq_buf(struct mlx5_context *mctx, struct mlx5_cq *cq,
 	mlx5_get_alloc_type(mctx, cq->parent_domain,
 			    MLX5_CQ_PREFIX, &type, default_type);
 
-	if (type == MLX5_ALLOC_TYPE_CUSTOM) {
-		buf->mparent_domain = to_mparent_domain(cq->parent_domain);
+	if (type == MLX5_ALLOC_TYPE_CUSTOM ||
+	    type == MLX5_ALLOC_TYPE_DMABUF) {
 		buf->req_alignment = dev->page_size;
 		buf->resource_type = MLX5DV_RES_TYPE_CQ;
 	}
@@ -1964,16 +1959,16 @@ int mlx5_alloc_cq_buf(struct mlx5_context *mctx, struct mlx5_cq *cq,
 				      align(nent * cqe_sz, dev->page_size),
 				      dev->page_size,
 				      type,
-				      MLX5_CQ_PREFIX);
+				      MLX5_CQ_PREFIX, cq->parent_domain);
 
 	if (ret)
 		return -1;
 
 	if (buf->type != MLX5_ALLOC_TYPE_CUSTOM)
-		memset(buf->buf, 0, nent * cqe_sz);
+		memset(buf->ibv_buf.addr, 0, nent * cqe_sz);
 
 	for (i = 0; i < nent; ++i) {
-		cqe = buf->buf + i * cqe_sz;
+		cqe = buf->ibv_buf.addr + i * cqe_sz;
 		cqe += cqe_sz == 128 ? 1 : 0;
 		cqe->op_own = MLX5_CQE_INVALID << 4;
 	}

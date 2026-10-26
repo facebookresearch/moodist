@@ -878,7 +878,7 @@ class CmdHcaCap(PRMPacket):
         BitField('log_max_cq', 0, 5),
         ByteField('log_max_eq_sz', 0),
         BitField('relaxed_ordering_write', 0, 1),
-        BitField('relaxed_ordering_read', 0, 1),
+        BitField('relaxed_ordering_read_pci_enabled', 0, 1),
         BitField('log_max_mkey', 0, 6),
         BitField('tunneled_atomic', 0, 1),
         BitField('as_notify', 0, 1),
@@ -1114,7 +1114,9 @@ class CmdHcaCap(PRMPacket):
         ByteField('log_max_mcg', 0),
         BitField('reserved25', 0, 3),
         BitField('log_max_transport_domain', 0, 5),
-        BitField('reserved26', 0, 3),
+        BitField('tir_esw_lb_filter_disable', 0, 1),
+        BitField('reserved26', 0, 1),
+        BitField('relaxed_ordering_read', 0, 1),
         BitField('log_max_pd', 0, 5),
         BitField('reserved27', 0, 11),
         BitField('log_max_xrcd', 0, 5),
@@ -1576,7 +1578,8 @@ class AllocFlowCounterIn(PRMPacket):
         ShortField('reserved1', 0),
         ShortField('op_mod', 0),
         IntField('flow_counter_id', 0),
-        BitField('reserved2', 0, 24),
+        BitField('reserved2', 0, 19),
+        BitField('flow_counter_bulk_log_size', 0, 5),
         ByteField('flow_counter_bulk', 0),
     ]
 
@@ -1642,6 +1645,23 @@ class QueryFlowCounterOut(PRMPacket):
         StrFixedLenField('reserved2', None, length=8),
         PacketField('flow_statistics', TrafficCounter(), TrafficCounter),
     ]
+
+
+class QueryBulkFlowCounterOut(PRMPacket):
+    fields_desc = [
+        ByteField('status', 0),
+        BitField('reserved1', 0, 24),
+        IntField('syndrome', 0),
+        StrFixedLenField('reserved2', None, length=4),
+        IntField('num_statistics', 0),
+        PacketListField('flow_statistics', [], TrafficCounter),
+    ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if self.num_statistics > 0:
+            self.flow_statistics = [TrafficCounter() for _ in range(self.num_statistics)]
 
 
 class RxHashFieldSelect(PRMPacket):

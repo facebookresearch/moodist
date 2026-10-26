@@ -107,6 +107,18 @@ int ibv_cmd_query_port(struct ibv_context *context, uint8_t port_num,
 	return 0;
 }
 
+int ibv_cmd_query_port_speed(struct ibv_context *context, uint32_t port_num,
+			     uint64_t *speed)
+{
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_DEVICE,
+			       UVERBS_METHOD_QUERY_PORT_SPEED, 2);
+
+	fill_attr_const_in(cmdb, UVERBS_ATTR_QUERY_PORT_SPEED_PORT_NUM, port_num);
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_QUERY_PORT_SPEED_RESP, speed);
+
+	return execute_ioctl(context, cmdb);
+}
+
 int ibv_cmd_alloc_async_fd(struct ibv_context *context)
 {
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_ASYNC_EVENT,
@@ -683,6 +695,46 @@ int ibv_cmd_query_device_any(struct ibv_context *context,
 			attr->phys_port_cnt_ex = attr->orig_attr.phys_port_cnt;
 	}
 #undef CAN_COPY
+
+	return 0;
+}
+
+int ibv_cmd_query_comp_cntr_caps(struct ibv_context *context,
+				 struct ibv_comp_cntr_caps *caps,
+				 size_t caps_size)
+{
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_DEVICE,
+			       UVERBS_METHOD_QUERY_COMP_CNTR_CAPS, 3);
+	uint32_t supported_qp_attach_ops;
+	int ret;
+
+	if (caps_size < sizeof(struct ibv_comp_cntr_caps))
+		return EINVAL;
+
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_QUERY_COMP_CNTR_CAPS_MAX_COUNTERS,
+			  &caps->max_counters);
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_QUERY_COMP_CNTR_CAPS_MAX_VALUE,
+			  &caps->max_value);
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_QUERY_COMP_CNTR_CAPS_SUPPORTED_QP_ATTACH_OPS,
+			  &supported_qp_attach_ops);
+
+	ret = execute_ioctl(context, cmdb);
+	if (ret)
+		return ret;
+
+	caps->supported_qp_attach_ops = 0;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_SEND)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_SEND;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_RECV)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_RECV;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_RDMA_READ)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_READ;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_READ)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_READ;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_RDMA_WRITE)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_WRITE;
+	if (supported_qp_attach_ops & IB_UVERBS_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_WRITE)
+		caps->supported_qp_attach_ops |= IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_WRITE;
 
 	return 0;
 }

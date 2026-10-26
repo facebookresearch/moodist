@@ -62,6 +62,7 @@ cdef extern from 'infiniband/mlx5dv.h':
         MLX5DV_CONTEXT_FLAGS_CQE_128B_PAD               = 1 << 5
         MLX5DV_CONTEXT_FLAGS_PACKET_BASED_CREDIT_MODE   = 1 << 6
         MLX5DV_CONTEXT_FLAGS_REAL_TIME_TS               = 1 << 7
+        MLX5DV_CONTEXT_FLAGS_BLUEFLAME                  = 1 << 8
 
     cpdef enum mlx5dv_sw_parsing_offloads:
         MLX5DV_SW_PARSING       = 1 << 0
@@ -184,6 +185,7 @@ cdef extern from 'infiniband/mlx5dv.h':
         MLX5DV_FLOW_ACTION_DEST_DEVX
         MLX5DV_FLOW_ACTION_COUNTERS_DEVX
         MLX5DV_FLOW_ACTION_DEFAULT_MISS
+        MLX5DV_FLOW_ACTION_COUNTERS_DEVX_WITH_OFFSET
 
     cpdef enum mlx5dv_dr_domain_type:
         MLX5DV_DR_DOMAIN_TYPE_NIC_RX
@@ -333,3 +335,7 @@ cdef extern from 'infiniband/mlx5_api.h':
     cdef int MLX5DV_FLOW_ACTION_PACKET_REFORMAT_TYPE_L2_TO_L3_TUNNEL
 
     cdef int MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT
+    cdef int MLX5DV_VAR_ALLOC_FLAG_TLP
+
+    cpdef enum mlx5dv_devx_create_event_channel_flags:
+        MLX5DV_DEVX_CREATE_EVENT_CHANNEL_FLAGS_OMIT_EV_DATA

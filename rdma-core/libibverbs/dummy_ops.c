@@ -30,6 +30,8 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+#include <stdlib.h>
+#include <unistd.h>
 #include <infiniband/driver.h>
 #include "ibverbs.h"
 #include <errno.h>
@@ -50,10 +52,47 @@ static struct ibv_dm *alloc_dm(struct ibv_context *context,
 	return NULL;
 }
 
+static struct ibv_dmah *alloc_dmah(struct ibv_context *context,
+				   struct ibv_dmah_init_attr *attr)
+{
+	errno = EOPNOTSUPP;
+	return NULL;
+}
+
 static struct ibv_mw *alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type)
 {
 	errno = EOPNOTSUPP;
 	return NULL;
+}
+
+static void *alloc_buf(struct ibv_pd *pd, size_t size, struct ibv_buf **buf)
+{
+	struct ibv_buf *ibuf;
+	void *ptr;
+	int ret;
+
+	ibuf = calloc(1, sizeof(*ibuf));
+	if (!ibuf) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	ret = posix_memalign(&ptr, sysconf(_SC_PAGESIZE), size);
+	if (ret) {
+		free(ibuf);
+		errno = ret;
+		return NULL;
+	}
+
+	ibv_buf_init(ibuf, pd, ptr, size);
+	*buf = ibuf;
+	return ptr;
+}
+
+static void free_buf(struct ibv_buf *buf)
+{
+	free(buf->addr);
+	free(buf);
 }
 
 static struct ibv_mr *alloc_null_mr(struct ibv_pd *pd)
@@ -117,6 +156,13 @@ static void cq_event(struct ibv_cq *cq)
 }
 
 static struct ibv_ah *create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
+{
+	errno = EOPNOTSUPP;
+	return NULL;
+}
+
+static struct ibv_comp_cntr *create_comp_cntr(struct ibv_context *context,
+					      struct ibv_comp_cntr_init_attr *attr)
 {
 	errno = EOPNOTSUPP;
 	return NULL;
@@ -202,6 +248,11 @@ static struct ibv_wq *create_wq(struct ibv_context *context,
 	return NULL;
 }
 
+static int dealloc_dmah(struct ibv_dmah *st)
+{
+	return EOPNOTSUPP;
+}
+
 static int dealloc_mw(struct ibv_mw *mw)
 {
 	return EOPNOTSUPP;
@@ -223,6 +274,11 @@ static int dereg_mr(struct verbs_mr *vmr)
 }
 
 static int destroy_ah(struct ibv_ah *ah)
+{
+	return EOPNOTSUPP;
+}
+
+static int destroy_comp_cntr(struct ibv_comp_cntr *comp_cntr)
 {
 	return EOPNOTSUPP;
 }
@@ -273,6 +329,12 @@ static int detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid,
 	return EOPNOTSUPP;
 }
 
+static int dm_export_dmabuf_fd(struct ibv_dm *dm)
+{
+	errno = EOPNOTSUPP;
+	return -1;
+}
+
 static void free_context(struct ibv_context *ctx)
 {
 	return;
@@ -307,6 +369,16 @@ static struct ibv_pd *import_pd(struct ibv_context *context,
 {
 	errno = EOPNOTSUPP;
 	return NULL;
+}
+
+static int inc_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount)
+{
+	return EOPNOTSUPP;
+}
+
+static int inc_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount)
+{
+	return EOPNOTSUPP;
 }
 
 static int modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr)
@@ -385,6 +457,20 @@ static int post_srq_recv(struct ibv_srq *srq, struct ibv_recv_wr *recv_wr,
 	return EOPNOTSUPP;
 }
 
+static int qp_attach_comp_cntr(struct ibv_qp *qp,
+			       struct ibv_comp_cntr *comp_cntr,
+			       struct ibv_qp_attach_comp_cntr_attr *attr)
+{
+	return EOPNOTSUPP;
+}
+
+static int query_comp_cntr_caps(struct ibv_context *context,
+				struct ibv_comp_cntr_caps *caps,
+				size_t caps_size)
+{
+	return EOPNOTSUPP;
+}
+
 static int query_device_ex(struct ibv_context *context,
 			   const struct ibv_query_device_ex_input *input,
 			   struct ibv_device_attr_ex *attr, size_t attr_size)
@@ -409,6 +495,12 @@ static int query_port(struct ibv_context *context, uint8_t port_num,
 	return EOPNOTSUPP;
 }
 
+static int query_port_speed(struct ibv_context *context, uint32_t port_num,
+			    uint64_t *speed)
+{
+	return EOPNOTSUPP;
+}
+
 static int query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask,
 		    struct ibv_qp_init_attr *init_attr)
 {
@@ -426,10 +518,20 @@ static int query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr)
 	return EOPNOTSUPP;
 }
 
+static int read_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value)
+{
+	return EOPNOTSUPP;
+}
+
 static int read_counters(struct ibv_counters *counters,
 			 uint64_t *counters_value,
 			 uint32_t ncounters,
 			 uint32_t flags)
+{
+	return EOPNOTSUPP;
+}
+
+static int read_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value)
 {
 	return EOPNOTSUPP;
 }
@@ -447,6 +549,54 @@ static struct ibv_mr *reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 {
 	errno = EOPNOTSUPP;
 	return NULL;
+}
+
+static struct ibv_mr *reg_mr_ex(struct ibv_pd *pd,
+				struct ibv_mr_init_attr *mr_init_attr)
+{
+	const struct verbs_context_ops *ops = get_ops(pd->context);
+	uint64_t comp_mask = mr_init_attr->comp_mask;
+	uint64_t supported_mask = IBV_REG_MR_MASK_IOVA |
+				  IBV_REG_MR_MASK_ADDR |
+				  IBV_REG_MR_MASK_FD |
+				  IBV_REG_MR_MASK_FD_OFFSET;
+
+	/*
+	 * The provider has no reg_mr_ex op, so translate the request into one
+	 * of the legacy registration ops. Fork handling and the common mr
+	 * fields are taken care of by ibv_reg_mr_ex(). Anything the legacy ops
+	 * cannot express (e.g. a dma handle) is rejected.
+	 */
+	if (!check_comp_mask(comp_mask, supported_mask)) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
+
+	if (comp_mask & IBV_REG_MR_MASK_FD) {
+		if ((comp_mask & IBV_REG_MR_MASK_ADDR) ||
+		    !(comp_mask & IBV_REG_MR_MASK_FD_OFFSET) ||
+		    !(comp_mask & IBV_REG_MR_MASK_IOVA)) {
+			errno = EINVAL;
+			return NULL;
+		}
+
+		return ops->reg_dmabuf_mr(pd, mr_init_attr->fd_offset,
+					  mr_init_attr->length,
+					  mr_init_attr->iova, mr_init_attr->fd,
+					  mr_init_attr->access);
+	}
+
+	if (!(comp_mask & IBV_REG_MR_MASK_ADDR) ||
+	    (comp_mask & IBV_REG_MR_MASK_FD_OFFSET)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	return ops->reg_mr(pd, mr_init_attr->addr, mr_init_attr->length,
+			   (comp_mask & IBV_REG_MR_MASK_IOVA) ?
+				   mr_init_attr->iova :
+				   (uintptr_t)mr_init_attr->addr,
+			   mr_init_attr->access);
 }
 
 static struct ibv_mr *reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
@@ -474,7 +624,17 @@ static int resize_cq(struct ibv_cq *cq, int cqe)
 	return EOPNOTSUPP;
 }
 
+static int set_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value)
+{
+	return EOPNOTSUPP;
+}
+
 static int set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
+{
+	return EOPNOTSUPP;
+}
+
+static int set_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value)
 {
 	return EOPNOTSUPP;
 }
@@ -504,7 +664,9 @@ static void unimport_pd(struct ibv_pd *pd)
  */
 const struct verbs_context_ops verbs_dummy_ops = {
 	advise_mr,
+	alloc_buf,
 	alloc_dm,
+	alloc_dmah,
 	alloc_mw,
 	alloc_null_mr,
 	alloc_parent_domain,
@@ -517,6 +679,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	close_xrcd,
 	cq_event,
 	create_ah,
+	create_comp_cntr,
 	create_counters,
 	create_cq,
 	create_cq_ex,
@@ -528,11 +691,13 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	create_srq,
 	create_srq_ex,
 	create_wq,
+	dealloc_dmah,
 	dealloc_mw,
 	dealloc_pd,
 	dealloc_td,
 	dereg_mr,
 	destroy_ah,
+	destroy_comp_cntr,
 	destroy_counters,
 	destroy_cq,
 	destroy_flow,
@@ -542,12 +707,16 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	destroy_srq,
 	destroy_wq,
 	detach_mcast,
+	dm_export_dmabuf_fd,
+	free_buf,
 	free_context,
 	free_dm,
 	get_srq_num,
 	import_dm,
 	import_mr,
 	import_pd,
+	inc_comp_cntr,
+	inc_err_comp_cntr,
 	modify_cq,
 	modify_flow_action_esp,
 	modify_qp,
@@ -561,21 +730,29 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	post_send,
 	post_srq_ops,
 	post_srq_recv,
+	qp_attach_comp_cntr,
+	query_comp_cntr_caps,
 	query_device_ex,
 	query_ece,
 	query_port,
+	query_port_speed,
 	query_qp,
 	query_qp_data_in_order,
 	query_rt_values,
 	query_srq,
+	read_comp_cntr,
 	read_counters,
+	read_err_comp_cntr,
 	reg_dm_mr,
 	reg_dmabuf_mr,
 	reg_mr,
+	reg_mr_ex,
 	req_notify_cq,
 	rereg_mr,
 	resize_cq,
+	set_comp_cntr,
 	set_ece,
+	set_err_comp_cntr,
 	unimport_dm,
 	unimport_mr,
 	unimport_pd,
@@ -629,7 +806,9 @@ void verbs_set_ops(struct verbs_context *vctx,
 	} while (0)
 
 	SET_OP(vctx, advise_mr);
+	SET_OP(vctx, alloc_buf);
 	SET_OP(vctx, alloc_dm);
+	SET_OP(vctx, alloc_dmah);
 	SET_OP(ctx, alloc_mw);
 	SET_OP(vctx, alloc_null_mr);
 	SET_PRIV_OP(ctx, alloc_pd);
@@ -645,6 +824,7 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, create_ah);
 	SET_PRIV_OP(ctx, create_cq);
 	SET_PRIV_OP_IC(vctx, create_cq_ex);
+	SET_PRIV_OP_IC(vctx, create_comp_cntr);
 	SET_OP2(vctx, ibv_create_flow, create_flow);
 	SET_OP(vctx, create_flow_action_esp);
 	SET_PRIV_OP(ctx, create_qp);
@@ -653,12 +833,14 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, create_srq);
 	SET_OP(vctx, create_srq_ex);
 	SET_OP(vctx, create_wq);
+	SET_OP(vctx, dealloc_dmah);
 	SET_OP(ctx, dealloc_mw);
 	SET_PRIV_OP(ctx, dealloc_pd);
 	SET_OP(vctx, dealloc_td);
 	SET_OP(vctx, destroy_counters);
 	SET_PRIV_OP(ctx, dereg_mr);
 	SET_PRIV_OP(ctx, destroy_ah);
+	SET_PRIV_OP_IC(vctx, destroy_comp_cntr);
 	SET_PRIV_OP(ctx, destroy_cq);
 	SET_OP2(vctx, ibv_destroy_flow, destroy_flow);
 	SET_OP(vctx, destroy_flow_action);
@@ -667,12 +849,16 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, destroy_srq);
 	SET_OP(vctx, destroy_wq);
 	SET_PRIV_OP(ctx, detach_mcast);
+	SET_OP(vctx, dm_export_dmabuf_fd);
+	SET_OP(vctx, free_buf);
 	SET_PRIV_OP_IC(ctx, free_context);
 	SET_OP(vctx, free_dm);
 	SET_OP(vctx, get_srq_num);
 	SET_PRIV_OP_IC(vctx, import_dm);
 	SET_PRIV_OP_IC(vctx, import_mr);
 	SET_PRIV_OP_IC(vctx, import_pd);
+	SET_PRIV_OP_IC(vctx, inc_comp_cntr);
+	SET_PRIV_OP_IC(vctx, inc_err_comp_cntr);
 	SET_OP(vctx, modify_cq);
 	SET_OP(vctx, modify_flow_action_esp);
 	SET_PRIV_OP(ctx, modify_qp);
@@ -686,21 +872,29 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_OP(ctx, post_send);
 	SET_OP(vctx, post_srq_ops);
 	SET_OP(ctx, post_srq_recv);
+	SET_PRIV_OP_IC(vctx, qp_attach_comp_cntr);
+	SET_PRIV_OP_IC(ctx, query_comp_cntr_caps);
 	SET_OP(vctx, query_device_ex);
 	SET_PRIV_OP_IC(vctx, query_ece);
 	SET_PRIV_OP_IC(ctx, query_port);
+	SET_PRIV_OP_IC(ctx, query_port_speed);
 	SET_PRIV_OP(ctx, query_qp);
 	SET_PRIV_OP_IC(ctx, query_qp_data_in_order);
 	SET_OP(vctx, query_rt_values);
+	SET_PRIV_OP_IC(vctx, read_comp_cntr);
 	SET_OP(vctx, read_counters);
+	SET_PRIV_OP_IC(vctx, read_err_comp_cntr);
 	SET_PRIV_OP(ctx, query_srq);
 	SET_OP(vctx, reg_dm_mr);
 	SET_PRIV_OP_IC(vctx, reg_dmabuf_mr);
 	SET_PRIV_OP(ctx, reg_mr);
+	SET_OP(vctx, reg_mr_ex);
 	SET_OP(ctx, req_notify_cq);
 	SET_PRIV_OP(ctx, rereg_mr);
 	SET_PRIV_OP(ctx, resize_cq);
+	SET_PRIV_OP_IC(vctx, set_comp_cntr);
 	SET_PRIV_OP_IC(vctx, set_ece);
+	SET_PRIV_OP_IC(vctx, set_err_comp_cntr);
 	SET_PRIV_OP_IC(vctx, unimport_dm);
 	SET_PRIV_OP_IC(vctx, unimport_mr);
 	SET_PRIV_OP_IC(vctx, unimport_pd);

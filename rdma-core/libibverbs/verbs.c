@@ -40,6 +40,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <linux/ip.h>
 #include <dirent.h>
@@ -395,6 +396,28 @@ void ibv_unimport_dm(struct ibv_dm *dm)
 	get_ops(dm->context)->unimport_dm(dm);
 }
 
+/**
+ * ibv_alloc_dmah - Allocate a dma handle
+ */
+struct ibv_dmah *ibv_alloc_dmah(struct ibv_context *context,
+				struct ibv_dmah_init_attr *attr)
+{
+	return get_ops(context)->alloc_dmah(context, attr);
+}
+
+/**
+ * ibv_dealloc_dmah - Free a dma handle
+ */
+int ibv_dealloc_dmah(struct ibv_dmah *dmah)
+{
+	return get_ops(dmah->context)->dealloc_dmah(dmah);
+}
+
+int ibv_dm_export_dmabuf_fd(struct ibv_dm *dm)
+{
+	return get_ops(dm->context)->dm_export_dmabuf_fd(dm);
+}
+
 struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
 				 size_t length, uint64_t iova, int fd,
 				 int access)
@@ -410,6 +433,164 @@ struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
 	mr->pd = pd;
 	mr->addr = (void *)(uintptr_t)offset;
 	mr->length = length;
+	return mr;
+}
+
+void *ibv_alloc_buf(struct ibv_pd *pd, size_t size, struct ibv_buf **buf)
+{
+	return get_ops(pd->context)->alloc_buf(pd, size, buf);
+}
+
+int ibv_export_buf_dmabuf_fd(struct ibv_buf *buf)
+{
+	if (buf->dmabuf_fd < 0) {
+		errno = ENODATA;
+		return -1;
+	}
+
+	return fcntl(buf->dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+}
+
+struct ibv_mr *ibv_reg_buf_mr(struct ibv_pd *pd, struct ibv_buf *buf,
+			      void *addr, size_t length, int access)
+{
+	struct ibv_mr_init_attr mr_init_attr = {
+		.length = length,
+		.access = access,
+		.comp_mask = IBV_REG_MR_MASK_BUF | IBV_REG_MR_MASK_ADDR,
+		.addr = addr,
+		.buf = buf,
+	};
+
+	return ibv_reg_mr_ex(pd, &mr_init_attr);
+}
+
+void ibv_free_buf(struct ibv_buf *buf)
+{
+	get_ops(buf->pd->context)->free_buf(buf);
+}
+
+/*
+ * Translate an ibv_buf handle into the concrete mr_init_attr fields so the
+ * registration can proceed through the regular addr-based or fd-based path.
+ * The IBV_REG_MR_MASK_BUF bit is consumed here and replaced by the masks the
+ * lower layers understand.
+ */
+/* Return 0 on success, or -1 on an invalid attr combination with errno set to EINVAL. */
+static int fill_mr_init_attr_from_buf(struct ibv_pd *pd,
+				      struct ibv_mr_init_attr *mr_init_attr)
+{
+	struct ibv_buf *buf = mr_init_attr->buf;
+	uintptr_t base = (uintptr_t)buf->addr;
+	uintptr_t addr = (uintptr_t)mr_init_attr->addr;
+	size_t off;
+
+	if (pd != buf->pd) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!(mr_init_attr->comp_mask & IBV_REG_MR_MASK_ADDR)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* The registered range must lie within the allocated buffer. */
+	if (addr < base) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	off = addr - base;
+	if (off > buf->size ||
+	    mr_init_attr->length > buf->size - off) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (mr_init_attr->comp_mask & (IBV_REG_MR_MASK_FD |
+				       IBV_REG_MR_MASK_FD_OFFSET)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	mr_init_attr->comp_mask &= ~IBV_REG_MR_MASK_BUF;
+
+	if (buf->dmabuf_fd != -1) {
+		/* dma-buf backed buffer: register through the fd-based path. */
+		if (mr_init_attr->comp_mask & IBV_REG_MR_MASK_IOVA) {
+			errno = EINVAL;
+			return -1;
+		}
+
+		mr_init_attr->comp_mask &= ~IBV_REG_MR_MASK_ADDR;
+		mr_init_attr->comp_mask |= IBV_REG_MR_MASK_FD |
+					   IBV_REG_MR_MASK_FD_OFFSET |
+					   IBV_REG_MR_MASK_IOVA;
+		mr_init_attr->fd = buf->dmabuf_fd;
+		mr_init_attr->fd_offset = off;
+		mr_init_attr->iova = addr;
+	}
+
+	return 0;
+}
+
+/*
+ * The caller's mr_init_attr is read-only input and is never modified: a local
+ * copy is built and passed to the lower layers which may modify it further.
+ */
+struct ibv_mr *ibv_reg_mr_ex(struct ibv_pd *pd, struct ibv_mr_init_attr *mr_init_attr)
+{
+	struct verbs_device *device = verbs_get_device(pd->context->device);
+	uint64_t comp_mask = mr_init_attr->comp_mask;
+	struct ibv_mr_init_attr attr = {
+		.length = mr_init_attr->length,
+		.access = mr_init_attr->access,
+		.comp_mask = comp_mask,
+	};
+	struct ibv_mr *mr;
+	bool need_fork;
+
+	if (comp_mask & IBV_REG_MR_MASK_IOVA)
+		attr.iova = mr_init_attr->iova;
+	if (comp_mask & IBV_REG_MR_MASK_ADDR)
+		attr.addr = mr_init_attr->addr;
+	if (comp_mask & IBV_REG_MR_MASK_FD)
+		attr.fd = mr_init_attr->fd;
+	if (comp_mask & IBV_REG_MR_MASK_FD_OFFSET)
+		attr.fd_offset = mr_init_attr->fd_offset;
+	if (comp_mask & IBV_REG_MR_MASK_DMAH)
+		attr.dmah = mr_init_attr->dmah;
+	if (comp_mask & IBV_REG_MR_MASK_BUF)
+		attr.buf = mr_init_attr->buf;
+
+	if (attr.comp_mask & IBV_REG_MR_MASK_BUF &&
+	    fill_mr_init_attr_from_buf(pd, &attr))
+		return NULL;
+
+	need_fork = !((attr.access & IBV_ACCESS_ON_DEMAND) ||
+		      (attr.comp_mask & IBV_REG_MR_MASK_FD));
+
+	if (need_fork && ibv_dontfork_range(attr.addr, attr.length))
+		return NULL;
+
+	if (!(device->core_support & IB_UVERBS_CORE_SUPPORT_OPTIONAL_MR_ACCESS))
+		attr.access &= ~IBV_ACCESS_OPTIONAL_RANGE;
+
+	mr = get_ops(pd->context)->reg_mr_ex(pd, &attr);
+	if (mr) {
+		mr->context = pd->context;
+		mr->length = attr.length;
+		mr->pd = pd;
+		if (attr.comp_mask & IBV_REG_MR_MASK_ADDR)
+			mr->addr = attr.addr;
+		else
+			/* Follows ibv_reg_dmabuf_mr logic */
+			mr->addr = (void *)(uintptr_t) attr.fd_offset;
+	} else if (need_fork) {
+		ibv_dofork_range(attr.addr, attr.length);
+	}
+
 	return mr;
 }
 
@@ -612,6 +793,54 @@ LATEST_SYMVER_FUNC(ibv_ack_cq_events, 1_1, "IBVERBS_1.1",
 	pthread_mutex_unlock(&cq->mutex);
 }
 
+int _ibv_query_comp_cntr_caps(struct ibv_context *context,
+			      struct ibv_comp_cntr_caps *caps, size_t caps_size)
+{
+	memset(caps, 0, caps_size);
+	return get_ops(context)->query_comp_cntr_caps(context, caps, caps_size);
+}
+
+struct ibv_comp_cntr *ibv_create_comp_cntr(struct ibv_context *context,
+					   struct ibv_comp_cntr_init_attr *cc_attr)
+{
+	return get_ops(context)->create_comp_cntr(context, cc_attr);
+}
+
+int ibv_destroy_comp_cntr(struct ibv_comp_cntr *comp_cntr)
+{
+	return get_ops(comp_cntr->context)->destroy_comp_cntr(comp_cntr);
+}
+
+int ibv_set_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value)
+{
+	return get_ops(comp_cntr->context)->set_comp_cntr(comp_cntr, value);
+}
+
+int ibv_set_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value)
+{
+	return get_ops(comp_cntr->context)->set_err_comp_cntr(comp_cntr, value);
+}
+
+int ibv_inc_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount)
+{
+	return get_ops(comp_cntr->context)->inc_comp_cntr(comp_cntr, amount);
+}
+
+int ibv_inc_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount)
+{
+	return get_ops(comp_cntr->context)->inc_err_comp_cntr(comp_cntr, amount);
+}
+
+int ibv_read_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value)
+{
+	return get_ops(comp_cntr->context)->read_comp_cntr(comp_cntr, value);
+}
+
+int ibv_read_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value)
+{
+	return get_ops(comp_cntr->context)->read_err_comp_cntr(comp_cntr, value);
+}
+
 LATEST_SYMVER_FUNC(ibv_create_srq, 1_1, "IBVERBS_1.1",
 		   struct ibv_srq *,
 		   struct ibv_pd *pd,
@@ -695,23 +924,31 @@ LATEST_SYMVER_FUNC(ibv_query_qp, 1_1, "IBVERBS_1.1",
 int ibv_query_qp_data_in_order(struct ibv_qp *qp, enum ibv_wr_opcode op,
 			       uint32_t flags)
 {
+	int result;
+
+	if (!check_comp_mask(flags,
+			     IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS |
+			     IBV_QUERY_QP_DATA_IN_ORDER_DEVICE_ONLY))
+		return 0;
+
 #if !defined(__i386__) && !defined(__x86_64__)
 	/* Currently this API is only supported for x86 architectures since most
 	 * non-x86 platforms are known to be OOO and need to do a per-platform study.
+	 * However, it is possible to override this restriction to allow querying
+	 * the device capability directly, regardless of the host CPU architecture.
 	 */
-	return 0;
-#else
-	int result;
-
-	if (!check_comp_mask(flags, IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS))
+	if (!(flags & IBV_QUERY_QP_DATA_IN_ORDER_DEVICE_ONLY))
 		return 0;
+#endif
 
 	result = get_ops(qp->context)->query_qp_data_in_order(qp, op, flags);
 	if (result & IBV_QUERY_QP_DATA_IN_ORDER_WHOLE_MSG)
 		result |= IBV_QUERY_QP_DATA_IN_ORDER_ALIGNED_128_BYTES;
 
-	return flags ? result : !!(result & IBV_QUERY_QP_DATA_IN_ORDER_WHOLE_MSG);
-#endif
+	if (flags & IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS)
+		return result;
+
+	return !!(result & IBV_QUERY_QP_DATA_IN_ORDER_WHOLE_MSG);
 }
 
 LATEST_SYMVER_FUNC(ibv_modify_qp, 1_1, "IBVERBS_1.1",
@@ -729,6 +966,12 @@ LATEST_SYMVER_FUNC(ibv_modify_qp, 1_1, "IBVERBS_1.1",
 		qp->state = attr->qp_state;
 
 	return 0;
+}
+
+int ibv_qp_attach_comp_cntr(struct ibv_qp *qp, struct ibv_comp_cntr *comp_cntr,
+			    struct ibv_qp_attach_comp_cntr_attr *attr)
+{
+	return get_ops(qp->context)->qp_attach_comp_cntr(qp, comp_cntr, attr);
 }
 
 LATEST_SYMVER_FUNC(ibv_destroy_qp, 1_1, "IBVERBS_1.1",
@@ -1125,4 +1368,11 @@ int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
 int ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece)
 {
 	return get_ops(qp->context)->query_ece(qp, ece);
+}
+
+int ibv_query_port_speed(struct ibv_context *context, uint32_t port_num,
+			 uint64_t *port_speed)
+{
+	return get_ops(context)->query_port_speed(context, port_num,
+						  port_speed);
 }

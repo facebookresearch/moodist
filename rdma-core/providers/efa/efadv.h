@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause */
 /*
- * Copyright 2019-2024 Amazon.com, Inc. or its affiliates. All rights reserved.
+ * Copyright 2019-2026 Amazon.com, Inc. or its affiliates. All rights reserved.
  */
 
 #ifndef __EFADV_H__
@@ -17,37 +17,13 @@ extern "C" {
 #endif
 
 enum {
-	/* Values must match the values in efa-abi.h */
-	EFADV_QP_DRIVER_TYPE_SRD = 0,
-};
-
-struct ibv_qp *efadv_create_driver_qp(struct ibv_pd *ibvpd,
-				      struct ibv_qp_init_attr *attr,
-				      uint32_t driver_qp_type);
-
-enum {
-	EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV = 1 << 0,
-};
-
-struct efadv_qp_init_attr {
-	uint64_t comp_mask;
-	uint32_t driver_qp_type;
-	uint16_t flags;
-	uint8_t sl;
-	uint8_t reserved[1];
-};
-
-struct ibv_qp *efadv_create_qp_ex(struct ibv_context *ibvctx,
-				  struct ibv_qp_init_attr_ex *attr_ex,
-				  struct efadv_qp_init_attr *efa_attr,
-				  uint32_t inlen);
-
-enum {
 	EFADV_DEVICE_ATTR_CAPS_RDMA_READ = 1 << 0,
 	EFADV_DEVICE_ATTR_CAPS_RNR_RETRY = 1 << 1,
 	EFADV_DEVICE_ATTR_CAPS_CQ_WITH_SGID = 1 << 2,
 	EFADV_DEVICE_ATTR_CAPS_RDMA_WRITE = 1 << 3,
 	EFADV_DEVICE_ATTR_CAPS_UNSOLICITED_WRITE_RECV = 1 << 4,
+	EFADV_DEVICE_ATTR_CAPS_CQ_WITH_EXT_MEM_DMABUF = 1 << 5,
+	EFADV_DEVICE_ATTR_CAPS_COMP_CNTR = 1 << 6,
 };
 
 struct efadv_device_attr {
@@ -57,7 +33,7 @@ struct efadv_device_attr {
 	uint16_t max_sq_sge;
 	uint16_t max_rq_sge;
 	uint16_t inline_buf_size;
-	uint8_t reserved[2];
+	uint16_t inline_buf_size_ex;
 	uint32_t device_caps;
 	uint32_t max_rdma_size;
 };
@@ -72,29 +48,140 @@ struct efadv_ah_attr {
 	uint8_t reserved[6];
 };
 
+enum {
+	EFADV_SQ_DEPTH_ATTR_INLINE_WRITE = 1 << 0,
+};
+
+struct efadv_sq_depth_attr {
+	uint64_t comp_mask;
+	uint32_t flags;
+	uint32_t max_send_sge;
+	uint32_t max_rdma_sge;
+	uint32_t max_inline_data;
+};
+
+int efadv_get_max_sq_depth(struct ibv_context *ibvctx, struct efadv_sq_depth_attr *attr,
+			   uint32_t inlen);
+
+struct efadv_rq_depth_attr {
+	uint64_t comp_mask;
+	uint32_t max_recv_sge;
+};
+
+int efadv_get_max_rq_depth(struct ibv_context *ibvctx, struct efadv_rq_depth_attr *attr,
+			   uint32_t inlen);
+
 int efadv_query_ah(struct ibv_ah *ibvah, struct efadv_ah_attr *attr,
 		   uint32_t inlen);
 
-struct efadv_cq {
-	uint64_t comp_mask;
-	int (*wc_read_sgid)(struct efadv_cq *efadv_cq, union ibv_gid *sgid);
-	bool (*wc_is_unsolicited)(struct efadv_cq *efadv_cq);
+enum {
+	/* Values must match the values in efa-abi.h */
+	EFADV_QP_DRIVER_TYPE_SRD = 0,
 };
+
+struct ibv_qp *efadv_create_driver_qp(struct ibv_pd *ibvpd,
+				      struct ibv_qp_init_attr *attr,
+				      uint32_t driver_qp_type);
+
+enum {
+	EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV = 1 << 0,
+	EFADV_QP_FLAGS_INLINE_WRITE = 1 << 1,
+};
+
+enum {
+	EFADV_WR_EX_WITH_PROCESSING_HINTS = 1 << 0,
+};
+
+struct efadv_qp_init_attr {
+	uint64_t comp_mask;
+	uint32_t driver_qp_type;
+	uint16_t flags;
+	uint8_t sl;
+	uint8_t reserved;
+	uint64_t wr_flags;
+};
+
+struct ibv_qp *efadv_create_qp_ex(struct ibv_context *ibvctx,
+				  struct ibv_qp_init_attr_ex *attr_ex,
+				  struct efadv_qp_init_attr *efa_attr,
+				  uint32_t inlen);
+
+enum {
+	EFADV_WQ_CAPS_64_BIT_REQ_ID = 1 << 0,
+};
+
+struct efadv_wq_attr {
+	uint64_t comp_mask;
+	uint8_t *buffer;
+	uint32_t entry_size;
+	uint32_t num_entries;
+	uint32_t *doorbell;
+	uint32_t max_batch;
+	uint16_t caps;
+	uint8_t reserved[2];
+};
+
+int efadv_query_qp_wqs(struct ibv_qp *ibvqp, struct efadv_wq_attr *sq_attr,
+		       struct efadv_wq_attr *rq_attr, uint32_t inlen);
+
+enum efadv_wr_processing_hint {
+	EFADV_WR_PROCESSING_HINT_BURST_PPS_SENSITIVE = 1 << 0,
+};
+
+struct efadv_qp {
+	uint64_t comp_mask;
+	void (*wr_set_processing_hints)(struct efadv_qp *efadv_qp, uint32_t hints);
+};
+
+struct efadv_qp *efadv_qp_from_ibv_qp_ex(struct ibv_qp_ex *ibvqpx);
+
+static inline void efadv_wr_set_processing_hints(struct efadv_qp *efadv_qp, uint32_t hints)
+{
+	efadv_qp->wr_set_processing_hints(efadv_qp, hints);
+}
 
 enum {
 	EFADV_WC_EX_WITH_SGID = 1 << 0,
 	EFADV_WC_EX_WITH_IS_UNSOLICITED = 1 << 1,
 };
 
+enum {
+	EFADV_CQ_INIT_FLAGS_EXT_MEM_DMABUF = 1 << 0,
+};
+
 struct efadv_cq_init_attr {
 	uint64_t comp_mask;
 	uint64_t wc_flags;
+	uint64_t flags;
+	struct {
+		uint8_t *buffer;
+		uint64_t length;
+		uint64_t offset;
+		int32_t fd;
+		uint8_t reserved[4];
+	} ext_mem_dmabuf;
 };
 
 struct ibv_cq_ex *efadv_create_cq(struct ibv_context *ibvctx,
 				  struct ibv_cq_init_attr_ex *attr_ex,
 				  struct efadv_cq_init_attr *efa_attr,
 				  uint32_t inlen);
+
+struct efadv_cq_attr {
+	uint64_t comp_mask;
+	uint8_t *buffer;
+	uint32_t entry_size;
+	uint32_t num_entries;
+	uint32_t *doorbell;
+};
+
+int efadv_query_cq(struct ibv_cq *ibvcq, struct efadv_cq_attr *attr, uint32_t inlen);
+
+struct efadv_cq {
+	uint64_t comp_mask;
+	int (*wc_read_sgid)(struct efadv_cq *efadv_cq, union ibv_gid *sgid);
+	bool (*wc_is_unsolicited)(struct efadv_cq *efadv_cq);
+};
 
 struct efadv_cq *efadv_cq_from_ibv_cq_ex(struct ibv_cq_ex *ibvcqx);
 
@@ -108,6 +195,40 @@ static inline bool efadv_wc_is_unsolicited(struct efadv_cq *efadv_cq)
 {
 	return efadv_cq->wc_is_unsolicited(efadv_cq);
 }
+
+enum {
+	EFADV_MEMORY_LOCATION_VA,
+	EFADV_MEMORY_LOCATION_DMABUF,
+};
+
+struct efadv_memory_location {
+	uint8_t *ptr;
+	struct {
+		uint64_t offset;
+		int32_t fd;
+		uint32_t reserved;
+	} dmabuf;
+	uint8_t type;
+	uint8_t reserved[7];
+};
+
+enum {
+	EFADV_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM = 1 << 0,
+	EFADV_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM = 1 << 1,
+};
+
+struct efadv_comp_cntr_init_attr {
+	uint64_t comp_mask;
+	uint32_t flags;
+	uint32_t reserved;
+	struct efadv_memory_location comp_cntr_ext_mem;
+	struct efadv_memory_location err_cntr_ext_mem;
+};
+
+struct ibv_comp_cntr *efadv_create_comp_cntr(struct ibv_context *ibvctx,
+					     struct ibv_comp_cntr_init_attr *attr,
+					     struct efadv_comp_cntr_init_attr *efa_attr,
+					     uint32_t inlen);
 
 enum {
 	EFADV_MR_ATTR_VALIDITY_RECV_IC_ID = 1 << 0,

@@ -84,6 +84,8 @@ const struct verbs_match_ent mlx5_hca_table[] = {
 	HCA(MELLANOX, 0x1021),  /* ConnectX-7 */
 	HCA(MELLANOX, 0x1023),  /* ConnectX-8 */
 	HCA(MELLANOX, 0x1025),  /* ConnectX-9 */
+	HCA(MELLANOX, 0x1027),  /* ConnectX-10 */
+	HCA(MELLANOX, 0x2101),  /* ConnectX-10 NVLink-C2C */
 	HCA(MELLANOX, 0xa2d2),	/* BlueField integrated ConnectX-5 network controller */
 	HCA(MELLANOX, 0xa2d3),	/* BlueField integrated ConnectX-5 network controller VF */
 	HCA(MELLANOX, 0xa2d6),  /* BlueField-2 integrated ConnectX-6 Dx network controller */
@@ -133,6 +135,8 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.alloc_dm = mlx5_alloc_dm,
 	.alloc_parent_domain = mlx5_alloc_parent_domain,
 	.alloc_td = mlx5_alloc_td,
+	.alloc_buf = mlx5_alloc_buf_op,
+	.free_buf = mlx5_free_buf_op,
 	.attach_counters_point_flow = mlx5_attach_counters_point_flow,
 	.close_xrcd = mlx5_close_xrcd,
 	.create_counters = mlx5_create_counters,
@@ -173,6 +177,11 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.unimport_mr = mlx5_unimport_mr,
 	.unimport_pd = mlx5_unimport_pd,
 	.query_qp_data_in_order = mlx5_query_qp_data_in_order,
+	.alloc_dmah = mlx5_alloc_dmah,
+	.dealloc_dmah = mlx5_dealloc_dmah,
+	.reg_mr_ex = mlx5_reg_mr_ex,
+	.query_port_speed = mlx5_query_port_speed,
+	.dm_export_dmabuf_fd = mlx5_dm_export_dmabuf_fd,
 };
 
 static const struct verbs_context_ops mlx5_ctx_cqev1_ops = {
@@ -894,6 +903,9 @@ static int _mlx5dv_query_device(struct ibv_context *ctx_in,
 		MLX5_VENDOR_CAP_FLAGS_PACKET_BASED_CREDIT_MODE)
 		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_PACKET_BASED_CREDIT_MODE;
 
+	if (mctx->bf_reg_size > 0)
+		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_BLUEFLAME;
+
 	if (attrs_out->comp_mask & MLX5DV_CONTEXT_MASK_SWP) {
 		attrs_out->sw_parsing_caps = mctx->sw_parsing_caps;
 		comp_mask_out |= MLX5DV_CONTEXT_MASK_SWP;
@@ -1014,13 +1026,13 @@ static int mlx5dv_get_qp(struct ibv_qp *qp_in,
 
 	if (mqp->sq_buf_size)
 		/* IBV_QPT_RAW_PACKET */
-		qp_out->sq.buf = (void *)((uintptr_t)mqp->sq_buf.buf);
+		qp_out->sq.buf = (void *)((uintptr_t)mqp->sq_buf.ibv_buf.addr);
 	else
-		qp_out->sq.buf = (void *)((uintptr_t)mqp->buf.buf + mqp->sq.offset);
+		qp_out->sq.buf = (void *)((uintptr_t)mqp->buf.ibv_buf.addr + mqp->sq.offset);
 	qp_out->sq.wqe_cnt = mqp->sq.wqe_cnt;
 	qp_out->sq.stride  = 1 << mqp->sq.wqe_shift;
 
-	qp_out->rq.buf     = (void *)((uintptr_t)mqp->buf.buf + mqp->rq.offset);
+	qp_out->rq.buf     = (void *)((uintptr_t)mqp->buf.ibv_buf.addr + mqp->rq.offset);
 	qp_out->rq.wqe_cnt = mqp->rq.wqe_cnt;
 	qp_out->rq.stride  = 1 << mqp->rq.wqe_shift;
 
@@ -1064,7 +1076,7 @@ static int mlx5dv_get_cq(struct ibv_cq *cq_in,
 	cq_out->cqn       = mcq->cqn;
 	cq_out->cqe_cnt   = mcq->verbs_cq.cq.cqe + 1;
 	cq_out->cqe_size  = mcq->cqe_sz;
-	cq_out->buf       = mcq->active_buf->buf;
+	cq_out->buf       = mcq->active_buf->ibv_buf.addr;
 	cq_out->dbrec     = mcq->dbrec;
 	cq_out->cq_uar	  = mctx->cq_uar_reg;
 
@@ -1095,7 +1107,7 @@ static int mlx5dv_get_srq(struct ibv_srq *srq_in,
 
 	msrq = container_of(srq_in, struct mlx5_srq, vsrq.srq);
 
-	srq_out->buf       = msrq->buf.buf;
+	srq_out->buf       = msrq->buf.ibv_buf.addr;
 	srq_out->dbrec     = msrq->db;
 	srq_out->stride    = 1 << msrq->wqe_shift;
 	srq_out->head      = msrq->head;
@@ -2242,7 +2254,7 @@ static int _mlx5dv_get_clock_info(struct ibv_context *ctx_in,
 				  struct mlx5dv_clock_info *clock_info)
 {
 	struct mlx5_context *ctx = to_mctx(ctx_in);
-	const struct mlx5_ib_clock_info *ci;
+	const struct ib_uverbs_clock_info *ci;
 	uint32_t retry, tmp_sig;
 	atomic_uint32_t *sig;
 

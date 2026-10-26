@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: (GPL-2.0 OR Linux-OpenIB)
-# Copyright 2020-2024 Amazon.com, Inc. or its affiliates. All rights reserved.
+# Copyright 2020-2026 Amazon.com, Inc. or its affiliates. All rights reserved.
 
 cimport pyverbs.providers.efa.efa_enums as dve
 cimport pyverbs.providers.efa.libefa as dv
 
 from pyverbs.addr cimport GID
 from pyverbs.base import PyverbsRDMAErrno, PyverbsRDMAError
+from pyverbs.base cimport PyverbsCM
+from pyverbs.comp_cntr cimport CompCntrInitAttr, CompCntr
 from pyverbs.cq cimport CQEX, CqInitAttrEx
-import pyverbs.enums as e
+from pyverbs.device cimport Context
+from pyverbs.libibverbs_enums import ibv_qp_attr_mask
 cimport pyverbs.libibverbs as v
+from pyverbs.mr cimport MR
 from pyverbs.pd cimport PD
 from pyverbs.qp cimport QP, QPEx, QPInitAttr, QPInitAttrEx
-from pyverbs.mr cimport MR
+from libc.string cimport memset
+from libc.stdint cimport uintptr_t, uint8_t
 
 
 def dev_cap_to_str(flags):
@@ -21,6 +26,8 @@ def dev_cap_to_str(flags):
             dve.EFADV_DEVICE_ATTR_CAPS_CQ_WITH_SGID: 'CQ entries with source GID',
             dve.EFADV_DEVICE_ATTR_CAPS_RDMA_WRITE: 'RDMA Write',
             dve.EFADV_DEVICE_ATTR_CAPS_UNSOLICITED_WRITE_RECV: 'Unsolicited RDMA Write receive',
+            dve.EFADV_DEVICE_ATTR_CAPS_CQ_WITH_EXT_MEM_DMABUF: 'CQ with external memory',
+            dve.EFADV_DEVICE_ATTR_CAPS_COMP_CNTR: 'Completion Counters',
     }
     return bitmask_to_str(flags, l)
 
@@ -93,6 +100,10 @@ cdef class EfaDVDeviceAttr(PyverbsObject):
         return self.device_attr.inline_buf_size
 
     @property
+    def inline_buf_size_ex(self):
+        return self.device_attr.inline_buf_size_ex
+
+    @property
     def device_caps(self):
         return self.device_attr.device_caps
 
@@ -108,6 +119,7 @@ cdef class EfaDVDeviceAttr(PyverbsObject):
             print_format.format('Max SQ SQE', self.device_attr.max_sq_sge) + \
             print_format.format('Max RQ SQE', self.device_attr.max_rq_sge) + \
             print_format.format('Inline buffer size', self.device_attr.inline_buf_size) + \
+            print_format.format('Inline buffer size ex', self.device_attr.inline_buf_size_ex) + \
             print_format.format('Device Capabilities', dev_cap_to_str(self.device_attr.device_caps)) + \
             print_format.format('Max RDMA Size', self.device_attr.max_rdma_size)
 
@@ -190,13 +202,21 @@ cdef class EfaQPInitAttr(PyverbsObject):
     def sl(self,val):
         self.qp_init_attr.sl = val
 
+    @property
+    def wr_flags(self):
+        return self.qp_init_attr.wr_flags
+
+    @wr_flags.setter
+    def wr_flags(self, val):
+        self.qp_init_attr.wr_flags = val
+
 
 cdef class SRDQPEx(QPEx):
     """
     Initializes an SRD QPEx according to the user-provided data.
     :param ctx: Context object
-    :param init_attr: QPInitAttrEx object
-    :param dv_init_attr: EFAQPInitAttr object
+    :param attr_ex: QPInitAttrEx object
+    :param efa_init_attr: EFAQPInitAttr object
     :return: An initialized SRDQPEx
     """
     def __init__(self, Context ctx not None, QPInitAttrEx attr_ex not None, EfaQPInitAttr efa_init_attr not None):
@@ -210,12 +230,16 @@ cdef class SRDQPEx(QPEx):
             pd=<PD>attr_ex.pd
             pd.add_ref(self)
         super().__init__(ctx, attr_ex)
+        self.dv_qp = dv.efadv_qp_from_ibv_qp_ex(self.qp_ex)
 
     def _get_comp_mask(self, dst):
-        srd_mask = {'INIT': e.IBV_QP_PKEY_INDEX | e.IBV_QP_PORT | e.IBV_QP_QKEY,
+        srd_mask = {'INIT': ibv_qp_attr_mask.IBV_QP_PKEY_INDEX | ibv_qp_attr_mask.IBV_QP_PORT | ibv_qp_attr_mask.IBV_QP_QKEY,
                     'RTR': 0,
-                    'RTS': e.IBV_QP_SQ_PSN}
-        return srd_mask [dst] | e.IBV_QP_STATE
+                    'RTS': ibv_qp_attr_mask.IBV_QP_SQ_PSN}
+        return srd_mask [dst] | ibv_qp_attr_mask.IBV_QP_STATE
+
+    def wr_set_processing_hints(self, hints):
+        dv.efadv_wr_set_processing_hints(self.dv_qp, hints)
 
 
 cdef class EfaDVCQInitAttr(PyverbsObject):
@@ -325,3 +349,122 @@ cdef class EfaMR(MR):
             raise PyverbsRDMAError(f'Failed to query EFA MR', rc)
 
         return mr_attr
+
+
+cdef class EfaDVSQDepthAttr(PyverbsObject):
+    """
+    Represents efadv_sq_depth_attr struct
+    """
+    @property
+    def comp_mask(self):
+        return self.sq_depth_attr.comp_mask
+
+    @comp_mask.setter
+    def comp_mask(self, val):
+        self.sq_depth_attr.comp_mask = val
+
+    @property
+    def flags(self):
+        return self.sq_depth_attr.flags
+
+    @flags.setter
+    def flags(self, val):
+        self.sq_depth_attr.flags = val
+
+    @property
+    def max_send_sge(self):
+        return self.sq_depth_attr.max_send_sge
+
+    @max_send_sge.setter
+    def max_send_sge(self, val):
+        self.sq_depth_attr.max_send_sge = val
+
+    @property
+    def max_rdma_sge(self):
+        return self.sq_depth_attr.max_rdma_sge
+
+    @max_rdma_sge.setter
+    def max_rdma_sge(self, val):
+        self.sq_depth_attr.max_rdma_sge = val
+
+    @property
+    def max_inline_data(self):
+        return self.sq_depth_attr.max_inline_data
+
+    @max_inline_data.setter
+    def max_inline_data(self, val):
+        self.sq_depth_attr.max_inline_data = val
+
+
+cdef class EfaDVRQDepthAttr(PyverbsObject):
+    """
+    Represents efadv_rq_depth_attr struct
+    """
+    @property
+    def comp_mask(self):
+        return self.sq_depth_attr.comp_mask
+
+    @comp_mask.setter
+    def comp_mask(self, val):
+        self.rq_depth_attr.comp_mask = val
+
+    @property
+    def max_recv_sge(self):
+        return self.sq_depth_attr.max_recv_sge
+
+    @max_recv_sge.setter
+    def max_recv_sge(self, val):
+        self.rq_depth_attr.max_recv_sge = val
+
+
+cdef class EfaCompCntrInitAttr(PyverbsObject):
+    """Represents efadv_comp_cntr_init_attr struct."""
+    cdef dv.efadv_comp_cntr_init_attr attr
+
+    def __init__(self, comp_ext_mem_ptr=None, err_ext_mem_ptr=None):
+        super().__init__()
+        memset(&self.attr, 0, sizeof(self.attr))
+        if comp_ext_mem_ptr is not None:
+            self.attr.flags |= dve.EFADV_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM
+            self.attr.comp_cntr_ext_mem.type = dve.EFADV_MEMORY_LOCATION_VA
+            self.attr.comp_cntr_ext_mem.ptr = <uint8_t *><uintptr_t>comp_ext_mem_ptr
+        if err_ext_mem_ptr is not None:
+            self.attr.flags |= dve.EFADV_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM
+            self.attr.err_cntr_ext_mem.type = dve.EFADV_MEMORY_LOCATION_VA
+            self.attr.err_cntr_ext_mem.ptr = <uint8_t *><uintptr_t>err_ext_mem_ptr
+
+    def set_comp_ext_mem_va(self, uintptr_t ptr):
+        """Set completion counter external memory VA."""
+        self.attr.flags |= dve.EFADV_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM
+        self.attr.comp_cntr_ext_mem.type = dve.EFADV_MEMORY_LOCATION_VA
+        self.attr.comp_cntr_ext_mem.ptr = <uint8_t *>ptr
+
+    def set_err_ext_mem_va(self, uintptr_t ptr):
+        """Set error counter external memory VA."""
+        self.attr.flags |= dve.EFADV_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM
+        self.attr.err_cntr_ext_mem.type = dve.EFADV_MEMORY_LOCATION_VA
+        self.attr.err_cntr_ext_mem.ptr = <uint8_t *>ptr
+
+
+cdef class EfaCompCntr(CompCntr):
+    """EFA-specific Completion Counter with external memory support."""
+    def __init__(self, Context ctx not None, CompCntrInitAttr attr not None,
+                 EfaCompCntrInitAttr efa_attr=None):
+        """Create an EFA completion counter.
+
+        :param ctx: Device context.
+        :param attr: Completion counter init attributes.
+        :param efa_attr: EFA-specific init attributes (optional).
+        """
+        PyverbsCM.__init__(self)
+        if efa_attr is None:
+            efa_attr = EfaCompCntrInitAttr()
+        self.comp_cntr = dv.efadv_create_comp_cntr(
+            ctx.context, &attr.attr, &efa_attr.attr, sizeof(efa_attr.attr))
+        if self.comp_cntr == NULL:
+            raise PyverbsRDMAErrno('Failed to create EFA comp_cntr')
+        self.ctx = ctx
+        ctx.add_ref(self)
+
+    def __dealloc__(self):
+        self.close()

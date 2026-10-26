@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
- * Copyright 2019-2024 Amazon.com, Inc. or its affiliates. All rights reserved.
+ * Copyright 2019-2026 Amazon.com, Inc. or its affiliates. All rights reserved.
  */
 
 #include <stdio.h>
@@ -23,33 +23,48 @@ static const struct verbs_match_ent efa_table[] = {
 	VERBS_PCI_MATCH(PCI_VENDOR_ID_AMAZON, 0xefa1, NULL),
 	VERBS_PCI_MATCH(PCI_VENDOR_ID_AMAZON, 0xefa2, NULL),
 	VERBS_PCI_MATCH(PCI_VENDOR_ID_AMAZON, 0xefa3, NULL),
+	VERBS_PCI_MATCH(PCI_VENDOR_ID_AMAZON, 0xefa4, NULL),
 	{}
 };
 
 static const struct verbs_context_ops efa_ctx_ops = {
 	.alloc_pd = efa_alloc_pd,
+	.alloc_parent_domain = efa_alloc_parent_domain,
+	.alloc_td = efa_alloc_td,
+	.cq_event = efa_cq_event,
 	.create_ah = efa_create_ah,
+	.create_comp_cntr = efa_create_comp_cntr,
 	.create_cq = efa_create_cq,
 	.create_cq_ex = efa_create_cq_ex,
 	.create_qp = efa_create_qp,
 	.create_qp_ex = efa_create_qp_ex,
-	.cq_event = efa_cq_event,
 	.dealloc_pd = efa_dealloc_pd,
+	.dealloc_td = efa_dealloc_td,
 	.dereg_mr = efa_dereg_mr,
 	.destroy_ah = efa_destroy_ah,
+	.destroy_comp_cntr = efa_destroy_comp_cntr,
 	.destroy_cq = efa_destroy_cq,
 	.destroy_qp = efa_destroy_qp,
+	.inc_comp_cntr = efa_inc_comp_cntr,
+	.inc_err_comp_cntr = efa_inc_err_comp_cntr,
 	.modify_qp = efa_modify_qp,
 	.poll_cq = efa_poll_cq,
 	.post_recv = efa_post_recv,
 	.post_send = efa_post_send,
+	.qp_attach_comp_cntr = efa_qp_attach_comp_cntr,
+	.query_comp_cntr_caps = ibv_cmd_query_comp_cntr_caps,
 	.query_device_ex = efa_query_device_ex,
 	.query_port = efa_query_port,
+	.query_port_speed = efa_query_port_speed,
 	.query_qp = efa_query_qp,
 	.query_qp_data_in_order = efa_query_qp_data_in_order,
+	.read_comp_cntr = efa_read_comp_cntr,
+	.read_err_comp_cntr = efa_read_err_comp_cntr,
 	.reg_dmabuf_mr = efa_reg_dmabuf_mr,
 	.reg_mr = efa_reg_mr,
 	.req_notify_cq = efa_arm_cq,
+	.set_comp_cntr = efa_set_comp_cntr,
+	.set_err_comp_cntr = efa_set_err_comp_cntr,
 	.free_context = efa_free_context,
 };
 
@@ -61,8 +76,8 @@ static struct verbs_context *efa_alloc_context(struct ibv_device *vdev,
 	struct efa_alloc_ucontext cmd = {};
 	struct efa_context *ctx;
 
-	cmd.comp_mask |= EFA_ALLOC_UCONTEXT_CMD_COMP_TX_BATCH;
-	cmd.comp_mask |= EFA_ALLOC_UCONTEXT_CMD_COMP_MIN_SQ_WR;
+	cmd.supported_caps |= EFA_ALLOC_UCONTEXT_CMD_SUPP_CAPS_TX_BATCH;
+	cmd.supported_caps |= EFA_ALLOC_UCONTEXT_CMD_SUPP_CAPS_MIN_SQ_WR;
 
 	ctx = verbs_init_and_alloc_context(vdev, cmd_fd, ctx, ibvctx,
 					   RDMA_DRIVER_EFA);
@@ -80,6 +95,10 @@ static struct verbs_context *efa_alloc_context(struct ibv_device *vdev,
 	ctx->cqe_size = sizeof(struct efa_io_rx_cdesc);
 	ctx->ex_cqe_size = sizeof(struct efa_io_rx_cdesc_ex);
 	ctx->inline_buf_size = resp.inline_buf_size;
+	ctx->inline_buf_size_ex = resp.inline_buf_size_ex;
+	if (ctx->inline_buf_size_ex == 0)
+		ctx->inline_buf_size_ex = ctx->inline_buf_size;
+
 	ctx->max_llq_size = resp.max_llq_size;
 	ctx->max_tx_batch = resp.max_tx_batch;
 	ctx->min_sq_wr = resp.min_sq_wr;
@@ -110,6 +129,7 @@ static void efa_free_context(struct ibv_context *ibvctx)
 	struct efa_context *ctx = to_efa_context(ibvctx);
 
 	free(ctx->qp_table);
+	free(ctx->qp_gen_table);
 	pthread_spin_destroy(&ctx->qp_table_lock);
 	verbs_uninit_context(&ctx->ibvctx);
 	free(ctx);

@@ -1,5 +1,5 @@
 Name: rdma-core
-Version: 58.0
+Version: 65.0
 Release: 1%{?dist}
 Summary: RDMA core userspace libraries and daemons
 
@@ -160,6 +160,8 @@ Provides: libhfi1 = %{version}-%{release}
 Obsoletes: libhfi1 < %{version}-%{release}
 Provides: libhns = %{version}-%{release}
 Obsoletes: libhns < %{version}-%{release}
+Provides: libionic = %{version}-%{release}
+Obsoletes: libionic < %{version}-%{release}
 Provides: libipathverbs = %{version}-%{release}
 Obsoletes: libipathverbs < %{version}-%{release}
 Provides: libirdma = %{version}-%{release}
@@ -191,6 +193,7 @@ Device-specific plug-in ibverbs userspace drivers are included:
 - liberdma: Alibaba Elastic RDMA (iWarp) Adapter
 - libhfi1: Intel Omni-Path HFI
 - libhns: HiSilicon Hip08+ SoC
+- libionic: AMD Pensando Distributed Services Card (DSC) RDMA/RoCE Support
 - libipathverbs: QLogic InfiniPath HCA
 - libirdma: Intel Ethernet Connection RDMA
 - libmana: Microsoft Azure Network Adapter
@@ -339,10 +342,10 @@ mkdir -p %{buildroot}/%{_sysconfdir}/rdma
 %global sysmodprobedir %{_prefix}/lib/modprobe.d
 mkdir -p %{buildroot}%{_libexecdir}
 mkdir -p %{buildroot}%{_udevrulesdir}
-mkdir -p %{buildroot}%{dracutlibdir}/modules.d/05rdma
+mkdir -p %{buildroot}%{dracutlibdir}/modules.d/50rdma
 mkdir -p %{buildroot}%{sysmodprobedir}
 install -D -m0644 redhat/rdma.mlx4.conf %{buildroot}/%{_sysconfdir}/rdma/mlx4.conf
-install -D -m0755 redhat/rdma.modules-setup.sh %{buildroot}%{dracutlibdir}/modules.d/05rdma/module-setup.sh
+install -D -m0755 kernel-boot/dracut/50rdma/module-setup.sh %{buildroot}%{dracutlibdir}/modules.d/50rdma/module-setup.sh
 install -D -m0644 redhat/rdma.mlx4.sys.modprobe %{buildroot}%{sysmodprobedir}/libmlx4.conf
 install -D -m0755 redhat/rdma.mlx4-setup.sh %{buildroot}%{_libexecdir}/mlx4-setup.sh
 rm -f %{buildroot}%{_sysconfdir}/rdma/modules/rdma.conf
@@ -430,8 +433,8 @@ fi
 %{_unitdir}/rdma-load-modules@.service
 %dir %{dracutlibdir}
 %dir %{dracutlibdir}/modules.d
-%dir %{dracutlibdir}/modules.d/05rdma
-%{dracutlibdir}/modules.d/05rdma/module-setup.sh
+%dir %{dracutlibdir}/modules.d/50rdma
+%{dracutlibdir}/modules.d/50rdma/module-setup.sh
 %dir %{_udevrulesdir}
 %{_udevrulesdir}/../rdma_rename
 %{_udevrulesdir}/60-rdma-ndd.rules
@@ -446,6 +449,7 @@ fi
 %{_libexecdir}/truescale-serdes.cmds
 %{_sbindir}/rdma-ndd
 %{_unitdir}/rdma-ndd.service
+%{_sbindir}/rdma_topo
 %{_mandir}/man7/rxe*
 %{_mandir}/man8/rdma-ndd.*
 %license COPYING.*
@@ -464,6 +468,7 @@ fi
 %{_mandir}/man3/efadv*
 %{_mandir}/man3/hnsdv*
 %{_mandir}/man3/ibv_*
+%{_mandir}/man3/ionic_dv*
 %{_mandir}/man3/rdma*
 %{_mandir}/man3/umad*
 %{_mandir}/man3/*_to_ibv_rate.*
@@ -473,6 +478,7 @@ fi
 %{_mandir}/man3/mlx4dv*
 %{_mandir}/man7/efadv*
 %{_mandir}/man7/hnsdv*
+%{_mandir}/man7/ionicdv*
 %{_mandir}/man7/manadv*
 %{_mandir}/man7/mlx5dv*
 %{_mandir}/man7/mlx4dv*
@@ -594,11 +600,13 @@ fi
 %{_libdir}/libhns.so.*
 %{_libdir}/libibverbs*.so.*
 %{_libdir}/libibverbs/*.so
+%{_libdir}/libionic.so.*
 %{_libdir}/libmana.so.*
 %{_libdir}/libmlx5.so.*
 %{_libdir}/libmlx4.so.*
 %config(noreplace) %{_sysconfdir}/libibverbs.d/*.driver
 %doc %{_docdir}/%{name}/libibverbs.md
+%{_prefix}/lib/sysusers.d/rdma.conf
 
 %files -n libibverbs-utils
 %{_bindir}/ibv_*

@@ -192,6 +192,7 @@ struct bnxt_re_wr_send_qp {
 	struct bnxt_re_send     *cur_sqe;
 	uint32_t                cur_wqe_cnt;
 	uint32_t                cur_slot_cnt;
+	uint32_t                used_slot_cnt;
 	uint32_t                cur_swq_idx;
 	uint8_t                 cur_opcode;
 	bool                    cur_push_wqe;
@@ -358,13 +359,6 @@ static inline struct bnxt_re_srq *to_bnxt_re_srq(struct ibv_srq *ibvsrq)
 static inline struct bnxt_re_ah *to_bnxt_re_ah(struct ibv_ah *ibvah)
 {
         return container_of(ibvah, struct bnxt_re_ah, ibvah);
-}
-
-static inline uint32_t bnxt_re_get_sqe_sz(void)
-{
-	return sizeof(struct bnxt_re_bsqe) +
-	       sizeof(struct bnxt_re_send) +
-	       BNXT_RE_MAX_INLINE_SIZE;
 }
 
 static inline uint32_t bnxt_re_get_sqe_hdr_sz(void)
@@ -643,4 +637,5 @@ static inline void bnxt_re_sub_sec_busy_wait(uint32_t nsec)
 }
 
 #define BNXT_RE_MSN_TBL_EN(a) ((a)->comp_mask & BNXT_RE_COMP_MASK_UCNTX_MSN_TABLE_ENABLED)
+#define BNXT_RE_RATE_LIMIT_EN(a) ((a)->comp_mask & BNXT_RE_COMP_MASK_UCNTX_RATE_LIMIT_ENABLED)
 #endif

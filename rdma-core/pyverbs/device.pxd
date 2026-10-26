@@ -23,10 +23,15 @@ cdef class Context(PyverbsCM):
     cdef object pps
     cdef object sched_nodes
     cdef object sched_leafs
+    cdef object comp_cntrs
     cdef object dr_domains
     cdef object wqs
     cdef object rwq_ind_tbls
     cdef object crypto_logins
+    cdef object event_channels
+    cdef object dmahs
+    cdef object devx_umems
+    cdef object devx_objs
 
 cdef class DeviceAttr(PyverbsObject):
     cdef v.ibv_device_attr dev_attr
@@ -58,6 +63,9 @@ cdef class TSOCaps(PyverbsObject):
 
 cdef class DeviceAttrEx(PyverbsObject):
     cdef v.ibv_device_attr_ex dev_attr
+
+cdef class CompCntrCaps(PyverbsObject):
+    cdef v.ibv_comp_cntr_caps caps
 
 cdef class AllocDmAttr(PyverbsObject):
     cdef v.ibv_alloc_dm_attr alloc_dm_attr

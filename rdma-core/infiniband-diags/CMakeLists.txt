@@ -1,5 +1,6 @@
 publish_internal_headers(""
   ibdiag_common.h
+  ibdiag_dr.h
   ibdiag_sa.h
   )
 
@@ -10,6 +11,7 @@ install(FILES
 
 add_library(ibdiags_tools STATIC
   ibdiag_common.c
+  ibdiag_dr.c
   ibdiag_sa.c
   )
 
@@ -45,6 +47,8 @@ ibdiag_programs(
   smpquery
   vendstat
   )
+
+target_link_libraries(ibstat LINK_PRIVATE ibverbs)
 
 rdma_test_executable(ibsendtrap "ibsendtrap.c")
 target_link_libraries(ibsendtrap LINK_PRIVATE ibdiags_tools ibumad ibmad)

@@ -44,10 +44,35 @@
 #include <config.h>
 #include <stdbool.h>
 #include <rdma/rdma_user_ioctl_cmds.h>
+#include <rdma/ib_user_ioctl_verbs.h>
 #include <infiniband/cmd_ioctl.h>
 #include <sys/types.h>
 
 struct verbs_device;
+
+/* Must change the PRIVATE IBVERBS_PRIVATE_ symbol if this is changed */
+struct ibv_buf {
+	void *addr;
+	size_t size;
+	struct ibv_pd *pd;
+	int dmabuf_fd;
+};
+
+static inline void ibv_buf_init(struct ibv_buf *buf, struct ibv_pd *pd,
+				void *addr, size_t size)
+{
+	buf->pd = pd;
+	buf->addr = addr;
+	buf->size = size;
+	buf->dmabuf_fd = -1;
+}
+
+static inline void ibv_buf_init_dmabuf(struct ibv_buf *buf, struct ibv_pd *pd,
+				       void *addr, size_t size, int fd)
+{
+	ibv_buf_init(buf, pd, addr, size);
+	buf->dmabuf_fd = fd;
+}
 
 enum {
 	VERBS_LOG_LEVEL_NONE,
@@ -106,6 +131,22 @@ enum verbs_xrcd_mask {
 
 enum create_cq_cmd_flags {
 	CREATE_CQ_CMD_FLAGS_TS_IGNORED_EX = 1 << 0,
+	CREATE_CQ_CMD_FLAGS_WITH_MEM_VA = 1 << 1,
+	CREATE_CQ_CMD_FLAGS_WITH_MEM_DMABUF = 1 << 2,
+};
+
+/* Must change the PRIVATE IBVERBS_PRIVATE_ symbol if this is changed */
+struct verbs_create_cq_prov_attr {
+	struct {
+		uint64_t length;
+		union {
+			uint8_t *ptr;
+			struct {
+				uint64_t offset;
+				int fd;
+			} dmabuf;
+		};
+	} buffer;
 };
 
 struct verbs_xrcd {
@@ -188,6 +229,16 @@ struct verbs_dm {
 	struct ibv_dm		dm;
 	uint32_t		handle;
 };
+
+struct verbs_dmah {
+	struct ibv_dmah dmah;
+	uint32_t handle;
+};
+
+static inline struct verbs_dmah *verbs_get_dmah(struct ibv_dmah *dmah)
+{
+	return container_of(dmah, struct verbs_dmah, dmah);
+}
 
 enum {
 	VERBS_MATCH_SENTINEL = 0,
@@ -314,8 +365,12 @@ struct verbs_context_ops {
 			 uint32_t flags,
 			 struct ibv_sge *sg_list,
 			 uint32_t num_sges);
+	void *(*alloc_buf)(struct ibv_pd *pd, size_t size,
+			   struct ibv_buf **buf);
 	struct ibv_dm *(*alloc_dm)(struct ibv_context *context,
 				   struct ibv_alloc_dm_attr *attr);
+	struct ibv_dmah *(*alloc_dmah)(struct ibv_context *context,
+				       struct ibv_dmah_init_attr *attr);
 	struct ibv_mw *(*alloc_mw)(struct ibv_pd *pd, enum ibv_mw_type type);
 	struct ibv_mr *(*alloc_null_mr)(struct ibv_pd *pd);
 	struct ibv_pd *(*alloc_parent_domain)(
@@ -336,6 +391,8 @@ struct verbs_context_ops {
 	void (*cq_event)(struct ibv_cq *cq);
 	struct ibv_ah *(*create_ah)(struct ibv_pd *pd,
 				    struct ibv_ah_attr *attr);
+	struct ibv_comp_cntr *(*create_comp_cntr)(struct ibv_context *context,
+						  struct ibv_comp_cntr_init_attr *attr);
 	struct ibv_counters *(*create_counters)(struct ibv_context *context,
 						struct ibv_counters_init_attr *init_attr);
 	struct ibv_cq *(*create_cq)(struct ibv_context *context, int cqe,
@@ -363,11 +420,13 @@ struct verbs_context_ops {
 		struct ibv_srq_init_attr_ex *srq_init_attr_ex);
 	struct ibv_wq *(*create_wq)(struct ibv_context *context,
 				    struct ibv_wq_init_attr *wq_init_attr);
+	int (*dealloc_dmah)(struct ibv_dmah *dmah);
 	int (*dealloc_mw)(struct ibv_mw *mw);
 	int (*dealloc_pd)(struct ibv_pd *pd);
 	int (*dealloc_td)(struct ibv_td *td);
 	int (*dereg_mr)(struct verbs_mr *vmr);
 	int (*destroy_ah)(struct ibv_ah *ah);
+	int (*destroy_comp_cntr)(struct ibv_comp_cntr *comp_cntr);
 	int (*destroy_counters)(struct ibv_counters *counters);
 	int (*destroy_cq)(struct ibv_cq *cq);
 	int (*destroy_flow)(struct ibv_flow *flow);
@@ -378,6 +437,8 @@ struct verbs_context_ops {
 	int (*destroy_wq)(struct ibv_wq *wq);
 	int (*detach_mcast)(struct ibv_qp *qp, const union ibv_gid *gid,
 			    uint16_t lid);
+	int (*dm_export_dmabuf_fd)(struct ibv_dm *dm);
+	void (*free_buf)(struct ibv_buf *buf);
 	void (*free_context)(struct ibv_context *context);
 	int (*free_dm)(struct ibv_dm *dm);
 	int (*get_srq_num)(struct ibv_srq *srq, uint32_t *srq_num);
@@ -387,6 +448,9 @@ struct verbs_context_ops {
 				    uint32_t mr_handle);
 	struct ibv_pd *(*import_pd)(struct ibv_context *context,
 				    uint32_t pd_handle);
+	int (*inc_comp_cntr)(struct ibv_comp_cntr *comp_cntr, uint64_t amount);
+	int (*inc_err_comp_cntr)(struct ibv_comp_cntr *comp_cntr,
+				 uint64_t amount);
 	int (*modify_cq)(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr);
 	int (*modify_flow_action_esp)(struct ibv_flow_action *action,
 				      struct ibv_flow_action_esp_attr *attr);
@@ -411,6 +475,12 @@ struct verbs_context_ops {
 			    struct ibv_ops_wr **bad_op);
 	int (*post_srq_recv)(struct ibv_srq *srq, struct ibv_recv_wr *recv_wr,
 			     struct ibv_recv_wr **bad_recv_wr);
+	int (*qp_attach_comp_cntr)(struct ibv_qp *qp,
+				   struct ibv_comp_cntr *comp_cntr,
+				   struct ibv_qp_attach_comp_cntr_attr *attr);
+	int (*query_comp_cntr_caps)(struct ibv_context *context,
+				    struct ibv_comp_cntr_caps *caps,
+				    size_t caps_size);
 	int (*query_device_ex)(struct ibv_context *context,
 			       const struct ibv_query_device_ex_input *input,
 			       struct ibv_device_attr_ex *attr,
@@ -418,6 +488,8 @@ struct verbs_context_ops {
 	int (*query_ece)(struct ibv_qp *qp, struct ibv_ece *ece);
 	int (*query_port)(struct ibv_context *context, uint8_t port_num,
 			  struct ibv_port_attr *port_attr);
+	int (*query_port_speed)(struct ibv_context *context, uint32_t port_num,
+				uint64_t *speed);
 	int (*query_qp)(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			int attr_mask, struct ibv_qp_init_attr *init_attr);
 	int (*query_qp_data_in_order)(struct ibv_qp *qp, enum ibv_wr_opcode op,
@@ -425,10 +497,13 @@ struct verbs_context_ops {
 	int (*query_rt_values)(struct ibv_context *context,
 			       struct ibv_values_ex *values);
 	int (*query_srq)(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr);
+	int (*read_comp_cntr)(struct ibv_comp_cntr *comp_cntr, uint64_t *value);
 	int (*read_counters)(struct ibv_counters *counters,
 			     uint64_t *counters_value,
 			     uint32_t ncounters,
 			     uint32_t flags);
+	int (*read_err_comp_cntr)(struct ibv_comp_cntr *comp_cntr,
+				  uint64_t *value);
 	struct ibv_mr *(*reg_dm_mr)(struct ibv_pd *pd, struct ibv_dm *dm,
 				    uint64_t dm_offset, size_t length,
 				    unsigned int access);
@@ -437,11 +512,16 @@ struct verbs_context_ops {
 					int fd, int access);
 	struct ibv_mr *(*reg_mr)(struct ibv_pd *pd, void *addr, size_t length,
 				 uint64_t hca_va, int access);
+	struct ibv_mr *(*reg_mr_ex)(struct ibv_pd *pd,
+				    struct ibv_mr_init_attr *mr_init_attr);
 	int (*req_notify_cq)(struct ibv_cq *cq, int solicited_only);
 	int (*rereg_mr)(struct verbs_mr *vmr, int flags, struct ibv_pd *pd,
 			void *addr, size_t length, int access);
 	int (*resize_cq)(struct ibv_cq *cq, int cqe);
+	int (*set_comp_cntr)(struct ibv_comp_cntr *comp_cntr, uint64_t value);
 	int (*set_ece)(struct ibv_qp *qp, struct ibv_ece *ece);
+	int (*set_err_comp_cntr)(struct ibv_comp_cntr *comp_cntr,
+				 uint64_t value);
 	void (*unimport_dm)(struct ibv_dm *dm);
 	void (*unimport_mr)(struct ibv_mr *mr);
 	void (*unimport_pd)(struct ibv_pd *pd);
@@ -526,6 +606,8 @@ int ibv_cmd_query_device_any(struct ibv_context *context,
 int ibv_cmd_query_port(struct ibv_context *context, uint8_t port_num,
 		       struct ibv_port_attr *port_attr,
 		       struct ibv_query_port *cmd, size_t cmd_size);
+int ibv_cmd_query_port_speed(struct ibv_context *context, uint32_t port_num,
+			     uint64_t *speed);
 int ibv_cmd_alloc_async_fd(struct ibv_context *context);
 int ibv_cmd_alloc_pd(struct ibv_context *context, struct ibv_pd *pd,
 		     struct ibv_alloc_pd *cmd, size_t cmd_size,
@@ -559,6 +641,8 @@ int ibv_cmd_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
 			  uint64_t iova, int fd, int access,
 			  struct verbs_mr *vmr,
 			  struct ibv_command_buffer *driver);
+int ibv_cmd_reg_mr_ex(struct ibv_pd *pd, struct verbs_mr *vmr,
+		      struct ibv_mr_init_attr *mr_init_attr);
 int ibv_cmd_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type,
 		     struct ibv_mw *mw, struct ibv_alloc_mw *cmd,
 		     size_t cmd_size,
@@ -571,6 +655,7 @@ int ibv_cmd_create_cq(struct ibv_context *context, int cqe,
 		      struct ib_uverbs_create_cq_resp *resp, size_t resp_size);
 int ibv_cmd_create_cq_ex(struct ibv_context *context,
 			 const struct ibv_cq_init_attr_ex *cq_attr,
+			 struct verbs_create_cq_prov_attr *prov_attr,
 			 struct verbs_cq *cq,
 			 struct ibv_create_cq_ex *cmd,
 			 size_t cmd_size,
@@ -579,6 +664,7 @@ int ibv_cmd_create_cq_ex(struct ibv_context *context,
 			 uint32_t cmd_flags);
 int ibv_cmd_create_cq_ex2(struct ibv_context *context,
 			  const struct ibv_cq_init_attr_ex *cq_attr,
+			  struct verbs_create_cq_prov_attr *prov_attr,
 			  struct verbs_cq *cq,
 			  struct ibv_create_cq_ex *cmd,
 			  size_t cmd_size,
@@ -630,7 +716,8 @@ int ibv_cmd_create_qp_ex2(struct ibv_context *context,
 			  struct ibv_create_qp_ex *cmd,
 			  size_t cmd_size,
 			  struct ib_uverbs_ex_create_qp_resp *resp,
-			  size_t resp_size);
+			  size_t resp_size,
+			  struct ibv_command_buffer *driver);
 int ibv_cmd_open_qp(struct ibv_context *context,
 		    struct verbs_qp *qp,  int vqp_sz,
 		    struct ibv_qp_open_attr *attr,
@@ -697,6 +784,10 @@ int ibv_cmd_read_counters(struct verbs_counters *vcounters,
 			  uint32_t ncounters,
 			  uint32_t flags,
 			  struct ibv_command_buffer *link);
+/*
+ * Adjust fork protection for the given range. Return 0 on success, or a
+ * non-zero value on failure with errno set to indicate the reason.
+ */
 int ibv_dontfork_range(void *base, size_t size);
 int ibv_dofork_range(void *base, size_t size);
 int ibv_cmd_alloc_dm(struct ibv_context *ctx,
@@ -704,6 +795,28 @@ int ibv_cmd_alloc_dm(struct ibv_context *ctx,
 		     struct verbs_dm *dm,
 		     struct ibv_command_buffer *link);
 int ibv_cmd_free_dm(struct verbs_dm *dm);
+int ibv_cmd_export_dmabuf_fd(struct ibv_context *ctx, off_t pg_off);
+int ibv_cmd_alloc_dmah(struct ibv_context *ctx, struct verbs_dmah *st,
+		       struct ibv_dmah_init_attr *attr);
+int ibv_cmd_free_dmah(struct verbs_dmah *dmah);
+
+int ibv_cmd_query_comp_cntr_caps(struct ibv_context *context,
+				 struct ibv_comp_cntr_caps *caps,
+				 size_t caps_size);
+int ibv_cmd_create_comp_cntr(struct ibv_context *context,
+			     struct ibv_comp_cntr *comp_cntr,
+			     struct ibv_command_buffer *link);
+int ibv_cmd_destroy_comp_cntr(struct ibv_comp_cntr *comp_cntr);
+int ibv_cmd_inc_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount);
+int ibv_cmd_inc_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount);
+int ibv_cmd_read_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value);
+int ibv_cmd_read_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value);
+int ibv_cmd_set_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value);
+int ibv_cmd_set_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value);
+int ibv_cmd_qp_attach_comp_cntr(struct ibv_qp *qp,
+				struct ibv_comp_cntr *comp_cntr,
+				struct ibv_qp_attach_comp_cntr_attr *attr);
+
 int ibv_cmd_reg_dm_mr(struct ibv_pd *pd, struct verbs_dm *dm,
 		      uint64_t offset, size_t length,
 		      unsigned int access, struct verbs_mr *vmr,
@@ -757,6 +870,27 @@ static inline void ibv_initialize_parent_domain(struct ibv_pd *parent_domain,
 {
 	parent_domain->context = contained_pd->context;
 	parent_domain->handle = contained_pd->handle;
+}
+
+/**
+ * In case the length is 0, the buffer size is used.
+ */
+static inline void
+fill_attr_in_buf_umem(struct ibv_command_buffer *cmdb, uint16_t attr_id,
+		      struct ib_uverbs_buffer_desc *storage,
+		      struct ibv_buf *buf, void *addr, size_t length)
+{
+	if (!buf || buf->dmabuf_fd == -1)
+		return;
+
+	*storage = (struct ib_uverbs_buffer_desc){
+		.type	= IB_UVERBS_BUFFER_TYPE_DMABUF,
+		.fd	= buf->dmabuf_fd,
+		.addr	= addr ? (uintptr_t)addr - (uintptr_t)buf->addr : 0,
+		.length	= length ? length : buf->size,
+	};
+	fill_attr_in_ptr(cmdb, attr_id, storage);
+	cmdb->fallback_ioctl_only = 1;
 }
 
 #endif /* INFINIBAND_DRIVER_H */

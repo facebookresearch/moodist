@@ -11,6 +11,7 @@ publish_headers(infiniband
 publish_internal_headers(infiniband
   cmd_ioctl.h
   cmd_write.h
+  dmabuf_heap.h
   driver.h
   kern-abi.h
   marshall.h
@@ -21,14 +22,18 @@ configure_file("libibverbs.map.in"
 
 rdma_library(ibverbs "${CMAKE_CURRENT_BINARY_DIR}/libibverbs.map"
   # See Documentation/versioning.md
-  1 1.14.${PACKAGE_VERSION}
+  1 1.18.${PACKAGE_VERSION}
   all_providers.c
   cmd.c
   cmd_ah.c
   cmd_counters.c
+  cmd_comp_cntr.c
   cmd_cq.c
   cmd_device.c
   cmd_dm.c
+  cmd_dmabuf.c
+  cmd_dmah.c
+  dmabuf_heap.c
   cmd_fallback.c
   cmd_flow.c
   cmd_flow_action.c

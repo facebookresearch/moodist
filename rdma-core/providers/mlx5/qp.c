@@ -64,7 +64,7 @@ static const uint32_t mlx5_ib_opcode[] = {
 
 static void *get_recv_wqe(struct mlx5_qp *qp, int n)
 {
-	return qp->buf.buf + qp->rq.offset + (n << qp->rq.wqe_shift);
+	return qp->buf.ibv_buf.addr + qp->rq.offset + (n << qp->rq.wqe_shift);
 }
 
 static void *get_wq_recv_wqe(struct mlx5_rwq *rwq, int n)
@@ -2106,7 +2106,7 @@ static int umr_sg_list_create(struct mlx5_qp *qp,
 			      uint64_t *reglen)
 {
 	struct mlx5_wqe_data_seg *dseg;
-	int byte_count = 0;
+	uint64_t byte_count = 0;
 	int i;
 	size_t tmp;
 

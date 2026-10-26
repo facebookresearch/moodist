@@ -51,7 +51,6 @@ static const uint32_t hns_roce_opcode[] = {
 	HR_IBV_OPC_MAP(RDMA_READ,		RDMA_READ),
 	HR_IBV_OPC_MAP(ATOMIC_CMP_AND_SWP,	ATOMIC_COM_AND_SWAP),
 	HR_IBV_OPC_MAP(ATOMIC_FETCH_AND_ADD,	ATOMIC_FETCH_AND_ADD),
-	HR_IBV_OPC_MAP(BIND_MW,			BIND_MW_TYPE),
 	HR_IBV_OPC_MAP(SEND_WITH_INV,		SEND_WITH_INV),
 };
 
@@ -86,8 +85,10 @@ static inline void set_data_seg_v2(struct hns_roce_v2_wqe_data_seg *dseg,
 	dseg->len = htole32(sg->length);
 }
 
-static void set_extend_atomic_seg(struct hns_roce_qp *qp, unsigned int sge_cnt,
-				  struct hns_roce_sge_info *sge_info, void *buf)
+static inline void set_extend_atomic_seg(struct hns_roce_qp *qp,
+					 unsigned int sge_cnt,
+					 struct hns_roce_sge_info *sge_info,
+					 void *buf)
 {
 	unsigned int sge_mask = qp->ex_sge.sge_cnt - 1;
 	unsigned int i;
@@ -322,14 +323,19 @@ static void hns_roce_write_dwqe(struct hns_roce_qp *qp, void *wqe)
 
 static void update_cq_db(struct hns_roce_context *ctx, struct hns_roce_cq *cq)
 {
-	struct hns_roce_db cq_db = {};
+	if (cq->flags & HNS_ROCE_CQ_FLAG_RECORD_DB) {
+		*cq->db = cq->cons_index & RECORD_DB_CI_MASK;
+	} else {
+		struct hns_roce_db cq_db = {};
 
-	hr_reg_write(&cq_db, DB_TAG, cq->cqn);
-	hr_reg_write(&cq_db, DB_CMD, HNS_ROCE_V2_CQ_DB_PTR);
-	hr_reg_write(&cq_db, DB_CQ_CI, cq->cons_index);
-	hr_reg_write(&cq_db, DB_CQ_CMD_SN, 1);
+		hr_reg_write(&cq_db, DB_TAG, cq->cqn);
+		hr_reg_write(&cq_db, DB_CMD, HNS_ROCE_V2_CQ_DB_PTR);
+		hr_reg_write(&cq_db, DB_CQ_CI, cq->cons_index);
+		hr_reg_write(&cq_db, DB_CQ_CMD_SN, 1);
 
-	hns_roce_write64(ctx->uar + ROCEE_VF_DB_CFG0_OFFSET, (__le32 *)&cq_db);
+		hns_roce_write64(ctx->uar + ROCEE_VF_DB_CFG0_OFFSET,
+				 (__le32 *)&cq_db);
+	}
 }
 
 static struct hns_roce_qp *hns_roce_v2_find_qp(struct hns_roce_context *ctx,
@@ -386,7 +392,6 @@ static const unsigned int wc_send_op_map[] = {
 	[HNS_ROCE_SQ_OP_RDMA_READ] = IBV_WC_RDMA_READ,
 	[HNS_ROCE_SQ_OP_ATOMIC_COMP_AND_SWAP] = IBV_WC_COMP_SWAP,
 	[HNS_ROCE_SQ_OP_ATOMIC_FETCH_AND_ADD] = IBV_WC_FETCH_ADD,
-	[HNS_ROCE_SQ_OP_BIND_MW] = IBV_WC_BIND_MW,
 };
 
 static const unsigned int wc_rcv_op_map[] = {
@@ -568,7 +573,6 @@ static void parse_cqe_for_req(struct hns_roce_v2_cqe *cqe, struct ibv_wc *wc,
 	case HNS_ROCE_SQ_OP_SEND:
 	case HNS_ROCE_SQ_OP_SEND_WITH_INV:
 	case HNS_ROCE_SQ_OP_RDMA_WRITE:
-	case HNS_ROCE_SQ_OP_BIND_MW:
 		wc->wc_flags = 0;
 		break;
 	case HNS_ROCE_SQ_OP_SEND_WITH_IMM:
@@ -681,7 +685,7 @@ static int parse_cqe_for_cq(struct hns_roce_context *ctx, struct hns_roce_cq *cq
 	return 0;
 }
 
-#ifdef LTTNG_ENABLED
+#if defined(LTTNG_ENABLED) || defined(USDT_ENABLED)
 static uint8_t read_wc_sl(struct hns_roce_qp *hr_qp,
 				   struct hns_roce_v2_cqe *cqe,
 				   struct ibv_wc *wc)
@@ -842,12 +846,8 @@ static int hns_roce_u_v2_poll_cq(struct ibv_cq *ibvcq, int ne,
 			break;
 	}
 
-	if (npolled || err == V2_CQ_POLL_ERR) {
-		if (cq->flags & HNS_ROCE_CQ_FLAG_RECORD_DB)
-			*cq->db = cq->cons_index & RECORD_DB_CI_MASK;
-		else
-			update_cq_db(ctx, cq);
-	}
+	if (npolled || err == V2_CQ_POLL_ERR)
+		update_cq_db(ctx, cq);
 
 	hns_roce_spin_unlock(&cq->hr_lock);
 
@@ -1251,28 +1251,6 @@ static int set_rc_inl(struct hns_roce_qp *qp, const struct ibv_send_wr *wr,
 	return 0;
 }
 
-static void set_bind_mw_seg(struct hns_roce_rc_sq_wqe *wqe,
-			    const struct ibv_send_wr *wr)
-{
-	unsigned int access = wr->bind_mw.bind_info.mw_access_flags;
-
-	hr_reg_write_bool(wqe, RCWQE_MW_TYPE, wr->bind_mw.mw->type - 1);
-	hr_reg_write_bool(wqe, RCWQE_MW_RA_EN,
-			  !!(access & IBV_ACCESS_REMOTE_ATOMIC));
-	hr_reg_write_bool(wqe, RCWQE_MW_RR_EN,
-			  !!(access & IBV_ACCESS_REMOTE_READ));
-	hr_reg_write_bool(wqe, RCWQE_MW_RW_EN,
-			  !!(access & IBV_ACCESS_REMOTE_WRITE));
-
-	wqe->new_rkey = htole32(wr->bind_mw.rkey);
-	wqe->byte_16 = htole32(wr->bind_mw.bind_info.length &
-			       HNS_ROCE_ADDRESS_MASK);
-	wqe->byte_20 = htole32(wr->bind_mw.bind_info.length >>
-			       HNS_ROCE_ADDRESS_SHIFT);
-	wqe->rkey = htole32(wr->bind_mw.bind_info.mr->rkey);
-	wqe->va = htole64(wr->bind_mw.bind_info.addr);
-}
-
 static int check_rc_opcode(struct hns_roce_rc_sq_wqe *wqe,
 			   const struct ibv_send_wr *wr)
 {
@@ -1297,9 +1275,6 @@ static int check_rc_opcode(struct hns_roce_rc_sq_wqe *wqe,
 		break;
 	case IBV_WR_SEND_WITH_INV:
 		wqe->inv_key = htole32(wr->invalidate_rkey);
-		break;
-	case IBV_WR_BIND_MW:
-		set_bind_mw_seg(wqe, wr);
 		break;
 	default:
 		ret = EINVAL;
@@ -1334,9 +1309,6 @@ static int set_rc_wqe(void *wqe, struct hns_roce_qp *qp, struct ibv_send_wr *wr,
 	hr_reg_write(rc_sq_wqe, RCWQE_MSG_START_SGE_IDX,
 		     sge_info->start_idx & (qp->ex_sge.sge_cnt - 1));
 
-	if (wr->opcode == IBV_WR_BIND_MW)
-		goto wqe_valid;
-
 	wqe += sizeof(struct hns_roce_rc_sq_wqe);
 	dseg = wqe;
 
@@ -1357,7 +1329,6 @@ static int set_rc_wqe(void *wqe, struct hns_roce_qp *qp, struct ibv_send_wr *wr,
 	if (ret)
 		return ret;
 
-wqe_valid:
 	enable_wqe(qp, rc_sq_wqe, qp->sq.head + nreq);
 
 	return 0;
@@ -1401,6 +1372,9 @@ int hns_roce_u_v2_post_send(struct ibv_qp *ibvqp, struct ibv_send_wr *wr,
 		wqe_idx = (qp->sq.head + nreq) & (qp->sq.wqe_cnt - 1);
 		wqe = get_send_wqe(qp, wqe_idx);
 		qp->sq.wrid[wqe_idx] = wr->wr_id;
+
+		/* RC and UD share the same DirectWQE field layout */
+		((struct hns_roce_rc_sq_wqe *)wqe)->byte_4 = 0;
 
 		switch (ibvqp->qp_type) {
 		case IBV_QPT_XRC_SEND:
@@ -1955,10 +1929,7 @@ static int wc_next_poll_cq(struct ibv_cq_ex *current)
 	if (err != V2_CQ_OK)
 		return err;
 
-	if (cq->flags & HNS_ROCE_CQ_FLAG_RECORD_DB)
-		*cq->db = cq->cons_index & RECORD_DB_CI_MASK;
-	else
-		update_cq_db(ctx, cq);
+	update_cq_db(ctx, cq);
 
 	return 0;
 }
@@ -1968,11 +1939,7 @@ static void wc_end_poll_cq(struct ibv_cq_ex *current)
 	struct hns_roce_cq *cq = to_hr_cq(ibv_cq_ex_to_cq(current));
 	struct hns_roce_context *ctx = to_hr_ctx(current->context);
 
-	if (cq->flags & HNS_ROCE_CQ_FLAG_RECORD_DB)
-		*cq->db = cq->cons_index & RECORD_DB_CI_MASK;
-	else
-		update_cq_db(ctx, cq);
-
+	update_cq_db(ctx, cq);
 	hns_roce_spin_unlock(&cq->hr_lock);
 }
 
@@ -2140,6 +2107,7 @@ init_rc_wqe(struct hns_roce_qp *qp, uint64_t wr_id, unsigned int opcode)
 	wqe_idx = qp->sq.head & (qp->sq.wqe_cnt - 1);
 	wqe = get_send_wqe(qp, wqe_idx);
 
+	wqe->byte_4 = 0;
 	hr_reg_write(wqe, RCWQE_OPCODE, opcode);
 	hr_reg_write_bool(wqe, RCWQE_CQE, send_flags & IBV_SEND_SIGNALED);
 	hr_reg_write_bool(wqe, RCWQE_FENCE, send_flags & IBV_SEND_FENCE);
@@ -2227,7 +2195,6 @@ static void wr_set_sge_list_rc(struct ibv_qp_ex *ibv_qp, size_t num_sge,
 		qp->err = EINVAL;
 		return;
 	}
-
 
 	hr_reg_write(wqe, RCWQE_MSG_START_SGE_IDX,
 		     qp->sge_info.start_idx & (qp->ex_sge.sge_cnt - 1));
@@ -2483,6 +2450,7 @@ init_ud_wqe(struct hns_roce_qp *qp, uint64_t wr_id, unsigned int opcode)
 	wqe_idx = qp->sq.head & (qp->sq.wqe_cnt - 1);
 	wqe = get_send_wqe(qp, wqe_idx);
 
+	wqe->rsv_opcode = 0;
 	hr_reg_write(wqe, UDWQE_OPCODE, opcode);
 	hr_reg_write_bool(wqe, UDWQE_CQE, send_flags & IBV_SEND_SIGNALED);
 	hr_reg_write_bool(wqe, UDWQE_SE, send_flags & IBV_SEND_SOLICITED);
@@ -2551,9 +2519,12 @@ static void wr_set_sge_ud(struct ibv_qp_ex *ibv_qp, uint32_t lkey,
 		return;
 
 	wqe->msg_len = htole32(length);
-	hr_reg_write(wqe, UDWQE_SGE_NUM, 1);
+	hr_reg_write(wqe, UDWQE_SGE_NUM, !!length);
 	sge_idx = qp->sge_info.start_idx & (qp->ex_sge.sge_cnt - 1);
 	hr_reg_write(wqe, UDWQE_MSG_START_SGE_IDX, sge_idx);
+
+	if (!length)
+		goto out;
 
 	dseg = get_send_sge_ex(qp, sge_idx);
 
@@ -2563,6 +2534,7 @@ static void wr_set_sge_ud(struct ibv_qp_ex *ibv_qp, uint32_t lkey,
 
 	qp->sge_info.start_idx++;
 
+out:
 	rdma_tracepoint(rdma_core_hns, post_send,
 			ibv_qp->qp_base.context->device->name, ibv_qp->wr_id,
 			1, ibv_qp->qp_base.qp_num,

@@ -120,8 +120,13 @@ int bnxt_re_post_srq_recv(struct ibv_srq *ibvsrq, struct ibv_recv_wr *wr,
 struct ibv_ah *bnxt_re_create_ah(struct ibv_pd *ibvpd,
 				 struct ibv_ah_attr *attr);
 int bnxt_re_destroy_ah(struct ibv_ah *ibvah);
+struct ibv_flow *bnxt_re_create_flow(struct ibv_qp *qp,
+				     struct ibv_flow_attr *flow);
+int bnxt_re_destroy_flow(struct ibv_flow *flow);
 void bnxt_re_async_event(struct ibv_context *context,
 			 struct ibv_async_event *event);
+int bnxt_re_modify_qp_rate_limit(struct ibv_qp *qp,
+				 struct ibv_qp_rate_limit_attr *attr);
 
 static inline __le64 bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint32_t start_psn)
 {

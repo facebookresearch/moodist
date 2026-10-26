@@ -151,6 +151,7 @@ enum ibv_fork_status {
  */
 #define IBV_DEVICE_RAW_SCATTER_FCS (1ULL << 34)
 #define IBV_DEVICE_PCI_WRITE_END_PADDING (1ULL << 36)
+#define IBV_DEVICE_CC_DMA_BOUNCE (1ULL << 41)
 
 enum ibv_atomic_cap {
 	IBV_ATOMIC_NONE,
@@ -471,6 +472,7 @@ enum ibv_event_type {
 	IBV_EVENT_CLIENT_REREGISTER,
 	IBV_EVENT_GID_CHANGE,
 	IBV_EVENT_WQ_FATAL,
+	IBV_EVENT_DEVICE_SPEED_CHANGE,
 };
 
 struct ibv_async_event {
@@ -631,6 +633,12 @@ struct ibv_mw_bind_info {
 	unsigned int	 mw_access_flags; /* use ibv_access_flags */
 };
 
+struct ibv_dmah {
+	struct ibv_context *context;
+};
+
+struct ibv_buf;
+
 struct ibv_pd {
 	struct ibv_context     *context;
 	uint32_t		handle;
@@ -675,6 +683,27 @@ struct ibv_mr {
 	uint32_t		handle;
 	uint32_t		lkey;
 	uint32_t		rkey;
+};
+
+enum ibv_mr_init_attr_mask {
+	IBV_REG_MR_MASK_IOVA = 1 << 0,
+	IBV_REG_MR_MASK_ADDR = 1 << 1,
+	IBV_REG_MR_MASK_FD = 1 << 2,
+	IBV_REG_MR_MASK_FD_OFFSET = 1 << 3,
+	IBV_REG_MR_MASK_DMAH = 1 << 4,
+	IBV_REG_MR_MASK_BUF = 1 << 5,
+};
+
+struct ibv_mr_init_attr {
+	size_t length;
+	int access;
+	uint64_t comp_mask; /* Use enum ibv_mr_init_attr_mask */
+	uint64_t iova;
+	void *addr;
+	int fd;
+	uint64_t fd_offset;
+	struct ibv_dmah *dmah;
+	struct ibv_buf *buf; /* Handle from ibv_alloc_buf(), addr must be set */
 };
 
 enum ibv_mw_type {
@@ -1042,6 +1071,7 @@ enum ibv_qp_attr_mask {
 
 enum ibv_query_qp_data_in_order_flags {
 	IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS = 1 << 0,
+	IBV_QUERY_QP_DATA_IN_ORDER_DEVICE_ONLY = 1 << 1,
 };
 
 enum ibv_query_qp_data_in_order_caps {
@@ -2087,9 +2117,46 @@ struct ibv_cq_init_attr_ex {
 	struct ibv_pd		*parent_domain;
 };
 
+enum ibv_qp_attach_comp_cntr_op {
+	IBV_QP_ATTACH_COMP_CNTR_OP_SEND			= 1 << 0,
+	IBV_QP_ATTACH_COMP_CNTR_OP_RECV			= 1 << 1,
+	IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_READ		= 1 << 2,
+	IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_READ	= 1 << 3,
+	IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_WRITE		= 1 << 4,
+	IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_WRITE	= 1 << 5,
+};
+
+struct ibv_comp_cntr_caps {
+	uint64_t max_value;
+	uint32_t max_counters;
+	uint32_t supported_qp_attach_ops; /* Bitmask of ibv_qp_attach_comp_cntr_op */
+};
+
+struct ibv_comp_cntr {
+	struct ibv_context *context;
+	uint32_t handle;
+};
+
+enum ibv_comp_cntr_type {
+	IBV_COMP_CNTR_TYPE_WRS,
+	IBV_COMP_CNTR_TYPE_BYTES,
+};
+
+struct ibv_comp_cntr_init_attr {
+	uint32_t comp_mask; /* Compatibility mask */
+	enum ibv_comp_cntr_type type;
+	uint32_t flags;
+};
+
+struct ibv_qp_attach_comp_cntr_attr {
+	uint32_t comp_mask; /* Compatibility mask */
+	uint32_t op_mask; /* Bitmask of ibv_qp_attach_comp_cntr_op */
+};
+
 enum ibv_parent_domain_init_attr_mask {
 	IBV_PARENT_DOMAIN_INIT_ATTR_ALLOCATORS = 1 << 0,
 	IBV_PARENT_DOMAIN_INIT_ATTR_PD_CONTEXT = 1 << 1,
+	IBV_PARENT_DOMAIN_INIT_ATTR_ALLOW_CC_UNPROTECTED_ALLOC = 1 << 2,
 };
 
 #define IBV_ALLOCATOR_USE_DEFAULT ((void *)-1)
@@ -2103,6 +2170,24 @@ struct ibv_parent_domain_init_attr {
 	void (*free)(struct ibv_pd *pd, void *pd_context, void *ptr,
 		     uint64_t resource_type);
 	void *pd_context;
+};
+
+enum ibv_tph_mem_type {
+	IBV_TPH_MEM_TYPE_VM, /* volatile memory */
+	IBV_TPH_MEM_TYPE_PM, /* persistent memory */
+};
+
+enum  ibv_dmah_init_attr_mask {
+	IBV_DMAH_INIT_ATTR_MASK_CPU_ID = 1 << 0,
+	IBV_DMAH_INIT_ATTR_MASK_PH = 1 << 1,
+	IBV_DMAH_INIT_ATTR_MASK_TPH_MEM_TYPE = 1 << 2,
+};
+
+struct ibv_dmah_init_attr {
+	uint32_t comp_mask;
+	uint32_t cpu_id;
+	uint8_t ph;
+	uint8_t tph_mem_type; /* From enum ibv_tph_mem_type */
 };
 
 struct ibv_counters_init_attr {
@@ -2140,6 +2225,15 @@ struct ibv_values_ex {
 
 struct verbs_context {
 	/*  "grows up" - new fields go here */
+	void (*free_buf)(struct ibv_buf *buf);
+	void *(*alloc_buf)(struct ibv_pd *pd, size_t size,
+			   struct ibv_buf **buf);
+	int (*dm_export_dmabuf_fd)(struct ibv_dm *dm);
+	struct ibv_mr *(*reg_mr_ex)(struct ibv_pd *pd,
+				    struct ibv_mr_init_attr *mr_init_attr);
+	int (*dealloc_dmah)(struct ibv_dmah *dmah);
+	struct ibv_dmah *(*alloc_dmah)(struct ibv_context *context,
+				       struct ibv_dmah_init_attr *attr);
 	int (*query_port)(struct ibv_context *context, uint8_t port_num,
 			  struct ibv_port_attr *port_attr,
 			  size_t port_attr_len);
@@ -2251,7 +2345,7 @@ struct ibv_device **ibv_get_device_list(int *num_devices);
  */
 #ifdef RDMA_STATIC_PROVIDERS
 #define _RDMA_STATIC_PREFIX_(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11,     \
-			     _12, _13, _14, _15, _16, _17, _18, _19, ...)      \
+			     _12, _13, _14, _15, _16, _17, _18, _19, _20, ...) \
 	&verbs_provider_##_1, &verbs_provider_##_2, &verbs_provider_##_3,      \
 		&verbs_provider_##_4, &verbs_provider_##_5,                    \
 		&verbs_provider_##_6, &verbs_provider_##_7,                    \
@@ -2260,11 +2354,12 @@ struct ibv_device **ibv_get_device_list(int *num_devices);
 		&verbs_provider_##_12, &verbs_provider_##_13,                  \
 		&verbs_provider_##_14, &verbs_provider_##_15,                  \
 		&verbs_provider_##_16, &verbs_provider_##_17,                  \
-		&verbs_provider_##_18, &verbs_provider_##_19
+		&verbs_provider_##_18, &verbs_provider_##_19,                  \
+		&verbs_provider_##_20
 #define _RDMA_STATIC_PREFIX(arg)                                               \
 	_RDMA_STATIC_PREFIX_(arg, none, none, none, none, none, none, none,    \
 			     none, none, none, none, none, none, none, none,   \
-			     none, none, none)
+			     none, none, none, none)
 
 struct verbs_devices_ops;
 extern const struct verbs_device_ops verbs_provider_bnxt_re;
@@ -2284,6 +2379,7 @@ extern const struct verbs_device_ops verbs_provider_qedr;
 extern const struct verbs_device_ops verbs_provider_rxe;
 extern const struct verbs_device_ops verbs_provider_siw;
 extern const struct verbs_device_ops verbs_provider_vmw_pvrdma;
+extern const struct verbs_device_ops verbs_provider_ionic;
 extern const struct verbs_device_ops verbs_provider_all;
 extern const struct verbs_device_ops verbs_provider_none;
 void ibv_static_providers(void *unused, ...);
@@ -2405,6 +2501,12 @@ int ibv_query_device(struct ibv_context *context,
  */
 int ibv_query_port(struct ibv_context *context, uint8_t port_num,
 		   struct _compat_ibv_port_attr *port_attr);
+
+/**
+ * ibv_query_port_speed - Get port effective speed in 100 Mb/s granularity.
+ */
+int ibv_query_port_speed(struct ibv_context *context, uint32_t port_num,
+			 uint64_t *port_speed);
 
 static inline int ___ibv_query_port(struct ibv_context *context,
 				    uint8_t port_num,
@@ -2632,6 +2734,8 @@ __ibv_reg_mr_iova(struct ibv_pd *pd, void *addr, size_t length, uint64_t iova,
 struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
 				 uint64_t iova, int fd, int access);
 
+struct ibv_mr *ibv_reg_mr_ex(struct ibv_pd *pd, struct ibv_mr_init_attr *mr_init_attr);
+
 enum ibv_rereg_mr_err_code {
 	/* Old MR is valid, invalid input */
 	IBV_REREG_MR_ERR_INPUT = -1,
@@ -2778,6 +2882,8 @@ int ibv_free_dm(struct ibv_dm *dm)
 
 	return vctx->free_dm(dm);
 }
+
+int ibv_dm_export_dmabuf_fd(struct ibv_dm *dm);
 
 /**
  * ibv_memcpy_to/from_dm - copy to/from device allocated memory
@@ -2957,6 +3063,77 @@ static inline int ibv_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *at
 
 	return vctx->modify_cq(cq, attr);
 }
+
+int _ibv_query_comp_cntr_caps(struct ibv_context *context,
+			      struct ibv_comp_cntr_caps *caps, size_t caps_size);
+
+/**
+ * ibv_query_comp_cntr_caps - Query completion counter capabilities
+ * @context: Device context.
+ * @caps: Output capabilities struct.
+ */
+static inline int ibv_query_comp_cntr_caps(struct ibv_context *context,
+					   struct ibv_comp_cntr_caps *caps)
+{
+	return _ibv_query_comp_cntr_caps(context, caps, sizeof(*caps));
+}
+
+/**
+ * ibv_create_comp_cntr - Create a completion counter
+ * @context: Device context to create the counter on.
+ * @cc_attr: Attributes for the completion counter.
+ */
+struct ibv_comp_cntr *ibv_create_comp_cntr(struct ibv_context *context,
+					   struct ibv_comp_cntr_init_attr *cc_attr);
+
+/**
+ * ibv_destroy_comp_cntr - Destroy a completion counter
+ * @comp_cntr: The completion counter to destroy.
+ */
+int ibv_destroy_comp_cntr(struct ibv_comp_cntr *comp_cntr);
+
+/**
+ * ibv_set_comp_cntr - Set the completion count value
+ * @comp_cntr: The completion counter to update.
+ * @value: The value to set.
+ */
+int ibv_set_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value);
+
+/**
+ * ibv_set_err_comp_cntr - Set the error count value
+ * @comp_cntr: The completion counter to update.
+ * @value: The value to set.
+ */
+int ibv_set_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t value);
+
+/**
+ * ibv_inc_comp_cntr - Increment the completion count
+ * @comp_cntr: The completion counter to increment.
+ * @amount: The amount to increment by.
+ */
+int ibv_inc_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount);
+
+/**
+ * ibv_inc_err_comp_cntr - Increment the error count
+ * @comp_cntr: The completion counter to increment.
+ * @amount: The amount to increment by.
+ */
+int ibv_inc_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t amount);
+
+/**
+ * ibv_read_comp_cntr - Read the completion count value
+ * @comp_cntr: The completion counter to read.
+ * @value: Output pointer to store the current completion count.
+ */
+int ibv_read_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value);
+
+/**
+ * ibv_read_err_comp_cntr - Read the error count value
+ * @comp_cntr: The completion counter to read.
+ * @value: Output pointer to store the current error count.
+ */
+int ibv_read_err_comp_cntr(struct ibv_comp_cntr *comp_cntr, uint64_t *value);
+
 /**
  * ibv_create_srq - Creates a SRQ associated with the specified protection
  *   domain.
@@ -3135,6 +3312,61 @@ ibv_alloc_parent_domain(struct ibv_context *context,
 }
 
 /**
+ * ibv_alloc_buf - Allocate a buffer using provider-configured allocation method
+ * @pd: Protection domain or parent domain
+ * @size: Buffer size in bytes
+ * @buf: On success, set to a handle for ibv_free_buf()
+ *
+ * The returned address is at least page aligned, so it can be registered
+ * with ibv_reg_buf_mr() regardless of how the buffer is backed.
+ *
+ * Returns the usable buffer address on success, or NULL on failure with
+ * errno set.
+ */
+void *ibv_alloc_buf(struct ibv_pd *pd, size_t size, struct ibv_buf **buf);
+
+/**
+ * ibv_export_buf_dmabuf_fd - Export a DMA-buf fd for an ibv_buf
+ * @buf: Handle from ibv_alloc_buf()
+ *
+ * Returns a new fd for the DMA-buf backing the buffer on success, or -1
+ * on failure with errno set. The returned fd is owned by the caller and
+ * should be closed with close(2) when no longer needed.
+ */
+int ibv_export_buf_dmabuf_fd(struct ibv_buf *buf);
+
+/**
+ * ibv_free_buf - Free a buffer allocated with ibv_alloc_buf
+ * @buf: Handle from ibv_alloc_buf()
+ */
+void ibv_free_buf(struct ibv_buf *buf);
+
+/**
+ * ibv_reg_buf_mr - Register an MR for a buffer from ibv_alloc_buf
+ * @pd: Protection domain
+ * @buf: Handle from ibv_alloc_buf()
+ * @addr: Start address to register; the buffer base returned by
+ *        ibv_alloc_buf() or an address within that buffer
+ * @length: Length in bytes; @addr + @length must stay within the buffer
+ * @access: Access flags (IBV_ACCESS_*)
+ *
+ * Returns the registered MR on success, or NULL on failure with errno set.
+ */
+struct ibv_mr *ibv_reg_buf_mr(struct ibv_pd *pd, struct ibv_buf *buf,
+			      void *addr, size_t length, int access);
+
+/**
+ * ibv_alloc_dmah - Allocate a dma handle
+ */
+struct ibv_dmah *ibv_alloc_dmah(struct ibv_context *context,
+				struct ibv_dmah_init_attr *attr);
+
+/**
+ * ibv_dealloc_dmah - Free a dma handle
+ */
+int ibv_dealloc_dmah(struct ibv_dmah *dmah);
+
+/**
  * ibv_query_rt_values_ex - Get current real time @values of a device.
  * @values - in/out - defines the attributes we need to query/queried.
  * (Or's bits of enum ibv_values_mask on values->comp_mask field)
@@ -3220,6 +3452,15 @@ ibv_modify_qp_rate_limit(struct ibv_qp *qp,
 
 	return vctx->modify_qp_rate_limit(qp, attr);
 }
+
+/**
+ * ibv_qp_attach_comp_cntr - Attach a completion counter to a QP
+ * @qp: The queue pair to attach the counter to.
+ * @comp_cntr: The completion counter to attach.
+ * @attr: Attach attributes.
+ */
+int ibv_qp_attach_comp_cntr(struct ibv_qp *qp, struct ibv_comp_cntr *comp_cntr,
+			    struct ibv_qp_attach_comp_cntr_attr *attr);
 
 /**
  * ibv_query_qp_data_in_order - Checks whether the data is guaranteed to be

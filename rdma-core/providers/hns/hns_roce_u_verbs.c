@@ -346,69 +346,6 @@ int hns_roce_u_dereg_mr(struct verbs_mr *vmr)
 	return ret;
 }
 
-int hns_roce_u_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
-		       struct ibv_mw_bind *mw_bind)
-{
-	struct ibv_mw_bind_info *bind_info = &mw_bind->bind_info;
-	struct ibv_send_wr *bad_wr = NULL;
-	struct ibv_send_wr wr = {};
-	int ret;
-
-	if (bind_info->mw_access_flags & ~(IBV_ACCESS_REMOTE_WRITE |
-	    IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC))
-		return EINVAL;
-
-	wr.opcode = IBV_WR_BIND_MW;
-	wr.next = NULL;
-
-	wr.wr_id = mw_bind->wr_id;
-	wr.send_flags = mw_bind->send_flags;
-
-	wr.bind_mw.mw = mw;
-	wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
-	wr.bind_mw.bind_info = mw_bind->bind_info;
-
-	ret = hns_roce_u_v2_post_send(qp, &wr, &bad_wr);
-	if (ret)
-		return ret;
-
-	mw->rkey = wr.bind_mw.rkey;
-
-	return 0;
-}
-
-struct ibv_mw *hns_roce_u_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type)
-{
-	struct ibv_mw *mw;
-	struct ibv_alloc_mw cmd = {};
-	struct ib_uverbs_alloc_mw_resp resp = {};
-
-	mw = malloc(sizeof(*mw));
-	if (!mw)
-		return NULL;
-
-	if (ibv_cmd_alloc_mw(pd, type, mw, &cmd, sizeof(cmd),
-			     &resp, sizeof(resp))) {
-		free(mw);
-		return NULL;
-	}
-
-	return mw;
-}
-
-int hns_roce_u_dealloc_mw(struct ibv_mw *mw)
-{
-	int ret;
-
-	ret = ibv_cmd_dealloc_mw(mw);
-	if (ret)
-		return ret;
-
-	free(mw);
-
-	return 0;
-}
-
 enum {
 	CREATE_CQ_SUPPORTED_COMP_MASK = IBV_CQ_INIT_ATTR_MASK_FLAGS |
 					IBV_CQ_INIT_ATTR_MASK_PD,
@@ -496,7 +433,7 @@ static int exec_cq_create_cmd(struct ibv_context *context,
 	cmd_drv->db_addr = (uintptr_t)cq->db;
 	cmd_drv->cqe_size = (uintptr_t)cq->cqe_size;
 
-	ret = ibv_cmd_create_cq_ex(context, attr, &cq->verbs_cq,
+	ret = ibv_cmd_create_cq_ex(context, attr, NULL, &cq->verbs_cq,
 				   &cmd_ex.ibv_cmd, sizeof(cmd_ex),
 				   &resp_ex.ibv_resp, sizeof(resp_ex), 0);
 	if (ret) {
@@ -783,11 +720,12 @@ static int alloc_srq_buf(struct hns_roce_srq *srq)
 	if (ret)
 		goto err_idx_que;
 
-	srq->wrid = calloc(srq->wqe_cnt, sizeof(*srq->wrid));
+	srq->wrid = malloc(srq->wqe_cnt * sizeof(*srq->wrid));
 	if (!srq->wrid) {
 		ret = -ENOMEM;
 		goto err_wqe_buf;
 	}
+	memset(srq->wrid, 0, srq->wqe_cnt * sizeof(*srq->wrid));
 
 	return 0;
 
@@ -1243,11 +1181,13 @@ static int qp_alloc_wqe(struct ibv_qp_cap *cap, struct hns_roce_qp *qp,
 	qp->sq.wrid = malloc(qp->sq.wqe_cnt * sizeof(uint64_t));
 	if (!qp->sq.wrid)
 		return -ENOMEM;
+	memset(qp->sq.wrid, 0, qp->sq.wqe_cnt * sizeof(uint64_t));
 
 	if (qp->rq.wqe_cnt) {
 		qp->rq.wrid = malloc(qp->rq.wqe_cnt * sizeof(uint64_t));
 		if (!qp->rq.wrid)
 			goto err_alloc;
+		memset(qp->rq.wrid, 0, qp->rq.wqe_cnt * sizeof(uint64_t));
 	}
 
 	if (qp->rq_rinl_buf.wqe_cnt) {
@@ -1256,12 +1196,13 @@ static int qp_alloc_wqe(struct ibv_qp_cap *cap, struct hns_roce_qp *qp,
 	}
 
 	if (hns_roce_alloc_buf(&qp->buf, qp->buf_size, HNS_HW_PAGE_SIZE))
-		goto err_alloc;
+		goto err_alloc_recv_rinl_buf;
 
 	return 0;
 
-err_alloc:
+err_alloc_recv_rinl_buf:
 	free_recv_rinl_buf(&qp->rq_rinl_buf);
+err_alloc:
 	if (qp->rq.wrid)
 		free(qp->rq.wrid);
 
@@ -1508,7 +1449,7 @@ static int qp_exec_create_cmd(struct ibv_qp_init_attr_ex *attr,
 
 	ret = ibv_cmd_create_qp_ex2(&ctx->ibv_ctx.context, &qp->verbs_qp, attr,
 				    &cmd_ex.ibv_cmd, sizeof(cmd_ex),
-				    &resp_ex.ibv_resp, sizeof(resp_ex));
+				    &resp_ex.ibv_resp, sizeof(resp_ex), NULL);
 	if (ret) {
 		verbs_err(&ctx->ibv_ctx,
 			  "failed to exec create qp cmd, ret = %d.\n", ret);

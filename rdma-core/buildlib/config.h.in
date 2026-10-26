@@ -46,9 +46,13 @@
 
 #cmakedefine HAVE_FUNC_ATTRIBUTE_IFUNC 1
 
+#cmakedefine HAVE_LS64 1
+
 #cmakedefine HAVE_FUNC_ATTRIBUTE_SYMVER 1
 
 #cmakedefine HAVE_WORKING_IF_H 1
+
+#cmakedefine HAVE_LINUX_DMA_HEAP_H 1
 
 #cmakedefine HAVE_SOCKADDR_ARG_AS_UNION 1
 

@@ -774,7 +774,7 @@ static void print_node(ibnd_node_t *node, void *user_data)
 	int startport = 1;
 	int type = 0;
 	int all_port_sup = 0;
-	ib_portid_t portid = { 0 };
+	ib_portid_t portid = { .pkey_idx = ibd_pkey_idx };
 	__be16 cap_mask = 0;
 	uint32_t cap_mask2 = 0;
 	char *node_name = NULL;
@@ -969,7 +969,7 @@ int main(int argc, char **argv)
 {
 	struct ibnd_config config = { 0 };
 	int resolved = -1;
-	ib_portid_t portid = { 0 };
+	ib_portid_t portid = { .pkey_idx = ibd_pkey_idx };
 	ib_portid_t self_portid = { 0 };
 	int rc = 0;
 	ibnd_fabric_t *fabric = NULL;
@@ -1124,10 +1124,12 @@ int main(int argc, char **argv)
 			ibd_ca, ibd_ca_port);
 	}
 
-	smp_mkey_set(ibmad_port, ibd_mkey);
+	smp_mkey_set(ibmad_ports->smi.port, ibd_mkey);
 
-	if (ibd_timeout)
-		mad_rpc_set_timeout(ibmad_port, ibd_timeout);
+	if (ibd_timeout) {
+		mad_rpc_set_timeout(ibmad_ports->smi.port, ibd_timeout);
+		mad_rpc_set_timeout(ibmad_ports->gsi.port, ibd_timeout);
+	}
 
 	if (port_guid_str) {
 		ibnd_port_t *ndport = ibnd_find_port_guid(fabric, port_guid);
@@ -1141,7 +1143,7 @@ int main(int argc, char **argv)
 
 		uint8_t ni[IB_SMP_DATA_SIZE] = { 0 };
 		if (!smp_query_via(ni, &portid, IB_ATTR_NODE_INFO, 0,
-			   ibd_timeout, ibmad_port)) {
+			   ibd_timeout, ibmad_ports->smi.port)) {
 				fprintf(stderr, "Failed to query local Node Info\n");
 				goto close_port;
 		}

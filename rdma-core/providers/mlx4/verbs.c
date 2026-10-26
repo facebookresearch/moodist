@@ -459,7 +459,7 @@ static int mlx4_cmd_create_cq_ex(struct ibv_context *context,
 	cmd.buf_addr = (uintptr_t) cq->buf.buf;
 	cmd.db_addr  = (uintptr_t) cq->set_ci_db;
 
-	ret = ibv_cmd_create_cq_ex(context, cq_attr,
+	ret = ibv_cmd_create_cq_ex(context, cq_attr, NULL,
 				   &cq->verbs_cq, &cmd.ibv_cmd,
 				   sizeof(cmd),
 				   &resp.ibv_resp,
@@ -804,7 +804,7 @@ static int mlx4_cmd_create_qp_ex_rss(struct ibv_context *context,
 	ret = ibv_cmd_create_qp_ex2(context, &qp->verbs_qp,
 				    attr, &cmd_ex.ibv_cmd,
 				    sizeof(cmd_ex), &resp.ibv_resp,
-				    sizeof(resp));
+				    sizeof(resp), NULL);
 	return ret;
 }
 
@@ -863,7 +863,7 @@ static int mlx4_cmd_create_qp_ex(struct ibv_context *context,
 	ret = ibv_cmd_create_qp_ex2(context, &qp->verbs_qp,
 				    attr, &cmd_ex.ibv_cmd,
 				    sizeof(cmd_ex), &resp.ibv_resp,
-				    sizeof(resp));
+				    sizeof(resp), NULL);
 	return ret;
 }
 

@@ -97,8 +97,13 @@ cdef extern from 'infiniband/mlx5dv.h':
     cdef struct mlx5dv_var:
         uint32_t    page_id
         uint32_t    length
-        long        mmap_off
+        off_t       mmap_off
         uint64_t    comp_mask
+
+    cdef struct mlx5dv_export_sizes:
+        uint32_t var_attrs_size
+        uint32_t devx_umem_attrs_size
+        uint32_t devx_obj_attrs_size
 
     cdef struct mlx5dv_pp:
         uint16_t index
@@ -155,12 +160,17 @@ cdef extern from 'infiniband/mlx5dv.h':
 
     cdef struct mlx5dv_devx_obj
 
+    cdef struct bulk_obj:
+        mlx5dv_devx_obj *obj
+        int             offset
+
     cdef struct mlx5dv_flow_action_attr:
         mlx5dv_flow_action_type type
         v.ibv_qp                *qp
         v.ibv_flow_action       *action
         unsigned int            tag_value
         mlx5dv_devx_obj         *obj
+        bulk_obj                bulk_obj
 
     cdef struct mlx5dv_dr_domain
 
@@ -277,6 +287,13 @@ cdef extern from 'infiniband/mlx5dv.h':
     cdef struct mlx5dv_devx_umem:
         uint32_t umem_id;
 
+    cdef struct mlx5dv_devx_cmd_comp:
+        int fd
+
+    cdef struct mlx5dv_devx_async_cmd_hdr:
+        uint64_t    wr_id
+        uint8_t     *out_data
+
     cdef struct mlx5dv_devx_umem_in:
         void        *addr
         size_t      size
@@ -355,6 +372,13 @@ cdef extern from 'infiniband/mlx5dv.h':
         uint16_t    wqe_counter
         uint8_t     signature
         uint8_t     op_own
+
+    cdef struct mlx5dv_devx_event_channel:
+        int fd
+
+    cdef struct mlx5dv_devx_async_event_hdr:
+        uint64_t cookie
+        uint8_t  *out_data
 
 
     void mlx5dv_set_ctrl_seg(mlx5_wqe_ctrl_seg *seg, uint16_t pi, uint8_t opcode,
@@ -435,6 +459,10 @@ cdef extern from 'infiniband/mlx5dv.h':
     void mlx5dv_wr_raw_wqe(mlx5dv_qp_ex *mqp_ex, const void *wqe)
     mlx5dv_var *mlx5dv_alloc_var(v.ibv_context *context, uint32_t flags)
     void mlx5dv_free_var(mlx5dv_var *dv_var)
+    int mlx5dv_var_export(mlx5dv_var *dv_var, void *data)
+    mlx5dv_var *mlx5dv_var_import(v.ibv_context *context, void *data)
+    void mlx5dv_var_unimport(mlx5dv_var *dv_var)
+    void mlx5dv_get_export_sizes(mlx5dv_export_sizes *sizes)
     mlx5dv_pp *mlx5dv_pp_alloc(v.ibv_context *context, size_t pp_context_sz,
                                const void *pp_context, uint32_t flags)
     void mlx5dv_pp_free(mlx5dv_pp *pp)
@@ -481,6 +509,9 @@ cdef extern from 'infiniband/mlx5dv.h':
                                                                  void *data,
                                                                  unsigned char reformat_type,
                                                                  unsigned char ft_type)
+    v.ibv_flow_action *mlx5dv_create_flow_action_modify_header(v.ibv_context *ctx,
+                                                               size_t actions_sz, void *actions,
+                                                               unsigned char ft_type)
     v.ibv_mr *mlx5dv_reg_dmabuf_mr(v.ibv_pd *pd, uint64_t offset, size_t length, uint64_t iova,
                                    int fd, int access, int mlx5_access)
     int mlx5dv_get_data_direct_sysfs_path(v.ibv_context *context, char *buf, size_t buf_len)
@@ -546,6 +577,7 @@ cdef extern from 'infiniband/mlx5dv.h':
     # DevX APIs
     mlx5dv_devx_uar *mlx5dv_devx_alloc_uar(v.ibv_context *context, uint32_t flags)
     void mlx5dv_devx_free_uar(mlx5dv_devx_uar *devx_uar)
+    int mlx5dv_devx_uar_export_dmabuf_fd(mlx5dv_devx_uar *devx_uar)
     int mlx5dv_devx_general_cmd(v.ibv_context *context, const void *in_,
                                 size_t inlen, void *out, size_t outlen)
     mlx5dv_devx_umem *mlx5dv_devx_umem_reg(v.ibv_context *ctx, void *addr,
@@ -553,20 +585,43 @@ cdef extern from 'infiniband/mlx5dv.h':
     mlx5dv_devx_umem *mlx5dv_devx_umem_reg_ex(v.ibv_context *ctx,
                                               mlx5dv_devx_umem_in *umem_in)
     int mlx5dv_devx_umem_dereg(mlx5dv_devx_umem *umem)
+    int mlx5dv_devx_umem_export(mlx5dv_devx_umem *umem, void *data)
+    mlx5dv_devx_umem *mlx5dv_devx_umem_import(v.ibv_context *context, void *data)
+    void mlx5dv_devx_umem_unimport(mlx5dv_devx_umem *umem)
     int mlx5dv_devx_query_eqn(v.ibv_context *context, uint32_t vector, uint32_t *eqn)
     mlx5dv_devx_obj *mlx5dv_devx_obj_create(v.ibv_context *context, const void *_in,
                                             size_t inlen, void *out, size_t outlen)
     int mlx5dv_devx_obj_query(mlx5dv_devx_obj *obj, const void *in_,
                               size_t inlen, void *out, size_t outlen)
+    int mlx5dv_devx_obj_query_async(mlx5dv_devx_obj *obj, const void *in_,
+                                    size_t inlen, size_t outlen, uint64_t wr_id,
+                                    mlx5dv_devx_cmd_comp *cmd_comp)
+    mlx5dv_devx_cmd_comp *mlx5dv_devx_create_cmd_comp(v.ibv_context *context)
+    void mlx5dv_devx_destroy_cmd_comp(mlx5dv_devx_cmd_comp *cmd_comp)
+    int mlx5dv_devx_get_async_cmd_comp(mlx5dv_devx_cmd_comp *cmd_comp,
+                                       mlx5dv_devx_async_cmd_hdr *cmd_resp, size_t cmd_resp_len)
     int mlx5dv_devx_obj_modify(mlx5dv_devx_obj *obj, const void *in_,
                                size_t inlen, void *out, size_t outlen)
     int mlx5dv_devx_obj_destroy(mlx5dv_devx_obj *obj)
+    int mlx5dv_devx_obj_export(mlx5dv_devx_obj *obj, void *data)
+    mlx5dv_devx_obj *mlx5dv_devx_obj_import(v.ibv_context *context, void *data)
+    void mlx5dv_devx_obj_unimport(mlx5dv_devx_obj *obj)
     int mlx5dv_init_obj(mlx5dv_obj *obj, uint64_t obj_type)
     mlx5dv_devx_msi_vector *mlx5dv_devx_alloc_msi_vector(v.ibv_context *ibctx)
     int mlx5dv_devx_free_msi_vector(mlx5dv_devx_msi_vector *msi)
     mlx5dv_devx_eq *mlx5dv_devx_create_eq(v.ibv_context *context, const void *_in,
                                           size_t inlen, void *out, size_t outlen)
     int mlx5dv_devx_destroy_eq(mlx5dv_devx_eq *eq)
+    mlx5dv_devx_event_channel *mlx5dv_devx_create_event_channel(v.ibv_context *context,
+                                                    mlx5dv_devx_create_event_channel_flags flags)
+    void mlx5dv_devx_destroy_event_channel(mlx5dv_devx_event_channel *dv_event_channel)
+    int mlx5dv_devx_subscribe_devx_event(mlx5dv_devx_event_channel *event_channel,
+                                         mlx5dv_devx_obj *obj, uint16_t events_sz,
+                                         uint16_t events_num[], uint64_t cookie)
+    int mlx5dv_devx_subscribe_devx_event_fd(mlx5dv_devx_event_channel *event_channel, int fd,
+                                            mlx5dv_devx_obj *obj, uint16_t event_num)
+    ssize_t mlx5dv_devx_get_event(mlx5dv_devx_event_channel *event_channel,
+                                  mlx5dv_devx_async_event_hdr *event_data, size_t event_resp_len)
 
     # Mkey setters
     void mlx5dv_wr_mkey_configure(mlx5dv_qp_ex *mqp, mlx5dv_mkey *mkey,

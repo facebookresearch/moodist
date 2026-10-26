@@ -36,7 +36,7 @@ struct efadv_device_attr {
 	uint16_t max_sq_sge;
 	uint16_t max_rq_sge;
 	uint16_t inline_buf_size;
-	uint8_t reserved[2];
+	uint16_t inline_buf_size_ex;
 	uint32_t device_caps;
 	uint32_t max_rdma_size;
 };
@@ -61,6 +61,9 @@ struct efadv_device_attr {
 :	Maximum Receive Queue (RQ) Scatter Gather Elements (SGEs).
 
 *inline_buf_size*
+:	Maximum inline buffer size (deprecated by inline_buf_size_ex).
+
+*inline_buf_size_ex*
 :	Maximum inline buffer size.
 
 *device_caps*
@@ -84,6 +87,13 @@ struct efadv_device_attr {
 		RDMA write with immediate. RQ with this feature enabled will not consume any work
 		requests in order to receive RDMA write with immediate and a WC generated for such
 		receive will be marked as unsolicited.
+
+	EFADV_DEVICE_ATTR_CAPS_CQ_WITH_EXT_MEM_DMABUF:
+		Indicates that creating CQs with external memory buffers by passing dmabuf is
+		supported.
+
+	EFADV_DEVICE_ATTR_CAPS_COMP_CNTR:
+		Completion counters are supported.
 
 *max_rdma_size*
 :	Maximum RDMA transfer size in bytes.

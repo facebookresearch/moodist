@@ -1,6 +1,8 @@
 rdma_man_pages(
   ibv_advise_mr.3.md
+  ibv_alloc_buf.3.md
   ibv_alloc_dm.3
+  ibv_alloc_dmah.3.md
   ibv_alloc_mw.3
   ibv_alloc_null_mr.3.md
   ibv_alloc_parent_domain.3
@@ -13,6 +15,7 @@ rdma_man_pages(
   ibv_create_ah.3
   ibv_create_ah_from_wc.3
   ibv_create_comp_channel.3
+  ibv_create_comp_cntr.3.md
   ibv_create_counters.3.md
   ibv_create_cq.3
   ibv_create_cq_ex.3
@@ -27,6 +30,7 @@ rdma_man_pages(
   ibv_create_wq.3
   ibv_devices.1
   ibv_devinfo.1
+  ibv_dm_export_dmabuf_fd.3.md
   ibv_event_type_str.3.md
   ibv_fork_init.3.md
   ibv_get_async_event.3
@@ -55,6 +59,8 @@ rdma_man_pages(
   ibv_post_send.3
   ibv_post_srq_ops.3
   ibv_post_srq_recv.3
+  ibv_qp_attach_comp_cntr.3.md
+  ibv_query_comp_cntr_caps.3.md
   ibv_query_device.3
   ibv_query_device_ex.3
   ibv_query_ece.3.md
@@ -63,6 +69,7 @@ rdma_man_pages(
   ibv_query_gid_table.3.md
   ibv_query_pkey.3.md
   ibv_query_port.3
+  ibv_query_port_speed.3.md
   ibv_query_qp.3
   ibv_query_qp_data_in_order.3.md
   ibv_query_rt_values_ex.3
@@ -83,10 +90,14 @@ rdma_man_pages(
   ibv_xsrq_pingpong.1
   )
 rdma_alias_man_pages(
+  ibv_alloc_buf.3 ibv_free_buf.3
+  ibv_alloc_buf.3 ibv_reg_buf_mr.3
+  ibv_alloc_buf.3 ibv_export_buf_dmabuf_fd.3
   ibv_alloc_dm.3 ibv_free_dm.3
   ibv_alloc_dm.3 ibv_reg_dm_mr.3
   ibv_alloc_dm.3 ibv_memcpy_to_dm.3
   ibv_alloc_dm.3 ibv_memcpy_from_dm.3
+  ibv_alloc_dmah.3 ibv_dealloc_dmah.3
   ibv_alloc_mw.3 ibv_dealloc_mw.3
   ibv_alloc_pd.3 ibv_dealloc_pd.3
   ibv_alloc_td.3 ibv_dealloc_td.3
@@ -94,6 +105,13 @@ rdma_alias_man_pages(
   ibv_create_ah.3 ibv_destroy_ah.3
   ibv_create_ah_from_wc.3 ibv_init_ah_from_wc.3
   ibv_create_comp_channel.3 ibv_destroy_comp_channel.3
+  ibv_create_comp_cntr.3 ibv_destroy_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_set_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_set_err_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_inc_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_inc_err_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_read_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_read_err_comp_cntr.3
   ibv_create_counters.3 ibv_destroy_counters.3
   ibv_create_cq.3 ibv_destroy_cq.3
   ibv_create_flow.3 ibv_destroy_flow.3
@@ -116,6 +134,7 @@ rdma_alias_man_pages(
   ibv_rate_to_mbps.3 mbps_to_ibv_rate.3
   ibv_rate_to_mult.3 mult_to_ibv_rate.3
   ibv_reg_mr.3 ibv_dereg_mr.3
+  ibv_reg_mr.3 ibv_reg_mr_ex.3
   ibv_wr_post.3 ibv_wr_abort.3
   ibv_wr_post.3 ibv_wr_complete.3
   ibv_wr_post.3 ibv_wr_start.3

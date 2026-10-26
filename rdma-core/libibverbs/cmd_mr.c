@@ -156,3 +156,120 @@ int ibv_cmd_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
 	vmr->mr_type = IBV_MR_TYPE_DMABUF_MR;
 	return 0;
 }
+
+int ibv_cmd_reg_mr_ex(struct ibv_pd *pd, struct verbs_mr *vmr,
+		      struct ibv_mr_init_attr *mr_init_attr)
+{
+	DECLARE_FBCMD_BUFFER(cmdb, UVERBS_OBJECT_MR,
+			     UVERBS_METHOD_REG_MR, 11, NULL);
+	bool fd_based = (mr_init_attr->comp_mask & IBV_REG_MR_MASK_FD);
+	struct ib_uverbs_attr *handle;
+	uint64_t length = mr_init_attr->length;
+	uint32_t lkey, rkey;
+	int ret;
+
+	if (fd_based) {
+		if (!(mr_init_attr->comp_mask & IBV_REG_MR_MASK_FD_OFFSET) ||
+		    (mr_init_attr->comp_mask & IBV_REG_MR_MASK_ADDR)) {
+			errno = EINVAL;
+			return EINVAL;
+		}
+		fill_attr_in_uint64(cmdb, UVERBS_ATTR_REG_MR_FD_OFFSET,
+				    mr_init_attr->fd_offset);
+		fill_attr_in_fd(cmdb, UVERBS_ATTR_REG_MR_FD,
+				mr_init_attr->fd);
+	} else {
+		if ((mr_init_attr->comp_mask & IBV_REG_MR_MASK_FD_OFFSET) ||
+		    !(mr_init_attr->comp_mask & IBV_REG_MR_MASK_ADDR)) {
+			errno = EINVAL;
+			return EINVAL;
+		}
+
+		fill_attr_in_uint64(cmdb, UVERBS_ATTR_REG_MR_ADDR,
+				    (uintptr_t) mr_init_attr->addr);
+		if (mr_init_attr->access & IBV_ACCESS_ON_DEMAND) {
+			if (mr_init_attr->length == SIZE_MAX && mr_init_attr->addr) {
+				errno = EINVAL;
+				return EINVAL;
+			}
+			if (mr_init_attr->length == SIZE_MAX)
+				length = UINT64_MAX;
+		}
+	}
+
+	if (mr_init_attr->comp_mask & IBV_REG_MR_MASK_IOVA) {
+		fill_attr_in_uint64(cmdb, UVERBS_ATTR_REG_MR_IOVA, mr_init_attr->iova);
+	} else {
+		if (!fd_based) {
+			fill_attr_in_uint64(cmdb, UVERBS_ATTR_REG_MR_IOVA,
+					    (uintptr_t) mr_init_attr->addr);
+		} else {
+			/* iova is a must from kernel point of view */
+			errno = EINVAL;
+			return EINVAL;
+		}
+	}
+
+	handle = fill_attr_out_obj(cmdb, UVERBS_ATTR_REG_MR_HANDLE);
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_REG_MR_RESP_LKEY, &lkey);
+	fill_attr_out_ptr(cmdb, UVERBS_ATTR_REG_MR_RESP_RKEY, &rkey);
+	fill_attr_in_obj(cmdb, UVERBS_ATTR_REG_MR_PD_HANDLE, pd->handle);
+	fill_attr_in_uint64(cmdb, UVERBS_ATTR_REG_MR_LENGTH, length);
+	fill_attr_in_uint32(cmdb, UVERBS_ATTR_REG_MR_ACCESS_FLAGS,
+			    mr_init_attr->access);
+
+	if (mr_init_attr->comp_mask & IBV_REG_MR_MASK_DMAH)
+		fill_attr_in_obj(cmdb, UVERBS_ATTR_REG_MR_DMA_HANDLE,
+				 verbs_get_dmah(mr_init_attr->dmah)->handle);
+
+	switch (execute_ioctl_fallback(pd->context, reg_mr_ex, cmdb, &ret)) {
+	case SUCCESS:
+		break;
+
+	case TRY_WRITE:
+	case TRY_WRITE_EX: {
+		/*
+		 * The kernel has no REG_MR ioctl method.  Only an address-based
+		 * request maps to the legacy write-ABI REG_MR command; a
+		 * dma-buf (fd) or DMA-handle request has no write-ABI
+		 * equivalent (and such a kernel could not service it anyway).
+		 * This mirrors ibv_cmd_reg_mr()'s write path so an ordinary
+		 * buffer registered via ibv_reg_mr_ex() -- e.g. through
+		 * ibv_reg_buf_mr() -- keeps working on a write-ABI-only kernel.
+		 */
+		struct ib_uverbs_reg_mr_resp wresp;
+		struct ibv_reg_mr req;
+		uint64_t hca_va;
+
+		if (fd_based ||
+		    (mr_init_attr->comp_mask & IBV_REG_MR_MASK_DMAH)) {
+			errno = EOPNOTSUPP;
+			return EOPNOTSUPP;
+		}
+
+		hca_va = (mr_init_attr->comp_mask & IBV_REG_MR_MASK_IOVA) ?
+				 mr_init_attr->iova :
+				 (uintptr_t)mr_init_attr->addr;
+
+		return ibv_cmd_reg_mr(pd, mr_init_attr->addr, length, hca_va,
+				      mr_init_attr->access, vmr, &req,
+				      sizeof(req), &wresp, sizeof(wresp));
+	}
+
+	default:
+		return ret;
+	}
+
+	vmr->ibv_mr.handle = read_attr_obj(UVERBS_ATTR_REG_MR_HANDLE,
+					   handle);
+	vmr->ibv_mr.context = pd->context;
+	vmr->ibv_mr.lkey = lkey;
+	vmr->ibv_mr.rkey = rkey;
+	if (fd_based)
+		vmr->mr_type = IBV_MR_TYPE_DMABUF_MR;
+	else
+		vmr->mr_type = IBV_MR_TYPE_MR;
+	vmr->access = mr_init_attr->access;
+
+	return 0;
+}

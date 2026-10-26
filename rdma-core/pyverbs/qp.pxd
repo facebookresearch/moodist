@@ -27,6 +27,12 @@ cdef class QPInitAttrEx(PyverbsObject):
 cdef class QPAttr(PyverbsObject):
     cdef v.ibv_qp_attr attr
 
+cdef class QPRateLimitAttr(PyverbsObject):
+    cdef v.ibv_qp_rate_limit_attr attr
+
+cdef class QPAttachCompCntrAttr(PyverbsObject):
+    cdef v.ibv_qp_attach_comp_cntr_attr attr
+
 cdef class QP(PyverbsCM):
     cdef v.ibv_qp *qp
     cdef int type

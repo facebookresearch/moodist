@@ -121,6 +121,9 @@ static const struct verbs_context_ops bnxt_re_cntx_ops = {
 	.free_context  = bnxt_re_free_context,
 
 	.create_qp_ex  = bnxt_re_create_qp_ex,
+	.create_flow   = bnxt_re_create_flow,
+	.destroy_flow  = bnxt_re_destroy_flow,
+	.modify_qp_rate_limit = bnxt_re_modify_qp_rate_limit,
 };
 
 static inline bool bnxt_re_is_chip_gen_p7(struct bnxt_re_chip_ctx *cctx)
@@ -226,6 +229,8 @@ static struct verbs_context *bnxt_re_alloc_context(struct ibv_device *vdev,
 		cntx->comp_mask |= BNXT_RE_COMP_MASK_UCNTX_POW2_DISABLED;
 	if (resp.comp_mask & BNXT_RE_UCNTX_CMASK_MSN_TABLE_ENABLED)
 		cntx->comp_mask |= BNXT_RE_COMP_MASK_UCNTX_MSN_TABLE_ENABLED;
+	if (resp.comp_mask & BNXT_RE_UCNTX_CMASK_QP_RATE_LIMIT_ENABLED)
+		cntx->comp_mask |= BNXT_RE_COMP_MASK_UCNTX_RATE_LIMIT_ENABLED;
 
 	/* mmap shared page. */
 	cntx->shpg = mmap(NULL, rdev->pg_size, PROT_READ | PROT_WRITE,

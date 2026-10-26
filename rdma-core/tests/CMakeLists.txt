@@ -14,11 +14,13 @@ rdma_python_test(tests
   rdmacm_utils.py
   test_addr.py
   test_atomic.py
+  test_buf.py
   test_cq.py
   test_cq_events.py
   test_cqex.py
   test_cuda_dmabuf.py
   test_device.py
+  test_dmah.py
   test_efa_srd.py
   test_efadv.py
   test_flow.py
@@ -28,6 +30,7 @@ rdma_python_test(tests
   test_mlx5_cuda_umem.py
   test_mlx5_dc.py
   test_mlx5_devx.py
+  test_mlx5_devx_async_events.py
   test_mlx5_dm_ops.py
   test_mlx5_dma_memcpy.py
   test_mlx5_dmabuf.py
@@ -52,6 +55,7 @@ rdma_python_test(tests
   test_odp.py
   test_pd.py
   test_parent_domain.py
+  test_phc_timestamp.py
   test_qp.py
   test_qpex.py
   test_rdmacm.py

@@ -220,10 +220,10 @@ class centos9(Environment):
                          (" ".join(sorted(self.pkgs))))
         return res
 
-class fc41(Environment):
-    docker_parent = "fedora:41";
+class fc44(Environment):
+    docker_parent = "fedora:44";
     pkgs = centos8.pkgs | {"util-linux"}
-    name = "fc41";
+    name = "fc44";
     specfile = "redhat/rdma-core.spec";
     ninja_cmd = "ninja-build";
     is_rpm = True;
@@ -404,7 +404,7 @@ class ZypperEnvironment(Environment):
         return res;
 
 class leap(ZypperEnvironment):
-    docker_parent = "opensuse/leap:15.0";
+    docker_parent = "opensuse/leap:16.0";
     specfile = "suse/rdma-core.spec";
     pkgs = {
         'cmake',
@@ -426,7 +426,7 @@ class leap(ZypperEnvironment):
     };
     rpmbuild_options = [ "--without=curlmini" ];
     to_azp = True;
-    name = "opensuse-15.0";
+    name = "opensuse-16.0";
     aliases = {"leap"};
 
 class tumbleweed(ZypperEnvironment):
@@ -626,7 +626,7 @@ environments = [centos7(),
                 jammy(),
                 jessie(),
                 stretch(),
-                fc41(),
+                fc44(),
                 leap(),
                 tumbleweed(),
                 debian_experimental(),

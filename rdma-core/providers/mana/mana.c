@@ -21,9 +21,10 @@
 #include "mana.h"
 
 DECLARE_DRV_CMD(mana_alloc_ucontext, IB_USER_VERBS_CMD_GET_CONTEXT, empty,
-		empty);
+		mana_ib_alloc_ucontext_resp);
 
-DECLARE_DRV_CMD(mana_alloc_pd, IB_USER_VERBS_CMD_ALLOC_PD, empty, empty);
+DECLARE_DRV_CMD(mana_alloc_pd, IB_USER_VERBS_CMD_ALLOC_PD, mana_ib_alloc_pd,
+		mana_ib_alloc_pd_resp);
 
 static const struct verbs_match_ent hca_table[] = {
 	VERBS_DRIVER_ID(RDMA_DRIVER_MANA),
@@ -35,16 +36,56 @@ struct mana_context *to_mctx(struct ibv_context *ibctx)
 	return container_of(ibctx, struct mana_context, ibv_ctx.context);
 }
 
-void *mana_alloc_mem(uint32_t size)
+void *mana_alloc_mem(size_t size)
 {
 	void *buf;
+
+	if (size == 0)
+		return NULL;
 
 	buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
 	if (buf == MAP_FAILED)
 		return NULL;
+
+	if (ibv_dontfork_range(buf, size))
+		goto unmap;
+
 	return buf;
+
+unmap:
+	munmap(buf, size);
+	return NULL;
+}
+
+void mana_dealloc_mem(void *buf, size_t size)
+{
+	if (buf) {
+		ibv_dofork_range(buf, size);
+		munmap(buf, size);
+	}
+}
+
+int create_shadow_queue(struct shadow_queue *queue, uint32_t length, uint32_t stride)
+{
+	length = roundup_pow_of_two(length);
+	stride = align(stride, 8);
+
+	queue->buffer = mana_alloc_mem(stride * length);
+	if (!queue->buffer)
+		return -1;
+
+	queue->length = length;
+	queue->stride = stride;
+	reset_shadow_queue(queue);
+	return 0;
+}
+
+void destroy_shadow_queue(struct shadow_queue *queue)
+{
+	mana_dealloc_mem(queue->buffer, queue->stride * queue->length);
+	queue->buffer = NULL;
 }
 
 int mana_query_device_ex(struct ibv_context *context,
@@ -74,19 +115,34 @@ int mana_query_port(struct ibv_context *context, uint8_t port,
 	return ibv_cmd_query_port(context, port, attr, &cmd, sizeof(cmd));
 }
 
-struct ibv_pd *mana_alloc_pd(struct ibv_context *context)
+struct ibv_pd *mana_alloc_pd_ex(struct ibv_context *context, uint32_t flags)
 {
-	struct ibv_alloc_pd cmd;
-	struct mana_alloc_pd_resp resp;
+	struct mana_context *mctx = to_mctx(context);
+	struct mana_alloc_pd cmd = {};
+	struct mana_ib_alloc_pd *cmd_drv = &cmd.drv_payload;
+	struct mana_alloc_pd_resp resp = {};
+	size_t cmd_size = sizeof(cmd.ibv_cmd); /* v0 size */
 	struct mana_pd *pd;
 	int ret;
+
+	if ((flags & MANADV_PD_FLAGS_SHORT_PDN) &&
+	    !(mctx->comp_mask & MANA_IB_UCNTX_ALLOC_PDN_SUPPORT)) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
 
 	pd = calloc(1, sizeof(*pd));
 	if (!pd)
 		return NULL;
 
-	ret = ibv_cmd_alloc_pd(context, &pd->ibv_pd, &cmd, sizeof(cmd),
-			       &resp.ibv_resp, sizeof(resp));
+	if (mctx->comp_mask & MANA_IB_UCNTX_ALLOC_PDN_SUPPORT)
+		cmd_size = sizeof(cmd); /* v1 size */
+
+	if (flags & MANADV_PD_FLAGS_SHORT_PDN)
+		cmd_drv->comp_mask |= MANA_IB_PD_SHORT_PDN;
+
+	ret = ibv_cmd_alloc_pd(context, &pd->ibv_pd, &cmd.ibv_cmd, cmd_size,
+			      &resp.ibv_resp, sizeof(resp));
 	if (ret) {
 		verbs_err(verbs_get_ctx(context), "Failed to allocate PD\n");
 		errno = ret;
@@ -94,7 +150,14 @@ struct ibv_pd *mana_alloc_pd(struct ibv_context *context)
 		return NULL;
 	}
 
+	pd->pdn = resp.pdn;
+
 	return &pd->ibv_pd;
+}
+
+static struct ibv_pd *mana_alloc_pd(struct ibv_context *context)
+{
+	return mana_alloc_pd_ex(context, 0);
 }
 
 struct ibv_pd *
@@ -155,6 +218,40 @@ int mana_dealloc_pd(struct ibv_pd *ibpd)
 
 	free(pd);
 
+	return 0;
+}
+
+static struct ibv_mw *
+mana_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type)
+{
+	struct ib_uverbs_alloc_mw_resp resp;
+	struct ibv_alloc_mw cmd;
+	struct ibv_mw *mw;
+	int ret;
+
+	mw = calloc(1, sizeof(*mw));
+	if (!mw)
+		return NULL;
+
+	ret = ibv_cmd_alloc_mw(pd, type, mw, &cmd, sizeof(cmd), &resp,
+			       sizeof(resp));
+	if (ret) {
+		free(mw);
+		return NULL;
+	}
+
+	return mw;
+}
+
+static int mana_dealloc_mw(struct ibv_mw *mw)
+{
+	int ret;
+
+	ret = ibv_cmd_dealloc_mw(mw);
+	if (ret)
+		return ret;
+
+	free(mw);
 	return 0;
 }
 
@@ -221,6 +318,70 @@ int mana_dereg_mr(struct verbs_mr *vmr)
 	return 0;
 }
 
+struct ibv_dm *mana_alloc_dm(struct ibv_context *context,
+			     struct ibv_alloc_dm_attr *dm_attr)
+{
+	struct verbs_dm *dm;
+	int ret;
+
+	dm = malloc(sizeof(*dm));
+	if (!dm)
+		return NULL;
+
+	ret = ibv_cmd_alloc_dm(context, dm_attr, dm, NULL);
+	if (ret) {
+		verbs_err(verbs_get_ctx(context),
+			  "Failed to alloc DM\n");
+		errno = ret;
+		free(dm);
+		return NULL;
+	}
+
+	return &dm->dm;
+}
+
+int mana_free_dm(struct ibv_dm *ibdm)
+{
+	struct verbs_dm *dm = container_of(ibdm, struct verbs_dm, dm);
+	int ret;
+
+	ret = ibv_cmd_free_dm(dm);
+	if (ret) {
+		verbs_err(verbs_get_ctx(ibdm->context), "Failed to free DM\n");
+		return ret;
+	}
+
+	free(dm);
+	return 0;
+}
+
+struct ibv_mr *mana_reg_dm_mr(struct ibv_pd *pd, struct ibv_dm *ibdm,
+			      uint64_t dm_offset, size_t length,
+			      unsigned int acc)
+{
+	struct verbs_dm *dm = container_of(ibdm, struct verbs_dm, dm);
+	struct verbs_mr *vmr;
+	int ret;
+
+	vmr = calloc(1, sizeof(*vmr));
+	if (!vmr) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	ret = ibv_cmd_reg_dm_mr(pd, dm, dm_offset, length, acc,
+				vmr, NULL);
+	if (ret) {
+		verbs_err(verbs_get_ctx(pd->context),
+			  "Failed to register DM MR\n");
+		errno = ret;
+		free(vmr);
+		return NULL;
+	}
+
+	return &vmr->ibv_mr;
+}
+
 static void mana_free_context(struct ibv_context *ibctx)
 {
 	struct mana_context *context = to_mctx(ibctx);
@@ -258,7 +419,9 @@ static void mana_async_event(struct ibv_context *context,
 }
 
 static const struct verbs_context_ops mana_ctx_ops = {
+	.alloc_mw = mana_alloc_mw,
 	.alloc_pd = mana_alloc_pd,
+	.alloc_dm = mana_alloc_dm,
 	.async_event = mana_async_event,
 	.alloc_parent_domain = mana_alloc_parent_domain,
 	.create_cq = mana_create_cq,
@@ -266,6 +429,7 @@ static const struct verbs_context_ops mana_ctx_ops = {
 	.create_qp_ex = mana_create_qp_ex,
 	.create_rwq_ind_table = mana_create_rwq_ind_table,
 	.create_wq = mana_create_wq,
+	.dealloc_mw = mana_dealloc_mw,
 	.dealloc_pd = mana_dealloc_pd,
 	.dereg_mr = mana_dereg_mr,
 	.destroy_cq = mana_destroy_cq,
@@ -273,6 +437,7 @@ static const struct verbs_context_ops mana_ctx_ops = {
 	.destroy_rwq_ind_table = mana_destroy_rwq_ind_table,
 	.destroy_wq = mana_destroy_wq,
 	.free_context = mana_free_context,
+	.free_dm = mana_free_dm,
 	.modify_wq = mana_modify_wq,
 	.modify_qp = mana_modify_qp,
 	.poll_cq = mana_poll_cq,
@@ -281,6 +446,7 @@ static const struct verbs_context_ops mana_ctx_ops = {
 	.query_device_ex = mana_query_device_ex,
 	.query_port = mana_query_port,
 	.reg_dmabuf_mr = mana_reg_dmabuf_mr,
+	.reg_dm_mr = mana_reg_dm_mr,
 	.reg_mr = mana_reg_mr,
 	.req_notify_cq = mana_arm_cq,
 };
@@ -309,7 +475,7 @@ static struct verbs_context *mana_alloc_context(struct ibv_device *ibdev,
 {
 	int ret, i;
 	struct mana_context *context;
-	struct mana_alloc_ucontext_resp resp;
+	struct mana_alloc_ucontext_resp resp = {};
 	struct ibv_get_context cmd;
 
 	context = verbs_init_and_alloc_context(ibdev, cmd_fd, context, ibv_ctx,
@@ -324,6 +490,8 @@ static struct verbs_context *mana_alloc_context(struct ibv_device *ibdev,
 		errno = ret;
 		goto free_ctx;
 	}
+
+	context->comp_mask = resp.drv_payload.comp_mask;
 
 	verbs_set_ops(&context->ibv_ctx, &mana_ctx_ops);
 

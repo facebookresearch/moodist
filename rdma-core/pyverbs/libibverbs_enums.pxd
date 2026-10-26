@@ -104,6 +104,7 @@ cdef extern from '<infiniband/verbs.h>':
         IBV_EVENT_CLIENT_REREGISTER
         IBV_EVENT_GID_CHANGE
         IBV_EVENT_WQ_FATAL
+        IBV_EVENT_DEVICE_SPEED_CHANGE
 
     cpdef enum ibv_access_flags:
         IBV_ACCESS_LOCAL_WRITE
@@ -480,10 +481,12 @@ cdef extern from '<infiniband/verbs.h>':
 
     cdef unsigned long long IBV_DEVICE_RAW_SCATTER_FCS
     cdef unsigned long long IBV_DEVICE_PCI_WRITE_END_PADDING
+    cdef unsigned long long IBV_DEVICE_CC_DMA_BOUNCE
 
     cpdef enum ibv_parent_domain_init_attr_mask:
         IBV_PARENT_DOMAIN_INIT_ATTR_ALLOCATORS
         IBV_PARENT_DOMAIN_INIT_ATTR_PD_CONTEXT
+        IBV_PARENT_DOMAIN_INIT_ATTR_ALLOW_CC_UNPROTECTED_ALLOC
 
     cdef void *IBV_ALLOCATOR_USE_DEFAULT
 
@@ -504,21 +507,37 @@ cdef extern from '<infiniband/verbs.h>':
         IBV_FLUSH_MR
         IBV_FLUSH_RANGE
 
+    cpdef enum ibv_tph_mem_type:
+        IBV_TPH_MEM_TYPE_VM
+        IBV_TPH_MEM_TYPE_PM
+
+    cpdef enum ibv_dmah_init_attr_mask:
+        IBV_DMAH_INIT_ATTR_MASK_CPU_ID
+        IBV_DMAH_INIT_ATTR_MASK_PH
+        IBV_DMAH_INIT_ATTR_MASK_TPH_MEM_TYPE
+
+    cpdef enum ibv_mr_init_attr_mask:
+        IBV_REG_MR_MASK_IOVA
+        IBV_REG_MR_MASK_ADDR
+        IBV_REG_MR_MASK_FD
+        IBV_REG_MR_MASK_FD_OFFSET
+        IBV_REG_MR_MASK_DMAH
+        IBV_REG_MR_MASK_BUF
+
+    cpdef enum ibv_qp_attach_comp_cntr_op:
+        IBV_QP_ATTACH_COMP_CNTR_OP_SEND
+        IBV_QP_ATTACH_COMP_CNTR_OP_RECV
+        IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_READ
+        IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_READ
+        IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_WRITE
+        IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_WRITE
+
+
 cdef extern from "<infiniband/verbs_api.h>":
     cdef unsigned long long IBV_ADVISE_MR_ADVICE_PREFETCH
     cdef unsigned long long IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE
     cdef unsigned long long IBV_ADVISE_MR_FLAG_FLUSH
     cdef unsigned long long IBV_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT
-
-
-_IBV_DEVICE_RAW_SCATTER_FCS = IBV_DEVICE_RAW_SCATTER_FCS
-_IBV_DEVICE_PCI_WRITE_END_PADDING = IBV_DEVICE_PCI_WRITE_END_PADDING
-_IBV_ALLOCATOR_USE_DEFAULT = <size_t>IBV_ALLOCATOR_USE_DEFAULT
-_IBV_ADVISE_MR_ADVICE_PREFETCH = IBV_ADVISE_MR_ADVICE_PREFETCH
-_IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE = IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE
-_IBV_ADVISE_MR_FLAG_FLUSH = IBV_ADVISE_MR_FLAG_FLUSH
-_IBV_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT = IBV_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT
-
 
 cdef extern from '<infiniband/driver.h>':
     cpdef enum ibv_gid_type_sysfs:

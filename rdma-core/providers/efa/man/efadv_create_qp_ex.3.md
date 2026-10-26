@@ -46,7 +46,8 @@ struct efadv_qp_init_attr {
 	uint32_t driver_qp_type;
 	uint16_t flags;
 	uint8_t sl;
-	uint8_t reserved[1];
+	uint8_t reserved;
+	uint64_t wr_flags;
 };
 ```
 
@@ -68,8 +69,20 @@ struct efadv_qp_init_attr {
 	EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV:
 		Receive WRs will not be consumed for RDMA write with imm.
 
+	EFADV_QP_FLAGS_INLINE_WRITE:
+		QP supports RDMA write with inline operations.
+
 *sl*
 :	Service Level - 0 value implies default level.
+
+*wr_flags*
+:	A bitwise OR of the values described below. Controls which
+	EFA-specific work request setter functions are available on
+	the QP. Use **efadv_qp_from_ibv_qp_ex()** to get the
+	efadv_qp for accessing the work request setter interface.
+
+	EFADV_WR_EX_WITH_PROCESSING_HINTS:
+		Enable **efadv_wr_set_processing_hints()** on this QP.
 
 # RETURN VALUE
 

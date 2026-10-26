@@ -180,7 +180,7 @@ union mana_rdma_cqe {
 		uint32_t reserved2	: 8;
 		uint32_t imm_data;
 		uint32_t rx_wqe_offset;
-	} rc_recv;
+	} rnic_recv;
 	struct {
 		uint32_t cqe_type	: 8;
 		uint32_t vendor_error	: 9;
@@ -249,10 +249,12 @@ enum mana_error_code {
 	VENDOR_ERR_RX_INVALID_REQ_NAK			= 0x161,
 	VENDOR_ERR_RX_REMOTE_ACCESS_NAK			= 0x162,
 	VENDOR_ERR_RX_REMOTE_OP_ERR_NAK			= 0x163,
+	VENDOR_ERR_RX_RNR_NAK                           = 0x164,
 	VENDOR_ERR_RX_ATB_SGE_ADDR_RIGHT                = 0x183,
 	VENDOR_ERR_RX_ATB_WQE_ADDR_RIGHT                = 0x185,
 	VENDOR_ERR_RX_ATB_SGE_ADDR_RANGE                = 0x1c3,
 	VENDOR_ERR_RX_ATB_WQE_ADDR_RANGE                = 0x1c5,
+	VENDOR_ERR_TX_RETRY_LIMIT_EXCEEDED              = 0x1c6,
 	VENDOR_ERR_RX_NOT_EMPTY_ON_DISABLE              = 0x1c7,
 	VENDOR_ERR_TX_GDMA_CORRUPTED_WQE                = 0x201,
 	VENDOR_ERR_TX_ATB_WQE_ACCESS_VIOLATION          = 0x202,

@@ -9,6 +9,7 @@
 #include "manadv.h"
 #include <ccan/minmax.h>
 #include "shadow_queue.h"
+#include "gdma.h"
 
 #define COMP_ENTRY_SIZE 64
 #define MANA_IB_TOEPLITZ_HASH_KEY_SIZE_IN_BYTES 40
@@ -44,12 +45,20 @@
 #define PSN_ADD(PSN, DELTA) (((PSN) + (DELTA)) & PSN_MASK)
 
 enum user_queue_types {
-	USER_RC_SEND_QUEUE_REQUESTER = 0,
-	USER_RC_SEND_QUEUE_RESPONDER = 1,
-	USER_RC_RECV_QUEUE_REQUESTER = 2,
-	USER_RC_RECV_QUEUE_RESPONDER = 3,
-	USER_RC_QUEUE_TYPE_MAX = 4,
+	USER_RNIC_SEND_QUEUE_REQUESTER = 0,
+	USER_RNIC_SEND_QUEUE_RESPONDER = 1,
+	USER_RNIC_RECV_QUEUE_REQUESTER = 2,
+	USER_RNIC_RECV_QUEUE_RESPONDER = 3,
+	USER_RNIC_SEND_QUEUE_MM = 4,
+	USER_RNIC_QUEUE_TYPE_MAX = 5,
 };
+
+#define QUEUE_TYPE_MASK 0x3
+#define QUEUE_TYPE_SREQ 0x0
+#define QUEUE_TYPE_SRESP 0x1
+#define QUEUE_TYPE_SMMQ 0x2
+#define QUEUE_TYPE_RRESP 0x0
+#define QUEUE_TYPE_RREQ 0x1
 
 static inline uint32_t align_hw_size(uint32_t size)
 {
@@ -81,6 +90,7 @@ struct mana_context {
 	struct mana_table qp_rtable[MANA_QP_TABLE_SIZE];
 	struct mana_table qp_stable[MANA_QP_TABLE_SIZE];
 	pthread_mutex_t qp_table_mutex;
+	uint64_t comp_mask;
 
 	struct manadv_ctx_allocators extern_alloc;
 	void *db_page;
@@ -111,20 +121,19 @@ struct mana_ib_raw_qp {
 	uint32_t tx_vp_offset;
 };
 
-struct mana_ib_rc_qp {
-	struct mana_gdma_queue queues[USER_RC_QUEUE_TYPE_MAX];
-	uint32_t sq_ssn;
-	uint32_t sq_psn;
+struct mana_ib_rnic_qp {
+	struct mana_gdma_queue queues[USER_RNIC_QUEUE_TYPE_MAX];
 };
 
 struct mana_qp {
 	struct verbs_qp ibqp;
 	pthread_spinlock_t sq_lock;
 	pthread_spinlock_t rq_lock;
-
+	uint32_t sq_ssn;
+	uint32_t sq_psn;
 	union {
 		struct mana_ib_raw_qp raw_qp;
-		struct mana_ib_rc_qp rc_qp;
+		struct mana_ib_rnic_qp rnic_qp;
 	};
 
 	enum ibv_mtu mtu;
@@ -133,9 +142,26 @@ struct mana_qp {
 	struct shadow_queue shadow_rq;
 	struct shadow_queue shadow_sq;
 
-	struct list_node send_cq_node;
-	struct list_node recv_cq_node;
+	struct list_node send_err_node;
+	struct list_node recv_err_node;
+	bool on_err_list_send;
+	bool on_err_list_recv;
 };
+
+static inline struct mana_gdma_queue *mana_ib_get_rresp(struct mana_qp *qp)
+{
+	return &qp->rnic_qp.queues[USER_RNIC_RECV_QUEUE_RESPONDER];
+}
+
+static inline struct mana_gdma_queue *mana_ib_get_rreq(struct mana_qp *qp)
+{
+	return &qp->rnic_qp.queues[USER_RNIC_RECV_QUEUE_REQUESTER];
+}
+
+static inline struct mana_gdma_queue *mana_ib_get_sreq(struct mana_qp *qp)
+{
+	return &qp->rnic_qp.queues[USER_RNIC_SEND_QUEUE_REQUESTER];
+}
 
 struct mana_wq {
 	struct ibv_wq ibwq;
@@ -157,12 +183,12 @@ struct mana_cq {
 
 	pthread_spinlock_t lock;
 	uint32_t head;
-	uint32_t last_armed_head;
+	uint32_t poll_credit;
 	void *db_page;
-	/* list of qp's that use this cq for send completions */
-	struct list_head send_qp_list;
-	/* list of qp's that use this cq for recv completions */
-	struct list_head recv_qp_list;
+	struct list_head send_err_qp_list;
+	struct list_head recv_err_qp_list;
+	struct gdma_cqe pending_cqe;
+	bool has_pending_cqe;
 	bool buf_external;
 };
 
@@ -172,6 +198,7 @@ struct mana_device {
 
 struct mana_pd {
 	struct ibv_pd ibv_pd;
+	uint32_t pdn;
 	struct mana_pd *mprotection_domain;
 };
 
@@ -182,7 +209,8 @@ struct mana_parent_domain {
 
 struct mana_context *to_mctx(struct ibv_context *ibctx);
 
-void *mana_alloc_mem(uint32_t size);
+void *mana_alloc_mem(size_t size);
+void mana_dealloc_mem(void *buf, size_t size);
 
 int mana_query_device_ex(struct ibv_context *context,
 			 const struct ibv_query_device_ex_input *input,
@@ -191,7 +219,7 @@ int mana_query_device_ex(struct ibv_context *context,
 int mana_query_port(struct ibv_context *context, uint8_t port,
 		    struct ibv_port_attr *attr);
 
-struct ibv_pd *mana_alloc_pd(struct ibv_context *context);
+struct ibv_pd *mana_alloc_pd_ex(struct ibv_context *context, uint32_t flags);
 struct ibv_pd *
 mana_alloc_parent_domain(struct ibv_context *context,
 			 struct ibv_parent_domain_init_attr *attr);
@@ -204,6 +232,13 @@ struct ibv_mr *mana_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
 
 struct ibv_mr *mana_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 			   uint64_t hca_va, int access);
+
+struct ibv_dm *mana_alloc_dm(struct ibv_context *context,
+			     struct ibv_alloc_dm_attr *dm_attr);
+int mana_free_dm(struct ibv_dm *ibdm);
+struct ibv_mr *mana_reg_dm_mr(struct ibv_pd *pd, struct ibv_dm *ibdm,
+			      uint64_t dm_offset, size_t length,
+			      unsigned int acc);
 
 int mana_dereg_mr(struct verbs_mr *vmr);
 

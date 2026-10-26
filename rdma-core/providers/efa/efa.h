@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause */
 /*
- * Copyright 2019-2025 Amazon.com, Inc. or its affiliates. All rights reserved.
+ * Copyright 2019-2026 Amazon.com, Inc. or its affiliates. All rights reserved.
  */
 
 #ifndef __EFA_H__
@@ -31,6 +31,7 @@ struct efa_context {
 	uint32_t cmds_supp_udata_mask;
 	uint16_t sub_cqs_per_cq;
 	uint16_t inline_buf_size;
+	uint16_t inline_buf_size_ex;
 	uint32_t max_llq_size;
 	uint32_t device_caps;
 	uint32_t max_sq_wr;
@@ -44,6 +45,7 @@ struct efa_context {
 	size_t cqe_size;
 	size_t ex_cqe_size;
 	struct efa_qp **qp_table;
+	uint16_t *qp_gen_table;
 	unsigned int qp_table_sz_m1;
 	pthread_spinlock_t qp_table_lock;
 };
@@ -51,6 +53,24 @@ struct efa_context {
 struct efa_pd {
 	struct ibv_pd ibvpd;
 	uint16_t pdn;
+	/* Pointer to original PD used to create parent domain */
+	struct efa_pd *orig_pd;
+	/* Number of parent domains referencing this PD */
+	atomic_int refcount;
+};
+
+struct efa_td {
+	struct ibv_td ibvtd;
+	/* Number of parent domains referencing this TD */
+	atomic_int refcount;
+};
+
+struct efa_parent_domain {
+	struct efa_pd pd;
+	struct efa_td *td;
+	/* Number of objects referencing this parent domain */
+	atomic_int refcount;
+	void *pd_context;
 };
 
 struct efa_sub_cq {
@@ -69,6 +89,7 @@ struct efa_cq {
 	size_t cqe_size;
 	uint8_t *buf;
 	size_t buf_size;
+	bool buf_mmaped;
 	uint32_t *db;
 	uint8_t *db_mmap_addr;
 	uint16_t cc; /* Consumer Counter */
@@ -80,7 +101,16 @@ struct efa_cq {
 	struct efa_wq *cur_wq;
 	struct efa_io_cdesc_common *cur_cqe;
 	struct ibv_device *dev;
+	struct efa_parent_domain *parent_domain;
 	struct efa_sub_cq sub_cq_arr[];
+};
+
+struct efa_comp_cntr {
+	struct ibv_comp_cntr ibv_comp_cntr;
+	uint64_t comp_val __attribute__((aligned(8)));
+	uint64_t err_val __attribute__((aligned(8)));
+	uint64_t *comp_ptr;
+	uint64_t *err_ptr;
 };
 
 struct efa_wq {
@@ -98,9 +128,13 @@ struct efa_wq {
 	uint16_t desc_mask;
 	/* wrid_idx_pool_next: Index of the next entry to use in wrid_idx_pool. */
 	uint16_t wrid_idx_pool_next;
+	uint16_t gen_mask;
+	uint16_t shifted_gen;
 	int max_sge;
 	int phase;
 	pthread_spinlock_t wqlock;
+	bool need_lock;
+	bool req_id_64_bit;
 
 	uint32_t *db;
 	uint16_t sub_cq_idx;
@@ -112,6 +146,21 @@ struct efa_rq {
 	size_t buf_size;
 };
 
+struct efa_tx_wqe_ctx {
+	/* wqe buffer */
+	void *buff;
+	/* wqe meta descriptor */
+	struct efa_io_tx_meta_desc *md;
+	/* wqe local memory / SGL */
+	struct efa_io_tx_buf_desc *local_mem;
+	/* wqe remote memory - RDMA only */
+	struct efa_io_remote_mem_addr *remote_mem;
+	/* wqe inline data buffer */
+	uint8_t *inline_data;
+	/* max sge allowed for this wqe */
+	uint8_t max_sge;
+};
+
 struct efa_sq {
 	struct efa_wq wq;
 	uint8_t *desc;
@@ -120,6 +169,8 @@ struct efa_sq {
 	size_t max_inline_data;
 	size_t max_wr_rdma_sge;
 	uint16_t max_batch_wr;
+	uint16_t wqe_size;
+	bool inline_write_enabled;
 
 	/* Buffer for pending WR entries in the current session */
 	uint8_t *local_queue;
@@ -128,17 +179,20 @@ struct efa_sq {
 	/* Phase before current session */
 	int phase_rb;
 	/* Current wqe being built */
-	struct efa_io_tx_wqe *curr_tx_wqe;
+	struct efa_tx_wqe_ctx curr_tx_wqe;
 };
 
 struct efa_qp {
 	struct verbs_qp verbs_qp;
+	struct efadv_qp dv_qp;
 	struct efa_sq sq;
 	struct efa_rq rq;
 	int page_size;
 	int sq_sig_all;
 	int wr_session_err;
 	struct ibv_device *dev;
+	struct efa_parent_domain *parent_domain;
+	uint16_t gen;
 };
 
 struct efa_mr {
@@ -185,6 +239,11 @@ static inline struct efa_cq *efadv_cq_to_efa_cq(struct efadv_cq *efadv_cq)
 	return container_of(efadv_cq, struct efa_cq, dv_cq);
 }
 
+static inline struct efa_comp_cntr *to_efa_comp_cntr(struct ibv_comp_cntr *ibvcc)
+{
+	return container_of(ibvcc, struct efa_comp_cntr, ibv_comp_cntr);
+}
+
 static inline struct efa_qp *to_efa_qp(struct ibv_qp *ibvqp)
 {
 	return container_of(ibvqp, struct efa_qp, verbs_qp.qp);
@@ -195,9 +254,24 @@ static inline struct efa_qp *to_efa_qp_ex(struct ibv_qp_ex *ibvqpx)
 	return container_of(ibvqpx, struct efa_qp, verbs_qp.qp_ex);
 }
 
+static inline struct efa_qp *efadv_qp_to_efa_qp(struct efadv_qp *efadv_qp)
+{
+	return container_of(efadv_qp, struct efa_qp, dv_qp);
+}
+
 static inline struct efa_ah *to_efa_ah(struct ibv_ah *ibvah)
 {
 	return container_of(ibvah, struct efa_ah, ibvah);
+}
+
+static inline struct efa_td *to_efa_td(struct ibv_td *ibvtd)
+{
+	return container_of(ibvtd, struct efa_td, ibvtd);
+}
+
+static inline struct efa_parent_domain *to_efa_parent_domain(struct ibv_pd *ibvpd)
+{
+	return container_of(ibvpd, struct efa_parent_domain, pd.ibvpd);
 }
 
 bool is_efa_dev(struct ibv_device *device);

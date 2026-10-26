@@ -16,7 +16,7 @@ from tests.base import PyverbsAPITestCase
 from pyverbs.device import Context, DM
 import tests.utils as u
 import pyverbs.device as d
-import pyverbs.enums as e
+from pyverbs.libibverbs_enums import ibv_node_type
 
 PAGE_SIZE = resource.getpagesize()
 
@@ -68,7 +68,7 @@ class DeviceTest(PyverbsAPITestCase):
         """
         for dev in self.get_device_list():
             with d.Context(name=dev.name.decode()) as ctx:
-                if dev.node_type == e.IBV_NODE_CA:
+                if dev.node_type == ibv_node_type.IBV_NODE_CA:
                     ctx.query_pkey(port_num=self.ib_port, index=0)
 
     def test_get_pkey_index(self):
@@ -78,7 +78,7 @@ class DeviceTest(PyverbsAPITestCase):
         source_pkey_index = 0
         for dev in self.get_device_list():
             with d.Context(name=dev.name.decode()) as ctx:
-                if dev.node_type == e.IBV_NODE_CA:
+                if dev.node_type == ibv_node_type.IBV_NODE_CA:
                     pkey = u.get_pkey_from_kernel(device=dev.name.decode(),
                                                   port=self.ib_port,
                                                   index=source_pkey_index)
@@ -195,7 +195,7 @@ class DeviceTest(PyverbsAPITestCase):
         :param device: A Device object
         :return: None
         """
-        if device.node_type != e.IBV_NODE_UNSPECIFIED and device.node_type != e.IBV_NODE_UNKNOWN:
+        if device.node_type != ibv_node_type.IBV_NODE_UNSPECIFIED and device.node_type != ibv_node_type.IBV_NODE_UNKNOWN:
             assert attr.node_guid != 0
             assert attr.sys_image_guid != 0
         assert attr.max_mr_size > PAGE_SIZE
@@ -209,7 +209,7 @@ class DeviceTest(PyverbsAPITestCase):
         assert attr.max_cqe > 0
         assert attr.max_mr > 0
         assert attr.max_pd > 0
-        if device.node_type == e.IBV_NODE_CA:
+        if device.node_type == ibv_node_type.IBV_NODE_CA:
             assert attr.max_pkeys > 0
 
     def test_query_device_ex(self):
@@ -283,6 +283,22 @@ class DeviceTest(PyverbsAPITestCase):
                     raise PyverbsRDMAError(
                         'Successfully queried non-existing port {p}'. \
                         format(p=port))
+
+    def test_query_port_speed(self):
+        """
+        Test ibv_query_port_speed
+        """
+        for dev in self.get_device_list():
+            with d.Context(name=dev.name.decode()) as ctx:
+                try:
+                    port_speed = ctx.query_port_speed(self.ib_port)
+                except PyverbsRDMAError as ex:
+                    if ex.error_code in [errno.EOPNOTSUPP, errno.EPROTONOSUPPORT]:
+                        raise unittest.SkipTest('ibv_query_port_speed is not'
+                                                ' supported on this device')
+                    raise ex
+                self.assertGreaterEqual(port_speed, 0, 'Port speed should be positive, got'
+                                                       f' {port_speed} Mbps')
 
 
 class DMTest(PyverbsAPITestCase):

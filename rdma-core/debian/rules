@@ -4,6 +4,10 @@ include /usr/share/dpkg/architecture.mk
 
 export DEB_BUILD_MAINT_OPTIONS=hardening=+all
 
+ifneq ($(DEB_BUILD_ARCH),$(DEB_HOST_ARCH))
+export _PYTHON_SYSCONFIGDATA_NAME=_sysconfigdata__${DEB_HOST_ARCH_OS}_${DEB_HOST_MULTIARCH}
+endif
+
 NON_COHERENT_DMA_ARCHS = alpha arc armel armhf hppa m68k sh4
 
 dh_params = --with python3 --builddirectory=build-deb
@@ -62,7 +66,7 @@ ifeq (,$(filter-out $(NON_COHERENT_DMA_ARCHS),$(DEB_HOST_ARCH)))
 	for package in ibverbs-providers libibverbs-dev rdma-core; do \
 		test -e debian/$$package.install.backup || cp debian/$$package.install debian/$$package.install.backup; \
 	done
-	sed -i '/efa\|hns\|mana\|mlx[45]/d' debian/ibverbs-providers.install debian/libibverbs-dev.install debian/rdma-core.install
+	sed -i '/efa\|hns\|ionic\|mana\|mlx[45]/d' debian/ibverbs-providers.install debian/libibverbs-dev.install debian/rdma-core.install
 endif
 	DESTDIR=$(CURDIR)/debian/tmp ninja -C build-deb install
 

@@ -9,6 +9,7 @@ which returns a DeviceAttr object.
 import weakref
 
 from .pyverbs_error import PyverbsRDMAError, PyverbsError
+from pyverbs.comp_cntr cimport CompCntr
 from pyverbs.cq cimport CQEX, CQ, CompChannel
 from .pyverbs_error import PyverbsUserError
 from pyverbs.base import PyverbsRDMAErrno
@@ -20,7 +21,7 @@ cimport pyverbs.librdmacm as cm
 from pyverbs.cmid cimport CMID
 from pyverbs.xrcd cimport XRCD
 from pyverbs.addr cimport GID
-from pyverbs.mr import DMMR
+from pyverbs.mr import DMMR, DMAHandle
 from pyverbs.pd cimport PD
 from pyverbs.qp cimport QP
 from libc.stdlib cimport free, malloc
@@ -28,6 +29,7 @@ from libc.string cimport memset
 from libc.stdint cimport uint64_t
 from libc.stdint cimport uint16_t
 from libc.stdint cimport uint32_t
+from libc.stdint cimport uintptr_t
 from pyverbs.utils import gid_str
 
 cdef extern from 'endian.h':
@@ -118,10 +120,15 @@ cdef class Context(PyverbsCM):
         self.pps = weakref.WeakSet()
         self.sched_nodes = weakref.WeakSet()
         self.sched_leafs = weakref.WeakSet()
+        self.comp_cntrs = weakref.WeakSet()
         self.dr_domains = weakref.WeakSet()
         self.wqs = weakref.WeakSet()
         self.rwq_ind_tbls = weakref.WeakSet()
         self.crypto_logins = weakref.WeakSet()
+        self.event_channels = weakref.WeakSet()
+        self.dmahs = weakref.WeakSet()
+        self.devx_umems = weakref.WeakSet()
+        self.devx_objs = weakref.WeakSet()
 
         self.name = kwargs.get('name')
         provider_attr = kwargs.get('attr')
@@ -176,9 +183,12 @@ cdef class Context(PyverbsCM):
         if self.context != NULL:
             if self.logger:
                 self.logger.debug('Closing Context')
-            close_weakrefs([self.qps, self.crypto_logins, self.rwq_ind_tbls, self.wqs, self.ccs, self.cqs,
-                            self.dms, self.pds, self.xrcds, self.vars, self.sched_leafs,
-                            self.sched_nodes, self.dr_domains])
+            close_weakrefs([self.devx_objs, self.devx_umems, self.qps,
+                            self.crypto_logins, self.rwq_ind_tbls, self.wqs,
+                            self.ccs, self.cqs, self.dms, self.pds, self.xrcds,
+                            self.vars, self.sched_leafs, self.sched_nodes,
+                            self.dr_domains, self.event_channels, self.dmahs,
+                            self.comp_cntrs])
             rc = v.ibv_close_device(self.context)
             if rc != 0:
                 raise PyverbsRDMAErrno(f'Failed to close device {self.name}')
@@ -186,7 +196,7 @@ cdef class Context(PyverbsCM):
 
     @property
     def context(self):
-        return <object>self.context
+        return <uintptr_t>self.context
 
     @property
     def num_comp_vectors(self):
@@ -220,6 +230,17 @@ cdef class Context(PyverbsCM):
             raise PyverbsRDMAError('Failed to query EX device {name}'.
                                    format(name=self.name), rc)
         return dev_attr_ex
+
+    def query_comp_cntr_caps(self):
+        """
+        Query completion counter capabilities.
+        :return: CompCntrCaps object
+        """
+        caps = CompCntrCaps()
+        rc = v.ibv_query_comp_cntr_caps(self.context, &caps.caps)
+        if rc != 0:
+            raise PyverbsRDMAError('Failed to query comp_cntr caps', rc)
+        return caps
 
     def query_pkey(self, unsigned int port_num, int index):
         cdef uint16_t pkey
@@ -262,6 +283,18 @@ cdef class Context(PyverbsCM):
             raise PyverbsRDMAError('Failed to query port {p}'.
                                    format(p=port_num), rc)
         return port_attrs
+
+    def query_port_speed(self, unsigned int port_num):
+        """
+        Query port <port_num> speed in 100 Mb/s granularity.
+        :param port_num: Port number to query
+        :return: Port speed
+        """
+        cdef uint64_t port_speed
+        rc = v.ibv_query_port_speed(self.context, port_num, &port_speed)
+        if rc != 0:
+            raise PyverbsRDMAError(f'Failed to query port speed for port {port_num}', rc)
+        return port_speed
 
     def query_gid_table(self, size_t max_entries, uint32_t flags=0):
         """
@@ -345,6 +378,10 @@ cdef class Context(PyverbsCM):
             self.wqs.add(obj)
         elif isinstance(obj, RwqIndTable):
             self.rwq_ind_tbls.add(obj)
+        elif isinstance(obj, DMAHandle):
+            self.dmahs.add(obj)
+        elif isinstance(obj, CompCntr):
+            self.comp_cntrs.add(obj)
         else:
             raise PyverbsError('Unrecognized object type')
 
@@ -728,6 +765,21 @@ cdef class DeviceAttrEx(PyverbsObject):
         return self.dev_attr.phys_port_cnt_ex
 
 
+cdef class CompCntrCaps(PyverbsObject):
+    """Completion counter capabilities."""
+    @property
+    def max_counters(self):
+        return self.caps.max_counters
+
+    @property
+    def max_value(self):
+        return self.caps.max_value
+
+    @property
+    def supported_qp_attach_ops(self):
+        return self.caps.supported_qp_attach_ops
+
+
 cdef class AllocDmAttr(PyverbsObject):
     def __init__(self, length, log_align_req = 0, comp_mask = 0):
         """
@@ -848,6 +900,16 @@ cdef class DM(PyverbsCM):
         res = data[:length]
         free(data)
         return res
+
+    def export_dmabuf_fd(self):
+        """
+        Export a dmabuf FD for this DM object.
+        :return: A file descriptor (int) for the dmabuf FD
+        """
+        fd = v.ibv_dm_export_dmabuf_fd(self.dm)
+        if fd < 0:
+            raise PyverbsRDMAErrno('Failed to export dmabuf FD for DM')
+        return fd
 
     @property
     def handle(self):
@@ -1261,7 +1323,8 @@ def translate_event_type(event_type):
         e.IBV_EVENT_QP_LAST_WQE_REACHED: '.IBV_EVENT_QP_LAST_WQE_REACHED',
         e.IBV_EVENT_CLIENT_REREGISTER: 'IBV_EVENT_CLIENT_REREGISTER',
         e.IBV_EVENT_GID_CHANGE: 'IBV_EVENT_GID_CHANGE',
-        e.IBV_EVENT_WQ_FATAL: 'IBV_EVENT_WQ_FATAL'
+        e.IBV_EVENT_WQ_FATAL: 'IBV_EVENT_WQ_FATAL',
+        e.IBV_EVENT_DEVICE_SPEED_CHANGE: 'IBV_EVENT_DEVICE_SPEED_CHANGE'
     }
     try:
         return types[event_type]

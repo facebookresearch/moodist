@@ -129,9 +129,9 @@ if(MOODIST_BUILD_CORE AND NOT MOODIST_PREBUILT_CORE)
 endif()
 
 set(ibverbs_sources
-  cmd.c cmd_ah.c cmd_counters.c cmd_cq.c cmd_device.c cmd_dm.c cmd_fallback.c cmd_flow.c
-  cmd_flow_action.c cmd_ioctl.c cmd_mr.c cmd_mw.c cmd_pd.c cmd_qp.c cmd_rwq_ind.c cmd_srq.c
-  cmd_wq.c cmd_xrcd.c device.c enum_strs.c ibdev_nl.c init.c marshall.c memory.c
+  cmd.c cmd_ah.c cmd_comp_cntr.c cmd_counters.c cmd_cq.c cmd_device.c cmd_dm.c cmd_dmabuf.c cmd_dmah.c
+  cmd_fallback.c cmd_flow.c cmd_flow_action.c cmd_ioctl.c cmd_mr.c cmd_mw.c cmd_pd.c cmd_qp.c cmd_rwq_ind.c
+  cmd_srq.c cmd_wq.c cmd_xrcd.c device.c dmabuf_heap.c enum_strs.c ibdev_nl.c init.c marshall.c memory.c
   static_driver.c sysfs.c verbs.c dummy_ops.c neigh.c
 )
 list(TRANSFORM ibverbs_sources PREPEND rdma-core/libibverbs/)
