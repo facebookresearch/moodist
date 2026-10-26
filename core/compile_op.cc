@@ -380,6 +380,8 @@ struct GraphBuilder {
     for (auto i = edges.begin(); i != edges.end();) {
       auto& e = *i;
       if (e.sources.size() != 1) {
+        // e.g. a relay edge (no sources), which stays with its executor
+        ++i;
         continue;
       }
       CHECK(e.destinations.size() == 1);
@@ -625,8 +627,9 @@ struct GraphBuilder {
       // FIXME proper load distribution
       CHECK(edgeMap.contains(cell));
       auto& edge = edgeMap.at(cell);
-      CHECK(!edge.sources.empty());
-      uint32_t sourceRank = edge.sources[0].rank;
+      // A relay edge (no sources; the proxy rank of a transfer over RDMA, whose node the other ranks' edges
+      // read) heads the chain.
+      uint32_t sourceRank = edge.sources.empty() ? rank : edge.sources[0].rank;
       std::ranges::rotate(ranks, std::ranges::lower_bound(ranks, sourceRank, {}, proj));
 
       Vector<uint32_t> rankns;
@@ -653,6 +656,10 @@ struct GraphBuilder {
     }
 
     for (auto& e : edges) {
+      if (e.sources.empty()) {
+        CHECK(e.rdmaSignal >= 0 && e.executorRank == rank);
+        continue;
+      }
       CHECK(e.sources.size() == 1);
       CHECK(e.destinations.size() == 1);
       if (writeMode) {
@@ -695,15 +702,18 @@ void logGraph(const Graph& graph) {
     }
     return s;
   };
+  auto signal = [](const Edge& e) {
+    return e.rdmaSignal >= 0 ? fmt::sprintf(" rdmaSignal=%d", e.rdmaSignal) : std::string();
+  };
   for (size_t i : indices(graph.rdmaEdges)) {
     const auto& e = graph.rdmaEdges[i];
-    log.info("  rdmaEdge[%zu]: %#x %zu bytes executor=%d cell=%u [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
-        e.cellIndex, f(e.sources), f(e.destinations));
+    log.info("  rdmaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
+        e.cellIndex, signal(e), f(e.sources), f(e.destinations));
   }
   for (size_t i : indices(graph.cudaEdges)) {
     const auto& e = graph.cudaEdges[i];
-    log.info("  cudaEdge[%zu]: %#x %zu bytes executor=%d cell=%u [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
-        e.cellIndex, f(e.sources), f(e.destinations));
+    log.info("  cudaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
+        e.cellIndex, signal(e), f(e.sources), f(e.destinations));
   }
 }
 
@@ -725,9 +735,9 @@ struct CompileOpConstructor {
     KernelConfig config;
   };
 
-  // A comma separated list from the environment variable `name` (or `defaultValue` if unset). Every rank must
-  // use the same list, as tuning is collective.
-  Vector<std::string> agreedEnvList(const char* name, const char* defaultValue) {
+  // The value of the environment variable `name` (or `defaultValue` if unset), which must be the same on every
+  // rank (it selects collective steps).
+  std::string agreedEnv(const char* name, const char* defaultValue) {
     std::string value = defaultValue;
     if (const char* env = std::getenv(name)) {
       value = env;
@@ -742,6 +752,12 @@ struct CompileOpConstructor {
       mismatch |= s != value;
     }
     REQUIRE(!mismatch, "compile_op: %s differs between ranks (this rank: '%s')", name, value);
+    return value;
+  }
+
+  // A comma separated list from agreedEnv.
+  Vector<std::string> agreedEnvList(const char* name, const char* defaultValue) {
+    std::string value = agreedEnv(name, defaultValue);
     Vector<std::string> r;
     for (size_t pos = 0; pos <= value.size();) {
       size_t end = std::min(value.find(',', pos), value.size());
@@ -749,6 +765,134 @@ struct CompileOpConstructor {
       pos = end + 1;
     }
     return r;
+  }
+
+  // Mixed NVLink + RDMA transfers: data that several ranks of an NVLink domain (the ranks this rank's kernel can
+  // reach, computeCudaRanks) need from a rank outside the domain should cross the network once. The ranks of a
+  // domain exchange their edges from outside the domain and group them by source node. In a group with two or
+  // more destinations, one destination rank, the proxy, reads the data over RDMA into its own destination node,
+  // and the other destinations copy it from there with the kernel: their edges' source becomes the proxy's
+  // node. The proxy's RDMA edge gets a signal index (rdmaSignal): its CPU thread signals the kernel once the
+  // read has completed. A relay edge on the proxy (no sources, the proxy's node as destination, same signal
+  // index) makes the kernel wait for that signal and then mark the node as filled, after which the copies from
+  // it run as dependent edges in every graph variant.
+  // Proxied are only groups whose copies the kernel can take (CUDA destinations, sizes and destination offsets
+  // multiples of 16 bytes) and that have one destination per rank. The proxy is preferably the destination with
+  // the same local rank as the source (NICs on the same rail), otherwise the one that proxies the fewest bytes
+  // so far. Every member of a domain computes the same assignment from the same exchanged lists.
+  void proxyRemoteEdges(InternalContext& ictx, Vector<Edge>& edges) {
+    Vector<size_t> domain = computeCudaRanks(group, !ctx.collectiveOp);
+    auto inDomain = [&](uint32_t r) {
+      return std::ranges::find(domain, r) != domain.end();
+    };
+
+    Vector<Edge> candidates;
+    for (const Edge& e : edges) {
+      if (e.sources.size() != 1 || e.destinations.size() != 1) {
+        continue;
+      }
+      const Node& s = e.sources[0];
+      const Node& d = e.destinations[0];
+      CHECK(d.rank == rank);
+      if (inDomain(s.rank) || d.device != DeviceType::CUDA || e.bytes % 16 != 0 || d.offset % 16 != 0) {
+        continue;
+      }
+      candidates.push_back(e);
+    }
+    for (size_t r : domain) {
+      ctx.send(r, domain, candidates);
+    }
+    HashMap<uint64_t, Vector<Edge>> groups;
+    for (size_t r : domain) {
+      Vector<size_t> peerDomain;
+      Vector<Edge> l;
+      ctx.receive(r, peerDomain, l);
+      CHECK(peerDomain == domain);
+      for (Edge& e : l) {
+        CHECK(e.destinations.at(0).rank == r);
+        groups[e.sources.at(0).id].push_back(std::move(e));
+      }
+    }
+    Vector<uint64_t> sourceIds;
+    for (auto& v : groups) {
+      sourceIds.push_back(v.first);
+    }
+    std::ranges::sort(sourceIds);
+
+    // Signal flags live in cpuOutBuffer after its first 16 slots
+    const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
+    HashMap<uint32_t, size_t> proxyBytes;
+    HashMap<uint32_t, size_t> proxySignals;
+    size_t numGroups = 0;
+    size_t numMine = 0;
+    for (uint64_t sourceId : sourceIds) {
+      Vector<Edge>& g = groups[sourceId];
+      if (g.size() < 2) {
+        continue;
+      }
+      std::ranges::sort(g, {}, [](const Edge& e) {
+        return e.destinations[0].rank;
+      });
+      bool eligible = true;
+      for (size_t i : indices(g)) {
+        eligible &= g[i].bytes == g[0].bytes && g[i].cellIndex == g[0].cellIndex;
+        eligible &= i == 0 || g[i].destinations[0].rank != g[i - 1].destinations[0].rank;
+      }
+      if (!eligible) {
+        continue;
+      }
+      uint32_t sourceRank = g[0].sources[0].rank;
+      const Edge* proxy = nullptr;
+      for (const Edge& e : g) {
+        uint32_t r = e.destinations[0].rank;
+        if (proxySignals[r] < maxSignals && group->rankLocalRank.at(r) == group->rankLocalRank.at(sourceRank)) {
+          proxy = &e;
+          break;
+        }
+      }
+      if (!proxy) {
+        for (const Edge& e : g) {
+          uint32_t r = e.destinations[0].rank;
+          if (proxySignals[r] < maxSignals && (!proxy || proxyBytes[r] < proxyBytes[proxy->destinations[0].rank])) {
+            proxy = &e;
+          }
+        }
+      }
+      if (!proxy) {
+        continue;
+      }
+      const uint32_t proxyRank = proxy->destinations[0].rank;
+      const Node proxyNode = proxy->destinations[0];
+      const int32_t signal = proxySignals[proxyRank]++;
+      proxyBytes[proxyRank] += proxy->bytes;
+      ++numGroups;
+
+      for (const Edge& m : g) {
+        if (m.destinations[0].rank != rank) {
+          continue;
+        }
+        ++numMine;
+        auto it = std::ranges::find(edges, m.id, &Edge::id);
+        CHECK(it != edges.end());
+        if (rank == proxyRank) {
+          it->rdmaSignal = signal;
+          Edge relay;
+          relay.id = ictx.nextEdgeId();
+          relay.destinations.push_back(proxyNode);
+          relay.bytes = m.bytes;
+          relay.cellIndex = m.cellIndex;
+          relay.executorRank = rank;
+          relay.rdmaSignal = signal;
+          edges.push_back(std::move(relay));
+        } else {
+          it->sources.clear();
+          it->sources.push_back(proxyNode);
+          it->id = ictx.nextEdgeId();
+        }
+      }
+    }
+    log.debug("compile_op: rank %zu: %zu proxied groups in a domain of %zu ranks (%zu of my edges, %zu as proxy)\n",
+        rank, numGroups, domain.size(), numMine, proxySignals[rank]);
   }
 
   Setting tuneKernels(Vector<Graph> graphs, const Vector<std::string>& copyEngines, std::string target) {
@@ -793,7 +937,8 @@ struct CompileOpConstructor {
     Vector<CompiledKernel> kernels;
 
     for (const auto& s : settings) {
-      sources.push_back(generateKernel(group, s.config, target, s.graph, ctx));
+      // Tuning launches run without the CPU thread: nodes filled over RDMA count as filled
+      sources.push_back(generateKernel(group, s.config, target, s.graph, ctx, true));
     }
 
     log.info("Generated %d kernels in %gs\n", sources.size(), seconds(std::chrono::steady_clock::now() - start));
@@ -1706,6 +1851,13 @@ struct CompileOpConstructor {
 
     Vector<Graph> graphs;
 
+    // Proxy transfers from outside the NVLink domain (MOODIST_COMPILE_OP_PROXY=0 disables it). Undone below if
+    // the kernel path is not used.
+    Vector<Edge> unproxiedEdges = baseGraph.edges;
+    if (agreedEnv("MOODIST_COMPILE_OP_PROXY", "1") != "0") {
+      proxyRemoteEdges(ictx, baseGraph.edges);
+    }
+
     // Generate ibReads for edges that cannot be handled by the CUDA kernel
     // (remote ranks not reachable via NVLink, or CPU tensors).
     // Remove those edges from baseGraph so only kernel-eligible edges remain.
@@ -1749,6 +1901,10 @@ struct CompileOpConstructor {
         ctx.receive(i, v);
         anyCuda &= v;
       }
+      if (!anyCuda) {
+        // Without the kernel, the copies from a proxy's node would be RDMA reads racing with the proxy's own read
+        baseGraph.edges = std::move(unproxiedEdges);
+      }
 
       for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
         auto& edge = *it;
@@ -1768,9 +1924,10 @@ struct CompileOpConstructor {
             read.inputOffset = src.offset;
             read.outputOffset = dest.offset;
             read.bytes = edge.bytes;
+            read.signalIndex = edge.rdmaSignal;
             op->ibReads.push_back(read);
-            log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes\n", read.rank, read.inputIndex,
-                read.inputOffset, read.outputIndex, read.outputOffset, read.bytes);
+            log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d\n", read.rank,
+                read.inputIndex, read.inputOffset, read.outputIndex, read.outputOffset, read.bytes, read.signalIndex);
           }
         }
         it = baseGraph.edges.erase(it);
@@ -1891,7 +2048,8 @@ struct CompileOpConstructor {
         ctx.barrier();
       }
 
-      std::shared_ptr<KernelHandle> kernelHandle = generateKernel(group, setting.config, target, setting.graph, ctx);
+      std::shared_ptr<KernelHandle> kernelHandle =
+          generateKernel(group, setting.config, target, setting.graph, ctx, false);
       const std::string& ptx = kernelHandle->ptx;
       if (std::getenv("MOODIST_DUMP_KERNELS")) {
         std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);

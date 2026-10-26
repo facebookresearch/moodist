@@ -45,32 +45,50 @@ Every step is collective: all ranks of the group take part (through per-rank que
 6. **Phase 5**: the output's rank creates one edge per cell, executed by itself: the source is the input (or
    input copy) node, the destination its output node, or an output copy if the piece is not contiguous in the
    output. Then the ranks exchange node ids.
-7. **Kernel / RDMA split**: an edge goes to the kernel if all its nodes are CUDA, all its ranks are kernel peers
+7. **Proxy pass** (`proxyRemoteEdges`; `MOODIST_COMPILE_OP_PROXY=0` disables it): data that several ranks of an
+   NVLink domain (`cudaRanks`, see the next step) need from a rank outside the domain should cross the network
+   once. The ranks of each domain exchange their edges from outside the domain and group them by source node. In a
+   group with two or more destinations (CUDA, sizes and destination offsets multiples of 16 bytes, one destination
+   per rank), one destination rank, the proxy, keeps its edge, which will be an RDMA read into its own output, and
+   the edges of the other destinations now read from the proxy's node instead, which makes them kernel edges. The
+   proxy is preferably the destination with the same local rank as the source (whose NICs are on the same rail),
+   otherwise the one that proxies the fewest bytes so far; every member of the domain computes the same
+   assignment. The proxy's RDMA edge gets a signal index (`rdmaSignal`), and the proxy gets a relay edge: no
+   sources, the proxy's node as destination, the same signal index. The relay edge makes the proxy's kernel wait
+   until the CPU thread signals that the read has completed, and then mark the node as filled; the copies from the
+   node are ordinary dependent edges.
+8. **Kernel / RDMA split**: an edge goes to the kernel if all its nodes are CUDA, all its ranks are kernel peers
    (`cudaRanks`: the ranks whose memory this rank can map, i.e. CUDA IPC peers on the same node, or all ranks of a
    multi-node NVLink fabric domain such as NVL72), and, for process group collectives built on compile_op
    (scatter, gather), its size and offsets are multiples of 16 bytes. Every other edge becomes an `ibRead`, an
-   RDMA read by the CPU thread of the destination rank. Kernel tuning and launch are collective, so the kernel
-   path is used only if every rank has at least one kernel edge; otherwise all edges become ibReads.
-8. **16-byte check**: kernel edges must have sizes and offsets that are multiples of 16 bytes (the kernel uses TMA
+   RDMA read by the CPU thread of the destination rank (with the edge's signal index). Kernel tuning and launch
+   are collective, so the kernel path is used only if every rank has at least one kernel edge; otherwise all
+   edges become ibReads, and the proxy pass is undone (the copies from a proxy's node would race with the proxy's
+   own read).
+9. **16-byte check**: kernel edges must have sizes and offsets that are multiples of 16 bytes (the kernel uses TMA
    bulk copies). The ranks exchange their first violation and raise together.
-9. **Graph variants** (`MOODIST_COMPILE_OP_GRAPHS`, default `multicast`), each a `GraphBuilder` pass over the
+10. **Graph variants** (`MOODIST_COMPILE_OP_GRAPHS`, default `multicast`), each a `GraphBuilder` pass over the
    kernel edges:
    - `multicast`: the edges that read the same source node are merged into one edge with several destinations,
      executed by the source rank: it reads each chunk once and writes it to all its destinations.
    - `read` (`buildNothing`): every edge stays with its destination rank, which reads from the source.
    - `ring_read`, `ring_write`: the destinations of a cell form a chain, starting at the source rank, and each
      rank copies the cell from the previous rank's output (read: the receiver executes the copy, write: the
-     sender). These are the only graphs with unfilled sources, i.e. dependencies between edges.
+     sender). A proxy's relay edge heads the chain of its cell.
+
+   Edges have unfilled sources, i.e. depend on other edges, in the ring graphs and for proxied transfers (the
+   copies from a proxy's node). Relay edges stay with the proxy in every variant.
 
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
-10. **Tuning** (`tuneKernels`): the copy engine `grouped` (`MOODIST_COMPILE_OP_ENGINES`) x block size {128, 256} x
+11. **Tuning** (`tuneKernels`): the copy engine `grouped` (`MOODIST_COMPILE_OP_ENGINES`) x block size {128, 256} x
     shared memory {64 KiB, 226 KiB} x grid size {8, 12, 16}, for every graph variant (12 settings per variant and
     engine). Each setting is generated and JIT
     compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The
     ranks exchange their timings and take the minimum over ranks per setting. The kernel of the fastest setting
-    is generated and compiled once more for the op.
+    is generated and compiled once more for the op. Tuning launches run without the CPU thread, so in tuning
+    kernels, relay edges do not wait for a signal.
 
 ## The kernel (`generateKernel`)
 
@@ -98,7 +116,11 @@ on new tensors at every call.
   for block b of the producer, which copied the same chunks, as all ranks run the same configuration.
 - **Signaling**: after an edge, thread 0 writes stepValue into the `depFilled` slots of its destination nodes on
   its own rank, on the destination ranks, and on the destination ranks of edges that read those nodes. In the
-  sequential path, only edges that others depend on are signaled.
+  sequential path, only edges that others depend on are signaled. Before copying from a source that another
+  agent wrote during the op (a peer GPU, or a NIC), thread 0 executes `fence.acquire.sys`.
+- **Relay edges** (proxied transfers): thread 0 polls the signal of the CPU thread, slot 16 + `rdmaSignal` of
+  `cpuOutBuffer` for the concurrency index, until it reaches stepValue, then signals the node as filled like after
+  a copy. No bar.red and no copy.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 
@@ -112,16 +134,20 @@ on new tensors at every call.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads) publishes the rank's input list (addresses, sizes,
   rkeys; CUDA tensors are registered on first use) to all ranks, registers the outputs, collects all ranks' input
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
-  (shuffled, at most 2 in flight per NIC), waits for them, runs a second barrier with all ranks (nobody reads this
-  rank's inputs any more) and writes `cpuOut`.
-- The kernel and the CPU thread run concurrently and independently: apart from `cpuIn` and `cpuOut` on the stream,
-  they do not signal each other.
+  (reads of 4 MiB or more split into one part per NIC; shuffled, at most 2 in flight per NIC), waits for them,
+  runs a second barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`.
+- The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
+  signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
+  step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
+  all-gather does for its chunks).
 
 ## Environment variables
 
 - `MOODIST_COMPILE_OP_GRAPHS` - the graph variants to tune over (see the compile phase). Same on all ranks.
 - `MOODIST_COMPILE_OP_ENGINES` - the copy engines to tune over, comma separated: `grouped` (default), `simple`,
   `buffered`, `lockstep`. Same on all ranks.
+- `MOODIST_COMPILE_OP_PROXY=0` - no proxy pass: every rank reads all its data from outside its NVLink domain
+  itself. Same on all ranks.
 - `MOODIST_FABRIC=0` - ignore a multi-node NVLink fabric: compile_op reaches other nodes over RDMA, as between
   separate NVLink domains. Same on all ranks.
 - `MOODIST_DUMP_KERNELS` - write each op's final PTX to `moodist-compile-op-kernels-rank<rank>-op<id>.ptx`.
@@ -137,9 +163,17 @@ call, algorithm bandwidth in parentheses):
 | `read` | 28 us | 48 us | 563 us | 10.7 ms (201 GB/s) |
 | `ring_read` | 60 us | 92 us | 313 us | 3.68 ms (584 GB/s) |
 | `ring_write` | 53 us | 81 us | 258 us | 3.15 ms (681 GB/s) |
-| `multicast` with `MOODIST_FABRIC=0` (other node over RDMA) | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
 | NCCL (NVLink fabric) | 85 us | 98 us | | 2.91 ms (739 GB/s) |
-| NCCL with `NCCL_MNNVL_ENABLE=0` (RoCE between the nodes) | 90 us | 98 us | 436 us | 5.38 ms (399 GB/s) |
+
+With `MOODIST_FABRIC=0`, i.e. two NVLink domains connected by RoCE (4 NICs per GPU):
+
+| | 1 KiB | 1 MiB | 16 MiB | 256 MiB |
+|---|---|---|---|---|
+| `multicast`, proxy pass (one RDMA read per chunk and node, then NVLink) | 74 us | 121 us | 429 us | 6.63 ms (324 GB/s) |
+| `ring_write`, proxy pass | 79 us | 121 us | 438 us | 6.84 ms (314 GB/s) |
+| `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 85 us | 211 us | 1.78 ms | 26.5 ms (81 GB/s) |
+| the same before reads were split over the NICs | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 92 us | 102 us | 440 us | 5.42 ms (396 GB/s) |
 
 Compile time grows with the number of edges, because the copy code of each edge is generated inline. All-gather
 where each rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
@@ -159,11 +193,14 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
 - Some compile errors are raised only by the rank that finds them (gaps and overlaps in phase 2, device
   mismatches), and the other ranks then wait forever in the next collective step. The 16-byte check shows the
   pattern to follow: exchange the first error and raise on all ranks.
-- `GraphBuilder::multicast()` loops forever on an edge with more than one source (`continue` without advancing
-  the iterator). No current path creates such edges.
 - The kernel path is all or nothing: if some rank has no kernel edge, every edge of every rank goes over RDMA
-  (e.g. a broadcast to other nodes). Ranks without kernel edges should take part in tuning without a kernel
-  instead.
+  (e.g. when a rank receives nothing, or only into CPU tensors). Ranks without kernel edges should take part in
+  tuning without a kernel instead.
+- Proxied transfers: the CPU thread signals the kernel as soon as the read's completion arrives, with a loopback
+  RDMA write through the first NIC. That the read's data is visible in GPU memory before the signal relies on
+  timing rather than on PCIe ordering (the read may have gone through another NIC, and MRs allow relaxed
+  ordering); the all-gather's chunk signals do the same. A flush (a small RDMA read of the destination through
+  the NIC of the read, before the signal) would make it explicit.
 - `tuneKernels` combines the ranks' timings with the minimum; the maximum (slowest rank) or the sum fits a
   collective better.
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
@@ -177,9 +214,9 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
   (the PTX differs per rank, so the work cannot be split across ranks).
 - The polling loop does one block-wide `bar.red` per edge and pass; with many edges, a warp-wide scan for the next
   ready edge would be cheaper.
-- Every edge that is not a kernel edge is read by its destination rank itself, so data needed by several ranks of
-  an NVLink domain crosses the network once per rank (four times per node in the two-node all-gather above). See
-  the mixed paths below.
+- Proxied transfers are not pipelined: the proxy's kernel starts the NVLink copies only once the whole RDMA read
+  has completed (6.6 ms against NCCL's 5.4 ms for the 256 MiB all-gather above). Edges the proxy pass leaves
+  alone (CPU destinations, unaligned pieces, one destination per domain) are read by each destination rank.
 - `WorkCustom` runs two barriers with all ranks per op, including ranks without RDMA work.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
@@ -189,23 +226,14 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
 - Kernel profiling (`Profiling` in `ptx_codegen.cc`) is compiled out with `if (false)`; an environment variable
   would make it usable without a rebuild.
 
-### Planned: mixed NVLink and RDMA paths
-Data needed by several ranks of an NVLink domain should cross the network once: one rank reads it over RDMA and the
-kernel copies it to the others over NVLink (or the reverse: it is written over RDMA, then forwarded). Before the
-edge-based model, `computeNvlinkPlan` (processgroup.cc, removed in c57c8f4) computed such a plan (gateway reads and
-local copies), but it was never executed. Plan:
-1. A proxy pass before the kernel / RDMA split: the ranks of a domain exchange their incoming remote edges and group
-   them by source node. Each group gets a proxy among the ranks that need the data, preferably the one with the
-   same local index as the source (which pairs NICs on the same rail), and becomes one RDMA edge (source to the
-   proxy's output) plus kernel edges from the proxy's output to the other ranks, which the graph variants then
-   handle as usual.
-2. Kernel: a source filled over RDMA waits for a flag written by the CPU thread (a loopback RDMA write of the step
-   value into GPU memory once the read has completed, as `writeCpuOut` does for the all-gather). For graphs where
-   other ranks read the proxy's output, the proxy's kernel passes the signal on.
-3. Pipelining: large transfers in chunks, with per-chunk flags checked in the copy engine's chunk loop (rather than
-   one edge per chunk, given the per-edge code size).
-4. Tuning runs the kernel without the CPU thread, so tuning kernels must treat nodes filled over RDMA as filled.
-5. Later: the write variant (the source writes the data and the flag into the proxy's memory).
+### Mixed NVLink and RDMA paths: next steps
+The proxy pass (compile phase step 7) sends data needed by several ranks of an NVLink domain over the network once.
+(Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in c57c8f4, computed a similar plan
+with gateway reads and local copies, but it was never executed.) Next:
+1. Pipelining: large proxied transfers in chunks, with a signal per chunk checked in the copy engine's chunk loop
+   (rather than one edge per chunk, given the per-edge code size), so that the NVLink copies overlap the RDMA read.
+2. The write variant: the source writes the data and the signal into the proxy's memory.
+3. An explicit flush before the signal (see Correctness).
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`

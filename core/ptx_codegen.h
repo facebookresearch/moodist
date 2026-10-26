@@ -37,8 +37,10 @@ struct KernelHandle {
   size_t profilingCountdown = 0;
 };
 
+// The copy kernel of an op on this rank. With tuning, the kernel does not wait for the CPU thread's signals that
+// nodes have been filled over RDMA (tuning launches run without the CPU thread).
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,
-    const compile_op::Graph& graph, compile_op::CompileContext& ctx);
+    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning);
 
 // Return the PTX target string (e.g. "sm_90a") for the given compute capability.
 const char* computeTarget(int computeMajor, int computeMinor);

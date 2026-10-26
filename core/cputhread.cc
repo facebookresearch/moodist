@@ -5665,11 +5665,15 @@ struct CpuThreadImpl {
     Vector<bool> remoteInputListReady;
 
     Vector<CustomOpDescriptor::IbRead> reads;
+    // Per signal index: parts of the read that are not done yet
+    Vector<size_t> signalPartsLeft;
 
     size_t liveReads = 0;
     std::array<size_t, maxDevices> deviceLiveReads{};
 
     static constexpr size_t numParallel = 2;
+    // Reads of at least this size are split into one part per NIC
+    static constexpr size_t splitBytes = 4 << 20;
     const size_t numDevices = self.devices.size();
 
     Vector<MemoryRegistration*> outputMrs;
@@ -5705,7 +5709,9 @@ struct CpuThreadImpl {
 
       uintptr_t localAddress = ot->data() + read.outputOffset;
 
+      int32_t signal = read.signalIndex;
       if (read.bytes == 0) {
+        partDone(signal);
         return;
       }
 
@@ -5715,11 +5721,21 @@ struct CpuThreadImpl {
       auto key = it.rkey;
       auto& dev = self.devices[di];
       self.readData(dev, source, (void*)localAddress, outputMrs[read.outputIndex]->mrs[di]->lkey, (void*)sourceAddress,
-          key[di], read.bytes, self.makeCallback([this, di, source]() {
+          key[di], read.bytes, self.makeCallback([this, di, signal]() {
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
             --deviceLiveReads[di];
+            partDone(signal);
           }));
+    }
+
+    // A part of a read is done: once all parts of a read with a signal index are, signal the copy kernel, which
+    // waits for the data in cpuOutBuffer slot 16 + signal (a loopback RDMA write of the step value; the same
+    // pattern as the all-gather's chunk signals).
+    void partDone(int32_t signal) {
+      if (signal >= 0 && --signalPartsLeft.at(signal) == 0) {
+        self.writeCpuOut(concurrencyIndex, 16 + signal, 0);
+      }
     }
 
     void step() {
@@ -5842,7 +5858,25 @@ struct CpuThreadImpl {
         }
       }
 
-      reads = op->ibReads;
+      for (const auto& r : op->ibReads) {
+        size_t parts = r.bytes >= splitBytes ? numDevices : 1;
+        size_t partBytes = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
+        if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
+          signalPartsLeft.resize(r.signalIndex + 1);
+        }
+        size_t offset = 0;
+        do {
+          auto part = r;
+          part.inputOffset += offset;
+          part.outputOffset += offset;
+          part.bytes = std::min(partBytes, r.bytes - offset);
+          reads.push_back(part);
+          if (r.signalIndex >= 0) {
+            ++signalPartsLeft[r.signalIndex];
+          }
+          offset += part.bytes;
+        } while (offset < r.bytes);
+      }
       std::ranges::shuffle(reads, getRng());
 
       if (params.anyCuda) {

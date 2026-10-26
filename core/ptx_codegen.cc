@@ -627,7 +627,7 @@ KernelMappedBuffers mapn(size_t memoryKey, compile_op::CompileContext& ctx, std:
 // This kernel runs in the remote memory synchronization domain.
 
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,
-    const compile_op::Graph& graph, compile_op::CompileContext& ctx) {
+    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning) {
   using namespace ptx;
 
   uint32_t blockSize = config.blockSize;
@@ -898,6 +898,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     Vector<Edge> localCopies;
 
     for (auto& v : graph.cudaEdges) {
+      if (v.sources.empty()) {
+        // Relay edge: this rank's CPU thread fills the destination over RDMA
+        CHECK(v.rdmaSignal >= 0 && v.destinations.size() == 1);
+        CHECK(v.executorRank == rank && v.destinations[0].rank == rank);
+        localCopies.push_back(v);
+        continue;
+      }
       CHECK(v.sources.size() == 1);
       CHECK(v.destinations.size() >= 1);
       auto& src = v.sources[0];
@@ -933,6 +940,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     bool hasRemoteReads = false;
     bool hasRemoteWrites = false;
     for (const Edge& e : localCopies) {
+      if (e.sources.empty()) {
+        nowaits = false; // a relay edge waits for the CPU thread
+      }
       for (const Node& n : e.sources) {
         if (!n.filled) {
           nowaits = false;
@@ -1043,6 +1053,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     };
 
+    // The depFilled slot of node `id` for this block on this rank: >= stepValue once the node has been filled
+    auto depFilledAddr = [&](uint64_t id) {
+      auto it = std::ranges::find(localNodes, id);
+      CHECK(it != localNodes.end());
+      return concurrency(depFilled.local) +
+             widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex));
+    };
+
     // Whether another edge reads one of e's destination nodes (e.g. the next rank of a ring), and so waits for
     // e to be signaled as done.
     auto hasDependents = [&](const Edge& e) {
@@ -1140,12 +1158,37 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
         u32 nextNodeOffset = 0;
         for (const Edge& e : localCopies) {
+          u32 nodeoffset = nextNodeOffset;
+          nextNodeOffset += e.destinations.size();
+
+          if (e.sources.empty()) {
+            // Relay edge: wait for the CPU thread's signal that the RDMA read into the destination node has
+            // completed (cpuOutBuffer slot 16 + rdmaSignal), then mark the node as filled. Nothing to copy, so
+            // thread 0 alone handles it.
+            IF_D(threadIndex == 0) {
+              IF(ld_global_relaxed_sys_u32(depFilledAddr(e.destinations[0].id)) == stepValue) {
+                numDone += 1;
+              }
+              ELSE {
+                u32 ready = 1;
+                if (!tuning) {
+                  u64 flagAddr = concurrency(group->cpuOutBuffer) + sizeof(uint32_t) * (16 + e.rdmaSignal);
+                  IF(ld_global_relaxed_sys_u32(flagAddr) < stepValue) {
+                    ready = 0;
+                  }
+                }
+                IF(ready != 0) {
+                  signalFilled(e);
+                  numDone += 1;
+                }
+              }
+            }
+            continue;
+          }
+
           CHECK(e.sources.size() == 1);
           CHECK(e.destinations.size() >= 1);
           auto& src = e.sources[0];
-
-          u32 nodeoffset = nextNodeOffset;
-          nextNodeOffset += e.destinations.size();
 
           Label skip;
           Label sync;
@@ -1153,23 +1196,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           IF_D(threadIndex == 0) {
             u32 ready = 1;
             if (!src.filled) {
-              auto it = std::ranges::find(localNodes, src.id);
-              CHECK(it != localNodes.end());
-              IF(ld_global_relaxed_sys_u32(concurrency(depFilled.local) +
-                                           widen(sizeof(uint32_t) * ((it - localNodes.begin()) +
-                                                                        localNodes.size() * blockIndex))) < stepValue) {
+              IF(ld_global_relaxed_sys_u32(depFilledAddr(src.id)) < stepValue) {
                 ready = 0;
               }
             }
 
             IF(ready != 0) {
-              auto& dst0 = e.destinations[0];
-              auto it = std::ranges::find(localNodes, dst0.id);
-              CHECK(it != localNodes.end());
-              IF(ld_global_relaxed_sys_u32(
-                     concurrency(depFilled.local) +
-                     widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex))) ==
-                  stepValue) {
+              IF(ld_global_relaxed_sys_u32(depFilledAddr(e.destinations[0].id)) == stepValue) {
                 numDone += 1;
               }
               ELSE {
@@ -1182,7 +1215,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           srcaddr = getaddr(src);
           setdst(e, nodeoffset, dstaddrs);
           bytes = e.bytes;
-          if (hasRemoteReads) {
+          // A source written by another agent (a peer GPU, or a NIC for nodes filled over RDMA): acquire before
+          // reading it
+          if (hasRemoteReads || !src.filled) {
             IF_D(threadIndex == 0) {
               fence_acquire_sys();
             }

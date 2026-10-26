@@ -338,10 +338,13 @@ struct CustomOpDescriptor {
     size_t inputOffset;
     size_t outputOffset;
     size_t bytes;
+    // >= 0: once the read has completed, write the step value into cpuOutBuffer slot 16 + signalIndex, where the
+    // copy kernel waits for it (the proxy read of a mixed NVLink + RDMA op)
+    int32_t signalIndex = -1;
 
     template<typename X>
     void serialize(X& x) {
-      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes);
+      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes, signalIndex);
     }
   };
 

@@ -54,10 +54,14 @@ struct Graph {
     size_t bytes;
     uint32_t cellIndex;
     uint32_t executorRank;
+    // >= 0 for the two edges of a proxied transfer on the proxy rank (see proxyRemoteEdges in compile_op.cc):
+    // the RDMA edge, whose read signals flag rdmaSignal once done, and the relay edge (no sources, the same
+    // destination), with which the kernel waits for that flag and then marks the destination as filled.
+    int32_t rdmaSignal = -1;
 
     template<typename X>
     void serialize(X& x) {
-      x(id, sources, destinations, bytes, cellIndex, executorRank);
+      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal);
     }
   };
 
