@@ -1,16 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// compile_op implementation
-// See compile_op.h for design overview
+// compile_op implementation; overview in docs/internals/compile_op.md
 //
-// Seven-phase protocol:
 // Phase 1: Exchange logical mappings (sender → receiver)
 // Phase 2: Overlap resolution via cell decomposition (local)
 // Phase 3: Send read requests (receiver → sender)
 // Phase 4: Process requests, generate copies (sender)
-// Phase 5: Finalize and generate reads (receiver)
-// Phase 6: Compute allLocal flag and build reverse mapping (localInputProvides)
-// Phase 7: Multicast setup (source-side analysis, create per-region multicast objects)
+// Phase 5: Build the edges (receiver), exchange node ids
+// Then: kernel / RDMA split, graph variants (GraphBuilder), kernel tuning (tuneKernels)
 
 #include "compile_op.h"
 #include "api/tensor_ptr.h"
@@ -512,15 +509,6 @@ struct GraphBuilder {
     for (auto& x : graph.remoteCudaTensorMappings) {
       CHECK(x.stride != 0);
     }
-
-    // for (size_t i : indices(op.localCudaTensorMappings)) {
-    //   auto& v = op.localCudaTensorMappings[i];
-    //   log.info(" local slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
-    // }
-    // for (size_t i : indices(op.remoteCudaTensorMappings)) {
-    //   auto& v = op.remoteCudaTensorMappings[i];
-    //   log.info(" remote slot %d: %d %d %d %d\n", i, v.rank, v.tensorIndex, v.destinationSlot, v.stride);
-    // }
   }
 
   void finalize() {
@@ -737,67 +725,47 @@ struct CompileOpConstructor {
     KernelConfig config;
   };
 
-  Setting tuneKernels(Vector<Graph> graphs, std::string target) {
+  // A comma separated list from the environment variable `name` (or `defaultValue` if unset). Every rank must
+  // use the same list, as tuning is collective.
+  Vector<std::string> agreedEnvList(const char* name, const char* defaultValue) {
+    std::string value = defaultValue;
+    if (const char* env = std::getenv(name)) {
+      value = env;
+    }
+    for (size_t i : range(size)) {
+      ctx.send(i, value);
+    }
+    bool mismatch = false;
+    for (size_t i : range(size)) {
+      std::string s;
+      ctx.receive(i, s);
+      mismatch |= s != value;
+    }
+    REQUIRE(!mismatch, "compile_op: %s differs between ranks (this rank: '%s')", name, value);
+    Vector<std::string> r;
+    for (size_t pos = 0; pos <= value.size();) {
+      size_t end = std::min(value.find(',', pos), value.size());
+      r.push_back(value.substr(pos, end - pos));
+      pos = end + 1;
+    }
+    return r;
+  }
+
+  Setting tuneKernels(Vector<Graph> graphs, const Vector<std::string>& copyEngines, std::string target) {
     auto start = std::chrono::steady_clock::now();
     Vector<KernelConfig> configs;
-    // for (uint32_t blockSize : {64, 128, 256, 448, 896}) {
-    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 224}) {
-    //     KernelConfig config;
-    //     config.copyEngine = "lockstep";
-    //     config.blockSize = blockSize;
-    //     config.sharedMemory = sharedSize;
-    //     configs.push_back(config);
-    //   }
-    // }
-
-    // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-    //   for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-    //     KernelConfig config;
-    //     config.copyEngine = "buffered";
-    //     config.blockSize = blockSize;
-    //     config.sharedMemory = sharedSize;
-    //     configs.push_back(config);for (uint32_t blockSize : {32, 64, 128, 256}) {
-    //   }
-    // }
-
-    // for (uint32_t blockSize : {32, 64, 128, 256, 512, 1024}) {
-    //    for (uint32_t sharedSize : {1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-    // for (uint32_t blockSize : {32, 64, 128, 256}) {
-    for (uint32_t blockSize : {128, 256}) {
-      // for (uint32_t blockSize : {288, 576}) {
-      // for (uint32_t blockSize : {256}) {
-      //  for (uint32_t blockSize : {1024}) {
-      // for (uint32_t blockSize : {864}) {
-      //  for (uint32_t sharedSize : {1024 * 1, 1024 * 2, 1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 *
-      //  226}) { for (uint32_t sharedSize : {1024 * 32, 1024 * 64, 1024 * 226}) {
-      // for (uint32_t sharedSize : {1024 * 4, 1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 226}) {
-      for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
-        // for (uint32_t sharedSize : {1024 * 1}) {
-        //  for (uint32_t blockSize : {32}) {
-        //    for (uint32_t sharedSize : {1024 * 16}) {
-        KernelConfig config;
-        // config.copyEngine = "simple";
-        config.copyEngine = "grouped";
-        config.blockSize = blockSize;
-        config.sharedMemory = sharedSize;
-        configs.push_back(config);
-      }
-    }
-
-    {
-      auto tmp = configs;
-      configs.clear();
-      for (KernelConfig c : tmp) {
-        c.gridSize = 8;
-        configs.push_back(c);
-        c.gridSize = 12;
-        configs.push_back(c);
-        c.gridSize = 16;
-        configs.push_back(c);
-        // c.gridSize = 32;
-        // configs.push_back(c);
-        // c.gridSize = 64;
-        // configs.push_back(c);
+    for (const std::string& copyEngine : copyEngines) {
+      for (uint32_t blockSize : {128, 256}) {
+        for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
+          for (uint32_t gridSize : {8, 12, 16}) {
+            KernelConfig config;
+            config.copyEngine = copyEngine;
+            config.blockSize = blockSize;
+            config.sharedMemory = sharedSize;
+            config.gridSize = gridSize;
+            configs.push_back(config);
+          }
+        }
       }
     }
 
@@ -811,20 +779,14 @@ struct CompileOpConstructor {
       }
     }
 
-    HashMap<std::string, Vector<int>> ranksPerTarget;
-
+    // Timings are combined per setting index below, so every rank must have the same settings.
     for (size_t i : range(size)) {
-      ctx.send(i, settings.size(), target);
+      ctx.send(i, settings.size());
     }
     for (size_t i : range(size)) {
       size_t n;
-      std::string ntarget;
-      ctx.receive(i, n, ntarget);
+      ctx.receive(i, n);
       CHECK(settings.size() == n);
-      ranksPerTarget[ntarget].push_back(i);
-    }
-    for (auto& v : ranksPerTarget) {
-      std::ranges::sort(v.second);
     }
 
     Vector<std::shared_ptr<KernelHandle>> sources;
@@ -840,41 +802,6 @@ struct CompileOpConstructor {
     for (const auto& h : sources) {
       kernels.push_back(compileKernelPtx(h->ptx, "compile_op_copy"));
     }
-
-    // {
-    //   Vector<std::thread> threads;
-    //   kernels.resize(sources.size());
-    //   for (size_t n : indices(sources)) {
-    //     size_t i = (rank + n) % sources.size();
-    //     threads.emplace_back([&, i] {
-    //       CHECK_CU(cuCtxSetCurrent(group->cuContext));
-    //       kernels[i] = compileKernelPtx(sources[i], "compile_op_copy");
-    //     });
-    //   }
-    //   for (auto& v : threads) {
-    //     v.join();
-    //   }
-    // }
-
-    // {
-    //   auto& ranks = ranksPerTarget[target];
-    //   auto myIt = std::ranges::find(ranks, rank);
-    //   CHECK(myIt != ranks.end());
-    //   for (size_t i = myIt - ranks.begin(); i < sources.size(); i += ranks.size()) {
-    //     std::string obj = compilePtxToCubin(sources[i]);
-    //     for (size_t r : ranks) {
-    //       ctx.send(r, i, obj);
-    //     }
-    //   }
-    //   for (size_t i : indices(sources)) {
-    //     uint32_t sourceRank = ranks[i % ranks.size()];
-    //     size_t ni;
-    //     std::string obj;
-    //     ctx.receive(sourceRank, ni, obj);
-    //     CHECK(ni == i);
-    //     kernels.push_back(compileKernelCubin(obj, "compile_op_copy"));
-    //   }
-    // }
 
     log.info("Compiled %d kernels in %gs\n", kernels.size(), seconds(std::chrono::steady_clock::now() - start));
     start = std::chrono::steady_clock::now();
@@ -979,10 +906,6 @@ struct CompileOpConstructor {
       for (size_t i : range(nRuns)) {
         float t = 0.0f;
         CHECK_CU(cuEventElapsedTime(&t, events[i].first, events[i].second));
-
-        // // t *= 1.0f + (0.0025f * config.gridSize) + (0.0001f * config.blockSize);
-        // t *= 1.0f + (0.0005f * config.gridSize) + (0.000005f * config.blockSize);
-
         auto ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<float, std::ratio<1, 1000>>(t));
         if (i == 0 || ns < timing) {
@@ -1022,517 +945,6 @@ struct CompileOpConstructor {
     return settings.at(index);
   }
 
-  // TuningResult tuneCopyKernel(CompileContext& ctx, SizeCategory sizeCat) {
-  //   static constexpr int depths[] = {1, 2, 4, 8, 16, 32};
-  //   static constexpr size_t blockSizes[] = {128, 256, 512, 768, 1024};
-  //   size_t gridSize = 8;
-  //   if (auto* env = std::getenv("MOODIST_COPY_GRID_SIZE")) {
-  //     int gs = atoi(env);
-  //     if (gs >= 1 && gs <= 128) {
-  //       gridSize = gs;
-  //     }
-  //   }
-  //   static constexpr int warmupIters = 2;
-  //   static constexpr int measuredIters = 6;
-
-  //   const Group* group = ctx.group;
-
-  //   const size_t copyBytes = representativeSize(sizeCat);
-  //   const size_t rank = group->rank;
-  //   const size_t size = group->size;
-  //   CUdevice cuDevice = group->cuDevice;
-  //   IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  //   bool verbose = false;
-  //   if (auto* env = std::getenv("MOODIST_TUNE_VERBOSE")) {
-  //     verbose = !strcmp(env, "1");
-  //   }
-
-  //   if (verbose) {
-  //     log.info("tuning copy kernel for size category %d (%zu bytes), rank %zu/%zu...\n", static_cast<int>(sizeCat),
-  //         copyBytes, rank, size);
-  //   }
-
-  //   // Get compute target for PTX generation
-  //   int computeMajor = 0, computeMinor = 0;
-  //   CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
-  //   CHECK_CU(cuDeviceGetAttribute(&computeMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuDevice));
-  //   const char* target = computeTarget(computeMajor, computeMinor);
-
-  //   // Allocate synthetic src and dst buffers
-  //   CUdeviceptr syntheticSrc = 0, syntheticDst = 0;
-  //   CHECK_CU(cuMemAlloc(&syntheticSrc, copyBytes));
-  //   CHECK_CU(cuMemAlloc(&syntheticDst, copyBytes));
-  //   CHECK_CU(cuMemsetD8(syntheticSrc, 0, copyBytes));
-  //   CHECK_CU(cuMemsetD8(syntheticDst, 0, copyBytes));
-
-  //   CustomOpDescriptor op;
-  //   CustomOpDescriptor::Edge edge1;
-  //   edge1.sources.emplace_back(nodeId(rank, 0), rank, 0, 0, true);
-  //   edge1.destinations.emplace_back(nodeId((rank + 1) % size, 1), (rank + 1) % size, 1, 0, false);
-  //   edge1.bytes = copyBytes;
-  //   edge1.cellIndex = 0;
-  //   edge1.id = (1ull << 63) + rank;
-  //   CustomOpDescriptor::Edge edge2;
-  //   edge2.sources.emplace_back(nodeId((rank + size - 1) % size, 0), (rank + size - 1) % size, 0, 0, true);
-  //   edge2.destinations.emplace_back(nodeId(rank, 1), rank, 1, 0, false);
-  //   edge2.bytes = copyBytes;
-  //   edge2.cellIndex = 0;
-  //   edge2.id = (1ull << 63) + (rank + size - 1) % size;
-
-  //   op.cudaEdges.push_back(edge1);
-  //   if (size != 1) {
-  //     op.cudaEdges.push_back(edge2);
-  //   }
-
-  //   for (size_t i : indices(op.cudaEdges)) {
-  //     const auto& e = op.cudaEdges[i];
-  //     std::string srcStr, dstStr;
-  //     for (const auto& s : e.sources) {
-  //       if (!srcStr.empty()) {
-  //         srcStr += ", ";
-  //       }
-  //       srcStr += fmt::sprintf("r%u:t%u+%zu", s.rank, s.tensorIndex, s.offset);
-  //     }
-  //     for (const auto& d : e.destinations) {
-  //       if (!dstStr.empty()) {
-  //         dstStr += ", ";
-  //       }
-  //       dstStr += fmt::sprintf("r%u:t%u+%zu", d.rank, d.tensorIndex, d.offset);
-  //     }
-  //     log.info(" tuning cudaEdge[%zu]: %zuB cell=%u [%s] -> [%s]\n", i, e.bytes, e.cellIndex, srcStr, dstStr);
-  //   }
-
-  //   op.inputs.push_back(copyBytes);
-  //   op.outputs.push_back(copyBytes);
-
-  //   constructCudaTensorMappings(op);
-
-  //   Vector<uintptr_t> tensors;
-  //   tensors.push_back(syntheticSrc);
-  //   tensors.push_back(syntheticDst);
-
-  //   Vector<uintptr_t> mappedAddrs(op.remoteCudaTensorMappings.size());
-  //   for (size_t i : indices(mappedAddrs)) {
-  //     auto& m = op.remoteCudaTensorMappings[i];
-  //     size_t peerIndex = group->getPeerIndex(m.rank);
-  //     ipcMapper->requestAddress(peerIndex, tensors.at(m.tensorIndex), copyBytes, &mappedAddrs[i]);
-  //   }
-  //   ipcMapper->wait();
-
-  //   // Create stream and events for timing
-  //   CUstream stream = nullptr;
-  //   CHECK_CU(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, 0));
-  //   Vector<CUevent> events; // pairs: [start0, stop0, start1, stop1, ...]
-
-  //   auto createEvents = [&](int count) {
-  //     while ((int)events.size() < count * 2) {
-  //       CUevent e = nullptr;
-  //       CHECK_CU(cuEventCreate(&e, CU_EVENT_DEFAULT));
-  //       events.push_back(e);
-  //     }
-  //   };
-
-  //   uint32_t stepValue = 1;
-
-  //   TuningResult best;
-  //   best.config.gridSize = gridSize;
-
-  //   auto tuneStart = std::chrono::steady_clock::now();
-
-  //   // Build candidate configs
-  //   Vector<CopyKernelConfig> candidates;
-
-  //   // Read env vars for fixed-value settings (applied to all relevant candidates)
-  //   int envWarppipeDepth = 0;
-  //   if (auto* env = std::getenv("MOODIST_WARPPIPE_DEPTH")) {
-  //     int d = atoi(env);
-  //     if (d >= 0 && d <= 32) {
-  //       envWarppipeDepth = d;
-  //     }
-  //   }
-
-  //   // Register pipeline variants: loadOp × depth × blockSize
-  //   static constexpr const char* loadOps[] = {"cv", "cs", "nc"};
-  //   for (const char* loadOp : loadOps) {
-  //     for (int depth : depths) {
-  //       for (size_t bs : blockSizes) {
-  //         candidates.push_back(CopyKernelConfig::reg(depth, bs, gridSize, loadOp));
-  //       }
-  //     }
-  //   }
-
-  //   // Bulk copy engine variants: blockSize × chunkSize × dmaMode × bulkMode
-  //   {
-  //     int maxSmem = 0;
-  //     CHECK_CU(cuDeviceGetAttribute(&maxSmem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
-  //     // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688};
-  //     static constexpr size_t chunkSizes[] = {114688};
-  //     static constexpr size_t bulkBlockSizes[] = {32, 64, 128, 256, 512, 1024};
-  //     for (size_t chunk : chunkSizes) {
-  //       for (size_t bs : bulkBlockSizes) {
-  //         size_t numWarps = bs / 32;
-
-  //         // Double-buffered: total smem = 2 * chunkSize + 2 * numWarps * 8
-  //         {
-  //           size_t totalSmem = 2 * chunk + 2 * numWarps * 8;
-  //           if (totalSmem <= (size_t)maxSmem) {
-  //             // Warp-leader mode: each warp leader DMAs chunk/numWarps bytes; must be multiple of 16
-  //             if (chunk % (numWarps * 16) == 0) {
-  //               candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, false));
-  //               candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, true, true));
-  //             }
-  //             // All-threads mode: each thread DMAs chunk/bs bytes; must be multiple of 16
-  //             if (chunk % (bs * 16) == 0) {
-  //               candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, false));
-  //               candidates.push_back(CopyKernelConfig::bulk(bs, gridSize, chunk, false, true));
-  //             }
-  //           }
-  //         }
-
-  //         // Warppipe: total smem = chunkSize + numWarps * 8
-  //         // Warppipe uses single-lane DMA (warp leader always), so no dmaMode sweep.
-  //         // stageChunk = chunk/numWarps must divide cleanly for 16-byte aligned DMAs.
-  //         {
-  //           size_t totalSmem = chunk + numWarps * 8;
-  //           if (totalSmem <= (size_t)maxSmem && (chunk * 2) % (numWarps * 1024) == 0) {
-  //             static constexpr int pipeDepths[] = {1, 2, 4, 8, 16};
-  //             // static constexpr int pipeDepths[] = {1};
-  //             for (int depth : pipeDepths) {
-  //               if (envWarppipeDepth == 0 || envWarppipeDepth == depth) {
-  //                 candidates.push_back(CopyKernelConfig::warppipe(bs, gridSize, chunk * 2, depth));
-  //               }
-  //             }
-  //           }
-  //         }
-
-  //         // Nbuf: single buffer + readBufs mbarriers per warp
-  //         {
-  //           if ((chunk * 2) % (numWarps * 1024) == 0) {
-  //             for (int rb = 2; rb <= 4; rb++) {
-  //               for (int wb = 0; wb <= 4; wb++) {
-  //                 size_t totalSmem = chunk + numWarps * rb * 8;
-  //                 if (totalSmem <= (size_t)maxSmem) {
-  //                   candidates.push_back(CopyKernelConfig::nbuf(bs, gridSize, chunk * 2, rb, wb));
-
-  //                   if (bs >= 64) {
-  //                     CopyKernelConfig c;
-  //                     c.copyEngine = "bulk";
-  //                     c.blockSize = bs;
-  //                     c.gridSize = gridSize;
-  //                     c.bulkChunkSize = chunk * 2;
-  //                     c.bulkMode = "nbuf2";
-  //                     c.nbufReadCount = rb;
-  //                     c.nbufWriteCount = wb;
-  //                     c.bulkSkipWriteBack = false;
-  //                     candidates.push_back(c);
-  //                   }
-  //                 }
-  //               }
-  //             }
-  //           }
-  //         }
-  //       }
-  //     }
-
-  //     // Flexbuf: split block into read group + write group, each bulk or reg
-  //     {
-  //       static constexpr int flexNumBuffers[] = {2, 4, 8, 16, 32};
-  //       static constexpr int regThreadCounts[] = {32, 64, 128, 256, 512};
-  //       for (size_t chunk : chunkSizes) {
-  //         for (int numBuffers : flexNumBuffers) {
-  //           size_t totalSmem = chunk + numBuffers * 8;
-  //           if (totalSmem > (size_t)maxSmem) {
-  //             continue;
-  //           }
-  //           // bulk-read + bulk-write
-  //           // for (int readParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
-  //           //   for (int writeParallel : {1, 2, 3, 4, 5, 6, 7, 8}) {
-  //           //     candidates.push_back(CopyKernelConfig::flexbuf(
-  //           //         gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
-  //           //   }
-  //           // }
-  //           for (int readParallel : {1, 2, 4, 8, 16}) {
-  //             for (int writeParallel : {1, 2, 4, 8, 16}) {
-  //               candidates.push_back(CopyKernelConfig::flexbuf(
-  //                   gridSize, chunk * 2, "bulk", 32, readParallel, "bulk", 32, writeParallel, numBuffers));
-  //               if (candidates.back().blockSize > 1024) {
-  //                 candidates.pop_back();
-  //               }
-  //               // for (int p : range(6)) {
-  //               //   candidates.push_back(CopyKernelConfig::flexbuf(
-  //               //       gridSize, chunk * 2, "reg", 32 * (1 << p), readParallel, "bulk", 32, writeParallel,
-  //               //       numBuffers));
-  //               //   if (candidates.back().blockSize > 1024) {
-  //               //     candidates.pop_back();
-  //               //   }
-  //               // }
-  //             }
-  //           }
-  //           // // bulk-read + reg-write
-  //           // for (int writeThreads : regThreadCounts) {
-  //           //   if (32 + writeThreads <= 1024) {
-  //           //     candidates.push_back(
-  //           //         CopyKernelConfig::flexbuf(gridSize, chunk, "bulk", 32, 1, "reg", writeThreads, 1,
-  //           numBuffers));
-  //           //   }
-  //           // }
-  //           // // reg-read + bulk-write
-  //           // for (int readThreads : regThreadCounts) {
-  //           //   if (readThreads + 32 <= 1024) {
-  //           //     candidates.push_back(
-  //           //         CopyKernelConfig::flexbuf(gridSize, chunk, "reg", readThreads, 1, "bulk", 32, 1, numBuffers));
-  //           //   }
-  //           // }
-  //         }
-  //       }
-  //     }
-  //   }
-
-  //   // Lockstep candidates
-  //   {
-  //     static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
-  //     bool lockstepMulticast = std::getenv("MOODIST_LOCKSTEP_MULTICAST") != nullptr;
-  //     for (size_t bs : lockstepBlockSizes) {
-  //       // candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, lockstepMulticast));
-  //       // static constexpr size_t chunkSizes[] = {8192, 16384, 32768, 65536, 98304, 114688, 229376};
-  //       static constexpr size_t chunkSizes[] = {1024 * 16};
-  //       for (size_t cs : chunkSizes) {
-  //         candidates.push_back(CopyKernelConfig::lockstep(gridSize, cs, bs, 1, 1, lockstepMulticast));
-  //       }
-  //     }
-  //   }
-  //   // {
-  //   //   static constexpr size_t lockstepBlockSizes[] = {64, 128, 192, 256, 512, 768};
-  //   //   for (size_t bs : lockstepBlockSizes) {
-  //   //     candidates.push_back(CopyKernelConfig::lockstep(gridSize, 229376, bs, 1, 1, false));
-  //   //     candidates.back().copyEngine = "lockstepg";
-  //   //   }
-  //   // }
-
-  //   // // Expand candidates into read + write variants, and optionally ring variants
-  //   // {
-  //   //   Vector<CopyKernelConfig> expanded;
-  //   //   expanded.reserve(candidates.size() * 4);
-  //   //   for (const auto& c : candidates) {
-  //   //     CopyKernelConfig read = c;
-  //   //     read.copyWrite = false;
-  //   //     expanded.push_back(read);
-  //   //     CopyKernelConfig write = c;
-  //   //     write.copyWrite = true;
-  //   //     expanded.push_back(write);
-  //   //     // CopyKernelConfig readRing = c;
-  //   //     // readRing.copyWrite = false;
-  //   //     // readRing.copyRing = true;
-  //   //     // expanded.push_back(readRing);
-  //   //     // CopyKernelConfig writeRing = c;
-  //   //     // writeRing.copyWrite = true;
-  //   //     // writeRing.copyRing = true;
-  //   //     // expanded.push_back(writeRing);
-  //   //   }
-  //   //   candidates = std::move(expanded);
-  //   // }
-
-  //   // Filter candidates by env vars
-  //   if (std::getenv("MOODIST_BULK_SKIP_WRITEBACK")) {
-  //     for (auto& c : candidates) {
-  //       c.bulkSkipWriteBack = true;
-  //     } // if (totalSmem > 48 * 1024) {
-  //       //   CHECK_CU(cuFuncSetAttribute(
-  //       //       op->tunedKernel->function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)totalSmem));
-  //       // }
-  //   }
-  //   if (auto* env = std::getenv("MOODIST_COPY_ENGINE")) {
-  //     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //                          [env](const CopyKernelConfig& c) {
-  //                            return strcmp(c.copyEngine, env) != 0;
-  //                          }),
-  //         candidates.end());
-  //   }
-  //   if (auto* env = std::getenv("MOODIST_COPY_BLOCK_SIZE")) {
-  //     size_t bs = atoi(env);
-  //     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //                          [bs](const CopyKernelConfig& c) {
-  //                            return c.blockSize != bs;
-  //                          }),
-  //         candidates.end());
-  //   }
-  //   if (auto* env = std::getenv("MOODIST_BULK_MODE")) {
-  //     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //                          [env](const CopyKernelConfig& c) {
-  //                            return c.bulkMode.has_value() && strcmp(c.bulkMode.value(), env) != 0;
-  //                          }),
-  //         candidates.end());
-  //   }
-  //   if (std::getenv("MOODIST_BULK_WRITEBACK")) {
-  //     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //                          [](const CopyKernelConfig& c) {
-  //                            return c.bulkWriteBack.has_value() && !c.bulkWriteBack.value();
-  //                          }),
-  //         candidates.end());
-  //   }
-  //   // if (auto* env = std::getenv("MOODIST_COPY_WRITE")) {
-  //   //   bool writeOnly = !strcmp(env, "1");
-  //   //   candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //   //                        [writeOnly](const CopyKernelConfig& c) {
-  //   //                          return c.copyWrite.value_or(false) != writeOnly;
-  //   //                        }),
-  //   //       candidates.end());
-  //   // }
-  //   if (auto* env = std::getenv("MOODIST_COPY_RING")) {
-  //     bool ringOnly = !strcmp(env, "1");
-  //     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-  //                          [ringOnly](const CopyKernelConfig& c) {
-  //                            return c.copyRing.value_or(false) != ringOnly;
-  //                          }),
-  //         candidates.end());
-  //   }
-
-  //   REQUIRE(!candidates.empty(), "No tuning candidates remain after env var filtering");
-
-  //   if (verbose) {
-  //     log.info("tuning: %zu candidates after env var filtering\n", candidates.size());
-  //   }
-
-  //   // Evaluate all candidates
-  //   Vector<float> candidateTimings(candidates.size());
-  //   for (auto& t : candidateTimings) {
-  //     t = INFINITY;
-  //   }
-  //   for (size_t ci : indices(candidates)) {
-  //     const auto& cfg = candidates[ci];
-
-  //     auto t0 = std::chrono::steady_clock::now();
-  //     std::string ptx = generateCopyKernelPtx(group, cfg, target, op, ctx);
-  //     double genSec = seconds(std::chrono::steady_clock::now() - t0);
-
-  //     if (auto* env = std::getenv("MOODIST_DUMP_TUNE_PTX"); env && !strcmp(env, "1")) {
-  //       fprintf(stderr, "=== PTX for %s ===\n%s\n=== END PTX ===\n", formatConfig(cfg).c_str(), ptx.c_str());
-  //     }
-
-  //     t0 = std::chrono::steady_clock::now();
-  //     CUmodule variantModule = nullptr;
-  //     char jitErrorLog[4096] = {};
-  //     CUjit_option jitOpts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
-  //     void* jitOptVals[] = {jitErrorLog, (void*)(uintptr_t)sizeof(jitErrorLog)};
-  //     CUresult jitErr = cuModuleLoadDataEx(&variantModule, ptx.c_str(), 2, jitOpts, jitOptVals);
-  //     double jitSec = seconds(std::chrono::steady_clock::now() - t0);
-  //     if (jitErr != CUDA_SUCCESS) {
-  //       if (verbose) {
-  //         log.info("  %s -> JIT failed (error %d), skipping\n", formatConfig(cfg), (int)jitErr);
-  //         if (jitErrorLog[0]) {
-  //           log.info("  ptxas: %s\n", jitErrorLog);
-  //         }
-  //       }
-  //       continue;
-  //     }
-
-  //     CUfunction fn = nullptr;
-  //     CHECK_CU(cuModuleGetFunction(&fn, variantModule, "compile_op_copy"));
-
-  //     auto run = [&]() {
-  //       stepValue += 0x1000;
-  //       CompileOpCopyParameters params;
-  //       params.stepValue = stepValue;
-  //       params.concurrencyIndex = 0;
-  //       std::array<void*, 3> kparams = {
-  //           &params, tensors.data(), mappedAddrs.data() ? mappedAddrs.data() : (void*)&params};
-  //       CHECK_CU(cuLaunchKernel(fn, cfg.gridSize, 1, 1, cfg.blockSize, 1, 1, 0, stream, kparams.data(), nullptr));
-  //     };
-
-  //     // Warmup
-  //     for (int i = 0; i < warmupIters; i++) {
-  //       run();
-  //     }
-  //     CHECK_CU(cuStreamSynchronize(stream));
-
-  //     // Measured runs: record all events without synchronizing
-  //     t0 = std::chrono::steady_clock::now();
-  //     createEvents(measuredIters);
-  //     for (int iter : range(measuredIters)) {
-  //       CHECK_CU(cuEventRecord(events[iter * 2], stream));
-  //       for (int n : range(4)) {
-  //         run();
-  //       }
-  //       CHECK_CU(cuEventRecord(events[iter * 2 + 1], stream));
-  //     }
-  //     CHECK_CU(cuStreamSynchronize(stream));
-  //     double measureSec = seconds(std::chrono::steady_clock::now() - t0);
-
-  //     // Query elapsed times
-  //     float bestMs = INFINITY;
-  //     for (int iter = 0; iter < measuredIters; iter++) {
-  //       float ms = 0.0f;
-  //       CHECK_CU(cuEventElapsedTime(&ms, events[iter * 2], events[iter * 2 + 1]));
-  //       if (ms < bestMs) {
-  //         bestMs = ms;
-  //       }
-  //     }
-
-  //     if (verbose) {
-  //       log.info("  %s -> %.3f ms  (gen=%.3fs jit=%.3fs measure=%.3fs)\n", formatConfig(cfg), bestMs, genSec, jitSec,
-  //           measureSec);
-  //     }
-
-  //     candidateTimings[ci] = bestMs;
-
-  //     cuModuleUnload(variantModule);
-  //   }
-
-  //   // Cleanup
-  //   for (auto& e : events) {
-  //     cuEventDestroy(e);
-  //   }
-  //   cuStreamDestroy(stream);
-  //   // cuMemFree(syntheticDst);
-  //   // cuMemFree(syntheticSrc);
-
-  //   // Collective decision: exchange timings across all ranks, sum them,
-  //   // and pick the candidate with the lowest total time.
-  //   {
-  //     ctx.barrier();
-
-  //     // Send our timings to all ranks
-  //     for (size_t destRank : range(size)) {
-  //       ctx.send(destRank, candidateTimings);
-  //     }
-
-  //     // Receive timings from all ranks and sum
-  //     Vector<float> summedTimings(candidates.size());
-  //     for (auto& t : summedTimings) {
-  //       t = 0.0f;
-  //     }
-  //     for (size_t i : range(size)) {
-  //       Vector<float> peerTimings;
-  //       ctx.receive(i, peerTimings);
-  //       CHECK(peerTimings.size() == candidates.size());
-  //       for (size_t ci : indices(candidates)) {
-  //         summedTimings[ci] += peerTimings[ci];
-  //       }
-  //     }
-
-  //     // Pick the best from summed timings
-  //     for (size_t ci : indices(candidates)) {
-  //       if (summedTimings[ci] < best.ms) {
-  //         best.ms = summedTimings[ci];
-  //         best.config = candidates[ci];
-  //       }
-  //     }
-  //     // Convert summed timing to per-rank average for reporting
-  //     best.ms /= size;
-
-  //     ctx.barrier();
-  //   }
-
-  //   if (best.config.copyEngine == nullptr) {
-  //     throw std::runtime_error("Tuning failed to find any working copy kernel");
-  //   }
-
-  //   double elapsed = seconds(std::chrono::steady_clock::now() - tuneStart);
-  //   log.info("tuning complete: best %s (%.3f ms) in %.1fs\n", formatConfig(best.config), best.ms, elapsed);
-
-  //   return best;
-  // }
   std::shared_ptr<CustomOpDescriptor> compile(DType dtype, std::span<const api::TensorRegion> inputs,
       std::span<const api::TensorRegion> outputs, ReduceOp reduce, bool cpuSync) {
     const Group* group = ctx.group;
@@ -2038,10 +1450,6 @@ struct CompileOpConstructor {
           inputCopies.push_back(std::move(copy));
 
           inputCopyDedup.push_back({key, copyIndex});
-
-          // log.debug("compile_op: input copy: inputIndex=%u, offset=[%s], shape=[%s], container=[%s]\n",
-          // req.inputIndex,
-          //     fmtCoord(relOffset).c_str(), fmtCoord(req.shape).c_str(), fmtCoord(inp.shape).c_str());
         }
 
         resp.tensorIndex = copyIndex;
@@ -2430,39 +1838,29 @@ struct CompileOpConstructor {
     //   read        every destination rank reads its chunks itself
     //   ring_read   the destinations of a chunk form a chain, each reading it from the previous one
     //   ring_write  the same chain, each rank writing the chunk to the next one
-    {
-      std::string graphNames = "multicast";
-      if (const char* env = std::getenv("MOODIST_COMPILE_OP_GRAPHS")) {
-        graphNames = env;
-      }
-      for (size_t i : range(size)) {
-        ctx.send(i, graphNames);
-      }
-      bool mismatch = false;
-      for (size_t i : range(size)) {
-        std::string s;
-        ctx.receive(i, s);
-        mismatch |= s != graphNames;
-      }
-      REQUIRE(!mismatch, "compile_op: MOODIST_COMPILE_OP_GRAPHS differs between ranks (this rank: '%s')", graphNames);
-      for (size_t pos = 0; pos <= graphNames.size();) {
-        size_t end = std::min(graphNames.find(',', pos), graphNames.size());
-        std::string name = graphNames.substr(pos, end - pos);
-        pos = end + 1;
-        if (name == "multicast") {
-          graphs.push_back(buildMulticast(ictx, baseGraph));
-        } else if (name == "read") {
-          graphs.push_back(buildNothing(ictx, baseGraph));
-        } else if (name == "ring_read") {
-          graphs.push_back(buildRing(ictx, baseGraph, false));
-        } else if (name == "ring_write") {
-          graphs.push_back(buildRing(ictx, baseGraph, true));
-        } else {
-          REQUIRE(false,
-              "compile_op: unknown graph '%s' in MOODIST_COMPILE_OP_GRAPHS (expected multicast, read, ring_read or "
-              "ring_write)",
-              name);
-        }
+    // and the kernel copy engines, selected by MOODIST_COMPILE_OP_ENGINES (default "grouped"; see ptx_codegen.cc):
+    //   grouped, simple, buffered, lockstep
+    Vector<std::string> copyEngines = agreedEnvList("MOODIST_COMPILE_OP_ENGINES", "grouped");
+    for (const std::string& name : copyEngines) {
+      REQUIRE(name == "grouped" || name == "simple" || name == "buffered" || name == "lockstep",
+          "compile_op: unknown copy engine '%s' in MOODIST_COMPILE_OP_ENGINES (expected grouped, simple, buffered or "
+          "lockstep)",
+          name);
+    }
+    for (const std::string& name : agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast")) {
+      if (name == "multicast") {
+        graphs.push_back(buildMulticast(ictx, baseGraph));
+      } else if (name == "read") {
+        graphs.push_back(buildNothing(ictx, baseGraph));
+      } else if (name == "ring_read") {
+        graphs.push_back(buildRing(ictx, baseGraph, false));
+      } else if (name == "ring_write") {
+        graphs.push_back(buildRing(ictx, baseGraph, true));
+      } else {
+        REQUIRE(false,
+            "compile_op: unknown graph '%s' in MOODIST_COMPILE_OP_GRAPHS (expected multicast, read, ring_read or "
+            "ring_write)",
+            name);
       }
     }
 
@@ -2479,7 +1877,7 @@ struct CompileOpConstructor {
 
       const char* target = computeTarget(computeMajor, computeMinor);
 
-      Setting setting = tuneKernels(graphs, target);
+      Setting setting = tuneKernels(graphs, copyEngines, target);
 
       op->graph = setting.graph;
       op->config = setting.config;

@@ -53,7 +53,6 @@ struct Function {
   Reg reg(RegType type);
 
   // DSL register allocation state
-  // std::vector<int> freeRegs[4];
   int regHighWater[4] = {};
 
   // Label/branch target counters
@@ -535,21 +534,8 @@ void mov_b64(const Value& d, const Value& a);
 
 // Load
 void ld_param_u32(const Value& d, const std::string& paramName);
-// void ld_param_u64(const Value& d, const std::string& paramName);
 void ld_param_u32(const Value& d, const Value& addr, int offset);
-// void ld_param_u64(const Value& d, const Value& addr, int offset);
-// inline u64 ld_param_u64(const Value& addr, int offset) {
-//   u64 result;
-//   ld_param_u64(result, addr, offset);
-//   return result;
-// }
 u64 ld_param_u64(const Value& addr, int offset);
-// void ld_global_u32(const Value& d, const Value& addr);
-// inline Value ld_global_u32(const Value& addr) {
-//   u32 result;
-//   ld_global_u32(result, addr);
-//   return result;
-// }
 u32 ld_global_u32(const Value& addr);
 void ld_global_u64(const Value& d, const Value& addr);
 inline u64 ld_global_u64(const u64& addr) {
@@ -557,18 +543,6 @@ inline u64 ld_global_u64(const u64& addr) {
   ld_global_u64(result, addr);
   return result;
 }
-// void ld_const_u32(const Value& d, const Value& addr);
-// inline u32 ld_const_u32(const Value& addr) {
-//   u32 result;
-//   ld_const_u32(result, addr);
-//   return result;
-// }
-// void ld_const_u64(const Value& d, const Value& addr);
-// inline u64 ld_const_u64(const Value& addr) {
-//   u64 result;
-//   ld_const_u64(result, addr);
-//   return result;
-// }
 u32 ld_const_u32(const Value& addr);
 u64 ld_const_u64(const Value& addr);
 void ld_const_u8(const Value& d, const Value& addr);
@@ -578,19 +552,7 @@ inline Value ld_const_u8(const Value& addr) {
   return result;
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr);
-// void ld_global_relaxed_sys_u32(const Value& d, const Value& addr);
-// inline u32 ld_global_relaxed_sys_u32(const Value& addr) {
-//   u32 result;
-//   ld_global_relaxed_sys_u32(result, addr);
-//   return result;
-// }
 u32 ld_global_relaxed_sys_u32(const Value& addr);
-// void ld_global_relaxed_sys_u64(const Value& d, const Value& addr);
-// inline u64 ld_global_relaxed_sys_u64(const Value& addr) {
-//   u64 result;
-//   ld_global_relaxed_sys_u64(result, addr);
-//   return result;
-// }
 u64 ld_global_relaxed_sys_u64(const Value& addr);
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
 inline Value ld_global_acquire_sys_u32(const Value& addr) {
@@ -696,9 +658,6 @@ void trap();
 
 // Raw emit (escape hatch)
 void emit(const std::string& inst);
-
-// Test function: generates simple kernels and returns the PTX string.
-std::string ptxTest(const char* target = "sm_90a");
 
 // RAII function scope — sets TLS context, manages register free-lists.
 // On destruction, writes register high-water marks to Function::regCounts[].
@@ -893,9 +852,6 @@ Value addConst32(const std::vector<T>& vec, const char* name) {
   }
   return addConst32(alignof(T), vec.data(), vec.size() * sizeof(T), name);
 }
-
-// Hex immediate — for baking GPU addresses into PTX
-// Value hexImm(uintptr_t value);
 
 // mbarrier operations (sm_90+)
 void mbarrier_init(const Value& addr, int count);

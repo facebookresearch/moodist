@@ -162,28 +162,8 @@ struct Profiling {
     return maxBytesPerThread * config.blockSize * config.gridSize;
   }
 
-  void start(const KernelConfig& config, u32 stepValue, u64 addrData) {
-    u64 addr = addGlobalVar(4, 4, "profiling_atomic");
-    // u64 addrClock = addGlobalVar(8, 8, "profiling_base_clock");
-    u64 addrStepValue = addGlobalVar(4, 4, "profiling_step_value");
-    // IF_D(threadIdx_x() == 0) {
-    //   IF(atom_global_relaxed_inc_u32(addr, config.gridSize - 1) == config.gridSize - 1) {
-    //     // st_global_u64(addrClock, clock64());
-    //     // fence_release_gpu();
-    //     st_global_relaxed_sys_u32(addrStepValue, stepValue);
-    //   }
-    // }
-    // u64 myclock;
-    // WHILE(true) {
-    //   myclock = clock64();
-    //   IF(ld_global_relaxed_sys_u32(addrStepValue) == stepValue) {
-    //     BREAK;
-    //   }
-    //   nanosleep(10);
-    // }
-    // fence_acquire_gpu();
+  void start(const KernelConfig& config, u64 addrData) {
     u64 myclock = clock64();
-    // atomicOffset = ld_global_relaxed_sys_u64(addrClock) - myclock;
     clockOffset = -myclock;
     enabled = true;
 
@@ -209,15 +189,9 @@ struct Profiling {
       nameToIndex[name] = nextIndex++;
     }
     u32 o = 8 + 16 * *nextEntryIndex;
-    // PRED(o + 16 > maxBytesPerThread) trap();
     u32 a = *dataOffset + o;
     st_global_u64(*addrData + widen(a), clock64() + *clockOffset + (nameToIndex[name] << 48));
-    // st_global_u32(*addrData + widen(a) + 8, nameToIndex[name]);
-    // st_global_u32(*addrData + widen(a + 12), arg ? *arg : 0);
     *nextEntryIndex = *nextEntryIndex + 1;
-
-    // fence_release_gpu();
-    // fence_acquire_gpu();
   }
   void leave() {
     enter("");
@@ -304,41 +278,9 @@ struct EmitSimple : EmitMultiCopy {
           profiling.enter("dst copy", size);
           u64 dstaddr = dst[i] + widen(offset);
           cp_async_bulk_global_shared(dstaddr, buffer, size);
-          // cp_async_bulk_commit_group();
-          // cp_async_bulk_wait_group_read(0);
           profiling.leave();
         }
       }
-
-      // for (size_t i : indices(dst)) {
-      //   for (uint32_t r : range(32)) {
-      //     IF_D(laneIndex == r) {
-      //       IF_D(dst[i] != 0) {
-      //         profiling.enter("dst copy", size);
-      //         u64 dstaddr = dst[i] + widen(offset);
-      //         cp_async_bulk_global_shared(dstaddr, buffer, size);
-      //         // cp_async_bulk_commit_group();
-      //         // cp_async_bulk_wait_group_read(0);
-      //         profiling.leave();
-      //       }
-      //     }
-      //     warp_sync();
-      //   }
-      // }
-      // for (size_t i : indices(dst)) {
-      //   for (uint32_t r : range(32)) {
-      //     IF_D(laneIndex == r) {
-      //       IF_D(dst[i] != 0) {
-      //         profiling.enter("dst copy", size);
-      //         u64 dstaddr = dst[i] + widen(offset);
-      //         cp_async_bulk_global_shared(dstaddr, buffer, size);
-      //         cp_async_bulk_commit_group();
-      //         cp_async_bulk_wait_group_read(0);
-      //         profiling.leave();
-      //       }
-      //     }
-      //   }
-      // }
 
       cp_async_bulk_commit_group();
       offset += numBlocks * blockSharedSize;
@@ -373,7 +315,6 @@ struct EmitGrouped : EmitMultiCopy {
   }
 
   size_t groupSize() override {
-    // return 576 / 2;
     return 128;
   }
 
@@ -388,8 +329,6 @@ struct EmitGrouped : EmitMultiCopy {
 
   u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
   u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
-
-  u32 writeSyncAddr = addShared32(8, 4 * numBuffers);
 
   u32 bufferIndex = warpIndex / (groupSize() / 32);
 
@@ -410,7 +349,6 @@ struct EmitGrouped : EmitMultiCopy {
     Value isLeader = myIndex == 0;
     IF_D(isLeader) {
       mbarrier_init(barrier, 1);
-      st_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex, 0);
     }
 
     PRED(bytes % 16 != 0) trap();
@@ -462,90 +400,23 @@ struct EmitGrouped : EmitMultiCopy {
         mbarrier_arrive_noComplete(barrier);
       }
       profiling.enter("wait for write");
-      // profiling.enter("commit write");
       cp_async_bulk_commit_group();
       cp_async_bulk_wait_group_read(0);
       sync();
       PRED(isLeader) {
-        // profiling.enter("wait for write");
-        // cp_async_bulk_wait_group_read(0);
         profiling.enter("read");
         cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
         profiling.leave();
       }
     }
 
-    // Label loop;
-    // LABEL(loop);
-    // for (uint32_t parity : range(2)) {
-    //   IF(offset >= bytes) {
-    //     GOTO(alldone);
-    //   }
-    //   u64 srcaddr = src + widen(offset);
-    //   u32 size = min_u32(bytes - offset, bufferSize);
-    //   profiling.enter("emit wait for write");
-    //   cp_async_bulk_wait_group_read(0);
-    //   sync();
-    //   IF_D(isLeader) {
-    //     profiling.enter("src copy", size);
-    //     mbarrier_expect_tx(barrier, size);
-    //     mbarrier_arrive_noComplete(barrier);
-    //     cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-    //     mbarrier_wait_parity(barrier, parity);
-    //     profiling.leave();
-    //   }
-    //   sync();
-    //   // for (size_t i : indices(dst)) {
-    //   //   for (uint32_t r : range(groupSize())) {
-    //   //     sync();
-    //   //     IF_D(myIndex == r) {
-    //   //       IF_D(dst[i] != 0) {
-    //   //         profiling.enter("dst copy", size);
-    //   //         u64 dstaddr = dst[i] + widen(offset);
-    //   //         cp_async_bulk_global_shared(dstaddr, buffer, size);
-    //   //         cp_async_bulk_commit_group();
-    //   //         cp_async_bulk_wait_group_read(0);
-    //   //         profiling.leave();
-    //   //       }
-    //   //     }
-    //   //   }
-    //   // }
-    //   // IF_D(laneIndex == 0) {
-    //   //   WHILE (ld_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex) != myIndex / 32) {
-    //   //     nanosleep(10);
-    //   //   }
-    //   // }
-    //   warp_sync();
-    //   for (size_t i : indices(dst)) {
-    //     IF_D(dst[i] != 0) {
-    //       profiling.enter("dst copy", size);
-    //       u64 dstaddr = dst[i] + widen(offset);
-    //       cp_async_bulk_global_shared(dstaddr, buffer, size);
-    //       // cp_async_bulk_commit_group();
-    //       profiling.leave();
-    //     }
-    //   }
-    //   // sync();
-    //   warp_sync();
-    //   cp_async_bulk_commit_group();
-    //   offset += numBlocks * blockSharedSize;
-
-    //   // IF_D(laneIndex == 0) {
-    //   //   st_shared_relaxed_u32(writeSyncAddr + 4 * bufferIndex, (myIndex / 32 + 1) % (groupSize() / 32));
-    //   // }
-    // }
-    // GOTO(loop);
     LABEL(alldone);
     IF_D(isLeader) {
       mbarrier_inval(barrier);
     }
-    // sync();
     profiling.enter("final wait for write");
     cp_async_bulk_wait_group(0);
     profiling.leave();
-    // IF_D(isLeader) {
-    //   mbarrier_inval(barrier);
-    // }
     profiling.enter("emit exit barrier_sync");
     barrier_sync(15);
     profiling.enter("emit exit barrier_sync wait");
@@ -773,11 +644,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
   mod.topLevelComments.push_back(fmt::sprintf("copy engine: %s", config.copyEngine));
   mod.topLevelComments.push_back(fmt::sprintf("shared memory: %d", config.sharedMemory));
   setModule(&mod);
-  if (false) {
-    mod.addGlobal(".u8", 4 * 1024 * 1024, "debug_buf");
-    mod.addGlobal(".u32", 1, "debug_warp_counter");
-    mod.addGlobal(".u64", 1, "debug_clock_ref");
-  }
 
   CHECK(!graph.cudaEdges.empty());
 
@@ -883,17 +749,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 warpIndex = threadIndex / 32;
     u32 laneIndex = laneid();
 
+    // Kernel profiling (debugging aid, compiled out): every thread records a timestamp at each profiling.enter(),
+    // and the op's 401st launch writes them as a Chrome trace to moodist-trace-cuda-<rank>.json (dumpProfiling in
+    // processgroup.cc). Needs Profiling::maxBytesPerThread of device memory per thread, also for every tuning
+    // candidate.
     if (false) {
-      auto profilingBuffer =
-          ctx.group->allocateDevice(Profiling::maxBytesPerThread * config.blockSize * config.gridSize);
+      auto profilingBuffer = ctx.group->allocateDevice(profiling.dataSize(config));
       profiling = Profiling();
-      profiling.start(config, stepValue, profilingBuffer.cudaPointer);
+      profiling.start(config, profilingBuffer.cudaPointer);
       rv->profilingData = std::move(profilingBuffer);
       rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
       rv->profilingCountdown = 400;
     }
-
-    u64 indeterminate = addGlobalVar(128, 128);
 
     auto predicated = [&](auto pred, auto f) {
       return [&, pred = std::move(pred), f = std::move(f)](auto&&... args) {
@@ -912,10 +779,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
                      widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
     u32 parityBit = 0;
-    // IF_D(threadIndex == 0) {
-    //   parityBit = ld_global_u32(parityAddr) ^ 1;
-    //   st_global_u32(parityAddr, parityBit);
-    // }
     auto isThreadZero = threadIndex == 0;
     parityBit = predicated(isThreadZero, ld_global_u32)(parityAddr) ^ 1;
     profiling.enter("parity setup bar");
@@ -1014,16 +877,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 caddrsetup = addConst32(addrsetup, "addrsetup");
     for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
       u32 index = blockSize * i + threadIndex;
-      // IF_D(index < graph.remoteCudaTensorMappings.size()) {
-      //   u32 caddr = caddrsetup + index * sizeof(AddrSetup);
-      //   u64 base = ld_const_u64(caddr);
-      //   u32 itembytes = ld_const_u32(caddr + 8);
-      //   u32 paramOffset = ld_const_u32(caddr + 12);
-      //   u32 stride = ld_const_u32(caddr + 16);
-      //   u32 slot = ld_const_u32(caddr + 20);
-      //   u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
-      //   st_global_relaxed_sys_u64(addr, ld_param_u64(mappedAddrs + paramOffset, 0) | parityTag);
-      // }
       auto pred = index < graph.remoteCudaTensorMappings.size();
       u32 caddr = caddrsetup + index * sizeof(AddrSetup);
       u64 base = predicated(pred, ld_const_u64)(caddr);
@@ -1139,30 +992,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     u32 cnodesetupaddr = addConst32(nodesetup, "nodesetup");
 
-    auto nodeaddr = [&](u32 index) {
-      profiling.enter("nodeaddr");
-      u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
-      u32 slot = ld_const_u32(caddr);
-      u32 offsetlo = ld_const_u32(caddr + 4);
-      u32 offsethi = ld_const_u32(caddr + 8);
-      u64 r;
-      IF_D((slot & 1) != 0) {
-        r = ld_param_u64(inputAddrs + (slot & ~1u), 0);
-      }
-      ELSE {
-        // WHILE(((r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot))) & (1ull << 63)) != parityTag) {}
-        r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot));
-        WHILE((r & (1ull << 63)) != parityTag) {
-          nanosleep(10);
-          r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + widen(slot));
-        }
-        r &= ~(1ull << 63);
-      }
-      r += widen(offsetlo) | (widen(offsethi) << 32);
-      profiling.leave();
-      return r;
-    };
-
+    // The address of destination node `index` (in nodesetup order) for the threads where pred is true, 0 for the
+    // others.
     auto nodeaddrpred = [&](Value pred, u32 index) {
       profiling.enter("nodeaddr");
       u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
@@ -1194,208 +1025,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     size_t groupSize = emit->groupSize();
 
-    std::vector<uint32_t> shuffledIndices;
-    size_t shuffledEntriesPerGroup = (maxDestinations + groupSize - 1) / groupSize * groupSize;
-    CHECK(config.gridSize * config.blockSize % groupSize == 0);
-    size_t numGroupsGlobally = config.gridSize * config.blockSize / groupSize;
-
-    for (size_t i : range(numGroupsGlobally)) {
-      std::vector<uint32_t> v(shuffledEntriesPerGroup);
-      std::ranges::iota(v, 0);
-      std::ranges::shuffle(v, getRng());
-      for (auto& x : v) {
-        shuffledIndices.push_back(x);
-      }
-    }
-
-    // uint32_t randomizedConstant = 0;
-    // uint32_t randomizedOffset = 0;
-
-    // while (true) {
-    //   uint32_t o = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   uint32_t x = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   uint32_t c = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   bool failed = false;
-    //   std::vector<uint32_t> v;
-    //   std::vector<uint32_t> collisions(shuffledEntriesPerGroup * shuffledEntriesPerGroup);
-    //   for (size_t i : range(numGroupsGlobally)) {
-    //     v.clear();
-    //     for (size_t n : range(shuffledEntriesPerGroup)) {
-    //       // //uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
-    //       // shuffledEntriesPerGroup) >> 32; uint32_t x = ((uint64_t)(uint32_t)((n + shuffledEntriesPerGroup * i) *
-    //       c) *
-    //       // shuffledEntriesPerGroup) >> 32;
-    //       // //uint32_t x = ((__uint128_t)((n + shuffledEntriesPerGroup * i) * 0x9E3779B97F4A7C15ul) *
-    //       // shuffledEntriesPerGroup) >> 64;
-    //       // //CHECK(!std::ranges::contains(v, x));
-
-    //       uint32_t halfBits = (std::bit_width(shuffledEntriesPerGroup - 1) + 1) / 2;
-    //       uint32_t halfMask = (1 << halfBits) - 1;
-
-    //       uint32_t x = n;
-    //       uint32_t seed = (i + o) * 0x9e3779b9;
-
-    //       do {
-    //         uint32_t lo = x & halfMask;
-    //         uint32_t hi = (x >> halfBits) & halfMask;
-    //         for (uint32_t round : range(4)) {
-    //           hi ^= ((lo * 0x45d9f3b + seed + round) >> 4) & halfMask;
-    //           std::swap(lo, hi);
-    //         }
-    //         x = (hi << halfBits) | lo;
-    //       } while (x >= shuffledEntriesPerGroup);
-
-    //       CHECK(x < shuffledEntriesPerGroup);
-    //       if (std::ranges::contains(v, x)) {
-    //         CHECK(false);
-    //         failed = true;
-    //         break;
-    //       }
-    //       collisions[v.size() * shuffledEntriesPerGroup + x] += 1;
-    //       v.push_back(x);
-    //     }
-    //     if (failed) {
-    //       break;
-    //     }
-    //   }
-    //   if (failed) {
-    //     continue;
-    //   }
-    //   uint32_t nCollisions = *std::ranges::max_element(collisions);
-    //   log.info("collisions: %d\n", nCollisions);
-    //   if (nCollisions > 32) {
-    //     continue;
-    //   }
-
-    //   log.info("Success for %#x %#x %#x! indices: %s\n", o, x, c, fmt::to_string(fmt::join(v, ", ")));
-    //   // CHECK(false);
-
-    //   for (size_t i : range(numGroupsGlobally)) {
-    //     v.clear();
-    //     for (size_t n : range(shuffledEntriesPerGroup)) {
-    //       uint32_t x = ((uint64_t)(uint32_t)((n + shuffledEntriesPerGroup * i) * c) * shuffledEntriesPerGroup) >> 32;
-    //       // uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
-    //       // shuffledEntriesPerGroup) >> 32;
-    //       v.push_back(x);
-    //     }
-    //     log.info("For %d: %s\n", i, fmt::to_string(fmt::join(v, ", ")));
-    //   }
-    //   CHECK(false);
-    //   randomizedConstant = c;
-    //   break;
-    // }
-
-    // while (true) {
-    //   uint32_t o = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   uint32_t x = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   uint32_t c = random((uint32_t)0, (uint32_t)0xffffffff);
-    //   bool failed = false;
-    //   std::vector<uint32_t> v;
-    //   std::vector<uint32_t> collisions(shuffledEntriesPerGroup * shuffledEntriesPerGroup);
-    //   for (size_t i : range(numGroupsGlobally)) {
-    //     v.clear();
-    //     for (size_t n : range(shuffledEntriesPerGroup)) {
-    //       uint32_t x = ((uint64_t)(uint32_t)((n + o) * c) * shuffledEntriesPerGroup) >> 32;
-
-    //       x = (x + i) % shuffledEntriesPerGroup;
-
-    //       CHECK(x < shuffledEntriesPerGroup);
-    //       if (std::ranges::contains(v, x)) {
-    //         failed = true;
-    //         break;
-    //       }
-    //       collisions[v.size() * shuffledEntriesPerGroup + x] += 1;
-    //       v.push_back(x);
-    //     }
-    //     if (failed) {
-    //       break;
-    //     }
-    //   }
-    //   if (failed) {
-    //     continue;
-    //   }
-    //   uint32_t nCollisions = *std::ranges::max_element(collisions);
-    //   log.info("collisions: %d\n", nCollisions);
-    //   if (nCollisions > 32) {
-    //     continue;
-    //   }
-
-    //   log.info("Success for %#x %#x %#x! indices: %s\n", o, x, c, fmt::to_string(fmt::join(v, ", ")));
-    //   // CHECK(false);
-
-    //   for (size_t i : range(numGroupsGlobally)) {
-    //     v.clear();
-    //     for (size_t n : range(shuffledEntriesPerGroup)) {
-    //       uint32_t x = ((uint64_t)(uint32_t)((n + o) * c) * shuffledEntriesPerGroup) >> 32;
-    //       x = (x + i) % shuffledEntriesPerGroup;
-    //       // uint32_t x = ((uint64_t)(uint32_t)((((n + shuffledEntriesPerGroup * i + o) * 0x9e3779b9) ^ x) * c) *
-    //       // shuffledEntriesPerGroup) >> 32;
-    //       v.push_back(x);
-    //     }
-    //     log.info("For %d: %s\n", i, fmt::to_string(fmt::join(v, ", ")));
-    //   }
-    //   //CHECK(false);
-    //   randomizedConstant = c;
-    //   randomizedOffset = o;
-    //   break;
-    // }
-
-    // u32 shuffledIndicesAddr = addConst32(shuffledIndices, "shuffledIndices");
-
+    // The destination addresses of edge e for this thread: slot i of the thread takes destination gindex(i) of e
+    // (0 if there is no such destination). In groups of several warps, consecutive destinations go to different
+    // warps (lane l of warp w of the group takes destination (w + 1) % warps + warps * l), so that all warps of the
+    // group issue the stores of a multicast edge.
     auto setdst = [&](const Edge& e, u32 nodeoffset, Vector<u64>& dstaddrs) {
       auto gindex = [&](size_t i) {
         if (groupSize == 32) {
           return (laneIndex + groupSize * i);
-          // return (threadIndex % groupSize + groupSize * i + blockIndex) % shuffledEntriesPerGroup;
         }
-        // CHECK(false);
-        //  CHECK(groupSize - 1 + groupSize * i +
-        //        (shuffledEntriesPerGroup *
-        //                (((config.gridSize - 1) * config.blockSize + (config.blockSize - 1)) / groupSize) <
-        //            shuffledIndices.size()));
-
-        // u32 index = narrow((widen((threadIndex % groupSize + groupSize * i + randomizedOffset) * randomizedConstant)
-        // * shuffledEntriesPerGroup) >> 32); index = (index + ((blockIndex * config.blockSize + threadIndex) /
-        // groupSize)) % shuffledEntriesPerGroup; return index;
-
-        // u32 index = (threadIndex % groupSize + groupSize * i) +
-        //             (shuffledEntriesPerGroup * ((blockIndex * config.blockSize + threadIndex) / groupSize));
-        // // return narrow((widen((threadIndex % groupSize + groupSize * i)) * shuffledEntriesPerGroup) >> 32);
-        // // return ld_const_u32(shuffledIndicesAddr + 4 * index);
-        // return narrow((widen(index * randomizedConstant) * shuffledEntriesPerGroup) >> 32);
-        // return narrow(((widen(index) * 0x9e3779b9) * shuffledEntriesPerGroup) >> 32);
-
-        // return (warpIndex + laneIndex * (config.blockSize / 32)) % groupSize + groupSize * i;
         u32 index = (threadIndex + 32) % groupSize;
         return (index / 32 + index % 32 * (groupSize / 32)) + groupSize * i;
-        // return threadIndex % groupSize + groupSize * i;
-        //  return index * 1234;
       };
-      if (e.destinations.size() == 1 && false) {
-        for (size_t i : indices(dstaddrs)) {
-          // u32 index = laneIndex + 32 * i;
-          u32 index = gindex(i);
-          for (size_t z : indices(e.destinations)) {
-            IF_D(index == z) {
-              dstaddrs[i] = getaddr(e.destinations[z]);
-            }
-            ELSE {
-              dstaddrs[i] = 0;
-            }
-          }
-        }
-      } else {
-        for (size_t i : indices(dstaddrs)) {
-          // u32 index = laneIndex + 32 * i;
-          u32 index = gindex(i);
-          dstaddrs[i] = nodeaddrpred(index < e.destinations.size(), nodeoffset + index);
-          // IF_D(index < e.destinations.size()) {
-          //   dstaddrs[i] = nodeaddr(nodeoffset + index);
-          // }
-          // ELSE {
-          //   dstaddrs[i] = 0;
-          // }
-        }
+      for (size_t i : indices(dstaddrs)) {
+        u32 index = gindex(i);
+        dstaddrs[i] = nodeaddrpred(index < e.destinations.size(), nodeoffset + index);
       }
     };
 
@@ -1463,7 +1107,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
         u64 srcaddr = getaddr(e.sources[0]);
         Vector<u64> dstaddrs((e.destinations.size() + emit->groupSize() - 1) / emit->groupSize());
-        // Vector<u64> dstaddrs(16);
         setdst(e, nodeoffset, dstaddrs);
         nodeoffset += e.destinations.size();
 
@@ -1551,7 +1194,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
           numDone += 1;
           LABEL(skip);
-          // warp_sync();
         }
 
         IF(bar_red_or(14, blockSize, numDone == localCopies.size())) {
@@ -1570,7 +1212,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         ldaddrs.emplace_back();
         staddrs.emplace_back();
         preds.emplace_back();
-        // u32 index = blockSize * i + threadIndex;
         u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
         u64& ldaddr = ldaddrs.back();
         u64& staddr = staddrs.back();
@@ -1586,25 +1227,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + sizeof(uint32_t) * ranks.size() * blockIndex);
         }
       }
-      // for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
-      //   profiling.enter("sync setup");
-      //   // u32 index = blockSize * i + threadIndex;
-      //   u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
-      //   ldaddrs.emplace_back();
-      //   staddrs.emplace_back();
-      //   u64& ldaddr = ldaddrs.back();
-      //   u64& staddr = staddrs.back();
-      //   preds.emplace_back();
-      //   Value& pred = preds.back();
-      //   pred = index < syncsetup.size();
-      //   u32 addr = csyncaddr + index * sizeof(SyncSetup);
-      //   u64 stbase = predicated(pred, ld_const_u64)(addr);
-      //   u32 itembytes = predicated(pred, ld_const_u32)(addr + 8);
-      //   u32 ldoffset = predicated(pred, ld_const_u32)(addr + 12);
-      //   u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
-      //   staddr = stbase + widen(itembytes * concurrencyIndex + blockStride);
-      //   ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
-      // }
       u32 targetValue = stepValue + stepOffset;
       profiling.enter("exit sync barrier");
       barrier_sync();
@@ -1617,19 +1239,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         profiling.enter("sync ld");
         u64 ldaddr = ldaddrs[i];
         Value pred = preds[i];
-        // IF_D(!pred) {
-        //   pred = ld_global_relaxed_sys_u32(ldaddr) < targetValue;
-        //   IF_D(!pred) {
-        //     BREAK;
-        //   }
-        //   nanosleep(10);
-        //   CONTINUE;
-        // }
-        // pred &= predicated(pred, ld_global_relaxed_sys_u32)(ldaddr) < targetValue;
-        // WHILE(vote_sync_any(pred)) {
-        //   nanosleep(10);
-        //   pred &= predicated(pred, ld_global_relaxed_sys_u32)(ldaddr) < targetValue;
-        // }
         Label loop;
         Label done;
         GOTO_IF_NOT(pred, done);
@@ -1649,9 +1258,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         fence_release_sys();
       }
     }
-    // profiling.enter("exit sync barrier");
-    // barrier_sync();
-    // profiling.enter("exit sync");
     execSync(1);
 
     profiling.leave();

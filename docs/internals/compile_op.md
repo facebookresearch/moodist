@@ -65,8 +65,9 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
-10. **Tuning** (`tuneKernels`): the copy engine `grouped` x block size {128, 256} x shared memory {64 KiB, 226 KiB}
-    x grid size {8, 12, 16}, for every graph variant (12 settings per variant). Each setting is generated and JIT
+10. **Tuning** (`tuneKernels`): the copy engine `grouped` (`MOODIST_COMPILE_OP_ENGINES`) x block size {128, 256} x
+    shared memory {64 KiB, 226 KiB} x grid size {8, 12, 16}, for every graph variant (12 settings per variant and
+    engine). Each setting is generated and JIT
     compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The
     ranks exchange their timings and take the minimum over ranks per setting. The kernel of the fastest setting
     is generated and compiled once more for the op.
@@ -88,8 +89,8 @@ on new tensors at every call.
 - **Copy engines** (`EmitMultiCopy::emit(src, dsts, bytes)`): TMA bulk loads into shared memory (completion via
   mbarrier), then one TMA bulk store per destination, so a multicast edge is read once and written N times. The
   chunks of an edge are assigned round-robin to (buffer, block). Engines: `grouped` (groups of 128 threads sharing
-  a double-buffered pipeline; the only one tuned), `simple`, `buffered`, `lockstep`. Unaligned addresses or sizes
-  trap.
+  a double-buffered pipeline; the default), `simple`, `buffered` and `lockstep` (one warp per pipeline; tuned only
+  if selected with `MOODIST_COMPILE_OP_ENGINES`). Unaligned addresses or sizes trap.
 - **Scheduling**: a rank executes the edges whose executor it is. If all their sources are filled, the copies run
   in sequence. Otherwise a polling loop goes over the edges: thread 0 checks whether the source is ready
   (`depFilled` of the node for this block >= stepValue) and whether the edge is already done, `bar.red` broadcasts
@@ -119,6 +120,8 @@ on new tensors at every call.
 ## Environment variables
 
 - `MOODIST_COMPILE_OP_GRAPHS` - the graph variants to tune over (see the compile phase). Same on all ranks.
+- `MOODIST_COMPILE_OP_ENGINES` - the copy engines to tune over, comma separated: `grouped` (default), `simple`,
+  `buffered`, `lockstep`. Same on all ranks.
 - `MOODIST_FABRIC=0` - ignore a multi-node NVLink fabric: compile_op reaches other nodes over RDMA, as between
   separate NVLink domains. Same on all ranks.
 - `MOODIST_DUMP_KERNELS` - write each op's final PTX to `moodist-compile-op-kernels-rank<rank>-op<id>.ptx`.
@@ -163,12 +166,15 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
   instead.
 - `tuneKernels` combines the ranks' timings with the minimum; the maximum (slowest rank) or the sum fits a
   collective better.
+- `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
+  or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
+  instructions, so a plain target would do.
 
 ### Performance
 - Compile time (see above): the copy code is inlined per edge, and the JIT of 12 candidates per graph variant
   dominates. A table-driven edge loop (edge descriptors in constant or global memory, one copy loop) would make
-  the code size independent of the number of edges. Parallel JIT on several threads, or splitting the JIT work
-  across ranks with the same target (both exist as commented-out code in `tuneKernels`), would cut the rest.
+  the code size independent of the number of edges. JIT of the candidates on several threads would cut the rest
+  (the PTX differs per rank, so the work cannot be split across ranks).
 - The polling loop does one block-wide `bar.red` per edge and pass; with many edges, a warp-wide scan for the next
   ready edge would be cheaper.
 - Every edge that is not a kernel edge is read by its destination rank itself, so data needed by several ranks of
@@ -179,14 +185,9 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
 
 ### Cleanup
-- `compile_op.cc`: the old `tuneCopyKernel` (about 500 commented-out lines: bulk, warppipe, nbuf, flexbuf and
-  lockstep candidates and their environment filters).
-- `ptx_codegen.cc`: the commented-out search for a device-side permutation of destinations, and the
-  `shuffledIndices` table, which is built at every compile but not used; the profiling hooks behind `if (false)`;
-  the engines that tuning never selects (`simple`, `buffered`, `lockstep`).
-- `compile_op_kernel.h`, `compile_op_kernel.cc`: commented-out remains of `CompileOpKernels` and
-  `launchCopyKernel`.
 - `docs/api/compile_op.md`: the examples predate `TensorRegion`'s `device` field.
+- Kernel profiling (`Profiling` in `ptx_codegen.cc`) is compiled out with `if (false)`; an environment variable
+  would make it usable without a rebuild.
 
 ### Planned: mixed NVLink and RDMA paths
 Data needed by several ranks of an NVLink domain should cross the network once: one rank reads it over RDMA and the

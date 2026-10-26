@@ -988,14 +988,6 @@ RegType regTypeFor(ValType type) {
 
 Value::Value(ValType t) : type(t), kind(Register) {
   RegType rt = regTypeFor(t);
-  // auto& free = currentFunction->freeRegs[(int)rt];
-  // int id;
-  // if (!free.empty() && false) {
-  //   id = free.back();
-  //   free.pop_back();
-  // } else {
-  //   id = currentFunction->regHighWater[(int)rt]++;
-  // }
   int id = currentFunction->regHighWater[(int)rt]++;
   reg.type = rt;
   reg.id = id;
@@ -1024,11 +1016,7 @@ const std::string& Value::str() const {
   return immStr;
 }
 
-Value::~Value() {
-  if (valid && kind == Register) {
-    // currentFunction->freeRegs[(int)reg.type].push_back(reg.id);
-  }
-}
+Value::~Value() = default;
 
 Value::Value(Value&& o)
     : reg(std::move(o.reg)), type(o.type), valid(o.valid), kind(o.kind), immStr(std::move(o.immStr)) {
@@ -1057,15 +1045,10 @@ Value& Value::operator=(Value&& o) {
       } else {
         throw std::runtime_error("bad assignment");
       }
-      // Free the source register
-      // currentFunction->freeRegs[(int)o.reg.type].push_back(o.reg.id);
       o.valid = false;
       o.kind = None;
     } else {
-      // // Uninitialized destination — just transfer ownership
-      // if (valid && kind == Register) {
-      //   currentFunction->freeRegs[(int)reg.type].push_back(reg.id);
-      // }
+      // Uninitialized destination: take over the source register
       reg = std::move(o.reg);
       type = o.type;
       valid = o.valid;
@@ -2072,12 +2055,6 @@ Value addShared32(int align, int sizeBytes, const char* suffix) {
   std::string sym = currentFunction->addShared(align, sizeBytes, suffix);
   return sharedAddr(sym.c_str());
 }
-
-// Value hexImm(uintptr_t value) {
-//   char buf[32];
-//   snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)value);
-//   return Value(buf);
-// }
 
 } // namespace ptx
 } // namespace moodist
