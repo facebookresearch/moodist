@@ -43,6 +43,15 @@ Value addConst32(int align, const void* data, size_t size, const char* name) {
   currentModule->addConst(align, data, size, name);
   return constAddr(name);
 }
+u64 addGlobalData(int align, const void* data, size_t size, const char* name) {
+  char zero = 0;
+  if (size == 0) {
+    data = &zero;
+    size = 1;
+  }
+  currentModule->addGlobalData(align, data, size, name);
+  return globalAddr(name);
+}
 void setBlock(Block* b) {
   currentBlock = b;
 }
@@ -216,9 +225,11 @@ std::string Module::addGlobal(const char* type, int count, const char* name) {
   return name;
 }
 
-std::string Module::addConst(int align, const void* data, size_t size, const char* name) {
-  // Emit: .const .align A .b8 name[SIZE] = {b0, b1, b2, ...};
-  std::string decl = ".const .align " + std::to_string(align) + " .b8 " + name + "[" + std::to_string(size) + "] = {";
+static std::string initializedArray(
+    const char* stateSpace, int align, const void* data, size_t size, const char* name) {
+  // Emit: .<space> .align A .b8 name[SIZE] = {b0, b1, b2, ...};
+  std::string decl = std::string(stateSpace) + " .align " + std::to_string(align) + " .b8 " + name + "[" +
+                     std::to_string(size) + "] = {";
   const auto* bytes = static_cast<const uint8_t*>(data);
   for (size_t i = 0; i < size; i++) {
     if (i > 0) {
@@ -227,7 +238,16 @@ std::string Module::addConst(int align, const void* data, size_t size, const cha
     decl += std::to_string(bytes[i]);
   }
   decl += "}";
-  globals.push_back(decl);
+  return decl;
+}
+
+std::string Module::addGlobalData(int align, const void* data, size_t size, const char* name) {
+  globals.push_back(initializedArray(".global", align, data, size, name));
+  return name;
+}
+
+std::string Module::addConst(int align, const void* data, size_t size, const char* name) {
+  globals.push_back(initializedArray(".const", align, data, size, name));
   return name;
 }
 
@@ -489,6 +509,19 @@ u32 ld_global_u32(const Value& addr) {
   ld_global_u32(result, addr);
   return result;
 }
+u32 ld_global_nc_u32(const Value& addr) {
+  u32 result;
+  emitInst("ld.global.nc.u32 %s, [%s]", result, addr);
+  return result;
+}
+u64 ld_global_nc_u64(const Value& addr) {
+  u64 result;
+  emitInst("ld.global.nc.u64 %s, [%s]", result, addr);
+  return result;
+}
+void ld_global_nc_u32_into(const Value& d, const Value& addr) {
+  emitInst("ld.global.nc.u32 %s, [%s]", d, addr);
+}
 void ld_global_u64(const Value& d, const Value& addr) {
   emitInst("ld.global.u64 " + d.str() + ", [" + addr.str() + "]");
 }
@@ -723,6 +756,21 @@ u64 selp_u64(const u64& a, const u64& b, const Value& pred) {
 Value vote_sync_any(const Value& pred) {
   Value result(ValType::Pred);
   emitInst("vote.sync.any.pred %s, %s, 0xffffffff", result, pred);
+  return result;
+}
+u32 vote_sync_ballot(const Value& pred) {
+  u32 result;
+  emitInst("vote.sync.ballot.b32 %s, %s, 0xffffffff", result, pred);
+  return result;
+}
+u32 brev_b32(const Value& a) {
+  u32 result;
+  emitInst("brev.b32 %s, %s", result, a);
+  return result;
+}
+u32 clz_b32(const Value& a) {
+  u32 result;
+  emitInst("clz.b32 %s, %s", result, a);
   return result;
 }
 

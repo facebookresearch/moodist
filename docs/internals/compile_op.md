@@ -109,18 +109,25 @@ on new tensors at every call.
   chunks of an edge are assigned round-robin to (buffer, block). Engines: `grouped` (groups of 128 threads sharing
   a double-buffered pipeline; the default), `simple`, `buffered` and `lockstep` (one warp per pipeline; tuned only
   if selected with `MOODIST_COMPILE_OP_ENGINES`). Unaligned addresses or sizes trap.
-- **Scheduling**: a rank executes the edges whose executor it is. If all their sources are filled, the copies run
-  in sequence. Otherwise a polling loop goes over the edges: thread 0 checks whether the source is ready
-  (`depFilled` of the node for this block >= stepValue) and whether the edge is already done, `bar.red` broadcasts
-  the decision, the block copies, and thread 0 signals. Dependencies are per block: block b of a consumer waits
-  for block b of the producer, which copied the same chunks, as all ranks run the same configuration.
-- **Signaling**: after an edge, thread 0 writes stepValue into the `depFilled` slots of its destination nodes on
-  its own rank, on the destination ranks, and on the destination ranks of edges that read those nodes. In the
-  sequential path, only edges that others depend on are signaled. Before copying from a source that another
-  agent wrote during the op (a peer GPU, or a NIC), thread 0 executes `fence.acquire.sys`.
-- **Relay edges** (proxied transfers): thread 0 polls the signal of the CPU thread, slot 16 + `rdmaSignal` of
-  `cpuOutBuffer` for the concurrency index, until it reaches stepValue, then signals the node as filled like after
-  a copy. No bar.red and no copy.
+- **Tables**: the edges a rank executes are described by tables in one initialized global array of the module:
+  edge setups (flags, source, bytes, destinations, signals), node setups (tensor slot and offset), signal setups
+  (`depFilled` slots to write when an edge is done) and the address exchange setups. The kernel loops over them at
+  runtime, so its code size does not depend on the number of edges (edges are limited to 4 GiB each).
+- **Scheduling**: a rank executes the edges whose executor it is. If no edge waits (all sources filled, no relay
+  edges), the edges run in order. Otherwise in rounds: warp 0 scans the edges that are not done, 32 at a time (one
+  per lane, `vote.ballot`); a source is ready when its `depFilled` slot for this block has reached stepValue. Relay
+  edges whose signal has arrived are finished on the spot by the lane that saw it. The first ready copy edge is
+  handed to the block through shared memory (one `bar.sync` per round); the block copies it and thread 0 marks it
+  done (done bits in shared memory). Relay edges come first in the table, so that the scan always reaches them.
+  Dependencies are per block: block b of a consumer waits for block b of the producer, which copied the same
+  chunks, as all ranks run the same configuration.
+- **Signaling**: after an edge that some edge reads (known from the peers' lists of read nodes, as the reader may
+  be an edge this rank does not see), the thread that saw it done (thread 0 after a copy) writes stepValue into
+  the `depFilled` slots of its destination nodes on its own rank, on the destination ranks, and on the destination
+  ranks of edges that read those nodes, after `fence.release.sys`. The lane that sees a dependency met executes
+  `fence.acquire.sys` before the selection barrier; before copying from a peer's tensor, every thread does.
+- **Relay edges** (proxied transfers): ready once the CPU thread's signal, slot 16 + `rdmaSignal` of
+  `cpuOutBuffer` for the concurrency index, has reached stepValue (always ready when tuning); nothing to copy.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 
@@ -175,17 +182,19 @@ With `MOODIST_FABRIC=0`, i.e. two NVLink domains connected by RoCE (4 NICs per G
 | the same before reads were split over the NICs | 82 us | 206 us | 2.19 ms | 33.9 ms (63 GB/s) |
 | NCCL with `NCCL_MNNVL_ENABLE=0` | 92 us | 102 us | 440 us | 5.42 ms (396 GB/s) |
 
-Compile time grows with the number of edges, because the copy code of each edge is generated inline. All-gather
-where each rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
+Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
+rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
 
 | K | PTX | compile_op | time per call |
 |---|---|---|---|
-| 1 | 11 KB | 1.2 s | 11 us |
-| 16 | 97 KB | 4.7 s | 22 us |
-| 64 | 384 KB | 13 s | 57 us |
-| 256 | 1.6 MB | 81 s | 204 us |
+| 1 | 15 KB | 1.4 s | 12 us |
+| 16 | 21 KB | 1.5 s | 24 us |
+| 64 | 40 KB | 1.3 s | 65 us |
+| 256 | 121 KB | 1.7 s | 229 us |
 
-Nearly all of the compile time is the JIT of the 12 tuning candidates.
+Most of the PTX of large ops is the tables (initializers in decimal). Nearly all of the compile time is the JIT of
+the 12 tuning candidates. The kernel that generated the copy code of each edge inline took 1.2 s, 4.7 s, 13 s and
+81 s (PTX of 11 KB to 1.6 MB), and was about 12% faster per edge (11, 22, 57 and 204 us).
 
 ## Known issues and TODO
 
@@ -203,17 +212,21 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
   the NIC of the read, before the signal) would make it explicit.
 - `tuneKernels` combines the ranks' timings with the minimum; the maximum (slowest rank) or the sum fits a
   collective better.
+- The kernel takes the tensor addresses (and the addresses at which peers map them) as kernel parameters, which are
+  limited to 32 KB: an op fails to JIT with about 4000 (tensor, peer) mappings (e.g. 1024 input tensors on 4
+  ranks). Passing them in a device buffer would lift the limit.
+- Kernel edges must be smaller than 4 GiB (32-bit offsets in the copy engines; checked). Splitting larger pieces
+  into several edges when the edges are created would lift the limit.
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
   or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
   instructions, so a plain target would do.
 
 ### Performance
-- Compile time (see above): the copy code is inlined per edge, and the JIT of 12 candidates per graph variant
-  dominates. A table-driven edge loop (edge descriptors in constant or global memory, one copy loop) would make
-  the code size independent of the number of edges. JIT of the candidates on several threads would cut the rest
-  (the PTX differs per rank, so the work cannot be split across ranks).
-- The polling loop does one block-wide `bar.red` per edge and pass; with many edges, a warp-wide scan for the next
-  ready edge would be cheaper.
+- Compile time is mostly the JIT of the tuning candidates (12 per graph variant and engine). JIT on several threads
+  would cut it (the PTX differs per rank, so the work cannot be split across ranks).
+- Per edge, the table-driven kernel is about 12% slower than the old inlined one (address resolution through the
+  tables; the sequential path loads the next edge's words while copying the current one). Prefetching one edge
+  further ahead, or tables in constant memory when they fit, could close it.
 - Proxied transfers are not pipelined: the proxy's kernel starts the NVLink copies only once the whole RDMA read
   has completed (6.6 ms against NCCL's 5.4 ms for the 256 MiB all-gather above). Edges the proxy pass leaves
   alone (CPU destinations, unaligned pieces, one destination per domain) are read by each destination rank.
@@ -230,8 +243,8 @@ Nearly all of the compile time is the JIT of the 12 tuning candidates.
 The proxy pass (compile phase step 7) sends data needed by several ranks of an NVLink domain over the network once.
 (Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in c57c8f4, computed a similar plan
 with gateway reads and local copies, but it was never executed.) Next:
-1. Pipelining: large proxied transfers in chunks, with a signal per chunk checked in the copy engine's chunk loop
-   (rather than one edge per chunk, given the per-edge code size), so that the NVLink copies overlap the RDMA read.
+1. Pipelining: large proxied transfers in chunks, each chunk its own read, signal, relay edge and copies (edges no
+   longer cost code size), so that the NVLink copies overlap the RDMA read.
 2. The write variant: the source writes the data and the signal into the proxy's memory.
 3. An explicit flush before the signal (see Correctness).
 

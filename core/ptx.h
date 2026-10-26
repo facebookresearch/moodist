@@ -90,6 +90,9 @@ struct Module {
   // name: symbol name
   std::string addConst(int align, const void* data, size_t size, const char* name);
 
+  // Declare an initialized global memory array (module scope, no size limit unlike .const). Returns the name.
+  std::string addGlobalData(int align, const void* data, size_t size, const char* name);
+
   // Serialize the complete module to a PTX string
   std::string finalize() const;
 };
@@ -537,6 +540,11 @@ void ld_param_u32(const Value& d, const std::string& paramName);
 void ld_param_u32(const Value& d, const Value& addr, int offset);
 u64 ld_param_u64(const Value& addr, int offset);
 u32 ld_global_u32(const Value& addr);
+// Non-coherent loads: for data that stays read-only while the kernel runs
+u32 ld_global_nc_u32(const Value& addr);
+u64 ld_global_nc_u64(const Value& addr);
+// The same into an existing register (e.g. to load ahead into loop-carried registers without a mov)
+void ld_global_nc_u32_into(const Value& d, const Value& addr);
 void ld_global_u64(const Value& d, const Value& addr);
 inline u64 ld_global_u64(const u64& addr) {
   u64 result;
@@ -622,6 +630,14 @@ inline u64 selp(const u64& a, const u64& b, const Value& pred) {
 }
 
 Value vote_sync_any(const Value& pred);
+// Bit i of the result is pred of lane i (all lanes of the warp must execute it)
+u32 vote_sync_ballot(const Value& pred);
+u32 brev_b32(const Value& a);
+u32 clz_b32(const Value& a);
+// Index of the least significant set bit of a (32 if a == 0)
+inline u32 lowest_bit_b32(const Value& a) {
+  return clz_b32(brev_b32(a));
+}
 
 void discard(const u64& address);
 
@@ -841,6 +857,8 @@ Value sharedAddr(const char* name); // mov.u32 of shared symbol address, returns
 Value addShared(int align, int sizeBytes, const char* suffix = nullptr);   // declare shared mem, return U64 address
 Value addShared32(int align, int sizeBytes, const char* suffix = nullptr); // declare shared mem, return U32 address
 u64 addGlobalVar(int align, int sizeBytes, const char* suffix = nullptr);  // declare global var, return U64 address
+// Declare an initialized global array, return its U64 address
+u64 addGlobalData(int align, const void* data, size_t size, const char* name);
 Value addConst32(
     int align, const void* data, size_t size, const char* name); // declare initialized const, return U32 address
 

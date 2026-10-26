@@ -716,6 +716,31 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     }
   }
 
+  // The nodes that edges read, as seen by this rank and its peers. An edge must signal its destinations if some
+  // edge reads one of them, and that edge may be one this rank does not know (finalize gives a rank the edges
+  // that touch its nodes): e.g. in a ring_write chain, rank 0 writes rank 1's node, which the edge from rank 1 to
+  // rank 2 reads. The reader's executor is a peer of the writer (the node's owner, or the edge's destination,
+  // which knows the edge writing the node), so the union over the peers is complete.
+  HashMap<uint64_t, bool> readNodes;
+  {
+    Vector<uint64_t> myReadNodes;
+    for (auto& v : graph.cudaEdges) {
+      for (auto& n : v.sources) {
+        myReadNodes.push_back(n.id);
+      }
+    }
+    for (size_t r : ranks) {
+      ctx.send(r, myReadNodes);
+    }
+    for (size_t r : ranks) {
+      Vector<uint64_t> nn;
+      ctx.receive(r, nn);
+      for (uint64_t id : nn) {
+        readNodes[id] = true;
+      }
+    }
+  }
+
   auto map = [&](std::string name, size_t bytes) {
     return mapn(rv->memoryKey, ctx, name, ranks, bytes);
   };
@@ -814,87 +839,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       CHECK(false);
     };
 
-    std::unique_ptr<EmitMultiCopy> emit;
-    if (config.copyEngine == "simple") {
-      emit = std::make_unique<EmitSimple>(config, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "grouped") {
-      emit = std::make_unique<EmitGrouped>(config, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "buffered") {
-      emit = std::make_unique<EmitBuffered>(config, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "lockstep") {
-      emit = std::make_unique<EmitLockstep>(config, blockIndex, warpIndex, laneIndex);
-    } else {
-      CHECK(false);
-    }
-    CHECK(emit != nullptr);
-
-    struct AddrSetup {
-      uint64_t base;
-      uint32_t itembytes;
-      uint32_t paramOffset;
-      uint32_t stride;
-      uint32_t slot;
-    };
-
-    struct SyncSetup {
-      uint64_t stbase;
-      uint32_t itembytes;
-      uint32_t ldoffset;
-      uint32_t stBlockStride; // bytes per block row in the peer's sync buffer
-    };
-
-    std::vector<SyncSetup> syncsetup;
-    for (size_t i : indices(ranks)) {
-      if (ranks[i] == rank) {
-        continue;
-      }
-      auto& r = syncAddrs.remote[i];
-      SyncSetup s;
-      s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
-      s.itembytes = r.itembytes;
-      s.ldoffset = sizeof(uint32_t) * i;
-      s.stBlockStride = sizeof(uint32_t) * peerRanksSize[i];
-      syncsetup.push_back(s);
-    }
-
-    u32 csyncaddr = addConst32(syncsetup, "syncsetup");
-
-    profiling.enter("syncsetup");
-
-    std::vector<AddrSetup> addrsetup;
-    for (size_t i : indices(graph.remoteCudaTensorMappings)) {
-      auto& v = graph.remoteCudaTensorMappings[i];
-      auto& r = addrAddrs.remote[rankIndex(v.rank)];
-
-      AddrSetup s;
-      s.base = r.base;
-      s.itembytes = r.itembytes;
-      s.paramOffset = sizeof(uint64_t) * i;
-      s.stride = sizeof(uint64_t) * v.stride;
-      s.slot = sizeof(uint64_t) * v.destinationSlot;
-      addrsetup.push_back(s);
-    }
-    u32 caddrsetup = addConst32(addrsetup, "addrsetup");
-    for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
-      u32 index = blockSize * i + threadIndex;
-      auto pred = index < graph.remoteCudaTensorMappings.size();
-      u32 caddr = caddrsetup + index * sizeof(AddrSetup);
-      u64 base = predicated(pred, ld_const_u64)(caddr);
-      u32 itembytes = predicated(pred, ld_const_u32)(caddr + 8);
-      u32 paramOffset = predicated(pred, ld_const_u32)(caddr + 12);
-      u32 stride = predicated(pred, ld_const_u32)(caddr + 16);
-      u32 slot = predicated(pred, ld_const_u32)(caddr + 20);
-      u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
-      predicated(pred, st_global_relaxed_sys_u64)(
-          addr, predicated(pred, ld_param_u64)(mappedAddrs + paramOffset, 0) | parityTag);
-    }
-
-    profiling.leave();
-
-    profiling.enter("syncsetup warp_sync");
-    warp_sync();
-    profiling.leave();
-
+    // ---- The edges this rank executes ----
     Vector<Edge> localCopies;
 
     for (auto& v : graph.cudaEdges) {
@@ -935,153 +880,105 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         localCopies.push_back(v);
       }
     }
+    // Relay edges first: the scan for ready edges below stops at the first ready copy, and always reaches them
+    std::stable_partition(localCopies.begin(), localCopies.end(), [](const Edge& e) {
+      return e.sources.empty();
+    });
 
+    // nowaits: no edge waits for another edge or for the CPU thread, so the edges run in order
     bool nowaits = true;
-    bool hasRemoteReads = false;
     bool hasRemoteWrites = false;
+    size_t maxDestinations = 0;
     for (const Edge& e : localCopies) {
-      if (e.sources.empty()) {
-        nowaits = false; // a relay edge waits for the CPU thread
-      }
-      for (const Node& n : e.sources) {
-        if (!n.filled) {
-          nowaits = false;
-        }
-        if (n.rank != rank) {
-          hasRemoteReads = true;
-        }
+      if (e.sources.empty() || !e.sources[0].filled) {
+        nowaits = false;
       }
       for (const Node& n : e.destinations) {
         if (n.rank != rank) {
           hasRemoteWrites = true;
         }
       }
-    }
-
-    u64 addrAddrsLocalBase = concurrency(addrAddrs.local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
-
-    auto getaddr = [&](const Node& n) {
-      if (n.rank == rank) {
-        return ld_param_u64(inputAddrs, sizeof(uint64_t) * n.tensorIndex) + n.offset;
-      } else {
-        u64 r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + sizeof(uint64_t) * findLocalMapping(n));
-        WHILE((r & (1ull << 63)) != parityTag) {
-          nanosleep(10);
-          r = ld_global_relaxed_sys_u64(addrAddrsLocalBase + sizeof(uint64_t) * findLocalMapping(n));
-        }
-        r &= ~(1ull << 63);
-        return r + n.offset;
-      }
-    };
-
-    struct NodeSetup {
-      uint32_t slot;
-      uint32_t offsetLow;
-      uint32_t offsetHigh;
-    };
-
-    size_t maxDestinations = 0;
-    for (const Edge& e : localCopies) {
       maxDestinations = std::max(maxDestinations, e.destinations.size());
     }
-
-    std::vector<NodeSetup> nodesetup;
-    for (const Edge& e : localCopies) {
-      for (auto& n : e.destinations) {
-        NodeSetup s;
-        s.offsetLow = n.offset;
-        s.offsetHigh = n.offset >> 32;
-        if (n.rank == rank) {
-          s.slot = sizeof(uint64_t) * n.tensorIndex | 1;
-        } else {
-          s.slot = sizeof(uint64_t) * findLocalMapping(n);
-        }
-        nodesetup.push_back(s);
-      }
-    }
-
-    u32 cnodesetupaddr = addConst32(nodesetup, "nodesetup");
-
-    // The address of destination node `index` (in nodesetup order) for the threads where pred is true, 0 for the
-    // others.
-    auto nodeaddrpred = [&](Value pred, u32 index) {
-      profiling.enter("nodeaddr");
-      u32 caddr = cnodesetupaddr + index * sizeof(NodeSetup);
-      u32 slot = predicated(pred, ld_const_u32)(caddr);
-      u32 offsetlo = predicated(pred, ld_const_u32)(caddr + 4);
-      u32 offsethi = predicated(pred, ld_const_u32)(caddr + 8);
-      u64 r;
-      Value done = !pred;
-      Value isParam = (slot & 1) != 0;
-      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~1u), 0);
-      done |= isParam;
-      u64 gaddr = addrAddrsLocalBase + widen(slot);
-      r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
-      done |= (r & (1ull << 63)) == parityTag;
-      profiling.enter("nodeaddr loop");
-      WHILE(vote_sync_any(!done)) {
-        nanosleep(10);
-        fence_acquire_sys();
-        r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
-        done |= (r & (1ull << 63)) == parityTag;
-      }
-      profiling.enter("nodeaddr post");
-      r &= ~(1ull << 63);
-
-      r += widen(offsetlo) | (widen(offsethi) << 32);
-      profiling.leave();
-      return selp_u64(r, 0, pred);
-    };
-
-    size_t groupSize = emit->groupSize();
-
-    // The destination addresses of edge e for this thread: slot i of the thread takes destination gindex(i) of e
-    // (0 if there is no such destination). In groups of several warps, consecutive destinations go to different
-    // warps (lane l of warp w of the group takes destination (w + 1) % warps + warps * l), so that all warps of the
-    // group issue the stores of a multicast edge.
-    auto setdst = [&](const Edge& e, u32 nodeoffset, Vector<u64>& dstaddrs) {
-      auto gindex = [&](size_t i) {
-        if (groupSize == 32) {
-          return (laneIndex + groupSize * i);
-        }
-        u32 index = (threadIndex + 32) % groupSize;
-        return (index / 32 + index % 32 * (groupSize / 32)) + groupSize * i;
-      };
-      for (size_t i : indices(dstaddrs)) {
-        u32 index = gindex(i);
-        dstaddrs[i] = nodeaddrpred(index < e.destinations.size(), nodeoffset + index);
-      }
-    };
-
-    // The depFilled slot of node `id` for this block on this rank: >= stepValue once the node has been filled
-    auto depFilledAddr = [&](uint64_t id) {
-      auto it = std::ranges::find(localNodes, id);
-      CHECK(it != localNodes.end());
-      return concurrency(depFilled.local) +
-             widen(sizeof(uint32_t) * ((it - localNodes.begin()) + localNodes.size() * blockIndex));
-    };
 
     // Whether another edge reads one of e's destination nodes (e.g. the next rank of a ring), and so waits for
     // e to be signaled as done.
     auto hasDependents = [&](const Edge& e) {
-      for (auto& ne : graph.cudaEdges) {
-        for (auto& n : ne.sources) {
-          for (auto& n2 : e.destinations) {
-            if (n.id == n2.id) {
-              return true;
-            }
-          }
+      for (auto& n : e.destinations) {
+        if (readNodes.contains(n.id)) {
+          return true;
         }
       }
       return false;
     };
 
-    // Signal (per block) that e's destination nodes are filled: to this rank (the dependency loop checks its own
-    // destination nodes to skip finished edges), to the destination ranks, and to the destination ranks of
-    // edges that read e's destinations. Called by thread 0 after the whole block has finished the copy.
-    auto signalFilled = [&](const Edge& e) {
-      // fixme: this fence is only needed if signalranks has a != rank member
-      fence_release_sys();
+    // ---- Tables ----
+    // The kernel reads its edges from tables at runtime, so its code size does not depend on the number of
+    // edges. All tables are in one initialized global array.
+    //
+    // A node address is the node's offset plus, for slot = 8 * tensorIndex | 1, this rank's tensor (a kernel
+    // parameter), else the peer's tensor at byte offset slot in the exchanged address table.
+    struct NodeSetup {
+      uint32_t slot;
+      uint32_t offsetLow;
+      uint32_t offsetHigh;
+    };
+    // An edge record: EdgeSetup, then the node setups of the source and of the destinations, with a fixed stride
+    // so that the loads of an edge do not depend on each other
+    struct EdgeSetup {
+      uint32_t flags;
+      uint32_t signal;    // a relay edge's signal index
+      uint32_t sourceDep; // depFilled index of an unfilled source node
+      uint32_t bytes;
+      uint32_t numDestinations;
+      uint32_t signals; // signal setup index of the first depFilled slot to write when the edge is done
+      uint32_t numSignals;
+      uint32_t pad;
+    };
+    static constexpr size_t sourceSetupOffset = sizeof(EdgeSetup);
+    static constexpr size_t destinationSetupsOffset = sizeof(EdgeSetup) + sizeof(NodeSetup);
+    const size_t edgeStride = (destinationSetupsOffset + sizeof(NodeSetup) * maxDestinations + 15) / 16 * 16;
+    // A depFilled slot on a peer (or this rank): base + itembytes * concurrencyIndex + 4 * (index + stride *
+    // blockIndex)
+    struct SignalSetup {
+      uint64_t base;
+      uint32_t itembytes;
+      uint32_t index;
+      uint32_t stride;
+      uint32_t pad;
+    };
+    // Where to write the address at which a peer maps one of this rank's tensors (in the peer's address table)
+    struct AddrSetup {
+      uint64_t base;
+      uint32_t itembytes;
+      uint32_t paramOffset;
+      uint32_t stride;
+      uint32_t slot;
+    };
+    static constexpr uint32_t edgeRelay = 1;   // relay edge: waits for the CPU thread's signal, copies nothing
+    static constexpr uint32_t edgeWait = 2;    // waits for its source node (relay edges: for the signal)
+    static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
+    static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
+
+    auto nodeSetup = [&](const Node& n) {
+      NodeSetup s;
+      s.offsetLow = n.offset;
+      s.offsetHigh = n.offset >> 32;
+      if (n.rank == rank) {
+        s.slot = sizeof(uint64_t) * n.tensorIndex | 1;
+      } else {
+        s.slot = sizeof(uint64_t) * findLocalMapping(n);
+      }
+      return s;
+    };
+    auto localNodeIndex = [&](uint64_t id) {
+      auto it = std::ranges::find(localNodes, id);
+      CHECK(it != localNodes.end());
+      return (uint32_t)(it - localNodes.begin());
+    };
+    // The depFilled slots to write once e's destination nodes are filled (per block): on this rank, on the
+    // destination ranks, and on the destination ranks of edges that read e's destinations.
+    auto appendSignals = [&](const Edge& e, std::vector<SignalSetup>& out) {
       HashMap<uint32_t, bool> signalRanks;
       signalRanks[rank] = true;
       for (const Node& n : e.destinations) {
@@ -1107,132 +1004,399 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         for (const Node& n : e.destinations) {
           auto it = dependencyIndices[r].find(n.id);
           if (it != dependencyIndices[r].end()) {
-            st_global_relaxed_sys_u32(concurrency(depFilled.remote.at(rankIndex(r))) +
-                                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
-                stepValue);
+            const auto& peer = depFilled.remote.at(rankIndex(r));
+            SignalSetup s = {};
+            s.base = peer.base;
+            s.itembytes = peer.itembytes;
+            s.index = it->second.index;
+            s.stride = it->second.stride;
+            out.push_back(s);
           }
         }
       }
     };
 
-    if (nowaits) {
-      profiling.enter("nowaits");
-
-      u32 nodeoffset = 0;
-      for (const Edge& e : localCopies) {
-        CHECK(e.sources.size() == 1);
-        CHECK(e.destinations.size() >= 1);
-
-        u64 srcaddr = getaddr(e.sources[0]);
-        Vector<u64> dstaddrs((e.destinations.size() + emit->groupSize() - 1) / emit->groupSize());
-        setdst(e, nodeoffset, dstaddrs);
-        nodeoffset += e.destinations.size();
-
-        if (hasRemoteReads) {
-          IF_D(threadIndex == 0) {
-            fence_acquire_sys();
-          }
+    std::vector<uint8_t> edgeTable(edgeStride * localCopies.size());
+    std::vector<SignalSetup> signalTable;
+    for (size_t i : indices(localCopies)) {
+      const Edge& e = localCopies[i];
+      uint8_t* record = edgeTable.data() + edgeStride * i;
+      EdgeSetup s = {};
+      CHECK(e.bytes < (1ull << 32));
+      s.bytes = e.bytes;
+      if (e.sources.empty()) {
+        s.flags = edgeRelay | edgeWait;
+        s.signal = e.rdmaSignal;
+      } else {
+        const Node& src = e.sources[0];
+        NodeSetup source = nodeSetup(src);
+        std::memcpy(record + sourceSetupOffset, &source, sizeof(source));
+        if (!src.filled) {
+          s.flags |= edgeWait | edgeAcquire;
+          s.sourceDep = localNodeIndex(src.id);
         }
-
-        profiling.enter("call emit");
-
-        emit->emit(srcaddr, dstaddrs, e.bytes);
-
-        // Nothing here waits, but other edges may wait for this one (e.g. the head of a ring).
-        if (hasDependents(e)) {
-          IF_D(threadIndex == 0) {
-            signalFilled(e);
-          }
+        if (src.rank != rank) {
+          s.flags |= edgeAcquire;
         }
       }
+      s.numDestinations = e.destinations.size();
+      for (size_t d : indices(e.destinations)) {
+        NodeSetup n = nodeSetup(e.destinations[d]);
+        std::memcpy(record + destinationSetupsOffset + sizeof(NodeSetup) * d, &n, sizeof(n));
+      }
+      if (hasDependents(e)) {
+        s.flags |= edgeSignal;
+        s.signals = signalTable.size();
+        appendSignals(e, signalTable);
+        s.numSignals = signalTable.size() - s.signals;
+      }
+      std::memcpy(record, &s, sizeof(s));
+    }
 
+    std::vector<AddrSetup> addrTable;
+    for (size_t i : indices(graph.remoteCudaTensorMappings)) {
+      auto& v = graph.remoteCudaTensorMappings[i];
+      auto& r = addrAddrs.remote[rankIndex(v.rank)];
+
+      AddrSetup s;
+      s.base = r.base;
+      s.itembytes = r.itembytes;
+      s.paramOffset = sizeof(uint64_t) * i;
+      s.stride = sizeof(uint64_t) * v.stride;
+      s.slot = sizeof(uint64_t) * v.destinationSlot;
+      addrTable.push_back(s);
+    }
+
+    std::vector<uint8_t> tableData;
+    auto appendTable = [&](const auto& table) {
+      size_t offset = (tableData.size() + 7) / 8 * 8;
+      size_t bytes = sizeof(table[0]) * table.size();
+      tableData.resize(offset + bytes);
+      if (bytes) {
+        std::memcpy(tableData.data() + offset, table.data(), bytes);
+      }
+      return offset;
+    };
+    size_t edgeTableOffset = appendTable(edgeTable);
+    size_t signalTableOffset = appendTable(signalTable);
+    size_t addrTableOffset = appendTable(addrTable);
+    u64 tables = addGlobalData(16, tableData.data(), tableData.size(), "tables");
+
+    // The scan for ready edges keeps a done bit per edge and the selected edge in shared memory, taken from the
+    // copy engine's share
+    const uint32_t numEdges = localCopies.size();
+    const uint32_t numDoneWords = (numEdges + 31) / 32;
+    const uint32_t scanShared = nowaits ? 0 : (4 * numDoneWords + 8 + 15) / 16 * 16;
+    KernelConfig engineConfig = config;
+    CHECK(engineConfig.sharedMemory > scanShared);
+    engineConfig.sharedMemory -= scanShared;
+
+    std::unique_ptr<EmitMultiCopy> emit;
+    if (config.copyEngine == "simple") {
+      emit = std::make_unique<EmitSimple>(engineConfig, blockIndex, warpIndex, laneIndex);
+    } else if (config.copyEngine == "grouped") {
+      emit = std::make_unique<EmitGrouped>(engineConfig, blockIndex, warpIndex, laneIndex);
+    } else if (config.copyEngine == "buffered") {
+      emit = std::make_unique<EmitBuffered>(engineConfig, blockIndex, warpIndex, laneIndex);
+    } else if (config.copyEngine == "lockstep") {
+      emit = std::make_unique<EmitLockstep>(engineConfig, blockIndex, warpIndex, laneIndex);
     } else {
-      u64 srcaddr = 0;
-      Vector<u64> dstaddrs((maxDestinations + emit->groupSize() - 1) / emit->groupSize());
-      u32 bytes = 0;
-      u32 index = 0;
+      CHECK(false);
+    }
+    CHECK(emit != nullptr);
 
-      WHILE(true) {
+    struct SyncSetup {
+      uint64_t stbase;
+      uint32_t itembytes;
+      uint32_t ldoffset;
+      uint32_t stBlockStride; // bytes per block row in the peer's sync buffer
+    };
 
-        u32 numDone = 0;
+    std::vector<SyncSetup> syncsetup;
+    for (size_t i : indices(ranks)) {
+      if (ranks[i] == rank) {
+        continue;
+      }
+      auto& r = syncAddrs.remote[i];
+      SyncSetup s;
+      s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
+      s.itembytes = r.itembytes;
+      s.ldoffset = sizeof(uint32_t) * i;
+      s.stBlockStride = sizeof(uint32_t) * peerRanksSize[i];
+      syncsetup.push_back(s);
+    }
 
-        u32 nextNodeOffset = 0;
-        for (const Edge& e : localCopies) {
-          u32 nodeoffset = nextNodeOffset;
-          nextNodeOffset += e.destinations.size();
+    u32 csyncaddr = addConst32(syncsetup, "syncsetup");
 
-          if (e.sources.empty()) {
-            // Relay edge: wait for the CPU thread's signal that the RDMA read into the destination node has
-            // completed (cpuOutBuffer slot 16 + rdmaSignal), then mark the node as filled. Nothing to copy, so
-            // thread 0 alone handles it.
-            IF_D(threadIndex == 0) {
-              IF(ld_global_relaxed_sys_u32(depFilledAddr(e.destinations[0].id)) == stepValue) {
-                numDone += 1;
-              }
-              ELSE {
-                u32 ready = 1;
-                if (!tuning) {
-                  u64 flagAddr = concurrency(group->cpuOutBuffer) + sizeof(uint32_t) * (16 + e.rdmaSignal);
-                  IF(ld_global_relaxed_sys_u32(flagAddr) < stepValue) {
-                    ready = 0;
-                  }
-                }
-                IF(ready != 0) {
-                  signalFilled(e);
-                  numDone += 1;
-                }
-              }
-            }
-            continue;
-          }
+    profiling.enter("syncsetup");
 
-          CHECK(e.sources.size() == 1);
-          CHECK(e.destinations.size() >= 1);
-          auto& src = e.sources[0];
+    // Address exchange: write the addresses at which the peers map this rank's tensors into their address tables
+    for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
+      u32 index = blockSize * i + threadIndex;
+      auto pred = index < graph.remoteCudaTensorMappings.size();
+      u64 caddr = tables + addrTableOffset + widen(index * sizeof(AddrSetup));
+      u64 base = predicated(pred, ld_global_nc_u64)(caddr);
+      u32 itembytes = predicated(pred, ld_global_nc_u32)(caddr + 8);
+      u32 paramOffset = predicated(pred, ld_global_nc_u32)(caddr + 12);
+      u32 stride = predicated(pred, ld_global_nc_u32)(caddr + 16);
+      u32 slot = predicated(pred, ld_global_nc_u32)(caddr + 20);
+      u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
+      predicated(pred, st_global_relaxed_sys_u64)(
+          addr, predicated(pred, ld_param_u64)(mappedAddrs + paramOffset, 0) | parityTag);
+    }
 
-          Label skip;
-          Label sync;
-          u32 pred = 0;
-          IF_D(threadIndex == 0) {
-            u32 ready = 1;
-            if (!src.filled) {
-              IF(ld_global_relaxed_sys_u32(depFilledAddr(src.id)) < stepValue) {
-                ready = 0;
-              }
-            }
+    profiling.leave();
 
-            IF(ready != 0) {
-              IF(ld_global_relaxed_sys_u32(depFilledAddr(e.destinations[0].id)) == stepValue) {
-                numDone += 1;
-              }
-              ELSE {
-                pred = 1;
-              }
-            }
-          }
-          GOTO_IF_NOT(bar_red_or(15, blockSize, pred != 0), skip);
+    profiling.enter("syncsetup warp_sync");
+    warp_sync();
+    profiling.leave();
 
-          srcaddr = getaddr(src);
-          setdst(e, nodeoffset, dstaddrs);
-          bytes = e.bytes;
-          // A source written by another agent (a peer GPU, or a NIC for nodes filled over RDMA): acquire before
-          // reading it
-          if (hasRemoteReads || !src.filled) {
-            IF_D(threadIndex == 0) {
-              fence_acquire_sys();
-            }
-          }
-          emit->emit(srcaddr, dstaddrs, bytes);
+    u64 addrAddrsLocalBase = concurrency(addrAddrs.local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
+    u64 edgeTableAddr = tables + edgeTableOffset;
+    u64 signalTableAddr = tables + signalTableOffset;
 
-          IF_D(threadIndex == 0) {
-            signalFilled(e);
-          }
-          numDone += 1;
-          LABEL(skip);
+    // The address of a node from its setup words (the same for all threads)
+    auto nodeaddr = [&](const u32& slot, const u32& offsetlo, const u32& offsethi) {
+      u64 r;
+      IF_D((slot & 1) != 0) {
+        r = ld_param_u64(inputAddrs + (slot & ~1u), 0);
+      }
+      ELSE {
+        u64 gaddr = addrAddrsLocalBase + widen(slot);
+        r = ld_global_relaxed_sys_u64(gaddr);
+        WHILE((r & (1ull << 63)) != parityTag) {
+          nanosleep(10);
+          r = ld_global_relaxed_sys_u64(gaddr);
         }
+        r &= ~(1ull << 63);
+      }
+      r += widen(offsetlo) | (widen(offsethi) << 32);
+      return r;
+    };
 
-        IF(bar_red_or(14, blockSize, numDone == localCopies.size())) {
+    // The address of a node from its setup words, for the threads where pred is true (0 for the others)
+    auto nodeaddrpred = [&](Value pred, const u32& slot, const u32& offsetlo, const u32& offsethi) {
+      profiling.enter("nodeaddr");
+      u64 r;
+      Value done = !pred;
+      Value isParam = (slot & 1) != 0;
+      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~1u), 0);
+      done |= isParam;
+      u64 gaddr = addrAddrsLocalBase + widen(slot);
+      r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
+      done |= (r & (1ull << 63)) == parityTag;
+      profiling.enter("nodeaddr loop");
+      WHILE(vote_sync_any(!done)) {
+        nanosleep(10);
+        fence_acquire_sys();
+        r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
+        done |= (r & (1ull << 63)) == parityTag;
+      }
+      profiling.enter("nodeaddr post");
+      r &= ~(1ull << 63);
+
+      r += widen(offsetlo) | (widen(offsethi) << 32);
+      profiling.leave();
+      return selp_u64(r, 0, pred);
+    };
+
+    size_t groupSize = emit->groupSize();
+    const size_t numDstSlots = (maxDestinations + groupSize - 1) / groupSize;
+
+    // Slot i of this thread takes destination gindex(i) of an edge. In groups of several warps, consecutive
+    // destinations go to different warps (lane l of warp w of the group takes destination (w + 1) % warps +
+    // warps * l), so that all warps of the group issue the stores of a multicast edge.
+    auto gindex = [&](size_t i) {
+      if (groupSize == 32) {
+        return (laneIndex + groupSize * i);
+      }
+      u32 index = (threadIndex + 32) % groupSize;
+      return (index / 32 + index % 32 * (groupSize / 32)) + groupSize * i;
+    };
+
+    // The words of an edge record this thread needs: the header fields, the source's setup, and the setups of the
+    // destinations of its slots
+    struct EdgeWords {
+      u32 flags;
+      u32 bytes;
+      u32 numDestinations;
+      std::array<u32, 3> source;
+      Vector<std::array<u32, 3>> destinations;
+    };
+    // Load the words of the edge at desc into w's registers (if pred, when given). Nothing uses them yet, so the
+    // sequential path can have the loads of the next edge in flight while it copies the current one.
+    auto loadEdge = [&](EdgeWords& w, const u64& desc, const Value* pred) {
+      w.destinations.resize(numDstSlots);
+      auto load = [&](const Value& d, const u64& addr) {
+        if (pred) {
+          PRED(*pred) ld_global_nc_u32_into(d, addr);
+        } else {
+          ld_global_nc_u32_into(d, addr);
+        }
+      };
+      load(w.flags, desc);
+      load(w.bytes, desc + 12);
+      load(w.numDestinations, desc + 16);
+      for (size_t j : range(3)) {
+        load(w.source[j], desc + sourceSetupOffset + 4 * j);
+      }
+      for (size_t i : range(numDstSlots)) {
+        u32 index = gindex(i);
+        u64 caddr = desc + destinationSetupsOffset + widen(index * sizeof(NodeSetup));
+        // Slots beyond the record's destinations stay unloaded
+        Value valid = index < maxDestinations;
+        Value p = pred ? valid & *pred : valid;
+        for (size_t j : range(3)) {
+          PRED(p) ld_global_nc_u32_into(w.destinations[i][j], caddr + 4 * j);
+        }
+      }
+    };
+
+    // Signal (this block's slots) that the destination nodes of the edge at `desc` are filled: a release fence,
+    // then the depFilled stores. For the thread that has seen the edge done (thread 0 after a copy by the whole
+    // block, or the lane that has seen a relay edge's signal); several lanes may run it at once, hence the
+    // divergent loop.
+    auto signalEdge = [&](const u64& desc) {
+      u32 i = ld_global_nc_u32(desc + 20);
+      u32 end = i + ld_global_nc_u32(desc + 24);
+      fence_release_sys();
+      Label loop;
+      Label done;
+      LABEL(loop);
+      GOTO_IF_NOT_D(i < end, done);
+      u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
+      u64 base = ld_global_nc_u64(s);
+      u32 itembytes = ld_global_nc_u32(s + 8);
+      u32 index = ld_global_nc_u32(s + 12);
+      u32 stride = ld_global_nc_u32(s + 16);
+      st_global_relaxed_sys_u32(
+          base + widen(itembytes * concurrencyIndex + 4 * (index + stride * blockIndex)), stepValue);
+      i += 1;
+      GOTO(loop);
+      LABEL(done);
+    };
+
+    Vector<u64> dstaddrs(numDstSlots);
+    // Resolve the addresses of an edge from its loaded words: returns the source address, sets dstaddrs
+    auto resolveEdge = [&](const EdgeWords& w) {
+      u64 srcaddr = nodeaddr(w.source[0], w.source[1], w.source[2]);
+      for (size_t i : range(numDstSlots)) {
+        auto& d = w.destinations[i];
+        dstaddrs[i] = nodeaddrpred(gindex(i) < w.numDestinations, d[0], d[1], d[2]);
+      }
+      return srcaddr;
+    };
+    // Copy the edge at `desc` (the same for all threads) with the whole block: flags, bytes and srcaddr taken
+    // from its words (copied into registers of their own, so the words can be reloaded), dstaddrs resolved
+    auto copyEdge = [&](const u64& desc, const u32& flags, const u32& bytes, const u64& srcaddr) {
+      // Every thread has read the source's address itself (remote sources), and any may issue loads
+      IF((flags & edgeAcquire) != 0) {
+        fence_acquire_sys();
+      }
+      emit->emit(srcaddr, dstaddrs, bytes);
+      IF_D(isThreadZero & ((flags & edgeSignal) != 0)) {
+        signalEdge(desc);
+      }
+    };
+
+    if (numEdges == 0) {
+    } else if (nowaits) {
+      // In order, with the words of the next edge loaded while the current one is copied
+      EdgeWords next;
+      loadEdge(next, edgeTableAddr, nullptr);
+      FOR(u32 e = 0, e < numEdges, e += 1) {
+        u32 flags = next.flags;
+        u32 bytes = next.bytes;
+        u64 srcaddr = resolveEdge(next);
+        Value more = e + 1 < numEdges;
+        loadEdge(next, edgeTableAddr + widen((e + 1) * edgeStride), &more);
+        copyEdge(edgeTableAddr + widen(e * edgeStride), flags, bytes, srcaddr);
+      }
+    } else {
+      // Rounds: warp 0 scans the edges that are not done, 32 at a time (one per lane). Relay edges whose signal
+      // has arrived are finished on the spot. The first ready copy edge is selected; after a block barrier, the
+      // whole block copies it and thread 0 marks it done. The selection slot alternates between two words, so
+      // that warp 0 can write the next round's while other warps still read this round's.
+      static constexpr uint32_t selWait = 0xffffffff; // nothing ready: scan again
+      static constexpr uint32_t selDone = 0xfffffffe; // all edges done
+      u32 doneAddr = addShared32(4, 4 * numDoneWords, "done");
+      u32 selAddr = addShared32(4, 8, "sel");
+      for (uint32_t i : range((numDoneWords + blockSize - 1) / blockSize)) {
+        u32 w = blockSize * i + threadIndex;
+        PRED(w < numDoneWords) st_shared_u32(doneAddr + 4 * w, 0);
+      }
+      barrier_sync(14);
+
+      u32 round = 0;
+      WHILE(true) {
+        u32 selSlot = selAddr + 4 * (round & 1);
+        IF(warpIndex == 0) {
+          warp_sync();
+          u32 found = selWait;
+          u32 pending = 0;
+          FOR(u32 w = 0, w < numDoneWords, w += 1) {
+            u32 doneWord = ld_shared_u32(doneAddr + 4 * w);
+            u32 e = 32 * w + laneIndex;
+            Value notDone = (e < numEdges) & (((doneWord >> laneIndex) & 1) == 0);
+            u64 desc = edgeTableAddr + widen(e * edgeStride);
+            u32 flags = predicated(notDone, ld_global_nc_u32)(desc);
+            u32 signal = predicated(notDone, ld_global_nc_u32)(desc + 4);
+            u32 sourceDep = predicated(notDone, ld_global_nc_u32)(desc + 8);
+            Value relay = notDone & ((flags & edgeRelay) != 0);
+            Value depWait = notDone & ((flags & edgeWait) != 0) & !relay;
+            u32 value = stepValue;
+            u64 depAddr = concurrency(depFilled.local) + widen(4 * (sourceDep + localNodes.size() * blockIndex));
+            value = selp(predicated(depWait, ld_global_relaxed_sys_u32)(depAddr), value, depWait);
+            if (!tuning) {
+              u64 flagAddr = concurrency(group->cpuOutBuffer) + widen(4 * (signal + 16));
+              value = selp(predicated(relay, ld_global_relaxed_sys_u32)(flagAddr), value, relay);
+            }
+            Value ready = notDone & (value >= stepValue);
+            Value relayReady = ready & relay;
+            u32 relayBits = vote_sync_ballot(relayReady);
+            u32 copyBits = vote_sync_ballot(ready & !relay);
+            pending |= vote_sync_ballot(notDone) & ~relayBits;
+            // A relay edge whose signal has arrived: its node is filled; the lane that has seen the signal
+            // passes it on
+            IF_D(relayReady) {
+              signalEdge(desc);
+            }
+            IF_D((laneIndex == 0) & (relayBits != 0)) {
+              st_shared_u32(doneAddr + 4 * w, doneWord | relayBits);
+            }
+            IF(copyBits != 0) {
+              found = 32 * w + lowest_bit_b32(copyBits);
+              BREAK;
+            }
+          }
+          // The lane that has seen the selected edge's source filled orders its load before the copy, which
+          // the block barrier below extends to all threads
+          IF(found != selWait) {
+            fence_acquire_sys();
+          }
+          IF_D(laneIndex == 0) {
+            u32 waitValue = selWait;
+            u32 doneValue = selDone;
+            st_shared_u32(selSlot, selp(found, selp(waitValue, doneValue, pending != 0), found != selWait));
+          }
+        }
+        barrier_sync(14);
+        u32 sel = ld_shared_u32(selSlot);
+        round += 1;
+        IF(sel == selDone) {
           BREAK;
+        }
+        IF(sel != selWait) {
+          u64 desc = edgeTableAddr + widen(sel * edgeStride);
+          EdgeWords w;
+          loadEdge(w, desc, nullptr);
+          u64 srcaddr = resolveEdge(w);
+          copyEdge(desc, w.flags, w.bytes, srcaddr);
+          IF_D(isThreadZero) {
+            u32 wordAddr = doneAddr + 4 * (sel / 32);
+            u32 one = 1;
+            st_shared_u32(wordAddr, ld_shared_u32(wordAddr) | (one << (sel % 32)));
+          }
         }
       }
     }
