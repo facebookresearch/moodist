@@ -347,13 +347,13 @@ struct InternalContext {
   }
 };
 
-static Vector<size_t> computeCudaRanks(const Group* group) {
+static Vector<size_t> computeCudaRanks(const Group* group, bool allowFabric) {
   Vector<size_t> cudaRanks = group->ipcRanks;
   if (std::ranges::find(cudaRanks, group->rank) == cudaRanks.end()) {
     cudaRanks.push_back(group->rank);
   }
   std::ranges::sort(cudaRanks);
-  if (!group->fabricDomainRanks.empty()) {
+  if (allowFabric && !group->fabricDomainRanks.empty()) {
     cudaRanks = group->fabricDomainRanks;
   }
   return cudaRanks;
@@ -375,7 +375,7 @@ struct GraphBuilder {
 
   GraphBuilder(InternalContext& ictx, const Graph& baseGraph) : ictx(ictx) {
     graph = baseGraph;
-    cudaRanks = computeCudaRanks(group);
+    cudaRanks = computeCudaRanks(group, !ctx.collectiveOp);
   }
 
   void multicast() {
@@ -2302,18 +2302,16 @@ struct CompileOpConstructor {
     // (remote ranks not reachable via NVLink, or CPU tensors).
     // Remove those edges from baseGraph so only kernel-eligible edges remain.
     {
-      Vector<size_t> cudaRanks = computeCudaRanks(group);
+      Vector<size_t> cudaRanks = computeCudaRanks(group, !ctx.collectiveOp);
       size_t numInputsAndCopies = op->inputs.size() + op->inputCopies.size();
 
-      // Kernel tuning and launch below are collective (sends/barriers across all ranks), so every rank must
-      // agree on whether the kernel path is used at all. Keep kernel-eligible edges only if EVERY rank has at
-      // least one (AND across ranks, despite the name); otherwise all edges become ibReads. E.g. a multi-node
-      // broadcast whose source is on one node leaves the other nodes without any local edges.
-      bool anyCuda = false;
-      for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
-        auto& edge = *it;
+      // Whether the copy kernel takes an edge: CUDA tensors on NVLink peers only. The kernel also needs sizes
+      // and offsets that are multiples of 16 bytes (TMA bulk copies): user ops must provide them (checked
+      // below), collective ops send other edges over RDMA.
+      auto kernelEdge = [&](const Edge& edge) {
         bool cuda = true;
         bool local = true;
+        bool aligned = edge.bytes % 16 == 0;
         for (auto& l : {&edge.sources, &edge.destinations}) {
           for (auto& n : *l) {
             if (n.device != DeviceType::CUDA) {
@@ -2322,14 +2320,19 @@ struct CompileOpConstructor {
             if (n.rank != rank && std::ranges::find(cudaRanks, n.rank) == cudaRanks.end()) {
               local = false;
             }
+            if (n.offset % 16 != 0) {
+              aligned = false;
+            }
           }
         }
-        if (local && cuda) {
-          anyCuda = true;
-          break;
-        }
-        ++it;
-      }
+        return cuda && local && (aligned || !ctx.collectiveOp);
+      };
+
+      // Kernel tuning and launch below are collective (sends/barriers across all ranks), so every rank must
+      // agree on whether the kernel path is used at all. Keep kernel-eligible edges only if EVERY rank has at
+      // least one (AND across ranks, despite the name); otherwise all edges become ibReads. E.g. a multi-node
+      // broadcast whose source is on one node leaves the other nodes without any local edges.
+      bool anyCuda = std::ranges::any_of(baseGraph.edges, kernelEdge);
       for (size_t i : range(size)) {
         ctx.send(i, anyCuda);
       }
@@ -2341,19 +2344,7 @@ struct CompileOpConstructor {
 
       for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
         auto& edge = *it;
-        bool cuda = true;
-        bool local = true;
-        for (auto& l : {&edge.sources, &edge.destinations}) {
-          for (auto& n : *l) {
-            if (n.device != DeviceType::CUDA) {
-              cuda = false;
-            }
-            if (n.rank != rank && std::ranges::find(cudaRanks, n.rank) == cudaRanks.end()) {
-              local = false;
-            }
-          }
-        }
-        if (local && cuda && anyCuda) {
+        if (anyCuda && kernelEdge(edge)) {
           ++it;
           continue;
         }
@@ -2390,8 +2381,47 @@ struct CompileOpConstructor {
       op->anyRankNeedsRdma = anyRankNeedsRdma;
     }
 
-    for (auto& edge : baseGraph.edges) {
-      REQUIRE(edge.bytes % 16 == 0, "compile_op: edge size %zu is not a multiple of 16 bytes", edge.bytes);
+    // The copy kernel moves data with TMA bulk copies (cp.async.bulk), which need 16-byte aligned addresses
+    // and sizes: every kernel edge must be a multiple of 16 bytes at 16-byte aligned offsets (tensor
+    // addresses are checked when the op runs). User ops must provide that (unaligned edges are not supported
+    // yet); collective ops sent unaligned edges over RDMA above. Each rank checks its own edges, so agree
+    // before raising: an error on some ranks alone would leave the others waiting in the collective steps
+    // below.
+    {
+      std::string alignmentError;
+      for (auto& edge : baseGraph.edges) {
+        if (edge.bytes % 16 != 0) {
+          alignmentError = fmt::sprintf("edge size %zu is not a multiple of 16 bytes", edge.bytes);
+        }
+        for (auto& l : {&edge.sources, &edge.destinations}) {
+          for (auto& n : *l) {
+            if (alignmentError.empty() && n.offset % 16 != 0) {
+              alignmentError = fmt::sprintf(
+                  "edge offset %zu (rank %u tensor %u) is not a multiple of 16 bytes", n.offset, n.rank, n.tensorIndex);
+            }
+          }
+        }
+        if (!alignmentError.empty()) {
+          break;
+        }
+      }
+      for (size_t i : range(size)) {
+        ctx.send(i, alignmentError);
+      }
+      std::string firstError;
+      size_t firstErrorRank = 0;
+      for (size_t i : range(size)) {
+        std::string e;
+        ctx.receive(i, e);
+        if (firstError.empty() && !e.empty()) {
+          firstError = std::move(e);
+          firstErrorRank = i;
+        }
+      }
+      REQUIRE(firstError.empty(),
+          "compile_op: %s (found on rank %zu). CUDA transfers between NVLink peers require sizes and offsets that "
+          "are multiples of 16 bytes",
+          firstError, firstErrorRank);
     }
 
     // graphs.push_back(buildNothing(ictx, baseGraph));

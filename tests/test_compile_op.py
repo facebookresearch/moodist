@@ -6,8 +6,9 @@ Each rank specifies which slices of a global tensor it contributes (inputs) and 
 
 These tests require distributed execution (multiple ranks).
 
-NOTE: compile_op requires CUDA tensors (or CPU tensors allocated through moodist's allocator).
-Tests run on both CPU and CUDA via @test_cpu_cuda decorator.
+NOTE: compile_op requires CUDA tensors from moodist's CUDA allocator (or CPU tensors allocated through
+moodist's CPU allocator), and CUDA transfers between NVLink peers use sizes and offsets that are multiples of
+16 bytes. Tests run on both CPU and CUDA via @test_cpu_cuda decorator.
 """
 
 import torch
@@ -15,8 +16,9 @@ import moodist
 from moodist import TensorRegion
 from framework import TestContext, test_cpu_cuda, create_process_group
 
-# Enable CPU allocator so compile_op works with CPU tensors
+# compile_op takes CPU tensors from moodist's CPU allocator and CUDA tensors from its CUDA allocator
 moodist.enable_cpu_allocator()
+moodist.enable_cuda_allocator()
 
 
 @test_cpu_cuda
@@ -429,9 +431,10 @@ def test_compile_op_tensor_id_multi_tensor(ctx: TestContext, device: str):
 
     This test transfers multiple tensors in a single compiled operation:
     - weight: 2D [world_size, 4], sharded on dim 0 (each rank provides 1 row)
-    - weight2: 2D [world_size, 2], sharded on dim 0 (same ndim as weight, different tensor_id)
+    - weight2: 2D [world_size, 8], sharded on dim 0 (same ndim as weight, different tensor_id)
     - bias: 1D [4], replicated from rank 0
-    - scale: 1D [2], replicated from rank 1 (same ndim as bias, different tensor_id)
+    - scale: 1D [8], replicated from rank 1 (same ndim as bias, different tensor_id)
+    (All rows and vectors are multiples of 16 bytes, as CUDA transfers between NVLink peers require.)
     """
     if ctx.world_size < 2:
         return
@@ -443,9 +446,9 @@ def test_compile_op_tensor_id_multi_tensor(ctx: TestContext, device: str):
     # Tensor dimensions
     weight_rows = ctx.world_size  # One row per rank
     weight_cols = 4
-    weight2_cols = 2
+    weight2_cols = 8
     bias_size = 4
-    scale_size = 2
+    scale_size = 8
 
     # Inputs: each rank provides its row of weight and weight2
     # Rank 0 provides bias, rank 1 provides scale

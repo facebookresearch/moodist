@@ -125,6 +125,14 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
     validates consistency across ranks, and compiles an optimized operation that handles
     the specified data movement patterns.
 
+    Requirements for CUDA tensors:
+        - They must be allocated by the moodist CUDA allocator (call
+          moodist.enable_cuda_allocator() before allocating them). Checked when the op runs.
+        - CUDA transfers between NVLink peers (including multi-node NVLink fabrics such as
+          NVL72) must use sizes and offsets that are multiples of 16 bytes, and 16-byte aligned
+          tensors. Sizes and offsets are checked here (RuntimeError on all ranks), tensor
+          addresses when the op runs.
+
     Args:
         group: A MoodistProcessGroup instance representing the distributed process group.
         dtype: The PyTorch data type (torch.dtype) for the operation (e.g., torch.float32).

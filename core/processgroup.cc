@@ -1072,9 +1072,13 @@ struct ProcessGroupImpl : api::ProcessGroup {
   void alltoall(std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream);
   void cudaBarrier(CUstream stream);
 
-  // compileOpFull - compile a distributed tensor operation
+  // compileOpFull - compile a distributed tensor operation. collectiveOp: an op behind a process group
+  // collective (scatter, gather), whose tensors may come from any allocator and have any size: no
+  // moodist-memory requirement, and edges the copy kernel cannot take go over RDMA (see
+  // CompileContext::collectiveOp).
   SharedPtr<CustomOpImpl> compileOpFull(DType dtype, std::span<const api::TensorRegion> inputs,
-      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync = false);
+      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync = false,
+      bool collectiveOp = false);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -2442,7 +2446,8 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
           .device = deviceStr});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
+    SharedPtr<CustomOpImpl> compiled =
+        compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None, /*cpuSync=*/false, /*collectiveOp=*/true);
     it = scatterCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -2540,7 +2545,8 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
           .device = deviceStr});
     }
 
-    SharedPtr<CustomOpImpl> compiled = compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None);
+    SharedPtr<CustomOpImpl> compiled =
+        compileOpFull(dtype, inputSpecs, outputSpecs, api::ReduceOp::None, /*cpuSync=*/false, /*collectiveOp=*/true);
     it = gatherCache.insert({key, std::move(compiled)}).first;
   }
 
@@ -3262,7 +3268,7 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
 // ============================================================================
 
 SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<const api::TensorRegion> inputsVec,
-    std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce, bool cpuSync) {
+    std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce, bool cpuSync, bool collectiveOp) {
 
   // Ensure queues exist for compile_op communication
   if (queues.empty()) {
@@ -3287,9 +3293,11 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
     resetStepValue();
   };
   ctx.nextOpId = &nextCustomOpId;
+  ctx.collectiveOp = collectiveOp;
 
   // Call compile_op
   auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce, cpuSync);
+  op->requireMoodistMemory = !collectiveOp;
 
   // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
   auto result = makeShared<CustomOpImpl>();
@@ -3388,6 +3396,27 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
         t->isCuda ? "cuda" : "cpu", expectedCuda ? "cuda" : "cpu");
     outputTDs.push_back(std::move(t));
   }
+
+  // The copy kernel needs 16-byte aligned tensor addresses (TMA bulk copies; edge sizes and offsets are
+  // checked at compile time). User ops take CUDA memory from the moodist CUDA allocator only: fabric peers
+  // can map nothing else, and moodist never unregisters or unmaps memory it has registered or shared (doing
+  // so synchronizes the device and can deadlock), so registered memory must never go back to CUDA.
+  auto checkTensors = [&](const char* what, const std::vector<TensorDataPtr>& tds) {
+    for (size_t i : indices(tds)) {
+      const auto& t = tds[i];
+      if (!t->isCuda || t->bytes() == 0) {
+        continue;
+      }
+      REQUIRE(!op->kernel || t->data() % 16 == 0, "moodist: custom op %s[%zu] data pointer %#x is not 16-byte aligned",
+          what, i, t->data());
+      REQUIRE(!op->requireMoodistMemory || allocator::owns(t->data()),
+          "moodist: custom op %s[%zu] (CUDA memory at %#x) was not allocated by the moodist CUDA allocator, which "
+          "compile_op requires (call moodist.enable_cuda_allocator() before allocating it)",
+          what, i, t->data());
+    }
+  };
+  checkTensors("input", inputTDs);
+  checkTensors("output", outputTDs);
 
   // Fast path: all-local, all-CUDA, no copies — skip CPU thread entirely
   // if (op->allLocal) {

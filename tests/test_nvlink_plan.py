@@ -14,6 +14,9 @@ import torch
 import moodist
 from framework import TestContext, test, create_process_group, create_context_from_env, TestRunner
 
+# compile_op takes CUDA tensors from moodist's CUDA allocator
+moodist.enable_cuda_allocator()
+
 
 @test
 def test_nvlink_plan_allgather(ctx: TestContext):

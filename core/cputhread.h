@@ -364,6 +364,9 @@ struct CustomOpDescriptor {
   bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
   bool anyRankNeedsRdma = false;
+  // CUDA tensors must come from the moodist CUDA allocator (checked in customOp). Off for process group
+  // collectives built on compile_op (scatter, gather), which take tensors from any allocator.
+  bool requireMoodistMemory = true;
 
   compile_op::Graph graph;
   std::shared_ptr<KernelHandle> kernelHandle;
