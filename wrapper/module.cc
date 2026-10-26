@@ -1586,6 +1586,17 @@ static PyObject* py_cuda_copy(PyObject* self, PyObject* args) {
   }
 }
 
+// enable_profiling(enabled) - CPU thread Chrome tracing: while enabled, CPU threads record trace spans; the first
+// traced point after disabling writes moodist-trace-cpu-<group>-<rank>.json to the current directory.
+static PyObject* py_enable_profiling(PyObject*, PyObject* args) {
+  int enabled = 0;
+  if (!PyArg_ParseTuple(args, "p", &enabled)) {
+    return nullptr;
+  }
+  moodist::coreApi.setProfilingEnabled(enabled != 0);
+  Py_RETURN_NONE;
+}
+
 // get_core_api_ptr(version=None) - CoreApi address for separately built C++ extensions. The build magic
 // check doesn't apply to them, so they pass the kMoodistApiVersion they were compiled against instead.
 static PyObject* py_get_core_api_ptr(PyObject*, PyObject* args) {
@@ -1616,6 +1627,8 @@ static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Retu
     {"cpu_allocator_owns", py_cpu_allocator_owns, METH_VARARGS,
         "Check if a tensor is owned by the moodist CPU allocator"},
     {"cuda_copy", py_cuda_copy, METH_VARARGS, "Copy tensor using moodist memory registration"},
+    {"enable_profiling", py_enable_profiling, METH_VARARGS,
+        "enable_profiling(enabled): CPU thread Chrome tracing (moodist-trace-cpu-<group>-<rank>.json)"},
     {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
     {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},
     {"get_core_api_ptr", py_get_core_api_ptr, METH_VARARGS,

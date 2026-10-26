@@ -382,6 +382,9 @@ struct QueueEntryCustom : QueueEntry {
   FutureImplSharedPtr future;
   bool anyCuda;
   bool anyCpu;
+  // While profiling: when and on which core the calling thread handed the op to the CPU thread (for the trace)
+  std::chrono::system_clock::time_point enqueueTime{};
+  int enqueueCpu = -1;
 
   std::vector<TensorDataPtr> inputs;
   std::vector<TensorDataPtr> outputs;

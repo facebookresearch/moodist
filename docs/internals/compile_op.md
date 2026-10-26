@@ -178,6 +178,19 @@ on new tensors at every call.
   see the RDMA bandwidth note under Performance).
 - `MOODIST_DUMP_KERNELS` - write each op's final PTX to `moodist-compile-op-kernels-rank<rank>-op<id>.ptx`.
 
+## Tracing
+
+`moodist.enable_profiling(True)` makes the CPU thread record Chrome trace spans; after
+`moodist.enable_profiling(False)`, its next traced point writes them to `moodist-trace-cpu-<group>-<rank>.json` in
+the current directory (so run one more op). For compile_op the spans are `WorkCustom`'s phases, named with the op's
+step value: `start`, `wait dyn N` (waiting for rank N's input list), `wait kernel` (for the stream to reach the
+op), `step exchange`, `wait step N`, `reads`, `wait read completions` and `wait reads of N` (rank N still reading),
+where only the ranks actually waited for appear; and each NIC's reads (`read N`, from rank N). The CPU thread also
+records how long each op waited from the call until the CPU thread picked it up, and its sleeps, stalls of 20 us
+or more and moves between cores, with the core numbers. Timestamps are the system clock, so the files of all
+ranks can be merged into one trace (align the nodes' clocks, e.g. on the end of `step exchange`, which all ranks
+leave within a few microseconds).
+
 ## Performance notes
 
 All-gather on two GB300 nodes with 4 GPUs each, in one NVL72 domain (October 2026; per-rank size, median time per
@@ -329,7 +342,8 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   1.5 x median in 47 of 79 runs; NCCL and moodist's all-gather 1.1 and 1.04, never over 1.5). Pinning the Python
   thread and the CPU thread to cores of their own also removed it (78-80 us), pinning either alone did not; Python
   garbage collection and the order of the reads played no part. Now the op is done for the caller at the call
-  (see Runtime), so the CPU thread has the next ops queued while the GPU works: 46 us with a p90 of 52 us.
+  (see Runtime), so the CPU thread has the next ops queued while the GPU works: 46 us with a p90 of 52 us. Traces
+  (see Tracing) show the phases of each op and which rank the others waited for.
 - The CPU thread still sleeps when it has nothing to do. A caller that waits for each op on the CPU (ops with CPU
   tensors or `cpu_sync`, or a `torch.cuda.synchronize()` per op) wakes it for every op, with the same occasional
   multi-millisecond wake-ups (moodist's all-gather in such a loop: 300-700 us instead of 58 us on 16 GPUs). Spinning

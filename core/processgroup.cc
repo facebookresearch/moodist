@@ -30,6 +30,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sched.h>
 #include <thread>
 
 namespace moodist {
@@ -3590,6 +3591,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     e->inputs = std::move(inputTDs);
     e->outputs = std::move(outputTDs);
 
+    // For the trace (entries are reused, so always set)
+    e->enqueueTime = getProfilingEnabled() ? std::chrono::system_clock::now() : std::chrono::system_clock::time_point{};
+    e->enqueueCpu = e->enqueueTime.time_since_epoch().count() != 0 ? sched_getcpu() : -1;
     group->cpuThread->enqueue(e);
   }
 

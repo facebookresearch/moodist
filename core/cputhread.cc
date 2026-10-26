@@ -30,6 +30,7 @@
 #include <exception>
 #include <memory>
 #include <random>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -1037,6 +1038,9 @@ struct CpuThreadImpl {
     int threadId = -1;
   };
   Vector<TraceEvent> traceEvents;
+  // Trace thread ids of events outside the per-work spans (those use 10 * concurrency index + sub-thread)
+  static constexpr int traceTidPickup = 9998;
+  static constexpr int traceTidLoop = 9999;
 
   std::chrono::system_clock::time_point beginning = std::chrono::system_clock::now();
 
@@ -5731,6 +5735,7 @@ struct CpuThreadImpl {
 
       ++liveReads;
       ++deviceLiveReads[di];
+      self.trace(concurrencyIndex, 1 + di, "%#x read %d", stepValue, source);
 
       auto key = it.rkey;
       auto& dev = self.devices[di];
@@ -5754,6 +5759,19 @@ struct CpuThreadImpl {
 
     void step() {
       ENTER
+
+      // Trace spans (moodist.enable_profiling): one per phase, and one per peer the CPU thread actually waits for
+      self.trace(concurrencyIndex, 0, "%#x start", stepValue);
+      if (profilingEnabled && params.enqueueTime.time_since_epoch().count() != 0) [[unlikely]] {
+        // From the call to the CPU thread picking the op up (tid traceTidPickup)
+        self.traceEvents.emplace_back();
+        auto& e = self.traceEvents.back();
+        e.name =
+            fmt::sprintf("%#x enqueued on cpu %d, picked up on cpu %d", stepValue, params.enqueueCpu, sched_getcpu());
+        e.begin = params.enqueueTime;
+        e.end = std::chrono::system_clock::now();
+        e.threadId = traceTidPickup;
+      }
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
@@ -5838,6 +5856,9 @@ struct CpuThreadImpl {
         }
         CHECK(i >= 0 && i < size);
 
+        if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+          self.trace(concurrencyIndex, 0, "%#x wait dyn %d", stepValue, i);
+        }
         while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
           YIELD
         }
@@ -5900,10 +5921,14 @@ struct CpuThreadImpl {
 
       if (params.anyCuda) {
         // wait for kernel
+        if (cpuIn[0] < stepValue) {
+          self.trace(concurrencyIndex, 0, "%#x wait kernel", stepValue);
+        }
         while (cpuIn[0] < stepValue) {
           YIELD
         }
       }
+      self.trace(concurrencyIndex, 0, "%#x step exchange", stepValue);
       for (size_t o = 1; o < size; ++o) {
         i = self.rank + o;
         if (i >= size) {
@@ -5916,11 +5941,15 @@ struct CpuThreadImpl {
         if (i >= size) {
           i += size;
         }
+        if (self.inStepValue(concurrencyIndex, i) < stepValue) {
+          self.trace(concurrencyIndex, 0, "%#x wait step %d", stepValue, i);
+        }
         while (self.inStepValue(concurrencyIndex, i) < stepValue) {
           YIELD
         }
       }
 
+      self.trace(concurrencyIndex, 0, "%#x reads", stepValue);
       readIndex = 0;
 
       while (readIndex != reads.size()) {
@@ -5940,6 +5969,9 @@ struct CpuThreadImpl {
         YIELD
       }
 
+      if (liveReads) {
+        self.trace(concurrencyIndex, 0, "%#x wait read completions", stepValue);
+      }
       while (liveReads) {
         YIELD
       }
@@ -5956,11 +5988,14 @@ struct CpuThreadImpl {
         }
         self.writeStepValue(concurrencyIndex, i, 1, rank);
       }
-      self.trace(concurrencyIndex, 0, "wait for remote reads");
+      self.trace(concurrencyIndex, 0, "%#x wait for remote reads", stepValue);
       for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
           i += size;
+        }
+        if (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
+          self.trace(concurrencyIndex, 0, "%#x wait reads of %d", stepValue, i);
         }
         while (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
           YIELD
@@ -5970,6 +6005,7 @@ struct CpuThreadImpl {
       if (params.anyCuda) {
         self.writeCpuOut(concurrencyIndex, 0, 0);
       }
+      self.trace(concurrencyIndex, 0, "");
 
       params.future->done = 1;
       futexWakeAll(&params.future->done);
@@ -6278,7 +6314,35 @@ struct CpuThreadImpl {
       }
     }
 
+    // While profiling, the loop's sleeps, stalls of 20 us or more (e.g. the thread was descheduled) and moves to
+    // another core become trace events (tid traceTidLoop), with the core numbers
+    std::chrono::system_clock::time_point traceLoopTime{};
+    int traceLoopCpu = -1;
+    bool traceLoopSlept = false;
+
+    auto traceLoop = [&]() {
+      if (profilingEnabled) [[unlikely]] {
+        auto t = std::chrono::system_clock::now();
+        int cpu = sched_getcpu();
+        if (traceLoopTime.time_since_epoch().count() != 0 &&
+            (t - traceLoopTime >= std::chrono::microseconds(20) || cpu != traceLoopCpu)) {
+          traceEvents.emplace_back();
+          TraceEvent& e = traceEvents.back();
+          e.name = fmt::sprintf("%s cpu %d -> %d", traceLoopSlept ? "sleep" : "stall", traceLoopCpu, cpu);
+          e.begin = traceLoopTime;
+          e.end = t;
+          e.threadId = traceTidLoop;
+        }
+        traceLoopTime = t;
+        traceLoopCpu = cpu;
+        traceLoopSlept = false;
+      } else if (traceLoopTime.time_since_epoch().count() != 0) [[unlikely]] {
+        traceLoopTime = {};
+      }
+    };
+
     while (true) {
+      traceLoop();
       auto now = std::chrono::steady_clock::now();
       if (now - prevHeartbeatTime >= heartbeatInterval) {
         prevHeartbeatTime = now;
@@ -6313,6 +6377,7 @@ struct CpuThreadImpl {
               break;
             }
             ++waitCount;
+            traceLoopSlept = true;
             futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
             if (debugCpuTime) {
               prevRunTime = std::chrono::steady_clock::now();
@@ -6326,6 +6391,7 @@ struct CpuThreadImpl {
         }
       }
       for (int i = 0; i != 256; ++i) {
+        traceLoop();
         if (cpuThread->queueSize.load(std::memory_order_relaxed) != 0) {
           --cpuThread->queueSize;
 
