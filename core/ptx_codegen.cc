@@ -817,15 +817,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     ctx.receive(ranks[i], myPeerIndex[i]);
   }
 
-  size_t ranksStride = 0;
-
+  // The exit sync buffer holds one row of ranks.size() slots per block. Peers can have different numbers of
+  // ranks (irregular graphs), so writers use the row length of the peer they write to.
+  Vector<size_t> peerRanksSize(ranks.size());
   for (uint32_t r : ranks) {
     ctx.send(r, ranks.size());
   }
-  for (uint32_t r : ranks) {
-    size_t s;
-    ctx.receive(r, s);
-    ranksStride = std::max(ranksStride, s);
+  for (size_t i : indices(ranks)) {
+    ctx.receive(ranks[i], peerRanksSize[i]);
   }
 
   struct SyncIndex {
@@ -857,7 +856,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
   size_t addrAddrsBlockStride = graph.localCudaTensorMappings.size();
   auto addrAddrs = map("addresses", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks);
-  auto syncAddrs = map("syncs", sizeof(uint32_t) * ranksStride * numBlocks);
+  auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
   auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
 
   auto* fn = mod.newFunction("compile_op_copy");
@@ -978,6 +977,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint64_t stbase;
       uint32_t itembytes;
       uint32_t ldoffset;
+      uint32_t stBlockStride; // bytes per block row in the peer's sync buffer
     };
 
     std::vector<SyncSetup> syncsetup;
@@ -990,6 +990,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
       s.itembytes = r.itembytes;
       s.ldoffset = sizeof(uint32_t) * i;
+      s.stBlockStride = sizeof(uint32_t) * peerRanksSize[i];
       syncsetup.push_back(s);
     }
 
@@ -1398,6 +1399,60 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     };
 
+    // Whether another edge reads one of e's destination nodes (e.g. the next rank of a ring), and so waits for
+    // e to be signaled as done.
+    auto hasDependents = [&](const Edge& e) {
+      for (auto& ne : graph.cudaEdges) {
+        for (auto& n : ne.sources) {
+          for (auto& n2 : e.destinations) {
+            if (n.id == n2.id) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+
+    // Signal (per block) that e's destination nodes are filled: to this rank (the dependency loop checks its own
+    // destination nodes to skip finished edges), to the destination ranks, and to the destination ranks of
+    // edges that read e's destinations. Called by thread 0 after the whole block has finished the copy.
+    auto signalFilled = [&](const Edge& e) {
+      // fixme: this fence is only needed if signalranks has a != rank member
+      fence_release_sys();
+      HashMap<uint32_t, bool> signalRanks;
+      signalRanks[rank] = true;
+      for (const Node& n : e.destinations) {
+        signalRanks[n.rank] = true;
+      }
+      for (auto& ne : graph.cudaEdges) {
+        bool concerned = false;
+        for (auto& n : ne.sources) {
+          for (auto& n2 : e.destinations) {
+            if (n.id == n2.id) {
+              concerned = true;
+            }
+          }
+        }
+        if (concerned) {
+          for (auto& n : ne.destinations) {
+            signalRanks[n.rank] = true;
+          }
+        }
+      }
+      for (auto& v : signalRanks) {
+        uint32_t r = v.first;
+        for (const Node& n : e.destinations) {
+          auto it = dependencyIndices[r].find(n.id);
+          if (it != dependencyIndices[r].end()) {
+            st_global_relaxed_sys_u32(concurrency(depFilled.remote.at(rankIndex(r))) +
+                                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
+                stepValue);
+          }
+        }
+      }
+    };
+
     if (nowaits) {
       profiling.enter("nowaits");
 
@@ -1421,6 +1476,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         profiling.enter("call emit");
 
         emit->emit(srcaddr, dstaddrs, e.bytes);
+
+        // Nothing here waits, but other edges may wait for this one (e.g. the head of a ring).
+        if (hasDependents(e)) {
+          IF_D(threadIndex == 0) {
+            signalFilled(e);
+          }
+        }
       }
 
     } else {
@@ -1485,40 +1547,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           emit->emit(srcaddr, dstaddrs, bytes);
 
           IF_D(threadIndex == 0) {
-            // fixme: this fence is only needed if signalranks has a != rank member
-            fence_release_sys();
-            HashMap<uint32_t, bool> signalRanks;
-            signalRanks[rank] = true;
-            for (const Node& n : e.destinations) {
-              signalRanks[n.rank] = true;
-            }
-            for (auto& ne : graph.cudaEdges) {
-              bool concerned = false;
-              for (auto& n : ne.sources) {
-                for (auto& n2 : e.destinations) {
-                  if (n.id == n2.id) {
-                    concerned = true;
-                  }
-                }
-              }
-              if (concerned) {
-                for (auto& n : ne.destinations) {
-                  signalRanks[n.rank] = true;
-                }
-              }
-            }
-            for (auto& v : signalRanks) {
-              uint32_t r = v.first;
-              for (const Node& n : e.destinations) {
-                auto it = dependencyIndices[r].find(n.id);
-                if (it != dependencyIndices[r].end()) {
-                  st_global_relaxed_sys_u32(
-                      concurrency(depFilled.remote.at(rankIndex(r))) +
-                          widen(sizeof(uint32_t) * (it->second.index + it->second.stride * blockIndex)),
-                      stepValue);
-                }
-              }
-            }
+            signalFilled(e);
           }
           numDone += 1;
           LABEL(skip);
@@ -1552,9 +1581,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u64 stbase = ld_const_u64(addr);
           u32 itembytes = ld_const_u32(addr + 8);
           u32 ldoffset = ld_const_u32(addr + 12);
-          u32 blockStride = sizeof(uint32_t) * ranksStride * blockIndex;
-          staddr = stbase + widen(itembytes * concurrencyIndex + blockStride);
-          ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + blockStride);
+          u32 stBlockStride = ld_const_u32(addr + 16);
+          staddr = stbase + widen(itembytes * concurrencyIndex + stBlockStride * blockIndex);
+          ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + sizeof(uint32_t) * ranks.size() * blockIndex);
         }
       }
       // for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
