@@ -139,6 +139,10 @@ struct IbCommon {
 
   size_t inlineBytes = 0;
 
+  // Register memory of this group's GPU through the device's Data Direct DMA function (see dataDirectPath in
+  // group.cc; the NIC selection pairs such a device with the GPU behind it)
+  bool dataDirect = false;
+
   void init(int portNum, ibv_port_attr portAttributes);
 
   void init2Ib(int portNum, ibv_port_attr portAttributes);

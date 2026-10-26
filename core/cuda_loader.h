@@ -196,6 +196,7 @@ constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED = 132;
 using CUpointer_attribute = int;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_SYNC_MEMOPS = 6;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_BUFFER_ID = 7;
+constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9;
 
 // Function attributes
 using CUfunction_attribute = int;

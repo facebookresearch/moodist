@@ -8,6 +8,7 @@
 #include "connection.h"
 #include "cputhread.h"
 #include "ib_common.h"
+#include "infiniband/mlx5dv.h"
 #include "ipc_mapper.h"
 #include "kernels.h"
 #include "queue.h"
@@ -84,6 +85,7 @@ struct LocalDevice {
   int portNum = 0;
   ibv_port_attr portAttributes;
   std::string ibPath;
+  bool dataDirect = false;
 };
 
 struct LocalDeviceNode {
@@ -130,6 +132,32 @@ std::unordered_map<std::string, int> railCache;
 bool railProbeEnabled() {
   const char* c = std::getenv("MOODIST_IB_RAIL_PROBE");
   return !(c && c[0] == '0' && c[1] == 0);
+}
+
+// MOODIST_IB_DATA_DIRECT=0: ignore Data Direct DMA functions (see dataDirectPath)
+bool dataDirectEnabled() {
+  const char* c = std::getenv("MOODIST_IB_DATA_DIRECT");
+  return !(c && c[0] == '0' && c[1] == 0);
+}
+
+// The PCI path (without the /sys/devices/ prefix) of the Data Direct DMA function of an mlx5 device, or "" if it has
+// none. ConnectX-8 NICs on Grace systems have one: a PCI function behind the NIC's own PCIe switch, to which one GPU
+// is attached too. Memory registered with MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT is accessed through that function,
+// i.e. inside the switch, rather than through the CPU (on GB300 the function and the GPU have Gen6 x16 links to the
+// switch, while the NIC's ports reach the CPU through a Gen5 x16 link: half the bandwidth). Only for memory of the
+// GPU behind the switch: the memory of other GPUs would be reached from there through the switch's own link to the
+// CPU, which is narrow (x1). All ports of a NIC share its function.
+std::string dataDirectPath(ibv_context* ctx) {
+  std::array<char, 4096> buf{};
+  if (mlx5dv_get_data_direct_sysfs_path(ctx, buf.data(), buf.size() - 1) != 0) {
+    return {};
+  }
+  std::string path = fmt::sprintf("/sys%s", buf.data());
+  if (char* real = realpath(path.c_str(), nullptr)) {
+    path = real;
+    free(real);
+  }
+  return removePciPathPrefix(path);
 }
 } // namespace
 
@@ -638,10 +666,19 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
           }
           ibPath = removePciPathPrefix(ibPath);
 
+          // Which GPU the device is close to follows from its PCI path, or from the path of its Data Direct DMA
+          // function if it has one (see dataDirectPath): it then reaches GPU memory at full speed only through that.
+          // ibPath stays the device's identity (rail probing, the node-wide assignment).
+          const std::string dataDirect = dataDirectEnabled() ? dataDirectPath(ctx) : std::string();
+          const std::string& localityPath = dataDirect.empty() ? ibPath : dataDirect;
+          if (!dataDirect.empty()) {
+            log.verbose("rank %d: %s has a Data Direct DMA function at %s\n", rank, di->name, dataDirect);
+          }
+
           auto getScore = [&](std::string cudaPath) {
             int nmatch = 0;
-            for (size_t i = 0; i != std::min(cudaPath.size(), ibPath.size()); ++i) {
-              if (cudaPath[i] == ibPath[i]) {
+            for (size_t i = 0; i != std::min(cudaPath.size(), localityPath.size()); ++i) {
+              if (cudaPath[i] == localityPath[i]) {
                 if (cudaPath[i] == '/') {
                   ++nmatch;
                 }
@@ -652,7 +689,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
             return nmatch;
           };
 
-          log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, ibPath, getScore(cudaPath), bestSpeed);
+          log.debug("rank %d: %s -> %s has score %d %d\n", rank, cudaPath, localityPath, getScore(cudaPath), bestSpeed);
 
           for (auto& v : localDevices) {
             CHECK(v.ibPath != ibPath);
@@ -663,6 +700,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
           lc.portNum = portNum;
           lc.ibPath = ibPath;
           lc.portAttributes = portAttributes;
+          lc.dataDirect = !dataDirect.empty();
           localDevices.push_back(std::move(lc));
 
           for (auto& v : localDeviceNodes) {
@@ -935,8 +973,10 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
         bestPortNum = d->portNum;
         bestPortAttributes = d->portAttributes;
         CHECK(bestCtx != nullptr);
+        ibCommon->dataDirect = d->dataDirect;
 
-        log.verbose("rank %d using device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
+        log.verbose("rank %d using device %s (%s)%s\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path,
+            d->dataDirect ? ", Data Direct" : "");
 
         ibCommon->init(bestPortNum, bestPortAttributes);
 
@@ -963,6 +1003,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
           bestPortNum = d->portNum;
           bestPortAttributes = d->portAttributes;
           CHECK(bestCtx != nullptr);
+          ibCommon->dataDirect = d->dataDirect;
 
           log.verbose(
               "rank %d using duplicate of device %s (%s)\n", rank, bestCtx->device->name, bestCtx->device->ibdev_path);
@@ -975,6 +1016,14 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
       CHECK(!ibDevs.empty());
       CHECK(ibDevs.size() <= maxDevices);
+
+      size_t numDataDirect = std::ranges::count_if(ibDevs, [](auto& v) {
+        return v->dataDirect;
+      });
+      if (numDataDirect) {
+        log.info("rank %d: %d of %d NICs reach CUDA memory through Data Direct DMA\n", rank, numDataDirect,
+            ibDevs.size());
+      }
 
       for (auto& v : ibDevs) {
         rdmaDevs.push_back(makeRdmaIb(this, std::move(v)));

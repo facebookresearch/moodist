@@ -1,8 +1,11 @@
 #include "cuda_loader.h"
 #include "group.h"
 #include "ib_common.h"
+#include "infiniband/mlx5dv.h"
 #include "rdma.h"
+#include <cstring>
 #include <ranges>
+#include <unistd.h>
 
 namespace moodist {
 
@@ -352,19 +355,49 @@ struct RdmaIb : Rdma {
     }
     return std::make_unique<Mr>(mr);
   }
+  // Whether `address` is memory of this group's GPU
+  bool onGroupDevice(void* address) {
+    int ordinal = -1;
+    return cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)address) == CUDA_SUCCESS &&
+           ordinal == (int)group->cuDevice;
+  }
+
   std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
-    int fd = -1;
-    CUresult err =
-        cuMemGetHandleForAddressRange(&fd, (uintptr_t)address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    const int access =
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING;
     ibv_mr* mr = nullptr;
-    if (err == CUDA_SUCCESS && fd != -1) {
-      // mr = mlx5dv_reg_dmabuf_mr(ib->protectionDomain, 0, bytes, (uintptr_t)address, fd, IBV_ACCESS_LOCAL_WRITE |
-      // IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ, 0);
-      mr = ibv_reg_dmabuf_mr(ib->protectionDomain, 0, bytes, (uintptr_t)address, fd,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
-    } else {
-      mr = ibv_reg_mr(ib->protectionDomain, address, bytes,
-          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING);
+    // Through the device's Data Direct DMA function, which serves the GPU behind the NIC's PCIe switch (the NIC
+    // selection pairs this group's GPU with such a NIC). The memory must be mapped through PCIe (the GPU's BAR1),
+    // which the function reaches inside the switch: the default mapping on Grace systems is through the CPU (over
+    // its C2C link to the GPU), which the function would reach through the switch's own link to the CPU, a narrow
+    // one (PCIe x1 on GB300). If this fails, the device registers without Data Direct from then on.
+    if (ib->dataDirect && onGroupDevice(address)) {
+      int fd = -1;
+      CUresult err = cuMemGetHandleForAddressRange(&fd, (uintptr_t)address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+          CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+      if (err == CUDA_SUCCESS && fd != -1) {
+        mr = mlx5dv_reg_dmabuf_mr(
+            ib->protectionDomain, 0, bytes, (uintptr_t)address, fd, access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+      }
+      if (!mr) {
+        log.error("rank %d: registering CUDA memory through Data Direct DMA on %s failed (CUresult %d, %s); "
+                  "registering without it\n",
+            group->rank, ib->context->device->name, (int)err, std::strerror(errno));
+        if (fd != -1) {
+          ::close(fd);
+        }
+        ib->dataDirect = false;
+      }
+    }
+    if (!mr) {
+      int fd = -1;
+      CUresult err =
+          cuMemGetHandleForAddressRange(&fd, (uintptr_t)address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+      if (err == CUDA_SUCCESS && fd != -1) {
+        mr = ibv_reg_dmabuf_mr(ib->protectionDomain, 0, bytes, (uintptr_t)address, fd, access);
+      } else {
+        mr = ibv_reg_mr(ib->protectionDomain, address, bytes, access);
+      }
     }
     if (!mr) {
       perror("ibv_reg_mr");
