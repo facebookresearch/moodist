@@ -355,6 +355,10 @@ struct CustomOpDescriptor {
   // Vector<size_t> outputs;
 
   Vector<IbRead> ibReads;
+  // How many of its reads without a signal index a rank reads at a time (WorkCustom): 1 if every rank reads the
+  // same amount from every rank outside its NVLink domain (each source then has one reader at a time), 8 otherwise
+  // (with unequal amounts, reading one source at a time leaves some sources idle; see compile_op.cc)
+  uint32_t readSources = 1;
 
   Vector<compile_op::Graph::TensorDescr> inputs;
   Vector<compile_op::Graph::TensorDescr> outputs;

@@ -2040,17 +2040,71 @@ struct CompileOpConstructor {
         });
       }
 
+      // How many sources a rank reads from at a time (readSources). In the order above, every source has one reader
+      // per step, so reading one source at a time is best if all steps take equally long: every rank that reads
+      // (without a signal) reads from every rank outside its domain (or from every other rank), the same amount
+      // from each (within 1/16). With unequal amounts, readers pile up on the larger transfers while other sources
+      // idle, and reading several sources at a time is faster. On 32 GB300 over RoCE (8 domains of 4 GPUs), 256 MiB
+      // per rank on average, one at a time vs 8: all-to-all 2.59 vs 3.01 ms; with lognormal sizes per pair (sigma 1)
+      // 6.58 vs 5.05 ms, one destination receiving 4 times as much 13.1 vs 10.7 ms. 4 at a time was up to 4% slower
+      // than 8, all at once no faster and less steady. Each rank describes its own reads in the exchange below.
+      Vector<size_t> bytesFrom(size);
+      for (const auto& read : op->ibReads) {
+        if (read.signalIndex < 0) {
+          bytesFrom[read.rank] += read.bytes;
+        }
+      }
+      bool hasReads = false;
+      size_t minBytes = std::numeric_limits<size_t>::max();
+      size_t maxBytes = 0;
+      size_t numRemote = 0;
+      size_t numRemoteRead = 0;
+      size_t numLocal = 0;
+      size_t numLocalRead = 0;
+      for (size_t s : range(size)) {
+        if (s == rank) {
+          continue;
+        }
+        bool remote = domainIds[s] != domainIds[rank];
+        ++(remote ? numRemote : numLocal);
+        if (bytesFrom[s]) {
+          ++(remote ? numRemoteRead : numLocalRead);
+          hasReads = true;
+          minBytes = std::min(minBytes, bytesFrom[s]);
+          maxBytes = std::max(maxBytes, bytesFrom[s]);
+        }
+      }
+      const bool dense = numRemoteRead == numRemote && (numLocalRead == 0 || numLocalRead == numLocal);
+
       bool localNeedsRdma = !op->ibReads.empty();
       for (size_t i : range(size)) {
-        ctx.send(i, localNeedsRdma);
+        ctx.send(i, localNeedsRdma, hasReads, dense, minBytes, maxBytes);
       }
       bool anyRankNeedsRdma = false;
+      bool uniform = true;
+      size_t globalMinBytes = std::numeric_limits<size_t>::max();
+      size_t globalMaxBytes = 0;
       for (size_t i : range(size)) {
-        bool v;
-        ctx.receive(i, v);
-        anyRankNeedsRdma |= v;
+        bool needsRdma;
+        bool peerHasReads;
+        bool peerDense;
+        size_t peerMin;
+        size_t peerMax;
+        ctx.receive(i, needsRdma, peerHasReads, peerDense, peerMin, peerMax);
+        anyRankNeedsRdma |= needsRdma;
+        if (peerHasReads) {
+          uniform &= peerDense;
+          globalMinBytes = std::min(globalMinBytes, peerMin);
+          globalMaxBytes = std::max(globalMaxBytes, peerMax);
+        }
       }
+      uniform &= globalMaxBytes == 0 || globalMaxBytes - globalMinBytes <= globalMaxBytes / 16;
       op->anyRankNeedsRdma = anyRankNeedsRdma;
+      op->readSources = uniform ? 1 : 8;
+      log.debug("compile_op: rank %zu: reads %s (%zu of %zu remote sources, %zu of %zu local, %zu-%zu bytes each); "
+                "readSources %u\n",
+          rank, uniform ? "uniform" : "not uniform", numRemoteRead, numRemote, numLocalRead, numLocal,
+          hasReads ? minBytes : 0, maxBytes, op->readSources);
     }
 
     // The copy kernel moves data with TMA bulk copies (cp.async.bulk), which need 16-byte aligned addresses

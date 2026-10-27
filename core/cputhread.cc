@@ -5759,6 +5759,97 @@ struct CpuThreadImpl {
       }
     }
 
+    // Splits the op's reads into parts of about partBytes (reads), in the order in which they are issued, each on the
+    // NIC with the fewest in flight (up to numParallel). Reads that signal the kernel come first, in signal order
+    // (the chunks of a transfer in order): copies on this and other ranks wait for them. The others follow in the
+    // order compile_op gave them (by source, rotated per rank so that every source has one reader per step),
+    // op->readSources at a time. With 1, a rank reads from one or two sources at a time, which keeps the ranks in
+    // step when they all read equal amounts. Larger parts let the ranks drift apart, until some sources have
+    // several readers and others none: with one part per NIC and two in flight, a source port of an all-to-all
+    // (1 GiB per rank, 32 GB300 over RoCE) had no reader 13% of the time and three or more 30%, and the op took
+    // 14.8 ms instead of 10.2 ms. One part in flight per NIC keeps the ranks in step, but then each part costs a
+    // round trip (about 13 us from post to completion besides the transfer). With more than 1 (unequal amounts),
+    // the parts of that many reads go round robin, and a read whose parts have all been issued makes room for the
+    // next one. With fewer reads than NICs, smaller reads are split as well, into parts of at least minPartBytes,
+    // so that every NIC gets some. The parts of a read with a signal index share its signal: it is written when
+    // the last part has completed.
+    void prepareReads() {
+      const bool fewReads = op->ibReads.size() < numDevices;
+      // The number of parts of each read without a signal index, in order
+      Vector<size_t> runs;
+      for (const auto& r : op->ibReads) {
+        size_t parts = std::max<size_t>((r.bytes + partBytes / 2) / partBytes, 1);
+        if (fewReads) {
+          parts = std::max(parts, std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices));
+        }
+        size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
+        if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
+          signalPartsLeft.resize(r.signalIndex + 1);
+        }
+        size_t offset = 0;
+        size_t n = 0;
+        do {
+          auto part = r;
+          part.inputOffset += offset;
+          part.outputOffset += offset;
+          part.bytes = std::min(bytesPerPart, r.bytes - offset);
+          reads.push_back(part);
+          if (r.signalIndex >= 0) {
+            ++signalPartsLeft[r.signalIndex];
+          }
+          offset += part.bytes;
+          ++n;
+        } while (offset < r.bytes);
+        if (r.signalIndex < 0) {
+          runs.push_back(n);
+        }
+      }
+      std::ranges::stable_sort(reads, {}, [](const CustomOpDescriptor::IbRead& r) {
+        return r.signalIndex < 0 ? std::numeric_limits<int32_t>::max() : r.signalIndex;
+      });
+      if (op->readSources <= 1) {
+        return;
+      }
+      // The parts of the reads without a signal index are the last ones, one run per read
+      size_t first = reads.size();
+      for (size_t n : runs) {
+        first -= n;
+      }
+      Vector<CustomOpDescriptor::IbRead> order;
+      order.reserve(reads.size() - first);
+      // [next part, end) of the reads being read
+      Vector<std::pair<size_t, size_t>> active;
+      size_t nextRun = 0;
+      size_t nextPart = first;
+      auto take = [&]() {
+        std::pair<size_t, size_t> run(nextPart, nextPart + runs[nextRun]);
+        nextPart = run.second;
+        ++nextRun;
+        return run;
+      };
+      while (active.size() < op->readSources && nextRun != runs.size()) {
+        active.push_back(take());
+      }
+      size_t i = 0;
+      while (!active.empty()) {
+        auto& run = active[i];
+        order.push_back(reads[run.first++]);
+        if (run.first != run.second) {
+          ++i;
+        } else if (nextRun != runs.size()) {
+          run = take();
+          ++i;
+        } else {
+          active.erase(&run);
+        }
+        if (i >= active.size()) {
+          i = 0;
+        }
+      }
+      CHECK(first + order.size() == reads.size());
+      std::ranges::move(order, reads.begin() + first);
+    }
+
     void step() {
       ENTER
 
@@ -5895,44 +5986,7 @@ struct CpuThreadImpl {
         }
       }
 
-      // Reads are split into parts of about partBytes. The parts are issued in order, each on the NIC with the
-      // fewest in flight (up to numParallel), so a rank reads from one or two sources at a time, and with the order
-      // compile_op gives the reads (by source, rotated per rank), every source has about one reader at a time.
-      // Larger parts let the ranks drift apart, until some sources have several readers and others none: with one
-      // part per NIC and two in flight, a source port of an all-to-all (1 GiB per rank, 32 GB300 over RoCE) had no
-      // reader 13% of the time and three or more 30%, and the op took 14.8 ms instead of 10.2 ms. One part in
-      // flight per NIC keeps the ranks in step, but then each part costs a round trip (about 13 us from post to
-      // completion besides the transfer). With fewer reads than NICs, smaller reads are split as well, into parts
-      // of at least minPartBytes, so that every NIC gets some. The parts of a read with a signal index share its
-      // signal: it is written when the last part has completed.
-      const bool fewReads = op->ibReads.size() < numDevices;
-      for (const auto& r : op->ibReads) {
-        size_t parts = std::max<size_t>((r.bytes + partBytes / 2) / partBytes, 1);
-        if (fewReads) {
-          parts = std::max(parts, std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices));
-        }
-        size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
-        if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
-          signalPartsLeft.resize(r.signalIndex + 1);
-        }
-        size_t offset = 0;
-        do {
-          auto part = r;
-          part.inputOffset += offset;
-          part.outputOffset += offset;
-          part.bytes = std::min(bytesPerPart, r.bytes - offset);
-          reads.push_back(part);
-          if (r.signalIndex >= 0) {
-            ++signalPartsLeft[r.signalIndex];
-          }
-          offset += part.bytes;
-        } while (offset < r.bytes);
-      }
-      // Reads that signal the kernel first, in signal order (the chunks of a transfer in order): copies on this
-      // and other ranks wait for them. The others keep their order.
-      std::ranges::stable_sort(reads, {}, [](const CustomOpDescriptor::IbRead& r) {
-        return r.signalIndex < 0 ? std::numeric_limits<int32_t>::max() : r.signalIndex;
-      });
+      prepareReads();
 
       if (params.anyCuda) {
         // wait for kernel

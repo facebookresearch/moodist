@@ -74,7 +74,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    exchange, the ranks learn each other's domain (its first rank), and the rank at position p of domain i reads
    the domains after its own in turn, each from position p (mod the domain's size) on, i.e. (domain i + 1 + a,
    position p + b) in step (a, b); reads from its own domain come last. (A rotation by rank, (source - rank) mod
-   size, does not work: the ranks of a domain skip its own ranks, so they all start on the same source.)
+   size, does not work: the ranks of a domain skip its own ranks, so they all start on the same source.) In the
+   next exchange (whether any rank needs RDMA), each rank also describes its reads without a signal: whether it
+   reads from every rank outside its domain (or from every other rank), and the least and the most it reads from
+   one rank. If every rank with such reads does, with amounts within 1/16 of each other, the steps all take equally
+   long and a rank reads one source at a time (`readSources` 1); otherwise 8 at a time (see the RDMA read notes
+   under Performance).
 9. **16-byte check**: kernel edges must have sizes and offsets that are multiples of 16 bytes (the kernel uses TMA
    bulk copies). The ranks exchange their first violation and raise together.
 10. **Graph variants** (`MOODIST_COMPILE_OP_GRAPHS`, default `multicast`), each a `GraphBuilder` pass over the
@@ -178,11 +183,12 @@ on new tensors at every call.
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
   (split into parts of about 128 KiB, and if the op has fewer reads than NICs, smaller reads too, into parts of at
   least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in order, then the
-  others in the order of the compile phase; each part on the NIC with the fewest in flight, up to 8), waits for
-  them, runs a second barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`. The
-  parts of a read with a signal share it: the signal is written when the last part has completed. Small parts keep
-  a rank on one or two sources at a time, which with the read order keeps the ranks in step (see the RDMA read
-  note under Performance).
+  others in the order of the compile phase, `readSources` at a time: with more than one, the parts of that many
+  reads go round robin, and a read whose parts have all been issued makes room for the next; each part on the NIC
+  with the fewest in flight, up to 8), waits for them, runs a second barrier with all ranks (nobody reads this
+  rank's inputs any more) and writes `cpuOut`. The parts of a read with a signal share it: the signal is written
+  when the last part has completed. Small parts keep a rank on one or two sources at a time (with `readSources`
+  1), which with the read order keeps the ranks in step (see the RDMA read notes under Performance).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
@@ -318,9 +324,33 @@ source port had no reader 13% of the time and three or more readers 30% of the t
 NIC, the ranks stayed in step (one reader per source port 97% of the time, 23 GB/s per 200 Gb/s port) and took
 11.6 ms, but every read cost a round trip (about 13 us from post to completion besides the transfer). 128 KiB parts
 with 8 in flight per NIC (1 MiB) keep a rank on one or two sources at a time and hide the round trip: 10.2 ms, or
-12.2 ms in random order. Smaller parts make the CPU thread the bottleneck (64 KiB with 12 in flight: 12.1 ms);
-other part sizes and counts with 768 KiB to 1.5 MiB in flight were within 1-7% at 1 GiB, but larger parts
-were slower at 16-64 MiB (fewer parts per source).
+12.2 ms in random order. Other part sizes and counts with 768 KiB to 1.5 MiB in flight were within 1-7% at 1 GiB,
+but larger parts were slower at 16-64 MiB (fewer parts per source), and smaller ones at 1 GiB (64 KiB with 12 in
+flight: 12.1 ms). The CPU thread posts a read in about 300 ns: at 128 KiB and 92 GB/s per GPU, 0.7 reads per us,
+which keeps it about 45% busy (its loop took 185 ns per iteration instead of about 100). The small parts load the
+network less: per 150 calls of the 1 GiB all-to-all, 2.1 million ECN-marked packets (144 million with the large
+parts in random order, 108 million with NCCL) and 0.6 million CNPs (9.6 and 12.4 million). The NIC already split
+the large reads into 256 KiB requests, so the read requests on the wire only doubled.
+
+With unequal amounts per pair of ranks, one source at a time leaves sources idle: readers pile up on the larger
+transfers. All-to-all-v on the same 32 GPUs, 256 MiB per rank on average, each pair of ranks its own range of the
+index space; the bound is the most any rank sends or receives across nodes, at 92 GB/s:
+
+| sizes per pair | bound | before the read order | one source at a time | 8 at a time | NCCL |
+|---|---|---|---|---|---|
+| equal | 2.55 ms | 4.16 ms | 2.59 ms | 3.01 ms | 2.93 ms |
+| lognormal, sigma 1 | 4.10 ms | 6.12 ms | 6.58 ms | 5.05 ms | 4.39 ms |
+| lognormal, sigma 2 | 7.40 ms | 12.1 ms | 9.02 ms | 8.17 ms | 8.00 ms |
+| one source sends 4 times as much | 10.2 ms | 11.4 ms | 10.8 ms | 10.2 ms | 4.46 ms |
+| one destination receives 4 times as much | 10.2 ms | 11.9 ms | 13.1 ms | 10.7 ms | 10.9 ms |
+
+compile_op reads one source at a time only when all ranks read equal amounts from all remote ranks (see the compile
+phase), otherwise 8 at a time: 4 at a time was up to 4% slower, all at once no faster and less steady (with many
+sources per reader port, congestion control steps in: 5-7 times as many ECN-marked packets). A fluid model of the
+reads (max-min fair rates over the GPUs' send and receive bandwidth) agrees: one source at a time 1.68 and 1.27
+times the bound for the two lognormal cases, 4 or more at a time within 3%. NCCL also sends a GPU's data through the
+NICs of the other GPUs of its node (PXN), which is why it beats the per-GPU bound when one source sends more than the
+others (over the node's NICs, the bound is 4.47 ms there).
 
 Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
 rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
@@ -374,6 +404,15 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   take 2 us each.
 - Edges the proxy pass leaves alone (CPU destinations, unaligned pieces, one destination per domain) are read by
   each destination rank.
+- Regions of different sizes in one index space fragment the op: phase 2 cuts each dimension at the boundaries of
+  all regions of all ranks, and neighboring cells are not merged into one edge. An all-to-all-v laid out as
+  [source, destination, max size], with a different size per pair, cuts every pair at the sizes of all others:
+  on 32 GPUs about 13,000 RDMA reads of a few KiB per rank and call at 256 MiB, which made the CPU thread the
+  bottleneck (2.4 times the bound instead of 1.2-1.6). Merging cells that are contiguous in both the input and the
+  output would avoid it; until then, such ops should give each piece its own range of the index space.
+- A GPU's RDMA traffic goes through its own NICs only. NCCL (PXN) also routes a GPU's data through the NICs of the
+  other GPUs of its node, over NVLink first, and was 2.3 times faster when one source sent 4 times as much as the
+  others (see the all-to-all-v table). compile_op would need a staging copy in another GPU's memory.
 - `WorkCustom` runs two barriers with all ranks per op, including ranks without RDMA work.
 - RDMA bandwidth on GB300 (one ConnectX-8 card with 4 ports of 200 Gb/s per GPU, i.e. 100 GB/s): the card's PCIe
   link to the CPU is Gen5 x16, and without Data Direct the NICs reach GPU memory through it, at about 52 GB/s per GPU.
