@@ -31,6 +31,9 @@ struct KernelHandle {
   KernelHandle(const KernelHandle&) = delete;
   KernelHandle& operator=(const KernelHandle&) = delete;
 
+  // Device memory the kernel uses (its address tables, when they do not fit in shared memory)
+  AllocatedBuffer scratch;
+
   AllocatedBuffer profilingData;
   size_t profilingBytesPerThread = 0;
   Vector<std::string> profilingNames;

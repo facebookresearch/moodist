@@ -963,22 +963,18 @@ struct CompileOpConstructor {
         rank, numGroups, numChunksTotal, domain.size(), numMine, proxySignals[rank]);
   }
 
-  Setting tuneKernels(Vector<Graph> graphs, const Vector<std::string>& copyEngines, std::string target) {
+  Setting tuneKernels(Vector<Graph> graphs, std::string target) {
     auto start = std::chrono::steady_clock::now();
+    // One pipeline of 32K chunks per block reaches an SM's NVLink bandwidth; the grid size is what is tuned
     Vector<KernelConfig> configs;
-    for (const std::string& copyEngine : copyEngines) {
-      for (uint32_t blockSize : {128, 256}) {
-        for (uint32_t sharedSize : {1024 * 64, 1024 * 226}) {
-          for (uint32_t gridSize : {8, 12, 16}) {
-            KernelConfig config;
-            config.copyEngine = copyEngine;
-            config.blockSize = blockSize;
-            config.sharedMemory = sharedSize;
-            config.gridSize = gridSize;
-            configs.push_back(config);
-          }
-        }
-      }
+    for (uint32_t gridSize : {4, 8, 12, 16}) {
+      KernelConfig config;
+      config.blockSize = 128;
+      config.sharedMemory = 1024 * 226;
+      config.gridSize = gridSize;
+      config.chunkSize = 32768;
+      config.pipelines = 1;
+      configs.push_back(config);
     }
 
     Vector<Setting> settings;
@@ -1151,7 +1147,19 @@ struct CompileOpConstructor {
       }
     }
 
-    auto index = std::ranges::min_element(timings) - timings.begin();
+    // The fastest setting, with a small penalty per block of the grid: the copy kernel occupies its SMs, which the
+    // computation it overlaps with lacks meanwhile. A bigger grid has to be clearly faster to be chosen, as it is
+    // for copies limited by the SMs' bandwidth; for latency bound ones the smaller grid wins.
+    static constexpr double gridPenalty = 0.005;
+    auto score = [&](size_t i) {
+      return timings[i].count() * (1 + gridPenalty * settings[i].config.gridSize);
+    };
+    size_t index = 0;
+    for (size_t i : indices(timings)) {
+      if (score(i) < score(index)) {
+        index = i;
+      }
+    }
 
     log.info("Best setting: index %d, %fms\n", index, seconds(timings[index]) * 1000);
 
@@ -2063,15 +2071,6 @@ struct CompileOpConstructor {
     //   read        every destination rank reads its chunks itself
     //   ring_read   the destinations of a chunk form a chain, each reading it from the previous one
     //   ring_write  the same chain, each rank writing the chunk to the next one
-    // and the kernel copy engines, selected by MOODIST_COMPILE_OP_ENGINES (default "grouped"; see ptx_codegen.cc):
-    //   grouped, simple, buffered, lockstep
-    Vector<std::string> copyEngines = agreedEnvList("MOODIST_COMPILE_OP_ENGINES", "grouped");
-    for (const std::string& name : copyEngines) {
-      REQUIRE(name == "grouped" || name == "simple" || name == "buffered" || name == "lockstep",
-          "compile_op: unknown copy engine '%s' in MOODIST_COMPILE_OP_ENGINES (expected grouped, simple, buffered or "
-          "lockstep)",
-          name);
-    }
     for (const std::string& name : agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast")) {
       if (name == "multicast") {
         graphs.push_back(buildMulticast(ictx, baseGraph));
@@ -2102,7 +2101,7 @@ struct CompileOpConstructor {
 
       const char* target = computeTarget(computeMajor, computeMinor);
 
-      Setting setting = tuneKernels(graphs, copyEngines, target);
+      Setting setting = tuneKernels(graphs, target);
 
       op->graph = setting.graph;
       op->config = setting.config;

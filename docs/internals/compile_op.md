@@ -88,13 +88,14 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
-11. **Tuning** (`tuneKernels`): the copy engine `grouped` (`MOODIST_COMPILE_OP_ENGINES`) x block size {128, 256} x
-    shared memory {64 KiB, 226 KiB} x grid size {8, 12, 16}, for every graph variant (12 settings per variant and
-    engine). Each setting is generated and JIT
-    compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The
-    ranks exchange their timings and take the minimum over ranks per setting. The kernel of the fastest setting
-    is generated and compiled once more for the op. Tuning launches run without the CPU thread, so in tuning
-    kernels, relay edges do not wait for a signal.
+11. **Tuning** (`tuneKernels`): the grid size {4, 8, 12, 16} (blocks of 128 threads with one pipeline of 32 KiB
+    chunks in 226 KiB of shared memory), for every graph variant (4 settings per variant). Each setting is
+    generated and JIT compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12
+    launches. The ranks exchange their timings and take the minimum over ranks per setting. The fastest setting
+    wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which the computation it overlaps with
+    lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it is for copies limited by the
+    SMs' bandwidth). The kernel of the chosen setting is generated and compiled once more for the op. Tuning
+    launches run without the CPU thread, so in tuning kernels, relay edges do not wait for a signal.
 
 ## The kernel (`generateKernel`)
 
@@ -110,27 +111,41 @@ on new tensors at every call.
 - **Address exchange**: on entry, each rank writes the addresses at which its peers have mapped its tensors (from
   the IPC mapper, per call) into the peers' `addresses` tables. A rank that needs a remote node's address spins
   until the entry carries the current parity.
-- **Copy engines** (`EmitMultiCopy::emit(src, dsts, bytes)`): TMA bulk loads into shared memory (completion via
-  mbarrier), then one TMA bulk store per destination, so a multicast edge is read once and written N times. The
-  chunks of an edge are assigned round-robin to (buffer, block). Engines: `grouped` (groups of 128 threads sharing
-  a double-buffered pipeline; the default), `simple`, `buffered` and `lockstep` (one warp per pipeline; tuned only
-  if selected with `MOODIST_COMPILE_OP_ENGINES`). Unaligned addresses or sizes trap.
+- **Copy engine** (`PipeRing`): each block runs pipelines (the first lane of each of its first warps; one by
+  default), each with a ring of stages of 32 KiB in shared memory. A chunk is copied by a TMA bulk load into a
+  stage (completion via mbarrier), then one TMA bulk store of the stage per destination, so a multicast edge is
+  read once and written N times. A TMA copy is latency bound: an SM reaches its NVLink bandwidth (about 52 GB/s for
+  one store per load, up to 65 GB/s for many, on GB300) only with about 100 KB of loads in flight. So a pipeline
+  keeps up to (stages - 2) loads in flight ahead of its stores: after issuing the stores of chunk k, it waits until
+  those of chunk k - 2 have read their stage (`cp.async.bulk.wait_group.read 2`) and loads the next chunk there.
+  The copy rates of the SMs vary (by up to half under load), hence the dynamic distribution below. Edges and
+  addresses must be 16-byte aligned (checked when the op is compiled).
 - **Tables**: the edges a rank executes are described by tables in one initialized global array of the module:
   edge setups (flags, source, bytes, destinations, signals), node setups (tensor slot and offset), signal setups
   (`depFilled` slots to write when an edge is done) and the address exchange setups. The kernel loops over them at
   runtime, so its code size does not depend on the number of edges (edges are limited to 4 GiB each).
 - **Scheduling**: a rank executes the edges whose executor it is. If no edge waits (all sources filled, no relay
-  edges), the edges run in order. Otherwise in rounds: warp 0 scans the edges that are not done, 32 at a time (one
-  per lane, `vote.ballot`); a source is ready when its `depFilled` slot for this block has reached stepValue. Relay
-  edges whose signal has arrived are finished on the spot by the lane that saw it. The first ready copy edge is
-  handed to the block through shared memory (one `bar.sync` per round); the block copies it and thread 0 marks it
-  done (done bits in shared memory). Relay edges come first in the table, so that the scan always reaches them.
-  Dependencies are per block: block b of a consumer waits for block b of the producer, which copied the same
-  chunks, as all ranks run the same configuration.
+  edges), every block first resolves the addresses of all edges into a table in shared memory (in global memory if
+  it exceeds 32 KiB), and the pipelines of all blocks then take items from one sequence: an item is a chunk of an
+  edge and a group of its destinations (with few chunks, an edge's destinations are split into groups, for about
+  4 items per pipeline, so that the stores of an all-gather of a few chunks to many ranks spread over the SMs).
+  Items are claimed from a counter in global memory (one per concurrency slot and launch parity), the first claim
+  of a pipeline taking enough items to fill its ring, the later ones one item, claimed when the pipeline starts on
+  the previous one. Edges are in destination rank order rotated to start at the executing rank (so that in an
+  all-to-all, the ranks do not all write to the same rank at once). If some edge waits, in rounds: warp 0 scans the
+  edges that are not done, 32 at a time (one per lane, `vote.ballot`); a source is ready when its `depFilled` slot
+  for this block has reached stepValue. Relay edges whose signal has arrived are finished on the spot by the lane
+  that saw it. The first ready copy edge is handed to the block through shared memory (one `bar.sync` per round);
+  the block copies its chunks c with c % grid size = block index (the pipelines of the block taking them in turn)
+  and thread 0 marks it done (done bits in shared memory). Relay edges come first in the table, so that the scan
+  always reaches them. Dependencies are per block: block b of a consumer waits for block b of the producer, which
+  copied the same chunks, as all ranks run the same configuration.
 - **Signaling**: after an edge that some edge reads (known from the peers' lists of read nodes, as the reader may
   be an edge this rank does not see), the thread that saw it done (thread 0 after a copy) writes stepValue into
   the `depFilled` slots of its destination nodes on its own rank, on the destination ranks, and on the destination
-  ranks of edges that read those nodes, after `fence.release.sys`. The lane that sees a dependency met executes
+  ranks of edges that read those nodes, after `fence.release.sys`. Without waits, any block may copy any item of
+  an edge: the pipeline that completes the edge's last item (a per-edge counter that wraps around after every
+  launch) writes the slots of all blocks. The lane that sees a dependency met executes
   `fence.acquire.sys` before the selection barrier; before copying from a peer's tensor, every thread does.
 - **Relay edges** (proxied transfers): ready once the CPU thread's signal, slot 16 + `rdmaSignal` of
   `cpuOutBuffer` for the concurrency index, has reached stepValue (always ready when tuning); nothing to copy.
@@ -170,8 +185,6 @@ on new tensors at every call.
 ## Environment variables
 
 - `MOODIST_COMPILE_OP_GRAPHS` - the graph variants to tune over (see the compile phase). Same on all ranks.
-- `MOODIST_COMPILE_OP_ENGINES` - the copy engines to tune over, comma separated: `grouped` (default), `simple`,
-  `buffered`, `lockstep`. Same on all ranks.
 - `MOODIST_COMPILE_OP_PROXY=0` - no proxy pass: every rank reads all its data from outside its NVLink domain
   itself. Same on all ranks.
 - `MOODIST_FABRIC=0` - ignore a multi-node NVLink fabric: compile_op reaches other nodes over RDMA, as between
@@ -280,7 +293,7 @@ rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one
 | 64 | 40 KB | 1.3 s | 65 us |
 | 256 | 121 KB | 1.7 s | 229 us |
 
-Most of the PTX of large ops is the tables (initializers in decimal). Nearly all of the compile time is the JIT of
+Most of the PTX of large ops is the tables (initializers in decimal). Nearly all of the compile time was the JIT of
 the 12 tuning candidates. The kernel that generated the copy code of each edge inline took 1.2 s, 4.7 s, 13 s and
 81 s (PTX of 11 KB to 1.6 MB), and was about 12% faster per edge (11, 22, 57 and 204 us).
 
@@ -303,18 +316,23 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - The kernel takes the tensor addresses (and the addresses at which peers map them) as kernel parameters, which are
   limited to 32 KB: an op fails to JIT with about 4000 (tensor, peer) mappings (e.g. 1024 input tensors on 4
   ranks). Passing them in a device buffer would lift the limit.
-- Kernel edges must be smaller than 4 GiB (32-bit offsets in the copy engines; checked). Splitting larger pieces
+- Kernel edges must be smaller than 4 GiB (32-bit sizes in the kernel's tables; checked). Splitting larger pieces
   into several edges when the edges are created would lift the limit.
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
   or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
   instructions, so a plain target would do.
 
 ### Performance
-- Compile time is mostly the JIT of the tuning candidates (12 per graph variant and engine). JIT on several threads
-  would cut it (the PTX differs per rank, so the work cannot be split across ranks).
-- Per edge, the table-driven kernel is about 12% slower than the old inlined one (address resolution through the
-  tables; the sequential path loads the next edge's words while copying the current one). Prefetching one edge
-  further ahead, or tables in constant memory when they fit, could close it.
+- Compile time is mostly the JIT of the tuning candidates (4 per graph variant). JIT on several threads would cut
+  it (the PTX differs per rank, so the work cannot be split across ranks).
+- With waits (relay edges, ring graphs), the block copies one edge at a time and drains its pipelines at the end
+  of each edge, and a dependency is per block and edge. Per-chunk ready flags would let the pipelines take chunks
+  across edges as without waits.
+- The fixed cost of a launch is about 6 us on 4 GPUs (64 KiB shift): of it, `fence.release.sys` before the exit
+  step value exchange takes 2-3 us (any system-scope fence takes about 1.8 us on GB300 even with nothing
+  outstanding, a GPU-scope one 0.3 us; under load it waits for the copies of the other blocks), the address
+  exchange and resolution about 1.5 us, reading the launch parity 0.5 us. Back-to-back launches of an empty kernel
+  take 2 us each.
 - Edges the proxy pass leaves alone (CPU destinations, unaligned pieces, one destination per domain) are read by
   each destination rank.
 - `WorkCustom` runs two barriers with all ranks per op, including ranks without RDMA work.

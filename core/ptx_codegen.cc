@@ -32,119 +32,6 @@ const char* computeTarget(int computeMajor, int computeMinor) {
   return "sm_60";
 }
 
-struct EmitMultiCopy {
-  virtual size_t groupSize() {
-    return 32;
-  }
-  virtual ~EmitMultiCopy() = default;
-  virtual void emit(u64 src, Vector<u64> dst, u32 bytes) = 0;
-};
-
-struct EmitLockstep : EmitMultiCopy {
-  const KernelConfig& config;
-  u32 blockIndex;
-  u32 warpIndex;
-  u32 laneIndex;
-
-  EmitLockstep(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
-      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
-    CHECK(numBuffers > 0);
-    CHECK(bufferSize > 0);
-    CHECK(config.blockSize / 64 < 15);
-    CHECK(config.blockSize % 64 == 0);
-  }
-
-  uint32_t numBlocks = config.gridSize;
-  uint32_t inputSharedSize = config.sharedMemory;
-
-  uint32_t numBuffers = config.blockSize / 32;
-  uint32_t blockSharedAlignment = numBuffers * 256;
-  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
-  uint32_t bufferSize = blockSharedSize / numBuffers;
-
-  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
-  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
-  u32 sharedOffset = addShared32(4, 4);
-
-  u32 bufferIndex = warpIndex;
-
-  u32 syncIndex = 1 + warpIndex / 2;
-  u32 pairIndex = warpIndex % 2;
-
-  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
-  u32 barrier = barrierBaseAddr + bufferIndex * 8;
-
-  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
-    Label alldone;
-    Value isLeader = laneIndex == 0;
-
-    IF_D(isLeader) {
-      st_shared_release_cta_u32(sharedOffset, blockIndex * bufferSize);
-      mbarrier_init(barrier, 1);
-    }
-    barrier_sync();
-
-    IF(pairIndex != 0) {
-      GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
-    }
-
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED(dst[i] % 16 != 0) trap();
-    }
-
-    Label loop;
-    LABEL(loop);
-
-    for (uint32_t parity : range(2)) {
-      u32 offset = 0;
-      PRED(isLeader) offset = atom_shared_relaxed_cta_add_u32(sharedOffset, numBlocks * bufferSize);
-      offset = shfl_sync_idx_b32(offset, 0, 31);
-      IF(offset >= bytes) {
-        bar_red_or(syncIndex, 64, 1);
-        GOTO(alldone);
-      }
-
-      u64 srcaddr = src + widen(offset);
-
-      u32 size = min_u32(bytes - offset, bufferSize);
-
-      cp_async_bulk_wait_group_read(0);
-      warp_sync();
-      IF_D(isLeader) {
-        mbarrier_expect_tx(barrier, size);
-        mbarrier_arrive_noComplete(barrier);
-        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-      }
-
-      bar_red_or(syncIndex, 64, 0);
-      IF_D(isLeader) {
-        mbarrier_wait_parity(barrier, parity);
-      }
-      warp_sync();
-      for (size_t i : indices(dst)) {
-        IF_D(dst[i] != 0) {
-          u64 dstaddr = dst[i] + widen(offset);
-          cp_async_bulk_global_shared(dstaddr, buffer, size);
-        }
-      }
-      cp_async_bulk_commit_group();
-
-      GOTO_IF(bar_red_or(syncIndex, 64, 0), alldone);
-    }
-
-    GOTO(loop);
-
-    LABEL(alldone);
-    cp_async_bulk_wait_group(0);
-    IF_D(isLeader) {
-      mbarrier_inval(barrier);
-    }
-    barrier_sync();
-  }
-};
-
 struct Profiling {
   bool enabled = false;
   HashMap<std::string, size_t> nameToIndex;
@@ -200,310 +87,74 @@ struct Profiling {
 
 static thread_local Profiling profiling;
 
-struct EmitSimple : EmitMultiCopy {
-  const KernelConfig& config;
-  u32 blockIndex;
-  u32 warpIndex;
-  u32 laneIndex;
+// The copy engine's stage ring, run by one lane per pipeline (a block runs config.pipelines pipelines, on the first
+// lane of each of its first warps). A pipeline copies chunks through a ring of numStages stages of chunkSize bytes in
+// shared memory: a bulk load (TMA) of a chunk into a stage, then bulk stores of the stage to each of the chunk's
+// destinations. A TMA copy is latency bound: an SM reaches its NVLink bandwidth (~52 GB/s on GB300) only with
+// ~100 KB of loads in flight. So the pipeline keeps loads in flight ahead of its stores: after issuing the stores of
+// a chunk, it waits until the stores of an earlier chunk have read their stage (cp.async.bulk.wait_group.read) and
+// loads the next chunk into that stage (see storeLag and the loops that use the ring). A stage's record holds what
+// its stores need: the chunk's offset and size, the generic address of the array of destination addresses (u64),
+// and a tag for the caller. The ring's position persists across copies (the mbarrier phases of the stages
+// continue).
+struct PipeRing {
+  static constexpr uint32_t recordSize = 32;
+  uint32_t chunkSize;
+  uint32_t numStages;
+  u32 buffers;  // stage s at buffers + chunkSize * s
+  u32 barriers; // the mbarrier of stage s at barriers + 8 * s
+  u32 records;  // the record of stage s at records + recordSize * s
 
-  EmitSimple(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
-      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
-    CHECK(numBuffers > 0);
-    CHECK(bufferSize > 0);
-    CHECK(config.blockSize % 32 == 0);
+  u32 loadStage = 0;   // the stage of the next load
+  u32 storeStage = 0;  // the stage of the next store
+  u32 storeParity = 0; // the phase parity of the mbarrier of that stage
+
+  PipeRing(uint32_t chunkSize, uint32_t numStages, const u32& buffers, const u32& barriers, const u32& records)
+      : chunkSize(chunkSize), numStages(numStages), buffers(buffers), barriers(barriers), records(records) {}
+
+  void init() {
+    for (uint32_t s : range(numStages)) {
+      mbarrier_init(barriers + 8 * s, 1);
+    }
+    fence_mbarrier_init();
   }
 
-  uint32_t numBlocks = config.gridSize;
-  uint32_t inputSharedSize = config.sharedMemory;
-
-  uint32_t numBuffers = config.blockSize / 32;
-  uint32_t blockSharedAlignment = numBuffers * 256;
-  uint32_t blockSharedSize =
-      std::max(inputSharedSize / blockSharedAlignment * blockSharedAlignment, blockSharedAlignment);
-  uint32_t bufferSize = blockSharedSize / numBuffers;
-
-  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
-  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
-
-  u32 bufferIndex = warpIndex;
-
-  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
-  u32 barrier = barrierBaseAddr + bufferIndex * 8;
-
-  void sync() {
-    profiling.enter("emit warp_sync");
-    warp_sync();
-    profiling.leave();
+  // Load bytes at src + offset into the next stage, to be stored to the numDestinations addresses (plus offset) in
+  // the array at dsts
+  void load(const u64& src, const u64& offset, const u32& bytes, const u64& dsts, const u32& numDestinations,
+      const u32& tag) {
+    u32 record = records + loadStage * recordSize;
+    st_shared_u64(record, offset);
+    st_shared_u64(record + 8, dsts);
+    st_shared_u32(record + 16, bytes);
+    st_shared_u32(record + 20, numDestinations);
+    st_shared_u32(record + 24, tag);
+    u32 barrier = barriers + loadStage * 8;
+    mbarrier_arrive_expect_tx(barrier, bytes);
+    cp_async_bulk_shared_global(buffers + loadStage * chunkSize, src + offset, bytes, barrier);
+    u32 next = loadStage + 1;
+    loadStage = selp_u32(0, next, next == numStages);
   }
 
-  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
-    sync();
-    Label alldone;
-    Value isLeader = laneIndex == 0;
-    IF_D(isLeader) {
-      mbarrier_init(barrier, 1);
+  // Wait for the chunk of the next stage to arrive, and issue its stores (one bulk group). Returns its tag.
+  u32 store() {
+    u32 record = records + storeStage * recordSize;
+    mbarrier_wait_parity_spin(barriers + storeStage * 8, storeParity);
+    u64 offset = ld_shared_u64(record);
+    u64 dsts = ld_shared_u64(record + 8);
+    u32 bytes = ld_shared_u32(record + 16);
+    u32 numDestinations = ld_shared_u32(record + 20);
+    u32 tag = ld_shared_u32(record + 24);
+    u32 buffer = buffers + storeStage * chunkSize;
+    FOR(u32 i = 0, i < numDestinations, i += 1) {
+      cp_async_bulk_global_shared(ld_u64(dsts + widen(i * 8)) + offset, buffer, bytes);
     }
-
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED(dst[i] % 16 != 0) trap();
-    }
-
-    u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
-
-    Label loop;
-    LABEL(loop);
-    for (uint32_t parity : range(2)) {
-      IF(offset >= bytes) {
-        GOTO(alldone);
-      }
-      u64 srcaddr = src + widen(offset);
-      u32 size = min_u32(bytes - offset, bufferSize);
-      profiling.enter("emit wait for write");
-      cp_async_bulk_wait_group_read(0);
-      sync();
-      IF_D(isLeader) {
-        profiling.enter("src copy", size);
-        mbarrier_expect_tx(barrier, size);
-        mbarrier_arrive_noComplete(barrier);
-        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-        mbarrier_wait_parity(barrier, parity);
-        profiling.leave();
-      }
-      sync();
-
-      for (size_t i : indices(dst)) {
-        IF_D(dst[i] != 0) {
-          profiling.enter("dst copy", size);
-          u64 dstaddr = dst[i] + widen(offset);
-          cp_async_bulk_global_shared(dstaddr, buffer, size);
-          profiling.leave();
-        }
-      }
-
-      cp_async_bulk_commit_group();
-      offset += numBlocks * blockSharedSize;
-    }
-    GOTO(loop);
-    LABEL(alldone);
-    profiling.enter("final wait for write");
-    cp_async_bulk_wait_group(0);
-    profiling.leave();
-    IF_D(isLeader) {
-      mbarrier_inval(barrier);
-    }
-    profiling.enter("emit exit barrier_sync");
-    barrier_sync(3);
-    profiling.enter("emit exit barrier_sync wait");
-    profiling.leave();
-  }
-};
-
-struct EmitGrouped : EmitMultiCopy {
-  const KernelConfig& config;
-  u32 blockIndex;
-  u32 warpIndex;
-  u32 laneIndex;
-
-  EmitGrouped(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
-      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
-    CHECK(numBuffers > 0);
-    CHECK(bufferSize > 0);
-    CHECK(config.blockSize % groupSize() == 0);
-    CHECK(config.blockSize / groupSize() < 15);
-  }
-
-  size_t groupSize() override {
-    return 128;
-  }
-
-  uint32_t numBlocks = config.gridSize;
-  uint32_t inputSharedSize = config.sharedMemory;
-
-  uint32_t numBuffers = config.blockSize / groupSize();
-  uint32_t blockSharedAlignment = numBuffers * 256;
-  uint32_t blockSharedSize =
-      std::max(inputSharedSize / blockSharedAlignment * blockSharedAlignment, blockSharedAlignment);
-  uint32_t bufferSize = blockSharedSize / numBuffers;
-
-  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
-  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
-
-  u32 bufferIndex = warpIndex / (groupSize() / 32);
-
-  u32 buffer = bufferBaseAddr + bufferIndex * bufferSize;
-  u32 barrier = barrierBaseAddr + bufferIndex * 8;
-
-  void sync() {
-    profiling.enter("emit sync");
-    barrier_sync(bufferIndex, groupSize());
-    profiling.enter("emit sync wait");
-    profiling.leave();
-  }
-
-  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
-    sync();
-    Label alldone;
-    u32 myIndex = (warpIndex * 32 + laneIndex) % groupSize();
-    Value isLeader = myIndex == 0;
-    IF_D(isLeader) {
-      mbarrier_init(barrier, 1);
-    }
-
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED(dst[i] % 16 != 0) trap();
-    }
-
-    u32 offset = (bufferIndex * numBlocks + blockIndex) * bufferSize;
-
-    u64 srcaddr = src + widen(offset);
-    u32 size = min_u32(bytes - offset, bufferSize);
-
-    GOTO_IF(offset >= bytes, alldone);
-
-    PRED(isLeader) {
-      profiling.enter("initial src copy");
-      mbarrier_expect_tx(barrier, size);
-      mbarrier_arrive_noComplete(barrier);
-      cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-      profiling.leave();
-    }
-
-    u32 parity = 0;
-    WHILE(true) {
-      IF_D(isLeader) {
-        profiling.enter("wait for read");
-        mbarrier_wait_parity(barrier, parity);
-      }
-      sync();
-      for (size_t i : indices(dst)) {
-        u64 dstaddr = dst[i] + widen(offset);
-        PRED(dst[i] != 0) {
-          profiling.enter("write", size);
-          cp_async_bulk_global_shared(dstaddr, buffer, size);
-          profiling.leave();
-        }
-      }
-      offset += numBlocks * blockSharedSize;
-      srcaddr += numBlocks * blockSharedSize;
-      size = min_u32(bytes - offset, bufferSize);
-      IF(offset >= bytes) {
-        BREAK;
-      }
-      parity ^= 1;
-      PRED(isLeader) {
-        profiling.enter("prepare read");
-        mbarrier_expect_tx(barrier, size);
-        mbarrier_arrive_noComplete(barrier);
-      }
-      profiling.enter("wait for write");
-      cp_async_bulk_commit_group();
-      cp_async_bulk_wait_group_read(0);
-      sync();
-      PRED(isLeader) {
-        profiling.enter("read");
-        cp_async_bulk_shared_global(buffer, srcaddr, size, barrier);
-        profiling.leave();
-      }
-    }
-
-    LABEL(alldone);
-    IF_D(isLeader) {
-      mbarrier_inval(barrier);
-    }
-    profiling.enter("final wait for write");
-    cp_async_bulk_wait_group(0);
-    profiling.leave();
-    profiling.enter("emit exit barrier_sync");
-    barrier_sync(15);
-    profiling.enter("emit exit barrier_sync wait");
-    profiling.leave();
-  }
-};
-
-struct EmitBuffered : EmitMultiCopy {
-  const KernelConfig& config;
-  u32 blockIndex;
-  u32 warpIndex;
-  u32 laneIndex;
-
-  EmitBuffered(const KernelConfig& config, const u32& blockIndex, const u32& warpIndex, const u32& laneIndex)
-      : config(config), blockIndex(blockIndex), warpIndex(warpIndex), laneIndex(laneIndex) {
-    CHECK(numBuffers > 0);
-    CHECK(bufferSize > 0);
-    CHECK(config.blockSize % 32 == 0);
-  }
-
-  uint32_t numBlocks = config.gridSize;
-  uint32_t inputSharedSize = config.sharedMemory;
-
-  uint32_t numBuffers = config.blockSize / 32 * 2;
-  uint32_t blockSharedAlignment = numBuffers * 256;
-  uint32_t blockSharedSize = inputSharedSize / blockSharedAlignment * blockSharedAlignment;
-  uint32_t bufferSize = blockSharedSize / numBuffers;
-
-  u32 bufferBaseAddr = addShared32(16, numBuffers* bufferSize);
-  u32 barrierBaseAddr = addShared32(8, numBuffers * 8);
-
-  u32 bufferIndex = warpIndex * 2;
-
-  u32 buffers[2] = {bufferBaseAddr + bufferIndex * bufferSize, bufferBaseAddr + (bufferIndex + 1) * bufferSize};
-  u32 barriers[2] = {barrierBaseAddr + bufferIndex * 8, barrierBaseAddr + (bufferIndex + 1) * 8};
-
-  void emit(u64 src, Vector<u64> dst, u32 bytes) override {
-    Value isLeader = laneIndex == 0;
-    IF_D(isLeader) {
-      mbarrier_init(barriers[0], 1);
-      mbarrier_init(barriers[1], 1);
-    }
-
-    PRED(bytes % 16 != 0) trap();
-    PRED(src % 16 != 0) trap();
-    for (size_t i : indices(dst)) {
-      PRED(dst[i] % 16 != 0) trap();
-    }
-
-    u32 offset = (warpIndex * numBlocks + blockIndex) * bufferSize;
-
-    WHILE(true) {
-      for (int parity : range(2)) {
-        for (int index : range(2)) {
-          IF(offset >= bytes) {
-            BREAK;
-          }
-          u64 srcaddr = src + widen(offset);
-          u32 size = min_u32(bytes - offset, bufferSize);
-          cp_async_bulk_wait_group_read(0);
-          warp_sync();
-          IF_D(isLeader) {
-            mbarrier_expect_tx(barriers[index], size);
-            mbarrier_arrive_noComplete(barriers[index]);
-            cp_async_bulk_shared_global(buffers[index], srcaddr, size, barriers[index]);
-            mbarrier_wait_parity(barriers[index], parity);
-          }
-          warp_sync();
-          for (size_t i : indices(dst)) {
-            IF_D(dst[i] != 0) {
-              u64 dstaddr = dst[i] + widen(offset);
-              cp_async_bulk_global_shared(dstaddr, buffers[index], size);
-            }
-          }
-          cp_async_bulk_commit_group();
-
-          offset += numBlocks * blockSharedSize / 2;
-        }
-      }
-    }
-
-    cp_async_bulk_wait_group(0);
-    IF_D(isLeader) {
-      mbarrier_inval(barriers[0]);
-      mbarrier_inval(barriers[1]);
-    }
-    barrier_sync();
+    cp_async_bulk_commit_group();
+    u32 next = storeStage + 1;
+    Value wrap = next == numStages;
+    storeStage = selp_u32(0, next, wrap);
+    storeParity = storeParity ^ selp_u32(1, 0, wrap);
+    return tag;
   }
 };
 
@@ -641,7 +292,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
   Module mod;
   mod.target = target;
   mod.topLevelComments.push_back(fmt::sprintf("block size: %d  grid size: %d", config.blockSize, config.gridSize));
-  mod.topLevelComments.push_back(fmt::sprintf("copy engine: %s", config.copyEngine));
   mod.topLevelComments.push_back(fmt::sprintf("shared memory: %d", config.sharedMemory));
   setModule(&mod);
 
@@ -778,6 +428,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // and the op's 401st launch writes them as a Chrome trace to moodist-trace-cuda-<rank>.json (dumpProfiling in
     // processgroup.cc). Needs Profiling::maxBytesPerThread of device memory per thread, also for every tuning
     // candidate.
+    profiling = Profiling();
     if (false) {
       auto profilingBuffer = ctx.group->allocateDevice(profiling.dataSize(config));
       profiling = Profiling();
@@ -1077,6 +728,78 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       addrTable.push_back(s);
     }
 
+    // Without waits, the items of all edges form one sequence, which the pipelines of all blocks take items from
+    // (see the copy loop below). An item is a chunk of an edge and a group of its destinations: an edge's
+    // destinations are split into groups when the op has few chunks, so that the stores of an all-gather of a few
+    // chunks to many ranks spread over the SMs too (a load per group: more local reads, which are cheap). Per edge:
+    // the index of its first item in the sequence, the destination groups (item i of the edge covers chunk
+    // i / groups and destination group i % groups), and the slots of its addresses in the address table that every
+    // block resolves at the start (source, then destinations). A last record (firstItem = the number of items) ends
+    // the sequence.
+    const uint32_t chunkSize = config.chunkSize;
+    const uint32_t numPipelines = config.pipelines;
+    const uint32_t numClaimers = numBlocks * numPipelines;
+    struct PipeEdge {
+      uint32_t firstItem;
+      uint32_t numItems;
+      uint32_t bytes;
+      uint32_t addrSlot;
+      uint32_t numDestinations;
+      uint32_t groups;
+      uint32_t groupSize; // destinations per group (the last group may have fewer)
+      uint32_t flags;
+      uint32_t signals;
+      uint32_t numSignals;
+      uint32_t pad[2];
+    };
+    static_assert(sizeof(PipeEdge) == 48);
+    std::vector<PipeEdge> pipeEdges;
+    std::vector<NodeSetup> pipeAddrSetups;
+    uint32_t pipeNumItems = 0;
+    CHECK(chunkSize >= 16 && chunkSize % 16 == 0);
+    CHECK(numPipelines >= 1 && numPipelines * 32 <= blockSize);
+    if (nowaits) {
+      uint64_t numChunksTotal = 0;
+      for (const Edge& e : localCopies) {
+        numChunksTotal += (e.bytes + chunkSize - 1) / chunkSize;
+      }
+      // Destination groups for about 4 items per pipeline: items are taken whole (in batches), so with few items,
+      // some pipelines get one more than others, e.g. with 32 chunks to 31 destinations each (an all-gather of
+      // 1 MB to 32 GPUs) and 12 pipelines. More groups cost more loads (and were slower at 8 items per pipeline).
+      const uint64_t groupsWanted =
+          std::max<uint64_t>((4 * numClaimers + numChunksTotal - 1) / std::max<uint64_t>(numChunksTotal, 1), 1);
+      for (size_t i : indices(localCopies)) {
+        const Edge& e = localCopies[i];
+        EdgeSetup s;
+        std::memcpy(&s, edgeTable.data() + edgeStride * i, sizeof(s));
+        CHECK(e.bytes > 0 && !e.destinations.empty());
+        const uint32_t numChunks = (e.bytes + chunkSize - 1) / chunkSize;
+        const uint32_t numDestinations = e.destinations.size();
+        PipeEdge p = {};
+        p.groupSize = (numDestinations + std::min<uint64_t>(groupsWanted, numDestinations) - 1) /
+                      std::min<uint64_t>(groupsWanted, numDestinations);
+        p.groups = (numDestinations + p.groupSize - 1) / p.groupSize;
+        p.firstItem = pipeNumItems;
+        p.numItems = numChunks * p.groups;
+        p.bytes = e.bytes;
+        p.addrSlot = pipeAddrSetups.size();
+        p.numDestinations = numDestinations;
+        p.flags = s.flags;
+        p.signals = s.signals;
+        p.numSignals = s.numSignals;
+        pipeAddrSetups.push_back(nodeSetup(e.sources.at(0)));
+        for (const Node& n : e.destinations) {
+          pipeAddrSetups.push_back(nodeSetup(n));
+        }
+        pipeEdges.push_back(p);
+        CHECK((uint64_t)pipeNumItems + p.numItems < (1ull << 30));
+        pipeNumItems += p.numItems;
+      }
+      PipeEdge end = {};
+      end.firstItem = pipeNumItems;
+      pipeEdges.push_back(end);
+    }
+
     std::vector<uint8_t> tableData;
     auto appendTable = [&](const auto& table) {
       size_t offset = (tableData.size() + 7) / 8 * 8;
@@ -1090,30 +813,50 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t edgeTableOffset = appendTable(edgeTable);
     size_t signalTableOffset = appendTable(signalTable);
     size_t addrTableOffset = appendTable(addrTable);
+    size_t pipeEdgeTableOffset = appendTable(pipeEdges);
+    size_t pipeAddrSetupOffset = appendTable(pipeAddrSetups);
     u64 tables = addGlobalData(16, tableData.data(), tableData.size(), "tables");
 
-    // The scan for ready edges keeps a done bit per edge and the selected edge in shared memory, taken from the
-    // copy engine's share
+    // Shared memory: with waits, the scan for ready edges keeps a done bit per edge and the selected edge, and the
+    // pipelines need the destination addresses of the edge being copied; without waits, the address table (in
+    // global memory if it does not fit in pipeTableSharedLimit). The stage rings take the rest.
     const uint32_t numEdges = localCopies.size();
     const uint32_t numDoneWords = (numEdges + 31) / 32;
     const uint32_t scanShared = nowaits ? 0 : (4 * numDoneWords + 8 + 15) / 16 * 16;
-    KernelConfig engineConfig = config;
-    CHECK(engineConfig.sharedMemory > scanShared);
-    engineConfig.sharedMemory -= scanShared;
-
-    std::unique_ptr<EmitMultiCopy> emit;
-    if (config.copyEngine == "simple") {
-      emit = std::make_unique<EmitSimple>(engineConfig, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "grouped") {
-      emit = std::make_unique<EmitGrouped>(engineConfig, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "buffered") {
-      emit = std::make_unique<EmitBuffered>(engineConfig, blockIndex, warpIndex, laneIndex);
-    } else if (config.copyEngine == "lockstep") {
-      emit = std::make_unique<EmitLockstep>(engineConfig, blockIndex, warpIndex, laneIndex);
-    } else {
-      CHECK(false);
+    static constexpr size_t pipeTableSharedLimit = 32 * 1024;
+    const size_t pipeTableBytes = 8 * pipeAddrSetups.size();
+    bool pipeTableInShared = false;
+    uint32_t numStages = 0;
+    {
+      const size_t perStage = chunkSize + 8 + PipeRing::recordSize;
+      size_t fixed = 256 + scanShared + (nowaits ? 0 : 8 * maxDestinations); // 256: alignment padding
+      if (nowaits && pipeTableBytes <= pipeTableSharedLimit &&
+          config.sharedMemory >= fixed + pipeTableBytes + 4 * numPipelines * perStage) {
+        pipeTableInShared = true;
+        fixed += pipeTableBytes;
+      }
+      REQUIRE(config.sharedMemory >= fixed + 4 * numPipelines * perStage,
+          "compile_op: %d bytes of shared memory are not enough for 4 stages of %d bytes per pipeline",
+          config.sharedMemory, chunkSize);
+      numStages = std::min<size_t>((config.sharedMemory - fixed) / (numPipelines * perStage), 16);
+      mod.topLevelComments.push_back(fmt::sprintf("chunk size %d, %d pipelines of %d stages per block%s", chunkSize,
+          numPipelines, numStages, nowaits && !pipeTableInShared ? ", address table in global memory" : ""));
     }
-    CHECK(emit != nullptr);
+
+    // Each pipeline's stage ring (the warps beyond the pipelines alias the first ring, and never use it)
+    std::optional<PipeRing> ring;
+    Value isPipelineLane = (laneIndex == 0) & (warpIndex < numPipelines);
+    {
+      u32 buffers = addShared32(128, numPipelines * numStages * chunkSize, "stages");
+      u32 barriers = addShared32(8, numPipelines * numStages * 8, "stagebarriers");
+      u32 records = addShared32(16, numPipelines * numStages * PipeRing::recordSize, "stagerecords");
+      u32 w = selp_u32(warpIndex, 0, warpIndex < numPipelines);
+      ring.emplace(chunkSize, numStages, buffers + w * (numStages * chunkSize), barriers + w * (numStages * 8),
+          records + w * (numStages * PipeRing::recordSize));
+      IF_D(isPipelineLane) {
+        ring->init();
+      }
+    }
 
     struct SyncSetup {
       uint64_t stbase;
@@ -1210,18 +953,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       return selp_u64(r, 0, pred);
     };
 
-    size_t groupSize = emit->groupSize();
-    const size_t numDstSlots = (maxDestinations + groupSize - 1) / groupSize;
-
-    // Slot i of this thread takes destination gindex(i) of an edge. In groups of several warps, consecutive
-    // destinations go to different warps (lane l of warp w of the group takes destination (w + 1) % warps +
-    // warps * l), so that all warps of the group issue the stores of a multicast edge.
+    // With waits, the threads resolve the destination addresses of an edge: slot i of a lane takes destination
+    // gindex(i) (the same in all warps)
+    const size_t numDstSlots = (maxDestinations + 31) / 32;
     auto gindex = [&](size_t i) {
-      if (groupSize == 32) {
-        return (laneIndex + groupSize * i);
-      }
-      u32 index = (threadIndex + 32) % groupSize;
-      return (index / 32 + index % 32 * (groupSize / 32)) + groupSize * i;
+      return laneIndex + 32 * i;
     };
 
     // The words of an edge record this thread needs: the header fields, the source's setup, and the setups of the
@@ -1296,14 +1032,69 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       return srcaddr;
     };
+    // After storing chunk k, a pipeline loads the next chunk into the stage of chunk k - storeLag, once the stores
+    // of that chunk have read it: up to storeLag + 1 chunks' stores in flight (the stores of an all-gather chunk to
+    // many GPUs take long), and numStages - storeLag loads
+    static constexpr int storeLag = 2;
+    CHECK(storeLag < (int)numStages);
+
+    // With waits: the destination addresses of the edge being copied, for the pipelines
+    std::optional<u32> pipeDestinations;
+    if (!nowaits) {
+      pipeDestinations = addShared32(8, 8 * std::max(maxDestinations, (size_t)1), "destinations");
+    }
+    // With waits: copy this block's chunks of an edge, pipelined within the edge. Chunk c of an edge belongs to
+    // block c % numBlocks, the same split on every rank, which the per-block depFilled slots rely on; the pipelines
+    // of a block take its chunks in turn. All threads call this; it returns when this block's stores are done.
+    auto pipeCopyEdge = [&](const u64& srcaddr, const u32& numDestinations, const u32& bytes) {
+      IF(warpIndex == 0) {
+        for (size_t i : range(numDstSlots)) {
+          u32 index = gindex(i);
+          PRED(index < numDestinations) st_shared_u64(*pipeDestinations + index * 8, dstaddrs[i]);
+        }
+      }
+      barrier_sync();
+      IF_D(isPipelineLane) {
+        // The loads below may read data whose readiness generic loads have observed
+        fence_proxy_async_global();
+        u32 numChunks = (bytes - 1) / chunkSize + 1;
+        u32 chunk = blockIndex + warpIndex * numBlocks;
+        u64 destinations = cvta_shared(widen(*pipeDestinations));
+        u32 loaded = 0;
+        u32 stored = 0;
+        auto loadChunk = [&]() {
+          u64 offset = widen(chunk) * chunkSize;
+          u32 n = min_u32(bytes - narrow(offset), chunkSize);
+          ring->load(srcaddr, offset, n, destinations, numDestinations, 0);
+          chunk += numBlocks * numPipelines;
+          loaded += 1;
+        };
+        WHILE((chunk < numChunks) & (loaded < numStages)) {
+          loadChunk();
+        }
+        WHILE(stored < loaded) {
+          ring->store();
+          stored += 1;
+          // The stage of the chunk before is free once its stores have read it
+          IF((chunk < numChunks) & (stored >= storeLag + 1)) {
+            cp_async_bulk_wait_group_read(storeLag);
+            loadChunk();
+          }
+        }
+        cp_async_bulk_wait_group(0);
+      }
+      barrier_sync();
+    };
+
     // Copy the edge at `desc` (the same for all threads) with the whole block: flags, bytes and srcaddr taken
     // from its words (copied into registers of their own, so the words can be reloaded), dstaddrs resolved
-    auto copyEdge = [&](const u64& desc, const u32& flags, const u32& bytes, const u64& srcaddr) {
+    auto copyEdge = [&](const u64& desc, const u32& flags, const u32& bytes, const u64& srcaddr,
+                        const u32& numDestinations) {
       // Every thread has read the source's address itself (remote sources), and any may issue loads
       IF((flags & edgeAcquire) != 0) {
         fence_acquire_sys();
       }
-      emit->emit(srcaddr, dstaddrs, bytes);
+      pipeCopyEdge(srcaddr, numDestinations, bytes);
       IF_D(isThreadZero & ((flags & edgeSignal) != 0)) {
         signalEdge(desc);
       }
@@ -1311,17 +1102,188 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     if (numEdges == 0) {
     } else if (nowaits) {
-      // In order, with the words of the next edge loaded while the current one is copied
-      EdgeWords next;
-      loadEdge(next, edgeTableAddr, nullptr);
-      FOR(u32 e = 0, e < numEdges, e += 1) {
-        u32 flags = next.flags;
-        u32 bytes = next.bytes;
-        u64 srcaddr = resolveEdge(next);
-        Value more = e + 1 < numEdges;
-        loadEdge(next, edgeTableAddr + widen((e + 1) * edgeStride), &more);
-        copyEdge(edgeTableAddr + widen(e * edgeStride), flags, bytes, srcaddr);
+      // The pipelines of all blocks take the items of the sequence (see PipeEdge) from a counter: the first claim
+      // of a pipeline takes enough to fill its ring (if there are enough items for all pipelines), the later ones
+      // one item (two were slower: the last pipelines to finish had more left). A pipeline claims its next item when
+      // it starts on one, so that the claim has returned when it needs it. Taking items dynamically keeps all SMs
+      // busy until the end: the copy rate of an SM varies (with a static split, the slowest SMs finished up to 47%
+      // after the others).
+      // Each concurrency slot has two counters, used by alternate launches (by the launch parity): block 0 resets
+      // the other one, which the previous launch used and the next one will use.
+      const uint32_t firstBatch = std::clamp<uint32_t>(pipeNumItems / numClaimers, 1, numStages);
+      static constexpr uint32_t pipeBatch = 1;
+      u64 claimCounters = addGlobalVar(8, 8 * maxConcurrency, "claims");
+      IF_D(isThreadZero & (blockIndex == 0)) {
+        st_global_u32(claimCounters + widen(concurrencyIndex * 8 + (parityBit ^ 1) * 4), 0);
       }
+      u64 claimCounter = claimCounters + widen(concurrencyIndex * 8 + parityBit * 4);
+      u32 nextBase; // the first item of the pending claim
+      IF_D(isPipelineLane) {
+        atom_global_relaxed_gpu_add_u32_into(nextBase, claimCounter, firstBatch);
+      }
+
+      // The address table: every block resolves the addresses of all edges at the start (waiting for the peers to
+      // publish theirs for this launch), so that edges cost nothing to switch between
+      const uint32_t numSlots = pipeAddrSetups.size();
+      u64 table;
+      if (pipeTableInShared) {
+        table = cvta_shared(widen(addShared32(16, 8 * numSlots, "addresses")));
+      } else {
+        const size_t blockBytes = 8 * numSlots;
+        rv->scratch = ctx.group->allocateDevice(blockBytes * numBlocks * maxConcurrency);
+        u64 base = (int64_t)rv->scratch.cudaPointer;
+        table = base + widen(concurrencyIndex) * (blockBytes * numBlocks) + widen(blockIndex) * blockBytes;
+      }
+      profiling.enter("resolve addresses");
+      FOR(u32 first = 0, first < numSlots, first += blockSize) {
+        u32 i = first + threadIndex;
+        Value valid = i < numSlots;
+        u64 setup = tables + pipeAddrSetupOffset + widen(i * sizeof(NodeSetup));
+        u32 slot = predicated(valid, ld_global_nc_u32)(setup);
+        u32 offsetLow = predicated(valid, ld_global_nc_u32)(setup + 4);
+        u32 offsetHigh = predicated(valid, ld_global_nc_u32)(setup + 8);
+        u64 addr = nodeaddrpred(valid, slot, offsetLow, offsetHigh);
+        PRED(valid) st_u64(table + widen(i * 8), addr);
+      }
+      bool anyRemoteSources = false;
+      bool anySignals = false;
+      for (const PipeEdge& p : pipeEdges) {
+        anyRemoteSources |= (p.flags & edgeAcquire) != 0;
+        anySignals |= (p.flags & edgeSignal) != 0;
+      }
+      // Copies of sources on other ranks: after the reads of their addresses (see copyEdge)
+      if (anyRemoteSources) {
+        fence_acquire_sys();
+      }
+      profiling.enter("resolve addresses barrier");
+      barrier_sync();
+      profiling.leave();
+
+      std::optional<u64> edgeDone;
+      if (anySignals) {
+        edgeDone = addGlobalVar(4, 4 * maxConcurrency * numEdges, "edgedone");
+      }
+
+      IF_D(isPipelineLane) {
+        profiling.enter("copy");
+        // The loads below may read data whose readiness generic loads have observed
+        fence_proxy_async_global();
+        u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
+        u32 item = 0;     // the next item of the current batch
+        u32 batchEnd = 0; // the end of the current batch
+        u32 claimSize = firstBatch;
+        Value exhausted(ValType::Pred);
+        exhausted = 0;
+        // The edge of the last item loaded, and the first item of the edge after it
+        u32 edge = 0;
+        u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
+        u32 loaded = 0;
+        u32 stored = 0;
+
+        // Take the next item; false if there are none left
+        auto take = [&]() {
+          IF(item >= batchEnd) {
+            u32 base = nextBase;
+            item = base;
+            batchEnd = min_u32(base + claimSize, pipeNumItems);
+            IF(base < pipeNumItems) {
+              claimSize = pipeBatch;
+              atom_global_relaxed_gpu_add_u32_into(nextBase, claimCounter, pipeBatch);
+            }
+          }
+          return item < batchEnd;
+        };
+        auto loadItem = [&]() {
+          // Items only increase: advance to the item's edge
+          WHILE(item >= nextFirst) {
+            edge += 1;
+            nextFirst = ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)));
+          }
+          u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
+          u32 edgeFirst = ld_global_nc_u32(record);
+          u32 edgeBytes = ld_global_nc_u32(record + 8);
+          u32 addrSlot = ld_global_nc_u32(record + 12);
+          u32 numDestinations = ld_global_nc_u32(record + 16);
+          u32 groups = ld_global_nc_u32(record + 20);
+          u32 groupSize = ld_global_nc_u32(record + 24);
+          u32 flags = ld_global_nc_u32(record + 28);
+          u64 src = ld_u64(table + widen(addrSlot * 8));
+          u32 index = item - edgeFirst;
+          u32 chunk = index / groups;
+          u32 firstDestination = (index - chunk * groups) * groupSize;
+          u64 offset = widen(chunk) * chunkSize;
+          u32 n = min_u32(edgeBytes - narrow(offset), chunkSize);
+          u32 numGroupDestinations = min_u32(numDestinations - firstDestination, groupSize);
+          // The tag: the edge, and whether it signals (bit 31)
+          u32 tag = edge | ((flags & edgeSignal) << 28);
+          ring->load(src, offset, n, table + widen((addrSlot + 1 + firstDestination) * 8), numGroupDestinations, tag);
+          item += 1;
+          loaded += 1;
+        };
+
+        // Fill the ring, then store items in order, loading the next one into the stage of the item before (free
+        // once its stores have read it)
+        WHILE(!exhausted & (loaded < numStages)) {
+          IF(take()) {
+            loadItem();
+          }
+          ELSE {
+            exhausted = 1;
+          }
+        }
+        WHILE(stored < loaded) {
+          u32 tag = ring->store();
+          stored += 1;
+          if (anySignals) {
+            // An item of an edge that other edges (on other ranks) wait for. Its items went to any block, while the
+            // waiting kernels wait for per-block slots: the last item to finish signals the slots of all blocks.
+            // Per launch, every item counts once, so the counter wraps back to 0.
+            IF((tag >> 31) != 0) {
+              u32 e = tag & 0x7fffffff;
+              u64 record = pipeEdgeTable + widen(e * sizeof(PipeEdge));
+              u32 numItems = ld_global_nc_u32(record + 4);
+              cp_async_bulk_wait_group(0);
+              fence_release_gpu();
+              u32 old =
+                  atom_global_relaxed_inc_u32(*edgeDone + widen((concurrencyIndex * numEdges + e) * 4), numItems - 1);
+              IF(old == numItems - 1) {
+                fence_acquire_gpu();
+                fence_release_sys();
+                u32 i = ld_global_nc_u32(record + 32);
+                u32 end = i + ld_global_nc_u32(record + 36);
+                WHILE(i < end) {
+                  u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
+                  u64 base = ld_global_nc_u64(s);
+                  u32 itembytes = ld_global_nc_u32(s + 8);
+                  u32 index = ld_global_nc_u32(s + 12);
+                  u32 stride = ld_global_nc_u32(s + 16);
+                  u64 slot = base + widen(itembytes * concurrencyIndex + 4 * index);
+                  FOR(u32 b = 0, b < numBlocks, b += 1) {
+                    st_global_relaxed_sys_u32(slot + widen(4 * stride * b), stepValue);
+                  }
+                  i += 1;
+                }
+              }
+            }
+          }
+          IF(!exhausted & (stored >= storeLag + 1)) {
+            cp_async_bulk_wait_group_read(storeLag);
+            IF(take()) {
+              loadItem();
+            }
+            ELSE {
+              exhausted = 1;
+            }
+          }
+        }
+        profiling.enter("drain");
+        cp_async_bulk_wait_group(0);
+        profiling.leave();
+      }
+      // All copies done before the exit's release fence
+      profiling.enter("copy end barrier");
+      barrier_sync();
+      profiling.leave();
     } else {
       // Rounds: warp 0 scans the edges that are not done, 32 at a time (one per lane). Relay edges whose signal
       // has arrived are finished on the spot. The first ready copy edge is selected; after a block barrier, the
@@ -1401,7 +1363,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           EdgeWords w;
           loadEdge(w, desc, nullptr);
           u64 srcaddr = resolveEdge(w);
-          copyEdge(desc, w.flags, w.bytes, srcaddr);
+          copyEdge(desc, w.flags, w.bytes, srcaddr, w.numDestinations);
           IF_D(isThreadZero) {
             u32 wordAddr = doneAddr + 4 * (sel / 32);
             u32 one = 1;

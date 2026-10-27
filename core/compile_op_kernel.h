@@ -14,12 +14,14 @@ struct CompileOpCopyParameters {
 };
 
 struct KernelConfig {
-  std::string copyEngine;
-
-  uint32_t blockSize = 256;
+  uint32_t blockSize = 128;
   uint32_t gridSize = 8;
 
   uint32_t sharedMemory = 0;
+
+  // Bytes per chunk, and pipelines (issuing warps) per block
+  uint32_t chunkSize = 32768;
+  uint32_t pipelines = 1;
 };
 
 struct CompiledModule {
