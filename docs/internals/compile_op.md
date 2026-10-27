@@ -157,9 +157,11 @@ on new tensors at every call.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads) publishes the rank's input list (addresses, sizes,
   rkeys; CUDA tensors are registered on first use) to all ranks, registers the outputs, collects all ranks' input
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
-  (reads of 4 MiB or more split into one part per NIC; reads with a signal first, in signal order, i.e. the chunks
-  of a transfer in order, then the others shuffled; at most 2 in flight per NIC), waits for them, runs a second
-  barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`.
+  (reads of 4 MiB or more split into one part per NIC, and if the op has fewer reads than NICs, smaller reads too,
+  into parts of at least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in
+  order, then the others shuffled; at most 2 in flight per NIC), waits for them, runs a second barrier with all
+  ranks (nobody reads this rank's inputs any more) and writes `cpuOut`. The parts of a read with a signal share it:
+  the signal is written when the last part has completed.
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
@@ -213,6 +215,11 @@ per GPU):
 | `multicast`, `MOODIST_COMPILE_OP_PROXY=0` (every rank reads all chunks of the other node) | 44 us | 171 us | 1.40 ms | 21.3 ms (101 GB/s) |
 | moodist's all-gather (process group) | 40 us | 68 us | 264 us | 3.51 ms (613 GB/s) |
 | NCCL with `NCCL_MNNVL_ENABLE=0` | 95 us | 101 us | 441 us | 5.42 ms (396 GB/s) |
+
+(The 1 MiB column above predates the splitting of small reads over the NICs: each proxy reads one 1 MiB piece,
+which then went through a single NIC, a 200 Gb/s port. Measured on other nodes of the same type, splitting it took
+1 MiB from 82 to 52 us, 512 KiB from 58 to 45 us and 2 MiB from 131 to 68 us; with four domains (three reads per
+proxy) 1 MiB from 101 to 94 us and 2 MiB from 160 to 143 us.)
 
 One GPU per node (each GPU receives one piece over the network): compile_op 87, 93 and 95 GB/s per GPU at 64 MiB,
 256 MiB and 1 GiB per rank, moodist's all-gather 90, 94 and 95 GB/s, NCCL 73, 81 and 84 GB/s.

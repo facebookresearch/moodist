@@ -5692,6 +5692,8 @@ struct CpuThreadImpl {
     static constexpr size_t numParallel = 2;
     // Reads of at least this size are split into one part per NIC
     static constexpr size_t splitBytes = 4 << 20;
+    // When an op has fewer reads than NICs, smaller reads are split too, into parts of at least this size
+    static constexpr size_t minPartBytes = 64 << 10;
     const size_t numDevices = self.devices.size();
 
     Vector<MemoryRegistration*> outputMrs;
@@ -5893,8 +5895,19 @@ struct CpuThreadImpl {
         }
       }
 
+      // Large reads are split into one part per NIC. With fewer reads than NICs, some NICs would idle, so the
+      // smaller reads are split as well (on GB300, a NIC is one 200 Gb/s port: a single 1 MiB read takes 42 us on
+      // one, 11 us on four). With more reads, they already spread over the NICs, and more parts would only cost
+      // round trips (at most numParallel reads are in flight per NIC). The parts of a read with a signal index
+      // share its signal: it is written when the last part has completed.
+      const bool fewReads = op->ibReads.size() < numDevices;
       for (const auto& r : op->ibReads) {
-        size_t parts = r.bytes >= splitBytes ? numDevices : 1;
+        size_t parts = 1;
+        if (r.bytes >= splitBytes) {
+          parts = numDevices;
+        } else if (fewReads) {
+          parts = std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices);
+        }
         size_t partBytes = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
         if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
           signalPartsLeft.resize(r.signalIndex + 1);
