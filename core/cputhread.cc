@@ -5689,9 +5689,9 @@ struct CpuThreadImpl {
     size_t liveReads = 0;
     std::array<size_t, maxDevices> deviceLiveReads{};
 
-    static constexpr size_t numParallel = 2;
-    // Reads of at least this size are split into one part per NIC
-    static constexpr size_t splitBytes = 4 << 20;
+    // Reads are split into parts of about partBytes, and each NIC has up to numParallel of them in flight
+    static constexpr size_t partBytes = 128 << 10;
+    static constexpr size_t numParallel = 8;
     // When an op has fewer reads than NICs, smaller reads are split too, into parts of at least this size
     static constexpr size_t minPartBytes = 64 << 10;
     const size_t numDevices = self.devices.size();
@@ -5895,20 +5895,23 @@ struct CpuThreadImpl {
         }
       }
 
-      // Large reads are split into one part per NIC. With fewer reads than NICs, some NICs would idle, so the
-      // smaller reads are split as well (on GB300, a NIC is one 200 Gb/s port: a single 1 MiB read takes 42 us on
-      // one, 11 us on four). With more reads, they already spread over the NICs, and more parts would only cost
-      // round trips (at most numParallel reads are in flight per NIC). The parts of a read with a signal index
-      // share its signal: it is written when the last part has completed.
+      // Reads are split into parts of about partBytes. The parts are issued in order, each on the NIC with the
+      // fewest in flight (up to numParallel), so a rank reads from one or two sources at a time, and with the order
+      // compile_op gives the reads (by source, rotated per rank), every source has about one reader at a time.
+      // Larger parts let the ranks drift apart, until some sources have several readers and others none: with one
+      // part per NIC and two in flight, a source port of an all-to-all (1 GiB per rank, 32 GB300 over RoCE) had no
+      // reader 13% of the time and three or more 30%, and the op took 14.8 ms instead of 10.2 ms. One part in
+      // flight per NIC keeps the ranks in step, but then each part costs a round trip (about 13 us from post to
+      // completion besides the transfer). With fewer reads than NICs, smaller reads are split as well, into parts
+      // of at least minPartBytes, so that every NIC gets some. The parts of a read with a signal index share its
+      // signal: it is written when the last part has completed.
       const bool fewReads = op->ibReads.size() < numDevices;
       for (const auto& r : op->ibReads) {
-        size_t parts = 1;
-        if (r.bytes >= splitBytes) {
-          parts = numDevices;
-        } else if (fewReads) {
-          parts = std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices);
+        size_t parts = std::max<size_t>((r.bytes + partBytes / 2) / partBytes, 1);
+        if (fewReads) {
+          parts = std::max(parts, std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices));
         }
-        size_t partBytes = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
+        size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
         if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
           signalPartsLeft.resize(r.signalIndex + 1);
         }
@@ -5917,7 +5920,7 @@ struct CpuThreadImpl {
           auto part = r;
           part.inputOffset += offset;
           part.outputOffset += offset;
-          part.bytes = std::min(partBytes, r.bytes - offset);
+          part.bytes = std::min(bytesPerPart, r.bytes - offset);
           reads.push_back(part);
           if (r.signalIndex >= 0) {
             ++signalPartsLeft[r.signalIndex];
@@ -5925,9 +5928,8 @@ struct CpuThreadImpl {
           offset += part.bytes;
         } while (offset < r.bytes);
       }
-      std::ranges::shuffle(reads, getRng());
       // Reads that signal the kernel first, in signal order (the chunks of a transfer in order): copies on this
-      // and other ranks wait for them
+      // and other ranks wait for them. The others keep their order.
       std::ranges::stable_sort(reads, {}, [](const CustomOpDescriptor::IbRead& r) {
         return r.signalIndex < 0 ? std::numeric_limits<int32_t>::max() : r.signalIndex;
       });

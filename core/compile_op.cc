@@ -1968,13 +1968,15 @@ struct CompileOpConstructor {
       // agree on whether the kernel path is used at all. Keep kernel-eligible edges only if EVERY rank has at
       // least one (AND across ranks, despite the name); otherwise all edges become ibReads. E.g. a multi-node
       // broadcast whose source is on one node leaves the other nodes without any local edges.
+      // The same exchange tells every rank the NVLink domain of each rank (its first rank), for the read order.
       bool anyCuda = std::ranges::any_of(baseGraph.edges, kernelEdge);
+      Vector<uint32_t> domainIds(size);
       for (size_t i : range(size)) {
-        ctx.send(i, anyCuda);
+        ctx.send(i, anyCuda, (uint32_t)cudaRanks.at(0));
       }
       for (size_t i : range(size)) {
         bool v;
-        ctx.receive(i, v);
+        ctx.receive(i, v, domainIds[i]);
         anyCuda &= v;
       }
       if (!anyCuda) {
@@ -2007,6 +2009,35 @@ struct CompileOpConstructor {
           }
         }
         it = baseGraph.edges.erase(it);
+      }
+
+      // The order of the reads. The CPU thread issues the reads that signal the kernel first (in signal order, see
+      // proxyRemoteEdges), then the others in this order, in small parts (see WorkCustom). Every rank takes the
+      // domains after its own in turn, and in a domain of n ranks, the ranks from its own position mod n on:
+      // (domain i, position p) reads (domain i + 1 + a, position p + b) in step (a, b), so that in each step every
+      // source has one reader (with domains of equal size). In random order, some sources had several readers and
+      // others none (all-to-all of 1 GiB per rank on 32 GB300 over RoCE: 12.2 ms instead of 10.2). A rotation by
+      // rank ((source - rank) mod size) does not work: the ranks of a domain skip its own ranks, so they all start
+      // on the same source. Sources in the rank's own domain (edges the kernel cannot take) come last.
+      {
+        Vector<uint32_t> firstRanks = domainIds;
+        std::ranges::sort(firstRanks);
+        firstRanks.erase(std::unique(firstRanks.begin(), firstRanks.end()), firstRanks.end());
+        const size_t numDomains = firstRanks.size();
+        Vector<size_t> domainIndex(size);
+        Vector<size_t> position(size);
+        Vector<size_t> domainSize(numDomains);
+        for (size_t r : range(size)) {
+          domainIndex[r] = std::ranges::lower_bound(firstRanks, domainIds[r]) - firstRanks.begin();
+          position[r] = domainSize[domainIndex[r]]++;
+        }
+        std::ranges::stable_sort(op->ibReads, {}, [&](const CustomOpDescriptor::IbRead& read) {
+          size_t j = domainIndex[read.rank];
+          size_t n = domainSize[j];
+          size_t a = (j + numDomains - 1 - domainIndex[rank]) % numDomains;
+          size_t b = (position[read.rank] + n - position[rank] % n) % n;
+          return std::make_pair(a, b);
+        });
       }
 
       bool localNeedsRdma = !op->ibReads.empty();

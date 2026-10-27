@@ -70,7 +70,11 @@ Every step is collective: all ranks of the group take part (through per-rank que
    RDMA read by the CPU thread of the destination rank (with the edge's signal index). Kernel tuning and launch
    are collective, so the kernel path is used only if every rank has at least one kernel edge; otherwise all
    edges become ibReads, and the proxy pass is undone (the copies from a proxy's node would race with the proxy's
-   own read).
+   own read). The ibReads are sorted by source so that each source has about one reader at a time: in the same
+   exchange, the ranks learn each other's domain (its first rank), and the rank at position p of domain i reads
+   the domains after its own in turn, each from position p (mod the domain's size) on, i.e. (domain i + 1 + a,
+   position p + b) in step (a, b); reads from its own domain come last. (A rotation by rank, (source - rank) mod
+   size, does not work: the ranks of a domain skip its own ranks, so they all start on the same source.)
 9. **16-byte check**: kernel edges must have sizes and offsets that are multiples of 16 bytes (the kernel uses TMA
    bulk copies). The ranks exchange their first violation and raise together.
 10. **Graph variants** (`MOODIST_COMPILE_OP_GRAPHS`, default `multicast`), each a `GraphBuilder` pass over the
@@ -172,11 +176,13 @@ on new tensors at every call.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads) publishes the rank's input list (addresses, sizes,
   rkeys; CUDA tensors are registered on first use) to all ranks, registers the outputs, collects all ranks' input
   lists, waits for `cpuIn`, runs a step value barrier with all ranks (all inputs are ready), issues its ibReads
-  (reads of 4 MiB or more split into one part per NIC, and if the op has fewer reads than NICs, smaller reads too,
-  into parts of at least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in
-  order, then the others shuffled; at most 2 in flight per NIC), waits for them, runs a second barrier with all
-  ranks (nobody reads this rank's inputs any more) and writes `cpuOut`. The parts of a read with a signal share it:
-  the signal is written when the last part has completed.
+  (split into parts of about 128 KiB, and if the op has fewer reads than NICs, smaller reads too, into parts of at
+  least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in order, then the
+  others in the order of the compile phase; each part on the NIC with the fewest in flight, up to 8), waits for
+  them, runs a second barrier with all ranks (nobody reads this rank's inputs any more) and writes `cpuOut`. The
+  parts of a read with a signal share it: the signal is written when the last part has completed. Small parts keep
+  a rank on one or two sources at a time, which with the read order keeps the ranks in step (see the RDMA read
+  note under Performance).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
@@ -281,7 +287,40 @@ without tails, 1 MiB 135-136 us and 16 MiB 412 us (two domains) and 653 us (four
 256 MiB (large buffers off page boundaries, without Data Direct): two domains 6.07 ms, or 11.4 ms with the first
 destination of the source's local rank as proxy (one node of each domain proxied everything); four domains
 17.4 ms, or 28.7 ms with the same read order in every domain; moodist's all-gather 15.2 ms (11.6 ms with Data
-Direct).
+Direct). The tables above predate the RDMA read order and 128 KiB parts (see below).
+
+32 GPUs: eight nodes in one NVL72 domain, with `MOODIST_FABRIC=0`, i.e. eight domains of one node over RoCE. For
+all-to-all the size is what each rank sends in total (a 32nd to each rank):
+
+| all-to-all | 4 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | 256 MiB | 1 GiB |
+|---|---|---|---|---|---|---|---|
+| compile_op | 68 us | 71 us | 104 us | 259 us | 771 us | 2.57 ms | 10.2 ms |
+| compile_op before the read order and 128 KiB parts | 83 us | 95 us | 143 us | 365 us | 1.28 ms | 4.16 ms | 16.6 ms |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 139 us | 137 us | 163 us | 282 us | 932 us | 2.93 ms | 11.2 ms |
+
+| all-gather | 1 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|---|
+| `multicast`, proxy pass | 56 us | 155 us | 403 us | 1.31 ms | 5.09 ms | 20.3 ms |
+| the same before | 55 us | 173 us | 518 us | 1.40 ms | 5.01 ms | 22.6 ms |
+| `MOODIST_COMPILE_OP_PROXY=0` | 68 us | 442 us | 1.38 ms | 5.09 ms | 20.5 ms | 84.7 ms |
+| the same before | 83 us | 669 us | 2.13 ms | 8.28 ms | 33.6 ms | 135 ms |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 102 us | 364 us | 661 us | 1.86 ms | 5.66 ms | 22.2 ms |
+
+At 1 GiB, the all-to-all reads 92 GB/s per GPU (of 100), NCCL moves 84. Over the NVLink fabric (one domain, no
+RDMA), all-to-all takes 22-23 us up to 1 MiB, 44.5 us at 16 MiB, 117 us at 64 MiB, 404 us at 256 MiB and 1.53 ms
+at 1 GiB (NCCL 118-236 us up to 1 MiB, then 165 us, 142 us, 434 us and 1.63 ms).
+
+RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
+1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
+in random order: 16.6 ms. In the order of the compile phase (each source one reader per step), 14.8 ms: each NIC
+still read from two sources at a time, the reads finished at different rates, and the ranks drifted apart until a
+source port had no reader 13% of the time and three or more readers 30% of the time. With one read in flight per
+NIC, the ranks stayed in step (one reader per source port 97% of the time, 23 GB/s per 200 Gb/s port) and took
+11.6 ms, but every read cost a round trip (about 13 us from post to completion besides the transfer). 128 KiB parts
+with 8 in flight per NIC (1 MiB) keep a rank on one or two sources at a time and hide the round trip: 10.2 ms, or
+12.2 ms in random order. Smaller parts make the CPU thread the bottleneck (64 KiB with 12 in flight: 12.1 ms);
+other part sizes and counts with 768 KiB to 1.5 MiB in flight were within 1-7% at 1 GiB, but larger parts
+were slower at 16-64 MiB (fewer parts per source).
 
 Compile time does not depend on the number of edges: the kernel reads its edges from tables. All-gather where each
 rank's input is K separate 4 KiB pieces (K edges per rank with `multicast`), one node with 4 GPUs:
@@ -353,8 +392,11 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   tensor allocated earlier (e.g. a benchmark's 1 KiB step) shifted all later buffers off page boundaries, which
   capped reads at about 64 GB/s per GPU (or 16 GB/s per queue pair: a second queue pair per NIC hid it). RDMA writes
   (scattered by the remote NIC into its memory) probably have the same problem; not measured.
-- Without Data Direct, more reads in flight per NIC made the proxied reads slower (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms
-  at 256 MiB with four domains).
+- With reads split into one part per NIC (before the 128 KiB parts), more reads in flight per NIC made the proxied
+  reads slower without Data Direct (2: 17.1 ms, 4: 19.9 ms, 8: 21.9 ms at 256 MiB with four domains): each NIC then
+  read from several sources at a time (see the RDMA read note). With 128 KiB parts, 8 in flight are faster than the
+  old 2 without Data Direct too (32 GPUs, `MOODIST_IB_DATA_DIRECT=0`, 256 MiB per rank: all-gather 34.1 ms
+  instead of 38.1, all-to-all 4.30 ms instead of 5.09; NCCL 4.67 ms).
 - Latency noise (fixed in October 2026): from 95a48ec on, `wait()` (and dropping the future) blocked until the CPU
   thread had finished every op with an RDMA part, although the stream already waits for it. The caller could not
   run ahead, so after each op the CPU thread ran out of work and slept, and every op had to wake it up on every
