@@ -637,6 +637,15 @@ void ld_global_acquire_sys_u32(const Value& d, const Value& addr) {
 void fence_proxy() {
   emitInst("fence.proxy.async");
 }
+void fence_proxy_async_global() {
+  emitInst("fence.proxy.async.global");
+}
+void fence_proxy_async_shared_cta() {
+  emitInst("fence.proxy.async.shared::cta");
+}
+void fence_mbarrier_init() {
+  emitInst("fence.mbarrier_init.release.cluster");
+}
 void fence() {
   emitInst("fence.cta");
 }
@@ -688,6 +697,22 @@ u32 ld_shared_u32(const u32& addr) {
 }
 void st_shared_u32(const u32& addr, const u32& value) {
   emitInst("st.shared.u32 [" + addr.str() + "], " + value.str());
+}
+u64 ld_shared_u64(const u32& addr) {
+  u64 r;
+  emitInst("ld.shared.u64 " + r.str() + ", [" + addr.str() + "]");
+  return r;
+}
+void st_shared_u64(const u32& addr, const u64& value) {
+  emitInst("st.shared.u64 [" + addr.str() + "], " + value.str());
+}
+u64 ld_u64(const u64& addr) {
+  u64 r;
+  emitInst("ld.u64 " + r.str() + ", [" + addr.str() + "]");
+  return r;
+}
+void st_u64(const u64& addr, const u64& value) {
+  emitInst("st.u64 [" + addr.str() + "], " + value.str());
 }
 u32 ld_shared_relaxed_u32(const u32& addr) {
   u32 r;
@@ -800,6 +825,9 @@ Value atom_global_relaxed_cta_add_u32(const Value& addr, const Value& b) {
 Value atom_global_relaxed_gpu_add_u32(const Value& addr, const Value& b) {
   return atomAdd("global", "relaxed", "gpu", addr, b);
 }
+void atom_global_relaxed_gpu_add_u32_into(const Value& d, const Value& addr, const Value& b) {
+  emitInst("atom.relaxed.gpu.global.add.u32 " + d.str() + ", [" + addr.str() + "], " + b.str());
+}
 Value atom_global_relaxed_sys_add_u32(const Value& addr, const Value& b) {
   return atomAdd("global", "relaxed", "sys", addr, b);
 }
@@ -885,6 +913,17 @@ Value mbarrier_arrive_noComplete(const Value& addr) {
 
 void mbarrier_expect_tx(const Value& addr, const Value& txCount) {
   emitInst("mbarrier.expect_tx.shared::cta.b64 [" + addr.str() + "], " + txCount.str());
+}
+
+void mbarrier_arrive_expect_tx(const Value& addr, const Value& txCount) {
+  emitInst("mbarrier.arrive.expect_tx.shared::cta.b64 _, [" + addr.str() + "], " + txCount.str());
+}
+
+void mbarrier_wait_parity_spin(const Value& addr, const Value& phaseParity) {
+  Label loop;
+  LABEL(loop);
+  Value done = mbarrier_try_wait_parity(addr, phaseParity);
+  GOTO_IF_NOT_D(done, loop);
 }
 
 Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity) {

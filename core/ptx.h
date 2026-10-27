@@ -569,6 +569,12 @@ inline Value ld_global_acquire_sys_u32(const Value& addr) {
   return result;
 }
 void fence_proxy();
+// Orders this thread's generic proxy accesses of global memory before its later async proxy (TMA) accesses, e.g. a
+// bulk load of data whose readiness a generic load has just observed
+void fence_proxy_async_global();
+void fence_proxy_async_shared_cta();
+// Makes this thread's prior mbarrier.init visible to the async proxy (TMA completions) and to the other threads
+void fence_mbarrier_init();
 void fence();
 void fence_acquire_sys();
 void fence_release_sys();
@@ -602,6 +608,11 @@ void st_shared_release_cta_u32(const Value& addr, const Value& val);
 
 u32 ld_shared_u32(const u32& addr);
 void st_shared_u32(const u32& addr, const u32& value);
+u64 ld_shared_u64(const u32& addr);
+void st_shared_u64(const u32& addr, const u64& value);
+// Generic addressing (shared or global memory)
+u64 ld_u64(const u64& addr);
+void st_u64(const u64& addr, const u64& value);
 
 u32 ld_shared_relaxed_u32(const u32& addr);
 void st_shared_relaxed_u32(const u32& addr, const u32& value);
@@ -657,6 +668,9 @@ Value atom_global_release_sys_add_u32(const Value& addr, const Value& b);
 Value atom_global_acq_rel_cta_add_u32(const Value& addr, const Value& b);
 Value atom_global_acq_rel_gpu_add_u32(const Value& addr, const Value& b);
 Value atom_global_acq_rel_sys_add_u32(const Value& addr, const Value& b);
+// The same into an existing register, e.g. to have an atomic in flight in a register that a later use waits for
+// (without a mov, which would wait for it right away)
+void atom_global_relaxed_gpu_add_u32_into(const Value& d, const Value& addr, const Value& b);
 // Atomic add (shared::cta, all semantics, cta scope)
 Value atom_shared_relaxed_cta_add_u32(const Value& addr, const Value& b);
 Value atom_shared_acquire_cta_add_u32(const Value& addr, const Value& b);
@@ -878,12 +892,17 @@ Value mbarrier_arrive(const Value& addr); // returns state token (u64)
 Value mbarrier_arrive_noComplete(
     const Value& addr); // arrive with .noComplete hint (caller guarantees this won't complete the phase)
 void mbarrier_expect_tx(const Value& addr, const Value& txCount);
+// Arrive (count 1) and add txCount to the expected transaction bytes of the current phase, in one instruction
+void mbarrier_arrive_expect_tx(const Value& addr, const Value& txCount);
 Value mbarrier_try_wait_parity(const Value& addr, const Value& phaseParity); // returns pred
 inline void mbarrier_wait_parity(const Value& addr, const Value& phaseParity) {
   WHILE(!mbarrier_try_wait_parity(addr, phaseParity)) {
     nanosleep(10);
   }
 }
+// Wait for the phase with the given parity to complete, without sleeping: try_wait itself suspends the thread for a
+// while. For waits on the critical path of a copy (a bulk load landing in shared memory). Divergence-safe.
+void mbarrier_wait_parity_spin(const Value& addr, const Value& phaseParity);
 
 // cp.async.bulk (sm_90+)
 void cp_async_bulk_shared_global(const Value& dst, const Value& src, const Value& size, const Value& mbar);
