@@ -103,6 +103,7 @@ Optional list of input tensor specifications that this rank will contribute. Eac
 **TensorRegion format:**
 - `offset`: `list[int]` - Starting position in the global tensor
 - `shape`: `list[int]` - Size of this input slice
+- `device`: `str | torch.device` - `"cpu"`, `"cuda"` or `"cuda:N"` (N must be the process group's device)
 - `tensor_id`: `str` (default: `"0"`) - Identifier for multi-tensor batching
 
 **DTensor format:**
@@ -117,14 +118,14 @@ If `None`, this rank contributes no inputs to the operation.
 from moodist import TensorRegion
 
 inputs = [
-    TensorRegion(offset=[0, 0], shape=[2, 4]),  # First slice at position [0,0]
-    TensorRegion(offset=[2, 0], shape=[2, 4]),  # Second slice at position [2,0]
+    TensorRegion(offset=[0, 0], shape=[2, 4], device="cuda"),  # First slice at position [0,0]
+    TensorRegion(offset=[2, 0], shape=[2, 4], device="cuda"),  # Second slice at position [2,0]
 ]
 
 # Multi-tensor batching with different dimensionalities:
 inputs = [
-    TensorRegion(offset=[0, 0], shape=[4, 4], tensor_id="weight"),  # 2D
-    TensorRegion(offset=[0], shape=[4], tensor_id="bias"),          # 1D
+    TensorRegion(offset=[0, 0], shape=[4, 4], device="cuda", tensor_id="weight"),  # 2D
+    TensorRegion(offset=[0], shape=[4], device="cuda", tensor_id="bias"),          # 1D
 ]
 ```
 
@@ -160,10 +161,10 @@ from moodist import TensorRegion
 
 # Example: Two ranks both write to offset [0, 0]
 # Rank 0:
-inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [1, 2, 3, ...]
+inputs = [TensorRegion(offset=[0, 0], shape=[2, 4], device="cuda")]  # Contains values [1, 2, 3, ...]
 
 # Rank 1:
-inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [10, 20, 30, ...]
+inputs = [TensorRegion(offset=[0, 0], shape=[2, 4], device="cuda")]  # Contains values [10, 20, 30, ...]
 
 # With reduce=None (default): raises an error due to overlap
 # With reduce="any": output contains values from either rank (arbitrary choice)
@@ -230,16 +231,17 @@ import torch
 import moodist
 from moodist import TensorRegion
 
+moodist.enable_cuda_allocator()  # before allocating the CUDA tensors that ops use
 group = moodist.find_process_group("my_group")
 
 if group.rank() == 0:
     # Rank 0 sends a 2×4 tensor
-    inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]
+    inputs = [TensorRegion(offset=[0, 0], shape=[2, 4], device="cuda")]
     outputs = None
 else:
     # Rank 1 receives a 2×4 tensor
     inputs = None
-    outputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]
+    outputs = [TensorRegion(offset=[0, 0], shape=[2, 4], device="cuda")]
 
 # Compile the operation (collective call - all ranks must participate)
 op = moodist.compile_op(
@@ -251,10 +253,10 @@ op = moodist.compile_op(
 
 # Create tensors and execute the operation
 if group.rank() == 0:
-    input_tensor = torch.randn(2, 4)
+    input_tensor = torch.randn(2, 4, device="cuda")
     op([input_tensor], [])
 else:
-    output_tensor = torch.empty(2, 4)
+    output_tensor = torch.empty(2, 4, device="cuda")
     op([], [output_tensor])
     # output_tensor now contains the data from rank 0
 ```
@@ -279,12 +281,12 @@ rank = group.rank()
 
 if rank == 0:
     # Rank 0 sends from a single contiguous tensor
-    inputs = [TensorRegion(offset=[0, 0], shape=[6, 4])]
+    inputs = [TensorRegion(offset=[0, 0], shape=[6, 4], device="cuda")]
     outputs = None
 else:
     # Ranks 1, 2, 3 each receive their slice
     inputs = None
-    outputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4])]
+    outputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4], device="cuda")]
 
 op = moodist.compile_op(
     group,
@@ -324,10 +326,10 @@ rank = group.rank()
 if rank == 0:
     # Rank 0 receives all slices into a single contiguous tensor
     inputs = None
-    outputs = [TensorRegion(offset=[0, 0], shape=[6, 4])]
+    outputs = [TensorRegion(offset=[0, 0], shape=[6, 4], device="cuda")]
 else:
     # Ranks 1, 2, 3 each send their slice
-    inputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4])]
+    inputs = [TensorRegion(offset=[(rank-1)*2, 0], shape=[2, 4], device="cuda")]
     outputs = None
 
 op = moodist.compile_op(
@@ -368,8 +370,8 @@ rank = group.rank()
 size = group.size()
 
 # Each rank contributes one slice and receives all slices
-inputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4])]
-outputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4])]
+inputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4], device="cuda")]
+outputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4], device="cuda")]
 
 op = moodist.compile_op(
     group,
@@ -406,10 +408,10 @@ rank = group.rank()
 size = group.size()
 
 # Each rank contributes the full tensor
-inputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4])]
+inputs = [TensorRegion(offset=[0, 0], shape=[size*2, 4], device="cuda")]
 
 # Each rank receives a different slice
-outputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4])]
+outputs = [TensorRegion(offset=[rank*2, 0], shape=[2, 4], device="cuda")]
 
 op = moodist.compile_op(
     group,
@@ -445,8 +447,8 @@ rank = group.rank()
 size = group.size()
 
 # Send to next rank (rank+1 % size), receive from previous (rank-1 % size)
-inputs = [TensorRegion(offset=[(rank+1) % size * 2, 0], shape=[2, 4])]
-outputs = [TensorRegion(offset=[rank * 2, 0], shape=[2, 4])]
+inputs = [TensorRegion(offset=[(rank+1) % size * 2, 0], shape=[2, 4], device="cuda")]
+outputs = [TensorRegion(offset=[rank * 2, 0], shape=[2, 4], device="cuda")]
 
 op = moodist.compile_op(
     group,
@@ -481,10 +483,10 @@ group = moodist.find_process_group("my_group")
 rank = group.rank()
 
 # All ranks contribute data to the same global location
-inputs = [TensorRegion(offset=[0, 0], shape=[4, 8])]
+inputs = [TensorRegion(offset=[0, 0], shape=[4, 8], device="cuda")]
 
 # All ranks receive the reduced result
-outputs = [TensorRegion(offset=[0, 0], shape=[4, 8])]
+outputs = [TensorRegion(offset=[0, 0], shape=[4, 8], device="cuda")]
 
 op = moodist.compile_op(
     group,

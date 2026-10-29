@@ -32,6 +32,31 @@ const char* computeTarget(int computeMajor, int computeMinor) {
   return "sm_60";
 }
 
+// The reduce loop's shared memory (see generateKernel): 2 to reduceMaxStages stages of chunkSize bytes with an mbarrier
+// each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), and 256 bytes
+// of alignment padding
+static constexpr uint32_t reduceResults = 2;
+static constexpr uint32_t reduceMaxStages = 16;
+static size_t reduceStageBytes(const KernelConfig& config) {
+  return config.chunkSize + 8;
+}
+static size_t reduceFixedBytes(const KernelConfig& config) {
+  return 256 + reduceResults * config.chunkSize + 8 * (reduceMaxStages + 2);
+}
+
+std::string reduceConfigError(const KernelConfig& config) {
+  if (config.pipelines != 1 || config.chunkSize % (16 * config.blockSize) != 0) {
+    return fmt::sprintf("kernels with reductions need one pipeline per block and chunks of a multiple of 16 bytes per "
+                        "thread (block size %d, chunk size %d, %d pipelines)",
+        config.blockSize, config.chunkSize, config.pipelines);
+  }
+  if (config.sharedMemory < reduceFixedBytes(config) + 2 * reduceStageBytes(config)) {
+    return fmt::sprintf("%d bytes of shared memory are not enough for the reduce loop with chunks of %d bytes",
+        config.sharedMemory, config.chunkSize);
+  }
+  return "";
+}
+
 struct Profiling {
   bool enabled = false;
   HashMap<std::string, size_t> nameToIndex;
@@ -1025,24 +1050,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     uint32_t numStages = 0;
     // The reduce loop (see below): stages of chunkSize with an mbarrier each (no records), reduceResults result
     // buffers, and a ring of reduceItemSlots claimed items (8 bytes each)
-    static constexpr uint32_t reduceResults = 2;
     uint32_t reduceItemSlots = 0;
     if (reduceKernel) {
       CHECK(nowaits);
-      REQUIRE(numPipelines == 1 && chunkSize % (16 * blockSize) == 0,
-          "compile_op: kernels with reductions need one pipeline per block and chunks of a multiple of 16 bytes per "
-          "thread (block size %d, chunk size %d, %d pipelines)",
-          blockSize, chunkSize, numPipelines);
-      const size_t perStage = chunkSize + 8;
-      size_t fixed = 256 + reduceResults * chunkSize + 8 * (16 + 2);
+      // (tuneKernels checks the configurations of reductions on every rank)
+      std::string error = reduceConfigError(config);
+      REQUIRE(error.empty(), "compile_op: %s", error);
+      const size_t perStage = reduceStageBytes(config);
+      size_t fixed = reduceFixedBytes(config);
       if (pipeTableBytes <= pipeTableSharedLimit && config.sharedMemory >= fixed + pipeTableBytes + 2 * perStage) {
         pipeTableInShared = true;
         fixed += pipeTableBytes;
       }
-      REQUIRE(config.sharedMemory >= fixed + 2 * perStage,
-          "compile_op: %d bytes of shared memory are not enough for the reduce loop with chunks of %d bytes",
-          config.sharedMemory, chunkSize);
-      numStages = std::min<size_t>((config.sharedMemory - fixed) / perStage, 16);
+      numStages = std::min<size_t>((config.sharedMemory - fixed) / perStage, reduceMaxStages);
       reduceItemSlots = numStages + 2;
       mod.topLevelComments.push_back(fmt::sprintf("reduce loop: chunk size %d, %d stages%s", chunkSize, numStages,
           pipeTableInShared ? "" : ", address table in global memory"));
@@ -1297,7 +1317,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // of that chunk have read it: up to storeLag + 1 chunks' stores in flight (the stores of an all-gather chunk to
     // many GPUs take long), and numStages - storeLag loads
     static constexpr int storeLag = 2;
-    CHECK(storeLag < (int)numStages);
+    CHECK(reduceKernel || storeLag < (int)numStages); // (the reduce loop does not lag, and may have 2 stages)
 
     // With waits: the destination addresses of the edge being copied, for the pipelines
     std::optional<u32> pipeDestinations;
@@ -1884,6 +1904,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
         // Fill the ring
         IF_D(isThreadZero) {
+          // The loads below may read data whose readiness generic loads have observed
+          fence_proxy_async_global();
           startItem();
           u32 loaded = 0;
           WHILE(!ldDone & (loaded < numStages)) {

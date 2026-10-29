@@ -273,17 +273,20 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
     all_inputs = []
     all_outputs = []
 
-    for _ in range(group.size()):
-        source_rank, ndtype, ninput, noutput, nreduce = queue.get_object()
+    # Every rank reads every rank's spec before any checks, so that all ranks raise alike and the queue stays empty
+    infos = [queue.get_object() for _ in range(group.size())]
+    for source_rank, ndtype, ninput, noutput, nreduce in infos:
         if ndtype != dtype:
             raise ValueError(
-                f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype}"
+                f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype} (rank {source_rank})"
             )
         if (nreduce or "none") != (reduce or "none"):
             raise ValueError(
-                f"moodist.compile_op: Ranks specified different reduce ops: {reduce!r} vs {nreduce!r} (rank {source_rank})"
+                f"moodist.compile_op: Ranks specified different reduce ops: {reduce!r} vs {nreduce!r} "
+                f"(rank {source_rank})"
             )
 
+    for source_rank, ndtype, ninput, noutput, nreduce in infos:
         if ninput is not None:
             for offset, shape, tensor_id, device in ninput:
                 all_inputs.append((source_rank, offset, shape, tensor_id, device))

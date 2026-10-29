@@ -10,6 +10,7 @@ by the number of inputs, rounded once in float32, then to the dtype, as the kern
 """
 
 import math
+import os
 
 import torch
 import moodist
@@ -241,3 +242,126 @@ def test_reduce_errors(ctx: TestContext):
     ctx.assert_raises(
         ValueError, lambda: moodist.compile_op(pg, dtype=torch.float32, inputs=region, outputs=region, reduce="mean")
     )
+
+
+@test
+def test_reduce_special_values(ctx: TestContext):
+    """NaN, infinities and zeros in an all-reduce: min and max propagate NaN, sums follow IEEE (inf + -inf = NaN),
+    and a sum of -0 only is -0 (sums start from -0)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 64
+    # vals[r]: rank r's input, small integers but for these elements
+    vals = (torch.arange(n * numel, dtype=torch.float64, device="cuda").view(n, numel) * 5) % 7 - 3
+    vals[0, 0] = math.nan  # NaN from the first rank
+    vals[n - 1, 1] = math.nan  # from the last
+    vals[:, 2] = -0.0  # -0 everywhere
+    vals[0, 3] = math.inf
+    vals[n - 1, 4] = -math.inf
+    vals[0, 5] = math.inf
+    vals[n - 1, 5] = -math.inf  # inf and -inf (with one rank: -inf)
+    vals[0, 6] = math.nan
+    vals[n - 1, 6] = math.inf
+    vals[:, 7] = math.inf
+    region = [TensorRegion(offset=[0], shape=[numel], device="cuda")]
+    bits = {torch.float16: torch.int16, torch.bfloat16: torch.int16, torch.float32: torch.int32,
+            torch.float64: torch.int64}
+    for dtype in FLOAT_DTYPES:
+        x = vals.to(dtype)
+        x64 = x.double()
+        for op_name in ["sum", "avg", "min", "max"]:
+            if op_name in ("sum", "avg"):
+                e = x64.sum(0)
+                e[(torch.signbit(x64) & (x64 == 0)).all(0)] = -0.0
+                if op_name == "avg":
+                    e = e / n if dtype == torch.float64 else e.float() / n
+            elif op_name == "min":
+                e = x64.amin(0)
+            else:
+                e = x64.amax(0)
+            expected = e.to(dtype)
+            out = torch.full((numel,), 99, dtype=dtype, device="cuda")
+            op = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=region, reduce=op_name)
+            op([x[ctx.rank].clone()], [out]).wait()
+            # NaN where expected, and elsewhere the same bits (-0 is not 0)
+            same_nan = torch.equal(out.isnan(), expected.isnan())
+            a = torch.where(out.isnan(), torch.zeros_like(out), out).view(bits[dtype])
+            b = torch.where(expected.isnan(), torch.zeros_like(expected), expected).view(bits[dtype])
+            ctx.assert_true(
+                same_nan and torch.equal(a, b),
+                f"reduce={op_name} {dtype}: got {out[:8].tolist()}, expected {expected[:8].tolist()}",
+            )
+
+
+@test
+def test_reduce_cpu_error(ctx: TestContext):
+    """A reduction of CPU tensors raises on every rank (for now), and the group compiles ops after it."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    region = [TensorRegion(offset=[0], shape=[64], device="cpu")]
+    ctx.assert_raises(
+        RuntimeError,
+        lambda: moodist.compile_op(pg, dtype=torch.float32, inputs=region, outputs=region, reduce="sum"),
+    )
+    spec = {"0": ([64], [[((0,), (64,))]] * n, [[((0,), (64,))]] * n)}
+    run_reduce(ctx, pg, "sum", torch.float32, spec)
+
+
+@test
+def test_reduce_mismatch(ctx: TestContext):
+    """Ranks that pass different reduce ops or dtypes get an error on every rank, from compile_op (checked in
+    Python) and from compile_op_full (checked in C++, for the C++ API), and the group compiles ops after it."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    region = [TensorRegion(offset=[0], shape=[64], device="cuda")]
+    op_name = "max" if ctx.rank == n - 1 else "sum"
+    dtype = torch.float64 if ctx.rank == 0 else torch.float32
+    ctx.assert_raises(
+        ValueError, lambda: moodist.compile_op(pg, dtype=torch.float32, inputs=region, outputs=region, reduce=op_name)
+    )
+    ctx.assert_raises(
+        ValueError, lambda: moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=region, reduce="sum")
+    )
+    # compile_op_full takes the regions of every rank: (rank, offset, shape, tensor_id, device)
+    everyone = [(r, (0,), (64,), "0", "cuda") for r in range(n)]
+    ctx.assert_raises(
+        RuntimeError, lambda: pg.compile_op_full(torch.float32, everyone, everyone, reduce=op_name, cpu_sync=False)
+    )
+    ctx.assert_raises(
+        RuntimeError, lambda: pg.compile_op_full(dtype, everyone, everyone, reduce="sum", cpu_sync=False)
+    )
+    spec = {"0": ([64], [[((0,), (64,))]] * n, [[((0,), (64,))]] * n)}
+    run_reduce(ctx, pg, "sum", torch.float32, spec)
+
+
+@test
+def test_reduce_configs(ctx: TestContext):
+    """MOODIST_COMPILE_OP_CONFIGS with reductions: configurations that the reduce loop cannot use raise on every rank,
+    also in a reduce-to-one, where only one rank executes reductions; 48 KiB chunks (2 stages) work."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 100000
+    to_one = [[] for _ in range(n)]
+    to_one[n - 1] = [((0,), (numel,))]
+    reduce_to_one = {"0": ([numel], [[((0,), (numel,))]] * n, to_one)}
+    all_reduce = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+    name = "MOODIST_COMPILE_OP_CONFIGS"
+    previous = os.environ.get(name)
+    try:
+        # two pipelines per block; 64 KiB of shared memory for 16 KiB chunks
+        for config in ["256:231424:8:32768:2", "256:65536:8:16384"]:
+            os.environ[name] = config
+            ctx.assert_raises(RuntimeError, lambda: run_reduce(ctx, pg, "sum", torch.float32, reduce_to_one))
+        os.environ[name] = "256:231424:8:49152"
+        run_reduce(ctx, pg, "sum", torch.float32, all_reduce)
+        run_reduce(ctx, pg, "max", torch.bfloat16, reduce_to_one)
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+    run_reduce(ctx, pg, "sum", torch.float32, all_reduce)

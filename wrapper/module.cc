@@ -840,6 +840,7 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
         if (strcmp(reduce_str, name) == 0) {
           reduce = op;
           found = true;
+          break;
         }
       }
       if (!found) {

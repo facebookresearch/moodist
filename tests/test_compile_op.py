@@ -612,3 +612,37 @@ def test_compile_op_device_mismatch_error(ctx: TestContext, device: str):
             "wrong device" in error_msg,
             f"Expected 'wrong device' in error message, got: {error_msg}"
         )
+
+
+@test_devices("cuda")
+def test_compile_op_mixed_devices(ctx: TestContext, device: str):
+    """One op with a CUDA and a CPU tensor on every rank, both all-gathered: the kernel copies the CUDA one between
+    NVLink peers (and is tuned with scratch tensors for the CUDA tensors only), RDMA reads move the CPU one."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    dtype = torch.float32
+    g = 16
+    c = 8
+    inputs = [
+        TensorRegion(offset=[ctx.rank * g], shape=[g], device="cuda", tensor_id="g"),
+        TensorRegion(offset=[ctx.rank * c], shape=[c], device="cpu", tensor_id="c"),
+    ]
+    outputs = [
+        TensorRegion(offset=[0], shape=[n * g], device="cuda", tensor_id="g"),
+        TensorRegion(offset=[0], shape=[n * c], device="cpu", tensor_id="c"),
+    ]
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+
+    g_input = torch.arange(g, dtype=dtype, device="cuda") + 100 * ctx.rank
+    c_input = torch.arange(c, dtype=dtype) + 1000 * ctx.rank
+    g_output = torch.zeros(n * g, dtype=dtype, device="cuda")
+    c_output = torch.zeros(n * c, dtype=dtype)
+    op([g_input, c_input], [g_output, c_output]).wait()
+
+    g_expected = torch.cat([torch.arange(g, dtype=dtype, device="cuda") + 100 * r for r in range(n)])
+    c_expected = torch.cat([torch.arange(c, dtype=dtype) + 1000 * r for r in range(n)])
+    ctx.assert_true(torch.equal(g_output, g_expected), f"CUDA tensor: got {g_output.tolist()}")
+    ctx.assert_true(torch.equal(c_output, c_expected), f"CPU tensor: got {c_output.tolist()}")

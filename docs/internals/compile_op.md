@@ -32,8 +32,9 @@ work. For the user-facing API, see [api/compile_op.md](../api/compile_op.md).
 
 Every step is collective: all ranks of the group take part (through per-rank queues and barriers).
 
-1. **Spec exchange** (compile.py): every rank gathers `(rank, dtype, inputs, outputs)` from all ranks, so every
-   rank knows every region of every rank.
+1. **Spec exchange** (compile.py): every rank gathers `(rank, dtype, inputs, outputs, reduce)` from all ranks, so
+   every rank knows every region of every rank, and checks that all ranks gave the same dtype and reduce op
+   (`compile` checks this again, for the C++ API, in its first exchange).
 2. **Phase 1**: each rank intersects its own inputs with every output (same `tensor_id`) and sends the
    intersections to the rank of the output.
 3. **Phase 2**, cell decomposition: per `tensor_id`, the boundaries of all regions of all ranks cut each
@@ -80,8 +81,9 @@ Every step is collective: all ranks of the group take part (through per-rank que
    RDMA read by the CPU thread of the destination rank (with the edge's signal index). Kernel tuning and launch
    are collective, so the ranks agree on whether the kernel path is used at all: it is if any rank has a kernel
    edge. A rank without one (e.g. one that only sends, or only receives over RDMA) still takes part in the tuning,
-   and runs a kernel if the kernel edges of other ranks touch its tensors (its kernel then only publishes their
-   addresses and takes part in the exit sync). Without the kernel path, all edges become ibReads, and the proxy
+   and runs a kernel if the graph gives it kernel edges to execute (with `multicast`, a rank that only sends executes
+   the copies of its inputs) or the kernel edges of other ranks touch its tensors (its kernel then only publishes
+   their addresses and takes part in the exit sync). Without the kernel path, all edges become ibReads, and the proxy
    pass is undone (the copies from a proxy's node would race with the proxy's own read). Reductions run in the
    kernel only for now: an edge with several sources that the kernel cannot take (CPU tensors, ranks of another
    NVLink domain) is an error, on every rank. (Until October 2026, the kernel path was used only if every rank had
@@ -120,11 +122,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
 11. **Tuning** (`tuneKernels`): the grid size {4, 8, 12, 16} (blocks of 128 threads with one pipeline of 32 KiB
-    chunks in 226 KiB of shared memory; reductions: {8, 16, 24, 32} with blocks of 256 threads, as their blocks also
-    combine the data, and reading from other GPUs takes more SMs than writing), for every graph variant (4 settings per variant;
-    `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations). Each setting is
-    generated and JIT compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12
-    launches. The ranks exchange their timings and take the minimum over ranks per setting. The fastest setting
+    chunks in 226 KiB of shared memory; reductions: {8, 16, 24, 32} with blocks of 256 threads, as their blocks
+    also combine the data, and reading from other GPUs takes more SMs than writing), for every graph variant (4
+    settings per variant; `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations, which every rank checks
+    against the reduce loop's needs for reductions). Each setting is generated and JIT compiled, then run on zeroed
+    scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The ranks exchange their timings and
+    take the minimum over ranks per setting (a rank without a kernel reports the largest time). The fastest setting
     wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which the computation it overlaps with
     lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it is for copies limited by the
     SMs' bandwidth). The kernel of the chosen setting is generated and compiled once more for the op. Tuning

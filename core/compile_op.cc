@@ -288,6 +288,33 @@ std::string fmtCoord(const Coord& c) {
   return fmt::to_string(fmt::join(c, ","));
 }
 
+// The name of a dtype, as torch has it (for error messages)
+const char* dtypeName(DType dtype) {
+  switch (dtype) {
+  case DType::UInt8:
+    return "uint8";
+  case DType::Int8:
+    return "int8";
+  case DType::Int16:
+    return "int16";
+  case DType::Int32:
+    return "int32";
+  case DType::Int64:
+    return "int64";
+  case DType::Float16:
+    return "float16";
+  case DType::Float32:
+    return "float32";
+  case DType::Float64:
+    return "float64";
+  case DType::Bool:
+    return "bool";
+  case DType::BFloat16:
+    return "bfloat16";
+  }
+  return "unknown";
+}
+
 // Parse device string without validation.
 // Returns the parsed DeviceType.
 // Throws if device string is invalid.
@@ -380,7 +407,8 @@ struct GraphBuilder {
     for (auto i = edges.begin(); i != edges.end();) {
       auto& e = *i;
       if (e.sources.size() != 1) {
-        // e.g. a relay edge (no sources), which stays with its executor
+        // a relay edge (no sources) or a reduction (several sources; see mergeReductions), which stays with its
+        // executor
         ++i;
         continue;
       }
@@ -1082,6 +1110,14 @@ struct CompileOpConstructor {
         configs.push_back(config);
       }
     }
+    // Only the ranks that execute reductions generate kernels with the reduce loop, which takes only some
+    // configurations: checked here, where every rank takes part
+    if (reduction) {
+      for (const KernelConfig& config : configs) {
+        std::string error = reduceConfigError(config);
+        REQUIRE(error.empty(), "compile_op: MOODIST_COMPILE_OP_CONFIGS: %s", error);
+      }
+    }
 
     Vector<Setting> settings;
     for (const Graph& graph : graphs) {
@@ -1253,6 +1289,7 @@ struct CompileOpConstructor {
       log.info("setting %d: %fms\n", i, seconds(timings.at(i)) * 1000);
     }
 
+    // The minimum over ranks: ranks without a kernel time nanoseconds::max() (a maximum would need to skip those)
     for (size_t i : range(size)) {
       ctx.send(i, timings);
     }
@@ -1289,19 +1326,6 @@ struct CompileOpConstructor {
     const Group* group = ctx.group;
 
     size_t itemsize = wrapperApi.dtypeSize(dtype);
-
-    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
-    // least 32 bits) and 32- and 64-bit integers. Every rank has the same dtype and reduce op (compile.py checks),
-    // so every rank raises here.
-    if (isReduction(reduce)) {
-      const bool floating =
-          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
-      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
-      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
-          "moodist.compile_op: reduce='%s' does not support this dtype (supported: float32, float64, float16, "
-          "bfloat16%s)",
-          reduceName(reduce), reduce == ReduceOp::Avg ? "" : ", int32, int64");
-    }
 
     // Validate per-tensorId ndim consistency
     // Different tensorIds can have different ndims (e.g., 2D weight vs 1D bias)
@@ -1457,6 +1481,36 @@ struct CompileOpConstructor {
 
     // Barrier before queue operations
     ctx.barrier();
+
+    // Every rank must compile the same op: the steps below depend on the dtype and the reduce op (e.g. only
+    // reductions merge their edges at the executors). compile.py checks this too, but the C++ API comes straight
+    // here. Every rank receives the values of all ranks before it raises, so that the queues stay in step.
+    for (size_t i : range(size)) {
+      ctx.send(i, (int)dtype, (int)reduce);
+    }
+    std::string mismatch;
+    for (size_t i : range(size)) {
+      int peerDtype;
+      int peerReduce;
+      ctx.receive(i, peerDtype, peerReduce);
+      if (mismatch.empty() && (peerDtype != (int)dtype || peerReduce != (int)reduce)) {
+        mismatch = fmt::sprintf("rank %zu: dtype %s, reduce='%s'; rank %zu: dtype %s, reduce='%s'", rank,
+            dtypeName(dtype), reduceName(reduce), i, dtypeName((DType)peerDtype), reduceName((ReduceOp)peerReduce));
+      }
+    }
+    REQUIRE(mismatch.empty(), "moodist.compile_op: ranks specified different dtypes or reduce ops (%s)", mismatch);
+
+    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
+    // least 32 bits) and 32- and 64-bit integers
+    if (isReduction(reduce)) {
+      const bool floating =
+          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
+      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
+      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
+          "moodist.compile_op: reduce='%s' does not support dtype %s (supported: float32, float64, float16, "
+          "bfloat16%s)",
+          reduceName(reduce), dtypeName(dtype), reduce == ReduceOp::Avg ? "" : ", int32, int64");
+    }
 
     // Send logical inputs to each destination rank
     for (size_t destRank : range(size)) {

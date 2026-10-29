@@ -53,6 +53,9 @@ struct KernelHandle {
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,
     const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning);
 
+// Why the kernels of ranks that execute reductions cannot run with config, or empty if they can
+std::string reduceConfigError(const KernelConfig& config);
+
 // Return the PTX target string (e.g. "sm_90a") for the given compute capability.
 const char* computeTarget(int computeMajor, int computeMinor);
 
