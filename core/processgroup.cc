@@ -3533,13 +3533,20 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
   // Reductions across NVLink domains: the scratch tensor (see CustomOpDescriptor::scratchBytes), the last tensor.
   // Allocated on the op's stream: once freed, it is reused only by work after the op on that stream, which comes after
-  // the RDMA reads into and from it (the stream waits for the CPU thread, see below).
+  // the RDMA reads into and from it (the stream waits for the CPU thread, see below). It is a CUDA tensor of the op
+  // like the others: a rank can have one without any tensors of its own (one that computes a partial result of its
+  // domain's inputs for another domain, see crossDomainReductions), and its stream must still wait for the CPU thread,
+  // or the scratch tensor could be reused while other ranks still read from it.
   if (op->scratchBytes != 0) {
     StreamGuard sg(stream, group->deviceIndex);
     TensorPtr t = TensorPtr::empty(
         {(int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype))}, op->dtype, group->deviceIndex);
     auto td = getTensorDataFromPtr(t, group.get());
-    CHECK(td->isCuda && td->bytes() == op->scratchBytes);
+    CHECK(td->isCuda && td->bytes() == op->scratchBytes && td->data() % 16 == 0);
+    REQUIRE(!op->requireMoodistMemory || allocator::owns(td->data()),
+        "moodist: this custom op (a reduction across NVLink domains) needs a scratch tensor on this rank, which must "
+        "come from the moodist CUDA allocator (call moodist.enable_cuda_allocator() on every rank)");
+    anyCuda = true;
     outputTDs.push_back(std::move(td));
     result->holdTensors.push_back(std::move(t));
   }

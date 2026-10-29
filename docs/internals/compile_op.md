@@ -302,9 +302,12 @@ on new tensors at every call.
   CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies
   (`narrow().contiguous()`), allocates the output copies (copied into the outputs when the op is waited on) and the
   scratch tensor of reductions across NVLink domains (on the op's stream: its memory is reused only by work after the
-  op on that stream, which comes after the op's RDMA reads into and from it).
-- Stream order: if any rank needs RDMA, write `cpuIn` = stepValue (the CPU thread may start), then the kernel, then
-  wait until `cpuOut` >= stepValue.
+  op on that stream, which comes after the op's RDMA reads into and from it). A rank with a scratch tensor counts as
+  one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need not have any): its
+  stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch tensor's memory
+  while other ranks still read from it.
+- Stream order (a rank with CUDA tensors, when any rank needs RDMA): write `cpuIn` = stepValue (the CPU thread may
+  start), then the kernel, then wait until `cpuOut` >= stepValue.
 - The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream
   sees the complete op, RDMA part included, so ops without CPU tensors are done for the caller when the call
   returns. Each op uses one of 16 concurrency slots (its own `cpuIn`, `cpuOut` and step value exchange areas): on

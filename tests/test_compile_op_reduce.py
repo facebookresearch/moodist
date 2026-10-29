@@ -13,6 +13,8 @@ results of the domains are divided and rounded to the dtype first, which is exac
 
 import math
 import os
+import socket
+import zlib
 
 import torch
 import moodist
@@ -261,6 +263,50 @@ def test_all_reduce_in_place_one_source(ctx: TestContext):
         spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
         for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
             run_reduce(ctx, pg, op_name, dtype, spec, in_place=True, repeat=3)
+
+
+def node_local_ranks(ctx, pg):
+    """Every rank's index among the ranks on its node, in rank order (as moodist numbers them)."""
+    host = torch.tensor([zlib.crc32(socket.gethostname().encode())], dtype=torch.int64, device="cuda")
+    hosts = torch.empty(ctx.world_size, dtype=torch.int64, device="cuda")
+    pg._allgather_base(hosts, host).wait()
+    hosts = hosts.tolist()
+    return [hosts[:r].count(hosts[r]) for r in range(ctx.world_size)]
+
+
+@test
+def test_reduce_partial_rank_without_tensors(ctx: TestContext):
+    """Reduce to rank 0 from rank 0 and from the ranks that are not the first of their node. Across NVLink domains,
+    the partial result of another domain comes from a rank with rank 0's local rank there, which has no tensors in
+    the op: its scratch tensor must stay untouched until rank 0 has read it, though the caller drops the op's future
+    at once and the stream allocates and fills new tensors right after the op."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    local = node_local_ranks(ctx, pg)
+    for numel in [1 << 20, 1 << 22]:
+        whole = [((0,), (numel,))]
+        ins = [whole if r == 0 or local[r] != 0 else [] for r in range(n)]
+        outs = [whole if r == 0 else [] for r in range(n)]
+        # (the expected values, from the op run as the other tests run it)
+        expected = run_reduce(ctx, pg, "sum", torch.float32, {"0": ([numel], ins, outs)})
+        region = TensorRegion(offset=[0], shape=[numel], device="cuda")
+        op = moodist.compile_op(
+            pg, dtype=torch.float32, inputs=[region] * len(ins[ctx.rank]), outputs=[region] * len(outs[ctx.rank]),
+            reduce="sum",
+        )
+        x = [make_input(ctx.rank, 0, [numel], (0,), (numel,), torch.float32, 0) for _ in ins[ctx.rank]]
+        errors = []
+        for run in range(4):
+            y = [torch.full((numel,), 99.0, device="cuda") for _ in outs[ctx.rank]]
+            op(x, y)  # the future is dropped right away
+            # New tensors on the stream, of the sizes of the scratch tensor's regions (the whole cell, or its parts)
+            garbage = [torch.full((numel >> s,), 1e9, device="cuda") for s in range(4) for _ in range(2)]
+            del garbage
+            torch.cuda.synchronize()
+            for out, exp in zip(y, expected):
+                if not torch.equal(out, exp):
+                    errors.append(f"numel {numel}, run {run}: {(out != exp).sum().item()} of {numel} wrong")
+        raise_on_all_ranks(ctx, pg, errors)
 
 
 @test
