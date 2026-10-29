@@ -22,8 +22,9 @@ work. For the user-facing API, see [api/compile_op.md](../api/compile_op.md).
 - A **node** is a byte offset in one tensor of one rank, `(rank, tensorIndex, offset)`, with a device and a
   `filled` flag (the data is there when the op starts, as opposed to being written by an edge during the op).
   Node ids are assigned by the rank that owns the node, so a node has the same id on every rank.
-- An **edge** copies `bytes` from its source node to one or more destination nodes. `executorRank` is the rank
-  whose kernel performs the copy. `cellIndex` identifies the piece of the global tensor.
+- An **edge** copies `bytes` from its source node to one or more destination nodes, or in a reduction combines
+  several source nodes into its destination nodes. `executorRank` is the rank whose kernel performs the copy.
+  `cellIndex` identifies the piece of the global tensor.
 - Tensor indices on a rank: its inputs, then its input copies (contiguous copies of input pieces that are not
   contiguous in the input), then its outputs, then its output copies.
 
@@ -38,13 +39,22 @@ Every step is collective: all ranks of the group take part (through per-rank que
 3. **Phase 2**, cell decomposition: per `tensor_id`, the boundaries of all regions of all ranks cut each
    dimension into intervals, and a cell is one box of the resulting grid (cells have global indices). For each
    cell of its outputs, a rank looks for the covering inputs: none is a gap error, more than one an overlap error
-   unless `reduce="any"` (which picks one at random).
-4. **Phase 3**: one read request per cell, to the rank that owns the chosen input.
+   unless `reduce="any"` (which picks one at random) or a reduction (`"sum"`, `"avg"`, `"min"`, `"max"`), which
+   takes all of them, in rank order. A reduced element is computed once, wherever its outputs are
+   (`reductionPieces`): a cell with several destination ranks (the ranks whose outputs cover it, e.g. every rank in
+   an all-reduce) is split into one piece per destination rank, byte ranges of whole 16-byte units of the cell in
+   row-major order (which is how its inputs and outputs, or their contiguous copies, hold it), and destination rank
+   (p + cell index) mod m computes piece p: it reads the piece from every source, combines them and stores the
+   result to every destination, which is a reduce-scatter and an all-gather in one pass. A cell with one destination
+   rank (e.g. in a reduce-scatter) is computed by that rank. Every destination rank of a cell computes the same
+   pieces, from the same regions.
+4. **Phase 3**: one read request per cell and source, to the rank that owns the input.
 5. **Phase 4**: that rank resolves the offset. A piece that is not contiguous in the input becomes an input copy
    (deduplicated).
 6. **Phase 5**: the output's rank creates one edge per cell, executed by itself: the source is the input (or
    input copy) node, the destination its output node, or an output copy if the piece is not contiguous in the
-   output. Then the ranks exchange node ids.
+   output. A reduced cell gets an edge per piece instead, with all the sources (in rank order) and the piece's
+   executor. Then the ranks exchange node ids.
 7. **Proxy pass** (`proxyRemoteEdges`; `MOODIST_COMPILE_OP_PROXY=0` disables it): data that several ranks of an
    NVLink domain (`cudaRanks`, see the next step) need from a rank outside the domain should cross the network
    once. The ranks of each domain exchange their edges from outside the domain and group them by source node. In a
@@ -68,9 +78,15 @@ Every step is collective: all ranks of the group take part (through per-rank que
    multi-node NVLink fabric domain such as NVL72), and, for process group collectives built on compile_op
    (scatter, gather), its size and offsets are multiples of 16 bytes. Every other edge becomes an `ibRead`, an
    RDMA read by the CPU thread of the destination rank (with the edge's signal index). Kernel tuning and launch
-   are collective, so the kernel path is used only if every rank has at least one kernel edge; otherwise all
-   edges become ibReads, and the proxy pass is undone (the copies from a proxy's node would race with the proxy's
-   own read). The ibReads are sorted by source so that each source has about one reader at a time: in the same
+   are collective, so the ranks agree on whether the kernel path is used at all: it is if any rank has a kernel
+   edge. A rank without one (e.g. one that only sends, or only receives over RDMA) still takes part in the tuning,
+   and runs a kernel if the kernel edges of other ranks touch its tensors (its kernel then only publishes their
+   addresses and takes part in the exit sync). Without the kernel path, all edges become ibReads, and the proxy
+   pass is undone (the copies from a proxy's node would race with the proxy's own read). Reductions run in the
+   kernel only for now: an edge with several sources that the kernel cannot take (CPU tensors, ranks of another
+   NVLink domain) is an error, on every rank. (Until October 2026, the kernel path was used only if every rank had
+   a kernel edge, so e.g. a gather, or a transfer between two ranks of a larger group, went entirely over RDMA.)
+   The ibReads are sorted by source so that each source has about one reader at a time: in the same
    exchange, the ranks learn each other's domain (its first rank), and the rank at position p of domain i reads
    the domains after its own in turn, each from position p (mod the domain's size) on, i.e. (domain i + 1 + a,
    position p + b) in step (a, b); reads from its own domain come last. (A rotation by rank, (source - rank) mod
@@ -94,11 +110,18 @@ Every step is collective: all ranks of the group take part (through per-rank que
    Edges have unfilled sources, i.e. depend on other edges, in the ring graphs and for proxied transfers (the
    copies from a proxy's node). Relay edges stay with the proxy in every variant.
 
+   Reductions use the `multicast` graph only. Its first pass (`mergeReductions`) merges the edges of a piece of a
+   reduced cell, one built by each destination rank of the cell (they have the same sources and the same
+   executor), into one edge with every destination, executed by that rank. Its sources start at the executor's own
+   (if any) and continue in rank order from there, and so do its destinations: the ranks then read from (and write
+   to) different ranks at the same time, and the kernel combines the sources in this order.
+
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
 11. **Tuning** (`tuneKernels`): the grid size {4, 8, 12, 16} (blocks of 128 threads with one pipeline of 32 KiB
-    chunks in 226 KiB of shared memory), for every graph variant (4 settings per variant;
+    chunks in 226 KiB of shared memory; reductions: {8, 16, 24, 32} with blocks of 256 threads, as their blocks also
+    combine the data, and reading from other GPUs takes more SMs than writing), for every graph variant (4 settings per variant;
     `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations). Each setting is
     generated and JIT compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12
     launches. The ranks exchange their timings and take the minimum over ranks per setting. The fastest setting
@@ -162,6 +185,17 @@ on new tensors at every call.
   `fence.acquire.sys` before the selection barrier; before copying from a peer's tensor, every thread does.
 - **Relay edges** (proxied transfers): ready once the CPU thread's signal, slot 16 + `rdmaSignal` of
   `cpuOutBuffer` for the concurrency index, has reached stepValue (always ready when tuning); nothing to copy.
+- **Reductions** (`reduceLoop`): a rank that executes an edge with several sources runs this loop instead of the
+  copy pipelines (reductions have no waits). The blocks (of 256 threads) take items one at a time from the
+  sequence (an item: a chunk of an edge, with all its destinations). Thread 0 loads the chunk of each source of an
+  item in turn with bulk loads, into a ring of 32 KiB stages (ahead across items as far as the ring allows), and
+  every thread combines each source's chunk, as it arrives, into its accumulators (16 bytes per thread and step),
+  in the order of the edge's sources: in `float32` for `float32`, `float16` and `bfloat16`, in `float64`, `int32` and
+  `int64` for those; `avg` then divides by the number of sources. The threads write the result into one of two
+  result buffers (rounding 16-bit floats once, to nearest even), and thread 0 stores it to every destination with
+  bulk stores (the stores of the item before may still be reading the other buffer). An item with one source (a
+  cell that one input covers) is stored as loaded. Sums start from -0 (x + -0 = x for every x), floating point
+  min and max propagate NaN.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 - **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
@@ -393,6 +427,25 @@ the outputs at offsets 64-192 KiB apart (NVLS needs them at the same offset: 12.
 814 us. Without the step counter, multicast stores from 32 ranks took 17-19 ms at 256 MiB (see the kernel). On 4
 GPUs, and on 64 GPUs in two NVL72 domains (29.4 ms at 256 MiB), ops do not use NVLS and take what they took before.
 
+Reductions (`reduce="sum"`, `bfloat16`) on 32 GPUs in one NVL72 domain, against NCCL and moodist's process group
+collectives (which reach the other nodes over RDMA). Reduce-scatter: the size is each rank's output (its input is 32
+times as large); all-reduce: the tensor's size:
+
+| | 64 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|
+| reduce-scatter, compile_op | 29 us | 69 us | 838 us | 3.26 ms | 12.94 ms |
+| reduce-scatter, NCCL | 115 us | 137 us | 809 us | 3.23 ms | 12.30 ms |
+| reduce-scatter, NCCL with `NCCL_MNNVL_ENABLE=0` | 316 us | 392 us | 1.88 ms | 5.69 ms | 22.2 ms |
+| reduce-scatter, moodist's process group | 139 us | 236 us | 2.52 ms | 9.65 ms | 39.7 ms |
+| all-reduce, compile_op | 30 us | 46 us | 72 us | 222 us | 937 us |
+| all-reduce, NCCL | 163 us | 132 us | 132 us | 334 us | 900 us |
+| all-reduce, NCCL with `NCCL_MNNVL_ENABLE=0` | 84 us | 153 us | 974 us | 1.66 ms | 5.04 ms |
+| all-reduce, moodist's process group | 158 us | 194 us | 321 us | 703 us | 2.12 ms |
+
+The large reduce-scatters read from the other GPUs at 620-640 GB/s per GPU (16 blocks), as fast as the all-gather
+writes. On 64 GPUs in two domains, NCCL took 25.0 ms for the 256 MiB reduce-scatter and 1.14 ms for the all-reduce
+(moodist's process group 87.8 ms and 2.58 ms), which compile_op cannot do yet (see Reductions: next steps).
+
 RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
 1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
 in random order: 16.6 ms. In the order of the compile phase (each source one reader per step), 14.8 ms: each NIC
@@ -449,9 +502,6 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - Some compile errors are raised only by the rank that finds them (gaps and overlaps in phase 2, device
   mismatches), and the other ranks then wait forever in the next collective step. The 16-byte check shows the
   pattern to follow: exchange the first error and raise on all ranks.
-- The kernel path is all or nothing: if some rank has no kernel edge, every edge of every rank goes over RDMA
-  (e.g. when a rank receives nothing, or only into CPU tensors). Ranks without kernel edges should take part in
-  tuning without a kernel instead.
 - Proxied transfers: the CPU thread signals the kernel as soon as the read's completion arrives, with a loopback
   RDMA write through the first NIC. That the read's data is visible in GPU memory before the signal relies on
   timing rather than on PCIe ordering (the read may have gone through another NIC, and MRs allow relaxed
@@ -564,8 +614,31 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    only, instead of `WorkCustom`'s exchanges with all ranks. It needs a heuristic for when it applies, and
    measurements against the proxy pass.
 
+### Reductions: next steps
+1. Across NVLink domains and with CPU tensors: a contribution from another domain has to be added, not copied, so
+   it needs a temporary buffer: an RDMA read of each such contribution into a buffer of the call, then the kernel
+   (correct, but every contribution crosses the network on its own), and then a reduction within each domain first,
+   so that only partial sums cross the network (the kernel has to tell the CPU thread when a partial sum is ready,
+   and the write variant above fits). CPU tensors: the CPU thread can combine them (`CpuReductions` in
+   cputhread.cc, which the process group's CPU reduce-scatter uses).
+2. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
+   all-reduce, each GPU then sends its input once and receives the result once, (1 + 1/N) times the data instead of
+   2 (N - 1) / N for the unicast pieces, about half on 32 ranks: this is where NCCL is faster at 256 MiB (see the
+   table under Performance notes). For a reduce-scatter it saves SMs, not bandwidth (each GPU sends its whole input
+   into the switches, N / (N - 1) times what the other ranks read in unicast). It needs inputs and outputs in the
+   communication pool, with memory bound at their offsets on every member (a member without makes the reader's
+   context fail with CUDA_ERROR_CONTAINED, see NVLS above), and a measurement of its rate per SM first: it is a
+   register load (at most 16 bytes per thread), not a bulk copy. Instruction support on GB300 (ptxas, sm_103a):
+   `add` of `f32`, `f16x2`, `bf16x2` (with `.acc::f32`), `f64`, `s32`, `u64`; `min`/`max` of 16-bit floats and
+   integers, not of `f32`.
+3. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
+   ranks). Splitting such cells among the sources (each computing a piece and writing it to the root) would bring
+   the root's NVLink ingress from (N - 1) times to about twice the data.
+4. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
+   parameterized by size (compiling takes 1-2 s, once per size), and `avg` (FSDP2's default `ReduceOp.AVG` is a
+   fatal error in moodist's process group reduce-scatter today).
+
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`
   between generic shared memory writes and TMA stores) or a staging buffer, to lift the 16-byte requirement.
-- Reductions (`reduce="sum"`), which need float math in the PTX DSL.
 - TMA tensor maps for strided regions, instead of copies of non-contiguous pieces.

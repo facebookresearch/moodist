@@ -49,6 +49,8 @@ struct Graph {
 
   struct Edge {
     uint64_t id;
+    // One source (a copy), none (a relay edge, see below), or for a reduction several, combined in this order (the
+    // executor's own source first, then the others in rank order from there; see mergeReductions in compile_op.cc)
     Vector<Node> sources;
     Vector<Node> destinations;
     size_t bytes;
@@ -92,7 +94,34 @@ struct Graph {
   size_t numOutputs;
   size_t numOutputCopies;
   Vector<TensorDescr> tensors;
+
+  // Sum, Avg, Min or Max: edges with several sources reduce them (see compile_op.cc)
+  ReduceOp reduce = ReduceOp::None;
 };
+
+// Whether reduce is an operation on the values (Sum, Avg, Min, Max), as opposed to None and Any
+inline bool isReduction(ReduceOp reduce) {
+  return reduce == ReduceOp::Sum || reduce == ReduceOp::Avg || reduce == ReduceOp::Min || reduce == ReduceOp::Max;
+}
+
+// The name of a reduce op, as compile_op takes it
+inline const char* reduceName(ReduceOp reduce) {
+  switch (reduce) {
+  case ReduceOp::None:
+    return "none";
+  case ReduceOp::Any:
+    return "any";
+  case ReduceOp::Sum:
+    return "sum";
+  case ReduceOp::Avg:
+    return "avg";
+  case ReduceOp::Min:
+    return "min";
+  case ReduceOp::Max:
+    return "max";
+  }
+  return "unknown";
+}
 
 // Context passed from ProcessGroupImpl to compile_op
 struct CompileContext {

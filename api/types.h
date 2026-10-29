@@ -56,7 +56,11 @@ struct RdmaEndpoint {
 enum class ReduceOp : int {
   None = 0, // Error on overlap (default)
   Any = 1,  // Pick any source (all sources have same value)
-  // Future: Sum, Mean, Max, Min (require CUDA kernels)
+  // Every output element is the sum (average, minimum, maximum) of the inputs that cover it
+  Sum = 2,
+  Avg = 3,
+  Min = 4,
+  Max = 5,
 };
 
 // Input/output specification for compile_op

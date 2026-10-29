@@ -510,9 +510,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         localCopies.push_back(v);
         continue;
       }
-      CHECK(v.sources.size() == 1);
+      // One source, or for a reduction several (see Graph::Edge)
+      CHECK(v.sources.size() == 1 || compile_op::isReduction(graph.reduce));
       CHECK(v.destinations.size() >= 1);
-      auto& src = v.sources[0];
+      bool localSource = false;
+      for (const Node& n : v.sources) {
+        CHECK(std::ranges::find(ranks, n.rank) != ranks.end());
+        localSource |= n.rank == rank;
+      }
       const Node* localdst = nullptr;
       for (const Node& n : v.destinations) {
         CHECK(!n.filled);
@@ -533,8 +538,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           localdst = &n;
         }
       }
-      CHECK(src.rank == rank || localdst);
-      CHECK(std::ranges::find(ranks, src.rank) != ranks.end());
+      CHECK(localSource || localdst);
 
       if (v.executorRank == rank) {
         localCopies.push_back(v);
@@ -565,10 +569,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     bool nowaits = true;
     bool hasRemoteWrites = false;
     size_t maxDestinations = 0;
+    // reduceKernel: this rank executes reductions (edges with several sources), and runs the reduce loop below
+    bool reduceKernel = false;
     for (const Edge& e : localCopies) {
-      if (e.sources.empty() || !e.sources[0].filled) {
+      if (e.sources.empty() || !std::ranges::all_of(e.sources, &Node::filled)) {
         nowaits = false;
       }
+      reduceKernel |= e.sources.size() > 1;
       for (const Node& n : e.destinations) {
         if (n.rank != rank) {
           hasRemoteWrites = true;
@@ -708,8 +715,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t nvlsCountersOffset = 0;
     if (!tuning) {
       Group* g = ctx.group;
-      const bool capable = !ctx.collectiveOp && g->size >= nvlsMinRanks && g->supportsMulticast &&
-                           g->fabricDomainRanks.size() == g->size && g->nvls.state != -1 &&
+      // (reductions: not yet, see the TODO in docs/internals/compile_op.md)
+      const bool capable = !ctx.collectiveOp && !compile_op::isReduction(graph.reduce) && g->size >= nvlsMinRanks &&
+                           g->supportsMulticast && g->fabricDomainRanks.size() == g->size && g->nvls.state != -1 &&
                            allocatorGetReservedBase() != 0 && ranks.size() == g->size;
       uint64_t chunks = 0;
       bool all = capable && nowaits && !localCopies.empty();
@@ -841,15 +849,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         s.flags = edgeRelay | edgeWait;
         s.signal = e.rdmaSignal;
       } else {
+        // (the record holds one source, for the path with waits; reductions only run without waits, from the
+        // PipeEdge table below, which holds all their sources)
         const Node& src = e.sources[0];
         NodeSetup source = nodeSetup(src);
         std::memcpy(record + sourceSetupOffset, &source, sizeof(source));
         if (!src.filled) {
+          CHECK(e.sources.size() == 1);
           s.flags |= edgeWait | edgeAcquire;
           s.sourceDep = localNodeIndex(src.id);
         }
-        if (src.rank != rank) {
-          s.flags |= edgeAcquire;
+        for (const Node& n : e.sources) {
+          if (n.rank != rank) {
+            s.flags |= edgeAcquire;
+          }
         }
       }
       s.numDestinations = e.destinations.size();
@@ -892,10 +905,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // chunks to many ranks spread over the SMs too (a load per group: more local reads, which are cheap). Per edge:
     // the index of its first item in the sequence, the destination groups (item i of the edge covers chunk
     // i / groups and destination group i % groups), and the slots of its addresses in the address table that every
-    // block resolves at the start (source, then destinations, then with NVLS the NVLS slot: the multicast address of
-    // the local destination, or 0 if the launch stores to each destination). A last record (firstItem = the number of
-    // items) ends the sequence. With NVLS, the chunks of all edges also form one sequence (nvlsFirst: the index of an
-    // edge's first chunk), which a launch that uses NVLS stores instead.
+    // block resolves at the start (its sources (one, except in reductions), then its destinations, then with NVLS the
+    // NVLS slot: the multicast address of the local destination, or 0 if the launch stores to each destination). A
+    // last record (firstItem = the number of items) ends the sequence. With NVLS, the chunks of all edges also form one
+    // sequence (nvlsFirst: the index of an edge's first chunk), which a launch that uses NVLS stores instead. The
+    // reduce loop takes whole chunks (one destination group).
     const uint32_t chunkSize = config.chunkSize;
     const uint32_t numPipelines = config.pipelines;
     const uint32_t numClaimers = numBlocks * numPipelines;
@@ -911,9 +925,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t signals;
       uint32_t numSignals;
       uint32_t nvlsFirst;
-      uint32_t pad;
+      uint32_t numSources;
     };
-    static_assert(sizeof(PipeEdge) == 48 && offsetof(PipeEdge, nvlsFirst) == 40);
+    static_assert(
+        sizeof(PipeEdge) == 48 && offsetof(PipeEdge, nvlsFirst) == 40 && offsetof(PipeEdge, numSources) == 44);
     std::vector<PipeEdge> pipeEdges;
     std::vector<NodeSetup> pipeAddrSetups;
     uint32_t pipeNumItems = 0;
@@ -940,8 +955,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         const uint32_t numChunks = (e.bytes + chunkSize - 1) / chunkSize;
         const uint32_t numDestinations = e.destinations.size();
         PipeEdge p = {};
-        p.groupSize = (numDestinations + std::min<uint64_t>(groupsWanted, numDestinations) - 1) /
-                      std::min<uint64_t>(groupsWanted, numDestinations);
+        const uint64_t groups = reduceKernel ? 1 : std::min<uint64_t>(groupsWanted, numDestinations);
+        p.groupSize = (numDestinations + groups - 1) / groups;
         p.groups = (numDestinations + p.groupSize - 1) / p.groupSize;
         const Node* nvlsDestination = nvlsLocal ? nvlsLocalDestination(e) : nullptr;
         CHECK(nvlsDestination || !nvlsLocal);
@@ -954,7 +969,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         p.signals = s.signals;
         p.numSignals = s.numSignals;
         p.nvlsFirst = nvlsChunksTotal;
-        pipeAddrSetups.push_back(nodeSetup(e.sources.at(0)));
+        p.numSources = e.sources.size();
+        for (const Node& n : e.sources) {
+          pipeAddrSetups.push_back(nodeSetup(n));
+        }
         for (const Node& n : e.destinations) {
           pipeAddrSetups.push_back(nodeSetup(n));
         }
@@ -1005,7 +1023,30 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     const size_t pipeTableBytes = 8 * pipeAddrSetups.size();
     bool pipeTableInShared = false;
     uint32_t numStages = 0;
-    {
+    // The reduce loop (see below): stages of chunkSize with an mbarrier each (no records), reduceResults result
+    // buffers, and a ring of reduceItemSlots claimed items (8 bytes each)
+    static constexpr uint32_t reduceResults = 2;
+    uint32_t reduceItemSlots = 0;
+    if (reduceKernel) {
+      CHECK(nowaits);
+      REQUIRE(numPipelines == 1 && chunkSize % (16 * blockSize) == 0,
+          "compile_op: kernels with reductions need one pipeline per block and chunks of a multiple of 16 bytes per "
+          "thread (block size %d, chunk size %d, %d pipelines)",
+          blockSize, chunkSize, numPipelines);
+      const size_t perStage = chunkSize + 8;
+      size_t fixed = 256 + reduceResults * chunkSize + 8 * (16 + 2);
+      if (pipeTableBytes <= pipeTableSharedLimit && config.sharedMemory >= fixed + pipeTableBytes + 2 * perStage) {
+        pipeTableInShared = true;
+        fixed += pipeTableBytes;
+      }
+      REQUIRE(config.sharedMemory >= fixed + 2 * perStage,
+          "compile_op: %d bytes of shared memory are not enough for the reduce loop with chunks of %d bytes",
+          config.sharedMemory, chunkSize);
+      numStages = std::min<size_t>((config.sharedMemory - fixed) / perStage, 16);
+      reduceItemSlots = numStages + 2;
+      mod.topLevelComments.push_back(fmt::sprintf("reduce loop: chunk size %d, %d stages%s", chunkSize, numStages,
+          pipeTableInShared ? "" : ", address table in global memory"));
+    } else {
       const size_t perStage = chunkSize + 8 + PipeRing::recordSize;
       // 256: alignment padding; with NVLS, the check's flag and the NVLS rings' barriers and records
       size_t fixed = 256 + scanShared + (nowaits ? 0 : 8 * maxDestinations) +
@@ -1023,10 +1064,26 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           numPipelines, numStages, nowaits && !pipeTableInShared ? ", address table in global memory" : ""));
     }
 
-    // Each pipeline's stage ring (the warps beyond the pipelines alias the first ring, and never use it)
+    // Each pipeline's stage ring (the warps beyond the pipelines alias the first ring, and never use it); with the
+    // reduce loop, its stages, barriers, result buffers and item ring
     std::optional<PipeRing> ring;
     Value isPipelineLane = (laneIndex == 0) & (warpIndex < numPipelines);
-    {
+    u32 reduceStages;
+    u32 reduceBarriers;
+    u32 reduceResultBuffers;
+    u32 reduceItemRing;
+    if (reduceKernel) {
+      reduceStages = addShared32(128, numStages * chunkSize, "reducestages");
+      reduceResultBuffers = addShared32(128, reduceResults * chunkSize, "reduceresults");
+      reduceBarriers = addShared32(8, numStages * 8, "reducebarriers");
+      reduceItemRing = addShared32(8, reduceItemSlots * 8, "reduceitems");
+      IF_D(isThreadZero) {
+        for (uint32_t s : range(numStages)) {
+          mbarrier_init(reduceBarriers + 8 * s, 1);
+        }
+        fence_mbarrier_init();
+      }
+    } else {
       u32 buffers = addShared32(128, numPipelines * numStages * chunkSize, "stages");
       u32 barriers = addShared32(8, numPipelines * numStages * 8, "stagebarriers");
       u32 records = addShared32(16, numPipelines * numStages * PipeRing::recordSize, "stagerecords");
@@ -1314,7 +1371,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       // after the others).
       // Each concurrency slot has two counters, used by alternate launches (by the launch parity): block 0 resets
       // the other one, which the previous launch used and the next one will use.
-      const uint32_t firstBatch = std::clamp<uint32_t>(pipeNumItems / numClaimers, 1, numStages);
+      // (the reduce loop claims one item at a time, see below)
+      const uint32_t firstBatch = reduceKernel ? 1 : std::clamp<uint32_t>(pipeNumItems / numClaimers, 1, numStages);
       static constexpr uint32_t pipeBatch = 1;
       u64 claimCounters = addGlobalVar(8, 8 * maxConcurrency, "claims");
       IF_D(isThreadZero & (blockIndex == 0)) {
@@ -1667,7 +1725,272 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         profiling.leave();
       };
 
-      if (nvlsLocal) {
+      // The reduce loop (kernels with reductions; see reductionPieces and mergeReductions in compile_op.cc). The blocks
+      // take items one at a time (an item is a chunk of an edge, with all its destinations). Thread 0 loads the chunk
+      // of each source of an item in turn with bulk loads, into a ring of stages, ahead across items as far as the ring
+      // allows, and all threads combine each source's chunk as it arrives into their accumulators, in the order of the
+      // edge's sources (the executor's own first, then the others in rank order from there, so that the ranks read
+      // from different ranks at the same time). The threads then write the result into one of two result buffers, and
+      // thread 0 stores it to every destination with bulk stores (the stores of the item before may still be reading
+      // the other buffer). Thread t holds the bytes at 16 * (t + v * blockSize) of a chunk, v < numVectors. The 16-bit
+      // floating point types are combined in f32 and rounded (to nearest even) once, when stored. An item with one
+      // source (a cell that one input covers) is stored as loaded.
+      auto reduceLoop = [&]() {
+        profiling.enter("reduce");
+        using compile_op::ReduceOp;
+        const DType dtype = graph.tensors.at(0).dtype;
+        const ReduceOp op = graph.reduce;
+        const uint32_t numVectors = chunkSize / (16 * blockSize);
+        const bool acc64 = dtype == DType::Float64 || dtype == DType::Int64;
+        const bool accFloat = dtype != DType::Int32 && dtype != DType::Int64;
+        const bool half = dtype == DType::Float16 || dtype == DType::BFloat16;
+        const uint32_t accPerVector = half ? 8 : acc64 ? 2 : 4;
+        const bool sum = op == ReduceOp::Sum || op == ReduceOp::Avg;
+        const bool isMin = op == ReduceOp::Min;
+        CHECK(compile_op::isReduction(op) && (accFloat || op != ReduceOp::Avg));
+        // The identity: -0 for sums (x + -0 = x for every x, -0 included), +-inf or the integer extremes for min / max
+        int64_t identity;
+        if (sum) {
+          identity = !accFloat ? 0 : acc64 ? (int64_t)0x8000000000000000ull : 0x80000000ll;
+        } else if (isMin) {
+          identity = !accFloat ? (acc64 ? INT64_MAX : 0x7fffffffll) : acc64 ? 0x7ff0000000000000ll : 0x7f800000ll;
+        } else {
+          identity = !accFloat ? (acc64 ? INT64_MIN : 0x80000000ll)
+                     : acc64   ? (int64_t)0xfff0000000000000ull
+                               : 0xff800000ll;
+        }
+        // acc = op(acc, x); floating point min / max propagate NaN (min.NaN; there is no min.NaN.f64)
+        auto combine = [&](const Value& acc, const Value& x) {
+          if (sum) {
+            arith(accFloat ? (acc64 ? "add.rn.f64" : "add.rn.f32") : (acc64 ? "add.s64" : "add.s32"), acc, acc, x);
+          } else if (!accFloat) {
+            arith(isMin ? (acc64 ? "min.s64" : "min.s32") : (acc64 ? "max.s64" : "max.s32"), acc, acc, x);
+          } else if (!acc64) {
+            arith(isMin ? "min.NaN.f32" : "max.NaN.f32", acc, acc, x);
+          } else {
+            Value nan(ValType::Pred);
+            setp_nan("f64", nan, acc, x);
+            Value m(ValType::U64);
+            arith(isMin ? "min.f64" : "max.f64", m, acc, x);
+            Value nanSum(ValType::U64);
+            arith("add.rn.f64", nanSum, acc, x);
+            emit("selp.b64 " + acc.str() + ", " + nanSum.str() + ", " + m.str() + ", " + nan.str());
+          }
+        };
+        // The accumulator values of a loaded vector
+        auto unpack = [&](const std::array<u32, 4>& x) {
+          Vector<Value> r;
+          for (size_t j : range(4)) {
+            if (dtype == DType::BFloat16) {
+              r.push_back(x[j] << 16);
+              r.push_back(x[j] & 0xffff0000ll);
+            } else if (dtype == DType::Float16) {
+              Value lo(ValType::U16);
+              Value hi(ValType::U16);
+              unpack_b32(lo, hi, x[j]);
+              r.emplace_back(ValType::U32);
+              arith("cvt.f32.f16", r.back(), lo);
+              r.emplace_back(ValType::U32);
+              arith("cvt.f32.f16", r.back(), hi);
+            } else if (acc64) {
+              if (j % 2 == 0) {
+                r.emplace_back(ValType::U64);
+                pack_b64(r.back(), x[j], x[j + 1]);
+              }
+            } else {
+              r.push_back(x[j]);
+            }
+          }
+          CHECK(r.size() == accPerVector);
+          return r;
+        };
+        // The vector to store from accumulator values (16-bit floats rounded to nearest even)
+        auto pack = [&](const Vector<Value>& acc) {
+          std::array<u32, 4> x;
+          for (size_t j : range(4)) {
+            if (half) {
+              // (cvt.rn.bf16x2.f32 d, a, b puts a in the upper half)
+              arith(dtype == DType::BFloat16 ? "cvt.rn.bf16x2.f32" : "cvt.rn.f16x2.f32", x[j], acc[2 * j + 1],
+                  acc[2 * j]);
+            } else if (acc64) {
+              if (j % 2 == 0) {
+                unpack_b64(x[j], x[j + 1], acc[j / 2]);
+              }
+            } else {
+              x[j] = acc[j];
+            }
+          }
+          return x;
+        };
+
+        u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
+
+        // Thread 0's loads: the stage of the next load, the item being loaded (its edge, the first item of the edge
+        // after it, its next source, its number of sources, its address slot, its offset in the edge and its size),
+        // and its slot in the item ring; ldDone once no items are left
+        u32 ldStage = 0;
+        u32 ldEdge = 0;
+        u32 ldNextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
+        u32 ldSource = 0;
+        u32 ldNumSources = 0;
+        u32 ldAddrSlot = 0;
+        u64 ldOffset = 0;
+        u32 ldBytes = 0;
+        u32 ldSlot = 0;
+        Value ldDone(ValType::Pred);
+        ldDone = 0;
+        // Take the item of the claim in flight, claim the next one, and write the item (its edge and chunk) to the
+        // item ring, or past the last item, the end mark (claims of one block only increase)
+        auto startItem = [&]() {
+          u32 item = nextBase;
+          IF(item < pipeNumItems) {
+            atom_global_relaxed_gpu_add_u32_into(nextBase, claimCounter, 1);
+            WHILE(item >= ldNextFirst) {
+              ldEdge += 1;
+              ldNextFirst = ld_global_nc_u32(pipeEdgeTable + widen((ldEdge + 1) * sizeof(PipeEdge)));
+            }
+            u64 record = pipeEdgeTable + widen(ldEdge * sizeof(PipeEdge));
+            u32 chunk = item - ld_global_nc_u32(record + offsetof(PipeEdge, firstItem));
+            ldNumSources = ld_global_nc_u32(record + offsetof(PipeEdge, numSources));
+            ldAddrSlot = ld_global_nc_u32(record + offsetof(PipeEdge, addrSlot));
+            ldOffset = widen(chunk) * chunkSize;
+            ldBytes = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(ldOffset), chunkSize);
+            ldSource = 0;
+            st_shared_u32(reduceItemRing + ldSlot * 8, ldEdge);
+            st_shared_u32(reduceItemRing + ldSlot * 8 + 4, chunk);
+          }
+          ELSE {
+            ldDone = 1;
+            u32 endMark = 0xffffffffll;
+            st_shared_u32(reduceItemRing + ldSlot * 8, endMark);
+          }
+        };
+        // Load the next source chunk of the item being loaded into the next stage (which the threads have combined
+        // into their accumulators), and after the item's last source, take the next item
+        auto issueLoad = [&]() {
+          u64 src = ld_u64(table + widen((ldAddrSlot + ldSource) * 8)) + ldOffset;
+          u32 barrier = reduceBarriers + ldStage * 8;
+          mbarrier_arrive_expect_tx(barrier, ldBytes);
+          cp_async_bulk_shared_global(reduceStages + ldStage * chunkSize, src, ldBytes, barrier);
+          u32 next = ldStage + 1;
+          ldStage = selp_u32(0, next, next == numStages);
+          ldSource += 1;
+          IF(ldSource == ldNumSources) {
+            u32 nextSlot = ldSlot + 1;
+            ldSlot = selp_u32(0, nextSlot, nextSlot == reduceItemSlots);
+            startItem();
+          }
+        };
+
+        // Fill the ring
+        IF_D(isThreadZero) {
+          startItem();
+          u32 loaded = 0;
+          WHILE(!ldDone & (loaded < numStages)) {
+            issueLoad();
+            loaded += 1;
+          }
+        }
+        barrier_sync();
+
+        u32 consStage = 0;
+        u32 consParity = 0;
+        u32 consSlot = 0;
+        u32 result = 0; // the result buffer of the next item
+        Vector<Vector<Value>> acc(numVectors);
+        for (auto& a : acc) {
+          for (size_t j : range(accPerVector)) {
+            a.emplace_back(acc64 ? ValType::U64 : ValType::U32);
+          }
+        }
+        Vector<std::array<u32, 4>> raw(numVectors); // the last loaded vectors
+        WHILE(true) {
+          u32 entry = reduceItemRing + consSlot * 8;
+          u32 edge = ld_shared_u32(entry);
+          IF(edge == 0xffffffffll) {
+            BREAK;
+          }
+          u32 chunk = ld_shared_u32(entry + 4);
+          u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
+          u32 numSources = ld_global_nc_u32(record + offsetof(PipeEdge, numSources));
+          u32 numDestinations = ld_global_nc_u32(record + offsetof(PipeEdge, numDestinations));
+          u32 addrSlot = ld_global_nc_u32(record + offsetof(PipeEdge, addrSlot));
+          u64 offset = widen(chunk) * chunkSize;
+          u32 n = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(offset), chunkSize);
+          for (auto& a : acc) {
+            for (Value& v : a) {
+              v = identity;
+            }
+          }
+          FOR(u32 s = 0, s < numSources, s += 1) {
+            mbarrier_wait_parity_spin(reduceBarriers + consStage * 8, consParity);
+            u32 stage = reduceStages + consStage * chunkSize;
+            for (uint32_t v : range(numVectors)) {
+              u32 off = threadIndex * 16 + 16 * blockSize * v;
+              PRED(off < n) ld_shared_v4_u32_into(raw[v], stage + off);
+              Vector<Value> x = unpack(raw[v]);
+              for (size_t j : range(accPerVector)) {
+                combine(acc[v][j], x[j]);
+              }
+            }
+            u32 next = consStage + 1;
+            Value wrap = next == numStages;
+            consStage = selp_u32(0, next, wrap);
+            consParity = consParity ^ selp_u32(1, 0, wrap);
+            // Every thread has combined the stage: load the next chunk into it
+            barrier_sync();
+            IF_D(isThreadZero & !ldDone) {
+              issueLoad();
+            }
+          }
+          // The result buffer is free once the stores of the item before the previous one have read it
+          IF_D(isThreadZero) {
+            cp_async_bulk_wait_group_read(reduceResults - 1);
+          }
+          barrier_sync();
+          u32 buffer = reduceResultBuffers + result * chunkSize;
+          Value copy = numSources == 1;
+          Value divisor(acc64 ? ValType::U64 : ValType::U32);
+          if (op == ReduceOp::Avg) {
+            arith(acc64 ? "cvt.rn.f64.u32" : "cvt.rn.f32.u32", divisor, numSources);
+          }
+          for (uint32_t v : range(numVectors)) {
+            if (op == ReduceOp::Avg) {
+              for (Value& a : acc[v]) {
+                arith(acc64 ? "div.rn.f64" : "div.rn.f32", a, a, divisor);
+              }
+            }
+            std::array<u32, 4> x = pack(acc[v]);
+            for (size_t j : range(4)) {
+              x[j] = selp_u32(raw[v][j], x[j], copy);
+            }
+            u32 off = threadIndex * 16 + 16 * blockSize * v;
+            PRED(off < n) st_shared_v4_u32(buffer + off, x);
+          }
+          // The bulk stores below read what the threads have written
+          fence_proxy_async_shared_cta();
+          barrier_sync();
+          IF_D(isThreadZero) {
+            FOR(u32 d = 0, d < numDestinations, d += 1) {
+              u64 dst = ld_u64(table + widen((addrSlot + numSources + d) * 8)) + offset;
+              cp_async_bulk_global_shared(dst, buffer, n);
+            }
+            cp_async_bulk_commit_group();
+          }
+          result = result ^ 1;
+          u32 nextSlot = consSlot + 1;
+          consSlot = selp_u32(0, nextSlot, nextSlot == reduceItemSlots);
+        }
+        IF_D(isThreadZero) {
+          cp_async_bulk_wait_group(0);
+        }
+        profiling.leave();
+      };
+
+      if (reduceKernel) {
+        CHECK(!nvlsLocal && !anySignals);
+        reduceLoop();
+      } else if (nvlsLocal) {
         IF(nvlsMode) {
           IF_D(isPipelineLane & (blockIndex == 0)) {
             nvlsCopy();

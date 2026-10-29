@@ -268,21 +268,21 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
 
     pg = create_process_group(ctx)
 
-    # Global shape: [4]
+    # Global shape: [8] (pieces of 16 bytes: CUDA transfers between NVLink peers need multiples of 16 bytes)
     dtype = torch.float32
 
     # Rank 0 provides two separate input tensors that together cover the full output
     if ctx.rank == 0:
         inputs = [
-            TensorRegion(offset=[0], shape=[2], device=device),
-            TensorRegion(offset=[2], shape=[2], device=device),
+            TensorRegion(offset=[0], shape=[4], device=device),
+            TensorRegion(offset=[4], shape=[4], device=device),
         ]
     else:
         inputs = None
 
     # Rank 1 receives the full tensor
     if ctx.rank == 1:
-        outputs = [TensorRegion(offset=[0], shape=[4], device=device)]
+        outputs = [TensorRegion(offset=[0], shape=[8], device=device)]
     else:
         outputs = None
 
@@ -291,20 +291,20 @@ def test_compile_op_multiple_inputs(ctx: TestContext, device: str):
     input_tensors = []
     if ctx.rank == 0:
         input_tensors = [
-            torch.tensor([1.0, 2.0], dtype=dtype, device=device),
-            torch.tensor([3.0, 4.0], dtype=dtype, device=device),
+            torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device),
+            torch.tensor([5.0, 6.0, 7.0, 8.0], dtype=dtype, device=device),
         ]
 
     output_tensors = []
     if ctx.rank == 1:
-        output_tensor = torch.zeros(4, dtype=dtype, device=device)
+        output_tensor = torch.zeros(8, dtype=dtype, device=device)
         output_tensors = [output_tensor]
 
     future = op(input_tensors, output_tensors)
     future.wait()
 
     if ctx.rank == 1:
-        expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=device)
+        expected = torch.arange(1, 9, dtype=dtype, device=device)
         ctx.assert_true(
             torch.equal(output_tensor, expected),
             f"got {output_tensor}, expected {expected}"

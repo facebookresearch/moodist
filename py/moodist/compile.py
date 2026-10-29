@@ -147,6 +147,11 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
         reduce: How to handle overlapping inputs. Options:
                 - None (default): Error if inputs overlap
                 - "any": Pick any source for overlapping regions (for replicated data)
+                - "sum", "avg", "min", "max": every output element is the sum (average,
+                  minimum, maximum) of all inputs that cover it, e.g. reduce-scatter and
+                  all-reduce. CUDA tensors in one NVLink domain (a node, or e.g. an NVL72
+                  rack); float32, float64, float16, bfloat16, int32 and int64 ("avg": the
+                  floating point types). All ranks must pass the same value.
         cpu_sync: If True, force CPU-side synchronization before CUDA operations.
                   This avoids potential deadlocks when CUDA has device-wide syncs pending.
                   Default is False.
@@ -214,6 +219,8 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
 
     if dtype is None:
         raise ValueError("dtype must be provided or derivable from DTensors")
+    if reduce is not None and reduce not in ("none", "any", "sum", "avg", "min", "max"):
+        raise ValueError(f"reduce must be None, 'any', 'sum', 'avg', 'min' or 'max', got {reduce!r}")
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
 
@@ -260,17 +267,21 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
     assert queue.empty()
     group.barrier()
 
-    info = (group.rank(), dtype, inputs, outputs)
+    info = (group.rank(), dtype, inputs, outputs, reduce)
     queue.put_object(info)
 
     all_inputs = []
     all_outputs = []
 
     for _ in range(group.size()):
-        source_rank, ndtype, ninput, noutput = queue.get_object()
+        source_rank, ndtype, ninput, noutput, nreduce = queue.get_object()
         if ndtype != dtype:
             raise ValueError(
                 f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype}"
+            )
+        if (nreduce or "none") != (reduce or "none"):
+            raise ValueError(
+                f"moodist.compile_op: Ranks specified different reduce ops: {reduce!r} vs {nreduce!r} (rank {source_rank})"
             )
 
         if ninput is not None:

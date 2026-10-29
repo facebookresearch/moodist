@@ -422,6 +422,64 @@ struct GraphBuilder {
     }
   }
 
+  // Reductions: the edges of a piece of a reduced cell (see reductionPieces), one built by each destination rank of
+  // the cell, have the same sources and the same executor. Merge them into one edge with every destination, executed
+  // by that rank. Its sources start at the executor's own, if any, and continue in rank order from there, and so do
+  // its destinations: the ranks then read from and write to different ranks at the same time (e.g. in a
+  // reduce-scatter, rank r reads from ranks r, r + 1, r + 2, ...), and the kernel combines the sources in this order.
+  void mergeReductions() {
+    if (!isReduction(graph.reduce)) {
+      return;
+    }
+    HashMap<uint32_t, Vector<Edge>> byExecutor;
+    for (auto i = edges.begin(); i != edges.end();) {
+      if (i->sources.size() < 2) {
+        ++i;
+        continue;
+      }
+      CHECK(i->destinations.size() == 1);
+      byExecutor[i->executorRank].push_back(std::move(*i));
+      i = edges.erase(i);
+    }
+    for (size_t i : range(size)) {
+      ctx.send(i, byExecutor[i]);
+    }
+    HashMap<std::string, size_t> merged; // the ids of an edge's sources -> its index in edges
+    Vector<Edge> el;
+    for (size_t i : range(size)) {
+      ctx.receive(i, el);
+      for (Edge& e : el) {
+        CHECK(e.executorRank == rank);
+        std::string key;
+        for (const Node& n : e.sources) {
+          key.append((const char*)&n.id, sizeof(n.id));
+        }
+        auto it = merged.find(key);
+        if (it == merged.end()) {
+          merged[key] = edges.size();
+          e.id = ictx.nextEdgeId();
+          edges.push_back(std::move(e));
+        } else {
+          Edge& target = edges[it->second];
+          CHECK(target.bytes == e.bytes && target.cellIndex == e.cellIndex && target.chunkIndex == e.chunkIndex);
+          target.destinations.push_back(e.destinations.at(0));
+        }
+      }
+    }
+    auto proj = [](const Node& n) {
+      return n.rank;
+    };
+    for (Edge& e : edges) {
+      if (e.sources.size() < 2) {
+        continue;
+      }
+      // (the sources are in rank order, see Phase 5)
+      std::ranges::rotate(e.sources, std::ranges::lower_bound(e.sources, rank, {}, proj));
+      std::ranges::sort(e.destinations, {}, proj);
+      std::ranges::rotate(e.destinations, std::ranges::lower_bound(e.destinations, rank, {}, proj));
+    }
+  }
+
   void constructCudaTensorMappings() {
     Vector<uint32_t> nranks;
     for (auto& v : graph.cudaEdges) {
@@ -519,9 +577,12 @@ struct GraphBuilder {
     for (const Edge& e : edges) {
       CHECK(!localEdges.contains(e.id));
       localEdges[e.id] = &e - edges.data();
+      // (once per rank: a rank can have several nodes in an edge, e.g. a source and a destination in a reduction)
+      Vector<uint32_t> sentTo;
       for (auto* l : {&e.sources, &e.destinations}) {
         for (const Node& n : *l) {
-          if (n.rank != rank) {
+          if (n.rank != rank && std::ranges::find(sentTo, n.rank) == sentTo.end()) {
+            sentTo.push_back(n.rank);
             edgePerRank[n.rank].push_back(e);
           }
         }
@@ -678,12 +739,14 @@ struct GraphBuilder {
 
 Graph buildNothing(InternalContext& ictx, const Graph& baseGraph) {
   GraphBuilder builder(ictx, baseGraph);
+  builder.mergeReductions();
   builder.finalize();
   return builder.graph;
 }
 
 Graph buildMulticast(InternalContext& ictx, const Graph& baseGraph) {
   GraphBuilder builder(ictx, baseGraph);
+  builder.mergeReductions();
   builder.multicast();
   builder.finalize();
   return builder.graph;
@@ -691,6 +754,7 @@ Graph buildMulticast(InternalContext& ictx, const Graph& baseGraph) {
 
 Graph buildRing(InternalContext& ictx, const Graph& baseGraph, bool writeMode) {
   GraphBuilder builder(ictx, baseGraph);
+  CHECK(!isReduction(baseGraph.reduce));
   builder.ring(writeMode);
   builder.finalize();
   return builder.graph;
@@ -965,11 +1029,17 @@ struct CompileOpConstructor {
 
   Setting tuneKernels(Vector<Graph> graphs, std::string target) {
     auto start = std::chrono::steady_clock::now();
-    // One pipeline of 32K chunks per block reaches an SM's NVLink bandwidth; the grid size is what is tuned
+    // One pipeline of 32K chunks per block reaches an SM's NVLink bandwidth; the grid size is what is tuned.
+    // Reductions: the blocks also combine the data (with more threads), and they read from other GPUs, which takes
+    // more SMs than writing (all-gather with the read graph on 32 GB300: 304, 631 and 659 GB/s per GPU with 8, 16 and
+    // 32 blocks; writes: 650-672).
+    const bool reduction = isReduction(graphs.at(0).reduce);
     Vector<KernelConfig> configs;
-    for (uint32_t gridSize : {4, 8, 12, 16}) {
+    static constexpr std::array<uint32_t, 4> copyGrids = {4, 8, 12, 16};
+    static constexpr std::array<uint32_t, 4> reductionGrids = {8, 16, 24, 32};
+    for (uint32_t gridSize : reduction ? reductionGrids : copyGrids) {
       KernelConfig config;
-      config.blockSize = 128;
+      config.blockSize = reduction ? 256 : 128;
       config.sharedMemory = 1024 * 226;
       config.gridSize = gridSize;
       config.chunkSize = 32768;
@@ -1037,15 +1107,17 @@ struct CompileOpConstructor {
     Vector<CompiledKernel> kernels;
 
     for (const auto& s : settings) {
-      // Tuning launches run without the CPU thread: nodes filled over RDMA count as filled
-      sources.push_back(generateKernel(group, s.config, target, s.graph, ctx, true));
+      // Tuning launches run without the CPU thread: nodes filled over RDMA count as filled. A rank that no kernel edge
+      // touches has no kernel; it takes part in the barriers and the exchange of timings (with none of its own).
+      sources.push_back(
+          s.graph.cudaEdges.empty() ? nullptr : generateKernel(group, s.config, target, s.graph, ctx, true));
     }
 
     log.info("Generated %d kernels in %gs\n", sources.size(), seconds(std::chrono::steady_clock::now() - start));
     start = std::chrono::steady_clock::now();
 
     for (const auto& h : sources) {
-      kernels.push_back(compileKernelPtx(h->ptx, "compile_op_copy"));
+      kernels.push_back(h ? compileKernelPtx(h->ptx, "compile_op_copy") : CompiledKernel());
     }
 
     log.info("Compiled %d kernels in %gs\n", kernels.size(), seconds(std::chrono::steady_clock::now() - start));
@@ -1078,13 +1150,23 @@ struct CompileOpConstructor {
 
       log.info("run %d\n", i);
 
+      if (!sources.at(i)) {
+        ctx.barrier();
+        timings.push_back(std::chrono::nanoseconds::max());
+        continue;
+      }
+
       Vector<TensorPtr> tensors;
       Vector<uintptr_t> tensorAddrs;
 
       for (size_t ti = 0; ti < graph.tensors.size(); ti++) {
         auto& t = graph.tensors[ti];
-        CHECK(t.device == DeviceType::CUDA);
-        auto x = TensorPtr::empty(t.shape, t.dtype, t.device == DeviceType::CUDA ? group->deviceIndex : -1);
+        if (t.device != DeviceType::CUDA) {
+          // (kernel edges have CUDA nodes only)
+          tensorAddrs.push_back(0);
+          continue;
+        }
+        auto x = TensorPtr::empty(t.shape, t.dtype, group->deviceIndex);
         log.debug("  tensor %d: shape=[%s] dtype=%d deviceIndex=%d data_ptr=%p\n", ti,
             fmt::to_string(fmt::join(t.shape, ",")), (int)t.dtype, group->deviceIndex,
             x.defined() ? x.data_ptr() : nullptr);
@@ -1207,6 +1289,19 @@ struct CompileOpConstructor {
     const Group* group = ctx.group;
 
     size_t itemsize = wrapperApi.dtypeSize(dtype);
+
+    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
+    // least 32 bits) and 32- and 64-bit integers. Every rank has the same dtype and reduce op (compile.py checks),
+    // so every rank raises here.
+    if (isReduction(reduce)) {
+      const bool floating =
+          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
+      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
+      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
+          "moodist.compile_op: reduce='%s' does not support this dtype (supported: float32, float64, float16, "
+          "bfloat16%s)",
+          reduceName(reduce), reduce == ReduceOp::Avg ? "" : ", int32, int64");
+    }
 
     // Validate per-tensorId ndim consistency
     // Different tensorIds can have different ndims (e.g., 2D weight vs 1D bias)
@@ -1395,15 +1490,53 @@ struct CompileOpConstructor {
       inputsPerOutput[receivedInputs[i].outputIndex].push_back(i);
     }
 
-    // Result: for each output, a list of (cell, source input index) pairs
-    // Each cell will become a ReadRequest in Phase 3
+    // Result: for each output, its cells and their sources. Each cell becomes a ReadRequest per source in Phase 3,
+    // and an edge in Phase 5, or with several sources (a reduction) an edge per piece (see reductionPieces)
     struct CellSource {
       Coord offset;
       Coord shape;
-      size_t sourceIdx; // Index into receivedInputs
+      Vector<size_t> sources; // Indices into receivedInputs: one, or with a reduction, every covering input
       uint32_t cellIndex;
+      // A reduced cell's pieces: (byte offset in the cell, bytes, executor rank)
+      Vector<std::tuple<size_t, size_t, uint32_t>> pieces;
     };
     Vector<Vector<CellSource>> cellsPerOutput(numMyOutputs);
+
+    // A reduced cell is computed once per element, wherever its outputs are. With several destination ranks (the
+    // ranks whose outputs cover the cell, e.g. every rank in an all-reduce), it is split into pieces of whole 16-byte
+    // units, one per destination rank, and destination rank (p + cellIndex) mod m computes piece p: it reads the piece
+    // from every source, combines them, and stores the result to every destination (a reduce-scatter and an
+    // all-gather in one pass). A cell with one destination rank (e.g. in a reduce-scatter) is computed by that rank.
+    // The destination ranks of a cell all compute the same pieces, from the same regions. Pieces are byte ranges of
+    // the cell in row-major order, which is how both its inputs and its outputs hold it (a cell that is not
+    // contiguous in a tensor goes through a contiguous copy, see Phases 4 and 5).
+    auto reductionPieces = [&](const std::string& tensorId, const Coord& cellOffset, const Coord& cellShape,
+                               uint32_t cellIndex) {
+      Vector<uint32_t> destinationRanks;
+      for (const TensorDescr& out : outputDescrs) {
+        bool contains = out.tensorId == tensorId;
+        for (size_t d : range(cellShape.size())) {
+          contains &= cellOffset[d] >= out.offset[d] && cellOffset[d] + cellShape[d] <= out.offset[d] + out.shape[d];
+        }
+        if (contains && std::ranges::find(destinationRanks, out.rank) == destinationRanks.end()) {
+          destinationRanks.push_back(out.rank);
+        }
+      }
+      std::ranges::sort(destinationRanks);
+      CHECK(!destinationRanks.empty());
+      const size_t bytes = itemsize * numel(cellShape);
+      const size_t units = bytes / 16;
+      const size_t m = destinationRanks.size();
+      // (a size that is not a multiple of 16 bytes is an error for kernel edges, raised below)
+      const size_t numPieces = bytes % 16 == 0 ? std::clamp<size_t>(units, 1, m) : 1;
+      Vector<std::tuple<size_t, size_t, uint32_t>> pieces;
+      for (size_t p : range(numPieces)) {
+        size_t begin = numPieces == 1 ? 0 : units * p / numPieces * 16;
+        size_t end = numPieces == 1 ? bytes : units * (p + 1) / numPieces * 16;
+        pieces.emplace_back(begin, end - begin, destinationRanks[(p + cellIndex) % m]);
+      }
+      return pieces;
+    };
 
     struct TensorCells {
       Vector<Vector<int64_t>> boundaries;
@@ -1536,14 +1669,27 @@ struct CompileOpConstructor {
               overlapDetails += fmt::sprintf("\n  output[%zu]: overlap at [%s] shape [%s] between rank %u and rank %u",
                   outIdx, fmtCoord(cellOffset).c_str(), fmtCoord(cellShape).c_str(), a.inputRank, b.inputRank);
             }
-          } else {
+          } else if (reduce == ReduceOp::Any) {
             // reduce == Any: pick one randomly
             size_t pickIdx = random<size_t>(0, coveringInputs.size() - 1);
             CellSource cs;
             cs.offset = std::move(cellOffset);
             cs.shape = std::move(cellShape);
-            cs.sourceIdx = coveringInputs[pickIdx];
+            cs.sources.push_back(coveringInputs[pickIdx]);
             cs.cellIndex = tc.cellsOffset + cellIdx;
+            cellsPerOutput[outIdx].push_back(std::move(cs));
+          } else {
+            // A reduction: all of them, in rank order
+            CHECK(isReduction(reduce));
+            std::ranges::sort(coveringInputs, {}, [&](size_t i) {
+              return std::make_pair(receivedInputs[i].inputRank, receivedInputs[i].inputIndex);
+            });
+            CellSource cs;
+            cs.cellIndex = tc.cellsOffset + cellIdx;
+            cs.pieces = reductionPieces(out.tensorId, cellOffset, cellShape, cs.cellIndex);
+            cs.offset = std::move(cellOffset);
+            cs.shape = std::move(cellShape);
+            cs.sources = std::move(coveringInputs);
             cellsPerOutput[outIdx].push_back(std::move(cs));
           }
         } else {
@@ -1551,7 +1697,7 @@ struct CompileOpConstructor {
           CellSource cs;
           cs.offset = std::move(cellOffset);
           cs.shape = std::move(cellShape);
-          cs.sourceIdx = coveringInputs[0];
+          cs.sources.push_back(coveringInputs[0]);
           cs.cellIndex = tc.cellsOffset + cellIdx;
           cellsPerOutput[outIdx].push_back(std::move(cs));
         }
@@ -1592,17 +1738,19 @@ struct CompileOpConstructor {
 
     for (size_t outIdx : range(numMyOutputs)) {
       for (const auto& cell : cellsPerOutput[outIdx]) {
-        const LogicalInput& src = receivedInputs[cell.sourceIdx];
+        for (size_t sourceIdx : cell.sources) {
+          const LogicalInput& src = receivedInputs[sourceIdx];
 
-        ReadRequest req;
-        req.offset = cell.offset;
-        req.shape = cell.shape;
-        req.cellIndex = cell.cellIndex;
-        req.requesterRank = static_cast<uint32_t>(rank);
-        req.inputIndex = src.inputIndex;
-        req.outputIndex = static_cast<uint32_t>(outIdx);
+          ReadRequest req;
+          req.offset = cell.offset;
+          req.shape = cell.shape;
+          req.cellIndex = cell.cellIndex;
+          req.requesterRank = static_cast<uint32_t>(rank);
+          req.inputIndex = src.inputIndex;
+          req.outputIndex = static_cast<uint32_t>(outIdx);
 
-        requestsToSend[src.inputRank].push_back(std::move(req));
+          requestsToSend[src.inputRank].push_back(std::move(req));
+        }
       }
     }
 
@@ -1788,10 +1936,27 @@ struct CompileOpConstructor {
 
     Vector<Edge>& edges = baseGraph.edges;
 
+    // Reduced cells (several sources): their responses, one per source, by output and cell
+    auto cellKey = [](uint32_t outputIndex, uint32_t cellIndex) {
+      return ((uint64_t)outputIndex << 32) | cellIndex;
+    };
+    HashMap<uint64_t, Vector<const ReadResponse*>> reducedResponses;
+    for (size_t outIdx : range(numMyOutputs)) {
+      for (const auto& cell : cellsPerOutput[outIdx]) {
+        if (cell.sources.size() > 1) {
+          reducedResponses[cellKey(outIdx, cell.cellIndex)];
+        }
+      }
+    }
+
     // Process responses and build reads
     for (const auto& resp : receivedResponses) {
       // Find my output
       CHECK(resp.outputIndex < outputsPerRank[rank].size());
+      if (auto it = reducedResponses.find(cellKey(resp.outputIndex, resp.cellIndex)); it != reducedResponses.end()) {
+        it->second.push_back(&resp);
+        continue;
+      }
       size_t globalOutputIdx = outputsPerRank[rank][resp.outputIndex];
       const TensorDescr& out = outputDescrs[globalOutputIdx];
 
@@ -1844,6 +2009,68 @@ struct CompileOpConstructor {
       edge.destinations.push_back(destination);
 
       edges.push_back(std::move(edge));
+    }
+
+    // Reduced cells: an edge per piece (see reductionPieces), with every source, executed by the piece's executor.
+    // The sources are in (rank, tensor, offset) order, the same on every destination rank of the cell (see
+    // mergeReductions).
+    for (size_t outIdx : range(numMyOutputs)) {
+      for (const auto& cell : cellsPerOutput[outIdx]) {
+        if (cell.sources.size() <= 1) {
+          continue;
+        }
+        const Vector<const ReadResponse*>& responses = reducedResponses.at(cellKey(outIdx, cell.cellIndex));
+        CHECK(responses.size() == cell.sources.size());
+        const TensorDescr& out = outputDescrs[outputsPerRank[rank][outIdx]];
+        Coord relOutOffset = cell.offset - out.offset;
+        Node destination;
+        destination.id = 0;
+        destination.rank = rank;
+        destination.tensorIndex = myInputIndices.size() + inputCopies.size() + outIdx;
+        destination.offset = itemsize * linearOffset(relOutOffset, out.shape);
+        destination.filled = false;
+        destination.device = out.device;
+        if (!contiguous(cell.shape, out.shape)) {
+          destination.tensorIndex =
+              myInputIndices.size() + inputCopies.size() + outputsPerRank[rank].size() + outputCopyList.size();
+          destination.offset = 0;
+          OutputCopy oc;
+          oc.outputIndex = outIdx;
+          oc.offset = relOutOffset;
+          oc.shape = cell.shape;
+          outputCopyList.push_back(std::move(oc));
+        }
+        Vector<Node> sources;
+        for (const ReadResponse* resp : responses) {
+          Node source;
+          source.id = 0;
+          source.rank = resp->senderRank;
+          source.tensorIndex = resp->tensorIndex;
+          source.offset = itemsize * resp->inputOffset;
+          source.filled = true;
+          source.device = resp->inputDevice;
+          sources.push_back(source);
+        }
+        std::ranges::sort(sources, {}, [](const Node& n) {
+          return std::make_tuple(n.rank, n.tensorIndex, n.offset);
+        });
+        for (size_t p : indices(cell.pieces)) {
+          auto [pieceOffset, pieceBytes, executor] = cell.pieces[p];
+          Edge edge;
+          for (Node source : sources) {
+            source.offset += pieceOffset;
+            edge.sources.push_back(source);
+          }
+          edge.destinations.push_back(destination);
+          edge.destinations.back().offset += pieceOffset;
+          edge.bytes = pieceBytes;
+          edge.cellIndex = cell.cellIndex;
+          edge.chunkIndex = p;
+          edge.executorRank = executor;
+          edge.id = ictx.nextEdgeId();
+          edges.push_back(std::move(edge));
+        }
+      }
     }
 
     // Add outputCopies
@@ -1923,6 +2150,7 @@ struct CompileOpConstructor {
       ctx.barrier();
     }
 
+    baseGraph.reduce = reduce;
     baseGraph.numInputs = op->inputs.size();
     baseGraph.numInputCopies = op->inputCopies.size();
     baseGraph.numOutputs = op->outputs.size();
@@ -1973,6 +2201,7 @@ struct CompileOpConstructor {
     // Generate ibReads for edges that cannot be handled by the CUDA kernel
     // (remote ranks not reachable via NVLink, or CPU tensors).
     // Remove those edges from baseGraph so only kernel-eligible edges remain.
+    bool kernelPath = false;
     {
       Vector<size_t> cudaRanks = computeCudaRanks(group, !ctx.collectiveOp);
       size_t numInputsAndCopies = op->inputs.size() + op->inputCopies.size();
@@ -2001,28 +2230,48 @@ struct CompileOpConstructor {
       };
 
       // Kernel tuning and launch below are collective (sends/barriers across all ranks), so every rank must
-      // agree on whether the kernel path is used at all. Keep kernel-eligible edges only if EVERY rank has at
-      // least one (AND across ranks, despite the name); otherwise all edges become ibReads. E.g. a multi-node
-      // broadcast whose source is on one node leaves the other nodes without any local edges.
+      // agree on whether the kernel path is used at all: it is if any rank has an edge the kernel can take. A
+      // rank without one (e.g. one that only sends, or only receives over RDMA) still takes part in the tuning, and
+      // runs a kernel if the kernel edges of other ranks read or write its tensors (tuneKernels). Every edge the
+      // kernel cannot take becomes an ibRead. Reductions run in the kernel only (for now): every edge with several
+      // sources must be a kernel edge.
       // The same exchange tells every rank the NVLink domain of each rank (its first rank), for the read order.
-      bool anyCuda = std::ranges::any_of(baseGraph.edges, kernelEdge);
+      bool anyKernelEdge = std::ranges::any_of(baseGraph.edges, kernelEdge);
+      std::string reductionError;
+      for (const Edge& e : baseGraph.edges) {
+        if (e.sources.size() > 1 && !kernelEdge(e)) {
+          reductionError = fmt::sprintf("an output of rank %zu reduces inputs of which some are CPU tensors or on "
+                                        "ranks outside its NVLink domain",
+              rank);
+          break;
+        }
+      }
       Vector<uint32_t> domainIds(size);
       for (size_t i : range(size)) {
-        ctx.send(i, anyCuda, (uint32_t)cudaRanks.at(0));
+        ctx.send(i, anyKernelEdge, (uint32_t)cudaRanks.at(0), reductionError);
       }
+      std::string firstReductionError;
       for (size_t i : range(size)) {
         bool v;
-        ctx.receive(i, v, domainIds[i]);
-        anyCuda &= v;
+        std::string error;
+        ctx.receive(i, v, domainIds[i], error);
+        kernelPath |= v;
+        if (firstReductionError.empty()) {
+          firstReductionError = std::move(error);
+        }
       }
-      if (!anyCuda) {
+      REQUIRE(firstReductionError.empty(),
+          "moodist.compile_op: reduce='%s' needs CUDA tensors on ranks of one NVLink domain (a node, or e.g. an NVL72 "
+          "rack) for now: %s",
+          reduceName(reduce), firstReductionError);
+      if (!kernelPath) {
         // Without the kernel, the copies from a proxy's node would be RDMA reads racing with the proxy's own read
         baseGraph.edges = std::move(unproxiedEdges);
       }
 
       for (auto it = baseGraph.edges.begin(); it != baseGraph.edges.end();) {
         auto& edge = *it;
-        if (anyCuda && kernelEdge(edge)) {
+        if (kernelPath && kernelEdge(edge)) {
           ++it;
           continue;
         }
@@ -2192,7 +2441,13 @@ struct CompileOpConstructor {
     //   read        every destination rank reads its chunks itself
     //   ring_read   the destinations of a chunk form a chain, each reading it from the previous one
     //   ring_write  the same chain, each rank writing the chunk to the next one
-    for (const std::string& name : agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast")) {
+    // Reductions use the multicast graph only, where every reduced element is computed once (see mergeReductions).
+    Vector<std::string> graphNames = agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast");
+    if (isReduction(reduce)) {
+      graphNames.clear();
+      graphNames.push_back("multicast");
+    }
+    for (const std::string& name : graphNames) {
       if (name == "multicast") {
         graphs.push_back(buildMulticast(ictx, baseGraph));
       } else if (name == "read") {
@@ -2212,7 +2467,7 @@ struct CompileOpConstructor {
     // Final barrier
     ctx.barrier();
 
-    if (!baseGraph.edges.empty()) {
+    if (kernelPath) {
       CUdevice cuDevice = group->cuDevice;
       int computeMajor = 0, computeMinor = 0;
       CHECK_CU(cuDeviceGetAttribute(&computeMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDevice));
@@ -2236,20 +2491,23 @@ struct CompileOpConstructor {
         ctx.barrier();
       }
 
-      std::shared_ptr<KernelHandle> kernelHandle =
-          generateKernel(group, setting.config, target, setting.graph, ctx, false);
-      const std::string& ptx = kernelHandle->ptx;
-      if (std::getenv("MOODIST_DUMP_KERNELS")) {
-        std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
-        FILE* f = fopen(fn.c_str(), "wb");
-        if (f) {
-          fwrite(ptx.data(), ptx.size(), 1, f);
-          fclose(f);
-          log.info("compile_op PTX dumped to %s\n", fn);
+      // A rank that no kernel edge touches runs no kernel
+      if (!setting.graph.cudaEdges.empty()) {
+        std::shared_ptr<KernelHandle> kernelHandle =
+            generateKernel(group, setting.config, target, setting.graph, ctx, false);
+        const std::string& ptx = kernelHandle->ptx;
+        if (std::getenv("MOODIST_DUMP_KERNELS")) {
+          std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
+          FILE* f = fopen(fn.c_str(), "wb");
+          if (f) {
+            fwrite(ptx.data(), ptx.size(), 1, f);
+            fclose(f);
+            log.info("compile_op PTX dumped to %s\n", fn);
+          }
         }
+        op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+        op->kernelHandle = std::move(kernelHandle);
       }
-      op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-      op->kernelHandle = std::move(kernelHandle);
     } else {
       op->graph = graphs[0];
     }

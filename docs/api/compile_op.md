@@ -35,14 +35,14 @@ class TensorRegion:
 - Support for both contiguous and non-contiguous memory patterns
 - Works with both CPU and CUDA tensors
 - Multi-tensor batching via `tensor_id` (batch tensors with different dimensionalities)
-- Overlap handling with `reduce="any"` (additional reduction ops planned)
+- Reductions of overlapping inputs with `reduce="sum"`, `"avg"`, `"min"`, `"max"` (reduce-scatter, all-reduce), or `reduce="any"` for replicated data
 
 **When to use `compile_op` vs standard collectives:**
 - Use standard collectives (`all_gather`, `reduce_scatter`, etc.) when your pattern matches exactly
 - Use `compile_op` when you need:
   - Custom slice distributions that don't match standard patterns
   - Multiple different slices per rank
-  - Overlapping inputs with `reduce="any"` (picks one source)
+  - Overlapping inputs, reduced (`reduce="sum"` etc.) or replicated (`reduce="any"` picks one source)
   - Batching multiple tensors with different dimensionalities (`tensor_id`)
   - Complex multi-rank communication patterns
 
@@ -143,15 +143,13 @@ Optional list of output tensor specifications that this rank will receive. Forma
 
 Specifies how to handle overlapping input regions. When multiple inputs (from the same or different ranks) cover the same output cell, this parameter determines the behavior.
 
-**Currently supported:**
 - `None` (default) - Error if any output cell is covered by multiple inputs
 - `"any"` - Arbitrarily pick one input source for overlapping cells (no actual reduction)
+- `"sum"`, `"avg"`, `"min"`, `"max"` - Every output element is the sum (average, minimum, maximum) of all the input regions, of any rank, that cover it. An element that one input covers is copied as it is. `"avg"` divides by the number of inputs that cover the element (the number of ranks, for the usual collectives).
 
-**Planned (not yet implemented):**
-- `"sum"` - Add overlapping values
-- `"mean"` - Average overlapping values
-- `"max"` - Take maximum of overlapping values
-- `"min"` - Take minimum of overlapping values
+All ranks must pass the same `reduce`.
+
+Reductions (for now) need CUDA tensors on ranks of one NVLink domain (a node, or e.g. an NVL72 rack): `compile_op` raises otherwise, on all ranks. The types are `float32`, `float64`, `float16`, `bfloat16`, `int32` and `int64` (`"avg"`: the floating point types). `float16` and `bfloat16` are combined in `float32` and rounded once per output element. Each output element is computed once, by one rank (which then stores it to every rank that has it in its outputs), always in the same order: the results are the same on every run, and the same on every rank (e.g. after an all-reduce). Another implementation (NCCL, or a different version of moodist) can round differently. Floating point `"min"` and `"max"` propagate NaN. An op's outputs may be its inputs (an in-place all-reduce).
 
 **Behavior with overlapping inputs:**
 
@@ -169,7 +167,7 @@ inputs = [TensorRegion(offset=[0, 0], shape=[2, 4])]  # Contains values [10, 20,
 
 # With reduce=None (default): raises an error due to overlap
 # With reduce="any": output contains values from either rank (arbitrary choice)
-# With reduce="sum" (planned): output would be [11, 22, 33, ...]
+# With reduce="sum": output contains [11, 22, 33, ...]
 ```
 
 The `reduce="any"` option is useful for replicated data patterns (e.g., `Replicate` placement in DTensor) where all sources have identical data and any one can be used.
@@ -394,11 +392,9 @@ Rank 3: [data_3]   →   Rank 3: [data_0][data_1][data_2][data_3]
 All ranks exchange their slices with all other ranks.
 ```
 
-### Example 5: Reduce-Scatter Pattern (Planned)
+### Example 5: Reduce-Scatter Pattern
 
 Each rank sends the full tensor and receives a different slice. With reduction, overlapping inputs are combined.
-
-> **Note:** This example requires `reduce="sum"` which is not yet implemented. Once available, the pattern will work as shown.
 
 ```python
 import torch
@@ -420,7 +416,7 @@ op = moodist.compile_op(
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs,
-    reduce='sum'  # Combine overlapping inputs (planned, not yet implemented)
+    reduce='sum'  # Combine overlapping inputs
 )
 ```
 
@@ -472,11 +468,9 @@ Ring topology - each rank sends to next, receives from previous:
 (Rank 0→1, Rank 1→2, Rank 2→3, Rank 3→0)
 ```
 
-### Example 7: All-Reduce Pattern (Planned)
+### Example 7: All-Reduce Pattern
 
 All ranks contribute overlapping data that gets combined and distributed to all ranks.
-
-> **Note:** This example requires `reduce="sum"` which is not yet implemented. Once available, the pattern will work as shown.
 
 ```python
 import torch
@@ -497,7 +491,7 @@ op = moodist.compile_op(
     dtype=torch.float32,
     inputs=inputs,
     outputs=outputs,
-    reduce='sum'  # Sum all inputs across ranks (planned, not yet implemented)
+    reduce='sum'  # Sum all inputs across ranks
 )
 ```
 

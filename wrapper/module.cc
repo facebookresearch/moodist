@@ -818,28 +818,37 @@ static PyObject* processgroup_compile_op_full(PyObject* self, PyObject* args, Py
     return nullptr;
   }
 
-  // Parse reduce parameter: None -> None, "any" -> Any, "none" -> None
+  // Parse reduce parameter: None or "none" -> None, "any" -> Any, "sum", "avg", "min", "max"
   moodist::api::ReduceOp reduce = moodist::api::ReduceOp::None;
   if (reduce_obj != Py_None) {
-    if (PyLong_Check(reduce_obj)) {
-      int reduce_int = PyLong_AsLong(reduce_obj);
-      reduce = static_cast<moodist::api::ReduceOp>(reduce_int);
-    } else if (PyUnicode_Check(reduce_obj)) {
+    if (PyUnicode_Check(reduce_obj)) {
       PyRef reduce_bytes(PyUnicode_AsEncodedString(reduce_obj, "utf-8", "strict"));
       if (!reduce_bytes) {
         return nullptr;
       }
       const char* reduce_str = PyBytes_AsString(reduce_bytes.get());
-      if (strcmp(reduce_str, "any") == 0) {
-        reduce = moodist::api::ReduceOp::Any;
-      } else if (strcmp(reduce_str, "none") == 0) {
-        reduce = moodist::api::ReduceOp::None;
-      } else {
-        PyErr_Format(PyExc_ValueError, "reduce must be 'any', 'none', or None, got '%s'", reduce_str);
+      static constexpr std::pair<const char*, moodist::api::ReduceOp> names[] = {
+          {"none", moodist::api::ReduceOp::None},
+          {"any", moodist::api::ReduceOp::Any},
+          {"sum", moodist::api::ReduceOp::Sum},
+          {"avg", moodist::api::ReduceOp::Avg},
+          {"min", moodist::api::ReduceOp::Min},
+          {"max", moodist::api::ReduceOp::Max},
+      };
+      bool found = false;
+      for (auto& [name, op] : names) {
+        if (strcmp(reduce_str, name) == 0) {
+          reduce = op;
+          found = true;
+        }
+      }
+      if (!found) {
+        PyErr_Format(
+            PyExc_ValueError, "reduce must be None, 'any', 'sum', 'avg', 'min' or 'max', got '%s'", reduce_str);
         return nullptr;
       }
     } else {
-      PyErr_SetString(PyExc_TypeError, "reduce must be a string ('any', 'none') or None");
+      PyErr_SetString(PyExc_TypeError, "reduce must be None or a string ('any', 'sum', 'avg', 'min' or 'max')");
       return nullptr;
     }
   }
