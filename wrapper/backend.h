@@ -122,6 +122,16 @@ public:
   virtual void shutdown() {
     pg.shutdown();
   }
+
+  // Tensors from the group's communication pool (FSDP2 allocates its communication buffers with these after
+  // set_allocate_memory_from_process_group_for_comm(True)). Without `override`: older torch versions do not have
+  // these virtuals.
+  virtual bool supportsTensorAlloc(c10::DeviceIndex deviceIdx) {
+    return true;
+  }
+  virtual at::Tensor allocateTensor(long size, at::TensorOptions options = {}) {
+    return pg.allocateCommTensor(size, options);
+  }
 };
 
 } // namespace wrapper

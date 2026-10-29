@@ -267,6 +267,15 @@ struct CoreApi {
       api::ProcessGroup* pg, uintptr_t dstAddress, size_t dstBytes, bool dstIsCuda, const api::RdmaEndpoint* src);
   void (*rdmaWorkDestroy)(api::RdmaWork* work);
   void (*rdmaWorkWait)(api::RdmaWork* work);
+
+  // The process group's communication pool (memory at the same offset of the group's multicast object on every rank
+  // that allocates and frees in the same order; see allocatorCommPoolCreate). The cleanup context is freed with
+  // cudaAllocatorImplFree. commPoolOffset: the logical offset of [address, address + bytes) in the communication pool
+  // it is in, or -1 if it is in none (or, once the pool's group has set up its multicast objects, its memory is not
+  // bound to them).
+  void (*processGroupCommPoolAllocate)(api::ProcessGroup* pg, size_t bytes, CUstream stream, uintptr_t* outPtr,
+      void** outCleanupCtx, int* outDeviceIndex);
+  int64_t (*commPoolOffset)(uintptr_t address, size_t bytes);
 };
 
 } // namespace moodist

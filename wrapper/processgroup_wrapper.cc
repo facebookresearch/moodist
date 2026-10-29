@@ -316,6 +316,30 @@ void ProcessGroup::setOption(const std::string& name, int64_t value) {
   coreApi.processGroupSetOption(handle.get(), name.c_str(), value);
 }
 
+at::Tensor ProcessGroup::allocateCommTensor(int64_t numel, at::TensorOptions options) {
+  TORCH_CHECK(numel >= 0, "moodist: allocateCommTensor: negative size ", numel);
+  TORCH_CHECK(!options.has_device() || options.device().is_cuda(),
+      "moodist: the communication pool only holds CUDA tensors, not ", options.device());
+  const size_t bytes = (size_t)numel * options.dtype().itemsize();
+  CUstream stream = c10::cuda::getCurrentCUDAStream();
+  uintptr_t ptr = 0;
+  void* cleanupCtx = nullptr;
+  int device = -1;
+  coreApi.processGroupCommPoolAllocate(handle.get(), bytes, stream, &ptr, &cleanupCtx, &device);
+  // The same deleter as moodist's CUDA allocator (see allocator_wrapper.cc)
+  auto deleter = [](void* ctx) {
+    coreApi.cudaAllocatorImplFree(ctx, c10::cuda::getCurrentCUDAStream());
+  };
+  c10::Device cudaDevice(c10::kCUDA, (c10::DeviceIndex)device);
+  c10::Storage storage(c10::Storage::use_byte_size_t(), bytes,
+      c10::DataPtr((void*)ptr, cleanupCtx, deleter, cudaDevice),
+      /*allocator=*/nullptr, /*resizable=*/false);
+  at::Tensor t = at::detail::make_tensor<c10::TensorImpl>(
+      std::move(storage), c10::DispatchKeySet(c10::DispatchKey::CUDA), options.dtype());
+  t.unsafeGetTensorImpl()->set_sizes_contiguous({numel});
+  return t;
+}
+
 // ============================================================================
 // Stubs - need additional CoreApi functions
 // ============================================================================

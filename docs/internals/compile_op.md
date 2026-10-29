@@ -162,15 +162,19 @@ on new tensors at every call.
   peers may still read or write its tensors.
 - **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
   collective): an edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can
-  store each chunk once to the group's multicast mapping, which the switches copy to every GPU. The group's
-  multicast object (`Group::setupNvls`, collective, at the first op that uses it) covers moodist's whole allocator
-  pool: every allocator chunk is bound at its offset in the pool when it is mapped (`allocatorAddChunkListener`), so
-  offset o of every rank's pool is at the mapping's base + o; a counter area follows. A rank uses NVLS if every edge
-  it executes is such an edge (no waits) and every rank that does stores the same number of chunks (agreed in
-  `generateKernel`). Each launch checks the destinations: a peer marks the address it publishes with bit 62
-  (`nvlsPoolBit`) if the tensor is in its pool, and the low 40 bits are then the tensor's pool offset (peers map a
-  rank's pool at a 1 TiB aligned base); if every destination is at the local destination's offset, block 0 stores
-  the chunks with one multicast store each (chunks of 64 KiB, through a ring of its own over the stage memory: per
+  store each chunk once to the group's multicast mapping, which the switches copy to every GPU. The group has two
+  multicast objects (`Group::setupNvls`, collective, at the first op that can use them). One covers moodist's whole
+  allocator pool: every allocator chunk is bound at its offset in the pool when it is mapped
+  (`allocatorAddChunkListener`), so offset o of every rank's pool is at the mapping's base + o; a counter area
+  follows. The other covers the group's communication pool (`allocatorCommPoolCreate`; `moodist.comm_empty`): every
+  slab of the pool is bound at its logical offset when the pool adds it, so a buffer that every rank allocates in the
+  same order is at the same place of that object on every rank. A rank uses NVLS if every edge it executes is such
+  an edge (no waits) and every rank that does stores the same number of chunks (agreed in `generateKernel`). Each
+  launch checks the destinations: with the addresses, the ranks publish their tensors' NVLS identities (the object
+  and the offset in it: `nvlsIdentity` in processgroup.cc) into a table of each peer's with the layout of the
+  address table. If every destination has the local destination's identity, block 0 stores the chunks with one
+  multicast store each (to the multicast address of the local destination's tensor, which `customOp` passes with the
+  identities in a fourth kernel parameter; chunks of 64 KiB, through a ring of its own over the stage memory: per
   chunk, the window and the counter cost time) and the other blocks only take part in the address exchange and the
   exit sync; otherwise the launch stores to each destination as usual. Multicast stores at full speed from all ranks
   overload the switches' links to the GPUs, which then deliver about 2/3 of their bandwidth, so the ranks advance in
@@ -213,8 +217,21 @@ on new tensors at every call.
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
   all-gather does for its chunks).
 
-- NVLS ops (see the kernel): `customOp` sets bit 62 of the addresses it publishes for tensors in moodist's pool
-  (when the peer's mapping of the pool is 1 TiB aligned), and passes the op's step counter value.
+- NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
+  communication pool, at logical offset o: (2 << 61) | o; else in moodist's pool, at offset o: (1 << 61) | o) and the
+  op's step counter value. Block 0 of a launch that used NVLS counts it in the group's counter area (the process
+  group option `nvls_launches`).
+- Communication pools (`allocatorCommPoolCreate`; per group, `Group::getCommPool`; `moodist.comm_empty` and the
+  process group's `allocate_tensor`): allocations get logical offsets that depend only on the sequence of
+  allocations and frees of the pool, so that ranks that allocate the same buffers in the same order get the same
+  offsets. The pool places them with the allocator's region machinery (best fit, lowest offset first) in logical
+  coordinates; memory freed while streams other than the allocation's still used it (record_stream) carries an
+  event per stream, and an allocation of it on another stream waits for those events on the GPU, not on the host
+  (which would make the placement depend on timing). The memory comes from the allocator's pool in slabs of at least
+  256 MiB (one 2 MiB aligned allocation each, at any address, never freed), each at its own logical range with a 2
+  MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new slab into the
+  group's multicast object when it adds it (before handing out memory in it), and the kernel's address exchange
+  orders that before any peer's multicast stores to it.
 
 ## Environment variables
 
@@ -435,12 +452,18 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 
 ### Performance
 - NVLS (see the kernel and the all-gather table under Performance notes). Open: the rank threshold (16; one node of
-  4 GPUs lost from 4M on, 8 and 12 are not measured; 16 ranks lose 1-2% from 64 MiB on), groups that span several
-  NVLink domains (one multicast object per domain, for the edges within a domain, including the proxies' stores of
-  what they read: 64 GPUs in two domains take 29.4 ms at 256 MiB, where the GPUs' NVLink ingress allows about 25),
-  destination sets smaller than the group (an object per set), ranks that store different numbers of chunks (the
-  window assumes the same), outputs that are not at the same offset on every rank (a pool for communication
-  buffers), and multicast reductions (`multimem.ld_reduce`, `multimem.red`) for reduce-scatter and all-reduce.
+  4 GPUs lost from 4M on, 8 and 12 are not measured; 16 ranks lose 1-2% from 64 MiB on) could become a tuning
+  candidate instead (one block, against the unicast grids with their block penalty), which needs tuning buffers from
+  the communication pool. The switch delivers each multicast chunk to its sender too: a multicast store reaches
+  exactly the members of the object that have memory bound at its offset (a member without, sender or receiver, is
+  skipped, without an error; GB300, October 2026), so one object per sender, bound by every rank but the sender,
+  would skip it, the local copy then done by the idle blocks. Further: groups that span several NVLink domains (one
+  multicast object per domain, for the edges within a domain, including the proxies' stores of what they read: 64
+  GPUs in two domains take 29.4 ms at 256 MiB, where the GPUs' NVLink ingress allows about 25), destination sets
+  smaller than the group (which ranks bind a range decides who receives it), ranks that store different numbers of
+  chunks (the window assumes the same), and multicast reductions (`multimem.ld_reduce`, which needs every member
+  bound: with one unbound, the reader's context fails with CUDA_ERROR_CONTAINED; `multimem.red`) for reduce-scatter
+  and all-reduce.
 - Unicast stores to outputs at the same offset on every rank are 2-4% slower at large sizes than to outputs at
   different offsets (all-gather on 32 GPUs, see the NVLS table), maybe because all copies of a chunk then have the
   same address bits; not investigated.

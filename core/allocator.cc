@@ -313,6 +313,25 @@ struct PointerHash {
 
 } // namespace
 
+// See allocatorCommPoolCreate. Guarded by the allocator's mutex.
+struct CommPool {
+  // Slabs are 2 MiB aligned (multicast binding granularity), at least minSlabBytes, with slabGap unused logical bytes
+  // before each (so that free memory of two slabs never merges into one region)
+  static constexpr size_t slabAlignment = (size_t)2 << 20;
+  static constexpr size_t minSlabBytes = (size_t)256 << 20;
+  static constexpr size_t slabGap = slabAlignment;
+  struct Slab {
+    uintptr_t local; // the slab's memory in this process
+    size_t logical;  // its logical offset
+    size_t bytes;
+    bool bound = true; // every listener bound every piece
+  };
+  Regions free; // in logical coordinates
+  Vector<Slab> slabs;
+  size_t nextLogical = slabGap;
+  Vector<std::pair<bool (*)(void*, size_t, unsigned long long, size_t, size_t), void*>> listeners;
+};
+
 // CudaAllocatorImpl is defined in moodist namespace so it can be forward-declared
 struct CudaAllocatorImpl {
   CudaAllocatorImpl() {}
@@ -1013,6 +1032,91 @@ struct CudaAllocatorImpl {
     return retval;
   }
 
+  // The parts of [address, address + bytes) in the cuMemCreate chunks: fn(handle, offset in the chunk, size, offset in
+  // the range)
+  template<typename F>
+  void forEachChunkPiece(uintptr_t address, size_t bytes, F&& fn) {
+    uintptr_t chunkBase = reservedBase;
+    const uintptr_t end = address + bytes;
+    for (auto& [size, handle] : cuMemHandles) {
+      uintptr_t chunkEnd = chunkBase + size;
+      uintptr_t begin = std::max(address, chunkBase);
+      uintptr_t stop = std::min(end, chunkEnd);
+      if (begin < stop) {
+        fn(handle, begin - chunkBase, stop - begin, begin - address);
+      }
+      chunkBase = chunkEnd;
+    }
+  }
+
+  // A new slab for pool that fits at least bytes, its memory free for use after the work enqueued on stream so far
+  void commPoolGrow(CommPool& pool, size_t bytes, CUstream stream) {
+    constexpr size_t align = CommPool::slabAlignment;
+    const size_t slabBytes = std::max((bytes + align - 1) / align * align, CommPool::minSlabBytes);
+    if (pool.nextLogical + slabBytes > commPoolLogicalSize) {
+      throw std::runtime_error(
+          fmt::sprintf("Moodist communication pool: no logical address space left for %d more bytes (%d in use)", bytes,
+              pool.nextLogical));
+    }
+    // From the pool, at a boundary of the binding granularity (the chunks start at one); never freed. Allocating on
+    // stream makes stream wait for the memory's earlier users, and the event below passes that on to the pool's
+    // allocations on other streams.
+    uintptr_t raw = allocate(slabBytes + align, stream, deviceIndex);
+    CommPool::Slab slab;
+    slab.local = (raw + align - 1) / align * align;
+    slab.logical = pool.nextLogical;
+    slab.bytes = slabBytes;
+    pool.nextLogical += slabBytes + CommPool::slabGap;
+    for (auto& [fn, ctx] : pool.listeners) {
+      forEachChunkPiece(slab.local, slab.bytes,
+          [&](CUmemGenericAllocationHandle handle, size_t memOffset, size_t size, size_t offset) {
+            slab.bound &= fn(ctx, slab.logical + offset, handle, memOffset, size);
+          });
+    }
+    pool.slabs.push_back(slab);
+    log.verbose("Moodist communication pool: slab of %d bytes at %#x, logical offset %#x\n", slab.bytes, slab.local,
+        slab.logical);
+
+    Span span{slab.logical, slab.logical + slab.bytes};
+    auto h = freeListEventRegions.pop();
+    if (!h->event) {
+      h->event = Event::create();
+    }
+    h->span = span;
+    h->eventStream = stream;
+    CHECK_CU(cuEventRecord(h->event, stream));
+    insertRegion(pool.free, span, std::array<EventRegion*, 1>{&*h});
+    h.release();
+  }
+
+  // Frees [logical, logical + bytes) of pool: like deallocate, the memory carries an event on each stream that used
+  // it, which an allocation of it on another stream waits for (see allocateFrom)
+  template<typename StreamList>
+  void commPoolDeallocate(CommPool& pool, uintptr_t logical, size_t bytes, const StreamList& streamList) {
+    tmpDeallocateStreamMap.clear();
+    for (auto& v : streamList) {
+      tmpDeallocateStreamMap.emplace(v);
+    }
+    CHECK(tmpDeallocateStreamMap.size() > 0);
+    Span span{logical, logical + bytes};
+    tmpDeallocateEventRegions.clear();
+    for (auto& v : tmpDeallocateStreamMap) {
+      CUstream stream = v.first;
+      auto h = freeListEventRegions.pop();
+      if (!h->event) {
+        h->event = Event::create();
+      }
+      h->eventStream = stream;
+      CHECK_CU(cuEventRecord(h->event, stream));
+      h->span = span;
+      tmpDeallocateEventRegions.push_back(std::move(h));
+    }
+    insertRegion(pool.free, span, tmpDeallocateEventRegions);
+    for (auto& v : tmpDeallocateEventRegions) {
+      v.release();
+    }
+  }
+
   std::string bytes(size_t n) {
     return fmt::sprintf("%d bytes (%gG)", n, n / 1024.0 / 1024.0 / 1024.0);
   }
@@ -1080,10 +1184,11 @@ struct CudaAllocatorImpl {
 // Cleanup context structure - stored per allocation
 struct CudaAllocCleanupCtx {
   CudaAllocatorImpl* impl;
-  uintptr_t ptr; // As allocated (with bytes, what is deallocated)
+  uintptr_t ptr; // As allocated (with bytes, what is deallocated; in a communication pool, the logical offset)
   size_t bytes;
-  CUstream allocStream; // Stream used for allocation
-  uintptr_t userPtr; // As returned (see cudaAllocatorImplAllocate): the key of streamUses and freeCallbacks
+  CUstream allocStream;         // Stream used for allocation
+  uintptr_t userPtr;            // As returned (see cudaAllocatorImplAllocate): the key of streamUses and freeCallbacks
+  CommPool* commPool = nullptr; // The communication pool the memory is from, if any
 };
 
 // Global allocator impl pointer for allocator::owns/mappedRegion
@@ -1106,11 +1211,9 @@ void setCudaAllocatorImpl(CudaAllocatorImpl* impl) {
   // globalCudaAllocatorImpl = impl;
 }
 
-CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
-  std::call_once(initFlag, init);
-  impl = globalCudaAllocatorImpl;
-  std::lock_guard l(impl->mutex);
-
+namespace {
+// The allocator, its device and context set up (on the first allocation) and checked. Called with its mutex held.
+void prepareAllocation(CudaAllocatorImpl* impl, int deviceIndex) {
   if (!loadCuda()) {
     throw std::runtime_error("CUDA driver not available");
   }
@@ -1153,6 +1256,14 @@ CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, 
                                "Allocator can only be used on one CUDA context.");
     }
   }
+}
+} // namespace
+
+CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex) {
+  std::call_once(initFlag, init);
+  impl = globalCudaAllocatorImpl;
+  std::lock_guard l(impl->mutex);
+  prepareAllocation(impl, deviceIndex);
 
   // Align allocation. Allocations are 256-byte aligned; those of at least 64 KiB start at a 4 KiB boundary (a little
   // more is allocated, and the returned pointer is the first boundary in it). RDMA into memory that starts in the
@@ -1186,6 +1297,25 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
 
   std::lock_guard l(impl->mutex);
 
+  // The streams that used the memory: the allocation's, then any recorded
+  struct StreamArrayView {
+    CUstream* data;
+    size_t count;
+    CUstream* begin() const {
+      return data;
+    }
+    CUstream* end() const {
+      return data + count;
+    }
+  };
+  auto deallocate = [&](const auto& streams) {
+    if (ctx->commPool) {
+      impl->commPoolDeallocate(*ctx->commPool, ctx->ptr, ctx->bytes, streams);
+    } else {
+      impl->deallocate<false>(ctx->ptr, ctx->bytes, streams);
+    }
+  };
+
   // Invoke any registered free callbacks for this address
   auto cbIt = impl->freeCallbacks.find(ctx->userPtr);
   if (cbIt != impl->freeCallbacks.end()) {
@@ -1203,27 +1333,102 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
   if (it != impl->streamUses.end()) {
     auto& list = it->second;
     list->insert(list->begin(), ctx->allocStream);
-    impl->deallocate<false>(ctx->ptr, ctx->bytes, *list);
+    deallocate(*list);
     list->clear();
     impl->streamListFree.push_back(std::move(list));
     impl->streamUses.erase(it);
   } else {
     // No recorded streams, just use the alloc stream
     CUstream streams[1] = {ctx->allocStream};
-    struct StreamArrayView {
-      CUstream* data;
-      size_t count;
-      CUstream* begin() const {
-        return data;
-      }
-      CUstream* end() const {
-        return data + count;
-      }
-    };
-    impl->deallocate<false>(ctx->ptr, ctx->bytes, StreamArrayView{streams, 1});
+    deallocate(StreamArrayView{streams, 1});
   }
 
   internalDelete(ctx);
+}
+
+namespace {
+// Every communication pool (never freed), for allocatorAnyCommPoolOffset. Guarded by the allocator's mutex.
+Vector<CommPool*> allCommPools;
+} // namespace
+
+CommPool* allocatorCommPoolCreate() {
+  std::call_once(initFlag, init);
+  CommPool* pool = internalNew<CommPool>();
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  allCommPools.push_back(pool);
+  return pool;
+}
+
+CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream stream, int deviceIndex) {
+  std::call_once(initFlag, init);
+  CudaAllocatorImpl* impl = globalCudaAllocatorImpl;
+  std::lock_guard l(impl->mutex);
+  prepareAllocation(impl, deviceIndex);
+  constexpr size_t alignment = 0x1000;
+  const size_t alignedBytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
+  uintptr_t logical = impl->allocateFrom(pool->free, alignedBytes, stream);
+  if (!logical) {
+    impl->commPoolGrow(*pool, alignedBytes, stream);
+    logical = impl->allocateFrom(pool->free, alignedBytes, stream);
+    CHECK(logical);
+  }
+  uintptr_t userPtr = 0;
+  for (auto& s : pool->slabs) {
+    if (logical >= s.logical && logical + alignedBytes <= s.logical + s.bytes) {
+      userPtr = s.local + (logical - s.logical);
+      break;
+    }
+  }
+  CHECK(userPtr != 0);
+  auto* ctx = internalNew<CudaAllocCleanupCtx>(impl, logical, alignedBytes, stream, userPtr, pool);
+  return CudaAllocation{userPtr, ctx, impl->deviceIndex};
+}
+
+void allocatorCommPoolAddSlabListener(CommPool* pool,
+    bool (*fn)(void* ctx, size_t logicalOffset, unsigned long long handle, size_t memOffset, size_t size), void* ctx) {
+  std::call_once(initFlag, init);
+  CudaAllocatorImpl* impl = globalCudaAllocatorImpl;
+  std::lock_guard l(impl->mutex);
+  for (auto& slab : pool->slabs) {
+    impl->forEachChunkPiece(
+        slab.local, slab.bytes, [&](CUmemGenericAllocationHandle handle, size_t memOffset, size_t size, size_t offset) {
+          slab.bound &= fn(ctx, slab.logical + offset, handle, memOffset, size);
+        });
+  }
+  pool->listeners.emplace_back(fn, ctx);
+}
+
+namespace {
+int64_t commPoolOffset(CommPool* pool, uintptr_t address, size_t bytes) {
+  for (auto& s : pool->slabs) {
+    if (address >= s.local && address + bytes <= s.local + s.bytes) {
+      return s.bound ? (int64_t)(s.logical + (address - s.local)) : -1;
+    }
+  }
+  return -1;
+}
+} // namespace
+
+int64_t allocatorCommPoolOffset(CommPool* pool, uintptr_t address, size_t bytes) {
+  if (!globalCudaAllocatorImpl) {
+    return -1;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  return commPoolOffset(pool, address, bytes);
+}
+
+int64_t allocatorAnyCommPoolOffset(uintptr_t address, size_t bytes) {
+  if (!globalCudaAllocatorImpl) {
+    return -1;
+  }
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  for (CommPool* pool : allCommPools) {
+    int64_t r = commPoolOffset(pool, address, bytes);
+    if (r >= 0) {
+      return r;
+    }
+  }
+  return -1;
 }
 
 // (impl, here and below, is what createCudaAllocatorImpl returned to the wrapper: nullptr, as the allocator is the

@@ -20,6 +20,7 @@ using CUstream = ::CUstream;
 
 using CUresult = int;
 constexpr CUresult CUDA_SUCCESS = 0;
+constexpr CUresult CUDA_ERROR_INVALID_VALUE = 1;
 constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY = 2;
 constexpr CUresult CUDA_ERROR_NOT_INITIALIZED = 3;
 constexpr CUresult CUDA_ERROR_DEINITIALIZED = 4;

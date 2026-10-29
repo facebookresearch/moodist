@@ -1581,14 +1581,45 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   return r;
 }
 namespace {
-// The allocator's chunk listener of Group::setupNvls: binds the chunk at its pool offset. A chunk that is not bound
-// would silently miss the multicast stores to it, so a failure is fatal.
+// What the allocator listeners of Group::setupNvls bind memory into: one of the group's multicast objects. Never
+// freed, like the objects: the allocator calls the listeners for as long as the process lives.
+struct NvlsBinder {
+  CUmemGenericAllocationHandle handle = 0;
+  size_t limit = 0; // the object's offsets that may be bound are below this
+};
+// The allocator's chunk listener: binds the chunk at its pool offset. A chunk that is not bound would silently miss
+// the multicast stores to it, so a failure is fatal.
 void nvlsBindChunk(void* ctx, unsigned long long handle, size_t offset, size_t size) {
-  Group* group = (Group*)ctx;
-  CHECK(offset + size <= Group::Nvls::poolBytes);
-  CHECK_CU(cuMulticastBindMem(group->nvls.handle, offset, handle, 0, size, 0));
+  auto* binder = (NvlsBinder*)ctx;
+  CHECK(offset + size <= binder->limit);
+  CHECK_CU(cuMulticastBindMem(binder->handle, offset, handle, 0, size, 0));
+}
+// The communication pool's slab listener: binds a piece of a slab at its logical offset. The pool does not count a
+// slab whose pieces are not all bound as in the pool for NVLS (see allocatorCommPoolOffset), so a failure only costs
+// that.
+bool nvlsBindSlab(void* ctx, size_t logicalOffset, unsigned long long handle, size_t memOffset, size_t size) {
+  auto* binder = (NvlsBinder*)ctx;
+  CUresult r = logicalOffset + size <= binder->limit
+                   ? cuMulticastBindMem(binder->handle, logicalOffset, handle, memOffset, size, 0)
+                   : CUDA_ERROR_INVALID_VALUE;
+  if (r != CUDA_SUCCESS) {
+    const char* str = "unknown error";
+    cuGetErrorString(r, &str);
+    log.error("moodist: binding %d bytes of a communication pool at logical offset %#x to its multicast object failed: "
+              "%s. Buffers in that part of the pool do not use NVLS.\n",
+        size, logicalOffset, str);
+    return false;
+  }
+  return true;
 }
 } // namespace
+
+CommPool* Group::getCommPool() {
+  std::call_once(commPoolOnce, [&] {
+    commPool = allocatorCommPoolCreate();
+  });
+  return commPool;
+}
 
 bool Group::setupNvls() {
   if (nvls.state != 0) {
@@ -1626,32 +1657,41 @@ bool Group::setupNvls() {
   access.location.id = deviceIndex;
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-  // The multicast object: the pool, then the counter area (see Nvls). Rank 0 creates it, the others import it, and
-  // every device must be added before any rank binds memory to it.
+  // The multicast objects (see Nvls): the pool's (the pool, then the counter area) and the communication pool's. Rank
+  // 0 creates them, the others import them, and every device must be added before any rank binds memory to them.
+  constexpr size_t numObjects = 2;
+  const std::array<size_t, numObjects> objectBytes = {Nvls::poolBytes + countersBytes, commPoolLogicalSize};
+  std::array<CUmemGenericAllocationHandle, numObjects> objects = {};
   CUmulticastObjectProp prop;
   std::memset(&prop, 0, sizeof(prop));
   prop.numDevices = size;
-  prop.size = Nvls::poolBytes + countersBytes;
+  prop.size = objectBytes[0];
   prop.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   size_t granularity = 0;
   check(cuMulticastGetGranularity(&granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM), "cuMulticastGetGranularity");
-  if (error.empty() && (granularity == 0 || prop.size % granularity != 0 || allocatorGetReservedBase() == 0)) {
+  if (error.empty() && (granularity == 0 || objectBytes[0] % granularity != 0 || objectBytes[1] % granularity != 0 ||
+                           allocatorGetReservedBase() == 0)) {
     error =
         fmt::sprintf("multicast granularity %d, allocator reservation at %#x", granularity, allocatorGetReservedBase());
   }
-  CUmemFabricHandle fabricHandle;
-  std::memset(&fabricHandle, 0, sizeof(fabricHandle));
-  if (rank == 0 && error.empty() && check(cuMulticastCreate(&nvls.handle, &prop), "cuMulticastCreate")) {
-    check(cuMemExportToShareableHandle(&fabricHandle, nvls.handle, CU_MEM_HANDLE_TYPE_FABRIC, 0),
-        "cuMemExportToShareableHandle");
+  std::array<CUmemFabricHandle, numObjects> fabricHandles;
+  std::memset(&fabricHandles, 0, sizeof(fabricHandles));
+  for (size_t i : range(numObjects)) {
+    prop.size = objectBytes[i];
+    if (rank == 0 && error.empty() && check(cuMulticastCreate(&objects[i], &prop), "cuMulticastCreate")) {
+      check(cuMemExportToShareableHandle(&fabricHandles[i], objects[i], CU_MEM_HANDLE_TYPE_FABRIC, 0),
+          "cuMemExportToShareableHandle");
+    }
   }
-  auto handles = setupComms->allgather(fabricHandle);
+  auto handles = setupComms->allgather(fabricHandles);
   if (!agree()) {
     return false;
   }
-  if (rank == 0 || check(cuMemImportFromShareableHandle(&nvls.handle, &handles.at(0), CU_MEM_HANDLE_TYPE_FABRIC),
-                       "cuMemImportFromShareableHandle")) {
-    check(cuMulticastAddDevice(nvls.handle, cuDevice), "cuMulticastAddDevice");
+  for (size_t i : range(numObjects)) {
+    if (rank == 0 || check(cuMemImportFromShareableHandle(&objects[i], &handles.at(0)[i], CU_MEM_HANDLE_TYPE_FABRIC),
+                         "cuMemImportFromShareableHandle")) {
+      check(cuMulticastAddDevice(objects[i], cuDevice), "cuMulticastAddDevice");
+    }
   }
   if (!agree()) {
     return false;
@@ -1673,27 +1713,34 @@ bool Group::setupNvls() {
       check(cuMemSetAccess(countersLocal, countersBytes, &access, 1), "cuMemSetAccess (counters)") &&
       check(cuMemsetD8(countersLocal, 0, countersBytes), "cuMemsetD8 (counters)") &&
       check(cuStreamSynchronize(nullptr), "cuStreamSynchronize")) {
-    check(cuMulticastBindMem(nvls.handle, Nvls::poolBytes, counters, 0, countersBytes, 0),
+    check(cuMulticastBindMem(objects[0], Nvls::poolBytes, counters, 0, countersBytes, 0),
         "cuMulticastBindMem (counters)");
   }
 
-  // Every chunk of the pool at its offset: the existing ones now, new ones when the allocator maps them (binding
-  // does not wait for the GPU)
+  // Every chunk of the pool at its offset, and every slab of the communication pool at its logical offset: the
+  // existing ones now, new ones when the allocator adds them (binding does not wait for the GPU)
   if (error.empty()) {
-    allocatorAddChunkListener(nvlsBindChunk, this);
+    allocatorAddChunkListener(nvlsBindChunk, internalNew<NvlsBinder>(objects[0], Nvls::poolBytes));
+    allocatorCommPoolAddSlabListener(getCommPool(), nvlsBindSlab, internalNew<NvlsBinder>(objects[1], objectBytes[1]));
   }
 
-  CUdeviceptr mcBase = 0;
-  if (error.empty() && check(cuMemAddressReserve(&mcBase, prop.size, granularity, 0, 0), "cuMemAddressReserve") &&
-      check(cuMemMap(mcBase, prop.size, 0, nvls.handle, 0), "cuMemMap")) {
-    check(cuMemSetAccess(mcBase, prop.size, &access, 1), "cuMemSetAccess");
+  std::array<CUdeviceptr, numObjects> mcBases = {};
+  for (size_t i : range(numObjects)) {
+    if (error.empty() &&
+        check(cuMemAddressReserve(&mcBases[i], objectBytes[i], granularity, 0, 0), "cuMemAddressReserve") &&
+        check(cuMemMap(mcBases[i], objectBytes[i], 0, objects[i], 0), "cuMemMap")) {
+      check(cuMemSetAccess(mcBases[i], objectBytes[i], &access, 1), "cuMemSetAccess");
+    }
   }
   if (!agree()) {
     return false;
   }
-  nvls.mcBase = mcBase;
+  nvls.mcBase = mcBases[0];
+  nvls.commMcBase = mcBases[1];
   nvls.countersLocal = countersLocal;
-  nvls.countersMc = mcBase + Nvls::poolBytes;
+  nvls.countersMc = mcBases[0] + Nvls::poolBytes;
+  nvls.launches = countersLocal;
+  nvls.nextCounters = 64;
   nvls.state = 1;
   if (rank == 0) {
     log.info("NVLS (multicast) set up for group %s (%d ranks) in %g ms\n", name, size,

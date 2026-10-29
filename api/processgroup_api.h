@@ -41,6 +41,10 @@ void processGroupSetOption(api::ProcessGroup* pg, const char* name, int64_t valu
 // Get unique group name
 const char* processGroupGetName(api::ProcessGroup* pg);
 
+// The group's communication pool (see CoreApi::processGroupCommPoolAllocate)
+void processGroupCommPoolAllocate(
+    api::ProcessGroup* pg, size_t bytes, CUstream stream, uintptr_t* outPtr, void** outCleanupCtx, int* outDeviceIndex);
+
 // Collective operations - all logic handled in core
 void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
 

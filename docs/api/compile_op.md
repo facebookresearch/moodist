@@ -69,6 +69,18 @@ This is useful for tensor redistribution operations where you want to change the
 - CUDA tensors must be allocated by the moodist CUDA allocator: call `moodist.enable_cuda_allocator()` before allocating them. Checked when the op runs.
 - Transfers between NVLink peers (GPUs on the same node, or all GPUs of a multi-node NVLink domain such as NVL72) are done by a copy kernel that needs sizes and offsets that are multiples of 16 bytes, and 16-byte aligned tensors. Sizes and offsets are checked by `compile_op` (a `RuntimeError` on all ranks), tensor addresses when the op runs.
 
+## NVLink multicast and communication buffers
+
+In groups of at least 16 ranks in one NVLink domain (with NVLink SHARP, e.g. GB200/GB300 NVL72), an op that sends the same data to every rank of the group (all-gather, broadcast) can store it once, with NVLink multicast: one SM then does the work of a dozen, and the op is faster up to large sizes. A launch uses multicast only if every rank's output is at the same place of the group's multicast memory, which buffers from the group's communication pool are when every rank allocates and frees them in the same order:
+
+```python
+op = moodist.compile_op(group, dtype=torch.float32, inputs=..., outputs=...)  # an all-gather
+out = moodist.comm_empty(numel * world_size, dtype=torch.float32, group=group)
+op([inp], [out])
+```
+
+`moodist.comm_empty(*size, dtype=None, group=None)` returns an uninitialized CUDA tensor from the communication pool of `group` (for use on the current stream, like `torch.empty`); `moodist.comm_pool_offset(tensor)` returns its offset in the pool (-1 if it is in none). The process group's `allocate_tensor` allocates from the same pool, so FSDP2's `set_allocate_memory_from_process_group_for_comm(True)` puts its buffers there. Launches whose outputs are not at the same place on every rank store to each rank as usual (correct, only slower). The process group option `nvls_launches` (`group._get_option("nvls_launches")`) counts this rank's launches that used multicast.
+
 ## Parameters
 
 ### `group`

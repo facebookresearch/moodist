@@ -39,6 +39,9 @@ from .queue import Queue, TransactionContextManager
 # Compile op
 from .compile import compile_op, TensorRegion, specs_from_dtensor
 
+# Communication pools
+from .comm_pool import comm_empty, comm_pool_offset
+
 # Sharding utilities
 from .sharding import compute_shards, compute_local_reshard, apply_local_reshard, dtensor_shards, ShardInfo
 
@@ -95,6 +98,9 @@ __all__ = [
     "compile_op",
     "TensorRegion",
     "specs_from_dtensor",
+    # Communication pools
+    "comm_empty",
+    "comm_pool_offset",
     # Sharding
     "compute_shards",
     "compute_local_reshard",

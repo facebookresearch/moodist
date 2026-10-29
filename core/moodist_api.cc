@@ -168,6 +168,10 @@ static CoreApi coreApi = {
     .rdmaRead = rdmaRead,
     .rdmaWorkDestroy = rdmaWorkDestroy,
     .rdmaWorkWait = rdmaWorkWait,
+
+    // Communication pool
+    .processGroupCommPoolAllocate = processGroupCommPoolAllocate,
+    .commPoolOffset = allocatorAnyCommPoolOffset,
 };
 
 } // namespace moodist

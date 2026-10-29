@@ -616,14 +616,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t stride;
       uint32_t pad;
     };
-    // Where to write the address at which a peer maps one of this rank's tensors (in the peer's address table)
+    // Where to write the address at which a peer maps one of this rank's tensors (in the peer's address table), and
+    // in NVLS ops the tensor's identity (in the peer's identity table, at the same slot)
     struct AddrSetup {
       uint64_t base;
       uint32_t itembytes;
       uint32_t paramOffset;
       uint32_t stride;
       uint32_t slot;
+      uint64_t idBase;
+      uint32_t idItembytes;
+      uint32_t idParamOffset;
     };
+    static_assert(sizeof(AddrSetup) == 40 && offsetof(AddrSetup, idBase) == 24);
     static constexpr uint32_t edgeRelay = 1;   // relay edge: waits for the CPU thread's signal, copies nothing
     static constexpr uint32_t edgeWait = 2;    // waits for its source node (relay edges: for the signal)
     static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
@@ -635,9 +640,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // chunk once, to the group's multicast mapping of that offset (see Group::Nvls), which the NVLink switches copy
     // to every GPU, instead of once per destination. One SM then reaches the GPUs' NVLink ingress, where unicast
     // stores need 12-16 (all-gather on 32 GB300: 1M 62 vs 73 us, 4M 208 vs 239, 256M 12.4 vs 12.7 ms). It needs the
-    // destination tensors at the same offset of every rank's pool (moodist's allocator), which every launch checks
-    // with the addresses the peers publish (see nvlsPoolBit and the address table below); otherwise the launch
-    // stores to each destination as usual. A rank uses NVLS if every edge it executes is such an edge, every rank
+    // destination tensors at the same place of one of the group's multicast objects on every rank (at the same
+    // offset of every rank's pool, or of the group's communication pool), which every launch checks with the NVLS
+    // identities the peers publish (see the address table below); otherwise the launch stores to each destination as
+    // usual. A rank uses NVLS if every edge it executes is such an edge, every rank
     // that does stores the same number of chunks (see the step counter below), and the group has at least
     // nvlsMinRanks ranks, all in one NVLink domain: within one node (4 GPUs), multicast stores were slower from 4M
     // on (the switch also sends each chunk back to the sender, 1/4 of a GPU's ingress; 1/32 on 32 GPUs).
@@ -748,6 +754,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     }
     // Whether this rank's kernel stores with NVLS
     const bool nvlsLocal = nvlsChunks != 0;
+    // In NVLS ops, every rank publishes, besides the address at which a peer maps one of its tensors (the address
+    // exchange below), where the tensor is in the group's multicast objects (its "NVLS identity", see nvlsIdentity
+    // in processgroup.cc), into a table of the peer's with the layout of the address table. customOp passes the
+    // identities of the rank's tensors and their multicast addresses in a fourth kernel parameter: per tensor, 8
+    // bytes of identity (0 if none), then 8 bytes of multicast address (0 if none).
+    std::optional<KernelMappedBuffers> nvlsIds;
+    if (nvlsOp) {
+      nvlsIds.emplace(map("nvlsids", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks));
+      fn->addParamBytes(8, 16 * std::max(graph.tensors.size(), (size_t)1));
+    }
 
     auto nodeSetup = [&](const Node& n) {
       NodeSetup s;
@@ -847,12 +863,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       auto& v = graph.remoteCudaTensorMappings[i];
       auto& r = addrAddrs.remote[rankIndex(v.rank)];
 
-      AddrSetup s;
+      AddrSetup s = {};
       s.base = r.base;
       s.itembytes = r.itembytes;
       s.paramOffset = sizeof(uint64_t) * i;
       s.stride = sizeof(uint64_t) * v.stride;
       s.slot = sizeof(uint64_t) * v.destinationSlot;
+      if (nvlsIds) {
+        auto& ir = nvlsIds->remote[rankIndex(v.rank)];
+        s.idBase = ir.base;
+        s.idItembytes = ir.itembytes;
+        s.idParamOffset = 16 * v.tensorIndex;
+      }
       addrTable.push_back(s);
     }
 
@@ -1048,8 +1070,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     profiling.enter("syncsetup");
 
-    // Address exchange: write the addresses at which the peers map this rank's tensors into their address tables
-    // (for NVLS ops, customOp marks those in moodist's pool with nvlsPoolBit)
+    // Address exchange: write the addresses at which the peers map this rank's tensors into their address tables (in
+    // NVLS ops, and the tensors' identities into their identity tables)
     for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
       u32 index = blockSize * i + threadIndex;
       auto pred = index < graph.remoteCudaTensorMappings.size();
@@ -1062,6 +1084,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
       predicated(pred, st_global_relaxed_sys_u64)(
           addr, predicated(pred, ld_param_u64)(mappedAddrs + paramOffset, 0) | parityTag);
+      if (nvlsIds) {
+        u64 idBase = predicated(pred, ld_global_nc_u64)(caddr + 24);
+        u32 idItembytes = predicated(pred, ld_global_nc_u32)(caddr + 32);
+        u32 idParamOffset = predicated(pred, ld_global_nc_u32)(caddr + 36);
+        u64 idAddr = idBase + widen(idItembytes * concurrencyIndex + slot + stride * blockIndex);
+        predicated(pred, st_global_relaxed_sys_u64)(
+            idAddr, predicated(pred, ld_param_u64)(paramBase(3) + idParamOffset, 0) | parityTag);
+      }
     }
 
     profiling.leave();
@@ -1087,7 +1117,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           nanosleep(10);
           r = ld_global_relaxed_sys_u64(gaddr);
         }
-        r &= ~((1ull << 63) | nvlsPoolBit);
+        r &= ~(1ull << 63);
       }
       r += widen(offsetlo) | (widen(offsethi) << 32);
       return r;
@@ -1112,7 +1142,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         done |= (r & (1ull << 63)) == parityTag;
       }
       profiling.enter("nodeaddr post");
-      r &= ~((1ull << 63) | nvlsPoolBit);
+      r &= ~(1ull << 63);
 
       r += widen(offsetlo) | (widen(offsethi) << 32);
       profiling.leave();
@@ -1302,7 +1332,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       // NVLS: the flag the check below sets if this launch cannot use NVLS (thread 0 clears it before the resolve
       // barrier)
-      const uintptr_t reservedBase = allocatorGetReservedBase();
       const Group::Nvls& groupNvls = ctx.group->nvls;
       u32 nvlsFailedAddr;
       if (nvlsLocal) {
@@ -1321,12 +1350,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u32 offsetHigh = predicated(valid, ld_global_nc_u32)(setup + 8);
         u64 addr = nodeaddrpred(valid, slot, offsetLow, offsetHigh);
         if (nvlsLocal) {
-          // An NVLS slot: the local destination through the group's multicast mapping if it is in the part of
-          // moodist's pool bound to it, else 0
+          // An NVLS slot (the local destination's setup, slot = 8 * tensorIndex | 3): the destination through the
+          // multicast address of its tensor, if it has one, else 0
           Value isNvls = valid & ((slot & 2) != 0);
-          u64 poolOffset = addr - (int64_t)reservedBase;
-          u64 mcAddr =
-              selp_u64(poolOffset + (int64_t)groupNvls.mcBase, 0, poolOffset < (int64_t)Group::Nvls::poolBytes);
+          u64 mcTensor = predicated(isNvls, ld_param_u64)(paramBase(3) + (slot & ~3u) * 2 + 8, 0);
+          u64 mcAddr = selp_u64(mcTensor + (widen(offsetLow) | (widen(offsetHigh) << 32)), 0, mcTensor != 0);
           addr = selp_u64(mcAddr, addr, isNvls);
         }
         PRED(valid) st_u64(table + widen(i * 8), addr);
@@ -1345,15 +1373,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       barrier_sync();
       profiling.leave();
 
-      // NVLS check: this launch stores with NVLS if every destination of every NVLS edge is at the pool offset of
-      // the local destination (of its tensor, as the node offset is the same on every rank): the address a peer
-      // published must carry nvlsPoolBit, and then its low bits are that offset. Warp w checks the edges w,
-      // w + numWarps, ...; an edge that fails gets 0 in its NVLS slot and sets the flag. Every block decides the
-      // same: from the same addresses.
+      // NVLS check: this launch stores with NVLS if every destination of every NVLS edge has the identity of the
+      // local destination (the same tensor at the same place of the same multicast object; the node offset is the
+      // same on every rank): from the identities the peers publish (with the launch's parity, like the addresses).
+      // Warp w checks the edges w, w + numWarps, ...; an edge that fails gets 0 in its NVLS slot and sets the flag.
+      // Every block decides the same: from the same identities.
       Value nvlsMode(ValType::Pred);
       if (nvlsLocal) {
         profiling.enter("nvls check");
         const uint32_t numWarps = blockSize / 32;
+        u64 idLocalBase = concurrency(nvlsIds->local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
         FOR(u32 e = warpIndex, e < (uint32_t)nvlsEdgeTable.size(), e += numWarps) {
           u64 record = tables + nvlsEdgeTableOffset + widen(e * 8);
           u32 addrSlot = ld_global_nc_u32(record);
@@ -1361,17 +1390,23 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 nvlsSlot = addrSlot + 1 + numDestinations;
           u64 nvlsAddr = ld_u64(table + widen(nvlsSlot * 8));
           u32 localSlot = ld_global_nc_u32(tables + pipeAddrSetupOffset + widen(nvlsSlot * sizeof(NodeSetup)));
-          u64 poolOffset = ld_param_u64(inputAddrs + (localSlot & ~3u), 0) - (int64_t)reservedBase;
-          Value ok = nvlsAddr != 0;
+          u64 identity = ld_param_u64(paramBase(3) + (localSlot & ~3u) * 2, 0);
+          Value ok = (nvlsAddr != 0) & (identity != 0);
           FOR(u32 d0 = 0, d0 < numDestinations, d0 += 32) {
             u32 d = d0 + laneIndex;
             Value valid = d < numDestinations;
             u32 dslot = predicated(valid, ld_global_nc_u32)(
                 tables + pipeAddrSetupOffset + widen((addrSlot + 1 + d) * sizeof(NodeSetup)));
             Value remote = valid & ((dslot & 1) == 0);
-            u64 published = predicated(remote, ld_global_relaxed_sys_u64)(addrAddrsLocalBase + widen(dslot));
-            Value bad = remote & (((published & (int64_t)nvlsPoolBit) == 0) |
-                                     ((published & (int64_t)(allocatorReserveSize - 1)) != poolOffset));
+            u64 idAddr = idLocalBase + widen(dslot);
+            u64 published = predicated(remote, ld_global_relaxed_sys_u64)(idAddr);
+            Value done = !remote | ((published & (1ull << 63)) == parityTag);
+            WHILE(vote_sync_any(!done)) {
+              nanosleep(10);
+              published = selp(published, predicated(!done, ld_global_relaxed_sys_u64)(idAddr), done);
+              done |= (published & (1ull << 63)) == parityTag;
+            }
+            Value bad = remote & ((published & ~(1ull << 63)) != identity);
             ok = ok & !vote_sync_any(bad);
           }
           IF_D(!ok & (laneIndex == 0)) {
@@ -1381,6 +1416,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         }
         barrier_sync();
         nvlsMode = ld_shared_u32(nvlsFailedAddr) == 0;
+        // Count the launch (see Group::Nvls::launches)
+        IF_D(nvlsMode & isThreadZero & (blockIndex == 0)) {
+          u64 launches = (int64_t)groupNvls.launches;
+          u32 old;
+          atom_global_relaxed_gpu_add_u32_into(old, launches, 1);
+        }
         profiling.leave();
       }
 

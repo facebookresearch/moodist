@@ -11,6 +11,8 @@
 #include "simple_vector.h"
 #include "vector.h"
 
+#include <mutex>
+
 namespace moodist {
 
 struct SetupComms;
@@ -147,24 +149,36 @@ struct Group {
   Vector<size_t> fabricDomainRanks;
 
   // NVLS (NVLink SHARP multicast) for compile_op (see generateKernel), set up by setupNvls when the first op that
-  // can use it is compiled: one multicast object of all ranks of the group over moodist's whole allocator pool,
+  // can use it is compiled: two multicast objects of all ranks of the group. One over moodist's whole allocator pool,
   // every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank is at mcBase + o),
-  // followed by an area for the ops' step counters.
+  // followed by an area for the ops' step counters; one over the group's communication pool (see commPool), every
+  // slab bound at its logical offset (so logical offset o of every rank is at commMcBase + o). The objects, and what
+  // is bound to them, outlive the group.
   struct Nvls {
-    // The object's size is the pool's (multicast objects of more than 1 TiB fail to bind): the counter area takes its
-    // last 2 MiB, so only pool offsets below poolBytes are bound (the allocator never maps that much)
+    // The pool object's size is the pool's (multicast objects of more than 1 TiB fail to bind): the counter area takes
+    // its last 2 MiB, so only pool offsets below poolBytes are bound (the allocator never maps that much)
     static constexpr size_t countersBytes = (size_t)2 << 20;
     static constexpr size_t poolBytes = allocatorReserveSize - countersBytes;
     int state = 0; // 0: not set up yet, 1: available, -1: unavailable
-    CUmemGenericAllocationHandle handle = 0;
     uintptr_t mcBase = 0;
+    uintptr_t commMcBase = 0;
     uintptr_t countersLocal = 0; // the counter area, through the local mapping
     uintptr_t countersMc = 0;    // the counter area, through the multicast mapping
     size_t nextCounters = 0;     // the offset in the counter area of the next op's counters (the same on all ranks)
+    // How many launches of this rank stored with NVLS (a 32-bit counter in the first 64 bytes of the counter area;
+    // see the process group option "nvls_launches")
+    uintptr_t launches = 0;
   };
   Nvls nvls;
   // Collective over all ranks of the group (setupComms). Returns whether NVLS is available.
   bool setupNvls();
+
+  // The group's communication pool (see allocatorCommPoolCreate): buffers that every rank allocates (and frees) in the
+  // same order get the same logical offset on every rank, which compile_op ops can then store to with NVLS. Created on
+  // first use; never freed (its memory can outlive the group).
+  CommPool* getCommPool();
+  std::once_flag commPoolOnce;
+  CommPool* commPool = nullptr;
 
   int allocationNode = -1;
 

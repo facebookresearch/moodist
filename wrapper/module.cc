@@ -1599,6 +1599,22 @@ static PyObject* py_enable_profiling(PyObject*, PyObject* args) {
 
 // get_core_api_ptr(version=None) - CoreApi address for separately built C++ extensions. The build magic
 // check doesn't apply to them, so they pass the kMoodistApiVersion they were compiled against instead.
+static PyObject* py_comm_pool_offset(PyObject*, PyObject* args) {
+  PyObject* tensor = nullptr;
+  if (!PyArg_ParseTuple(args, "O", &tensor)) {
+    return nullptr;
+  }
+  if (!THPVariable_Check(tensor)) {
+    PyErr_SetString(PyExc_TypeError, "comm_pool_offset: expected a tensor");
+    return nullptr;
+  }
+  const at::Tensor& t = THPVariable_Unpack(tensor);
+  if (!t.is_cuda()) {
+    return PyLong_FromLongLong(-1);
+  }
+  return PyLong_FromLongLong(moodist::coreApi.commPoolOffset((uintptr_t)t.data_ptr(), t.nbytes()));
+}
+
 static PyObject* py_get_core_api_ptr(PyObject*, PyObject* args) {
   PyObject* versionObj = nullptr;
   if (!PyArg_ParseTuple(args, "|O", &versionObj)) {
@@ -1631,6 +1647,8 @@ static PyMethodDef module_methods[] = {{"hello", hello_world, METH_NOARGS, "Retu
         "enable_profiling(enabled): CPU thread Chrome tracing (moodist-trace-cpu-<group>-<rank>.json)"},
     {"serialize", moodist::wrapper::serialize, METH_VARARGS, "Serialize a Python object to a uint8 tensor"},
     {"deserialize", moodist::wrapper::deserialize, METH_VARARGS, "Deserialize a uint8 tensor to a Python object"},
+    {"comm_pool_offset", py_comm_pool_offset, METH_VARARGS,
+        "comm_pool_offset(tensor): the offset of the tensor's memory in the communication pool it is in, or -1"},
     {"get_core_api_ptr", py_get_core_api_ptr, METH_VARARGS,
         "get_core_api_ptr(version=None): address of moodist's CoreApi struct, for C++ extensions built "
         "against moodist's api/ headers. Pass the moodist::kMoodistApiVersion the extension was compiled "

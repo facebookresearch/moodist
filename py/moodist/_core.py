@@ -36,6 +36,7 @@ enable_cpu_allocator = getattr(_C, "enable_cpu_allocator", None)
 cpu_allocator_owns = getattr(_C, "cpu_allocator_owns", None)
 cpu_allocator_debug = getattr(_C, "cpu_allocator_debug", None)
 cuda_copy = getattr(_C, "cuda_copy", None)
+comm_pool_offset = getattr(_C, "comm_pool_offset", None)
 set_prefer_kernel_less = getattr(_C, "set_prefer_kernel_less", None)
 TcpStore = getattr(_C, "TcpStore", None)
 

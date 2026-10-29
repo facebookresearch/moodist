@@ -117,6 +117,10 @@ public:
   int64_t getOption(const std::string& name) const;
   void setOption(const std::string& name, int64_t value);
 
+  // A 1-d CUDA tensor of numel elements from the group's communication pool (see
+  // CoreApi::processGroupCommPoolAllocate), for use on the current stream
+  at::Tensor allocateCommTensor(int64_t numel, at::TensorOptions options);
+
   // Standard c10d collectives
   c10::intrusive_ptr<Work> broadcast(
       std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;

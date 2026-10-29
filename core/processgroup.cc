@@ -2841,6 +2841,18 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
     return impl->options.chunkSize;
   } else if (key == "method") {
     return impl->options.method;
+  } else if (key == "nvls_launches") {
+    // Read-only: how many compile_op launches of this rank in this group stored with NVLS (see generateKernel); as
+    // of the launches that have completed
+    const Group::Nvls& nvls = impl->group->nvls;
+    if (nvls.state != 1) {
+      return 0;
+    }
+    uint32_t value = 0;
+    CHECK_CU(cuCtxSetCurrent(impl->group->cuContext));
+    CHECK_CU(cuMemcpyAsync((CUdeviceptr)&value, nvls.launches, sizeof(value), nullptr));
+    CHECK_CU(cuStreamSynchronize(nullptr));
+    return value;
   }
   throw std::runtime_error(std::string("Unknown option: ") + name);
 }
@@ -2867,6 +2879,16 @@ const char* processGroupGetName(api::ProcessGroup* pg) {
   auto* impl = static_cast<ProcessGroupImpl*>(pg);
   // Return pointer to internal string data - safe as long as ProcessGroup lives
   return impl->group->name.c_str();
+}
+
+void processGroupCommPoolAllocate(api::ProcessGroup* pg, size_t bytes, CUstream stream, uintptr_t* outPtr,
+    void** outCleanupCtx, int* outDeviceIndex) {
+  auto* impl = static_cast<ProcessGroupImpl*>(pg);
+  Group* group = &*impl->group;
+  CudaAllocation alloc = allocatorCommPoolAllocate(group->getCommPool(), bytes, stream, group->deviceIndex);
+  *outPtr = alloc.ptr;
+  *outCleanupCtx = alloc.cleanupCtx;
+  *outDeviceIndex = alloc.deviceIndex;
 }
 
 // ============================================================================
@@ -3311,6 +3333,28 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   return result;
 }
 
+namespace {
+// The NVLS identity of this rank's CUDA tensor at ptr (see generateKernel): where it is in the group's multicast
+// objects, and its multicast address there. In the group's communication pool, at logical offset o: (2 << 61) | o;
+// else in moodist's pool, at offset o: (1 << 61) | o; else 0 (and no multicast address). The same identity on two
+// ranks means the same offset of the same multicast object.
+std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t bytes) {
+  const Group::Nvls& nvls = group->nvls;
+  if (nvls.state != 1) {
+    return {0, 0};
+  }
+  int64_t logical = allocatorCommPoolOffset(group->getCommPool(), ptr, bytes);
+  if (logical >= 0) {
+    return {(2ull << 61) | (uint64_t)logical, nvls.commMcBase + logical};
+  }
+  const uintptr_t reserved = allocatorGetReservedBase();
+  if (reserved && ptr >= reserved && ptr - reserved + bytes <= Group::Nvls::poolBytes) {
+    return {(1ull << 61) | (ptr - reserved), nvls.mcBase + (ptr - reserved)};
+  }
+  return {0, 0};
+}
+} // namespace
+
 // ============================================================================
 // ProcessGroupImpl::customOp - execute a compiled custom operation
 // ============================================================================
@@ -3543,21 +3587,18 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     if (mappedAddrs.empty()) {
       mappedAddrs.push_back(0);
     }
-    // NVLS (see generateKernel): mark the addresses published to the peers that are offsets in this rank's pool
-    // (the peer's mapping of the pool is aligned to allocatorReserveSize, so that the address's low bits are the
-    // offset), and pass the op's step counter before this launch
+    // NVLS (see generateKernel): the tensors' NVLS identities and multicast addresses, and the op's step counter
+    // before this launch
     uint32_t nvlsCounterBase = 0;
+    Vector<uint64_t> nvlsTensors;
     if (op->kernelHandle->nvls) {
       KernelHandle& kh = *op->kernelHandle;
-      const uintptr_t reserved = allocatorGetReservedBase();
-      for (size_t i : indices(op->graph.remoteCudaTensorMappings)) {
-        auto& m = op->graph.remoteCudaTensorMappings[i];
-        auto& tensor = m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size())
-                                                        : inputTDs.at(m.tensorIndex);
-        uintptr_t ptr = tensor->data();
-        if (reserved && ptr >= reserved && ptr - reserved + tensor->bytes() <= allocatorReserveSize &&
-            ((mappedAddrs[i] - (ptr - reserved)) & (allocatorReserveSize - 1)) == 0) {
-          mappedAddrs[i] |= nvlsPoolBit;
+      nvlsTensors.resize(2 * std::max(inputTDs.size() + outputTDs.size(), (size_t)1));
+      size_t n = 0;
+      for (auto* list : {&inputTDs, &outputTDs}) {
+        for (auto& v : *list) {
+          std::tie(nvlsTensors[n], nvlsTensors[n + 1]) = nvlsIdentity(&*group, v->data(), v->bytes());
+          n += 2;
         }
       }
       nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
@@ -3565,7 +3606,7 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
     CompileOpCopyParameters params{
         .stepValue = stepValue, .concurrencyIndex = concurrencyIndex, .nvlsCounterBase = nvlsCounterBase};
-    std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
+    std::array<void*, 4> kparams = {&params, tensorAddrs.data(), mappedAddrs.data(), nvlsTensors.data()};
     CUlaunchConfig launchConfig;
     CUlaunchAttribute attr;
     std::memset(&launchConfig, 0, sizeof(launchConfig));

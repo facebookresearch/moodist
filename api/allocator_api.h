@@ -75,8 +75,7 @@ int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl);
 uintptr_t allocatorGetReservedBase();
 
 // Size of the allocator's VA reservation: chunk offsets (and so pool offsets) are below it. Peers reserve the same
-// size, aligned to it, for the mapping of a rank's pool (see IpcMapper), so that the pool offset of an address in such
-// a mapping is its low bits (compile_op's NVLS check relies on it).
+// size for the mapping of a rank's pool (see IpcMapper).
 constexpr size_t allocatorReserveSize = (size_t)1 << 40;
 
 // Get number of cuMemCreate chunks
@@ -94,17 +93,39 @@ bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outO
 // Check if the allocator supports fabric handles
 bool allocatorSupportsFabric();
 
-// Chunk binding info for multicast
-struct AllocatorChunkBinding {
-  unsigned long long handle; // cuMemCreate handle
-  size_t mcOffset;           // Offset within multicast object to bind at
-  size_t memOffset;          // Offset within the chunk handle
-  size_t size;               // Bytes to bind
-};
+// Communication pools. A communication pool places its allocations in a logical address space of its own,
+// deterministically: the same sequence of allocations and frees (sizes and order) gives the same logical offsets in
+// every process, whatever else the processes allocate and whenever their GPUs finish with freed memory. (An allocation
+// that reuses freed memory makes its stream wait on the GPU for the streams that used the memory, instead of the host
+// checking whether they have, which depends on timing.) The memory comes from the allocator's pool, in slabs: one
+// contiguous allocation per slab, at any address, each at its own range of logical offsets (never adjacent, so that no
+// allocation spans two slabs). A process group binds every slab at its logical offset into a multicast object of its
+// own (see allocatorCommPoolAddSlabListener), so that a buffer that all ranks of the group allocate in the same order
+// is at the same offset of that object on every rank. Slabs are never returned to the pool.
+struct CommPool;
 
-// Find which physical chunks back the VA range [addr, addr+len).
-// Writes bindings to out[], returns number of entries written.
-// mcOffset is relative to the start of addr (0 for the first byte).
-size_t allocatorGetChunksForRange(uintptr_t addr, size_t len, AllocatorChunkBinding* out, size_t maxOut);
+// Logical offsets are below this (the size of the multicast object they are bound into)
+constexpr size_t commPoolLogicalSize = (size_t)1 << 40;
+
+CommPool* allocatorCommPoolCreate();
+
+// Allocate from the pool (bytes are rounded up to 4 KiB; the memory is 4 KiB aligned) for use on stream. The
+// cleanupCtx is freed with cudaAllocatorImplFree, like those of cudaAllocatorImplAllocate.
+CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream stream, int deviceIndex);
+
+// Call fn(ctx, logicalOffset, handle, memOffset, size) for every piece of every slab of the pool (the part of a slab
+// in one cuMemCreate chunk: handle, the offset in it, size; logicalOffset is the piece's): for the existing slabs
+// now, for new ones when they are added, before any memory in them is handed out. fn returns whether it bound the
+// piece; the memory of a slab counts as in the pool for allocatorCommPoolOffset only if every piece was bound. fn runs
+// with the allocator's lock held, so it must not allocate. All offsets and sizes are multiples of 2 MiB.
+void allocatorCommPoolAddSlabListener(CommPool* pool,
+    bool (*fn)(void* ctx, size_t logicalOffset, unsigned long long handle, size_t memOffset, size_t size), void* ctx);
+
+// The logical offset of [address, address + bytes) if it lies in one slab of the pool whose pieces are all bound (see
+// allocatorCommPoolAddSlabListener), else -1
+int64_t allocatorCommPoolOffset(CommPool* pool, uintptr_t address, size_t bytes);
+
+// The same for whichever communication pool [address, address + bytes) is in (memory is in at most one), or -1
+int64_t allocatorAnyCommPoolOffset(uintptr_t address, size_t bytes);
 
 } // namespace moodist
