@@ -362,6 +362,7 @@ struct CustomOpDescriptor {
   };
   // Notification slots per pair of ranks (inStepValueDeviceChunk: maxDevices x maxChunks)
   static constexpr size_t numNotificationSlots = 32;
+  static_assert(numNotificationSlots == maxDevices * maxChunks);
 
   Vector<Copy> inputCopies;
   Vector<Copy> outputCopies;

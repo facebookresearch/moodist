@@ -5740,14 +5740,28 @@ struct CpuThreadImpl {
     void tryRead(size_t di) {
       CHECK(readIndex < reads.size());
 
-      // A read that waits for a notification may let reads after it go first, until it can be issued
+      // A read that waits for a notification may let reads after it go first, until it can be issued: the first part
+      // that is ready goes next, so that a read before it goes on as soon as it is ready (moving all parts of the
+      // ready read ahead instead made all-reduce of 16 MiB across 16 domains 10% slower: the order of the reads is
+      // what keeps one reader on each partial rank at a time). Whether a read is ready depends only on its rank and
+      // wait slot, which the parts of a read share, and they are consecutive (see prepareReads): the scan checks a
+      // run of such parts once (a reduce-scatter of 256 MiB across 16 domains has about 30000 parts of reads that
+      // wait for notifications).
       if (!readReady(reads[readIndex])) {
         if (reads[readIndex].waitSlot < 0) {
           return;
         }
-        size_t j = readIndex + 1;
+        auto runEnd = [&](size_t first) {
+          size_t end = first + 1;
+          while (end != reads.size() && reads[end].rank == reads[first].rank &&
+                 reads[end].waitSlot == reads[first].waitSlot) {
+            ++end;
+          }
+          return end;
+        };
+        size_t j = runEnd(readIndex);
         while (j != reads.size() && !readReady(reads[j])) {
-          ++j;
+          j = runEnd(j);
         }
         if (j == reads.size()) {
           return;
@@ -5940,16 +5954,16 @@ struct CpuThreadImpl {
         out.custom.stepValue = stepValue;
         out.custom.numInputs = numTensors;
 
-        auto describe = [&](size_t i, InputTensor& v) {
-          const bool input = i < params.inputs.size();
-          auto& tensor = input ? params.inputs[i] : params.outputs.back();
+        auto describe = [&](size_t index, InputTensor& v) {
+          const bool input = index < params.inputs.size();
+          auto& tensor = input ? params.inputs[index] : params.outputs.back();
           v.address = tensor->data();
           v.bytes = tensor->bytes();
           auto* mr = !input           ? outputMrs.back()
                      : tensor->isCuda ? self.regMrCuda(v.address, v.bytes)
                                       : self.regMr(v.address, v.bytes);
-          for (size_t i = 0; i != maxDevices; ++i) {
-            v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
+          for (size_t d = 0; d != maxDevices; ++d) {
+            v.rkey[d] = mr->mrs[d] ? mr->mrs[d]->rkey : 0;
           }
         };
 

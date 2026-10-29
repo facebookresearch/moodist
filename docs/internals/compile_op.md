@@ -74,21 +74,24 @@ Every step is collective: all ranks of the group take part (through per-rank que
 
    Across NVLink domains, an executor reads the sources of its own domain itself, and one value from each other
    domain over RDMA: the input, if the domain has one source, otherwise the domain's partial result, which a rank of
-   that domain computes. A piece with one executor (its destinations are in one domain: a reduce-scatter, a reduce
-   to one rank) gets its partial results from ranks with the executor's local rank (NICs on the same rail), the one
-   at the executor's position among the ranks of its domain with that local rank, so that with domains of the same
-   shape every rank computes as many partial results. The executors send their requests to the partial ranks, which
-   add an edge per partial result, from the domain's sources (in rank order from their own) to a region of their
-   scratch tensor (a CUDA tensor of the op's dtype that `customOp` allocates per call, for the partial results that
-   the rank computes and the data that it reads, at page aligned offsets), with a `doneSignal` (see the kernel and
-   Runtime), and answer with the region and a notification slot (32 per pair of ranks; with more requests,
-   consecutive ones share a slot). The executor's edge then combines its domain's sources, the inputs of other
-   domains and the partial results (in the order of their domains' first ranks), the last two from regions of its
-   scratch tensor that ibReads fill (with a `signalIndex`, and for partial results a `waitSlot`: read once the
-   partial rank has sent its notification); `sourceSignals` holds the signal of each source the kernel has to wait
-   for. Partial results are of the op's dtype (16-bit floats are rounded once per domain), and `avg` divides them by
-   the number of all inputs already (`divisor`; the executor divides what it combined of the inputs, then adds the
-   `partialSources`), which keeps sums of many 16-bit values in range.
+   that domain computes. A piece with one executor (its destinations are in one domain: a reduce-scatter, a reduce to
+   one rank) gets its partial results from ranks with the executor's local rank (NICs on the same rail), the one at
+   the executor's position among the ranks of its domain with that local rank, so that with domains of the same shape
+   every rank computes as many partial results. The executors send their requests to the partial ranks, which add an
+   edge per partial result, from the domain's sources (in rank order from their own) to a region of their scratch
+   tensor (a CUDA tensor of the op's dtype that `customOp` allocates per call, for the partial results that the rank
+   computes and the data that it reads, at page aligned offsets: for a reduce-scatter across k domains, about
+   2 (k - 1) times a rank's output, the k - 1 partial results that it reads and about as many that it computes, e.g.
+   7.5 GiB at 256 MiB per rank with 16 domains; for an all-reduce, about k / m of the tensor, m the most destination
+   ranks of a domain; `tuneKernels` allocates it too), with a `doneSignal` (see the kernel and Runtime), and answer
+   with the region and a notification slot (32 per pair of ranks; with more requests, consecutive ones share a slot).
+   The executor's edge then combines its domain's sources, the inputs of other domains and the partial results (in
+   the order of their domains' first ranks), the last two from regions of its scratch tensor that ibReads fill (with
+   a `signalIndex`, and for partial results a `waitSlot`: read once the partial rank has sent its notification);
+   `sourceSignals` holds the signal of each source the kernel has to wait for. Partial results are of the op's dtype
+   (16-bit floats are rounded once per domain), and `avg` divides them by the number of all inputs already
+   (`divisor`; the executor divides what it combined of the inputs, then adds the `partialSources`), which keeps sums
+   of many 16-bit values in range.
 
    A piece with destinations in several domains (e.g. an all-reduce) has an executor in each of them (Phase 2), and
    these must store the same bits: they combine the same values in the same order, the inputs of the domains with one
@@ -332,10 +335,12 @@ on new tensors at every call.
   1), which with the read order keeps the ranks in step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
   has arrived (slot `waitSlot` of the partial rank's slots in `inStepValueDeviceChunk`), and lets the reads after it
-  go first meanwhile. The CPU thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the
-  flags of all partial results of a notification slot are set, it writes the step value into that slot of the
-  executor (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a
-  notification for each).
+  go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as soon as they are
+  ready, which keeps the order; the search skips the parts of a read together, which share its readiness). The CPU
+  thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the flags of all partial results
+  of a notification slot are set, it writes the step value into that slot of the executor
+  (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a notification for
+  each).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer, or of a reduction's source from another NVLink domain, has
   completed (all its parts): `writeCpuOut` writes the step value into slot 16 + signal index of `cpuOutBuffer` (a
