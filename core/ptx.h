@@ -512,6 +512,18 @@ void shr_s32(const Value& d, const Value& a, const Value& b);
 
 void neg_s32(const Value& d, const Value& a);
 
+// Typed arithmetic by opcode, e.g. arith("add.rn.f32", d, a, b), mainly floating point: PTX takes bit-size registers
+// for any type of their size, so a U32 Value holds an f32 (or an f16x2 / bf16x2 pair), a U64 Value an f64
+void arith(const char* opcode, const Value& d, const Value& a, const Value& b);
+void arith(const char* opcode, const Value& d, const Value& a);
+// mov.b32 {lo, hi}, a: the 16-bit halves of a 32-bit value (into U16 Values)
+void unpack_b32(const Value& lo, const Value& hi, const Value& a);
+// mov.b64 d, {lo, hi}: a 64-bit value from its 32-bit halves, and back
+void pack_b64(const Value& d, const Value& lo, const Value& hi);
+void unpack_b64(const Value& lo, const Value& hi, const Value& a);
+// setp.nan.<type> p, a, b: whether a or b is NaN (type "f32" or "f64")
+void setp_nan(const char* type, const Value& p, const Value& a, const Value& b);
+
 // Comparison
 void setp_eq_u32(const Value& p, const Value& a, const Value& b);
 void setp_ne_u32(const Value& p, const Value& a, const Value& b);
@@ -597,6 +609,8 @@ inline Value ld_shared_acquire_cta_u32(const Value& addr) {
 void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr);
 void st_shared_v4_u32(const Value& addr, const std::array<u32, 4>& v);
 std::array<u32, 4> ld_shared_v4_u32(const Value& addr);
+// The same into existing registers (e.g. loop-carried ones)
+void ld_shared_v4_u32_into(const std::array<u32, 4>& d, const Value& addr);
 
 u64 ld_global_cv_u64(const u64& addr);
 void st_global_wt_u64(const u64& addr, const u64& value);

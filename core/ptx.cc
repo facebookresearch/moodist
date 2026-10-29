@@ -363,6 +363,24 @@ void min_u32(const Value& d, const Value& a, const Value& b) {
 void min_s32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("min.s32", d, a, b));
 }
+void arith(const char* opcode, const Value& d, const Value& a, const Value& b) {
+  emitInst(fmt3(opcode, d, a, b));
+}
+void arith(const char* opcode, const Value& d, const Value& a) {
+  emitInst(fmt2(opcode, d, a));
+}
+void unpack_b32(const Value& lo, const Value& hi, const Value& a) {
+  emitInst("mov.b32 {" + lo.str() + ", " + hi.str() + "}, " + a.str());
+}
+void pack_b64(const Value& d, const Value& lo, const Value& hi) {
+  emitInst("mov.b64 " + d.str() + ", {" + lo.str() + ", " + hi.str() + "}");
+}
+void unpack_b64(const Value& lo, const Value& hi, const Value& a) {
+  emitInst("mov.b64 {" + lo.str() + ", " + hi.str() + "}, " + a.str());
+}
+void setp_nan(const char* type, const Value& p, const Value& a, const Value& b) {
+  emitInst(fmt3((std::string("setp.nan.") + type).c_str(), p, a, b));
+}
 void max_u32(const Value& d, const Value& a, const Value& b) {
   emitInst(fmt3("max.u32", d, a, b));
 }
@@ -568,6 +586,10 @@ void ld_shared_v4_u32(std::array<Value, 4>& v, const Value& addr) {
 void st_shared_v4_u32(const Value& addr, const std::array<u32, 4>& v) {
   emitInst("st.shared.v4.u32 [" + addr.str() + "], {" + v[0].inner.str() + ", " + v[1].inner.str() + ", " +
            v[2].inner.str() + ", " + v[3].inner.str() + "}");
+}
+void ld_shared_v4_u32_into(const std::array<u32, 4>& d, const Value& addr) {
+  emitInst("ld.shared.v4.u32 {" + d[0].inner.str() + ", " + d[1].inner.str() + ", " + d[2].inner.str() + ", " +
+           d[3].inner.str() + "}, [" + addr.str() + "]");
 }
 std::array<u32, 4> ld_shared_v4_u32(const Value& addr) {
   std::array<u32, 4> v;
