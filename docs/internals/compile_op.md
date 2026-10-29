@@ -91,17 +91,21 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `partialSources`), which keeps sums of many 16-bit values in range.
 
    A piece with destinations in several domains (e.g. an all-reduce) has an executor in each of them (Phase 2), and
-   these must store the same bits: they combine the same values in the same order, the inputs of the domains with
-   one source, then the partial results of the others, in the order of the domains. An executor computes the partial
+   these must store the same bits: they combine the same values in the same order, the inputs of the domains with one
+   source, then the partial results of the others, in the order of the domains. An executor computes the partial
    result of its own domain itself, which the other executors read, and combines it as rounded, from its scratch
    tensor, once its kernel has stored all of it (`sourceDoneSignals`: the kernel waits for its own done signal). All
    executors get the partial result of a domain from the same rank, which computes it once (a request for a partial
    result that a rank computes already joins it, by its sources): the domain's executor, or in a domain without
-   destinations, its source rank (p + cell index) mod (their number). Every domain's partial result thus crosses to
-   every other domain with destinations: with k such domains of n GPUs, an all-reduce moves (k - 1) / n of the tensor
-   per GPU over RDMA each way (1/32 with 2 domains of 32 GPUs, but 15/4 with 16 domains of 4, where a reduce-scatter
-   and an all-gather among the executors of a piece would move 2 (k - 1) / (k n), about 1/2; see Reductions: next
-   steps).
+   destinations, its source rank (p + cell index) mod (their number). A domain whose one source is on one of its own
+   destination ranks contributes a copy of that input: in an in-place op the input is the output that the domain's
+   executor stores the result to, while the executors of other domains still read it over RDMA. So the executor first
+   copies it into its scratch tensor (an edge with one source and a `doneSignal`, which the kernel stores as loaded),
+   and every executor, itself included, combines the copy, in the input's place (`avg` divides it with the inputs).
+   Every domain's partial result thus crosses to every other domain with destinations: with k such domains of n GPUs,
+   an all-reduce moves (k - 1) / n of the tensor per GPU over RDMA each way (1/32 with 2 domains of 32 GPUs, but
+   15/4 with 16 domains of 4, where a reduce-scatter and an all-gather among the executors of a piece would move
+   2 (k - 1) / (k n), about 1/2; see Reductions: next steps).
 
    A partial rank's kernel computes its partial results part by part (`chunkIndex`, see Phase 2), so that every
    executor gets the first parts from all domains early on, and within a part, its own executor's first, then the
@@ -255,16 +259,17 @@ on new tensors at every call.
   still be reading the other buffer). An item with one source (a cell that one input covers) is stored as loaded.
   Sums start from -0 (x + -0 = x for every x), floating point min and max propagate NaN.
 
-  Across domains, the edges that compute partial results come first in the sequence (they wait for nothing). The
-  block that stores the last item of one (a per-edge counter, which wraps around after every launch) waits for its
-  stores to complete and writes the step value into slot 16 + `doneSignal` of `cpuInBuffer` (host memory) for the
-  CPU thread. A source that the CPU thread reads from another domain is loaded once the read's signal (slot 16 +
-  signal of `cpuOutBuffer`) has arrived, and in an all-reduce, the partial result of the executor's own domain once
-  that `cpuInBuffer` slot has the step value (the wait table word has bit 31 set for these). Until then, thread 0
-  stops loading at that source, and the block goes on with the stages it has; it waits for the signal only when it
-  has combined every stage loaded before (at the start of a stage). Its earlier items are then complete, including
-  any partial results among them, so a block never holds back a partial result that a rank (its own included) waits
-  for while it waits itself, and the blocks of all ranks make progress.
+  Across domains, the edges that compute partial results (and copies of inputs, see compile phase step 7) come first
+  in the sequence (they wait for nothing). A block that has stored an item of one waits for its stores to complete
+  and counts the item (a per-edge counter, which wraps around after every launch); the block that counts the last one
+  writes the step value into slot 16 + `doneSignal` of `cpuInBuffer` (host memory) for the CPU thread. A source that
+  the CPU thread reads from another domain is loaded once the read's signal (slot 16 + signal of `cpuOutBuffer`) has
+  arrived, and in an all-reduce, the partial result of the executor's own domain once that `cpuInBuffer` slot has the
+  step value (the wait table word has bit 31 set for these). Until then, thread 0 stops loading at that source, and
+  the block goes on with the stages it has; it waits for the signal only when it has combined every stage loaded
+  before (at the start of a stage). Its earlier items are then complete, including any partial results among them, so
+  a block never holds back a partial result that a rank (its own included) waits for while it waits itself, and the
+  blocks of all ranks make progress.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 - **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group

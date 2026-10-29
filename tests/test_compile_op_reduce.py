@@ -56,14 +56,18 @@ def make_input(rank, region, gshape, offset, shape, dtype, salt):
     return v.to(dtype)
 
 
-def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False):
+def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
     """spec: tensor_id -> (global shape, [per rank: list of input (offset, shape)], [per rank: list of output (offset,
     shape)]). Compiles and runs the op on this rank's regions, and checks its outputs against the expected values.
+    in_place: an output with the region of one of the rank's inputs (same tensor id, offset and shape) is that input
+    tensor (the op writes over it). repeat: runs the op that many times, with the inputs filled in anew each time.
     Returns this rank's outputs."""
     inputs = []
     outputs = []
+    input_values = []
     input_tensors = []
     output_tensors = []
+    aliased = []  # per output: whether it is an input tensor
     expected = []
     for tid, (gshape, ins, outs) in spec.items():
         # The expected values of the whole global tensor, from every rank's inputs
@@ -92,31 +96,49 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False):
             else:
                 acc = acc.to(torch.float32) / count.to(torch.float32)
         result = acc.to(dtype)
+        my_inputs = {}
         for i, (offset, shape) in enumerate(ins[ctx.rank]):
             inputs.append(TensorRegion(offset=list(offset), shape=list(shape), device="cuda", tensor_id=tid))
-            input_tensors.append(make_input(ctx.rank, i, gshape, offset, shape, dtype, salt))
+            input_values.append(make_input(ctx.rank, i, gshape, offset, shape, dtype, salt))
+            input_tensors.append(input_values[-1].clone())
+            my_inputs[(tuple(offset), tuple(shape))] = input_tensors[-1]
         for offset, shape in outs[ctx.rank]:
             outputs.append(TensorRegion(offset=list(offset), shape=list(shape), device="cuda", tensor_id=tid))
             sl = tuple(slice(o, o + s) for o, s in zip(offset, shape))
             expected.append(result[sl])
-            output_tensors.append(torch.full(shape, 99, dtype=dtype, device="cuda"))
-    if in_place:
-        # (every rank's single input and output cover the same region: the op writes over its inputs)
-        assert len(input_tensors) == 1 and len(output_tensors) == 1
-        output_tensors = input_tensors
+            same = my_inputs.get((tuple(offset), tuple(shape))) if in_place else None
+            aliased.append(same is not None)
+            output_tensors.append(same if same is not None else torch.empty(shape, dtype=dtype, device="cuda"))
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs, reduce=op_name)
-    op(input_tensors, output_tensors).wait()
-    for i, (out, exp) in enumerate(zip(output_tensors, expected)):
-        ok = torch.equal(out, exp)
-        if not ok:
-            bad = (out != exp).nonzero()
-            first = tuple(bad[0].tolist())
-            ctx.assert_true(
-                False,
-                f"reduce={op_name} {dtype} output {i}: {len(bad)} of {out.numel()} wrong, first at {first}: "
-                f"{out[first].item()} expected {exp[first].item()}",
-            )
+    errors = []
+    for run in range(repeat):
+        for t, v in zip(input_tensors, input_values):
+            t.copy_(v)
+        for t, a in zip(output_tensors, aliased):
+            if not a:
+                t.fill_(99)
+        op(input_tensors, output_tensors).wait()
+        for i, (out, exp) in enumerate(zip(output_tensors, expected)):
+            if not torch.equal(out, exp):
+                bad = (out != exp).nonzero()
+                first = tuple(bad[0].tolist())
+                errors.append(
+                    f"reduce={op_name} {dtype} output {i}{' (in place)' if aliased[i] else ''}, run {run}: {len(bad)} "
+                    f"of {out.numel()} wrong, first at {first}: {out[first].item()} expected {exp[first].item()}"
+                )
+    raise_on_all_ranks(ctx, pg, errors)
     return output_tensors
+
+
+def raise_on_all_ranks(ctx, pg, errors):
+    """Raises on every rank if any rank has errors, so that all ranks leave the test together (a rank that raised
+    alone would leave the others waiting in the next collective)."""
+    count = torch.tensor([len(errors)], dtype=torch.int64, device="cuda")
+    counts = torch.empty(ctx.world_size, dtype=torch.int64, device="cuda")
+    pg._allgather_base(counts, count).wait()
+    failed = [r for r, c in enumerate(counts.tolist()) if c]
+    if failed:
+        ctx.assert_true(False, "; ".join(errors[:4]) if errors else f"wrong results on ranks {failed[:16]}")
 
 
 @test
@@ -211,6 +233,34 @@ def test_reduce_some_ranks(ctx: TestContext):
         spec = {"0": ([numel], ins, outs)}
         for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg"), (torch.int32, "max")]:
             run_reduce(ctx, pg, op_name, dtype, spec)
+
+
+@test
+def test_all_reduce_large(ctx: TestContext):
+    """All-reduce of 64 MiB (across NVLink domains, the pieces are split into parts, which the executors of every
+    domain read and combine one by one); the inputs differ at every position, so that a part from the wrong place
+    shows."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
+        numel = (64 << 20) // torch.tensor([], dtype=dtype).element_size()
+        spec = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+        run_reduce(ctx, pg, op_name, dtype, spec)
+
+
+@test
+def test_all_reduce_in_place_one_source(ctx: TestContext):
+    """In-place all-reduce with inputs on the first and the last rank only, whose outputs are their inputs, and outputs
+    on all ranks. Across NVLink domains, a domain whose one source is the input of one of its destinations contributes
+    a copy of it: the input is also the output that the domain's executor stores the sum to, while the executors of
+    the other domains need it (they used to read it over RDMA as it was being overwritten)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    for numel in [1 << 18, 1 << 24]:
+        whole = [((0,), (numel,))]
+        spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
+        for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
+            run_reduce(ctx, pg, op_name, dtype, spec, in_place=True, repeat=3)
 
 
 @test
