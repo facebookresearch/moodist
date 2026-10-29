@@ -431,18 +431,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 warpIndex = threadIndex / 32;
     u32 laneIndex = laneid();
 
-    // Kernel profiling (debugging aid, compiled out): every thread records a timestamp at each profiling.enter(),
-    // and the op's 401st launch writes them as a Chrome trace to moodist-trace-cuda-<rank>.json (dumpProfiling in
-    // processgroup.cc). Needs Profiling::maxBytesPerThread of device memory per thread, also for every tuning
-    // candidate.
+    // Kernel profiling (debugging aid; MOODIST_COMPILE_OP_PROFILE=N): in the kernel of each op (not in the tuning
+    // candidates), every thread records a timestamp at each profiling.enter(), and the op's N-th launch writes them as
+    // a Chrome trace (dumpProfiling in processgroup.cc). Needs Profiling::maxBytesPerThread of device memory per
+    // thread.
     profiling = Profiling();
-    if (false) {
+    if (const char* env = std::getenv("MOODIST_COMPILE_OP_PROFILE"); env && !tuning) {
+      int launch = std::atoi(env);
+      REQUIRE(launch >= 1, "MOODIST_COMPILE_OP_PROFILE must be the number of the launch to trace (1 or more)");
       auto profilingBuffer = ctx.group->allocateDevice(profiling.dataSize(config));
       profiling = Profiling();
       profiling.start(config, profilingBuffer.cudaPointer);
       rv->profilingData = std::move(profilingBuffer);
       rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
-      rv->profilingCountdown = 400;
+      rv->profilingCountdown = launch - 1;
     }
 
     auto predicated = [&](auto pred, auto f) {

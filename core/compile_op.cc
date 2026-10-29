@@ -976,6 +976,42 @@ struct CompileOpConstructor {
       config.pipelines = 1;
       configs.push_back(config);
     }
+    // MOODIST_COMPILE_OP_CONFIGS="blockSize:sharedMemory:gridSize[:chunkSize[:pipelines]],..." replaces the
+    // candidates (for benchmarks and experiments; the same on every rank)
+    if (Vector<std::string> items = agreedEnvList("MOODIST_COMPILE_OP_CONFIGS", "");
+        items.size() != 1 || !items[0].empty()) {
+      configs.clear();
+      for (const std::string& item : items) {
+        Vector<uint32_t> fields;
+        bool ok = true;
+        for (size_t p = 0; p <= item.size();) {
+          size_t e = std::min(item.find(':', p), item.size());
+          std::string field = item.substr(p, e - p);
+          ok &= !field.empty() && field.size() <= 9 && std::ranges::all_of(field, [](char c) {
+            return c >= '0' && c <= '9';
+          });
+          fields.push_back(ok ? std::stoul(field) : 0);
+          p = e + 1;
+        }
+        KernelConfig config;
+        if (ok && fields.size() >= 3 && fields.size() <= 5) {
+          config.blockSize = fields[0];
+          config.sharedMemory = fields[1];
+          config.gridSize = fields[2];
+          config.chunkSize = fields.size() > 3 ? fields[3] : config.chunkSize;
+          config.pipelines = fields.size() > 4 ? fields[4] : config.pipelines;
+        }
+        ok &= config.blockSize % 32 == 0 && config.blockSize >= 32 && config.blockSize <= 1024 &&
+              config.gridSize >= 1 && config.chunkSize >= 16 && config.chunkSize % 16 == 0 && config.pipelines >= 1 &&
+              config.pipelines * 32 <= config.blockSize;
+        REQUIRE(ok,
+            "compile_op: MOODIST_COMPILE_OP_CONFIGS: bad config '%s' (expected blockSize:sharedMemory:gridSize[:"
+            "chunkSize[:pipelines]], with blockSize a multiple of 32 up to 1024, chunkSize a multiple of 16 and at "
+            "most blockSize / 32 pipelines)",
+            item);
+        configs.push_back(config);
+      }
+    }
 
     Vector<Setting> settings;
     for (const Graph& graph : graphs) {

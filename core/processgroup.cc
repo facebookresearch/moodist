@@ -3236,7 +3236,7 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
   uint64_t clockFreq = (uint64_t)clockRate * 1000;
   uint64_t clockDiv = (clockFreq + 1000000 - 1) / 1000000;
 
-  std::string fn = fmt::sprintf("moodist-trace-cuda-%d.json", group->rank);
+  std::string fn = fmt::sprintf("moodist-trace-cuda-%s-%d-op%u.json", group->name, group->rank, op->id);
   FILE* f = fopen(fn.c_str(), "wb");
   CHECK(f != nullptr);
   fmt::fprintf(f, R"({"traceEvents": [)"
@@ -3265,7 +3265,8 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
         uint32_t index;
         // std::memcpy(&index, data.data() + dataOffset + 8 + 16 * i + 8, sizeof(uint32_t));
         index = clock >> 48;
-        if (index) {
+        // (an unnamed marker, profiling.leave(), ends the span before it)
+        if (index && !op->kernelHandle->profilingNames.at(index).empty()) {
           std::string name = op->kernelHandle->profilingNames.at(index);
           if (!first) {
             fmt::fprintf(f, ",\n");

@@ -98,7 +98,8 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
    its tensors each peer must map, and in which slot of the peer's address table they go.
 11. **Tuning** (`tuneKernels`): the grid size {4, 8, 12, 16} (blocks of 128 threads with one pipeline of 32 KiB
-    chunks in 226 KiB of shared memory), for every graph variant (4 settings per variant). Each setting is
+    chunks in 226 KiB of shared memory), for every graph variant (4 settings per variant;
+    `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations). Each setting is
     generated and JIT compiled, then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12
     launches. The ranks exchange their timings and take the minimum over ranks per setting. The fastest setting
     wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which the computation it overlaps with
@@ -243,6 +244,10 @@ on new tensors at every call.
 - `MOODIST_IB_DATA_DIRECT=0` - ignore the Data Direct DMA functions of ConnectX-8 NICs (not specific to compile_op;
   see the RDMA bandwidth note under Performance).
 - `MOODIST_DUMP_KERNELS` - write each op's final PTX to `moodist-compile-op-kernels-rank<rank>-op<id>.ptx`.
+- `MOODIST_COMPILE_OP_CONFIGS="blockSize:sharedMemory:gridSize[:chunkSize[:pipelines]],..."` - the kernel
+  configurations to tune over, instead of the default ones (see Tuning); e.g. `128:231424:16` for one 16-block
+  configuration (which also skips the tuning of the others). For benchmarks and experiments. Same on all ranks.
+- `MOODIST_COMPILE_OP_PROFILE=N` - kernel profiling (see Tracing).
 
 ## Tracing
 
@@ -256,6 +261,12 @@ records how long each op waited from the call until the CPU thread picked it up,
 or more and moves between cores, with the core numbers. Timestamps are the system clock, so the files of all
 ranks can be merged into one trace (align the nodes' clocks, e.g. on the end of `step exchange`, which all ranks
 leave within a few microseconds).
+
+With `MOODIST_COMPILE_OP_PROFILE=N`, the kernel of every op compiled from then on records a timestamp at each
+marker in `generateKernel` (`profiling.enter`: the phases of the kernel, such as the address exchange, the
+address resolution, the copy loop and the exit sync), and the op's N-th launch synchronizes the device and writes
+them to `moodist-trace-cuda-<group>-<rank>-op<id>.json`, one track per thread (pid = block). Timestamps are SM clock
+cycles since the thread started, shown as microseconds. It costs 128 KiB of device memory per thread of the kernel.
 
 ## Performance notes
 
@@ -534,8 +545,6 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 
 ### Cleanup
 - `docs/api/compile_op.md`: the examples predate `TensorRegion`'s `device` field.
-- Kernel profiling (`Profiling` in `ptx_codegen.cc`) is compiled out with `if (false)`; an environment variable
-  would make it usable without a rebuild.
 
 ### Mixed NVLink and RDMA paths: next steps
 The proxy pass (compile phase step 7) sends data needed by several ranks of an NVLink domain over the network once,
