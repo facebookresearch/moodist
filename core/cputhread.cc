@@ -5686,6 +5686,13 @@ struct CpuThreadImpl {
     // Per signal index: parts of the read that are not done yet
     Vector<size_t> signalPartsLeft;
 
+    // Notifications (see CustomOpDescriptor::Notification): whether the kernel has written each one's flag, and per
+    // rank and slot, the flags not written yet
+    Vector<uint8_t> flagSeen;
+    HashMap<uint32_t, uint32_t> slotFlagsLeft;
+    size_t notificationsLeft = 0;
+    size_t firstUnseen = 0;
+
     size_t liveReads = 0;
     std::array<size_t, maxDevices> deviceLiveReads{};
 
@@ -5700,15 +5707,56 @@ struct CpuThreadImpl {
 
     WorkCustom(CpuThreadImpl& self, QueueEntryCustom& params) : Work(self, params), params(params) {}
 
+    // Whether a read can be issued: its source's input list has arrived, and the source has notified that the data
+    // is there, if the read waits for that
+    bool readReady(const CustomOpDescriptor::IbRead& read) {
+      if (!remoteInputListReady[read.rank]) {
+        return false;
+      }
+      return read.waitSlot < 0 || self.inStepValueDeviceChunk(concurrencyIndex, read.rank, read.waitSlot / maxChunks,
+                                      read.waitSlot % maxChunks) >= stepValue;
+    }
+
+    // Write the notifications whose flags the kernel has written (all flags of their rank and slot)
+    void forwardNotifications() {
+      const auto& notifications = op->notifications;
+      for (size_t i = firstUnseen; i != notifications.size(); ++i) {
+        if (flagSeen[i] || cpuIn[16 + notifications[i].flag] < stepValue) {
+          continue;
+        }
+        flagSeen[i] = 1;
+        --notificationsLeft;
+        const auto& n = notifications[i];
+        if (--slotFlagsLeft[n.rank * CustomOpDescriptor::numNotificationSlots + n.slot] == 0) {
+          self.trace(concurrencyIndex, 0, "%#x notify %d", stepValue, n.rank);
+          self.writeStepValueDeviceChunk(concurrencyIndex, n.rank, 0, rank, n.slot / maxChunks, n.slot % maxChunks);
+        }
+      }
+      while (firstUnseen != notifications.size() && flagSeen[firstUnseen]) {
+        ++firstUnseen;
+      }
+    }
+
     void tryRead(size_t di) {
       CHECK(readIndex < reads.size());
 
+      // A read that waits for a notification may let reads after it go first, until it can be issued
+      if (!readReady(reads[readIndex])) {
+        if (reads[readIndex].waitSlot < 0) {
+          return;
+        }
+        size_t j = readIndex + 1;
+        while (j != reads.size() && !readReady(reads[j])) {
+          ++j;
+        }
+        if (j == reads.size()) {
+          return;
+        }
+        std::rotate(reads.begin() + readIndex, reads.begin() + j, reads.begin() + j + 1);
+      }
+
       auto& read = reads[readIndex];
       uint32_t source = read.rank;
-
-      if (!remoteInputListReady[source]) {
-        return;
-      }
       ++readIndex;
 
       // log.info(
@@ -5872,47 +5920,55 @@ struct CpuThreadImpl {
       // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
       {
         CHECK(params.inputs.size() == op->inputs.size() + op->inputCopies.size());
-        CHECK(params.outputs.size() == op->outputs.size() + op->outputCopies.size());
+        CHECK(params.outputs.size() == op->outputs.size() + op->outputCopies.size() + (op->scratchBytes != 0));
+
+        outputMrs.resize(params.outputs.size());
+        for (size_t i : indices(outputMrs)) {
+          auto& t = params.outputs[i];
+          outputMrs[i] = t->isCuda ? self.regMrCuda(t->data(), t->bytes()) : self.regMr(t->data(), t->bytes());
+        }
 
         Dyn& out = (Dyn&)self.outDyn(concurrencyIndex, 0);
         out.opType = opTypeCustom;
         out.gatherBytes = 0;
         out.stepValue = stepValue;
 
+        // The tensors that other ranks read from: the inputs (and input copies), and the scratch tensor, if any (the
+        // last tensor, with partial results of reductions, see CustomOpDescriptor::scratchBytes)
+        const size_t numTensors = params.inputs.size() + (op->scratchBytes != 0);
         out.custom.opid = op->id;
         out.custom.stepValue = stepValue;
-        out.custom.numInputs = params.inputs.size();
+        out.custom.numInputs = numTensors;
 
-        if (params.inputs.size() <= maxInlinedInputs) {
+        auto describe = [&](size_t i, InputTensor& v) {
+          const bool input = i < params.inputs.size();
+          auto& tensor = input ? params.inputs[i] : params.outputs.back();
+          v.address = tensor->data();
+          v.bytes = tensor->bytes();
+          auto* mr = !input           ? outputMrs.back()
+                     : tensor->isCuda ? self.regMrCuda(v.address, v.bytes)
+                                      : self.regMr(v.address, v.bytes);
+          for (size_t i = 0; i != maxDevices; ++i) {
+            v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
+          }
+        };
 
-          for (size_t i : indices(params.inputs)) {
-            auto& tensor = params.inputs[i];
-            auto& v = out.custom.inputs[i];
-            v.address = tensor->data();
-            v.bytes = tensor->bytes();
-            auto* mr = tensor->isCuda ? self.regMrCuda(v.address, v.bytes) : self.regMr(v.address, v.bytes);
-            for (size_t i = 0; i != maxDevices; ++i) {
-              v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
-            }
+        if (numTensors <= maxInlinedInputs) {
+
+          for (size_t i : range(numTensors)) {
+            describe(i, out.custom.inputs[i]);
           }
 
           out.gatherAddress = 0;
 
         } else {
 
-          dynbuf = self.allocateTemporaryBuffer(sizeof(InputTensor) * params.inputs.size());
+          dynbuf = self.allocateTemporaryBuffer(sizeof(InputTensor) * numTensors);
 
           InputTensor* l = (InputTensor*)dynbuf->cpuPointer;
 
-          for (size_t i : indices(params.inputs)) {
-            auto& tensor = params.inputs[i];
-            auto& v = l[i];
-            v.address = tensor->data();
-            v.bytes = tensor->bytes();
-            auto* mr = tensor->isCuda ? self.regMrCuda(v.address, v.bytes) : self.regMr(v.address, v.bytes);
-            for (size_t i = 0; i != maxDevices; ++i) {
-              v.rkey[i] = mr->mrs[i] ? mr->mrs[i]->rkey : 0;
-            }
+          for (size_t i : range(numTensors)) {
+            describe(i, l[i]);
           }
 
           out.gatherAddress = (uintptr_t)dynbuf->cpuPointer;
@@ -5929,12 +5985,6 @@ struct CpuThreadImpl {
           CHECK(i >= 0 && i < size);
           self.writeDyn(concurrencyIndex, i, 0, rank);
         }
-      }
-
-      outputMrs.resize(params.outputs.size());
-      for (size_t i : indices(outputMrs)) {
-        auto& t = params.outputs[i];
-        outputMrs[i] = t->isCuda ? self.regMrCuda(t->data(), t->bytes()) : self.regMr(t->data(), t->bytes());
       }
 
       CHECK(remoteInputList.empty());
@@ -5988,6 +6038,12 @@ struct CpuThreadImpl {
 
       prepareReads();
 
+      flagSeen.resize(op->notifications.size());
+      for (const auto& n : op->notifications) {
+        ++slotFlagsLeft[n.rank * CustomOpDescriptor::numNotificationSlots + n.slot];
+      }
+      notificationsLeft = op->notifications.size();
+
       if (params.anyCuda) {
         // wait for kernel
         if (cpuIn[0] < stepValue) {
@@ -6021,8 +6077,12 @@ struct CpuThreadImpl {
       self.trace(concurrencyIndex, 0, "%#x reads", stepValue);
       readIndex = 0;
 
-      while (readIndex != reads.size()) {
-        {
+      // Reads, and the notifications of partial results this rank's kernel computes for other ranks
+      while (readIndex != reads.size() || notificationsLeft != 0) {
+        if (notificationsLeft != 0) {
+          forwardNotifications();
+        }
+        if (readIndex != reads.size()) {
           size_t bestDevice = 0;
           size_t bestLiveReads = numParallel;
           for (size_t di = 0; di != numDevices; ++di) {

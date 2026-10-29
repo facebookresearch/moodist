@@ -341,12 +341,27 @@ struct CustomOpDescriptor {
     // >= 0: once the read has completed, write the step value into cpuOutBuffer slot 16 + signalIndex, where the
     // copy kernel waits for it (the proxy read of a mixed NVLink + RDMA op)
     int32_t signalIndex = -1;
+    // >= 0: read only once the source rank has notified this rank that its kernel has written the data (a partial
+    // result of a reduction, see Notification), in notification slot waitSlot
+    int32_t waitSlot = -1;
 
     template<typename X>
     void serialize(X& x) {
-      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes, signalIndex);
+      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes, signalIndex, waitSlot);
     }
   };
+
+  // A partial result of a reduction that this rank's kernel computes for a rank in another NVLink domain (see
+  // crossDomainReductions in compile_op.cc): once the kernel has written the step value into cpuInBuffer slot
+  // 16 + flag, and into those of all other notifications for the same rank and slot, the CPU thread notifies that
+  // rank (slot `slot` of its notifications from this rank), which then reads the data
+  struct Notification {
+    uint32_t flag;
+    uint32_t rank;
+    uint32_t slot;
+  };
+  // Notification slots per pair of ranks (inStepValueDeviceChunk: maxDevices x maxChunks)
+  static constexpr size_t numNotificationSlots = 32;
 
   Vector<Copy> inputCopies;
   Vector<Copy> outputCopies;
@@ -359,6 +374,11 @@ struct CustomOpDescriptor {
   // same amount from every rank outside its NVLink domain (each source then has one reader at a time), 8 otherwise
   // (with unequal amounts, reading one source at a time leaves some sources idle; see compile_op.cc)
   uint32_t readSources = 1;
+  Vector<Notification> notifications;
+  // Reductions across NVLink domains: the bytes of the scratch tensor (a CUDA tensor of the op's dtype that customOp
+  // allocates per launch, after the output copies: the last tensor), which holds the partial results that this rank
+  // computes for other domains and the ones that it reads from them; 0 if none
+  size_t scratchBytes = 0;
 
   Vector<compile_op::Graph::TensorDescr> inputs;
   Vector<compile_op::Graph::TensorDescr> outputs;

@@ -63,9 +63,23 @@ struct Graph {
     // The part of the cell, for cells whose proxied transfer is split into chunks (0 otherwise)
     uint32_t chunkIndex = 0;
 
+    // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc):
+    // per source, the signal index of the RDMA read that fills it (the kernel waits for cpuOutBuffer slot
+    // 16 + signal before it loads the source), or -1; empty if no source waits
+    Vector<int32_t> sourceSignals;
+    // The number of sources, at the end, that are partial results of other NVLink domains: an average has divided
+    // those by the divisor already, the others it divides after combining them
+    uint32_t partialSources = 0;
+    // Avg: the number of inputs the result is the average of (0: the number of sources)
+    uint32_t divisor = 0;
+    // >= 0: a partial result that a rank in another domain reads over RDMA. Once all of the edge has been stored,
+    // the kernel writes the step value into cpuInBuffer slot 16 + doneSignal, for its CPU thread.
+    int32_t doneSignal = -1;
+
     template<typename X>
     void serialize(X& x) {
-      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex);
+      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex, sourceSignals,
+          partialSources, divisor, doneSignal);
     }
   };
 

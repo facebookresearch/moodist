@@ -3531,6 +3531,19 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     result->holdTensors.push_back(std::move(t));
   }
 
+  // Reductions across NVLink domains: the scratch tensor (see CustomOpDescriptor::scratchBytes), the last tensor.
+  // Allocated on the op's stream: once freed, it is reused only by work after the op on that stream, which comes after
+  // the RDMA reads into and from it (the stream waits for the CPU thread, see below).
+  if (op->scratchBytes != 0) {
+    StreamGuard sg(stream, group->deviceIndex);
+    TensorPtr t = TensorPtr::empty(
+        {(int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype))}, op->dtype, group->deviceIndex);
+    auto td = getTensorDataFromPtr(t, group.get());
+    CHECK(td->isCuda && td->bytes() == op->scratchBytes);
+    outputTDs.push_back(std::move(td));
+    result->holdTensors.push_back(std::move(t));
+  }
+
   bool anyRdma = op->anyRankNeedsRdma;
 
   if (op->cpuSync) {

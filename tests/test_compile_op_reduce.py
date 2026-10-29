@@ -2,11 +2,14 @@
 Tests for compile_op reductions: reduce="sum", "avg", "min" and "max", where every output element is the op over all
 the input regions (of all ranks) that cover it, e.g. reduce-scatter and all-reduce.
 
-Reductions need CUDA tensors on ranks of one NVLink domain (a node, or e.g. an NVL72 rack).
+Reductions need CUDA tensors. Across NVLink domains (nodes, or e.g. NVL72 racks), so far only regions whose outputs are
+all in one domain (e.g. reduce-scatter, reduce to one rank; all-reduce raises): with several domains, run the tests of
+those (reduce_scatter, reduce_scatter_large, reduce_scatter_tensor_ids, reduce_to_one).
 
 Inputs are small integers that depend on the rank, the region and the global index, so that every rank can compute
 every rank's inputs, and sums are exact in every dtype: the expected results are exact too (avg: the exact sum divided
-by the number of inputs, rounded once in float32, then to the dtype, as the kernel does).
+by the number of inputs, rounded once in float32, then to the dtype, as the kernel does; across domains, the partial
+results of other domains are divided and rounded to the dtype first, which is exact with a power of 2 ranks).
 """
 
 import math
@@ -162,6 +165,35 @@ def test_reduce_to_one(ctx: TestContext):
     spec = {"0": ([numel], [[((0,), (numel,))]] * n, outs)}
     for dtype in [torch.float32, torch.int64]:
         run_reduce(ctx, pg, "sum", dtype, spec)
+
+
+@test
+def test_reduce_scatter_large(ctx: TestContext):
+    """Reduce-scatter of 10 MiB per rank, and reduce to one rank of 10 MiB (across NVLink domains, the partial results
+    of other domains arrive in parts)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 5 << 19
+    spec = {"0": ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])}
+    run_reduce(ctx, pg, "sum", torch.float32, spec)
+    outs = [[] for _ in range(n)]
+    outs[0] = [((0,), (numel,))]
+    spec = {"0": ([numel], [[((0,), (numel,))]] * n, outs)}
+    run_reduce(ctx, pg, "avg", torch.bfloat16, spec)
+
+
+@test
+def test_reduce_scatter_tensor_ids(ctx: TestContext):
+    """Reduce-scatter of 40 tensors in one op (across NVLink domains, more partial results per pair of ranks than they
+    have notification slots, with small domains)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    spec = {}
+    for t in range(40):
+        numel = 64 * (t % 3 + 1)
+        spec[f"t{t}"] = ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])
+    for op_name in ["sum", "avg"]:
+        run_reduce(ctx, pg, op_name, torch.float32, spec)
 
 
 @test

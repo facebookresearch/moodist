@@ -589,18 +589,26 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       };
       return key(a) < key(b);
     });
+    // The edges that compute partial results which ranks in other NVLink domains wait for (see crossDomainReductions
+    // in compile_op.cc) come first: the reduce loop's blocks take items in order, so these have all been taken
+    // before any block waits for a partial result of another domain
+    std::stable_partition(firstCopy, localCopies.end(), [](const Edge& e) {
+      return e.doneSignal >= 0;
+    });
 
-    // nowaits: no edge waits for another edge or for the CPU thread, so the edges run in order
+    // nowaits: no edge waits for another edge or for the CPU thread, so the edges run in order (the reduce loop's
+    // waits for the sources that the CPU thread reads from other NVLink domains aside, see Edge::sourceSignals)
     bool nowaits = true;
     bool hasRemoteWrites = false;
     size_t maxDestinations = 0;
-    // reduceKernel: this rank executes reductions (edges with several sources), and runs the reduce loop below
+    // reduceKernel: this rank executes reductions (edges with several sources, or parts of a reduction across NVLink
+    // domains), and runs the reduce loop below
     bool reduceKernel = false;
     for (const Edge& e : localCopies) {
       if (e.sources.empty() || !std::ranges::all_of(e.sources, &Node::filled)) {
         nowaits = false;
       }
-      reduceKernel |= e.sources.size() > 1;
+      reduceKernel |= e.sources.size() > 1 || !e.sourceSignals.empty() || e.doneSignal >= 0;
       for (const Node& n : e.destinations) {
         if (n.rank != rank) {
           hasRemoteWrites = true;
@@ -674,6 +682,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
     static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
     static constexpr uint32_t edgeNvls = 16;   // stored with NVLS when the launch can: the NVLS slot follows the dsts
+    static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for the CPU thread (PipeEdge::waits)
+    static constexpr uint32_t edgeDoneSignal = 64;  // reduce loop: signals the CPU thread when stored (doneSignal)
 
     // ---- NVLS (NVLink SHARP multicast) ----
     // An edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can store each
@@ -951,11 +961,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t numSignals;
       uint32_t nvlsFirst;
       uint32_t numSources;
+      // Reductions: the sources that an average divides after combining them (the first ones; the others are
+      // partial results, see Edge::partialSources) and the divisor; with edgeSourceWaits, the index of the first
+      // source's word in the wait table (per source, its signal index + 1, or 0 if it does not wait); with
+      // edgeDoneSignal, the cpuIn slot to signal (Edge::doneSignal)
+      uint32_t inputSources;
+      uint32_t divisor;
+      uint32_t waits;
+      uint32_t doneSignal;
     };
-    static_assert(
-        sizeof(PipeEdge) == 48 && offsetof(PipeEdge, nvlsFirst) == 40 && offsetof(PipeEdge, numSources) == 44);
+    static_assert(sizeof(PipeEdge) == 64 && offsetof(PipeEdge, nvlsFirst) == 40 &&
+                  offsetof(PipeEdge, numSources) == 44 && offsetof(PipeEdge, doneSignal) == 60);
     std::vector<PipeEdge> pipeEdges;
     std::vector<NodeSetup> pipeAddrSetups;
+    std::vector<uint32_t> pipeWaits;
     uint32_t pipeNumItems = 0;
     // The NVLS edges' address slots and destination counts (for the check of every launch, see below)
     std::vector<std::array<uint32_t, 2>> nvlsEdgeTable;
@@ -995,6 +1014,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         p.numSignals = s.numSignals;
         p.nvlsFirst = nvlsChunksTotal;
         p.numSources = e.sources.size();
+        CHECK(e.partialSources <= e.sources.size());
+        p.inputSources = e.sources.size() - e.partialSources;
+        p.divisor = e.divisor != 0 ? e.divisor : e.sources.size();
+        if (!e.sourceSignals.empty()) {
+          CHECK(e.sourceSignals.size() == e.sources.size());
+          p.flags |= edgeSourceWaits;
+          p.waits = pipeWaits.size();
+          for (int32_t signal : e.sourceSignals) {
+            pipeWaits.push_back(signal + 1);
+          }
+        }
+        if (e.doneSignal >= 0) {
+          p.flags |= edgeDoneSignal;
+          p.doneSignal = e.doneSignal;
+        }
         for (const Node& n : e.sources) {
           pipeAddrSetups.push_back(nodeSetup(n));
         }
@@ -1036,6 +1070,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t pipeEdgeTableOffset = appendTable(pipeEdges);
     size_t pipeAddrSetupOffset = appendTable(pipeAddrSetups);
     size_t nvlsEdgeTableOffset = appendTable(nvlsEdgeTable);
+    size_t pipeWaitsOffset = appendTable(pipeWaits);
     u64 tables = addGlobalData(16, tableData.data(), tableData.size(), "tables");
 
     // Shared memory: with waits, the scan for ready edges keeps a done bit per edge and the selected edge, and the
@@ -1845,9 +1880,25 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
         u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
 
+        // Reductions across NVLink domains (not in the tuning launches, which run without the CPU thread): sources
+        // that the CPU thread reads from other domains, and partial results that it sends to them (see
+        // crossDomainReductions in compile_op.cc)
+        bool anyWaits = false;
+        bool anyDoneSignals = false;
+        for (const PipeEdge& p : pipeEdges) {
+          anyWaits |= !tuning && (p.flags & edgeSourceWaits) != 0;
+          anyDoneSignals |= !tuning && (p.flags & edgeDoneSignal) != 0;
+        }
+        // Per concurrency slot and edge: the items of a partial result stored so far
+        std::optional<u64> partialDone;
+        if (anyDoneSignals) {
+          partialDone = addGlobalVar(4, 4 * maxConcurrency * numEdges, "partialdone");
+        }
+
         // Thread 0's loads: the stage of the next load, the item being loaded (its edge, the first item of the edge
-        // after it, its next source, its number of sources, its address slot, its offset in the edge and its size),
-        // and its slot in the item ring; ldDone once no items are left
+        // after it, its next source, its number of sources, its address slot, its offset in the edge and its size,
+        // and with waits, its first wait word or ~0 if none), and its slot in the item ring; ldDone once no items
+        // are left; the loads issued so far
         u32 ldStage = 0;
         u32 ldEdge = 0;
         u32 ldNextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
@@ -1856,9 +1907,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u32 ldAddrSlot = 0;
         u64 ldOffset = 0;
         u32 ldBytes = 0;
+        u32 ldWaits = 0;
         u32 ldSlot = 0;
         Value ldDone(ValType::Pred);
         ldDone = 0;
+        u32 ldIssued = 0;
+        // The stages that the threads have combined so far (the same in all threads)
+        u32 consumed = 0;
         // Take the item of the claim in flight, claim the next one, and write the item (its edge and chunk) to the
         // item ring, or past the last item, the end mark (claims of one block only increase)
         auto startItem = [&]() {
@@ -1876,6 +1931,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             ldOffset = widen(chunk) * chunkSize;
             ldBytes = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(ldOffset), chunkSize);
             ldSource = 0;
+            if (anyWaits) {
+              u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
+              ldWaits = selp_u32(
+                  ld_global_nc_u32(record + offsetof(PipeEdge, waits)), 0xffffffffll, (flags & edgeSourceWaits) != 0);
+            }
             st_shared_u32(reduceItemRing + ldSlot * 8, ldEdge);
             st_shared_u32(reduceItemRing + ldSlot * 8 + 4, chunk);
           }
@@ -1894,11 +1954,48 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           cp_async_bulk_shared_global(reduceStages + ldStage * chunkSize, src, ldBytes, barrier);
           u32 next = ldStage + 1;
           ldStage = selp_u32(0, next, next == numStages);
+          ldIssued += 1;
           ldSource += 1;
           IF(ldSource == ldNumSources) {
             u32 nextSlot = ldSlot + 1;
             ldSlot = selp_u32(0, nextSlot, nextSlot == reduceItemSlots);
             startItem();
+          }
+        };
+        // Issue loads while the ring has room (thread 0). A source that the CPU thread reads from another NVLink
+        // domain is loaded once its read has arrived (the signal in cpuOutBuffer): until then, the loads stop there,
+        // and the block goes on with the stages it has. It waits for the signal only when it has combined all stages
+        // loaded before (blocking, at the start of a stage): its earlier items are then complete, including the
+        // partial results among them that other domains wait for, which come before anything that waits (see
+        // localCopies), so all blocks of all ranks make progress.
+        u64 signalFlags = concurrency(group->cpuOutBuffer) + 4 * 16;
+        auto fill = [&](bool blocking) {
+          WHILE(!ldDone & (ldIssued - consumed < numStages)) {
+            if (anyWaits) {
+              IF(ldWaits != 0xffffffffll) {
+                u32 wait = ld_global_nc_u32(tables + pipeWaitsOffset + widen((ldWaits + ldSource) * 4));
+                IF(wait != 0) {
+                  u64 flag = signalFlags + widen((wait - 1) * 4);
+                  u32 value = ld_global_relaxed_sys_u32(flag);
+                  if (blocking) {
+                    IF(ldIssued == consumed) {
+                      profiling.enter("reduce wait");
+                      WHILE(value < stepValue) {
+                        value = ld_global_relaxed_sys_u32(flag);
+                      }
+                      profiling.leave();
+                    }
+                  }
+                  IF(value < stepValue) {
+                    BREAK;
+                  }
+                  // The data arrived before the signal; the loads are bulk copies
+                  fence_acquire_sys();
+                  fence_proxy_async_global();
+                }
+              }
+            }
+            issueLoad();
           }
         };
 
@@ -1907,11 +2004,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           // The loads below may read data whose readiness generic loads have observed
           fence_proxy_async_global();
           startItem();
-          u32 loaded = 0;
-          WHILE(!ldDone & (loaded < numStages)) {
-            issueLoad();
-            loaded += 1;
-          }
+          fill(false);
         }
         barrier_sync();
 
@@ -1939,12 +2032,27 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 addrSlot = ld_global_nc_u32(record + offsetof(PipeEdge, addrSlot));
           u64 offset = widen(chunk) * chunkSize;
           u32 n = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(offset), chunkSize);
+          // An average divides once it has combined the inputs among the sources (the partial results of other
+          // domains after them are divided already)
+          u32 inputSources;
+          Value divisor(acc64 ? ValType::U64 : ValType::U32);
+          if (op == ReduceOp::Avg) {
+            inputSources = ld_global_nc_u32(record + offsetof(PipeEdge, inputSources));
+            arith(acc64 ? "cvt.rn.f64.u32" : "cvt.rn.f32.u32", divisor,
+                ld_global_nc_u32(record + offsetof(PipeEdge, divisor)));
+          }
           for (auto& a : acc) {
             for (Value& v : a) {
               v = identity;
             }
           }
           FOR(u32 s = 0, s < numSources, s += 1) {
+            if (anyWaits) {
+              // The load of this stage has not been issued: it waits for a source from another domain
+              IF_D(isThreadZero & (ldIssued == consumed)) {
+                fill(true);
+              }
+            }
             mbarrier_wait_parity_spin(reduceBarriers + consStage * 8, consParity);
             u32 stage = reduceStages + consStage * chunkSize;
             for (uint32_t v : range(numVectors)) {
@@ -1955,14 +2063,24 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                 combine(acc[v][j], x[j]);
               }
             }
+            if (op == ReduceOp::Avg) {
+              IF(s + 1 == inputSources) {
+                for (auto& a : acc) {
+                  for (Value& v : a) {
+                    arith(acc64 ? "div.rn.f64" : "div.rn.f32", v, v, divisor);
+                  }
+                }
+              }
+            }
             u32 next = consStage + 1;
             Value wrap = next == numStages;
             consStage = selp_u32(0, next, wrap);
             consParity = consParity ^ selp_u32(1, 0, wrap);
+            consumed += 1;
             // Every thread has combined the stage: load the next chunk into it
             barrier_sync();
-            IF_D(isThreadZero & !ldDone) {
-              issueLoad();
+            IF_D(isThreadZero) {
+              fill(false);
             }
           }
           // The result buffer is free once the stores of the item before the previous one have read it
@@ -1972,16 +2090,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           barrier_sync();
           u32 buffer = reduceResultBuffers + result * chunkSize;
           Value copy = numSources == 1;
-          Value divisor(acc64 ? ValType::U64 : ValType::U32);
-          if (op == ReduceOp::Avg) {
-            arith(acc64 ? "cvt.rn.f64.u32" : "cvt.rn.f32.u32", divisor, numSources);
-          }
           for (uint32_t v : range(numVectors)) {
-            if (op == ReduceOp::Avg) {
-              for (Value& a : acc[v]) {
-                arith(acc64 ? "div.rn.f64" : "div.rn.f32", a, a, divisor);
-              }
-            }
             std::array<u32, 4> x = pack(acc[v]);
             for (size_t j : range(4)) {
               x[j] = selp_u32(raw[v][j], x[j], copy);
@@ -1998,6 +2107,25 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               cp_async_bulk_global_shared(dst, buffer, n);
             }
             cp_async_bulk_commit_group();
+            if (anyDoneSignals) {
+              // A partial result that another domain reads: once all its items (of any block) are stored, the last
+              // one signals the CPU thread (per launch, every item counts once, so the counter wraps back to 0)
+              u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
+              IF((flags & edgeDoneSignal) != 0) {
+                cp_async_bulk_wait_group(0);
+                fence_proxy_async_global();
+                fence_release_gpu();
+                u32 numItems = ld_global_nc_u32(record + offsetof(PipeEdge, numItems));
+                u32 old = atom_global_relaxed_inc_u32(
+                    *partialDone + widen((concurrencyIndex * numEdges + edge) * 4), numItems - 1);
+                IF(old == numItems - 1) {
+                  fence_acquire_gpu();
+                  fence_release_sys();
+                  u32 doneSignal = ld_global_nc_u32(record + offsetof(PipeEdge, doneSignal));
+                  st_global_relaxed_sys_u32(concurrency(group->cpuInBuffer) + widen((16 + doneSignal) * 4), stepValue);
+                }
+              }
+            }
           }
           result = result ^ 1;
           u32 nextSlot = consSlot + 1;
