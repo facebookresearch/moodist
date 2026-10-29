@@ -34,7 +34,8 @@ struct Vector {
   Vector(Vector&& n) noexcept {
     *this = std::move(n);
   }
-  Vector(size_t count) {
+  // (explicit: `v = {x}` would make x default elements)
+  explicit Vector(size_t count) {
     resize(count);
   }
   template<typename Iterator>
