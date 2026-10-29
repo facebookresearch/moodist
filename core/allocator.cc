@@ -1226,7 +1226,13 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream freeStream) {
   internalDelete(ctx);
 }
 
+// (impl, here and below, is what createCudaAllocatorImpl returned to the wrapper: nullptr, as the allocator is the
+// global one)
 void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstream stream) {
+  impl = globalCudaAllocatorImpl;
+  if (!impl) {
+    return;
+  }
   std::lock_guard l(impl->mutex);
 
   auto& list = impl->streamUses[ptr];
@@ -1242,10 +1248,13 @@ void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstr
 }
 
 int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl) {
-  return impl->deviceIndex;
+  impl = globalCudaAllocatorImpl;
+  return impl ? impl->deviceIndex : -1;
 }
 
 void* allocatorAddFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* callbackFn) {
+  std::call_once(initFlag, init);
+  impl = globalCudaAllocatorImpl;
   std::lock_guard l(impl->mutex);
   FunctionPointer fp = static_cast<FunctionPointer>(callbackFn);
   auto& head = impl->freeCallbacks[baseAddress];
@@ -1255,6 +1264,8 @@ void* allocatorAddFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress, v
 }
 
 void allocatorRemoveFreeCallback(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle) {
+  std::call_once(initFlag, init);
+  impl = globalCudaAllocatorImpl;
   std::lock_guard l(impl->mutex);
   auto** head = &impl->freeCallbacks[baseAddress];
   while (*head) {
