@@ -120,20 +120,26 @@ struct PipeRing {
   }
 
   // Load bytes at src + offset into the next stage, to be stored to the numDestinations addresses (plus offset) in
-  // the array at dsts
+  // the array at dsts; tag is returned by its store(), aux kept for nextStoreAux()
   void load(const u64& src, const u64& offset, const u32& bytes, const u64& dsts, const u32& numDestinations,
-      const u32& tag) {
+      const u32& tag, const u32& aux) {
     u32 record = records + loadStage * recordSize;
     st_shared_u64(record, offset);
     st_shared_u64(record + 8, dsts);
     st_shared_u32(record + 16, bytes);
     st_shared_u32(record + 20, numDestinations);
     st_shared_u32(record + 24, tag);
+    st_shared_u32(record + 28, aux);
     u32 barrier = barriers + loadStage * 8;
     mbarrier_arrive_expect_tx(barrier, bytes);
     cp_async_bulk_shared_global(buffers + loadStage * chunkSize, src + offset, bytes, barrier);
     u32 next = loadStage + 1;
     loadStage = selp_u32(0, next, next == numStages);
+  }
+
+  // The aux value of the chunk that store() stores next (its record is written when it is loaded)
+  u32 nextStoreAux() {
+    return ld_shared_u32(records + storeStage * recordSize + 28);
   }
 
   // Wait for the chunk of the next stage to arrive, and issue its stores (one bulk group). Returns its tag.
@@ -414,6 +420,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 params = paramBase(0);
     u32 stepValue = loadParamField(params, 0, ValType::U32);
     u32 concurrencyIndex = loadParamField(params, 4, ValType::U32);
+    static_assert(offsetof(CompileOpCopyParameters, nvlsCounterBase) == 8);
 
     u32 inputAddrs = paramBase(1);
     u32 mappedAddrs = paramBase(2);
@@ -578,7 +585,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // edges. All tables are in one initialized global array.
     //
     // A node address is the node's offset plus, for slot = 8 * tensorIndex | 1, this rank's tensor (a kernel
-    // parameter), else the peer's tensor at byte offset slot in the exchanged address table.
+    // parameter), else the peer's tensor at byte offset slot in the exchanged address table (bit 1 marks the NVLS
+    // slot of an edge; see the address table below).
     struct NodeSetup {
       uint32_t slot;
       uint32_t offsetLow;
@@ -620,6 +628,126 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeWait = 2;    // waits for its source node (relay edges: for the signal)
     static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
     static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
+    static constexpr uint32_t edgeNvls = 16;   // stored with NVLS when the launch can: the NVLS slot follows the dsts
+
+    // ---- NVLS (NVLink SHARP multicast) ----
+    // An edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can store each
+    // chunk once, to the group's multicast mapping of that offset (see Group::Nvls), which the NVLink switches copy
+    // to every GPU, instead of once per destination. One SM then reaches the GPUs' NVLink ingress, where unicast
+    // stores need 12-16 (all-gather on 32 GB300: 1M 62 vs 73 us, 4M 208 vs 239, 256M 12.4 vs 12.7 ms). It needs the
+    // destination tensors at the same offset of every rank's pool (moodist's allocator), which every launch checks
+    // with the addresses the peers publish (see nvlsPoolBit and the address table below); otherwise the launch
+    // stores to each destination as usual. A rank uses NVLS if every edge it executes is such an edge, every rank
+    // that does stores the same number of chunks (see the step counter below), and the group has at least
+    // nvlsMinRanks ranks, all in one NVLink domain: within one node (4 GPUs), multicast stores were slower from 4M
+    // on (the switch also sends each chunk back to the sender, 1/4 of a GPU's ingress; 1/32 on 32 GPUs).
+    //
+    // Step counter: multicast stores from all ranks at full speed overload the switches' links to the GPUs (more
+    // than their ingress arrives), which then deliver about 2/3 of their bandwidth (all-gather of 256M on 32 GPUs:
+    // 17-19 ms instead of 12.3). So the ranks advance in step: once the stores of a chunk have completed, a rank adds
+    // 1 to the op's step counter through its multicast address (one multimem.red reaches every GPU), and it stores
+    // its chunk c only once its local copy of the counter shows that every rank has completed its chunks up to
+    // c - nvlsWindow. This bounds the data in flight to what the links deliver, without a clock (pacing the stores
+    // by time worked too, but needs the rate). The counter of each concurrency slot only grows: customOp passes its
+    // value before the launch (launches times nvlsIncrement).
+    static constexpr size_t nvlsMinRanks = 16;
+    static constexpr uint32_t nvlsSignalLag = 1; // a chunk is signaled once the stores of the one after it are issued
+    static constexpr size_t nvlsCountersStride = 64; // bytes per counter (one per concurrency slot)
+    // With NVLS, a pipeline stores chunks of nvlsChunkSize through its own ring over the same stage memory (up to
+    // nvlsMaxStages stages; a chunk's single store reads its stage quickly, so it reloads the stage of the chunk
+    // before): per chunk, the window and the counter cost time, and 64 KiB chunks reached 674 GB/s of a GPU's
+    // ingress (32 GPUs, all-gather) where 32 KiB chunks reached 654. At least 2 stages: of the 4 the unicast ring has.
+    const uint32_t nvlsChunkSize = std::max(config.chunkSize, std::min(65536u, 2 * config.chunkSize));
+    static constexpr uint32_t nvlsMaxStages = 4;
+    static constexpr uint32_t nvlsStoreLag = 1;
+    static_assert(std::tuple_size_v<decltype(KernelHandle::nvlsLaunches)> == maxConcurrency);
+
+    // The local destination of an edge that can store with NVLS (if every rank's pool holds its destination at the
+    // same offset), else nullptr
+    auto nvlsLocalDestination = [&](const Edge& e) -> const Node* {
+      if (e.sources.size() != 1 || !e.sources[0].filled || e.destinations.size() != group->size || hasDependents(e)) {
+        return nullptr;
+      }
+      Vector<uint8_t> seen(group->size);
+      const Node* local = nullptr;
+      for (const Node& n : e.destinations) {
+        const Node& first = e.destinations[0];
+        if (n.rank >= group->size || seen[n.rank] || n.tensorIndex != first.tensorIndex || n.offset != first.offset ||
+            n.device != DeviceType::CUDA) {
+          return nullptr;
+        }
+        seen[n.rank] = 1;
+        if (n.rank == rank) {
+          local = &n;
+        }
+      }
+      return local;
+    };
+
+    // Whether the op uses NVLS (decided by all ranks together; the same on every rank), and if so, the chunks this
+    // rank stores with it per launch (0 if none), the ranks that store any (all the same number), the window and
+    // the offset of the op's counters in the group's counter area
+    bool nvlsOp = false;
+    uint32_t nvlsChunks = 0;  // stored by this rank
+    uint32_t nvlsSenders = 0; // the ranks that store any
+    uint32_t nvlsWindow = 0;
+    size_t nvlsCountersOffset = 0;
+    if (!tuning) {
+      Group* g = ctx.group;
+      const bool capable = !ctx.collectiveOp && g->size >= nvlsMinRanks && g->supportsMulticast &&
+                           g->fabricDomainRanks.size() == g->size && g->nvls.state != -1 &&
+                           allocatorGetReservedBase() != 0 && ranks.size() == g->size;
+      uint64_t chunks = 0;
+      bool all = capable && nowaits && !localCopies.empty();
+      for (const Edge& e : localCopies) {
+        all &= nvlsLocalDestination(e) != nullptr;
+        chunks += (e.bytes + nvlsChunkSize - 1) / nvlsChunkSize;
+      }
+      uint32_t myChunks = all && chunks < (1u << 30) ? (uint32_t)chunks : 0;
+      for (uint32_t r : ranks) {
+        ctx.send(r, capable, myChunks);
+      }
+      bool allCapable = true;
+      bool uniform = true;
+      uint32_t sendersChunks = 0;
+      for (uint32_t r : ranks) {
+        bool c;
+        uint32_t n;
+        ctx.receive(r, c, n);
+        allCapable &= c;
+        if (n) {
+          uniform &= nvlsSenders == 0 || n == sendersChunks;
+          sendersChunks = n;
+          ++nvlsSenders;
+        }
+      }
+      // A rank that does not have every rank among its peers says so (capable is false): every rank that does
+      // hears it (the peers of a rank have it among theirs), so they all agree. setupNvls is collective over the
+      // group, which is then all of ranks.
+      nvlsOp = allCapable && uniform && nvlsSenders > 0 && g->setupNvls();
+      if (nvlsOp && g->nvls.nextCounters + nvlsCountersStride * maxConcurrency > Group::Nvls::countersBytes) {
+        if (rank == 0) {
+          log.error("moodist: compile_op: no NVLS step counters left for more ops; this op does not use NVLS\n");
+        }
+        nvlsOp = false;
+      }
+      if (nvlsOp) {
+        nvlsCountersOffset = g->nvls.nextCounters;
+        g->nvls.nextCounters += nvlsCountersStride * maxConcurrency;
+        nvlsChunks = myChunks;
+        // A pipeline holds up to nvlsSignalLag stored but unsignaled chunks while it waits for the counter, so the
+        // window must be larger than all of them (8: see the results above)
+        nvlsWindow = std::max<uint32_t>(8, config.pipelines * nvlsSignalLag + 1);
+        rv->nvls = true;
+        rv->nvlsIncrement = nvlsSenders * sendersChunks;
+        if (rank == 0) {
+          log.info("compile_op: NVLS: %d ranks store %d chunks of %d bytes each with multicast stores\n", nvlsSenders,
+              sendersChunks, nvlsChunkSize);
+        }
+      }
+    }
+    // Whether this rank's kernel stores with NVLS
+    const bool nvlsLocal = nvlsChunks != 0;
 
     auto nodeSetup = [&](const Node& n) {
       NodeSetup s;
@@ -734,8 +862,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // chunks to many ranks spread over the SMs too (a load per group: more local reads, which are cheap). Per edge:
     // the index of its first item in the sequence, the destination groups (item i of the edge covers chunk
     // i / groups and destination group i % groups), and the slots of its addresses in the address table that every
-    // block resolves at the start (source, then destinations). A last record (firstItem = the number of items) ends
-    // the sequence.
+    // block resolves at the start (source, then destinations, then with NVLS the NVLS slot: the multicast address of
+    // the local destination, or 0 if the launch stores to each destination). A last record (firstItem = the number of
+    // items) ends the sequence. With NVLS, the chunks of all edges also form one sequence (nvlsFirst: the index of an
+    // edge's first chunk), which a launch that uses NVLS stores instead.
     const uint32_t chunkSize = config.chunkSize;
     const uint32_t numPipelines = config.pipelines;
     const uint32_t numClaimers = numBlocks * numPipelines;
@@ -750,12 +880,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t flags;
       uint32_t signals;
       uint32_t numSignals;
-      uint32_t pad[2];
+      uint32_t nvlsFirst;
+      uint32_t pad;
     };
-    static_assert(sizeof(PipeEdge) == 48);
+    static_assert(sizeof(PipeEdge) == 48 && offsetof(PipeEdge, nvlsFirst) == 40);
     std::vector<PipeEdge> pipeEdges;
     std::vector<NodeSetup> pipeAddrSetups;
     uint32_t pipeNumItems = 0;
+    // The NVLS edges' address slots and destination counts (for the check of every launch, see below)
+    std::vector<std::array<uint32_t, 2>> nvlsEdgeTable;
+    uint32_t nvlsChunksTotal = 0;
     CHECK(chunkSize >= 16 && chunkSize % 16 == 0);
     CHECK(numPipelines >= 1 && numPipelines * 32 <= blockSize);
     if (nowaits) {
@@ -779,17 +913,28 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         p.groupSize = (numDestinations + std::min<uint64_t>(groupsWanted, numDestinations) - 1) /
                       std::min<uint64_t>(groupsWanted, numDestinations);
         p.groups = (numDestinations + p.groupSize - 1) / p.groupSize;
+        const Node* nvlsDestination = nvlsLocal ? nvlsLocalDestination(e) : nullptr;
+        CHECK(nvlsDestination || !nvlsLocal);
         p.firstItem = pipeNumItems;
         p.numItems = numChunks * p.groups;
         p.bytes = e.bytes;
         p.addrSlot = pipeAddrSetups.size();
         p.numDestinations = numDestinations;
-        p.flags = s.flags;
+        p.flags = s.flags | (nvlsDestination ? edgeNvls : 0);
         p.signals = s.signals;
         p.numSignals = s.numSignals;
+        p.nvlsFirst = nvlsChunksTotal;
         pipeAddrSetups.push_back(nodeSetup(e.sources.at(0)));
         for (const Node& n : e.destinations) {
           pipeAddrSetups.push_back(nodeSetup(n));
+        }
+        if (nvlsDestination) {
+          // The NVLS slot: the local destination's setup, marked by bit 1 (see the address table below)
+          NodeSetup m = nodeSetup(*nvlsDestination);
+          m.slot |= 2;
+          pipeAddrSetups.push_back(m);
+          nvlsEdgeTable.push_back({p.addrSlot, numDestinations});
+          nvlsChunksTotal += (e.bytes + nvlsChunkSize - 1) / nvlsChunkSize;
         }
         pipeEdges.push_back(p);
         CHECK((uint64_t)pipeNumItems + p.numItems < (1ull << 30));
@@ -797,7 +942,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       PipeEdge end = {};
       end.firstItem = pipeNumItems;
+      end.nvlsFirst = nvlsChunksTotal;
       pipeEdges.push_back(end);
+      CHECK(nvlsChunksTotal == nvlsChunks);
     }
 
     std::vector<uint8_t> tableData;
@@ -815,6 +962,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t addrTableOffset = appendTable(addrTable);
     size_t pipeEdgeTableOffset = appendTable(pipeEdges);
     size_t pipeAddrSetupOffset = appendTable(pipeAddrSetups);
+    size_t nvlsEdgeTableOffset = appendTable(nvlsEdgeTable);
     u64 tables = addGlobalData(16, tableData.data(), tableData.size(), "tables");
 
     // Shared memory: with waits, the scan for ready edges keeps a done bit per edge and the selected edge, and the
@@ -829,7 +977,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     uint32_t numStages = 0;
     {
       const size_t perStage = chunkSize + 8 + PipeRing::recordSize;
-      size_t fixed = 256 + scanShared + (nowaits ? 0 : 8 * maxDestinations); // 256: alignment padding
+      // 256: alignment padding; with NVLS, the check's flag and the NVLS rings' barriers and records
+      size_t fixed = 256 + scanShared + (nowaits ? 0 : 8 * maxDestinations) +
+                     (nvlsLocal ? 32 + numPipelines * nvlsMaxStages * (8 + PipeRing::recordSize) : 0);
       if (nowaits && pipeTableBytes <= pipeTableSharedLimit &&
           config.sharedMemory >= fixed + pipeTableBytes + 4 * numPipelines * perStage) {
         pipeTableInShared = true;
@@ -855,6 +1005,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           records + w * (numStages * PipeRing::recordSize));
       IF_D(isPipelineLane) {
         ring->init();
+      }
+    }
+    // With NVLS, each pipeline's ring of nvlsChunkSize stages over the same stage memory (a launch uses one of them)
+    std::optional<PipeRing> nvlsRing;
+    uint32_t nvlsStages = 0;
+    if (nvlsLocal) {
+      nvlsStages = std::min<uint32_t>(numStages * chunkSize / nvlsChunkSize, nvlsMaxStages);
+      CHECK(nvlsStages >= 2);
+      u32 barriers = addShared32(8, numPipelines * nvlsStages * 8, "nvlsbarriers");
+      u32 records = addShared32(16, numPipelines * nvlsStages * PipeRing::recordSize, "nvlsrecords");
+      u32 w = selp_u32(warpIndex, 0, warpIndex < numPipelines);
+      nvlsRing.emplace(nvlsChunkSize, nvlsStages, ring->buffers, barriers + w * (nvlsStages * 8),
+          records + w * (nvlsStages * PipeRing::recordSize));
+      IF_D(isPipelineLane) {
+        nvlsRing->init();
       }
     }
 
@@ -884,6 +1049,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     profiling.enter("syncsetup");
 
     // Address exchange: write the addresses at which the peers map this rank's tensors into their address tables
+    // (for NVLS ops, customOp marks those in moodist's pool with nvlsPoolBit)
     for (uint32_t i : range((graph.remoteCudaTensorMappings.size() + blockSize - 1) / blockSize)) {
       u32 index = blockSize * i + threadIndex;
       auto pred = index < graph.remoteCudaTensorMappings.size();
@@ -912,7 +1078,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     auto nodeaddr = [&](const u32& slot, const u32& offsetlo, const u32& offsethi) {
       u64 r;
       IF_D((slot & 1) != 0) {
-        r = ld_param_u64(inputAddrs + (slot & ~1u), 0);
+        r = ld_param_u64(inputAddrs + (slot & ~3u), 0);
       }
       ELSE {
         u64 gaddr = addrAddrsLocalBase + widen(slot);
@@ -921,7 +1087,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           nanosleep(10);
           r = ld_global_relaxed_sys_u64(gaddr);
         }
-        r &= ~(1ull << 63);
+        r &= ~((1ull << 63) | nvlsPoolBit);
       }
       r += widen(offsetlo) | (widen(offsethi) << 32);
       return r;
@@ -933,7 +1099,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u64 r;
       Value done = !pred;
       Value isParam = (slot & 1) != 0;
-      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~1u), 0);
+      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~3u), 0);
       done |= isParam;
       u64 gaddr = addrAddrsLocalBase + widen(slot);
       r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
@@ -946,7 +1112,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         done |= (r & (1ull << 63)) == parityTag;
       }
       profiling.enter("nodeaddr post");
-      r &= ~(1ull << 63);
+      r &= ~((1ull << 63) | nvlsPoolBit);
 
       r += widen(offsetlo) | (widen(offsethi) << 32);
       profiling.leave();
@@ -1065,7 +1231,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         auto loadChunk = [&]() {
           u64 offset = widen(chunk) * chunkSize;
           u32 n = min_u32(bytes - narrow(offset), chunkSize);
-          ring->load(srcaddr, offset, n, destinations, numDestinations, 0);
+          ring->load(srcaddr, offset, n, destinations, numDestinations, 0, 0);
           chunk += numBlocks * numPipelines;
           loaded += 1;
         };
@@ -1134,6 +1300,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 base = (int64_t)rv->scratch.cudaPointer;
         table = base + widen(concurrencyIndex) * (blockBytes * numBlocks) + widen(blockIndex) * blockBytes;
       }
+      // NVLS: the flag the check below sets if this launch cannot use NVLS (thread 0 clears it before the resolve
+      // barrier)
+      const uintptr_t reservedBase = allocatorGetReservedBase();
+      const Group::Nvls& groupNvls = ctx.group->nvls;
+      u32 nvlsFailedAddr;
+      if (nvlsLocal) {
+        nvlsFailedAddr = addShared32(4, 4, "nvlsfailed");
+        IF_D(isThreadZero) {
+          st_shared_u32(nvlsFailedAddr, 0);
+        }
+      }
       profiling.enter("resolve addresses");
       FOR(u32 first = 0, first < numSlots, first += blockSize) {
         u32 i = first + threadIndex;
@@ -1143,6 +1320,15 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u32 offsetLow = predicated(valid, ld_global_nc_u32)(setup + 4);
         u32 offsetHigh = predicated(valid, ld_global_nc_u32)(setup + 8);
         u64 addr = nodeaddrpred(valid, slot, offsetLow, offsetHigh);
+        if (nvlsLocal) {
+          // An NVLS slot: the local destination through the group's multicast mapping if it is in the part of
+          // moodist's pool bound to it, else 0
+          Value isNvls = valid & ((slot & 2) != 0);
+          u64 poolOffset = addr - (int64_t)reservedBase;
+          u64 mcAddr =
+              selp_u64(poolOffset + (int64_t)groupNvls.mcBase, 0, poolOffset < (int64_t)Group::Nvls::poolBytes);
+          addr = selp_u64(mcAddr, addr, isNvls);
+        }
         PRED(valid) st_u64(table + widen(i * 8), addr);
       }
       bool anyRemoteSources = false;
@@ -1159,115 +1345,136 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       barrier_sync();
       profiling.leave();
 
+      // NVLS check: this launch stores with NVLS if every destination of every NVLS edge is at the pool offset of
+      // the local destination (of its tensor, as the node offset is the same on every rank): the address a peer
+      // published must carry nvlsPoolBit, and then its low bits are that offset. Warp w checks the edges w,
+      // w + numWarps, ...; an edge that fails gets 0 in its NVLS slot and sets the flag. Every block decides the
+      // same: from the same addresses.
+      Value nvlsMode(ValType::Pred);
+      if (nvlsLocal) {
+        profiling.enter("nvls check");
+        const uint32_t numWarps = blockSize / 32;
+        FOR(u32 e = warpIndex, e < (uint32_t)nvlsEdgeTable.size(), e += numWarps) {
+          u64 record = tables + nvlsEdgeTableOffset + widen(e * 8);
+          u32 addrSlot = ld_global_nc_u32(record);
+          u32 numDestinations = ld_global_nc_u32(record + 4);
+          u32 nvlsSlot = addrSlot + 1 + numDestinations;
+          u64 nvlsAddr = ld_u64(table + widen(nvlsSlot * 8));
+          u32 localSlot = ld_global_nc_u32(tables + pipeAddrSetupOffset + widen(nvlsSlot * sizeof(NodeSetup)));
+          u64 poolOffset = ld_param_u64(inputAddrs + (localSlot & ~3u), 0) - (int64_t)reservedBase;
+          Value ok = nvlsAddr != 0;
+          FOR(u32 d0 = 0, d0 < numDestinations, d0 += 32) {
+            u32 d = d0 + laneIndex;
+            Value valid = d < numDestinations;
+            u32 dslot = predicated(valid, ld_global_nc_u32)(
+                tables + pipeAddrSetupOffset + widen((addrSlot + 1 + d) * sizeof(NodeSetup)));
+            Value remote = valid & ((dslot & 1) == 0);
+            u64 published = predicated(remote, ld_global_relaxed_sys_u64)(addrAddrsLocalBase + widen(dslot));
+            Value bad = remote & (((published & (int64_t)nvlsPoolBit) == 0) |
+                                     ((published & (int64_t)(allocatorReserveSize - 1)) != poolOffset));
+            ok = ok & !vote_sync_any(bad);
+          }
+          IF_D(!ok & (laneIndex == 0)) {
+            st_u64(table + widen(nvlsSlot * 8), 0);
+            st_shared_u32(nvlsFailedAddr, 1);
+          }
+        }
+        barrier_sync();
+        nvlsMode = ld_shared_u32(nvlsFailedAddr) == 0;
+        profiling.leave();
+      }
+
       std::optional<u64> edgeDone;
       if (anySignals) {
         edgeDone = addGlobalVar(4, 4 * maxConcurrency * numEdges, "edgedone");
       }
 
-      IF_D(isPipelineLane) {
-        profiling.enter("copy");
-        // The loads below may read data whose readiness generic loads have observed
-        fence_proxy_async_global();
-        u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
-        u32 item = 0;     // the next item of the current batch
-        u32 batchEnd = 0; // the end of the current batch
-        u32 claimSize = firstBatch;
-        Value exhausted(ValType::Pred);
-        exhausted = 0;
-        // The edge of the last item loaded, and the first item of the edge after it
-        u32 edge = 0;
-        u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
-        u32 loaded = 0;
-        u32 stored = 0;
+      // The op's step counter of this concurrency slot, through the multicast and the local mapping
+      u64 nvlsCounterMc;
+      u64 nvlsCounterLocal;
+      if (nvlsLocal) {
+        u64 slotOffset = widen(concurrencyIndex * (uint32_t)nvlsCountersStride);
+        nvlsCounterMc = slotOffset + (int64_t)(groupNvls.countersMc + nvlsCountersOffset);
+        nvlsCounterLocal = slotOffset + (int64_t)(groupNvls.countersLocal + nvlsCountersOffset);
+      }
 
-        // Take the next item; false if there are none left
-        auto take = [&]() {
-          IF(item >= batchEnd) {
-            u32 base = nextBase;
-            item = base;
-            batchEnd = min_u32(base + claimSize, pipeNumItems);
-            IF(base < pipeNumItems) {
-              claimSize = pipeBatch;
-              atom_global_relaxed_gpu_add_u32_into(nextBase, claimCounter, pipeBatch);
-            }
+      // Without NVLS: the pipelines of all blocks take items (see above). With NVLS edges, a launch that does not
+      // use NVLS adds the chunks to the op's step counter at the end, so that its value stays the same for every
+      // launch (ranks whose launch uses NVLS may wait for them).
+      auto unicastCopy = [&]() {
+        IF_D(isPipelineLane) {
+          profiling.enter("copy");
+          // The loads below may read data whose readiness generic loads have observed
+          fence_proxy_async_global();
+          u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
+          u32 item = 0;     // the next item of the current batch
+          u32 batchEnd = 0; // the end of the current batch
+          u32 claimSize = firstBatch;
+          Value exhausted(ValType::Pred);
+          exhausted = 0;
+          // The edge of the last item loaded, and the first item of the edge after it
+          u32 edge = 0;
+          u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
+          u32 loaded = 0;
+          u32 stored = 0;
+          // With NVLS edges: the NVLS chunks (of nvlsChunkSize, see PipeEdge::nvlsFirst) of the edges whose first
+          // item this pipeline loaded
+          u32 nvlsLoaded;
+          if (nvlsLocal) {
+            nvlsLoaded = 0;
           }
-          return item < batchEnd;
-        };
-        auto loadItem = [&]() {
-          // Items only increase: advance to the item's edge
-          WHILE(item >= nextFirst) {
-            edge += 1;
-            nextFirst = ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)));
-          }
-          u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
-          u32 edgeFirst = ld_global_nc_u32(record);
-          u32 edgeBytes = ld_global_nc_u32(record + 8);
-          u32 addrSlot = ld_global_nc_u32(record + 12);
-          u32 numDestinations = ld_global_nc_u32(record + 16);
-          u32 groups = ld_global_nc_u32(record + 20);
-          u32 groupSize = ld_global_nc_u32(record + 24);
-          u32 flags = ld_global_nc_u32(record + 28);
-          u64 src = ld_u64(table + widen(addrSlot * 8));
-          u32 index = item - edgeFirst;
-          u32 chunk = index / groups;
-          u32 firstDestination = (index - chunk * groups) * groupSize;
-          u64 offset = widen(chunk) * chunkSize;
-          u32 n = min_u32(edgeBytes - narrow(offset), chunkSize);
-          u32 numGroupDestinations = min_u32(numDestinations - firstDestination, groupSize);
-          // The tag: the edge, and whether it signals (bit 31)
-          u32 tag = edge | ((flags & edgeSignal) << 28);
-          ring->load(src, offset, n, table + widen((addrSlot + 1 + firstDestination) * 8), numGroupDestinations, tag);
-          item += 1;
-          loaded += 1;
-        };
 
-        // Fill the ring, then store items in order, loading the next one into the stage of the item before (free
-        // once its stores have read it)
-        WHILE(!exhausted & (loaded < numStages)) {
-          IF(take()) {
-            loadItem();
-          }
-          ELSE {
-            exhausted = 1;
-          }
-        }
-        WHILE(stored < loaded) {
-          u32 tag = ring->store();
-          stored += 1;
-          if (anySignals) {
-            // An item of an edge that other edges (on other ranks) wait for. Its items went to any block, while the
-            // waiting kernels wait for per-block slots: the last item to finish signals the slots of all blocks.
-            // Per launch, every item counts once, so the counter wraps back to 0.
-            IF((tag >> 31) != 0) {
-              u32 e = tag & 0x7fffffff;
-              u64 record = pipeEdgeTable + widen(e * sizeof(PipeEdge));
-              u32 numItems = ld_global_nc_u32(record + 4);
-              cp_async_bulk_wait_group(0);
-              fence_release_gpu();
-              u32 old =
-                  atom_global_relaxed_inc_u32(*edgeDone + widen((concurrencyIndex * numEdges + e) * 4), numItems - 1);
-              IF(old == numItems - 1) {
-                fence_acquire_gpu();
-                fence_release_sys();
-                u32 i = ld_global_nc_u32(record + 32);
-                u32 end = i + ld_global_nc_u32(record + 36);
-                WHILE(i < end) {
-                  u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
-                  u64 base = ld_global_nc_u64(s);
-                  u32 itembytes = ld_global_nc_u32(s + 8);
-                  u32 index = ld_global_nc_u32(s + 12);
-                  u32 stride = ld_global_nc_u32(s + 16);
-                  u64 slot = base + widen(itembytes * concurrencyIndex + 4 * index);
-                  FOR(u32 b = 0, b < numBlocks, b += 1) {
-                    st_global_relaxed_sys_u32(slot + widen(4 * stride * b), stepValue);
-                  }
-                  i += 1;
-                }
+          // Take the next item; false if there are none left
+          auto take = [&]() {
+            IF(item >= batchEnd) {
+              u32 base = nextBase;
+              item = base;
+              batchEnd = min_u32(base + claimSize, pipeNumItems);
+              IF(base < pipeNumItems) {
+                claimSize = pipeBatch;
+                atom_global_relaxed_gpu_add_u32_into(nextBase, claimCounter, pipeBatch);
               }
             }
-          }
-          IF(!exhausted & (stored >= storeLag + 1)) {
-            cp_async_bulk_wait_group_read(storeLag);
+            return item < batchEnd;
+          };
+          auto loadItem = [&]() {
+            // Items only increase: advance to the item's edge
+            WHILE(item >= nextFirst) {
+              edge += 1;
+              nextFirst = ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)));
+            }
+            u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
+            u32 edgeFirst = ld_global_nc_u32(record);
+            u32 edgeBytes = ld_global_nc_u32(record + 8);
+            u32 addrSlot = ld_global_nc_u32(record + 12);
+            u32 numDestinations = ld_global_nc_u32(record + 16);
+            u32 groups = ld_global_nc_u32(record + 20);
+            u32 groupSize = ld_global_nc_u32(record + 24);
+            u32 flags = ld_global_nc_u32(record + 28);
+            u64 src = ld_u64(table + widen(addrSlot * 8));
+            u32 index = item - edgeFirst;
+            u32 chunk = index / groups;
+            u32 firstDestination = (index - chunk * groups) * groupSize;
+            u64 offset = widen(chunk) * chunkSize;
+            u32 n = min_u32(edgeBytes - narrow(offset), chunkSize);
+            u32 numGroupDestinations = min_u32(numDestinations - firstDestination, groupSize);
+            // The tag: the edge, and whether it signals (bit 31)
+            u32 tag = edge | ((flags & edgeSignal) << 28);
+            ring->load(
+                src, offset, n, table + widen((addrSlot + 1 + firstDestination) * 8), numGroupDestinations, tag, 0);
+            item += 1;
+            loaded += 1;
+            if (nvlsLocal) {
+              IF(index == 0) {
+                nvlsLoaded += ld_global_nc_u32(record + sizeof(PipeEdge) + offsetof(PipeEdge, nvlsFirst)) -
+                              ld_global_nc_u32(record + offsetof(PipeEdge, nvlsFirst));
+              }
+            }
+          };
+
+          // Fill the ring, then store items in order, loading the next one into the stage of the item before (free
+          // once its stores have read it)
+          WHILE(!exhausted & (loaded < numStages)) {
             IF(take()) {
               loadItem();
             }
@@ -1275,10 +1482,153 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               exhausted = 1;
             }
           }
+          WHILE(stored < loaded) {
+            u32 tag = ring->store();
+            stored += 1;
+            if (anySignals) {
+              // An item of an edge that other edges (on other ranks) wait for. Its items went to any block, while the
+              // waiting kernels wait for per-block slots: the last item to finish signals the slots of all blocks.
+              // Per launch, every item counts once, so the counter wraps back to 0.
+              IF((tag >> 31) != 0) {
+                u32 e = tag & 0x7fffffff;
+                u64 record = pipeEdgeTable + widen(e * sizeof(PipeEdge));
+                u32 numItems = ld_global_nc_u32(record + 4);
+                cp_async_bulk_wait_group(0);
+                fence_release_gpu();
+                u32 old =
+                    atom_global_relaxed_inc_u32(*edgeDone + widen((concurrencyIndex * numEdges + e) * 4), numItems - 1);
+                IF(old == numItems - 1) {
+                  fence_acquire_gpu();
+                  fence_release_sys();
+                  u32 i = ld_global_nc_u32(record + 32);
+                  u32 end = i + ld_global_nc_u32(record + 36);
+                  WHILE(i < end) {
+                    u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
+                    u64 base = ld_global_nc_u64(s);
+                    u32 itembytes = ld_global_nc_u32(s + 8);
+                    u32 index = ld_global_nc_u32(s + 12);
+                    u32 stride = ld_global_nc_u32(s + 16);
+                    u64 slot = base + widen(itembytes * concurrencyIndex + 4 * index);
+                    FOR(u32 b = 0, b < numBlocks, b += 1) {
+                      st_global_relaxed_sys_u32(slot + widen(4 * stride * b), stepValue);
+                    }
+                    i += 1;
+                  }
+                }
+              }
+            }
+            IF(!exhausted & (stored >= storeLag + 1)) {
+              cp_async_bulk_wait_group_read(storeLag);
+              IF(take()) {
+                loadItem();
+              }
+              ELSE {
+                exhausted = 1;
+              }
+            }
+          }
+          profiling.enter("drain");
+          cp_async_bulk_wait_group(0);
+          profiling.leave();
+          if (nvlsLocal) {
+            IF(nvlsLoaded != 0) {
+              multimem_red_relaxed_sys_add_u32(nvlsCounterMc, nvlsLoaded);
+            }
+          }
+        }
+      };
+
+      // With NVLS: the pipelines of block 0 store the chunks of the NVLS sequence (see PipeEdge), pipeline p chunks
+      // p, p + numPipelines, ..., one store each, to the NVLS slot of the chunk's edge, in step with the other ranks
+      // (see the step counter above: before storing chunk c, wait until the counter is at least its value before the
+      // launch plus nvlsSenders * (c + 1 - nvlsWindow); once a chunk's stores have completed, add 1 to it).
+      auto nvlsCopy = [&]() {
+        profiling.enter("nvls copy");
+        // The loads below may read data whose readiness generic loads have observed
+        fence_proxy_async_global();
+        u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
+        u32 counterBase = loadParamField(params, 8, ValType::U32);
+        u32 chunk = warpIndex; // the next chunk this pipeline loads
+        // The edge of the last chunk loaded, and the first chunk of the edge after it
+        u32 edge = 0;
+        u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge) + offsetof(PipeEdge, nvlsFirst));
+        u32 loaded = 0;
+        u32 stored = 0;
+        u32 signaled = 0;
+        auto loadChunk = [&]() {
+          // Chunks only increase: advance to the chunk's edge
+          WHILE(chunk >= nextFirst) {
+            edge += 1;
+            nextFirst =
+                ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)) + offsetof(PipeEdge, nvlsFirst));
+          }
+          u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
+          u32 edgeBytes = ld_global_nc_u32(record + 8);
+          u32 addrSlot = ld_global_nc_u32(record + 12);
+          u32 numDestinations = ld_global_nc_u32(record + 16);
+          u32 first = ld_global_nc_u32(record + offsetof(PipeEdge, nvlsFirst));
+          u64 src = ld_u64(table + widen(addrSlot * 8));
+          u64 offset = widen(chunk - first) * nvlsChunkSize;
+          u32 n = min_u32(edgeBytes - narrow(offset), nvlsChunkSize);
+          nvlsRing->load(src, offset, n, table + widen((addrSlot + 1 + numDestinations) * 8), 1, edge, chunk);
+          chunk += numPipelines;
+          loaded += 1;
+        };
+        WHILE((chunk < nvlsChunks) & (loaded < nvlsStages)) {
+          loadChunk();
+        }
+        WHILE(stored < loaded) {
+          // The window. A wait gives up after a second: the counter only paces the stores, and a launch must not
+          // hang on it (the kernels of a launch start together: each waits for all peers' addresses)
+          u32 c = nvlsRing->nextStoreAux();
+          IF(c >= nvlsWindow) {
+            u32 target = counterBase + (c + 1 - nvlsWindow) * nvlsSenders;
+            u32 value = ld_global_relaxed_sys_u32(nvlsCounterLocal);
+            IF((value - target) >= 0x80000000u) {
+              profiling.enter("nvls window");
+              u64 t0 = globaltimer();
+              u64 waited = globaltimer() - t0;
+              WHILE(((value - target) >= 0x80000000u) & (waited < 1000000000ull)) {
+                value = ld_global_relaxed_sys_u32(nvlsCounterLocal);
+                waited = globaltimer() - t0;
+              }
+              profiling.leave();
+            }
+          }
+          nvlsRing->store();
+          stored += 1;
+          // Signal the chunks whose stores have completed (all but the last nvlsSignalLag). Relaxed: a release
+          // would wait for all of this thread's outstanding stores (1 SM then reached 1/3 of the bandwidth).
+          cp_async_bulk_wait_group(nvlsSignalLag);
+          IF(stored > signaled + nvlsSignalLag) {
+            multimem_red_relaxed_sys_add_u32(nvlsCounterMc, stored - nvlsSignalLag - signaled);
+            signaled = stored - nvlsSignalLag;
+          }
+          IF((chunk < nvlsChunks) & (stored >= nvlsStoreLag + 1)) {
+            cp_async_bulk_wait_group_read(nvlsStoreLag);
+            loadChunk();
+          }
         }
         profiling.enter("drain");
         cp_async_bulk_wait_group(0);
         profiling.leave();
+        IF(stored != signaled) {
+          multimem_red_relaxed_sys_add_u32(nvlsCounterMc, stored - signaled);
+        }
+        profiling.leave();
+      };
+
+      if (nvlsLocal) {
+        IF(nvlsMode) {
+          IF_D(isPipelineLane & (blockIndex == 0)) {
+            nvlsCopy();
+          }
+        }
+        ELSE {
+          unicastCopy();
+        }
+      } else {
+        unicastCopy();
       }
       // All copies done before the exit's release fence
       profiling.enter("copy end barrier");

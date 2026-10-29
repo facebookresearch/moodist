@@ -3543,8 +3543,28 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     if (mappedAddrs.empty()) {
       mappedAddrs.push_back(0);
     }
+    // NVLS (see generateKernel): mark the addresses published to the peers that are offsets in this rank's pool
+    // (the peer's mapping of the pool is aligned to allocatorReserveSize, so that the address's low bits are the
+    // offset), and pass the op's step counter before this launch
+    uint32_t nvlsCounterBase = 0;
+    if (op->kernelHandle->nvls) {
+      KernelHandle& kh = *op->kernelHandle;
+      const uintptr_t reserved = allocatorGetReservedBase();
+      for (size_t i : indices(op->graph.remoteCudaTensorMappings)) {
+        auto& m = op->graph.remoteCudaTensorMappings[i];
+        auto& tensor = m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size())
+                                                        : inputTDs.at(m.tensorIndex);
+        uintptr_t ptr = tensor->data();
+        if (reserved && ptr >= reserved && ptr - reserved + tensor->bytes() <= allocatorReserveSize &&
+            ((mappedAddrs[i] - (ptr - reserved)) & (allocatorReserveSize - 1)) == 0) {
+          mappedAddrs[i] |= nvlsPoolBit;
+        }
+      }
+      nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
+    }
 
-    CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
+    CompileOpCopyParameters params{
+        .stepValue = stepValue, .concurrencyIndex = concurrencyIndex, .nvlsCounterBase = nvlsCounterBase};
     std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
     CUlaunchConfig launchConfig;
     CUlaunchAttribute attr;

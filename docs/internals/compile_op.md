@@ -160,6 +160,25 @@ on new tensors at every call.
   `cpuOutBuffer` for the concurrency index, has reached stepValue (always ready when tuning); nothing to copy.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
+- **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
+  collective): an edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can
+  store each chunk once to the group's multicast mapping, which the switches copy to every GPU. The group's
+  multicast object (`Group::setupNvls`, collective, at the first op that uses it) covers moodist's whole allocator
+  pool: every allocator chunk is bound at its offset in the pool when it is mapped (`allocatorAddChunkListener`), so
+  offset o of every rank's pool is at the mapping's base + o; a counter area follows. A rank uses NVLS if every edge
+  it executes is such an edge (no waits) and every rank that does stores the same number of chunks (agreed in
+  `generateKernel`). Each launch checks the destinations: a peer marks the address it publishes with bit 62
+  (`nvlsPoolBit`) if the tensor is in its pool, and the low 40 bits are then the tensor's pool offset (peers map a
+  rank's pool at a 1 TiB aligned base); if every destination is at the local destination's offset, block 0 stores
+  the chunks with one multicast store each (chunks of 64 KiB, through a ring of its own over the stage memory: per
+  chunk, the window and the counter cost time) and the other blocks only take part in the address exchange and the
+  exit sync; otherwise the launch stores to each destination as usual. Multicast stores at full speed from all ranks
+  overload the switches' links to the GPUs, which then deliver about 2/3 of their bandwidth, so the ranks advance in
+  step: an op has a step counter per concurrency slot in the counter area; once the stores of a chunk have completed,
+  a rank adds 1 to it through the multicast mapping (`multimem.red`, relaxed: a release waits for all outstanding
+  stores), and it stores chunk c once its local copy of the counter shows every rank's chunks up to c - 8 complete.
+  The counter only grows; `customOp` passes its value before the launch (launches of the slot times the chunks of
+  all ranks); a launch that does not use NVLS adds its chunks at the end.
 
 ## Runtime (`customOp`, `WorkCustom`)
 
@@ -193,6 +212,9 @@ on new tensors at every call.
   signals the kernel when the read of a proxied transfer has completed (all its parts): `writeCpuOut` writes the
   step value into slot 16 + signal index of `cpuOutBuffer` (a loopback RDMA write through the first NIC, as the
   all-gather does for its chunks).
+
+- NVLS ops (see the kernel): `customOp` sets bit 62 of the addresses it publishes for tensors in moodist's pool
+  (when the peer's mapping of the pool is 1 TiB aligned), and passes the op's step counter value.
 
 ## Environment variables
 
@@ -316,6 +338,26 @@ At 1 GiB, the all-to-all reads 92 GB/s per GPU (of 100), NCCL moves 84. Over the
 RDMA), all-to-all takes 22-23 us up to 1 MiB, 44.5 us at 16 MiB, 117 us at 64 MiB, 404 us at 256 MiB and 1.53 ms
 at 1 GiB (NCCL 118-236 us up to 1 MiB, then 165 us, 142 us, 434 us and 1.63 ms).
 
+All-gather over the NVLink fabric with NVLS (see the kernel: one SM per GPU stores each chunk once, with
+multicast) and without it (unicast stores from 12-16 SMs, the state before NVLS), outputs at the same pool offset
+on every rank:
+
+| all-gather | 64 KiB | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|---|---|
+| 32 GPUs (8 nodes, one NVL72 domain), NVLS | 19.6 us | 27.4 us | 62.1 us | 208 us | 789 us | 3.10 ms | 12.40 ms |
+| 32 GPUs, unicast | 19.9 us | 31.5 us | 72.9 us | 239 us | 826 us | 3.20 ms | 12.69 ms |
+| 32 GPUs, NVLS with 32 KiB chunks | 17.8 us | 28.8 us | 63.9 us | 215 us | 811 us | 3.19 ms | 12.73 ms |
+| 16 GPUs (4 nodes), NVLS | 17.8 us | 20.4 us | 38.6 us | 110 us | 405 us | 1.56 ms | 6.19 ms |
+| 16 GPUs, unicast | 16.8 us | 23.6 us | 43.5 us | 126 us | 408 us | 1.54 ms | 6.11 ms |
+
+Up to 128 KiB, runs differ by 1-2 us, more than NVLS changes. Large sizes are bound by what the GPUs' NVLink links
+deliver to them, and the switch also delivers each multicast chunk to its sender: a GPU receives N/(N-1) times
+what unicast stores bring it, 3.2% more on 32 ranks and 6.7% more on 16, where NVLS is slower from 64 MiB on.
+Unicast stores are faster when the ranks' outputs are at different offsets: on 32 GPUs, 256 MiB took 12.22 ms with
+the outputs at offsets 64-192 KiB apart (NVLS needs them at the same offset: 12.38 ms in the same run), and 16 MiB
+814 us. Without the step counter, multicast stores from 32 ranks took 17-19 ms at 256 MiB (see the kernel). On 4
+GPUs, and on 64 GPUs in two NVL72 domains (29.4 ms at 256 MiB), ops do not use NVLS and take what they took before.
+
 RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
 1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
 in random order: 16.6 ms. In the order of the compile phase (each source one reader per step), 14.8 ms: each NIC
@@ -392,6 +434,16 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   instructions, so a plain target would do.
 
 ### Performance
+- NVLS (see the kernel and the all-gather table under Performance notes). Open: the rank threshold (16; one node of
+  4 GPUs lost from 4M on, 8 and 12 are not measured; 16 ranks lose 1-2% from 64 MiB on), groups that span several
+  NVLink domains (one multicast object per domain, for the edges within a domain, including the proxies' stores of
+  what they read: 64 GPUs in two domains take 29.4 ms at 256 MiB, where the GPUs' NVLink ingress allows about 25),
+  destination sets smaller than the group (an object per set), ranks that store different numbers of chunks (the
+  window assumes the same), outputs that are not at the same offset on every rank (a pool for communication
+  buffers), and multicast reductions (`multimem.ld_reduce`, `multimem.red`) for reduce-scatter and all-reduce.
+- Unicast stores to outputs at the same offset on every rank are 2-4% slower at large sizes than to outputs at
+  different offsets (all-gather on 32 GPUs, see the NVLS table), maybe because all copies of a chunk then have the
+  same address bits; not investigated.
 - Compile time is mostly the JIT of the tuning candidates (4 per graph variant). JIT on several threads would cut
   it (the PTX differs per rank, so the work cannot be split across ranks).
 - With waits (relay edges, ring graphs), the block copies one edge at a time and drains its pipelines at the end

@@ -462,6 +462,9 @@ void setp_eq_u64(const Value& p, const Value& a, const Value& b) {
 void setp_ne_u64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.ne.u64", p, a, b));
 }
+void setp_lt_u64(const Value& p, const Value& a, const Value& b) {
+  emitInst(fmt3("setp.lt.u64", p, a, b));
+}
 void setp_lt_s64(const Value& p, const Value& a, const Value& b) {
   emitInst(fmt3("setp.lt.s64", p, a, b));
 }
@@ -663,6 +666,9 @@ void fence_release_gpu() {
 }
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
   emitInst("st.relaxed.sys.global.u32 [" + addr.str() + "], " + val.str());
+}
+void multimem_red_relaxed_sys_add_u32(const Value& addr, const Value& val) {
+  emitInst("multimem.red.relaxed.sys.global.add.u32 [" + addr.str() + "], " + val.str());
 }
 void st_global_relaxed_sys_u64(const Value& addr, const Value& val) {
   emitInst("st.relaxed.sys.global.u64 [" + addr.str() + "], " + val.str());
@@ -1440,6 +1446,9 @@ Value Value::operator<(const Value& b) const {
   case ValType::S32:
     setp_lt_s32(result, *this, b);
     break;
+  case ValType::U64:
+    setp_lt_u64(result, *this, b);
+    break;
   case ValType::S64:
     setp_lt_s64(result, *this, b);
     break;
@@ -1892,6 +1901,10 @@ u32 blockDim_x() {
 
 u64 clock64() {
   return special64("%clock64");
+}
+
+u64 globaltimer() {
+  return special64("%globaltimer");
 }
 
 u32 laneid() {

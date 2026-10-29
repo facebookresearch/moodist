@@ -526,6 +526,7 @@ void setp_ge_s32(const Value& p, const Value& a, const Value& b);
 void setp_ne_s64(const Value& p, const Value& a, const Value& b);
 void setp_eq_u64(const Value& p, const Value& a, const Value& b);
 void setp_ne_u64(const Value& p, const Value& a, const Value& b);
+void setp_lt_u64(const Value& p, const Value& a, const Value& b);
 void setp_lt_s64(const Value& p, const Value& a, const Value& b);
 void setp_ge_s64(const Value& p, const Value& a, const Value& b);
 
@@ -581,6 +582,8 @@ void fence_release_sys();
 void fence_acquire_gpu();
 void fence_release_gpu();
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
+// addr is a multicast address: the add reaches every member's memory
+void multimem_red_relaxed_sys_add_u32(const Value& addr, const Value& val);
 void st_global_relaxed_sys_u64(const Value& addr, const Value& val);
 void st_global_release_sys_u32(const Value& addr, const Value& val);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);
@@ -815,6 +818,7 @@ u32 threadIdx_x();
 u32 blockIdx_x();
 u32 blockDim_x();
 u64 clock64();
+u64 globaltimer();
 u32 laneid();
 
 void nanosleep(u32 t);

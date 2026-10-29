@@ -11,6 +11,8 @@ struct Group;
 struct CompileOpCopyParameters {
   uint32_t stepValue;
   uint32_t concurrencyIndex;
+  // NVLS: the value of the op's step counter (of this concurrency slot) before this launch (see generateKernel)
+  uint32_t nvlsCounterBase = 0;
 };
 
 struct KernelConfig {
