@@ -1580,6 +1580,128 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   log.verbose("allocated write-combined memory (%p %#x) of %#x bytes\n", r.cpuPointer, r.cudaPointer, r.bytes);
   return r;
 }
+namespace {
+// The allocator's chunk listener of Group::setupNvls: binds the chunk at its pool offset. A chunk that is not bound
+// would silently miss the multicast stores to it, so a failure is fatal.
+void nvlsBindChunk(void* ctx, unsigned long long handle, size_t offset, size_t size) {
+  Group* group = (Group*)ctx;
+  CHECK(offset + size <= Group::Nvls::poolBytes);
+  CHECK_CU(cuMulticastBindMem(group->nvls.handle, offset, handle, 0, size, 0));
+}
+} // namespace
+
+bool Group::setupNvls() {
+  if (nvls.state != 0) {
+    return nvls.state == 1;
+  }
+  auto start = std::chrono::steady_clock::now();
+  CHECK_CU(cuCtxSetCurrent(cuContext));
+  constexpr size_t countersBytes = Nvls::countersBytes;
+  std::string error; // this rank's first error
+  auto check = [&](CUresult r, const char* what) {
+    if (r != CUDA_SUCCESS && error.empty()) {
+      const char* str = "unknown error";
+      cuGetErrorString(r, &str);
+      error = fmt::sprintf("%s: %s", what, str);
+    }
+    return error.empty();
+  };
+  // Whether no rank has failed so far (all ranks get the same answer)
+  auto agree = [&]() {
+    auto errors = setupComms->allgather(error);
+    for (size_t i : indices(errors)) {
+      if (!errors[i].empty()) {
+        if (rank == 0) {
+          log.error("moodist: NVLS (multicast) is not available for group %s (rank %d: %s)\n", name, i, errors[i]);
+        }
+        nvls.state = -1;
+        return false;
+      }
+    }
+    return true;
+  };
+  CUmemAccessDesc access;
+  std::memset(&access, 0, sizeof(access));
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = deviceIndex;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+  // The multicast object: the pool, then the counter area (see Nvls). Rank 0 creates it, the others import it, and
+  // every device must be added before any rank binds memory to it.
+  CUmulticastObjectProp prop;
+  std::memset(&prop, 0, sizeof(prop));
+  prop.numDevices = size;
+  prop.size = Nvls::poolBytes + countersBytes;
+  prop.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+  size_t granularity = 0;
+  check(cuMulticastGetGranularity(&granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM), "cuMulticastGetGranularity");
+  if (error.empty() && (granularity == 0 || prop.size % granularity != 0 || allocatorGetReservedBase() == 0)) {
+    error =
+        fmt::sprintf("multicast granularity %d, allocator reservation at %#x", granularity, allocatorGetReservedBase());
+  }
+  CUmemFabricHandle fabricHandle;
+  std::memset(&fabricHandle, 0, sizeof(fabricHandle));
+  if (rank == 0 && error.empty() && check(cuMulticastCreate(&nvls.handle, &prop), "cuMulticastCreate")) {
+    check(cuMemExportToShareableHandle(&fabricHandle, nvls.handle, CU_MEM_HANDLE_TYPE_FABRIC, 0),
+        "cuMemExportToShareableHandle");
+  }
+  auto handles = setupComms->allgather(fabricHandle);
+  if (!agree()) {
+    return false;
+  }
+  if (rank == 0 || check(cuMemImportFromShareableHandle(&nvls.handle, &handles.at(0), CU_MEM_HANDLE_TYPE_FABRIC),
+                       "cuMemImportFromShareableHandle")) {
+    check(cuMulticastAddDevice(nvls.handle, cuDevice), "cuMulticastAddDevice");
+  }
+  if (!agree()) {
+    return false;
+  }
+
+  // The counter area: zeroed before any rank can add to it (once every rank has returned from here)
+  CUmemAllocationProp counterProp;
+  std::memset(&counterProp, 0, sizeof(counterProp));
+  counterProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  counterProp.requestedHandleTypes =
+      (CUmemAllocationHandleType)(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR | CU_MEM_HANDLE_TYPE_FABRIC);
+  counterProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  counterProp.location.id = deviceIndex;
+  CUmemGenericAllocationHandle counters = 0;
+  CUdeviceptr countersLocal = 0;
+  if (check(cuMemCreate(&counters, countersBytes, &counterProp, 0), "cuMemCreate (counters)") &&
+      check(cuMemAddressReserve(&countersLocal, countersBytes, granularity, 0, 0), "cuMemAddressReserve (counters)") &&
+      check(cuMemMap(countersLocal, countersBytes, 0, counters, 0), "cuMemMap (counters)") &&
+      check(cuMemSetAccess(countersLocal, countersBytes, &access, 1), "cuMemSetAccess (counters)") &&
+      check(cuMemsetD8(countersLocal, 0, countersBytes), "cuMemsetD8 (counters)") &&
+      check(cuStreamSynchronize(nullptr), "cuStreamSynchronize")) {
+    check(cuMulticastBindMem(nvls.handle, Nvls::poolBytes, counters, 0, countersBytes, 0),
+        "cuMulticastBindMem (counters)");
+  }
+
+  // Every chunk of the pool at its offset: the existing ones now, new ones when the allocator maps them (binding
+  // does not wait for the GPU)
+  if (error.empty()) {
+    allocatorAddChunkListener(nvlsBindChunk, this);
+  }
+
+  CUdeviceptr mcBase = 0;
+  if (error.empty() && check(cuMemAddressReserve(&mcBase, prop.size, granularity, 0, 0), "cuMemAddressReserve") &&
+      check(cuMemMap(mcBase, prop.size, 0, nvls.handle, 0), "cuMemMap")) {
+    check(cuMemSetAccess(mcBase, prop.size, &access, 1), "cuMemSetAccess");
+  }
+  if (!agree()) {
+    return false;
+  }
+  nvls.mcBase = mcBase;
+  nvls.countersLocal = countersLocal;
+  nvls.countersMc = mcBase + Nvls::poolBytes;
+  nvls.state = 1;
+  if (rank == 0) {
+    log.info("NVLS (multicast) set up for group %s (%d ranks) in %g ms\n", name, size,
+        seconds(std::chrono::steady_clock::now() - start) * 1000);
+  }
+  return true;
+}
+
 AllocatedBuffer Group::allocateDeviceMapped(size_t bytes) {
   CHECK(false);
   return {};
