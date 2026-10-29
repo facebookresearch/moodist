@@ -141,8 +141,11 @@ on new tensors at every call.
   4 items per pipeline, so that the stores of an all-gather of a few chunks to many ranks spread over the SMs).
   Items are claimed from a counter in global memory (one per concurrency slot and launch parity), the first claim
   of a pipeline taking enough items to fill its ring, the later ones one item, claimed when the pipeline starts on
-  the previous one. Edges are in destination rank order rotated to start at the executing rank (so that in an
-  all-to-all, the ranks do not all write to the same rank at once). If some edge waits, in rounds: warp 0 scans the
+  the previous one. Edges are in the order of the rank they write to rotated to start at the executing rank (so
+  that in an all-to-all, the ranks do not all write to the same rank at once), or for edges that read another
+  rank's node into the executing rank (the `read` graphs), of the rank they read from (all-gather on 32 GPUs, 64 MiB
+  per rank, 16 blocks: 74 GB/s per GPU in destination order, where every rank read rank 0 first, 631 GB/s rotated
+  by source). If some edge waits, in rounds: warp 0 scans the
   edges that are not done, 32 at a time (one per lane, `vote.ballot`); a source is ready when its `depFilled` slot
   for this block has reached stepValue. Relay edges whose signal has arrived are finished on the spot by the lane
   that saw it. The first ready copy edge is handed to the block through shared memory (one `bar.sync` per round);
@@ -280,6 +283,10 @@ call, algorithm bandwidth in parentheses):
 | `ring_read` | 60 us | 92 us | 313 us | 3.68 ms (584 GB/s) |
 | `ring_write` | 53 us | 81 us | 258 us | 3.15 ms (681 GB/s) |
 | NCCL (NVLink fabric) | 85 us | 98 us | | 2.91 ms (739 GB/s) |
+
+(The `read` row predates the order of edges by the rank they read from (see Scheduling): on the same kind of nodes at
+the end of October, `read` took 17 us, 26 us, 213 us and 3.24 ms (580 GB/s), against 15 us, 37 us, 657 us and
+11.2 ms before it, and `multicast` 15 us, 27 us, 193 us and 2.81 ms.)
 
 With `MOODIST_FABRIC=0`, i.e. two NVLink domains connected by RoCE (one ConnectX-8 card with 4 ports of 200 Gb/s
 per GPU):

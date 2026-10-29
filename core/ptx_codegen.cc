@@ -544,13 +544,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     auto firstCopy = std::stable_partition(localCopies.begin(), localCopies.end(), [](const Edge& e) {
       return e.sources.empty();
     });
-    // Then the copies in destination rank order rotated to start at this rank: in rank order, every rank would
-    // write to the same peer at once (in an all-to-all, all ranks to rank 0 first, then to rank 1, ...), whose
-    // NVLink ingress then limits all of them while the other peers idle. An edge with several destinations counts
-    // by its first one (multicast edges list their destinations rotated the same way).
+    // Then the copies in the order of the peer they move data to, or from, rotated to start at this rank: in rank
+    // order, every rank would write to the same peer at once (in an all-to-all, all ranks to rank 0 first, then to
+    // rank 1, ...), whose NVLink ingress then limits all of them while the other peers idle. An edge counts by its
+    // first destination (multicast edges list their destinations rotated the same way), or by its source if it
+    // reads another rank's node into this rank (the read graphs), where the source's egress limits the readers in
+    // the same way (all-gather on 32 GB300 with the read graph and 16 blocks: 74 GB/s per GPU, 631 rotated by source).
     std::stable_sort(firstCopy, localCopies.end(), [&](const Edge& a, const Edge& b) {
       auto key = [&](const Edge& e) {
-        return (e.destinations.at(0).rank + group->size - rank) % group->size;
+        size_t r = e.destinations.at(0).rank;
+        if (r == rank && !e.sources.empty() && e.sources[0].rank != rank) {
+          r = e.sources[0].rank;
+        }
+        return (r + group->size - rank) % group->size;
       };
       return key(a) < key(b);
     });
