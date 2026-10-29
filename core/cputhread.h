@@ -377,7 +377,7 @@ struct CustomOpDescriptor {
   Vector<Notification> notifications;
   // Reductions across NVLink domains: the bytes of the scratch tensor (a CUDA tensor of the op's dtype that customOp
   // allocates per launch, after the output copies: the last tensor), which holds the partial results that this rank
-  // computes for other domains and the ones that it reads from them; 0 if none
+  // computes (for other domains, and in an all-reduce for itself) and the ones that it reads from them; 0 if none
   size_t scratchBytes = 0;
 
   Vector<compile_op::Graph::TensorDescr> inputs;

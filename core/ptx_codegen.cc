@@ -589,9 +589,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       };
       return key(a) < key(b);
     });
-    // The edges that compute partial results which ranks in other NVLink domains wait for (see crossDomainReductions
-    // in compile_op.cc) come first: the reduce loop's blocks take items in order, so these have all been taken
-    // before any block waits for a partial result of another domain
+    // The edges that compute partial results which ranks in other NVLink domains (or other edges of this rank's)
+    // wait for (see crossDomainReductions in compile_op.cc) come first: the reduce loop's blocks take items in order,
+    // so these have all been taken before any block waits for a partial result
     std::stable_partition(firstCopy, localCopies.end(), [](const Edge& e) {
       return e.doneSignal >= 0;
     });
@@ -608,7 +608,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       if (e.sources.empty() || !std::ranges::all_of(e.sources, &Node::filled)) {
         nowaits = false;
       }
-      reduceKernel |= e.sources.size() > 1 || !e.sourceSignals.empty() || e.doneSignal >= 0;
+      reduceKernel |=
+          e.sources.size() > 1 || !e.sourceSignals.empty() || !e.sourceDoneSignals.empty() || e.doneSignal >= 0;
       for (const Node& n : e.destinations) {
         if (n.rank != rank) {
           hasRemoteWrites = true;
@@ -682,8 +683,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
     static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
     static constexpr uint32_t edgeNvls = 16;   // stored with NVLS when the launch can: the NVLS slot follows the dsts
-    static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for the CPU thread (PipeEdge::waits)
+    static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for signals (PipeEdge::waits)
     static constexpr uint32_t edgeDoneSignal = 64;  // reduce loop: signals the CPU thread when stored (doneSignal)
+    // A wait table word for a source that waits for a done signal of this kernel's (in cpuInBuffer), with the index
+    // + 1 in the other bits (without this bit, the signal of an RDMA read, in cpuOutBuffer)
+    static constexpr uint32_t waitDoneSignal = 0x80000000;
 
     // ---- NVLS (NVLink SHARP multicast) ----
     // An edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can store each
@@ -963,8 +967,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t numSources;
       // Reductions: the sources that an average divides after combining them (the first ones; the others are
       // partial results, see Edge::partialSources) and the divisor; with edgeSourceWaits, the index of the first
-      // source's word in the wait table (per source, its signal index + 1, or 0 if it does not wait); with
-      // edgeDoneSignal, the cpuIn slot to signal (Edge::doneSignal)
+      // source's word in the wait table (per source, its signal index + 1, or waitDoneSignal | its done signal + 1,
+      // or 0 if it does not wait); with edgeDoneSignal, the cpuIn slot to signal (Edge::doneSignal)
       uint32_t inputSources;
       uint32_t divisor;
       uint32_t waits;
@@ -1017,12 +1021,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         CHECK(e.partialSources <= e.sources.size());
         p.inputSources = e.sources.size() - e.partialSources;
         p.divisor = e.divisor != 0 ? e.divisor : e.sources.size();
-        if (!e.sourceSignals.empty()) {
-          CHECK(e.sourceSignals.size() == e.sources.size());
+        if (!e.sourceSignals.empty() || !e.sourceDoneSignals.empty()) {
+          CHECK(e.sourceSignals.empty() || e.sourceSignals.size() == e.sources.size());
+          CHECK(e.sourceDoneSignals.empty() || e.sourceDoneSignals.size() == e.sources.size());
           p.flags |= edgeSourceWaits;
           p.waits = pipeWaits.size();
-          for (int32_t signal : e.sourceSignals) {
-            pipeWaits.push_back(signal + 1);
+          for (size_t s : indices(e.sources)) {
+            const int32_t signal = e.sourceSignals.empty() ? -1 : e.sourceSignals[s];
+            const int32_t doneSignal = e.sourceDoneSignals.empty() ? -1 : e.sourceDoneSignals[s];
+            CHECK(signal < 0 || doneSignal < 0);
+            CHECK((uint32_t)doneSignal + 1 < waitDoneSignal);
+            pipeWaits.push_back(doneSignal >= 0 ? waitDoneSignal | (doneSignal + 1) : signal + 1);
           }
         }
         if (e.doneSignal >= 0) {
@@ -1881,8 +1890,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
 
         // Reductions across NVLink domains (not in the tuning launches, which run without the CPU thread): sources
-        // that the CPU thread reads from other domains, and partial results that it sends to them (see
-        // crossDomainReductions in compile_op.cc)
+        // that the CPU thread reads from other domains, and partial results that it sends to them, or that this
+        // kernel combines itself (see crossDomainReductions in compile_op.cc)
         bool anyWaits = false;
         bool anyDoneSignals = false;
         for (const PipeEdge& p : pipeEdges) {
@@ -1963,19 +1972,22 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
         };
         // Issue loads while the ring has room (thread 0). A source that the CPU thread reads from another NVLink
-        // domain is loaded once its read has arrived (the signal in cpuOutBuffer): until then, the loads stop there,
-        // and the block goes on with the stages it has. It waits for the signal only when it has combined all stages
-        // loaded before (blocking, at the start of a stage): its earlier items are then complete, including the
-        // partial results among them that other domains wait for, which come before anything that waits (see
-        // localCopies), so all blocks of all ranks make progress.
+        // domain is loaded once its read has arrived (the signal in cpuOutBuffer), and a partial result that this
+        // kernel computes for itself (in an all-reduce) once all of it has been stored (its done signal in
+        // cpuInBuffer): until then, the loads stop there, and the block goes on with the stages it has. It waits for
+        // the signal only when it has combined all stages loaded before (blocking, at the start of a stage): its
+        // earlier items are then complete, including the partial results among them, which come before anything that
+        // waits (see localCopies), so all blocks of all ranks make progress.
         u64 signalFlags = concurrency(group->cpuOutBuffer) + 4 * 16;
+        u64 doneFlags = concurrency(group->cpuInBuffer) + 4 * 16;
         auto fill = [&](bool blocking) {
           WHILE(!ldDone & (ldIssued - consumed < numStages)) {
             if (anyWaits) {
               IF(ldWaits != 0xffffffffll) {
                 u32 wait = ld_global_nc_u32(tables + pipeWaitsOffset + widen((ldWaits + ldSource) * 4));
                 IF(wait != 0) {
-                  u64 flag = signalFlags + widen((wait - 1) * 4);
+                  u64 flags = selp_u64(doneFlags, signalFlags, wait >= (int64_t)waitDoneSignal);
+                  u64 flag = flags + widen(((wait & (int64_t)(waitDoneSignal - 1)) - 1) * 4);
                   u32 value = ld_global_relaxed_sys_u32(flag);
                   if (blocking) {
                     IF(ldIssued == consumed) {
@@ -1989,7 +2001,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                   IF(value < stepValue) {
                     BREAK;
                   }
-                  // The data arrived before the signal; the loads are bulk copies
+                  // The data arrived (or was stored) before the signal; the loads are bulk copies
                   fence_acquire_sys();
                   fence_proxy_async_global();
                 }

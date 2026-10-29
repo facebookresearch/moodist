@@ -2,14 +2,13 @@
 Tests for compile_op reductions: reduce="sum", "avg", "min" and "max", where every output element is the op over all
 the input regions (of all ranks) that cover it, e.g. reduce-scatter and all-reduce.
 
-Reductions need CUDA tensors. Across NVLink domains (nodes, or e.g. NVL72 racks), so far only regions whose outputs are
-all in one domain (e.g. reduce-scatter, reduce to one rank; all-reduce raises): with several domains, run the tests of
-those (reduce_scatter, reduce_scatter_large, reduce_scatter_tensor_ids, reduce_to_one).
+Reductions need CUDA tensors. They work across NVLink domains (nodes, or e.g. NVL72 racks) too, where the tests run
+unchanged.
 
 Inputs are small integers that depend on the rank, the region and the global index, so that every rank can compute
 every rank's inputs, and sums are exact in every dtype: the expected results are exact too (avg: the exact sum divided
 by the number of inputs, rounded once in float32, then to the dtype, as the kernel does; across domains, the partial
-results of other domains are divided and rounded to the dtype first, which is exact with a power of 2 ranks).
+results of the domains are divided and rounded to the dtype first, which is exact with a power of 2 ranks).
 """
 
 import math
@@ -194,6 +193,24 @@ def test_reduce_scatter_tensor_ids(ctx: TestContext):
         spec[f"t{t}"] = ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])
     for op_name in ["sum", "avg"]:
         run_reduce(ctx, pg, op_name, torch.float32, spec)
+
+
+@test
+def test_reduce_some_ranks(ctx: TestContext):
+    """Inputs or outputs on some ranks only: inputs on ranks 0 and 1 (across NVLink domains, one domain has all
+    sources), on the first and the last rank (one source per domain, read as it is), and outputs on the first 8 ranks
+    of inputs on all (with more domains than those, domains that only have sources)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 40000
+    whole = [((0,), (numel,))]
+    first_two = [whole if r < 2 else [] for r in range(n)]
+    first_last = [whole if r in (0, n - 1) else [] for r in range(n)]
+    first_eight = [whole if r < 8 else [] for r in range(n)]
+    for ins, outs in [(first_two, [whole] * n), (first_last, [whole] * n), ([whole] * n, first_eight)]:
+        spec = {"0": ([numel], ins, outs)}
+        for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg"), (torch.int32, "max")]:
+            run_reduce(ctx, pg, op_name, dtype, spec)
 
 
 @test

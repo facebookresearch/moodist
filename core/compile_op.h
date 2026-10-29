@@ -50,7 +50,8 @@ struct Graph {
   struct Edge {
     uint64_t id;
     // One source (a copy), none (a relay edge, see below), or for a reduction several, combined in this order (the
-    // executor's own source first, then the others in rank order from there; see mergeReductions in compile_op.cc)
+    // executor's own source first, then the others in rank order from there; see mergeReductions in compile_op.cc,
+    // and crossDomainReductions for reductions across NVLink domains)
     Vector<Node> sources;
     Vector<Node> destinations;
     size_t bytes;
@@ -65,21 +66,25 @@ struct Graph {
 
     // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc):
     // per source, the signal index of the RDMA read that fills it (the kernel waits for cpuOutBuffer slot
-    // 16 + signal before it loads the source), or -1; empty if no source waits
+    // 16 + signal before it loads the source), or -1; empty if no source waits for a read
     Vector<int32_t> sourceSignals;
-    // The number of sources, at the end, that are partial results of other NVLink domains: an average has divided
-    // those by the divisor already, the others it divides after combining them
+    // per source, the doneSignal of the edge of this rank's that computes it (in an all-reduce, the partial result of
+    // the executor's own domain; the kernel waits for cpuInBuffer slot 16 + doneSignal), or -1; empty if none
+    Vector<int32_t> sourceDoneSignals;
+    // The number of sources, at the end, that are partial results of NVLink domains: an average has divided those
+    // by the divisor already, the others it divides after combining them
     uint32_t partialSources = 0;
     // Avg: the number of inputs the result is the average of (0: the number of sources)
     uint32_t divisor = 0;
-    // >= 0: a partial result that a rank in another domain reads over RDMA. Once all of the edge has been stored,
-    // the kernel writes the step value into cpuInBuffer slot 16 + doneSignal, for its CPU thread.
+    // >= 0: a partial result that ranks in other domains read over RDMA (or that the executor combines itself, see
+    // sourceDoneSignals). Once all of the edge has been stored, the kernel writes the step value into cpuInBuffer slot
+    // 16 + doneSignal, for its CPU thread.
     int32_t doneSignal = -1;
 
     template<typename X>
     void serialize(X& x) {
       x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex, sourceSignals,
-          partialSources, divisor, doneSignal);
+          sourceDoneSignals, partialSources, divisor, doneSignal);
     }
   };
 

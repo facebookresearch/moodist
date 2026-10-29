@@ -48,11 +48,17 @@ Every step is collective: all ranks of the group take part (through per-rank que
    row-major order (which is how its inputs and outputs, or their contiguous copies, hold it), and destination rank
    (p + cell index) mod m computes piece p: it reads the piece from every source, combines them and stores the
    result to every destination, which is a reduce-scatter and an all-gather in one pass. A cell with one destination
-   rank (e.g. in a reduce-scatter) is computed by that rank. Every destination rank of a cell computes the same
-   pieces, from the same regions. In a cell whose sources and destinations are not all in one NVLink domain (the
-   ranks learn each other's domain, its first rank, in the first exchange of `compile`), pieces of 8 MiB or more are
-   split further, into parts of at least 4 MiB (at most 32, with the same executor), so that the partial results of
-   other domains (step 7) arrive in parts.
+   rank (e.g. in a reduce-scatter) is computed by that rank. A cell with destination ranks in several NVLink domains
+   (the ranks learn each other's domain, its first rank, in the first exchange of `compile`), e.g. in an all-reduce
+   across domains, is computed once per domain with destinations: it has as many pieces as the domain with the most
+   destination ranks has, and in each such domain, destination rank (p + cell index) mod m_d of its m_d computes
+   piece p for the destinations there (step 7). Every destination rank of a cell computes the same pieces, from the
+   same regions. In a cell whose sources and destinations are not all in one NVLink domain, pieces are split further
+   into parts (at most 32, with the same executors), so that the partial results of other domains (step 7) arrive in
+   parts: pieces of 8 MiB or more into parts of at least 4 MiB, and with destinations in several domains, into parts
+   of at least 32 MiB / m (from 1 to 4 MiB; m: the most destination ranks of a domain), since such an executor writes
+   each part to the m destinations of its domain, which with many of them takes longer than reading the part, and
+   smaller parts then overlap the two better (see the measurements in `reductionPieces`).
 4. **Phase 3**: one read request per cell and source, to the rank that owns the input.
 5. **Phase 4**: that rank resolves the offset. A piece that is not contiguous in the input becomes an input copy
    (deduplicated).
@@ -68,30 +74,44 @@ Every step is collective: all ranks of the group take part (through per-rank que
 
    Across NVLink domains, an executor reads the sources of its own domain itself, and one value from each other
    domain over RDMA: the input, if the domain has one source, otherwise the domain's partial result, which a rank of
-   that domain computes. This partial rank is one with the executor's local rank (a NIC on the same rail), the one
+   that domain computes. A piece with one executor (its destinations are in one domain: a reduce-scatter, a reduce
+   to one rank) gets its partial results from ranks with the executor's local rank (NICs on the same rail), the one
    at the executor's position among the ranks of its domain with that local rank, so that with domains of the same
    shape every rank computes as many partial results. The executors send their requests to the partial ranks, which
-   add an edge per request, from the domain's sources (in rank order from their own) to a region of their scratch
-   tensor (a CUDA tensor of the op's dtype that `customOp` allocates per call, for the partial results that the rank
-   computes and the data that it reads, at page aligned offsets), with a `doneSignal` (see the kernel and Runtime),
-   and answer with the region and a notification slot (32 per pair of ranks; with more requests, consecutive ones
-   share a slot). The executor's edge then combines its domain's sources, the inputs of other domains and the
-   partial results (in the order of their domains' first ranks), the last two from regions of its scratch tensor
-   that ibReads fill (with a `signalIndex`, and for partial results a `waitSlot`: read once the partial rank has
-   sent its notification); `sourceSignals` holds the signal of each source the kernel has to wait for. Partial
-   results are of the op's dtype (16-bit floats are rounded once per domain), and `avg` divides them by the number of
-   all inputs already (`divisor`; the executor divides what it combined of the inputs, then adds the
+   add an edge per partial result, from the domain's sources (in rank order from their own) to a region of their
+   scratch tensor (a CUDA tensor of the op's dtype that `customOp` allocates per call, for the partial results that
+   the rank computes and the data that it reads, at page aligned offsets), with a `doneSignal` (see the kernel and
+   Runtime), and answer with the region and a notification slot (32 per pair of ranks; with more requests,
+   consecutive ones share a slot). The executor's edge then combines its domain's sources, the inputs of other
+   domains and the partial results (in the order of their domains' first ranks), the last two from regions of its
+   scratch tensor that ibReads fill (with a `signalIndex`, and for partial results a `waitSlot`: read once the
+   partial rank has sent its notification); `sourceSignals` holds the signal of each source the kernel has to wait
+   for. Partial results are of the op's dtype (16-bit floats are rounded once per domain), and `avg` divides them by
+   the number of all inputs already (`divisor`; the executor divides what it combined of the inputs, then adds the
    `partialSources`), which keeps sums of many 16-bit values in range.
 
-   A partial rank's kernel computes its partial results part by part (`chunkIndex`, see Phase 2), so that every
-   executor gets the first parts from all domains early on, and within a part, starting with the requests of the
-   domain after its own, at its own position; an executor issues its reads per part from the domain before its own
-   on, the order in which they are computed. At any time, every partial rank then has one reader, and every executor
-   one source (reduce-scatter with 16 domains of 4 GPUs: 47.5 ms at 256 MiB, 68.7 ms with the partial ranks serving
-   the executors in rank order and the executors reading in domain order; see Performance notes).
+   A piece with destinations in several domains (e.g. an all-reduce) has an executor in each of them (Phase 2), and
+   these must store the same bits: they combine the same values in the same order, the inputs of the domains with
+   one source, then the partial results of the others, in the order of the domains. An executor computes the partial
+   result of its own domain itself, which the other executors read, and combines it as rounded, from its scratch
+   tensor, once its kernel has stored all of it (`sourceDoneSignals`: the kernel waits for its own done signal). All
+   executors get the partial result of a domain from the same rank, which computes it once (a request for a partial
+   result that a rank computes already joins it, by its sources): the domain's executor, or in a domain without
+   destinations, its source rank (p + cell index) mod (their number). Every domain's partial result thus crosses to
+   every other domain with destinations: with k such domains of n GPUs, an all-reduce moves (k - 1) / n of the tensor
+   per GPU over RDMA each way (1/32 with 2 domains of 32 GPUs, but 15/4 with 16 domains of 4, where a reduce-scatter
+   and an all-gather among the executors of a piece would move 2 (k - 1) / (k n), about 1/2; see Reductions: next
+   steps).
 
-   So far, only pieces whose destinations are all in the executor's domain (reduce-scatter, reduce to one rank) go
-   across domains: the others (e.g. all-reduce across domains), and reductions of CPU tensors, are an error (step 9).
+   A partial rank's kernel computes its partial results part by part (`chunkIndex`, see Phase 2), so that every
+   executor gets the first parts from all domains early on, and within a part, its own executor's first, then the
+   requests of the domain after its own, at its own position; an executor issues its reads per part from the domain
+   before its own on, the order in which they are computed, and combines the parts in that order too. At any time,
+   every partial rank then has one reader, and every executor one source (reduce-scatter with 16 domains of 4 GPUs:
+   47.5 ms at 256 MiB, 68.7 ms with the partial ranks serving the executors in rank order and the executors reading
+   in domain order; see Performance notes).
+
+   Reductions of CPU tensors are an error (step 9).
 8. **Proxy pass** (`proxyRemoteEdges`; `MOODIST_COMPILE_OP_PROXY=0` disables it; not for reductions, whose kernel
    takes no relay edges): data that several ranks of an
    NVLink domain (`cudaRanks`, see the next step) need from a rank outside the domain should cross the network
@@ -122,8 +142,8 @@ Every step is collective: all ranks of the group take part (through per-rank que
    the copies of its inputs) or the kernel edges of other ranks touch its tensors (its kernel then only publishes
    their addresses and takes part in the exit sync). Without the kernel path, all edges become ibReads, and the proxy
    pass is undone (the copies from a proxy's node would race with the proxy's own read). Reductions run in the
-   kernel only: an edge with several sources that the kernel cannot take (CPU tensors, or outputs in several NVLink
-   domains, see step 7) is an error, on every rank. (Until October 2026, the kernel path was used only if every rank
+   kernel only: an edge with several sources that the kernel cannot take (CPU tensors; those of CUDA tensors in other
+   NVLink domains are kernel edges after step 7) is an error, on every rank. (Until October 2026, the kernel path was used only if every rank
    had a kernel edge, so e.g. a gather, or a transfer between two ranks of a larger group, went entirely over RDMA.)
    The ibReads are sorted by source so that each source has about one reader at a time: in the same
    exchange, the ranks learn each other's domain (its first rank), and the rank at position p of domain i reads
@@ -239,11 +259,12 @@ on new tensors at every call.
   block that stores the last item of one (a per-edge counter, which wraps around after every launch) waits for its
   stores to complete and writes the step value into slot 16 + `doneSignal` of `cpuInBuffer` (host memory) for the
   CPU thread. A source that the CPU thread reads from another domain is loaded once the read's signal (slot 16 +
-  signal of `cpuOutBuffer`) has arrived. Until then, thread 0 stops loading at that source, and the block goes on
-  with the stages it has; it waits for the signal only when it has combined every stage loaded before (at the start
-  of a stage). Its earlier items are then complete, including any partial results among them, so a block never holds
-  back a partial result that another domain waits for while it waits itself, and the blocks of all ranks make
-  progress.
+  signal of `cpuOutBuffer`) has arrived, and in an all-reduce, the partial result of the executor's own domain once
+  that `cpuInBuffer` slot has the step value (the wait table word has bit 31 set for these). Until then, thread 0
+  stops loading at that source, and the block goes on with the stages it has; it waits for the signal only when it
+  has combined every stage loaded before (at the start of a stage). Its earlier items are then complete, including
+  any partial results among them, so a block never holds back a partial result that a rank (its own included) waits
+  for while it waits itself, and the blocks of all ranks make progress.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 - **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
@@ -305,7 +326,8 @@ on new tensors at every call.
   has arrived (slot `waitSlot` of the partial rank's slots in `inStepValueDeviceChunk`), and lets the reads after it
   go first meanwhile. The CPU thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the
   flags of all partial results of a notification slot are set, it writes the step value into that slot of the
-  executor (`writeStepValueDeviceChunk`).
+  executor (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a
+  notification for each).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
   signals the kernel when the read of a proxied transfer, or of a reduction's source from another NVLink domain, has
   completed (all its parts): `writeCpuOut` writes the step value into slot 16 + signal index of `cpuOutBuffer` (a
@@ -523,10 +545,28 @@ domains, by RDMA: a GPU reads 15 partial results of the size of its output, at a
 orders of the partial results and the reads (step 7), the 16 domains took 443 us, 4.65 ms, 16.8 ms and 68.7 ms from
 1 MiB on; with 1 MiB parts instead of 128 KiB (see the RDMA notes), 442 us, 3.99 ms, 13.9 ms and 50.7 ms. NCCL's
 reduce-scatter on the 64 GPUs is a ring at every size, NVLS or not (`NCCL_NVLS_ENABLE=0`: 420 us, 747 us, 2.02 ms,
-6.71 ms and 26.2 ms). Its all-reduce, which compile_op cannot do yet across domains (see Reductions: next steps),
-uses NVLS within each domain and a tree across them (`NVLS_TREE`) from 1 MiB on: 138 us, 421 us, 422 us, 725 us and
-1.23 ms; without NVLS (tree and ring) 174 us, 209 us, 313 us, 599 us and 1.72 ms, faster than NCCL's choice from
-1 MiB to 64 MiB (moodist's process group: 2.58 ms at 256 MiB).
+6.71 ms and 26.2 ms).
+
+All-reduce (`bfloat16`) on the same 64 GPUs (one session):
+
+| all-reduce, 64 GPUs | 64 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|
+| compile_op, two domains | 111 us | 96 us | 123 us | 261 us | 846 us |
+| NCCL (`NVLS_TREE` from 1 MiB on) | 151 us | 423 us | 408 us | 738 us | 1.24 ms |
+| NCCL with `NCCL_NVLS_ENABLE=0` (tree and ring) | 140 us | 210 us | 311 us | 596 us | 1.73 ms |
+| compile_op, 16 domains | 101 us | 153 us | 872 us | 3.20 ms | 12.5 ms |
+| NCCL with `NCCL_MNNVL_ENABLE=0` | 140 us | 193 us | 1.17 ms | 1.99 ms | 5.40 ms |
+
+With two domains, an executor computes its domain's partial result of its piece (reading 1/32 of the tensor from
+each GPU of its domain), reads the other domain's over RDMA (1/32 of the tensor) and stores the sum to the 32 GPUs of
+its domain: the NVLink traffic of an all-reduce in one domain, in two phases, and the RDMA in between, in 1 MiB parts
+(Phase 2). The phases take less time than the single pass of one domain, where every item reads its 32 sources and
+stores to 32 destinations: 846 us against 937 us on 32 GPUs in the same session at 256 MiB, with the same grid of
+24 blocks (the NVLink-only tuning launches: 10.0 against 11.2 ms for 12), which suggests the same split within one
+domain (see Reductions: next steps). NCCL's choice, `NVLS_TREE`, is slower than its tree and ring from 1 MiB to
+64 MiB. With 16 domains, every GPU reads 15 partial results of a quarter of the tensor over RDMA, 3.75 times the
+tensor, at about 80 GB/s at 256 MiB, and the large sizes take 1.6 (64 MiB) to 2.3 times (256 MiB) as long as NCCL's
+(moodist's process group: 2.58 ms at 256 MiB with two domains).
 
 RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
 1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
@@ -697,16 +737,21 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    measurements against the proxy pass.
 
 ### Reductions: next steps
-1. Across NVLink domains (compile phase step 7), so far for regions whose outputs are all in one domain (e.g.
-   reduce-scatter). Next: all-reduce, where the outputs of a piece are in several domains: every destination domain
-   computes the piece from the partial results of the other domains, and its own domain's partial result (computed
-   once, and used as rounded, so that all domains get the same bits); with three or more domains, a reduce-scatter
-   and an all-gather across domains instead, so that a partial result does not cross the network to every
-   destination domain. Then the write variant: the partial rank writes its result into the executor's scratch
-   tensor (one RDMA write instead of a notification and a read). With 16 domains, the reduce-scatter is 6-9% slower
-   than NCCL from 64 MiB on (above). CPU tensors (an error): the CPU thread could combine them (`CpuReductions` in
-   cputhread.cc, which the process group's CPU reduce-scatter uses).
-2. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
+1. Across NVLink domains (compile phase step 7): with three or more domains with destinations, a reduce-scatter and
+   an all-gather among the executors of a piece, so that a partial result does not cross the network to every
+   destination domain (an all-reduce on 16 domains of 4 GPUs moves 15/4 of the tensor per GPU over RDMA, and is
+   2.3 times slower than NCCL at 256 MiB; see Performance notes). Then the write variant: the partial rank writes its
+   result into the executor's scratch tensor (one RDMA write instead of a notification and a read). With 16 domains,
+   the reduce-scatter is 6-9% slower than NCCL from 64 MiB on (above). Small reductions across domains take about
+   100 us on 64 GPUs, against 30 us in one domain of 32: `WorkCustom` exchanges with every rank (the input lists and
+   two step value barriers), where a reduction needs only its partial ranks and executors (to be measured). CPU
+   tensors (an error): the CPU thread could combine them (`CpuReductions` in cputhread.cc, which the process group's
+   CPU reduce-scatter uses).
+2. All-reduce in one domain in two phases, as across domains: an executor computes its piece into its scratch
+   tensor, then stores it from there to every destination (an edge that waits for the first one's done signal).
+   Across two domains, the two phases took 846 us at 256 MiB, against 937 us for the single pass in one domain of 32
+   GPUs (see Performance notes), where NCCL takes 900 us with NVLS.
+3. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
    all-reduce, each GPU then sends its input once and receives the result once, (1 + 1/N) times the data instead of
    2 (N - 1) / N for the unicast pieces, about half on 32 ranks: this is where NCCL is faster at 256 MiB (see the
    table under Performance notes). For a reduce-scatter it saves SMs, not bandwidth (each GPU sends its whole input
@@ -716,10 +761,10 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    register load (at most 16 bytes per thread), not a bulk copy. Instruction support on GB300 (ptxas, sm_103a):
    `add` of `f32`, `f16x2`, `bf16x2` (with `.acc::f32`), `f64`, `s32`, `u64`; `min`/`max` of 16-bit floats and
    integers, not of `f32`.
-3. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
+4. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
    ranks). Splitting such cells among the sources (each computing a piece and writing it to the root) would bring
    the root's NVLink ingress from (N - 1) times to about twice the data.
-4. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
+5. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
    parameterized by size (compiling takes 1-2 s, once per size), and `avg` (FSDP2's default `ReduceOp.AVG` is a
    fatal error in moodist's process group reduce-scatter today).
 

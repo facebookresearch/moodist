@@ -149,10 +149,9 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
                 - "any": Pick any source for overlapping regions (for replicated data)
                 - "sum", "avg", "min", "max": every output element is the sum (average,
                   minimum, maximum) of all inputs that cover it, e.g. reduce-scatter and
-                  all-reduce. CUDA tensors; across NVLink domains (nodes, or e.g. NVL72
-                  racks) so far only regions whose outputs are all in one domain, e.g.
-                  reduce-scatter. float32, float64, float16, bfloat16, int32 and int64
-                  ("avg": the floating point types). All ranks must pass the same value.
+                  all-reduce. CUDA tensors; float32, float64, float16, bfloat16, int32 and
+                  int64 ("avg": the floating point types). All ranks must pass the same
+                  value.
         cpu_sync: If True, force CPU-side synchronization before CUDA operations.
                   This avoids potential deadlocks when CUDA has device-wide syncs pending.
                   Default is False.
