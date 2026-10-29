@@ -351,6 +351,8 @@ struct CudaAllocatorImpl {
   size_t nextMapBase = 0;
 
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
+  // See allocatorAddChunkListener
+  Vector<std::pair<void (*)(void*, unsigned long long, size_t, size_t), void*>> chunkListeners;
   size_t allocationGranularity = 0;
   bool fabricSupported = false;
   bool gpuDirectRdmaSupported = false;
@@ -577,7 +579,7 @@ struct CudaAllocatorImpl {
         }
       }
 
-      constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+      constexpr size_t reserveSize = allocatorReserveSize; // 1 TB
       CUdeviceptr base = 0;
       CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
       reservedBase = base;
@@ -645,6 +647,9 @@ struct CudaAllocatorImpl {
 
     cuMemHandles.emplace_back(bytes, handle);
     nextMapBase += bytes;
+    for (auto& [fn, ctx] : chunkListeners) {
+      fn(ctx, handle, address - reservedBase, bytes);
+    }
 
     log.info("Moodist successfully mapped %d bytes at %#x (cuMemCreate + cuMemMap)\n", bytes, address);
 
@@ -1336,6 +1341,18 @@ bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outO
   *outOffset = offset;
   *outSize = handles[index].first;
   return true;
+}
+
+void allocatorAddChunkListener(
+    void (*fn)(void* ctx, unsigned long long handle, size_t offset, size_t size), void* ctx) {
+  CHECK(globalCudaAllocatorImpl);
+  std::lock_guard l(globalCudaAllocatorImpl->mutex);
+  size_t offset = 0;
+  for (auto& [size, handle] : globalCudaAllocatorImpl->cuMemHandles) {
+    fn(ctx, handle, offset, size);
+    offset += size;
+  }
+  globalCudaAllocatorImpl->chunkListeners.emplace_back(fn, ctx);
 }
 
 bool allocatorSupportsFabric() {

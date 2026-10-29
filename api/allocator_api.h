@@ -74,8 +74,18 @@ int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl);
 // Get the reserved VA base address (0 if not initialized)
 uintptr_t allocatorGetReservedBase();
 
+// Size of the allocator's VA reservation: chunk offsets (and so pool offsets) are below it. Peers reserve the same
+// size, aligned to it, for the mapping of a rank's pool (see IpcMapper), so that the pool offset of an address in such
+// a mapping is its low bits (compile_op's NVLS check relies on it).
+constexpr size_t allocatorReserveSize = (size_t)1 << 40;
+
 // Get number of cuMemCreate chunks
 size_t allocatorGetChunkCount();
+
+// Call fn(ctx, handle, offset, size) for every chunk (cuMemCreate handle, offset within the reserved range, size): the
+// existing ones now, the ones mapped later as they are mapped (before any memory in them is handed out). fn runs with
+// the allocator's lock held, so it must not allocate.
+void allocatorAddChunkListener(void (*fn)(void* ctx, unsigned long long handle, size_t offset, size_t size), void* ctx);
 
 // Get chunk info by index: handle, offset within reserved range, size.
 // Returns true if index is valid, false otherwise.

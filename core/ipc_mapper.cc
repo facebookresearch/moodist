@@ -319,9 +319,13 @@ struct IpcMapperImpl : IpcMapper {
           size_t granularity = 0;
           CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
 
-          constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024; // 1 TB
+          // Aligned to its size, so that the low bits of an address in it are the peer's pool offset (see
+          // allocatorReserveSize); without that alignment, NVLS is not used with this peer (see customOp)
+          constexpr size_t reserveSize = allocatorReserveSize; // 1 TB
           CUdeviceptr base = 0;
-          CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+          if (cuMemAddressReserve(&base, reserveSize, reserveSize, 0, 0) != CUDA_SUCCESS) {
+            CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+          }
           hpeer.reservedBase = base;
           hpeer.reservedSize = reserveSize;
 
@@ -811,7 +815,7 @@ struct IpcMapperImpl : IpcMapper {
     log.info("waa got fabric map request of chunk %d from rank %d\n", info.chunkIndex, source);
     // CHECK(false);
 
-    constexpr size_t reserveSize = (size_t)1024 * 1024 * 1024 * 1024;
+    constexpr size_t reserveSize = allocatorReserveSize;
     CHECK(info.offset + info.bytes <= reserveSize);
 
     if (remoteFabricMaps.size() != group->size) {
@@ -834,8 +838,12 @@ struct IpcMapperImpl : IpcMapper {
       prop.location.id = dev;
       size_t granularity = 0;
       CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+      // Aligned to its size, so that the low bits of an address in it are the peer's pool offset (see
+      // allocatorReserveSize); without that alignment, NVLS is not used with this peer (see customOp)
       CUdeviceptr base;
-      CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+      if (cuMemAddressReserve(&base, reserveSize, reserveSize, 0, 0) != CUDA_SUCCESS) {
+        CHECK_CU(cuMemAddressReserve(&base, reserveSize, granularity, 0, 0));
+      }
       m.base = base;
 
       log.info("Fabric map reserved memory for rank %d at %#x\n", source, m.base);
