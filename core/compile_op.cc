@@ -2018,18 +2018,26 @@ struct CompileOpConstructor {
       log.info("setting %d: %fms\n", i, seconds(timings.at(i)) * 1000);
     }
 
-    // The minimum over ranks: ranks without a kernel time nanoseconds::max() (a maximum would need to skip those)
+    // The slowest rank per setting (the op takes as long as its slowest rank, e.g. the executors of a reduction
+    // across NVLink domains, which combine more than the others), of the ranks with a kernel: the others time
+    // nanoseconds::max()
     for (size_t i : range(size)) {
       ctx.send(i, timings);
     }
+    static constexpr std::chrono::nanoseconds noKernel = std::chrono::nanoseconds::max();
+    Vector<std::chrono::nanoseconds> slowest(timings.size());
+    std::ranges::fill(slowest, noKernel);
     Vector<std::chrono::nanoseconds> ntimings;
     for (size_t i : range(size)) {
       ctx.receive(i, ntimings);
       CHECK(ntimings.size() == timings.size());
-      for (size_t i : indices(timings)) {
-        timings[i] = std::min(timings[i], ntimings[i]);
+      for (size_t j : indices(timings)) {
+        if (ntimings[j] != noKernel) {
+          slowest[j] = slowest[j] == noKernel ? ntimings[j] : std::max(slowest[j], ntimings[j]);
+        }
       }
     }
+    timings = std::move(slowest);
 
     // The fastest setting, with a small penalty per block of the grid: the copy kernel occupies its SMs, which the
     // computation it overlaps with lacks meanwhile. A bigger grid has to be clearly faster to be chosen, as it is
@@ -2062,41 +2070,114 @@ struct CompileOpConstructor {
 
     auto validateAndRecordNdim = [&](const api::TensorRegion& region, const char* kind, size_t idx) {
       int ndim = static_cast<int>(region.offset.size());
-      if (region.offset.size() != region.shape.size()) {
+      if (region.rank < 0 || (size_t)region.rank >= size) {
         throw std::runtime_error(
-            fmt::sprintf("moodist.compile_op: %s %zu has mismatched offset/shape sizes (%zu vs %zu)", kind, idx,
-                region.offset.size(), region.shape.size()));
+            fmt::sprintf("%s %zu has rank %d, outside the group (%zu ranks)", kind, idx, region.rank, size));
+      }
+      if (region.offset.size() != region.shape.size()) {
+        throw std::runtime_error(fmt::sprintf("%s %zu has mismatched offset/shape sizes (%zu vs %zu)", kind, idx,
+            region.offset.size(), region.shape.size()));
+      }
+      for (size_t d : indices(region.shape)) {
+        if (region.offset[d] < 0 || region.shape[d] < 0) {
+          throw std::runtime_error(fmt::sprintf("%s %zu has a negative offset or shape (offset [%s], shape [%s])", kind,
+              idx, fmt::to_string(fmt::join(region.offset, ",")), fmt::to_string(fmt::join(region.shape, ","))));
+        }
       }
       std::string tid(region.tensorId);
       auto it = tensorIdNdim.find(tid);
       if (it != tensorIdNdim.end()) {
         if (it->second != ndim) {
-          throw std::runtime_error(
-              fmt::sprintf("moodist.compile_op: %s %zu has wrong dimensions for tensorId '%s' (got %d, expected %d)",
-                  kind, idx, tid.c_str(), ndim, it->second));
+          throw std::runtime_error(fmt::sprintf("%s %zu has wrong dimensions for tensorId '%s' (got %d, expected %d)",
+              kind, idx, tid.c_str(), ndim, it->second));
         }
       } else {
         tensorIdNdim[tid] = ndim;
       }
     };
 
-    for (size_t i : indices(inputs)) {
-      validateAndRecordNdim(inputs[i], "input", i);
-    }
-    for (size_t i : indices(outputs)) {
-      validateAndRecordNdim(outputs[i], "output", i);
+    // Errors in the regions are raised on every rank, after the first exchange below (where every rank learns the
+    // others' errors): only this rank can check the device index of its own regions, and the C++ API takes the
+    // regions of all ranks as each rank passes them (compile.py exchanges them)
+    std::string regionError;
+    try {
+      for (size_t i : indices(inputs)) {
+        validateAndRecordNdim(inputs[i], "input", i);
+      }
+      for (size_t i : indices(outputs)) {
+        validateAndRecordNdim(outputs[i], "output", i);
+      }
+      // Device strings, and the CUDA index of this rank's own regions
+      for (auto regions : {inputs, outputs}) {
+        for (const auto& region : regions) {
+          if (static_cast<size_t>(region.rank) == rank) {
+            parseAndValidateDevice(region.device, group->deviceIndex);
+          } else {
+            parseDevice(region.device);
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      regionError = e.what();
     }
 
-    // Validate device strings for local regions (where rank == this rank)
-    for (const auto& region : inputs) {
-      if (static_cast<size_t>(region.rank) == rank) {
-        parseAndValidateDevice(region.device, group->deviceIndex);
+    // Barrier before queue operations
+    ctx.barrier();
+
+    // Every rank must compile the same op: the steps below depend on the dtype and the reduce op (e.g. only
+    // reductions merge their edges at the executors). compile.py checks this too, but the C++ API comes straight
+    // here. Every rank receives the values of all ranks before it raises, so that the queues stay in step.
+    // The same exchange tells every rank the NVLink domain of each rank (its first rank), and the errors in the
+    // regions (above).
+    Vector<uint32_t> domainIds(size);
+    for (size_t i : range(size)) {
+      ctx.send(i, (int)dtype, (int)reduce, (uint32_t)computeCudaRanks(group, !ctx.collectiveOp).at(0), regionError);
+    }
+    std::string mismatch;
+    std::string firstRegionError;
+    size_t firstRegionErrorRank = 0;
+    for (size_t i : range(size)) {
+      int peerDtype;
+      int peerReduce;
+      std::string peerRegionError;
+      ctx.receive(i, peerDtype, peerReduce, domainIds[i], peerRegionError);
+      if (mismatch.empty() && (peerDtype != (int)dtype || peerReduce != (int)reduce)) {
+        mismatch = fmt::sprintf("rank %zu: dtype %s, reduce='%s'; rank %zu: dtype %s, reduce='%s'", rank,
+            dtypeName(dtype), reduceName(reduce), i, dtypeName((DType)peerDtype), reduceName((ReduceOp)peerReduce));
+      }
+      if (firstRegionError.empty() && !peerRegionError.empty()) {
+        firstRegionError = std::move(peerRegionError);
+        firstRegionErrorRank = i;
       }
     }
-    for (const auto& region : outputs) {
-      if (static_cast<size_t>(region.rank) == rank) {
-        parseAndValidateDevice(region.device, group->deviceIndex);
-      }
+    REQUIRE(mismatch.empty(), "moodist.compile_op: ranks specified different dtypes or reduce ops (%s)", mismatch);
+    REQUIRE(
+        firstRegionError.empty(), "moodist.compile_op: %s (found on rank %zu)", firstRegionError, firstRegionErrorRank);
+    const Domains domains(domainIds);
+    // MOODIST_COMPILE_OP_ROUNDS: all-reduces across NVLink domains in one round, in two wherever they can be, or
+    // ("auto") as the cost model in reductionPieces picks. MOODIST_COMPILE_OP_PHASES: reductions in one domain in one
+    // pass, in two phases (see twoPhaseReductions), or ("auto") as tuneKernels picks.
+    std::string rounds = "auto";
+    std::string phases = "auto";
+    if (isReduction(reduce)) {
+      rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
+      REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
+          "compile_op: MOODIST_COMPILE_OP_ROUNDS must be auto, 1 or 2 (not '%s')", rounds);
+      phases = agreedEnv("MOODIST_COMPILE_OP_PHASES", "auto");
+      REQUIRE(phases == "auto" || phases == "1" || phases == "2",
+          "compile_op: MOODIST_COMPILE_OP_PHASES must be auto, 1 or 2 (not '%s')", phases);
+    }
+
+    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
+    // least 32 bits) and 32- and 64-bit integers
+    if (isReduction(reduce)) {
+      const bool floating =
+          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
+      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
+      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
+          "moodist.compile_op: reduce='%s' does not support dtype %s (supported: float32, float64, float16, "
+          "bfloat16%s)",
+          reduceName(reduce), dtypeName(dtype), reduce == ReduceOp::Avg ? "" : ", int32, int64");
     }
 
     // Parse inputs and outputs into TensorDescr structs
@@ -2206,55 +2287,6 @@ struct CompileOpConstructor {
 
         logicalInputsToSend[out.rank].push_back(std::move(li));
       }
-    }
-
-    // Barrier before queue operations
-    ctx.barrier();
-
-    // Every rank must compile the same op: the steps below depend on the dtype and the reduce op (e.g. only
-    // reductions merge their edges at the executors). compile.py checks this too, but the C++ API comes straight
-    // here. Every rank receives the values of all ranks before it raises, so that the queues stay in step.
-    // The same exchange tells every rank the NVLink domain of each rank (its first rank).
-    Vector<uint32_t> domainIds(size);
-    for (size_t i : range(size)) {
-      ctx.send(i, (int)dtype, (int)reduce, (uint32_t)computeCudaRanks(group, !ctx.collectiveOp).at(0));
-    }
-    std::string mismatch;
-    for (size_t i : range(size)) {
-      int peerDtype;
-      int peerReduce;
-      ctx.receive(i, peerDtype, peerReduce, domainIds[i]);
-      if (mismatch.empty() && (peerDtype != (int)dtype || peerReduce != (int)reduce)) {
-        mismatch = fmt::sprintf("rank %zu: dtype %s, reduce='%s'; rank %zu: dtype %s, reduce='%s'", rank,
-            dtypeName(dtype), reduceName(reduce), i, dtypeName((DType)peerDtype), reduceName((ReduceOp)peerReduce));
-      }
-    }
-    REQUIRE(mismatch.empty(), "moodist.compile_op: ranks specified different dtypes or reduce ops (%s)", mismatch);
-    const Domains domains(domainIds);
-    // MOODIST_COMPILE_OP_ROUNDS: all-reduces across NVLink domains in one round, in two wherever they can be, or
-    // ("auto") as the cost model in reductionPieces picks. MOODIST_COMPILE_OP_PHASES: reductions in one domain in one
-    // pass, in two phases (see twoPhaseReductions), or ("auto") as tuneKernels picks.
-    std::string rounds = "auto";
-    std::string phases = "auto";
-    if (isReduction(reduce)) {
-      rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
-      REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
-          "compile_op: MOODIST_COMPILE_OP_ROUNDS must be auto, 1 or 2 (not '%s')", rounds);
-      phases = agreedEnv("MOODIST_COMPILE_OP_PHASES", "auto");
-      REQUIRE(phases == "auto" || phases == "1" || phases == "2",
-          "compile_op: MOODIST_COMPILE_OP_PHASES must be auto, 1 or 2 (not '%s')", phases);
-    }
-
-    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
-    // least 32 bits) and 32- and 64-bit integers
-    if (isReduction(reduce)) {
-      const bool floating =
-          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
-      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
-      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
-          "moodist.compile_op: reduce='%s' does not support dtype %s (supported: float32, float64, float16, "
-          "bfloat16%s)",
-          reduceName(reduce), dtypeName(dtype), reduce == ReduceOp::Avg ? "" : ", int32, int64");
     }
 
     // Send logical inputs to each destination rank
@@ -2489,6 +2521,9 @@ struct CompileOpConstructor {
       numTotalCells += tc.totalCells;
     }
 
+    // Gaps (output regions no input covers) and overlaps (regions several inputs cover, without a reduce op) in this
+    // rank's outputs: the first output's, sent to every rank in Phase 3, so that every rank raises it
+    std::string coverageError;
     for (size_t outIdx : range(numMyOutputs)) {
       size_t globalOutIdx = outputsPerRank[rank][outIdx];
       const TensorDescr& out = outputDescrs[globalOutIdx];
@@ -2604,27 +2639,18 @@ struct CompileOpConstructor {
         }
       }
 
-      // Report errors
-      if (gapCount > 0) {
-        std::string msg = "moodist.compile_op: missing input coverage";
-        if (gapCount > maxReportedRegions) {
-          msg += fmt::sprintf(" (%zu regions, showing first %zu):", gapCount, maxReportedRegions);
+      // The first error (raised on every rank in Phase 3)
+      if (coverageError.empty() && (gapCount > 0 || overlapCount > 0)) {
+        const bool gaps = gapCount > 0;
+        const size_t count = gaps ? gapCount : overlapCount;
+        coverageError = fmt::sprintf("moodist.compile_op: %s in the outputs of rank %zu",
+            gaps ? "missing input coverage" : "overlapping inputs detected", rank);
+        if (count > maxReportedRegions) {
+          coverageError += fmt::sprintf(" (%zu regions, showing first %zu):", count, maxReportedRegions);
         } else {
-          msg += ":";
+          coverageError += ":";
         }
-        msg += gapDetails;
-        throw std::runtime_error(msg);
-      }
-
-      if (overlapCount > 0) {
-        std::string msg = "moodist.compile_op: overlapping inputs detected";
-        if (overlapCount > maxReportedRegions) {
-          msg += fmt::sprintf(" (%zu regions, showing first %zu):", overlapCount, maxReportedRegions);
-        } else {
-          msg += ":";
-        }
-        msg += overlapDetails;
-        throw std::runtime_error(msg);
+        coverageError += gaps ? gapDetails : overlapDetails;
       }
     }
 
@@ -2658,20 +2684,26 @@ struct CompileOpConstructor {
     // Barrier before queue operations
     ctx.barrier();
 
-    // Send read requests to each source rank
+    // Send read requests to each source rank, with this rank's coverage error (Phase 2)
     for (size_t destRank : range(size)) {
-      ctx.send(destRank, requestsToSend[destRank]);
+      ctx.send(destRank, requestsToSend[destRank], coverageError);
     }
 
     // Receive read requests from all ranks (as a sender)
     Vector<ReadRequest> receivedRequests;
+    std::string firstCoverageError;
     for (size_t i : range(size)) {
       Vector<ReadRequest> batch;
-      ctx.receive(i, batch);
+      std::string error;
+      ctx.receive(i, batch, error);
       for (auto& req : batch) {
         receivedRequests.push_back(std::move(req));
       }
+      if (firstCoverageError.empty()) {
+        firstCoverageError = std::move(error);
+      }
     }
+    REQUIRE(firstCoverageError.empty(), "%s", firstCoverageError);
 
     log.debug("compile_op phase3: rank %zu, received %zu read requests\n", rank, receivedRequests.size());
 

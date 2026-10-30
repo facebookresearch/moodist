@@ -36,6 +36,14 @@ Every step is collective: all ranks of the group take part (through per-rank que
 1. **Spec exchange** (compile.py): every rank gathers `(rank, dtype, inputs, outputs, reduce)` from all ranks, so
    every rank knows every region of every rank, and checks that all ranks gave the same dtype and reduce op
    (`compile` checks this again, for the C++ API, in its first exchange).
+
+   Errors are raised on every rank: a rank that raised alone would leave the others waiting in the next
+   exchange (and the queues out of step). A rank that finds an error sends it in the next exchange, and every rank
+   raises the first one (lowest rank): compile.py's checks of a rank's own arguments in the spec exchange, the
+   regions (the device index of a rank's own regions, which only it knows) in `compile`'s first exchange, the gaps and
+   overlaps of a rank's outputs (Phase 2) with the read requests of Phase 3, the reductions' errors with the
+   agreement on the kernel path (step 9), and the 16-byte check (step 10) in an exchange of its own. Failures inside
+   the steps (e.g. running out of memory in the tuning) still leave the other ranks waiting.
 2. **Phase 1**: each rank intersects its own inputs with every output (same `tensor_id`) and sends the
    intersections to the rank of the output.
 3. **Phase 2**, cell decomposition: per `tensor_id`, the boundaries of all regions of all ranks cut each
@@ -222,7 +230,8 @@ Every step is collective: all ranks of the group take part (through per-rank que
     settings per variant; `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations, which every rank checks
     against the reduce loop's needs for reductions). Each setting is generated and JIT compiled, then run on zeroed
     scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The ranks exchange their timings and
-    take the minimum over ranks per setting (a rank without a kernel reports the largest time). The fastest setting
+    take the slowest rank's per setting (of the ranks with a kernel): an op takes as long as its slowest rank, e.g.
+    the executors of a reduction across domains, which combine more than the others. The fastest setting
     wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which the computation it overlaps with
     lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it is for copies limited by the
     SMs' bandwidth). The kernel of the chosen setting is generated and compiled once more for the op. Tuning
@@ -704,16 +713,14 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 ## Known issues and TODO
 
 ### Correctness
-- Some compile errors are raised only by the rank that finds them (gaps and overlaps in phase 2, device
-  mismatches), and the other ranks then wait forever in the next collective step. The 16-byte check shows the
-  pattern to follow: exchange the first error and raise on all ranks.
+- Failures inside the collective steps of the compile phase (e.g. running out of memory for the tuning's scratch
+  tensors, or a kernel that fails to JIT on one rank) are raised by that rank only, and the other ranks then wait
+  forever in the next exchange (the errors the compile phase checks for are raised on all ranks, see step 1).
 - Proxied transfers: the CPU thread signals the kernel as soon as the read's completion arrives, with a loopback
   RDMA write through the first NIC. That the read's data is visible in GPU memory before the signal relies on
   timing rather than on PCIe ordering (the read may have gone through another NIC, and MRs allow relaxed
   ordering); the all-gather's chunk signals do the same. A flush (a small RDMA read of the destination through
   the NIC of the read, before the signal) would make it explicit.
-- `tuneKernels` combines the ranks' timings with the minimum; the maximum (slowest rank) or the sum fits a
-  collective better.
 - The kernel takes the tensor addresses (and the addresses at which peers map them) as kernel parameters, which are
   limited to 32 KB: an op fails to JIT with about 4000 (tensor, peer) mappings (e.g. 1024 input tensors on 4
   ranks). Passing them in a device buffer would lift the limit.

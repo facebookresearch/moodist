@@ -614,6 +614,61 @@ def test_compile_op_device_mismatch_error(ctx: TestContext, device: str):
         )
 
 
+@test_cpu_cuda
+def test_compile_op_errors_on_all_ranks(ctx: TestContext, device: str):
+    """An error that one rank finds (in its own outputs or arguments) is raised on every rank, and the group's
+    compile_op still works afterwards (its queues stayed in step): before, the other ranks waited forever."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    last = n - 1
+    dtype = torch.float32
+    k = 4  # 16 bytes per rank
+
+    def expect_error(cls, text, inputs, outputs):
+        try:
+            moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+        except cls as e:
+            ctx.assert_true(text in str(e), f"rank {ctx.rank}: expected '{text}' in the error, got: {e}")
+            return
+        ctx.assert_true(False, f"rank {ctx.rank}: compile_op did not raise {cls.__name__} ('{text}')")
+
+    def region(offset, shape, device=device):
+        return TensorRegion(offset=[offset], shape=[shape], device=device)
+
+    inputs = [region(ctx.rank * k, k)]
+    everything = [region(0, n * k)]
+
+    # A gap in the last rank's output only (it wants k elements more than the inputs cover)
+    outputs = [region(0, (n + 1) * k)] if ctx.rank == last else everything
+    expect_error(RuntimeError, f"missing input coverage in the outputs of rank {last}", inputs, outputs)
+
+    # An overlap in rank 0's output only: the last rank has a second input over rank 0's
+    overlapping = inputs + [region(0, k)] if ctx.rank == last else inputs
+    outputs = [region(0, k)] if ctx.rank == 0 else [region(k, (n - 1) * k)]
+    expect_error(RuntimeError, "overlapping inputs detected in the outputs of rank 0", overlapping, outputs)
+
+    # A CUDA device index that is not rank 1's own (only rank 1 can check it)
+    if device == "cuda":
+        wrong = f"cuda:{torch.cuda.current_device() + 1}"
+        mine = [region(ctx.rank * k, k, wrong if ctx.rank == 1 else device)]
+        expect_error(RuntimeError, "(found on rank 1)", mine, everything)
+
+    # A malformed spec on rank 1 (compile.py checks it before the spec exchange)
+    bad = [TensorRegion(offset=[0.5], shape=[k], device=device)] if ctx.rank == 1 else inputs
+    expect_error(TypeError, "offset[0] must be an int", bad, everything)
+
+    # The group still compiles and runs ops
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=everything)
+    x = torch.arange(k, dtype=dtype, device=device) + 100 * ctx.rank
+    out = torch.zeros(n * k, dtype=dtype, device=device)
+    op([x], [out]).wait()
+    expected = torch.cat([torch.arange(k, dtype=dtype, device=device) + 100 * r for r in range(n)])
+    ctx.assert_true(torch.equal(out, expected), f"rank {ctx.rank}: got {out.tolist()}")
+
+
 @test_devices("cuda")
 def test_compile_op_mixed_devices(ctx: TestContext, device: str):
     """One op with a CUDA and a CPU tensor on every rank, both all-gathered: the kernel copies the CUDA one between

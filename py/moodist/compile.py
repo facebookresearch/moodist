@@ -209,21 +209,6 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
         - Different tensor_ids can have different ndims (e.g., 2D weight vs 1D bias).
         - The function uses an internal queue for coordination, which is cached per group.
     """
-    # Process specs and extract dtype if not provided
-    holder = {'dtype': dtype}
-
-    inputs = _process_tensor_specs(inputs, holder)
-    outputs = _process_tensor_specs(outputs, holder)
-
-    dtype = holder['dtype']
-
-    if dtype is None:
-        raise ValueError("dtype must be provided or derivable from DTensors")
-    if reduce is not None and reduce not in ("none", "any", "sum", "avg", "min", "max"):
-        raise ValueError(f"reduce must be None, 'any', 'sum', 'avg', 'min' or 'max', got {reduce!r}")
-    if not isinstance(dtype, torch.dtype):
-        raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
-
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
     if name not in weak_group:
         queue = Queue(group, range(group.size()), name=name)
@@ -259,15 +244,39 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
             result.append((tuple(spec.offset), tuple(spec.shape), spec.tensor_id, device_str))
         return tuple(result)
 
-    if inputs is not None:
-        inputs = check(inputs)
-    if outputs is not None:
-        outputs = check(outputs)
+    # An error in this rank's arguments is raised on every rank, after the spec exchange below (a rank that raised
+    # alone would leave the others waiting in it)
+    error = None
+    try:
+        # Process specs and extract dtype if not provided
+        holder = {'dtype': dtype}
+
+        inputs = _process_tensor_specs(inputs, holder)
+        outputs = _process_tensor_specs(outputs, holder)
+
+        dtype = holder['dtype']
+
+        if dtype is None:
+            raise ValueError("dtype must be provided or derivable from DTensors")
+        if reduce is not None and reduce not in ("none", "any", "sum", "avg", "min", "max"):
+            raise ValueError(f"reduce must be None, 'any', 'sum', 'avg', 'min' or 'max', got {reduce!r}")
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
+
+        if inputs is not None:
+            inputs = check(inputs)
+        if outputs is not None:
+            outputs = check(outputs)
+    except Exception as e:
+        error = e
 
     assert queue.empty()
     group.barrier()
 
-    info = (group.rank(), dtype, inputs, outputs, reduce)
+    if error is None:
+        info = (group.rank(), dtype, inputs, outputs, reduce, None)
+    else:
+        info = (group.rank(), None, None, None, None, (type(error).__name__, str(error)))
     queue.put_object(info)
 
     all_inputs = []
@@ -275,7 +284,14 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
 
     # Every rank reads every rank's spec before any checks, so that all ranks raise alike and the queue stays empty
     infos = [queue.get_object() for _ in range(group.size())]
-    for source_rank, ndtype, ninput, noutput, nreduce in infos:
+    if error is not None:
+        raise error
+    for source_rank, _, _, _, _, nerror in infos:
+        if nerror is not None:
+            kind, message = nerror
+            cls = {"TypeError": TypeError, "ValueError": ValueError}.get(kind, RuntimeError)
+            raise cls(f"moodist.compile_op: rank {source_rank}: {message}")
+    for source_rank, ndtype, ninput, noutput, nreduce, _ in infos:
         if ndtype != dtype:
             raise ValueError(
                 f"moodist.compile_op: Ranks specified different dtypes: {dtype} vs {ndtype} (rank {source_rank})"
@@ -286,7 +302,7 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
                 f"(rank {source_rank})"
             )
 
-    for source_rank, ndtype, ninput, noutput, nreduce in infos:
+    for source_rank, ndtype, ninput, noutput, nreduce, _ in infos:
         if ninput is not None:
             for offset, shape, tensor_id, device in ninput:
                 all_inputs.append((source_rank, offset, shape, tensor_id, device))
