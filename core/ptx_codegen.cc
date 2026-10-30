@@ -719,7 +719,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for signals (PipeEdge::waits)
     static constexpr uint32_t edgeDoneSignal = 64;  // reduce loop: signals the CPU thread when stored (doneSignal)
     // A wait table word for a source that waits for a done signal of this kernel's (in cpuInBuffer), with the index
-    // + 1 in the other bits (without this bit, the signal of an RDMA read, in cpuOutBuffer)
+    // + 1 in the other bits (without this bit, the signal of an RDMA transfer, in rdmaSignalBuffer)
     static constexpr uint32_t waitDoneSignal = 0x80000000;
 
     // ---- NVLS (NVLink SHARP multicast) ----
@@ -2040,14 +2040,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
         };
         // Issue loads while the ring has room (thread 0). A source that the CPU thread reads from another NVLink
-        // domain is loaded once its read has arrived (the signal in cpuOutBuffer), and a partial result that this
+        // domain is loaded once its read has arrived (its signal in rdmaSignalBuffer), and a partial result that this
         // kernel computes for itself (in an all-reduce) once all of it has been stored (its done signal in
         // cpuInBuffer): until then, the loads stop there, and the block goes on with the stages it has. It waits for
         // the signal only when it has combined all stages loaded before (blocking, at the start of a stage): its
         // earlier items are then complete, including the partial results among them, which come before anything that
         // waits, and in an all-reduce in two rounds the shares of a part, which come before the copies of the part's
         // other shares (see localCopies), so all blocks of all ranks make progress.
-        u64 signalFlags = concurrency(group->cpuOutBuffer) + 4 * 16;
+        u64 signalFlags = concurrency(group->rdmaSignalBuffer);
         u64 doneFlags = concurrency(group->cpuInBuffer) + 4 * 16;
         auto fill = [&](bool blocking) {
           WHILE(!ldDone & (ldIssued - consumed < numStages)) {
@@ -2055,14 +2055,25 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               IF(ldWaits != 0xffffffffll) {
                 u32 wait = ld_global_nc_u32(tables + pipeWaitsOffset + widen((ldWaits + ldSource) * 4));
                 IF(wait != 0) {
-                  u64 flags = selp_u64(doneFlags, signalFlags, wait >= (int64_t)waitDoneSignal);
-                  u64 flag = flags + widen(((wait & (int64_t)(waitDoneSignal - 1)) - 1) * 4);
-                  u32 value = ld_global_relaxed_sys_u32(flag);
+                  // An RDMA signal is a word per NIC, all of which get the step value (see writeRdmaSignal in
+                  // cputhread.cc), a done signal one word
+                  Value done = wait >= (int64_t)waitDoneSignal;
+                  u32 index = (wait & (int64_t)(waitDoneSignal - 1)) - 1;
+                  u64 flag = selp_u64(doneFlags + widen(index * 4), signalFlags + widen(index * Group::rdmaSignalBytes),
+                      done);
+                  static_assert(Group::rdmaSignalBytes == 16 && maxDevices == 4);
+                  auto load = [&]() {
+                    u32 v = predicated(done, ld_global_relaxed_sys_u32)(flag);
+                    std::array<Value, 4> words;
+                    PRED(!done) ld_global_relaxed_sys_v4_u32(words, flag);
+                    return selp_u32(v, min_u32(min_u32(words[0], words[1]), min_u32(words[2], words[3])), done);
+                  };
+                  u32 value = load();
                   if (blocking) {
                     IF(ldIssued == consumed) {
                       profiling.enter("reduce wait");
                       WHILE(value < stepValue) {
-                        value = ld_global_relaxed_sys_u32(flag);
+                        value = load();
                       }
                       profiling.leave();
                     }
@@ -2273,8 +2284,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             u64 depAddr = concurrency(depFilled.local) + widen(4 * (sourceDep + localNodes.size() * blockIndex));
             value = selp(predicated(depWait, ld_global_relaxed_sys_u32)(depAddr), value, depWait);
             if (!tuning) {
-              u64 flagAddr = concurrency(group->cpuOutBuffer) + widen(4 * (signal + 16));
-              value = selp(predicated(relay, ld_global_relaxed_sys_u32)(flagAddr), value, relay);
+              // (the signal's words, one per NIC, see writeRdmaSignal in cputhread.cc)
+              u64 flagAddr = concurrency(group->rdmaSignalBuffer) + widen(signal * Group::rdmaSignalBytes);
+              std::array<Value, 4> words;
+              PRED(relay) ld_global_relaxed_sys_v4_u32(words, flagAddr);
+              u32 signalValue = min_u32(min_u32(words[0], words[1]), min_u32(words[2], words[3]));
+              value = selp(signalValue, value, relay);
             }
             Value ready = notDone & (value >= stepValue);
             Value relayReady = ready & relay;

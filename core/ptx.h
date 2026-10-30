@@ -574,6 +574,8 @@ inline Value ld_const_u8(const Value& addr) {
 }
 void ld_global_volatile_u32(const Value& d, const Value& addr);
 u32 ld_global_relaxed_sys_u32(const Value& addr);
+// Four 32-bit words at a 16-byte aligned address, each a relaxed system-scope load, with one instruction
+void ld_global_relaxed_sys_v4_u32(std::array<Value, 4>& v, const Value& addr);
 u64 ld_global_relaxed_sys_u64(const Value& addr);
 void ld_global_acquire_sys_u32(const Value& d, const Value& addr);
 inline Value ld_global_acquire_sys_u32(const Value& addr) {

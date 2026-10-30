@@ -102,6 +102,12 @@ struct Group {
 
   AllocatedArray cpuOutBuffer;
   AllocatedArray cpuInBuffer;
+  // The signals of compile_op's RDMA transfers, which its kernels wait for (see CustomOpDescriptor::IbRead and
+  // IbWrite): 16 bytes per signal index, a 32-bit word per NIC (maxDevices), all of which the CPU threads set to the
+  // step value once the data is there (see writeRdmaSignal in cputhread.cc). Aligned to 64 KiB, for a memory
+  // registration of its own (dmabuf ranges are in whole host pages).
+  AllocatedArray rdmaSignalBuffer;
+  static constexpr size_t rdmaSignalBytes = 16;
 
   AllocatedArray cudaStepValue;
   std::array<PeerArrayRef, 8> peerCudaStepValue;

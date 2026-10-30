@@ -648,6 +648,13 @@ u32 ld_global_relaxed_sys_u32(const Value& addr) {
   ld_global_relaxed_sys_u32(result, addr);
   return result;
 }
+void ld_global_relaxed_sys_v4_u32(std::array<Value, 4>& v, const Value& addr) {
+  for (auto& x : v) {
+    x = Value(ValType::U32);
+  }
+  emitInst("ld.relaxed.sys.global.v4.u32 {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " + v[3].str() +
+           "}, [" + addr.str() + "]");
+}
 void ld_global_relaxed_sys_u64(const Value& d, const Value& addr) {
   emitInst("ld.relaxed.sys.global.u64 " + d.str() + ", [" + addr.str() + "]");
 }

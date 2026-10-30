@@ -490,7 +490,7 @@ struct RdmaTcp : Rdma {
   std::unique_ptr<RdmaMr> regMrCpu(void* address, size_t bytes) {
     return std::make_unique<Mr>(mrManager.reg(true, address, bytes));
   }
-  std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
+  std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes, bool relaxedOrdering) {
     return std::make_unique<Mr>(mrManager.reg(false, address, bytes));
   }
 

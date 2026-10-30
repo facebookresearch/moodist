@@ -343,6 +343,19 @@ struct CpuThreadImpl {
 
   MemoryRegistration* cpuOutMr = regMrCuda(group->cpuOutBuffer.buffer.cudaPointer, group->cpuOutBuffer.buffer.bytes);
 
+  // compile_op's RDMA signals (Group::rdmaSignalBuffer, see writeRdmaSignal): a registration of their own, without
+  // relaxed ordering; and where every rank's are
+  MemoryRegistration* rdmaSignalMr =
+      regMrCudaStrict(group->rdmaSignalBuffer.buffer.cudaPointer, group->rdmaSignalBuffer.buffer.bytes);
+  IVector<RemoteAddressAndKey> remoteRdmaSignals =
+      distributeAddressAndKeys(group->rdmaSignalBuffer.buffer.cudaPointer, rdmaSignalMr);
+  // Whether signals can follow their data without flushes (see writeRdmaSignal)
+  const bool orderedSignals = initOrderedSignals();
+
+  // Where flush reads put the byte they read (see flushRead)
+  AllocatedBuffer flushBuffer = group->allocateHost(4096);
+  MemoryRegistration* flushMr = regMr((uintptr_t)flushBuffer.cpuPointer, flushBuffer.bytes);
+
   // Vector<uint32_t> debugVector{size};
 
   // size_t uniqueIndexOffset = 0;
@@ -878,6 +891,45 @@ struct CpuThreadImpl {
     return r;
   }
 
+  // A registration of exactly [address, address + bytes) of CUDA memory (whole host pages), without relaxed ordering
+  // (see Rdma::regMrCuda), apart from regMrCuda's (whose registrations of the same memory allow relaxed ordering)
+  MemoryRegistration* regMrCudaStrict(uintptr_t address, size_t bytes) {
+    auto ptr = std::make_unique<CudaMapping>();
+    ptr->address = address;
+    ptr->bytes = bytes;
+    ptr->mr.mrs.fill(nullptr);
+    for (size_t i = 0; i != devices.size(); ++i) {
+      for (size_t i2 = 0; i2 != i; ++i2) {
+        if (devices[i2].rdma->mrCompatible(devices[i].rdma)) {
+          ptr->mr.mrs[i] = ptr->mr.mrs[i2];
+          break;
+        }
+      }
+      if (ptr->mr.mrs[i]) {
+        continue;
+      }
+      auto mr = devices[i].rdma->regMrCuda((void*)address, bytes, false);
+      ptr->mr.mrs[i] = &*mr;
+      localMrs.push_back(std::move(mr));
+    }
+    MemoryRegistration* r = &ptr->mr;
+    cudaMappings.push_back(std::move(ptr));
+    return r;
+  }
+
+  // Signals can follow their data through the NICs that carried it, without flushes (see writeRdmaSignal), if the GPU
+  // consumes the writes into its memory in the order they arrive (GPUDirect RDMA writes ordering "owner"), unless
+  // MOODIST_RDMA_FLUSH=1
+  bool initOrderedSignals() {
+    int ordering = CU_GPU_DIRECT_RDMA_WRITES_ORDERING_NONE;
+    CHECK_CU(cuDeviceGetAttribute(&ordering, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING, group->cuDevice));
+    const char* env = std::getenv("MOODIST_RDMA_FLUSH");
+    const bool r = ordering >= CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER && !(env && std::string_view(env) == "1");
+    log.debug("rank %zu: GPUDirect RDMA writes ordering %d: RDMA signals %s\n", rank, ordering,
+        r ? "follow their data" : "after flushes");
+    return r;
+  }
+
   IVector<RemoteAddressAndKey> distributeAddressAndKeys(uintptr_t address, MemoryRegistration* mr) {
     SimpleVector<uint32_t> localKeys;
     localKeys.resize(devices.size());
@@ -1269,6 +1321,69 @@ struct CpuThreadImpl {
     writeControl(concurrencyIndex, dev, rank, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(group->cpuOutBuffer.cuda(concurrencyIndex) + offset),
         cpuOutMr->mrs[di]->rkey, sizeof(uint32_t));
+  }
+
+  // Signals of compile_op's RDMA transfers (Group::rdmaSignalBuffer), which its kernels wait for before they use the
+  // data. A NIC's writes into GPU memory reach the GPU in the order the NIC issued them if the later ones are not
+  // relaxed-ordered (PCIe lets a write pass earlier ones only with relaxed ordering, which the data's registrations
+  // allow for speed), and a GPU whose GPUDirect RDMA writes ordering is "owner" lets its kernels see them in that
+  // order. So a signal is a write through each NIC that carried some of the data, after that NIC has placed it (the
+  // completion of its reads), into a registration without relaxed ordering
+  // (rdmaSignalMr) on the same path as the data's (both registered through Data Direct or both not): a word per NIC,
+  // and the kernel waits until all words of the signal have the step value (see signalWords). Elsewhere (or with
+  // MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
+  // writeRdmaSignal writes words [first, end) of signal `signal` of rank i (of this rank: a loopback write), through
+  // dev.
+  void writeRdmaSignal(size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end) {
+    CHECK(i < size && first < end && end <= maxDevices);
+    CHECK(Group::rdmaSignalBytes * (signal + 1) <= group->rdmaSignalBuffer.itembytes);
+    size_t di = &dev - devices.data();
+    auto offset = group->rdmaSignalBuffer.itembytes * concurrencyIndex + Group::rdmaSignalBytes * signal +
+                  sizeof(uint32_t) * first;
+    // (from 4 copies of the step value; inline, so the copies may change once posted)
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, signalStepValues + first),
+        outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteRdmaSignals[i].address + offset),
+        remoteRdmaSignals[i].keys[di], sizeof(uint32_t) * (end - first));
+  }
+  // (outStepValue slots [signalStepValues, signalStepValues + maxDevices) hold the step value, see WorkCustom)
+  static constexpr size_t signalStepValues = 4;
+
+  // The words of a signal that NIC di writes when the NICs in `used` (a bit each) carried its data: from the one after
+  // the previous used NIC's up to its own, the last used NIC's up to the last word, so that every word is written
+  // once, and each used NIC's own by that NIC
+  static std::pair<size_t, size_t> signalWords(uint8_t used, size_t di) {
+    CHECK(used & (1 << di));
+    size_t first = 0;
+    for (size_t d = 0; d != di; ++d) {
+      if (used & (1 << d)) {
+        first = d + 1;
+      }
+    }
+    return {first, (used >> (di + 1)) == 0 ? maxDevices : di + 1};
+  }
+
+  // Whether a signal can follow data that the NICs in `used` wrote into memory registered as mr (see
+  // writeRdmaSignal): the GPU orders the writes, and the data and the signals take the same path
+  bool signalFollows(const MemoryRegistration* mr, uint8_t used) {
+    if (!orderedSignals) {
+      return false;
+    }
+    for (size_t di : range(devices.size())) {
+      if ((used & (1 << di)) && mr->mrs[di]->dataDirect != rdmaSignalMr->mrs[di]->dataDirect) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // A flush: a read of one byte at `address`, GPU memory of rank i (of this rank: a loopback read), through dev.
+  // Writes into GPU memory through a NIC are visible to the GPU's kernels once a read through the same NIC that
+  // follows them has completed: PCIe does not let a read pass the writes before it. Used before the signals of data
+  // where they cannot follow it (see writeRdmaSignal), and at the end of an op for the reads without a signal, before
+  // the stream goes on.
+  void flushRead(Device& dev, size_t i, uintptr_t address, uint32_t rkey, Callback* callback) {
+    size_t di = &dev - devices.data();
+    postRead(dev, i, flushBuffer.cpuPointer, flushMr->mrs[di]->lkey, (void*)address, rkey, 1, callback);
   }
 
   struct WorkBarrier : Work {
@@ -5706,7 +5821,8 @@ struct CpuThreadImpl {
     size_t firstUnseen = 0;
 
     size_t liveReads = 0;
-    std::array<size_t, maxDevices> deviceLiveReads{};
+    // Per NIC: the parts of reads in flight
+    std::array<size_t, maxDevices> deviceLive{};
 
     // Reads are split into parts of about partBytes, and each NIC has up to numParallel of them in flight
     static constexpr size_t partBytes = 128 << 10;
@@ -5714,6 +5830,16 @@ struct CpuThreadImpl {
     // When an op has fewer reads than NICs, smaller reads are split too, into parts of at least this size
     static constexpr size_t minPartBytes = 64 << 10;
     const size_t numDevices = self.devices.size();
+
+    // The signals of reads into CUDA tensors (see writeRdmaSignal): per signal index, the NICs that carried parts of
+    // its read (a bit each) and a destination of the read (address and output index). The NICs that carried parts of
+    // reads without a signal index into CUDA tensors, and a destination of such a read for each, flushed at the end
+    // (see flushRead).
+    Vector<uint8_t> signalDevices;
+    Vector<std::pair<uintptr_t, uint32_t>> signalDestination;
+    uint8_t unsignaledDevices = 0;
+    std::array<std::pair<uintptr_t, uint32_t>, maxDevices> unsignaledDestination{};
+    size_t liveFlushes = 0;
 
     Vector<MemoryRegistration*> outputMrs;
 
@@ -5809,8 +5935,19 @@ struct CpuThreadImpl {
         return;
       }
 
+      // (data in CPU tensors needs no flush: the completion, written to host memory too, does not pass it)
+      if (ot->isCuda) {
+        if (signal >= 0) {
+          signalDevices.at(signal) |= 1 << di;
+          signalDestination.at(signal) = {localAddress, read.outputIndex};
+        } else {
+          unsignaledDevices |= 1 << di;
+          unsignaledDestination[di] = {localAddress, read.outputIndex};
+        }
+      }
+
       ++liveReads;
-      ++deviceLiveReads[di];
+      ++deviceLive[di];
       self.trace(concurrencyIndex, 1 + di, "%#x read %d", stepValue, source);
 
       auto key = it.rkey;
@@ -5819,17 +5956,61 @@ struct CpuThreadImpl {
           key[di], read.bytes, self.makeCallback([this, di, signal]() {
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
-            --deviceLiveReads[di];
+            --deviceLive[di];
             partDone(signal);
           }));
     }
 
-    // A part of a read is done: once all parts of a read with a signal index are, signal the copy kernel, which
-    // waits for the data in cpuOutBuffer slot 16 + signal (a loopback RDMA write of the step value; the same
-    // pattern as the all-gather's chunk signals).
+    // A part of a read is done: once all parts of a read with a signal index are, signal the kernel, which waits for
+    // the data (see writeRdmaSignal): through every NIC that carried a part (loopback writes), or after flushes
+    // through them.
     void partDone(int32_t signal) {
-      if (signal >= 0 && --signalPartsLeft.at(signal) == 0) {
-        self.writeCpuOut(concurrencyIndex, 16 + signal, 0);
+      if (signal < 0 || --signalPartsLeft.at(signal) != 0) {
+        return;
+      }
+      const uint8_t used = signalDevices.at(signal);
+      if (used == 0) {
+        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices);
+        return;
+      }
+      auto [address, outputIndex] = signalDestination[signal];
+      if (self.signalFollows(outputMrs[outputIndex], used)) {
+        for (size_t di : range(numDevices)) {
+          if (used & (1 << di)) {
+            auto [first, end] = signalWords(used, di);
+            self.writeRdmaSignal(concurrencyIndex, self.devices[di], rank, signal, first, end);
+          }
+        }
+        return;
+      }
+      ++liveFlushes;
+      auto callback = self.makeCallback([this, signal]() {
+        --liveFlushes;
+        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices);
+      });
+      for (size_t di : range(numDevices)) {
+        if (used & (1 << di)) {
+          self.flushRead(self.devices[di], rank, address, outputMrs[outputIndex]->mrs[di]->rkey, callback);
+        }
+      }
+    }
+
+    // The flushes of the reads without a signal index (see flushRead), once they have completed: the stream goes on
+    // once the CPU thread writes cpuOutBuffer slot 0, after them
+    void flushUnsignaledReads() {
+      CHECK(liveReads == 0);
+      if (unsignaledDevices == 0) {
+        return;
+      }
+      ++liveFlushes;
+      auto callback = self.makeCallback([this]() {
+        --liveFlushes;
+      });
+      for (size_t di : range(numDevices)) {
+        if (unsignaledDevices & (1 << di)) {
+          auto [address, outputIndex] = unsignaledDestination[di];
+          self.flushRead(self.devices[di], rank, address, outputMrs[outputIndex]->mrs[di]->rkey, callback);
+        }
       }
     }
 
@@ -5859,6 +6040,8 @@ struct CpuThreadImpl {
         size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
         if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
           signalPartsLeft.resize(r.signalIndex + 1);
+          signalDevices.resize(r.signalIndex + 1);
+          signalDestination.resize(r.signalIndex + 1);
         }
         size_t offset = 0;
         size_t n = 0;
@@ -5942,6 +6125,9 @@ struct CpuThreadImpl {
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
+      for (size_t d : range(maxDevices)) {
+        self.outStepValue(concurrencyIndex, signalStepValues + d) = stepValue;
+      }
 
       // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
       {
@@ -6070,6 +6256,7 @@ struct CpuThreadImpl {
       }
       notificationsLeft = op->notifications.size();
 
+
       if (params.anyCuda) {
         // wait for kernel
         if (cpuIn[0] < stepValue) {
@@ -6110,14 +6297,14 @@ struct CpuThreadImpl {
         }
         if (readIndex != reads.size()) {
           size_t bestDevice = 0;
-          size_t bestLiveReads = numParallel;
+          size_t bestLive = numParallel;
           for (size_t di = 0; di != numDevices; ++di) {
-            if (deviceLiveReads[di] < bestLiveReads) {
-              bestLiveReads = deviceLiveReads[di];
+            if (deviceLive[di] < bestLive) {
+              bestLive = deviceLive[di];
               bestDevice = di;
             }
           }
-          if (bestLiveReads < numParallel) {
+          if (bestLive < numParallel) {
             tryRead(bestDevice);
           }
         }
@@ -6130,6 +6317,7 @@ struct CpuThreadImpl {
       while (liveReads) {
         YIELD
       }
+      flushUnsignaledReads();
 
       // Ensure first writeStepValue loop (stepValue) completes before second loop (stepValue+1).
       // Both write to the same remote address; without this, RDMA reordering could cause
@@ -6155,6 +6343,14 @@ struct CpuThreadImpl {
         while (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
           YIELD
         }
+      }
+
+      // (the flushes of reads, before the stream goes on to use their data)
+      if (liveFlushes) {
+        self.trace(concurrencyIndex, 0, "%#x wait flushes", stepValue);
+      }
+      while (liveFlushes) {
+        YIELD
       }
 
       if (params.anyCuda) {

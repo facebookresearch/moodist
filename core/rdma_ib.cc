@@ -366,10 +366,11 @@ struct RdmaIb : Rdma {
            ordinal == (int)group->cuDevice;
   }
 
-  std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) {
-    const int access =
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING;
+  std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes, bool relaxedOrdering) {
+    const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+                       (relaxedOrdering ? IBV_ACCESS_RELAXED_ORDERING : 0);
     ibv_mr* mr = nullptr;
+    bool dataDirect = false;
     // Through the device's Data Direct DMA function, which serves the GPU behind the NIC's PCIe switch (the NIC
     // selection pairs this group's GPU with such a NIC). The memory must be mapped through PCIe (the GPU's BAR1),
     // which the function reaches inside the switch: the default mapping on Grace systems is through the CPU (over
@@ -382,6 +383,7 @@ struct RdmaIb : Rdma {
       if (err == CUDA_SUCCESS && fd != -1) {
         mr = mlx5dv_reg_dmabuf_mr(
             ib->protectionDomain, 0, bytes, (uintptr_t)address, fd, access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+        dataDirect = mr != nullptr;
       }
       if (!mr) {
         log.error("rank %d: registering CUDA memory through Data Direct DMA on %s failed (CUresult %d, %s); "
@@ -407,7 +409,9 @@ struct RdmaIb : Rdma {
       perror("ibv_reg_mr");
       fatal("rank %d failed to register CUDA memory at %#x size %#x\n", group->rank, (uintptr_t)address, bytes);
     }
-    return std::make_unique<Mr>(mr);
+    auto r = std::make_unique<Mr>(mr);
+    r->dataDirect = dataDirect;
+    return r;
   }
 
   constexpr bool supportsCuda() const {

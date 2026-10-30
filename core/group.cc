@@ -1357,6 +1357,17 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
     cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
     cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+    {
+      // (as many signals as cpuOutBuffer had for them after its first 16 slots)
+      static_assert(rdmaSignalBytes == sizeof(uint32_t) * maxDevices);
+      constexpr size_t alignment = 64 * 1024;
+      rdmaSignalBuffer.itembytes = rdmaSignalBytes * (1008 + maxChunks * size);
+      rdmaSignalBuffer.numel = Group::maxConcurrency;
+      const size_t bytes = (rdmaSignalBuffer.itembytes * Group::maxConcurrency + alignment - 1) / alignment * alignment;
+      rdmaSignalBuffer.buffer = allocateDevice(bytes + alignment);
+      rdmaSignalBuffer.buffer.cudaPointer = (rdmaSignalBuffer.buffer.cudaPointer + alignment - 1) / alignment * alignment;
+      rdmaSignalBuffer.buffer.bytes = bytes;
+    }
 
     // {
     //   unsigned int value = 1;
@@ -1423,6 +1434,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     buffersToReset = {
         &cpuOutBuffer,
         &cpuInBuffer,
+        &rdmaSignalBuffer,
         &cudaStepValue,
         &cudaPeerAddresses,
         &cudaCommsDeviceDataSent,

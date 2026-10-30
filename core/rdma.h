@@ -158,6 +158,9 @@ RdmaCallbackWrapper makeRdmaCallback(F&& f) {
 struct RdmaMr {
   uint32_t lkey;
   uint32_t rkey;
+  // Registered through the NIC's Data Direct DMA function (see RdmaIb::regMrCuda): the NIC's writes into this memory
+  // take that function's path, not its main one
+  bool dataDirect = false;
 
   virtual ~RdmaMr() {}
 };
@@ -190,7 +193,10 @@ struct Rdma {
   virtual void stopReceives() = 0;
   virtual bool mrCompatible(Rdma* other) = 0;
   virtual std::unique_ptr<RdmaMr> regMrCpu(void* address, size_t bytes) = 0;
-  virtual std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes) = 0;
+  // relaxedOrdering: the NIC's writes into the memory may pass its earlier writes on their way (PCIe relaxed
+  // ordering), which is faster for data; without it, a write lands after all writes the NIC issued before it on the
+  // same path (signals, see writeRdmaSignal in cputhread.cc)
+  virtual std::unique_ptr<RdmaMr> regMrCuda(void* address, size_t bytes, bool relaxedOrdering = true) = 0;
   constexpr virtual bool supportsCuda() const = 0;
   virtual void close() = 0;
 };

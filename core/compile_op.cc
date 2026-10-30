@@ -1017,8 +1017,8 @@ struct CompileOpConstructor {
       return std::make_pair((sourceRank + size - domain.at(0)) % size, id);
     });
 
-    // Signal flags live in cpuOutBuffer after its first 16 slots
-    const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
+    // (the signals that the kernel waits for, see Group::rdmaSignalBuffer)
+    const size_t maxSignals = group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes;
     static constexpr size_t minChunkBytes = 4 << 20;
     static constexpr size_t maxTransferChunks = 32;
     HashMap<uint32_t, size_t> proxyBytes;
@@ -1711,7 +1711,7 @@ struct CompileOpConstructor {
               "input copies or shares (for this and other ranks), %d signals, %zu bytes of scratch\n",
         rank, plans.size(), results.size(), numFlags, nextSignal, scratchBytes);
 
-    const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
+    const size_t maxSignals = group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes;
     const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
     if ((size_t)nextSignal > maxSignals || (size_t)numFlags > maxFlags) {
       return fmt::sprintf("rank %zu would read %d regions from other NVLink domains and compute %d partial results, "

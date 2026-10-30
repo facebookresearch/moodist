@@ -403,11 +403,24 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   of a notification slot are set, it writes the step value into that slot of the executor
   (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a notification for
   each).
-- The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread
-  signals the kernel when the read of a proxied transfer, or of a reduction's source from another NVLink domain, has
-  completed (all its parts): `writeCpuOut` writes the step value into slot 16 + signal index of `cpuOutBuffer` (a
-  loopback RDMA write through the first NIC, as the all-gather does for its chunks); and the kernel signals the CPU
-  thread when it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).
+- Signals (`writeRdmaSignal`): a kernel waits for the data of an RDMA transfer (a proxied transfer's read, a
+  reduction's source from another NVLink domain) until its signal in `Group::rdmaSignalBuffer` is set: 16 bytes per
+  signal index, a word per NIC, all of which must have the step value. A NIC's writes into GPU memory reach the GPU in
+  the order the NIC issued them unless the later one is relaxed-ordered (PCIe lets a write pass earlier ones only with
+  relaxed ordering, which the data's registrations allow, for speed), and a GPU whose GPUDirect RDMA writes ordering
+  is "owner" (`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING`; GB300) lets its kernels see them in that order. So
+  each NIC that carried some of the data writes its word (and the words of the NICs next to it that carried none, see
+  `signalWords`) once its data is in place: a loopback write once all parts of the read have completed. The signal
+  buffer has a registration of its own without relaxed ordering (`rdmaSignalMr`, `Rdma::regMrCuda`), on the same path
+  as the data's: registered through Data Direct like the data, or like it without (`RdmaMr::dataDirect`). Elsewhere,
+  or with `MOODIST_RDMA_FLUSH=1`, the CPU thread flushes the data first (`flushRead`): a loopback read of one byte of
+  it through every NIC that carried some (PCIe does not let a read pass the writes before it), then sets all words
+  with one write. The reads without a signal (into CUDA tensors) are flushed once they have all completed, through
+  each NIC that carried some, before the CPU thread lets the stream go on (`cpuOut`; it is one word, which the stream
+  waits for). Data in CPU tensors needs no flush (the completion, written to host memory too, does not pass it).
+- The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread signals
+  the kernel when the data of an RDMA transfer is in place (see Signals), and the kernel signals the CPU thread when
+  it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).
 
 - NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
   communication pool, at logical offset o: (2 << 61) | o; else in moodist's pool, at offset o: (1 << 61) | o) and the
@@ -443,6 +456,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   instead of as the cost model picks (`auto`, the default; see compile phase step 7). Same on all ranks.
 - `MOODIST_COMPILE_OP_PHASES=1|2` - reductions in one NVLink domain in one pass, or in two phases (pieces of any
   size), instead of as tuning picks (`auto`, the default; see compile phase step 11). Same on all ranks.
+- `MOODIST_RDMA_FLUSH=1` - the data of RDMA transfers is flushed before their signals even where the signals can
+  follow it (see Runtime, Signals), for tests and comparisons. Read when the CPU thread starts; may differ between
+  ranks.
 - `MOODIST_COMPILE_OP_MAX_EDGE_BYTES=N` - the largest edge (a multiple of 4096 up to 2 GiB; by default 1 GiB, see
   Phase 5), for tests: small values split regions into many edges. Same on all ranks.
 - `MOODIST_COMPILE_OP_PARAM_BUFFER=1` - the kernel takes its address arrays from its parameter buffer, as ops too
@@ -456,8 +472,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 `moodist.enable_profiling(False)`, its next traced point writes them to `moodist-trace-cpu-<group>-<rank>.json` in
 the current directory (so run one more op). For compile_op the spans are `WorkCustom`'s phases, named with the op's
 step value: `start`, `wait dyn N` (waiting for rank N's input list), `wait kernel` (for the stream to reach the
-op), `step exchange`, `wait step N`, `reads`, `wait read completions` and `wait reads of N` (rank N still reading),
-where only the ranks actually waited for appear; and each NIC's reads (`read N`, from rank N). The CPU thread also
+op), `step exchange`, `wait step N`, `reads`, `wait read completions`, `wait reads of N` (rank N still reading) and
+`wait flushes`, where only the ranks actually waited for appear; and each NIC's reads (`read N`, from rank N). The
+CPU thread also
 records how long each op waited from the call until the CPU thread picked it up, and its sleeps, stalls of 20 us
 or more and moves between cores, with the core numbers. Timestamps are the system clock, so the files of all
 ranks can be merged into one trace (align the nodes' clocks, e.g. on the end of `step exchange`, which all ranks
@@ -731,11 +748,10 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - Failures inside the collective steps of the compile phase (e.g. running out of memory for the tuning's scratch
   tensors, or a kernel that fails to JIT on one rank) are raised by that rank only, and the other ranks then wait
   forever in the next exchange (the errors the compile phase checks for are raised on all ranks, see step 1).
-- Proxied transfers: the CPU thread signals the kernel as soon as the read's completion arrives, with a loopback
-  RDMA write through the first NIC. That the read's data is visible in GPU memory before the signal relies on
-  timing rather than on PCIe ordering (the read may have gone through another NIC, and MRs allow relaxed
-  ordering); the all-gather's chunk signals do the same. A flush (a small RDMA read of the destination through
-  the NIC of the read, before the signal) would make it explicit.
+- The process group's own collectives (all-gather, reduce-scatter, broadcast and reduce in cputhread.cc) signal their
+  kernels as soon as the completions of their RDMA reads arrive (`writeCpuOut`), through the first NIC into memory
+  registered with relaxed ordering, so the signal may land before data that another NIC wrote (compile_op's signals
+  follow their data, see Runtime).
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
   or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
   instructions, so a plain target would do.
@@ -830,8 +846,7 @@ The proxy pass (compile phase step 8) sends data needed by several ranks of an N
 in chunks for large transfers. (Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in
 c57c8f4, computed a similar plan with gateway reads and local copies, but it was never executed.) Next:
 1. The write variant: the source writes the data and the signal into the proxy's memory.
-2. An explicit flush before the signal (see Correctness).
-3. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
+2. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
    fixed neighbor, which relays the data of the ranks before it): fixed neighbors and synchronization with neighbors
    only, instead of `WorkCustom`'s exchanges with all ranks. It needs a heuristic for when it applies, and
    measurements against the proxy pass.

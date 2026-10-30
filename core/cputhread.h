@@ -338,8 +338,8 @@ struct CustomOpDescriptor {
     size_t inputOffset;
     size_t outputOffset;
     size_t bytes;
-    // >= 0: once the read has completed, write the step value into cpuOutBuffer slot 16 + signalIndex, where the
-    // copy kernel waits for it (the proxy read of a mixed NVLink + RDMA op)
+    // >= 0: once the read has completed, set signal signalIndex (see writeRdmaSignal in cputhread.cc), which the
+    // kernel waits for (the proxy read of a mixed NVLink + RDMA op, a source of a reduction across NVLink domains)
     int32_t signalIndex = -1;
     // >= 0: read only once the source rank has notified this rank that its kernel has written the data (a partial
     // result of a reduction, see Notification), in notification slot waitSlot

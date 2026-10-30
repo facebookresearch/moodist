@@ -65,8 +65,8 @@ struct Graph {
     uint32_t chunkIndex = 0;
 
     // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc):
-    // per source, the signal index of the RDMA read that fills it (the kernel waits for cpuOutBuffer slot
-    // 16 + signal before it loads the source), or -1; empty if no source waits for a read
+    // per source, the signal index of the RDMA transfer that fills it (the kernel waits for the signal in
+    // rdmaSignalBuffer before it loads the source), or -1; empty if no source waits for a transfer
     Vector<int32_t> sourceSignals;
     // per source, the doneSignal of the edge of this rank's that computes it (in an all-reduce, the partial result of
     // the executor's own domain; the kernel waits for cpuInBuffer slot 16 + doneSignal), or -1; empty if none
