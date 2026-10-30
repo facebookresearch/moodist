@@ -317,9 +317,9 @@ def test_all_reduce_two_rounds(ctx: TestContext):
 
 @test
 def test_all_reduce_rounds_same_bits(ctx: TestContext):
-    """Random floats: an all-reduce gives the same bits in one round and in two (MOODIST_COMPILE_OP_ROUNDS), and in
-    one pass and in two phases (MOODIST_COMPILE_OP_PHASES), on every rank: the executors combine the same values in
-    the same order either way."""
+    """Random floats: an all-reduce gives the same bits in one round and in two (MOODIST_COMPILE_OP_ROUNDS), in one
+    pass and in two phases (MOODIST_COMPILE_OP_PHASES), and with reads and with writes (MOODIST_COMPILE_OP_TRANSFER),
+    on every rank: the executors combine the same values in the same order either way."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     variants = [
@@ -327,6 +327,8 @@ def test_all_reduce_rounds_same_bits(ctx: TestContext):
         ("MOODIST_COMPILE_OP_ROUNDS", "2"),
         ("MOODIST_COMPILE_OP_PHASES", "1"),
         ("MOODIST_COMPILE_OP_PHASES", "2"),
+        ("MOODIST_COMPILE_OP_TRANSFER", "read"),
+        ("MOODIST_COMPILE_OP_TRANSFER", "write"),
     ]
     for dtype, op_name, numel in [(torch.bfloat16, "sum", 1 << 20), (torch.float32, "avg", 3 << 20)]:
         gen = torch.Generator(device="cuda")
@@ -352,6 +354,47 @@ def test_all_reduce_rounds_same_bits(ctx: TestContext):
                 errors.append(f"reduce={op_name} {dtype}: rank {r} has different bits")
                 break
         raise_on_all_ranks(ctx, pg, errors)
+
+
+@test
+def test_reduce_writes(ctx: TestContext):
+    """Reductions across NVLink domains with writes instead of reads (MOODIST_COMPILE_OP_TRANSFER=write): the ranks
+    that compute partial results and shares write them into the scratch tensors of the ranks that need them, and
+    signal their kernels. Reduce-scatter (up to parts), all-reduce of all sizes, in place, inputs or outputs on some
+    ranks only, many partial results per pair of ranks, and in two rounds (64 MiB, and in place with inputs on two
+    ranks: copies of the inputs)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    with environment("MOODIST_COMPILE_OP_TRANSFER", "write"):
+        for numel in [64, 100000, 5 << 19]:
+            spec = {"0": ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])}
+            run_reduce(ctx, pg, "sum", torch.float32, spec)
+        for numel, combinations in [(4096, SOME), (8, SOME), ((1 << 20) + 64, SOME)]:
+            spec = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+            for dtype, op_name in combinations:
+                run_reduce(ctx, pg, op_name, dtype, spec, salt=numel)
+        numel = 300000
+        whole = [((0,), (numel,))]
+        spec = {"0": ([numel], [whole] * n, [whole] * n)}
+        run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=2)
+        first_two = [whole if r < 2 else [] for r in range(n)]
+        first_last = [whole if r in (0, n - 1) else [] for r in range(n)]
+        first_eight = [whole if r < 8 else [] for r in range(n)]
+        for ins, outs in [(first_two, [whole] * n), (first_last, [whole] * n), ([whole] * n, first_eight)]:
+            run_reduce(ctx, pg, "avg", torch.bfloat16, {"0": ([numel], ins, outs)})
+        spec = {}
+        for t in range(40):
+            numel = 64 * (t % 3 + 1)
+            spec[f"t{t}"] = ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])
+        run_reduce(ctx, pg, "avg", torch.float32, spec)
+        with environment("MOODIST_COMPILE_OP_ROUNDS", "2"):
+            numel = (64 << 20) // 2
+            spec = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+            run_reduce(ctx, pg, "avg", torch.bfloat16, spec)
+            numel = 1 << 18
+            whole = [((0,), (numel,))]
+            spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
+            run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=3)
 
 
 @test

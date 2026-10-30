@@ -180,6 +180,9 @@ struct RdmaCpuThreadApi {
 
 struct Rdma {
   const char* type = nullptr;
+  // Whether a peer executes the requests to it in the order they were posted (reliable connections): a read posted
+  // after writes then reads what they wrote, and returns once they are in memory. False for EFA (SRD).
+  bool inOrder = true;
 
   virtual ~Rdma() {}
   virtual void setCpuThreadApi(RdmaCpuThreadApi cpuThreadApi) = 0;

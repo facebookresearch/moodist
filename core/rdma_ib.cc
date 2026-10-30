@@ -48,6 +48,8 @@ struct RdmaIb : Rdma {
 
   RdmaIb(Group* group, std::unique_ptr<IbCommon> ib) : group(group), ib(std::move(ib)) {
     this->type = typestr;
+    // (EFA: one SRD queue pair for all peers, which delivers out of order)
+    this->inOrder = this->ib->qpex == nullptr;
   }
 
   void setCpuThreadApi(RdmaCpuThreadApi cpuThreadApi) {

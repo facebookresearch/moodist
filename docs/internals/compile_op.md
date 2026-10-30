@@ -152,6 +152,17 @@ Every step is collective: all ranks of the group take part (through per-rank que
    47.5 ms at 256 MiB, 68.7 ms with the partial ranks serving the executors in rank order and the executors reading
    in domain order; see Performance notes).
 
+   With writes (`MOODIST_COMPILE_OP_TRANSFER=write`; reads by default), the data goes the other way: an executor
+   allocates the region of its scratch tensor and the signal for each partial result (or share) that it needs when it
+   makes its request, and sends them with it (`WriteTarget`: also the range it needs, its share in two rounds). The
+   rank that computes it gets a `CustomOpDescriptor::IbWrite` instead of a notification: its CPU thread writes the
+   range there once its kernel has stored it, then sets the signal, which the executor's kernel waits for (see
+   Runtime, Signals). No notification, and nothing to do for the executor's CPU thread:
+   one transfer instead of a notification and a read. The writes go in the order in which the kernel computes their
+   data (the order above; the shares of two rounds part by part, each to the owners of the domains after its own
+   first). The edges, their order and the bits are those of reads. The inputs of domains with one source are read
+   either way.
+
    Reductions of CPU tensors are an error (step 9).
 8. **Proxy pass** (`proxyRemoteEdges`; `MOODIST_COMPILE_OP_PROXY=0` disables it; not for reductions, whose kernel
    takes no relay edges): data that several ranks of an
@@ -403,6 +414,13 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   of a notification slot are set, it writes the step value into that slot of the executor
   (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a notification for
   each).
+  With writes (`MOODIST_COMPILE_OP_TRANSFER=write`), the CPU thread of a partial rank watches the flags of its
+  `IbWrite`s instead: once one is set (and the destination's input list has arrived), it splits the write into parts
+  like a read (about 128 KiB, round robin over the NICs from one that rotates per write) and queues them on their
+  NICs; each NIC posts its queued parts up to the same limit of 8 parts (of reads and writes) in flight, and once its
+  parts of a write have completed, it sets its words of the write's signal in the destination (see Signals below).
+  The writes go before the reads in each round of the loop: other ranks' kernels wait for them. The second barrier
+  then also tells a rank that nobody writes into its scratch tensor any more.
 - Signals (`writeRdmaSignal`): a kernel waits for the data of an RDMA transfer (a proxied transfer's read, a
   reduction's source from another NVLink domain) until its signal in `Group::rdmaSignalBuffer` is set: 16 bytes per
   signal index, a word per NIC, all of which must have the step value. A NIC's writes into GPU memory reach the GPU in
@@ -410,17 +428,22 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   relaxed ordering, which the data's registrations allow, for speed), and a GPU whose GPUDirect RDMA writes ordering
   is "owner" (`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING`; GB300) lets its kernels see them in that order. So
   each NIC that carried some of the data writes its word (and the words of the NICs next to it that carried none, see
-  `signalWords`) once its data is in place: a loopback write once all parts of the read have completed. The signal
-  buffer has a registration of its own without relaxed ordering (`rdmaSignalMr`, `Rdma::regMrCuda`), on the same path
-  as the data's: registered through Data Direct like the data, or like it without (`RdmaMr::dataDirect`). Elsewhere,
-  or with `MOODIST_RDMA_FLUSH=1`, the CPU thread flushes the data first (`flushRead`): a loopback read of one byte of
-  it through every NIC that carried some (PCIe does not let a read pass the writes before it), then sets all words
-  with one write. The reads without a signal (into CUDA tensors) are flushed once they have all completed, through
-  each NIC that carried some, before the CPU thread lets the stream go on (`cpuOut`; it is one word, which the stream
-  waits for). Data in CPU tensors needs no flush (the completion, written to host memory too, does not pass it).
-- The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU thread signals
-  the kernel when the data of an RDMA transfer is in place (see Signals), and the kernel signals the CPU thread when
-  it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).
+  `signalWords`) once its data is in place: for a read, a loopback write once all parts have completed; for writes,
+  a write to the destination once that NIC's parts have completed (its completions mean the data is in the
+  destination's memory, even if the network delivered it out of order). The signal buffer has a registration of its
+  own without relaxed ordering (`rdmaSignalMr`, `Rdma::regMrCuda`), on the same path as the data's: registered
+  through Data Direct like the data, or like it without (`RdmaMr::dataDirect`; a destination whose registrations
+  differ asks the writers to flush, `Header::flags`). Elsewhere, or with `MOODIST_RDMA_FLUSH=1`, the CPU thread
+  flushes the data first (`flushRead`): a read of one byte of it through every NIC that carried some (PCIe does not
+  let a read pass the writes before it), a loopback read for the reads of a signal, a read of the destination for
+  writes (on the same connection right after the last part, which the peer executes after them, `Rdma::inOrder`; on
+  EFA, whose SRD queue pairs deliver out of order, once the parts have completed), then sets all words with one write.
+  The reads without a signal (into CUDA tensors) are flushed once they have all completed, through each NIC that
+  carried some, before the CPU thread lets the stream go on (`cpuOut`; it is one word, which the stream waits for).
+  Data in CPU tensors needs no flush (the completion, written to host memory too, does not pass it).
+- The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU threads
+  signal the kernel when the data of an RDMA transfer is in place (see Signals), and the kernel signals the CPU thread
+  when it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).
 
 - NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
   communication pool, at logical offset o: (2 << 61) | o; else in moodist's pool, at offset o: (1 << 61) | o) and the
@@ -456,6 +479,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   instead of as the cost model picks (`auto`, the default; see compile phase step 7). Same on all ranks.
 - `MOODIST_COMPILE_OP_PHASES=1|2` - reductions in one NVLink domain in one pass, or in two phases (pieces of any
   size), instead of as tuning picks (`auto`, the default; see compile phase step 11). Same on all ranks.
+- `MOODIST_COMPILE_OP_TRANSFER=read|write` - the partial results and shares of reductions across NVLink domains go
+  over RDMA reads by the ranks that need them (`read`, the default), or writes by the ranks that compute them (see
+  compile phase step 7). Same on all ranks.
 - `MOODIST_RDMA_FLUSH=1` - the data of RDMA transfers is flushed before their signals even where the signals can
   follow it (see Runtime, Signals), for tests and comparisons. Read when the CPU thread starts; may differ between
   ranks.
@@ -472,9 +498,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 `moodist.enable_profiling(False)`, its next traced point writes them to `moodist-trace-cpu-<group>-<rank>.json` in
 the current directory (so run one more op). For compile_op the spans are `WorkCustom`'s phases, named with the op's
 step value: `start`, `wait dyn N` (waiting for rank N's input list), `wait kernel` (for the stream to reach the
-op), `step exchange`, `wait step N`, `reads`, `wait read completions`, `wait reads of N` (rank N still reading) and
-`wait flushes`, where only the ranks actually waited for appear; and each NIC's reads (`read N`, from rank N). The
-CPU thread also
+op), `step exchange`, `wait step N`, `reads`, `wait read and write completions`, `wait reads of N` (rank N still
+reading) and `wait flushes`, where only the ranks actually waited for appear; and each NIC's reads and writes
+(`read N`, from rank N, and `write N`, to rank N). The CPU thread also
 records how long each op waited from the call until the CPU thread picked it up, and its sleeps, stalls of 20 us
 or more and moves between cores, with the core numbers. Timestamps are the system clock, so the files of all
 ranks can be merged into one trace (align the nodes' clocks, e.g. on the end of `step exchange`, which all ranks
@@ -692,6 +718,29 @@ with `MOODIST_FABRIC=0`; one round / two rounds, in us; the model's crossover in
 
 The model picks the faster variant everywhere but with 8 domains at 2 MiB (5% slower than one round).
 
+Reads against writes (`MOODIST_COMPILE_OP_TRANSFER`, step 7) and signals that follow their data against flushes
+(`MOODIST_RDMA_FLUSH=1`, see Runtime), 16 domains of 4 GB300 with `MOODIST_FABRIC=0` (`bfloat16`, one build):
+
+| 16 domains of 4 | AR 1 MiB | AR 16 MiB | AR 64 MiB | AR 256 MiB | RS 4 MiB | RS 16 MiB | RS 64 MiB | RS 256 MiB |
+|---|---|---|---|---|---|---|---|---|
+| reads | 144 us | 263 us | 604 us | 1.95 ms | 872 us | 3.17 ms | 12.5 ms | 46.2 ms |
+| reads, flushes | 152 us | 271 us | 650 us | 2.11 ms | 894 us | 3.18 ms | 12.5 ms | 46.2 ms |
+| writes | 139 us | 230 us | 531 us | 1.89 ms | 824 us | 3.28 ms | 17.8 ms | 89.9 ms |
+| writes, flushes | 166 us | 261 us | 574 us | 2.04 ms | 841 us | 3.34 ms | 15.7 ms | 90.2 ms |
+
+The reads take what they took before the signals and flushes existed. A flush costs a stage of transfers about
+5 us with reads (a loopback read) and 10-15 us with writes (a read over the network), and an all-reduce in two
+rounds, whose rounds wait for each other's signals, up to 8% at 64-256 MiB. Writes save the notification and the
+executor's CPU thread: 3-13% for all-reduces across 16 domains from 16 MiB on, 5% for reduce-scatters of 1-4 MiB.
+Large reduce-scatters are much slower with writes: every GPU sends 15 partial results the size of its output (3.75
+GiB at 256 MiB), in a rotation that gives every receiver one sender at a time as long as the ranks stay in step.
+With writes, ranks out of step put two senders on one receiver, whose switch port then queues, and the NICs' congestion
+control cuts both senders' rates (14.4 million ECN-marked packets per 20 ops at 256 MiB, against 1.45 million with
+reads), which the transfers that follow feel too: 3% slower at 16 MiB, 20-40% at 64 MiB, twice as slow at 256 MiB.
+With reads, two readers on one source share its link, and nothing queues in the network. More writes in flight per
+NIC (2 MiB instead of 1) brought 64 MiB level with reads, but left 256 MiB at 79 ms. On 64 GPUs in two domains of 32,
+reads and writes took the same time from 16 MiB on (an all-reduce of 256 MiB 847 us, a reduce-scatter 25.7 ms).
+
 RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
 1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
 in random order: 16.6 ms. In the order of the compile phase (each source one reader per step), 14.8 ms: each NIC
@@ -837,6 +886,15 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   for about 200 us before sleeping removed them in that test.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
+- Small ops across two NVL72 domains (64 GPUs, all-reduce of 64 KiB to 4 MiB) took 10-18 us longer (median; the
+  fastest 10% the same) with builds that differ from 9c67f3a only in memory layout than with 9c67f3a itself: 8 bytes
+  of padding at the end of `RdmaIb`, a member more in `CustomOpDescriptor` or in `Rdma`, unused code in the CPU
+  thread's loop (a changed log message made no difference). Not the kernel configuration, the CPU thread's sleeps,
+  or the core of the caller's thread; 16 domains of 4 GPUs do not show it. Probably false sharing or alignment on the
+  CPU thread's path: the four `RdmaIb` objects come from malloc (after the verbs library's objects of the NICs), so
+  their size moves everything allocated after them (moodist's own allocator has power-of-two size classes per
+  thread, which packs only objects smaller than a cache line together). Until it is understood, small sizes there
+  cannot be compared between builds.
 
 ### Cleanup
 - `docs/api/compile_op.md`: the examples predate `TensorRegion`'s `device` field.
@@ -845,11 +903,13 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 The proxy pass (compile phase step 8) sends data needed by several ranks of an NVLink domain over the network once,
 in chunks for large transfers. (Before the edge-based model, `computeNvlinkPlan` in processgroup.cc, removed in
 c57c8f4, computed a similar plan with gateway reads and local copies, but it was never executed.) Next:
-1. The write variant: the source writes the data and the signal into the proxy's memory.
+1. The write variant: the source writes the data and the signal into the proxy's memory (as reductions across
+   domains can, see compile phase step 7).
 2. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
    fixed neighbor, which relays the data of the ranks before it): fixed neighbors and synchronization with neighbors
    only, instead of `WorkCustom`'s exchanges with all ranks. It needs a heuristic for when it applies, and
-   measurements against the proxy pass.
+   measurements against the proxy pass. The same for reductions across domains (a reduce-scatter in a ring): a ring
+   has no incast, which makes large reduce-scatters with writes twice as slow (see Performance notes).
 
 ### Reductions: next steps
 1. TODO, a problem: the scratch tensor of reductions across NVLink domains holds every partial result whole, for the
@@ -858,15 +918,17 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    tensor (4 times the tensor with 16 domains of 4 GPUs), in two rounds about 3 / m (3/4). It should be bounded, e.g.
    a ring of part-sized regions per pair of ranks: a region is reused once the executor has combined the part in it,
    which needs flow control back to the partial rank (the executor's kernel signals its CPU thread, which notifies
-   the partial rank, whose kernel waits for that before it computes into the region again). With the write variant
-   (item 2), a partial rank also knows when its own region is free (once its write has completed), but the
-   executor's regions still need the flow control. In two rounds, the copies of other shares could read them into
+   the partial rank, whose kernel waits for that before it computes into the region again). With writes (step 7), a
+   partial rank also knows when its own region is free (once its write has completed), but the executor's regions
+   still need the flow control. In two rounds, the copies of other shares could read them into
    the outputs instead (the RDMA read into the executor's own output, the kernel copying it to the others of its
    domain).
-2. Across NVLink domains (compile phase step 7): the write variant, where the partial rank writes its result into
-   the executor's scratch tensor (one RDMA write instead of a notification and a read), and in two rounds the owner
-   its share into the other owners'. With 16 domains, the reduce-scatter is 6-9% slower than NCCL from 64 MiB on
-   (above). Small reductions across domains take about 100 us on 64 GPUs, against 30 us in one domain of 32 (two
+2. Across NVLink domains (compile phase step 7): reads or writes (`MOODIST_COMPILE_OP_TRANSFER`, reads by default).
+   Writes are faster for all-reduces across many domains from 16 MiB on and much slower for large reduce-scatters
+   (see Performance notes); which to use when (e.g. writes for all-reduces in two rounds) is open, and so are rings
+   (see Mixed NVLink and RDMA paths). In two rounds, owners could write their shares straight into the other owners'
+   outputs instead of their scratch tensors. With 16 domains, the reduce-scatter is 6-9% slower than NCCL from
+   64 MiB on (above). Small reductions across domains take about 100 us on 64 GPUs, against 30 us in one domain of 32 (two
    rounds about 35 us more): `WorkCustom` exchanges with every rank (the input lists and two step value barriers),
    where a reduction needs only its partial ranks and executors (to be measured). The cost model of two rounds
    (Performance notes) picks two rounds a little early with 8 domains; its parts are those of one round (Phase 2),

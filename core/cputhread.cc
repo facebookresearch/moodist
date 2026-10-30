@@ -344,7 +344,7 @@ struct CpuThreadImpl {
   MemoryRegistration* cpuOutMr = regMrCuda(group->cpuOutBuffer.buffer.cudaPointer, group->cpuOutBuffer.buffer.bytes);
 
   // compile_op's RDMA signals (Group::rdmaSignalBuffer, see writeRdmaSignal): a registration of their own, without
-  // relaxed ordering; and where every rank's are
+  // relaxed ordering; and where the other ranks' are (this rank writes them when it writes data into their tensors)
   MemoryRegistration* rdmaSignalMr =
       regMrCudaStrict(group->rdmaSignalBuffer.buffer.cudaPointer, group->rdmaSignalBuffer.buffer.bytes);
   IVector<RemoteAddressAndKey> remoteRdmaSignals =
@@ -1328,7 +1328,7 @@ struct CpuThreadImpl {
   // relaxed-ordered (PCIe lets a write pass earlier ones only with relaxed ordering, which the data's registrations
   // allow for speed), and a GPU whose GPUDirect RDMA writes ordering is "owner" lets its kernels see them in that
   // order. So a signal is a write through each NIC that carried some of the data, after that NIC has placed it (the
-  // completion of its reads), into a registration without relaxed ordering
+  // completion of its reads, or of the other rank's writes to it), into a registration without relaxed ordering
   // (rdmaSignalMr) on the same path as the data's (both registered through Data Direct or both not): a word per NIC,
   // and the kernel waits until all words of the signal have the step value (see signalWords). Elsewhere (or with
   // MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
@@ -5797,7 +5797,11 @@ struct CpuThreadImpl {
       uint32_t numInputs;
       std::array<InputTensor, maxInlinedInputs> inputs;
       uint32_t stepValue;
+      uint32_t flags;
     };
+    // Header::flags: the signals of writes into this rank's tensors cannot follow the data (see writeRdmaSignal): the
+    // writers flush first
+    static constexpr uint32_t flagSignalsNeedFlush = 1;
 
     struct alignas(128) Dyn : DynamicAddressesBase {
       Header custom;
@@ -5808,6 +5812,8 @@ struct CpuThreadImpl {
 
     Vector<TemporaryBufferHandle> remoteInputList;
     Vector<bool> remoteInputListReady;
+    // Per rank: its Header::flags
+    Vector<uint32_t> remoteFlags;
 
     Vector<CustomOpDescriptor::IbRead> reads;
     // Per signal index: parts of the read that are not done yet
@@ -5821,13 +5827,13 @@ struct CpuThreadImpl {
     size_t firstUnseen = 0;
 
     size_t liveReads = 0;
-    // Per NIC: the parts of reads in flight
+    // Per NIC: the parts of reads and writes in flight
     std::array<size_t, maxDevices> deviceLive{};
 
-    // Reads are split into parts of about partBytes, and each NIC has up to numParallel of them in flight
+    // Reads and writes are split into parts of about partBytes, and each NIC has up to numParallel of them in flight
     static constexpr size_t partBytes = 128 << 10;
     static constexpr size_t numParallel = 8;
-    // When an op has fewer reads than NICs, smaller reads are split too, into parts of at least this size
+    // When an op has fewer reads (or writes) than NICs, smaller ones are split too, into parts of at least this size
     static constexpr size_t minPartBytes = 64 << 10;
     const size_t numDevices = self.devices.size();
 
@@ -5840,6 +5846,29 @@ struct CpuThreadImpl {
     uint8_t unsignaledDevices = 0;
     std::array<std::pair<uintptr_t, uint32_t>, maxDevices> unsignaledDestination{};
     size_t liveFlushes = 0;
+
+    // Writes (see CustomOpDescriptor::IbWrite). Once the kernel has written a write's flag, its parts go into the
+    // queues of the NICs that carry them (queueWrites); each NIC writes its words of the write's signal once its parts
+    // have completed (see writeRdmaSignal), or where the signal cannot follow the data, its queue has a flush read
+    // after the parts, and the signal is written once the flushes have completed. Per write: the NICs that carry it
+    // (writeDevices), per NIC the parts not completed (writePartsLeft), and the NICs whose words or flushes are still
+    // to come (writePending).
+    struct WritePart {
+      uint32_t write;
+      bool flush;
+      size_t offset;
+      size_t bytes;
+    };
+    std::array<Vector<WritePart>, maxDevices> writeQueues;
+    std::array<size_t, maxDevices> writeQueueHeads{};
+    Vector<uint8_t> writeQueued;
+    Vector<uint8_t> writeDevices;
+    Vector<uint8_t> writeFlushes;
+    Vector<std::array<uint32_t, maxDevices>> writePartsLeft;
+    Vector<uint32_t> writePending;
+    size_t firstUnqueuedWrite = 0;
+    size_t writesLeft = 0; // writes whose signal has not been sent
+    size_t liveWrites = 0; // parts of writes and their flushes in flight
 
     Vector<MemoryRegistration*> outputMrs;
 
@@ -6014,6 +6043,122 @@ struct CpuThreadImpl {
       }
     }
 
+    // The writes whose flags the kernel has written (and whose destination's tensor list has arrived) go into the
+    // queues of their NICs: parts of about partBytes like reads, round robin over the NICs from one that rotates per
+    // write; if the destination needs flushes (Header::flags), after its last part on each NIC a flush read through
+    // that NIC (see issueWrites)
+    void queueWrites() {
+      const auto& writes = op->ibWrites;
+      const bool fewWrites = writes.size() < numDevices;
+      for (size_t w = firstUnqueuedWrite; w != writes.size(); ++w) {
+        const auto& write = writes[w];
+        if (writeQueued[w] || cpuIn[16 + write.flag] < stepValue || !remoteInputListReady[write.rank]) {
+          continue;
+        }
+        writeQueued[w] = 1;
+        checkWrite(write);
+        size_t parts = std::max<size_t>((write.bytes + partBytes / 2) / partBytes, 1);
+        if (fewWrites) {
+          parts = std::max(parts, std::clamp(write.bytes / minPartBytes, (size_t)1, numDevices));
+        }
+        const size_t bytesPerPart = std::max(((write.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
+        uint8_t used = 0;
+        size_t di = w % numDevices;
+        for (size_t offset = 0; offset < write.bytes; offset += bytesPerPart) {
+          writeQueues[di].push_back({(uint32_t)w, false, offset, std::min(bytesPerPart, write.bytes - offset)});
+          ++writePartsLeft[w][di];
+          used |= 1 << di;
+          di = di + 1 == numDevices ? 0 : di + 1;
+        }
+        writeDevices[w] = used;
+        writeFlushes[w] = (remoteFlags[write.rank] & flagSignalsNeedFlush) != 0;
+        if (used == 0) {
+          self.writeRdmaSignal(concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices);
+          --writesLeft;
+          continue;
+        }
+        for (size_t d : range(numDevices)) {
+          if (used & (1 << d)) {
+            ++writePending[w];
+            if (writeFlushes[w]) {
+              writeQueues[d].push_back({(uint32_t)w, true, 0, 0});
+            }
+          }
+        }
+      }
+      while (firstUnqueuedWrite != writes.size() && writeQueued[firstUnqueuedWrite]) {
+        ++firstUnqueuedWrite;
+      }
+    }
+
+    // Posts the queued parts of writes, up to numParallel parts (of reads and writes) in flight per NIC. A NIC writes
+    // its words of a write's signal once its parts of the write have completed (they are then in the destination's
+    // memory), or with flushes, posts its flush read right after its last part (the peer executes it after the
+    // writes before it, see Rdma::inOrder; otherwise once they have completed), and the signal goes once all the
+    // flushes of the write have completed.
+    void issueWrites() {
+      for (size_t di : range(numDevices)) {
+        auto& queue = writeQueues[di];
+        size_t& head = writeQueueHeads[di];
+        auto& dev = self.devices[di];
+        while (head != queue.size()) {
+          const WritePart part = queue[head];
+          const auto& write = op->ibWrites[part.write];
+          const InputTensor& dst = ((const InputTensor*)remoteInputList[write.rank]->cpuPointer)[write.destinationIndex];
+          if (part.flush) {
+            if (!dev.rdma->inOrder && writePartsLeft[part.write][di] != 0) {
+              break;
+            }
+            ++liveWrites;
+            self.flushRead(dev, write.rank, dst.address + write.destinationOffset, dst.rkey[di],
+                self.makeCallback([this, w = part.write]() {
+                  --liveWrites;
+                  if (--writePending[w] == 0) {
+                    const auto& write = op->ibWrites[w];
+                    self.writeRdmaSignal(
+                        concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices);
+                    --writesLeft;
+                  }
+                }));
+          } else {
+            if (deviceLive[di] >= numParallel) {
+              break;
+            }
+            ++liveWrites;
+            ++deviceLive[di];
+            self.trace(concurrencyIndex, 1 + di, "%#x write %d", stepValue, write.rank);
+            auto& src = params.outputs.back();
+            // (no inline data: the source is GPU memory)
+            self.writeDataNoInline(dev, write.rank, (void*)(src->data() + write.sourceOffset + part.offset),
+                outputMrs.back()->mrs[di]->lkey, (void*)(dst.address + write.destinationOffset + part.offset),
+                dst.rkey[di], part.bytes, self.makeCallback([this, di, w = part.write]() {
+                  self.trace(concurrencyIndex, 1 + di, "");
+                  --liveWrites;
+                  --deviceLive[di];
+                  if (--writePartsLeft[w][di] == 0 && !writeFlushes[w]) {
+                    const auto& write = op->ibWrites[w];
+                    auto [first, end] = signalWords(writeDevices[w], di);
+                    self.writeRdmaSignal(concurrencyIndex, self.devices[di], write.rank, write.signalIndex, first, end);
+                    if (--writePending[w] == 0) {
+                      --writesLeft;
+                    }
+                  }
+                }));
+          }
+          ++head;
+        }
+      }
+    }
+
+    // Checks the writes against the tensors of their destinations, once their lists have arrived
+    void checkWrite(const CustomOpDescriptor::IbWrite& write) {
+      CHECK(write.rank < size && write.rank != rank);
+      CHECK(remoteInputList[write.rank]->bytes >= sizeof(InputTensor) * (write.destinationIndex + 1));
+      const InputTensor& dst = ((const InputTensor*)remoteInputList[write.rank]->cpuPointer)[write.destinationIndex];
+      CHECK(write.destinationOffset + write.bytes <= dst.bytes);
+      CHECK(op->scratchBytes != 0 && write.sourceOffset + write.bytes <= params.outputs.back()->bytes());
+    }
+
     // Splits the op's reads into parts of about partBytes (reads), in the order in which they are issued, each on the
     // NIC with the fewest in flight (up to numParallel). Reads that signal the kernel come first, in signal order
     // (the chunks of a transfer in order): copies on this and other ranks wait for them. The others follow in the
@@ -6146,11 +6291,15 @@ struct CpuThreadImpl {
         out.stepValue = stepValue;
 
         // The tensors that other ranks read from: the inputs (and input copies), and the scratch tensor, if any (the
-        // last tensor, with partial results of reductions, see CustomOpDescriptor::scratchBytes)
+        // last tensor, with partial results of reductions, see CustomOpDescriptor::scratchBytes), which other ranks
+        // may also write into (whose signals then need flushes if they cannot follow the data on any NIC)
         const size_t numTensors = params.inputs.size() + (op->scratchBytes != 0);
         out.custom.opid = op->id;
         out.custom.stepValue = stepValue;
         out.custom.numInputs = numTensors;
+        out.custom.flags = op->scratchBytes != 0 && !self.signalFollows(outputMrs.back(), (1 << numDevices) - 1)
+                               ? flagSignalsNeedFlush
+                               : 0;
 
         auto describe = [&](size_t index, InputTensor& v) {
           const bool input = index < params.inputs.size();
@@ -6203,6 +6352,7 @@ struct CpuThreadImpl {
       CHECK(remoteInputListReady.empty());
       remoteInputList.resize(size);
       remoteInputListReady.resize(size);
+      remoteFlags.resize(size);
 
       for (o = 0; o != size; ++o) {
         i = self.rank - o;
@@ -6230,6 +6380,7 @@ struct CpuThreadImpl {
         if (dyn.custom.opid != op->id) {
           fatal("Mismatched custom operation: Local id is %d, remote id is %d", dyn.custom.opid, op->id);
         }
+        remoteFlags[i] = dyn.custom.flags;
 
         auto& targetBuffer = remoteInputList[i];
         size_t bytes = sizeof(InputTensor) * dyn.custom.numInputs;
@@ -6256,6 +6407,12 @@ struct CpuThreadImpl {
       }
       notificationsLeft = op->notifications.size();
 
+      writeQueued.resize(op->ibWrites.size());
+      writeDevices.resize(op->ibWrites.size());
+      writeFlushes.resize(op->ibWrites.size());
+      writePartsLeft.resize(op->ibWrites.size());
+      writePending.resize(op->ibWrites.size());
+      writesLeft = op->ibWrites.size();
 
       if (params.anyCuda) {
         // wait for kernel
@@ -6290,11 +6447,16 @@ struct CpuThreadImpl {
       self.trace(concurrencyIndex, 0, "%#x reads", stepValue);
       readIndex = 0;
 
-      // Reads, and the notifications of partial results this rank's kernel computes for other ranks
-      while (readIndex != reads.size() || notificationsLeft != 0) {
+      // Reads, the notifications of partial results this rank's kernel computes for other ranks, and the writes of
+      // those that it writes to them (the writes go first: the kernels of other ranks wait for them)
+      while (readIndex != reads.size() || notificationsLeft != 0 || writesLeft != 0) {
         if (notificationsLeft != 0) {
           forwardNotifications();
         }
+        if (firstUnqueuedWrite != op->ibWrites.size()) {
+          queueWrites();
+        }
+        issueWrites();
         if (readIndex != reads.size()) {
           size_t bestDevice = 0;
           size_t bestLive = numParallel;
@@ -6311,10 +6473,10 @@ struct CpuThreadImpl {
         YIELD
       }
 
-      if (liveReads) {
-        self.trace(concurrencyIndex, 0, "%#x wait read completions", stepValue);
+      if (liveReads || liveWrites) {
+        self.trace(concurrencyIndex, 0, "%#x wait read and write completions", stepValue);
       }
-      while (liveReads) {
+      while (liveReads || liveWrites) {
         YIELD
       }
       flushUnsignaledReads();

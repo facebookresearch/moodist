@@ -364,6 +364,23 @@ struct CustomOpDescriptor {
   static constexpr size_t numNotificationSlots = 32;
   static_assert(numNotificationSlots == maxDevices * maxChunks);
 
+  // With writes instead of reads (MOODIST_COMPILE_OP_TRANSFER=write, see crossDomainReductions in compile_op.cc): a
+  // range of a partial result (or of a share of a result) that this rank's kernel computes for a rank in another
+  // NVLink domain, which this rank writes into that rank's scratch tensor. Once the kernel has written the step value
+  // into cpuInBuffer slot 16 + flag, the CPU thread writes `bytes` bytes from offset sourceOffset of its own scratch
+  // tensor to offset destinationOffset of tensor destinationIndex of `rank` (in the list of tensors it publishes, see
+  // WorkCustom), then sets signal signalIndex of `rank` (see writeRdmaSignal in cputhread.cc), which its kernel waits
+  // for
+  struct IbWrite {
+    uint32_t flag;
+    uint32_t rank;
+    uint32_t destinationIndex;
+    size_t sourceOffset;
+    size_t destinationOffset;
+    size_t bytes;
+    int32_t signalIndex;
+  };
+
   Vector<Copy> inputCopies;
   Vector<Copy> outputCopies;
 
@@ -376,9 +393,11 @@ struct CustomOpDescriptor {
   // (with unequal amounts, reading one source at a time leaves some sources idle; see compile_op.cc)
   uint32_t readSources = 1;
   Vector<Notification> notifications;
+  Vector<IbWrite> ibWrites;
   // Reductions across NVLink domains: the bytes of the scratch tensor (a CUDA tensor of the op's dtype that customOp
   // allocates per launch, after the output copies: the last tensor), which holds the partial results that this rank
-  // computes (for other domains, and in an all-reduce for itself) and the ones that it reads from them; 0 if none
+  // computes (for other domains, and in an all-reduce for itself) and the ones that it reads from them (or that they
+  // write into it); 0 if none
   size_t scratchBytes = 0;
 
   Vector<compile_op::Graph::TensorDescr> inputs;

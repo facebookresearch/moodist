@@ -382,17 +382,35 @@ struct Domains {
   }
 };
 
+// crossDomainReductions with writes: where the rank that computes a partial result (or a share of a result) writes the
+// range of it that a rank asks for: the range (from the start of the partial result or share), the region of the
+// asking rank's scratch tensor (the tensor's index in the list that WorkCustom publishes, and the offset), and the
+// signal that the asking rank's kernel waits for
+struct WriteTarget {
+  size_t offset = 0;
+  size_t bytes = 0;
+  uint32_t tensorIndex = 0;
+  size_t tensorOffset = 0;
+  int32_t signal = -1;
+  template<typename X>
+  void serialize(X& x) {
+    x(offset, bytes, tensorIndex, tensorOffset, signal);
+  }
+};
+
 // crossDomainReductions: a partial result that an executor asks a rank in another NVLink domain to compute, and the
-// answer: where it will be (the partial rank's scratch tensor) and the notification slot it will be announced in
+// answer: where it will be (the partial rank's scratch tensor) and the notification slot it will be announced in.
+// With writes, the request says where to write it instead, and the answer is not used.
 struct PartialRequest {
   Vector<Node> sources; // in (rank, tensor, offset) order
   size_t bytes;
   uint32_t divisor;
   uint32_t cellIndex;
   uint32_t chunkIndex;
+  WriteTarget target;
   template<typename X>
   void serialize(X& x) {
-    x(sources, bytes, divisor, cellIndex, chunkIndex);
+    x(sources, bytes, divisor, cellIndex, chunkIndex, target);
   }
 };
 struct PartialResponse {
@@ -405,13 +423,14 @@ struct PartialResponse {
   }
 };
 // In two rounds: the share of a part's result that an executor asks the share's owner for (answered with a
-// PartialResponse: where the share will be, and the notification slot)
+// PartialResponse: where the share will be, and the notification slot; with writes, where to write it)
 struct ResultRequest {
   uint32_t cellIndex;
   uint32_t chunkIndex;
+  WriteTarget target;
   template<typename X>
   void serialize(X& x) {
-    x(cellIndex, chunkIndex);
+    x(cellIndex, chunkIndex, target);
   }
 };
 // A piece of a reduced cell with destinations in several NVLink domains (an all-reduce's, see reductionPieces), per
@@ -1182,10 +1201,16 @@ struct CompileOpConstructor {
   // it once notified (a ResultRequest each), and copies the shares of the others to the destinations of its domain
   // (an edge per share, with one source): an all-gather. The bits are those of one round. An executor then reads
   // (n - 1) / k + (k - 1) / k parts instead of n - 1 (n domains with sources, k with destinations).
+  // With writes (MOODIST_COMPILE_OP_TRANSFER=write), the rank that computes a partial result or a share writes it to
+  // the ranks that need it instead: an executor puts in its request the region of its scratch tensor and the signal
+  // for it (WriteTarget), and the computing rank's CPU thread writes it there once its kernel has stored it, then
+  // signals the executor's kernel directly (CustomOpDescriptor::IbWrite): no notification, and nothing to do for the
+  // executor's CPU thread. The inputs of domains with one source are read in both cases. The edges and their order are
+  // the same either way (and so are the results).
   // Every rank takes part (the requests are exchanged); returns an error message (a full signal table), or an empty
   // string.
   std::string crossDomainReductions(InternalContext& ictx, Graph& graph, CustomOpDescriptor& op, const Domains& domains,
-      const HashMap<uint64_t, AllReducePiece>& allReducePieces) {
+      const HashMap<uint64_t, AllReducePiece>& allReducePieces, bool writes) {
     const size_t myDomain = domains.index.at(rank);
     const size_t numDomains = domains.count;
     auto inMyDomain = [&](const Node& n) {
@@ -1230,6 +1255,8 @@ struct CompileOpConstructor {
     // offsets (RDMA reads into page aligned destinations are faster)
     const uint32_t scratchIndex = graph.tensors.size();
     const uint32_t scratchOutputIndex = scratchIndex - graph.numInputs - graph.numInputCopies;
+    // (and its index in the list of tensors that WorkCustom publishes: after the inputs and input copies)
+    const uint32_t publishedScratchIndex = graph.numInputs + graph.numInputCopies;
     size_t scratchBytes = 0;
     auto allocate = [&](size_t bytes) {
       size_t offset = scratchBytes;
@@ -1316,6 +1343,7 @@ struct CompileOpConstructor {
       size_t requestIndex;
       size_t offset;
       size_t bytes;
+      WriteTarget target; // with writes
     };
     struct Plan {
       size_t edgeIndex;
@@ -1419,7 +1447,8 @@ struct CompileOpConstructor {
         plan.doneSignals.push_back(-1);
       };
       // A partial result of another rank's, or a copy of an input that it makes, of the whole edge (filled in from its
-      // response; this rank reads the range of the plan)
+      // response; this rank reads the range of the plan). With writes, the partial rank writes that range into the
+      // scratch tensor.
       auto addRequest = [&](uint32_t partialRank, Vector<Node> sources, bool partial) {
         CHECK(partialRank != rank);
         plan.partials.emplace_back(plan.sources.size(), partialRank, requests[partialRank].size());
@@ -1429,9 +1458,15 @@ struct CompileOpConstructor {
         request.divisor = plan.divisor;
         request.cellIndex = e.cellIndex;
         request.chunkIndex = e.chunkIndex;
+        if (writes) {
+          request.target = {plan.offset, plan.bytes, publishedScratchIndex, allocate(plan.bytes), nextSignal++};
+          plan.sources.push_back(scratchNode(request.target.tensorOffset, true));
+          plan.signals.push_back(request.target.signal);
+        } else {
+          plan.sources.emplace_back();
+          plan.signals.push_back(-1);
+        }
         requests[partialRank].push_back(std::move(request));
-        plan.sources.emplace_back();
-        plan.signals.push_back(-1);
         plan.doneSignals.push_back(-1);
         plan.partialSources += partial;
       };
@@ -1494,8 +1529,12 @@ struct CompileOpConstructor {
             if (j != shareIndex) {
               const uint32_t owner = piece->shareOwners[j];
               auto [offset, bytes] = shareRange(e.bytes, numShares, j);
-              plan.shares.push_back({owner, resultRequests[owner].size(), offset, bytes});
-              resultRequests[owner].push_back({e.cellIndex, e.chunkIndex});
+              ResultRequest request{e.cellIndex, e.chunkIndex};
+              if (writes) {
+                request.target = {0, bytes, publishedScratchIndex, allocate(bytes), nextSignal++};
+              }
+              plan.shares.push_back({owner, resultRequests[owner].size(), offset, bytes, request.target});
+              resultRequests[owner].push_back(request);
             }
           }
         }
@@ -1554,18 +1593,37 @@ struct CompileOpConstructor {
     for (size_t i : range(size)) {
       responses[i].resize(incoming[i].size());
     }
-    // (the index of the scratch tensor in the list of tensors that WorkCustom publishes: after the inputs and input
-    // copies)
-    const uint32_t publishedScratchIndex = graph.numInputs + graph.numInputCopies;
+    // With writes, the writes in the order in which the kernel computes their data: the partial results in the order
+    // above, then the shares of results part by part (in plan order), each to the owners of the domains after this
+    // rank's first (as the partial results)
+    auto addWrite = [&](uint32_t requester, int32_t flag, size_t offset, const WriteTarget& t) {
+      CustomOpDescriptor::IbWrite w;
+      w.flag = flag;
+      w.rank = requester;
+      w.destinationIndex = t.tensorIndex;
+      w.sourceOffset = offset + t.offset;
+      w.destinationOffset = t.tensorOffset;
+      w.bytes = t.bytes;
+      w.signalIndex = t.signal;
+      op.ibWrites.push_back(w);
+      log.info("  ibWrite: flag %d, output[%u]+%zu -> rank %u tensor %u + %zu, %zu bytes, signal %d\n", w.flag,
+          scratchOutputIndex, w.sourceOffset, w.rank, w.destinationIndex, w.destinationOffset, w.bytes, w.signalIndex);
+    };
     for (auto [i, j] : order) {
       const PartialRequest& request = incoming[i][j];
       Partial partial = computePartial(
           request.sources, request.bytes, request.divisor, request.cellIndex, request.chunkIndex, requestOrder({i, j}));
+      if (writes) {
+        CHECK(request.target.offset + request.target.bytes <= request.bytes);
+        addWrite(i, partial.doneSignal, partial.offset, request.target);
+        continue;
+      }
       const uint32_t slot = slotOf(j, incoming[i].size(), 0, partialSlots(i));
       op.notifications.push_back({(uint32_t)partial.doneSignal, i, slot});
       responses[i][j] = {publishedScratchIndex, partial.offset, slot};
     }
     Vector<Vector<PartialResponse>> resultResponses(size);
+    Vector<std::tuple<uint32_t, uint32_t, size_t, uint32_t, uint32_t>> resultWrites; // (chunk, cell, order, i, j)
     for (size_t i : range(size)) {
       const size_t first = partialSlots(i);
       for (size_t j : indices(incomingResults[i])) {
@@ -1578,9 +1636,22 @@ struct CompileOpConstructor {
           resultResponses[i].push_back({publishedScratchIndex, 0, slot});
           continue;
         }
+        if (writes) {
+          resultWrites.emplace_back(request.chunkIndex, request.cellIndex,
+              (domains.index[i] + numDomains - 1 - myDomain) % numDomains, (uint32_t)i, (uint32_t)j);
+          resultResponses[i].push_back({publishedScratchIndex, 0, slot});
+          continue;
+        }
         op.notifications.push_back({(uint32_t)it->second.first, (uint32_t)i, slot});
         resultResponses[i].push_back({publishedScratchIndex, it->second.second, slot});
       }
+    }
+    std::ranges::sort(resultWrites);
+    for (auto [chunkIndex, cellIndex, o, i, j] : resultWrites) {
+      const ResultRequest& request = incomingResults[i][j];
+      auto [doneSignal, resultOffset] = results.at(((uint64_t)cellIndex << 32) | chunkIndex);
+      CHECK(request.target.offset == 0);
+      addWrite(i, doneSignal, resultOffset, request.target);
     }
     std::ranges::stable_sort(partialEdges, {}, [](const std::pair<PartialOrder, Edge>& x) {
       return x.first;
@@ -1606,7 +1677,8 @@ struct CompileOpConstructor {
     // its domain and to its scratch tensor, where the other owners read it once notified (it has a done signal); then
     // an edge per other share of the part copies the share from where this rank has read it (in the same order of
     // domains, after the partial results of the part) to the destinations of its domain. The edges go in the order of
-    // the plans (part by part), in which the kernel takes them.
+    // the plans (part by part), in which the kernel takes them. (With writes, the regions and signals of the partial
+    // results and shares are those of the requests.)
     auto readOrder = [&](uint32_t r) {
       return (myDomain + numDomains - 1 - domains.index[r]) % numDomains;
     };
@@ -1620,6 +1692,9 @@ struct CompileOpConstructor {
         return readOrder(std::get<1>(x));
       });
       for (auto [sourcePosition, partialRank, requestIndex] : partials) {
+        if (writes) {
+          break;
+        }
         const PartialResponse& response = received[partialRank].at(requestIndex);
         auto r = read(partialRank, response.tensorIndex, response.offset + plan.offset, plan.bytes, response.slot);
         plan.sources[sourcePosition] = scratchNode(r.outputOffset, true);
@@ -1635,12 +1710,18 @@ struct CompileOpConstructor {
         return readOrder(s.owner);
       });
       for (const Share& s : plan.shares) {
-        const PartialResponse& response = receivedResults[s.owner].at(s.requestIndex);
-        auto r = read(s.owner, response.tensorIndex, response.offset, s.bytes, response.slot);
+        size_t offset = s.target.tensorOffset;
+        int32_t signal = s.target.signal;
+        if (!writes) {
+          const PartialResponse& response = receivedResults[s.owner].at(s.requestIndex);
+          auto r = read(s.owner, response.tensorIndex, response.offset, s.bytes, response.slot);
+          offset = r.outputOffset;
+          signal = r.signalIndex;
+        }
         Edge copy;
         copy.id = ictx.nextEdgeId();
-        copy.sources.push_back(scratchNode(r.outputOffset, true));
-        copy.sourceSignals.push_back(r.signalIndex);
+        copy.sources.push_back(scratchNode(offset, true));
+        copy.sourceSignals.push_back(signal);
         copy.destinations = e.destinations;
         for (Node& n : copy.destinations) {
           n.offset += s.offset;
@@ -1708,8 +1789,8 @@ struct CompileOpConstructor {
       op.scratchBytes = scratchBytes;
     }
     log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds), %d partial results, "
-              "input copies or shares (for this and other ranks), %d signals, %zu bytes of scratch\n",
-        rank, plans.size(), results.size(), numFlags, nextSignal, scratchBytes);
+              "input copies or shares (for this and other ranks), %d signals, %zu bytes of scratch, %zu writes\n",
+        rank, plans.size(), results.size(), numFlags, nextSignal, scratchBytes, op.ibWrites.size());
 
     const size_t maxSignals = group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes;
     const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
@@ -2165,6 +2246,9 @@ struct CompileOpConstructor {
     // pass, in two phases (see twoPhaseReductions), or ("auto") as tuneKernels picks.
     std::string rounds = "auto";
     std::string phases = "auto";
+    // MOODIST_COMPILE_OP_TRANSFER: the data of reductions across NVLink domains goes over RDMA reads by the ranks that
+    // need it, or writes by the ranks that compute it (see crossDomainReductions)
+    std::string transfer = "read";
     if (isReduction(reduce)) {
       rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
       REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
@@ -2172,6 +2256,9 @@ struct CompileOpConstructor {
       phases = agreedEnv("MOODIST_COMPILE_OP_PHASES", "auto");
       REQUIRE(phases == "auto" || phases == "1" || phases == "2",
           "compile_op: MOODIST_COMPILE_OP_PHASES must be auto, 1 or 2 (not '%s')", phases);
+      transfer = agreedEnv("MOODIST_COMPILE_OP_TRANSFER", "read");
+      REQUIRE(transfer == "read" || transfer == "write",
+          "compile_op: MOODIST_COMPILE_OP_TRANSFER must be read or write (not '%s')", transfer);
     }
     if (std::string value = agreedEnv("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", ""); !value.empty()) {
       const bool digits = value.size() <= 10 && std::ranges::all_of(value, [](char c) {
@@ -3157,7 +3244,7 @@ struct CompileOpConstructor {
       GraphBuilder merger(ictx, baseGraph);
       merger.mergeReductions();
       baseGraph.edges = std::move(merger.graph.edges);
-      crossDomainError = crossDomainReductions(ictx, baseGraph, *op, domains, allReducePieces);
+      crossDomainError = crossDomainReductions(ictx, baseGraph, *op, domains, allReducePieces, transfer == "write");
     }
 
     // Proxy transfers from outside the NVLink domain (MOODIST_COMPILE_OP_PROXY=0 disables it), except in reductions
@@ -3320,7 +3407,7 @@ struct CompileOpConstructor {
       }
       const bool dense = numRemoteRead == numRemote && (numLocalRead == 0 || numLocalRead == numLocal);
 
-      bool localNeedsRdma = !op->ibReads.empty();
+      bool localNeedsRdma = !op->ibReads.empty() || !op->ibWrites.empty();
       for (size_t i : range(size)) {
         ctx.send(i, localNeedsRdma, hasReads, dense, minBytes, maxBytes);
       }
