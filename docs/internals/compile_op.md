@@ -434,6 +434,8 @@ on new tensors at every call.
   instead of as the cost model picks (`auto`, the default; see compile phase step 7). Same on all ranks.
 - `MOODIST_COMPILE_OP_PHASES=1|2` - reductions in one NVLink domain in one pass, or in two phases (pieces of any
   size), instead of as tuning picks (`auto`, the default; see compile phase step 11). Same on all ranks.
+- `MOODIST_IB_TIMEOUT` - the RDMA transport's ACK timeout exponent (not specific to compile_op; default 20, as
+  NCCL's: on ConnectX-8, about 64 s of an unanswered request before the error that ends the job; see ib_common.cc).
 
 ## Tracing
 

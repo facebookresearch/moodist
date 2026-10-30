@@ -315,8 +315,12 @@ struct RdmaIb : Rdma {
         NOINLINE_COLD({
           RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
           if (!cpuThreadApi.suppressErrors()) {
-            log.error("%s: Error communicating with %s: Work completion with status %d (%s).\n",
-                cpuThreadApi.groupName(), cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status));
+            log.error("%s: Error communicating with %s: Work completion with status %d (%s).%s\n",
+                cpuThreadApi.groupName(), cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status),
+                wc.status == IBV_WC_RETRY_EXC_ERR
+                    ? " The peer did not acknowledge in time: its process is gone, or the network lost the traffic "
+                      "between the two for longer than the transport timeout (MOODIST_IB_TIMEOUT)."
+                    : "");
             cpuThreadApi.setError();
           }
         });

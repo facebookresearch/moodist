@@ -279,7 +279,9 @@ std::vector<uint8_t> probeIbRailBatch(
     attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 4979;
     // Low retry so a cross-rail (black-holed) write reports RETRY_EXC quickly instead of
-    // stalling the wave; ~4 tries * (4.096us * 2^12 ~= 17ms) => ~67ms to RETRY_EXC.
+    // stalling the wave; ~4 tries * (4.096us * 2^12 ~= 17ms) => ~67ms to RETRY_EXC. (Some NICs
+    // take longer: ConnectX-8 counts exponents below its local_ca_ack_delay of 16 as 16, about
+    // 2 s for 4 tries. The probe's deadline, timeoutMs, then decides.)
     attr.timeout = 12;
     attr.retry_cnt = 3;
     attr.rnr_retry = 3;
@@ -373,9 +375,16 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   if (trafficClass != 0 || serviceLevel != 0) {
     log.info("Using RoCE traffic_class %d, service level %d\n", trafficClass, serviceLevel);
   }
-  // Local ACK timeout exponent: 4.096us * 2^timeout per attempt (0 = infinite). The default 14 is ~67ms per
-  // attempt, ~0.5s in total with retry_cnt=7 before IBV_WC_RETRY_EXC_ERR (status 12).
-  const int ackTimeout = intEnv("MOODIST_IB_TIMEOUT", 14, 0, 31);
+  // Local ACK timeout exponent (0 = infinite): how long a peer may leave a request unacknowledged before it is
+  // retransmitted, 4.096us * 2^timeout nominally; after retry_cnt=7 retransmissions, IBV_WC_RETRY_EXC_ERR (status
+  // 12), which is fatal (the QPs are never re-established). So this is how long a network outage the job survives.
+  // Measured on ConnectX-8 (firmware 40.48, local_ca_ack_delay 16), from the post to the error: about twice the
+  // nominal time per attempt, and exponents below 16 count as 16: 4.0-4.3 s for any exponent up to 16, 8.0 s for
+  // 17, 16.6 s for 18, about 64 s for 20. The default is NCCL's (20 since NCCL 2.23, 18 since 2.14, 14 before; its
+  // docs: about 30 s): with 14, one direction of a link between two GPUs of a node that dropped everything for over
+  // 4.3 s at startup failed a 64-rank job. Losses that the NIC recovers by itself (adaptive retransmission) do not
+  // wait for this timer.
+  const int ackTimeout = intEnv("MOODIST_IB_TIMEOUT", 20, 0, 31);
 
   IbAddress loopbackAddress;
 

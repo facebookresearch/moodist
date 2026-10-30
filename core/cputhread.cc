@@ -947,7 +947,8 @@ struct CpuThreadImpl {
       for (size_t i = 0; i != 512; ++i) {
         testPtr[512 * rank + i] = rng();
       }
-      size_t remaining = 0;
+      // (shared: after an error, the writes may complete after this function has returned)
+      auto remaining = std::make_shared<size_t>(0);
       for (size_t i = 0; i != size; ++i) {
         if (i == rank) {
           continue;
@@ -956,22 +957,33 @@ struct CpuThreadImpl {
         for (size_t di = 0; di != devices.size(); ++di) {
           auto& dev = devices[di];
           size_t n = 512 / devices.size();
-          ++remaining;
+          ++*remaining;
           writeData(dev, i, testPtr + offset, testMr->mrs[di]->lkey, (uint64_t*)testRemote[i].address + offset,
-              testRemote[i].keys[di], n * 8, makeCallback([&]() {
-                --remaining;
+              testRemote[i].keys[di], n * 8, makeCallback([remaining]() {
+                --*remaining;
               }));
           offset += n;
         }
       }
-      while (remaining && !errorState) {
+      while (*remaining && !errorState) {
         poll();
         timeout.check();
       }
-      if (errorState) {
+      // Every rank takes part in the allgather, with whether it has failed: a rank that skipped it left the others
+      // waiting in it forever (a retry-exceeded error between two ranks of a 64-rank group hung the other 62).
+      // Then every rank is in the error state.
+      std::vector<uint8_t> failed = setupComms->allgather((uint8_t)errorState);
+      std::string failedRanks;
+      for (size_t i = 0; i != size; ++i) {
+        if (failed.at(i)) {
+          failedRanks += fmt::sprintf("%s%zu", failedRanks.empty() ? "" : ", ", i);
+        }
+      }
+      if (!failedRanks.empty()) {
+        log.error("%s: the connection test failed on rank(s) %s\n", groupName(), failedRanks);
+        setErrorState();
         break;
       }
-      setupComms->allgather(0);
       for (size_t i = 0; i != size; ++i) {
         rng.seed(i);
         for (size_t j = 0; j != 512; ++j) {
