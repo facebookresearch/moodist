@@ -750,7 +750,17 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    measurements against the proxy pass.
 
 ### Reductions: next steps
-1. Across NVLink domains (compile phase step 7): with three or more domains with destinations, a reduce-scatter and
+1. TODO, a problem: the scratch tensor of reductions across NVLink domains holds every partial result whole, for the
+   whole op. A reduce-scatter across k domains takes about 2 (k - 1) times a rank's output (7.5 GiB at 256 MiB per
+   rank with 16 domains, and `tuneKernels` allocates it once more), an all-reduce about k / m of the tensor (4 times
+   the tensor with 16 domains of 4 GPUs). It should be bounded, e.g. a ring of part-sized regions per pair of ranks:
+   a region is reused once the executor has combined the part in it, which needs flow control back to the partial
+   rank (the executor's kernel signals its CPU thread, which notifies the partial rank, whose kernel waits for that
+   before it computes into the region again). With the write variant (item 2), a partial rank also knows when its own
+   region is free (once its write has completed), but the executor's regions still need the flow control. The
+   reduce-scatter and all-gather among the executors of an all-reduce across three or more domains (item 2) shrink
+   it too.
+2. Across NVLink domains (compile phase step 7): with three or more domains with destinations, a reduce-scatter and
    an all-gather among the executors of a piece, so that a partial result does not cross the network to every
    destination domain (an all-reduce on 16 domains of 4 GPUs moves 15/4 of the tensor per GPU over RDMA, and is
    2.3 times slower than NCCL at 256 MiB; see Performance notes). Then the write variant: the partial rank writes its
@@ -760,11 +770,11 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    two step value barriers), where a reduction needs only its partial ranks and executors (to be measured). CPU
    tensors (an error): the CPU thread could combine them (`CpuReductions` in cputhread.cc, which the process group's
    CPU reduce-scatter uses).
-2. All-reduce in one domain in two phases, as across domains: an executor computes its piece into its scratch
+3. All-reduce in one domain in two phases, as across domains: an executor computes its piece into its scratch
    tensor, then stores it from there to every destination (an edge that waits for the first one's done signal).
    Across two domains, the two phases took 846 us at 256 MiB, against 937 us for the single pass in one domain of 32
    GPUs (see Performance notes), where NCCL takes 900 us with NVLS.
-3. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
+4. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
    all-reduce, each GPU then sends its input once and receives the result once, (1 + 1/N) times the data instead of
    2 (N - 1) / N for the unicast pieces, about half on 32 ranks: this is where NCCL is faster at 256 MiB (see the
    table under Performance notes). For a reduce-scatter it saves SMs, not bandwidth (each GPU sends its whole input
@@ -774,10 +784,10 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    register load (at most 16 bytes per thread), not a bulk copy. Instruction support on GB300 (ptxas, sm_103a):
    `add` of `f32`, `f16x2`, `bf16x2` (with `.acc::f32`), `f64`, `s32`, `u64`; `min`/`max` of 16-bit floats and
    integers, not of `f32`.
-4. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
+5. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
    ranks). Splitting such cells among the sources (each computing a piece and writing it to the root) would bring
    the root's NVLink ingress from (N - 1) times to about twice the data.
-5. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
+6. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
    parameterized by size (compiling takes 1-2 s, once per size), and `avg` (FSDP2's default `ReduceOp.AVG` is a
    fatal error in moodist's process group reduce-scatter today).
 
