@@ -437,6 +437,11 @@ inline std::pair<size_t, size_t> shareRange(size_t bytes, size_t n, size_t j) {
   return {begin, end - begin};
 }
 
+// The largest edge (CompileOpConstructor::maxEdgeBytes): the kernel's tables hold 32-bit sizes, so larger regions are
+// split into several edges, the parts of their cell (by chunkIndex; see Phase 5 and reductionPieces). A multiple of the
+// page size; MOODIST_COMPILE_OP_MAX_EDGE_BYTES sets another one (tests).
+static constexpr size_t defaultMaxEdgeBytes = 1ull << 30;
+
 struct InternalContext {
   CompileContext& ctx;
 
@@ -908,6 +913,9 @@ struct CompileOpConstructor {
   const size_t rank = group->rank;
   const size_t size = group->size;
 
+  // See defaultMaxEdgeBytes (set in compile)
+  size_t maxEdgeBytes = defaultMaxEdgeBytes;
+
   uint64_t nodeId(uint32_t rank, uint32_t localIndex) {
     return ((uint64_t)(rank + 1) << 32) + localIndex;
   }
@@ -1100,6 +1108,8 @@ struct CompileOpConstructor {
         CHECK(it != edges.end());
         Edge original = std::move(*it);
         edges.erase(it);
+        // (chunkIndex: the chunk within the edge's part of its cell, see maxEdgeBytes)
+        const uint32_t firstChunkIndex = original.chunkIndex * maxTransferChunks;
         for (size_t c : range(numChunks)) {
           size_t offset = chunkBytes * c;
           size_t n = std::min(chunkBytes, bytes - offset);
@@ -1111,7 +1121,7 @@ struct CompileOpConstructor {
             read.destinations[0] = chunkNodes[m][c];
             read.bytes = n;
             read.rdmaSignal = firstSignal + c;
-            read.chunkIndex = c;
+            read.chunkIndex = firstChunkIndex + c;
             edges.push_back(std::move(read));
             Edge relay;
             relay.id = ictx.nextEdgeId();
@@ -1120,7 +1130,7 @@ struct CompileOpConstructor {
             relay.cellIndex = original.cellIndex;
             relay.executorRank = rank;
             relay.rdmaSignal = firstSignal + c;
-            relay.chunkIndex = c;
+            relay.chunkIndex = firstChunkIndex + c;
             edges.push_back(std::move(relay));
           } else {
             Edge copy = original;
@@ -1129,7 +1139,7 @@ struct CompileOpConstructor {
             copy.sources.push_back(chunkNodes[proxyIndex][c]);
             copy.destinations[0] = chunkNodes[m][c];
             copy.bytes = n;
-            copy.chunkIndex = c;
+            copy.chunkIndex = firstChunkIndex + c;
             edges.push_back(std::move(copy));
           }
         }
@@ -1958,21 +1968,17 @@ struct CompileOpConstructor {
         mappedAddrs.push_back(0);
       }
 
+      // The tuning launches use the same tensors: with the parameter buffer, every slot's copy is filled once
+      const KernelHandle& kh = *sources.at(i);
+      if (kh.paramBuffer) {
+        for (uint32_t slot : range(maxConcurrency)) {
+          fillCompileOpParamBuffer(kh, kernels.at(i), stream, slot, tensorAddrs, mappedAddrs, {});
+        }
+      }
       CompileOpCopyParameters params{.stepValue = stepValue, .concurrencyIndex = concurrencyIndex};
-      std::array<void*, 3> kparams = {&params, tensorAddrs.data(), mappedAddrs.data()};
-      CUlaunchConfig launchConfig;
-      CUlaunchAttribute attr;
-      launchConfig.grid = {config.gridSize, 1, 1};
-      launchConfig.block = {config.blockSize, 1, 1};
-      launchConfig.sharedMemBytes = 0;
-      launchConfig.hStream = stream;
-      launchConfig.attrs = &attr;
-      launchConfig.numAttrs = 1;
-      attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
-      attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
 
       auto run = [&]() {
-        CHECK_CU(cuLaunchKernelEx(&launchConfig, kernels.at(i).function, kparams.data(), nullptr));
+        launchCompileOpKernel(kh, kernels.at(i), config, stream, params, tensorAddrs, mappedAddrs, {}, false);
         stepValue += 0x1000;
         concurrencyIndex = (concurrencyIndex + 1) % maxConcurrency;
         params.stepValue = stepValue;
@@ -2166,6 +2172,15 @@ struct CompileOpConstructor {
       phases = agreedEnv("MOODIST_COMPILE_OP_PHASES", "auto");
       REQUIRE(phases == "auto" || phases == "1" || phases == "2",
           "compile_op: MOODIST_COMPILE_OP_PHASES must be auto, 1 or 2 (not '%s')", phases);
+    }
+    if (std::string value = agreedEnv("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", ""); !value.empty()) {
+      const bool digits = value.size() <= 10 && std::ranges::all_of(value, [](char c) {
+        return c >= '0' && c <= '9';
+      });
+      maxEdgeBytes = digits ? std::stoull(value) : 0;
+      REQUIRE(maxEdgeBytes >= 4096 && maxEdgeBytes % 4096 == 0 && maxEdgeBytes <= (1ull << 31),
+          "compile_op: MOODIST_COMPILE_OP_MAX_EDGE_BYTES must be a multiple of 4096 from 4096 to 2 GiB (not '%s')",
+          value);
     }
 
     // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
@@ -2454,6 +2469,8 @@ struct CompileOpConstructor {
           size_t numParts = std::min(maxParts, (end - begin) / minPartBytes);
           partBytes = ((end - begin + numParts - 1) / numParts + 4095) / 4096 * 4096;
         }
+        // (more parts where they would exceed maxEdgeBytes)
+        partBytes = std::min(partBytes, maxEdgeBytes);
         for (size_t offset = begin; offset < end; offset += partBytes) {
           piece.offset = offset;
           piece.bytes = std::min(partBytes, end - offset);
@@ -2903,7 +2920,6 @@ struct CompileOpConstructor {
       // Compute bytes
       size_t bytes = itemsize * numel(resp.requestShape);
 
-      Edge edge;
       Node source;
       Node destination;
 
@@ -2921,11 +2937,6 @@ struct CompileOpConstructor {
       destination.filled = false;
       destination.device = out.device;
 
-      edge.bytes = bytes;
-      edge.cellIndex = resp.cellIndex;
-      edge.id = ictx.nextEdgeId();
-      edge.executorRank = rank;
-
       if (!outputContiguous) {
         destination.tensorIndex =
             myInputIndices.size() + inputCopies.size() + outputsPerRank[rank].size() + outputCopyList.size();
@@ -2938,10 +2949,20 @@ struct CompileOpConstructor {
         outputCopyList.push_back(std::move(oc));
       }
 
-      edge.sources.push_back(source);
-      edge.destinations.push_back(destination);
-
-      edges.push_back(std::move(edge));
+      // An edge per part of at most maxEdgeBytes, with the part's index as its chunkIndex
+      for (size_t offset = 0, part = 0; offset == 0 || offset < bytes; offset += maxEdgeBytes, ++part) {
+        Edge edge;
+        edge.bytes = std::min(maxEdgeBytes, bytes - offset);
+        edge.cellIndex = resp.cellIndex;
+        edge.chunkIndex = part;
+        edge.id = ictx.nextEdgeId();
+        edge.executorRank = rank;
+        edge.sources.push_back(source);
+        edge.sources.back().offset += offset;
+        edge.destinations.push_back(destination);
+        edge.destinations.back().offset += offset;
+        edges.push_back(std::move(edge));
+      }
     }
 
     // Reduced cells: an edge per piece (see reductionPieces), with every source, executed by the piece's executor

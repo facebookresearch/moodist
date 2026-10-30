@@ -54,6 +54,8 @@ struct CompiledModule {
 struct CompiledKernel {
   CompiledModule module;
   CUfunction function = nullptr;
+  // The module's compile_op_params kernel, if it has one (see generateKernel)
+  CUfunction paramsFunction = nullptr;
 
   CompiledKernel() = default;
   CompiledKernel(CompiledKernel&&) = default;

@@ -3627,19 +3627,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
 
     CompileOpCopyParameters params{
         .stepValue = stepValue, .concurrencyIndex = concurrencyIndex, .nvlsCounterBase = nvlsCounterBase};
-    std::array<void*, 4> kparams = {&params, tensorAddrs.data(), mappedAddrs.data(), nvlsTensors.data()};
-    CUlaunchConfig launchConfig;
-    CUlaunchAttribute attr;
-    std::memset(&launchConfig, 0, sizeof(launchConfig));
-    launchConfig.grid = {op->config.gridSize, 1, 1};
-    launchConfig.block = {op->config.blockSize, 1, 1};
-    launchConfig.sharedMemBytes = 0;
-    launchConfig.hStream = stream;
-    launchConfig.attrs = &attr;
-    launchConfig.numAttrs = 1;
-    attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
-    attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
-    CHECK_CU(cuLaunchKernelEx(&launchConfig, op->kernel->function, kparams.data(), nullptr));
+    // (with the parameter buffer, the slot's copy is filled first: the slot's previous op, whose kernel read it, is
+    // done on the GPU before this one starts, see slotSerializer)
+    launchCompileOpKernel(
+        *op->kernelHandle, *op->kernel, op->config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
 
     if (op->kernelHandle->profilingBytesPerThread != 0) {
       if (op->kernelHandle->profilingCountdown-- == 0) {

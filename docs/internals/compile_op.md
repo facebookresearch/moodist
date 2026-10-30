@@ -75,7 +75,10 @@ Every step is collective: all ranks of the group take part (through per-rank que
 6. **Phase 5**: the output's rank creates one edge per cell, executed by itself: the source is the input (or
    input copy) node, the destination its output node, or an output copy if the piece is not contiguous in the
    output. A reduced cell gets an edge per piece instead, with all the sources (in rank order) and the piece's
-   executor. Then the ranks exchange node ids.
+   executor. No edge is larger than 1 GiB (the kernel's tables hold 32-bit sizes): a larger cell becomes an edge
+   per part of 1 GiB, and a larger piece several parts (in `reductionPieces`), the part's index being the edge's
+   `chunkIndex` (the proxy pass numbers its chunks within the part's, and the ring graphs chain each part
+   separately). Then the ranks exchange node ids.
 7. **Reductions** (`mergeReductions`, `crossDomainReductions`): the edges of a piece of a reduced cell, one built
    by each destination rank of the cell (they have the same sources and the same executor), are merged into one
    edge with every destination, executed by that rank. Its sources start at the executor's own (if any) and continue
@@ -245,7 +248,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
 
 One kernel per op and rank: `compile_op_copy(params {stepValue, concurrencyIndex}, tensorAddrs[], mappedAddrs[])`,
 launched in the remote memory synchronization domain. Tensor addresses are kernel arguments, so a compiled op runs
-on new tensors at every call.
+on new tensors at every call. Kernel parameters are limited to 32764 bytes, which about 4000 tensors and (tensor,
+peer) mappings fill (e.g. an all-gather of 1400 tensors on 2 ranks): an op whose address arrays could exceed 32000
+bytes (counting NVLS's) has them in a global array of its module instead, with a copy per concurrency slot, and the
+module's second kernel, `compile_op_params`, copies them there from its own parameters (31 KiB per launch) before
+every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot run one after the other on the GPU
+(customOp), so the copy stays until the kernel has read it; tuning fills every slot's copy once per candidate.
 
 - **Buffers** (device memory, one slot per concurrency index, mapped by all kernel peers; cached per group and
   reused by later ops): `addresses` (peer tensor addresses, per block), `syncs` (exit sync, one row per block),
@@ -267,7 +275,8 @@ on new tensors at every call.
 - **Tables**: the edges a rank executes are described by tables in one initialized global array of the module:
   edge setups (flags, source, bytes, destinations, signals), node setups (tensor slot and offset), signal setups
   (`depFilled` slots to write when an edge is done) and the address exchange setups. The kernel loops over them at
-  runtime, so its code size does not depend on the number of edges (edges are limited to 4 GiB each).
+  runtime, so its code size does not depend on the number of edges (they hold 32-bit sizes: compile_op makes no
+  edge larger than 1 GiB, see Phase 5).
 - **Scheduling**: a rank executes the edges whose executor it is. If no edge waits (all sources filled, no relay
   edges), every block first resolves the addresses of all edges into a table in shared memory (in global memory if
   it exceeds 32 KiB), and the pipelines of all blocks then take items from one sequence: an item is a chunk of an
@@ -434,6 +443,10 @@ on new tensors at every call.
   instead of as the cost model picks (`auto`, the default; see compile phase step 7). Same on all ranks.
 - `MOODIST_COMPILE_OP_PHASES=1|2` - reductions in one NVLink domain in one pass, or in two phases (pieces of any
   size), instead of as tuning picks (`auto`, the default; see compile phase step 11). Same on all ranks.
+- `MOODIST_COMPILE_OP_MAX_EDGE_BYTES=N` - the largest edge (a multiple of 4096 up to 2 GiB; by default 1 GiB, see
+  Phase 5), for tests: small values split regions into many edges. Same on all ranks.
+- `MOODIST_COMPILE_OP_PARAM_BUFFER=1` - the kernel takes its address arrays from its parameter buffer, as ops too
+  large for kernel parameters do (see The kernel), for tests.
 - `MOODIST_IB_TIMEOUT` - the RDMA transport's ACK timeout exponent (not specific to compile_op; default 20, as
   NCCL's: on ConnectX-8, about 64 s of an unanswered request before the error that ends the job; see ib_common.cc).
 
@@ -723,11 +736,6 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   timing rather than on PCIe ordering (the read may have gone through another NIC, and MRs allow relaxed
   ordering); the all-gather's chunk signals do the same. A flush (a small RDMA read of the destination through
   the NIC of the read, before the signal) would make it explicit.
-- The kernel takes the tensor addresses (and the addresses at which peers map them) as kernel parameters, which are
-  limited to 32 KB: an op fails to JIT with about 4000 (tensor, peer) mappings (e.g. 1024 input tensors on 4
-  ranks). Passing them in a device buffer would lift the limit.
-- Kernel edges must be smaller than 4 GiB (32-bit sizes in the kernel's tables; checked). Splitting larger pieces
-  into several edges when the edges are created would lift the limit.
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
   or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
   instructions, so a plain target would do.

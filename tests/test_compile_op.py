@@ -11,6 +11,9 @@ moodist's CPU allocator), and CUDA transfers between NVLink peers use sizes and 
 16 bytes. Tests run on both CPU and CUDA via @test_cpu_cuda decorator.
 """
 
+import contextlib
+import os
+
 import torch
 import moodist
 from moodist import TensorRegion
@@ -19,6 +22,28 @@ from framework import TestContext, test_cpu_cuda, test_devices, create_process_g
 # compile_op takes CPU tensors from moodist's CPU allocator and CUDA tensors from its CUDA allocator
 moodist.enable_cpu_allocator()
 moodist.enable_cuda_allocator()
+
+
+@contextlib.contextmanager
+def environment(name, value):
+    """The environment variable `name` set to `value` (on every rank: compile_op checks that they agree)."""
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+def all_ranks_ok(ctx, pg, ok, message):
+    """Asserts on every rank that every rank is ok (a rank that raised alone would leave the others waiting)."""
+    flags = torch.zeros(ctx.world_size, dtype=torch.int32, device="cuda")
+    pg._allgather_base(flags, torch.tensor([int(ok)], dtype=torch.int32, device="cuda")).wait()
+    bad = [r for r, f in enumerate(flags.tolist()) if not f]
+    ctx.assert_true(not bad, f"{message} (ranks {bad[:16]})")
 
 
 @test_cpu_cuda
@@ -667,6 +692,136 @@ def test_compile_op_errors_on_all_ranks(ctx: TestContext, device: str):
     op([x], [out]).wait()
     expected = torch.cat([torch.arange(k, dtype=dtype, device=device) + 100 * r for r in range(n)])
     ctx.assert_true(torch.equal(out, expected), f"rank {ctx.rank}: got {out.tolist()}")
+
+
+def check_all_gather(ctx, pg, k, device, graphs=None, salt=0):
+    """All-gather of k float32 elements per rank (1-D), with values that differ per rank and position: whether every
+    rank's output is right."""
+    n = ctx.world_size
+    dtype = torch.float32
+    region = [TensorRegion(offset=[ctx.rank * k], shape=[k], device=device)]
+    whole = [TensorRegion(offset=[0], shape=[n * k], device=device)]
+    if graphs:
+        with environment("MOODIST_COMPILE_OP_GRAPHS", graphs):
+            op = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=whole)
+    else:
+        op = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=whole)
+    # (exact in float32: below 2^24)
+    x = (torch.arange(k, dtype=torch.int64, device=device) * 7 + ctx.rank * 1000003 + salt) % 16777213
+    out = torch.zeros(n * k, dtype=dtype, device=device)
+    op([x.to(dtype)], [out]).wait()
+    expected = torch.cat(
+        [(torch.arange(k, dtype=torch.int64, device=device) * 7 + r * 1000003 + salt) % 16777213 for r in range(n)]
+    )
+    return torch.equal(out, expected.to(dtype))
+
+
+@test_devices("cuda")
+def test_compile_op_many_tensors(ctx: TestContext, device: str):
+    """An all-gather of so many tensors (one tensor_id each) that the addresses a rank's kernel takes, of its tensors
+    and of the peers' mappings of its outputs, need more than the 32764 bytes of kernel parameters (with all ranks in
+    one NVLink domain): they go through the kernel's parameter buffer. Run twice, with other output tensors the second
+    time (the buffer is filled anew for every launch). Then a small op with the parameter buffer forced
+    (MOODIST_COMPILE_OP_PARAM_BUFFER=1)."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    k = 4  # 16 bytes per rank and tensor
+    num = max(64, 4200 // (n + 1) + 1)
+    dtype = torch.float32
+    inputs = [TensorRegion(offset=[ctx.rank * k], shape=[k], device=device, tensor_id=str(t)) for t in range(num)]
+    outputs = [TensorRegion(offset=[0], shape=[n * k], device=device, tensor_id=str(t)) for t in range(num)]
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+
+    def values(t, r):
+        return torch.arange(k, dtype=dtype, device=device) + t * 1024 + r * 8
+
+    xs = [values(t, ctx.rank) for t in range(num)]
+    expected = [torch.cat([values(t, r) for r in range(n)]) for t in range(num)]
+    ok = True
+    for run in range(2):
+        outs = [torch.zeros(n * k, dtype=dtype, device=device) for _ in range(num)]
+        op(xs, outs).wait()
+        ok &= all(torch.equal(o, e) for o, e in zip(outs, expected))
+    all_ranks_ok(ctx, pg, ok, f"all-gather of {num} tensors: wrong outputs")
+
+    with environment("MOODIST_COMPILE_OP_PARAM_BUFFER", "1"):
+        ok = check_all_gather(ctx, pg, 1 << 16, device)
+    all_ranks_ok(ctx, pg, ok, "all-gather with the parameter buffer forced: wrong outputs")
+
+
+@test_devices("cuda")
+def test_compile_op_small_edges(ctx: TestContext, device: str):
+    """Regions split into several edges (MOODIST_COMPILE_OP_MAX_EDGE_BYTES; by default 1 GiB, as the kernel's tables
+    hold 32-bit sizes): with 4 KiB edges, an all-gather of 64 KiB + 16 bytes per rank (the last edge smaller) and one
+    of columns (not contiguous in the output: through an output copy); with 8 MiB edges, an all-gather of 16 MiB + 64
+    KiB per rank in every graph variant (across nodes: the transfers of the parts are proxied, in chunks)."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    dtype = torch.float32
+    with environment("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", "4096"):
+        ok = check_all_gather(ctx, pg, (1 << 14) + 4, device)
+        all_ranks_ok(ctx, pg, ok, "all-gather in 4 KiB edges: wrong outputs")
+
+        rows, c = 8, 1028
+        region = [TensorRegion(offset=[0, ctx.rank * c], shape=[rows, c], device=device)]
+        whole = [TensorRegion(offset=[0, 0], shape=[rows, n * c], device=device)]
+        op = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=whole)
+
+        def block(r):
+            i = torch.arange(rows, dtype=dtype, device=device).view(rows, 1)
+            j = torch.arange(c, dtype=dtype, device=device).view(1, c)
+            return r * 100000 + i * 2000 + j
+
+        out = torch.zeros(rows, n * c, dtype=dtype, device=device)
+        op([block(ctx.rank)], [out]).wait()
+        expected = torch.cat([block(r) for r in range(n)], dim=1)
+        all_ranks_ok(ctx, pg, torch.equal(out, expected), "all-gather of columns in 4 KiB edges: wrong outputs")
+
+    with environment("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", str(8 << 20)):
+        k = (4 << 20) + (16 << 10)
+        ok = check_all_gather(ctx, pg, k, device, graphs="multicast,read,ring_read,ring_write", salt=5)
+        all_ranks_ok(ctx, pg, ok, "all-gather in 8 MiB edges: wrong outputs")
+
+
+@test_devices("cuda")
+def test_compile_op_large_edge(ctx: TestContext, device: str):
+    """A copy of 4 GiB + 64 KiB from rank 0 to rank 1: more than the kernel's tables can hold in one edge (32-bit
+    sizes), so compile_op splits it into edges of at most 1 GiB. Skipped without enough free GPU memory (the op, the
+    tuning's copies of its tensors and the check need about 16 GiB on rank 1)."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n_elem = (1 << 30) + (16 << 10)  # int32
+    free = torch.cuda.mem_get_info()[0]
+    enough = torch.tensor([int(free >= 20 << 30)], dtype=torch.int32, device=device)
+    everyone = torch.zeros(ctx.world_size, dtype=torch.int32, device=device)
+    pg._allgather_base(everyone, enough).wait()
+    if not bool(everyone[:2].all()):
+        if ctx.rank == 0:
+            ctx.log("skipped: not enough free GPU memory")
+        return
+    dtype = torch.int32
+    inputs = [TensorRegion(offset=[0], shape=[n_elem], device=device)] if ctx.rank == 0 else None
+    outputs = [TensorRegion(offset=[0], shape=[n_elem], device=device)] if ctx.rank == 1 else None
+    op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs)
+    ok = True
+    if ctx.rank == 0:
+        x = torch.arange(n_elem, dtype=dtype, device=device)
+        op([x], []).wait()
+        del x
+    elif ctx.rank == 1:
+        out = torch.zeros(n_elem, dtype=dtype, device=device)
+        op([], [out]).wait()
+        ok = torch.equal(out, torch.arange(n_elem, dtype=dtype, device=device))
+        del out
+    else:
+        op([], []).wait()
+    torch.cuda.synchronize()
+    all_ranks_ok(ctx, pg, ok, "copy of 4 GiB + 64 KiB: wrong output")
 
 
 @test_devices("cuda")

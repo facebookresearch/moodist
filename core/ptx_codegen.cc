@@ -32,6 +32,11 @@ const char* computeTarget(int computeMajor, int computeMinor) {
   return "sm_60";
 }
 
+// compile_op_params (see paramBuffer in generateKernel): the words one launch copies (its second parameter, 31 KiB),
+// and its block size
+static constexpr uint32_t paramFillWords = 3968;
+static constexpr uint32_t paramFillBlockSize = 256;
+
 // The reduce loop's shared memory (see generateKernel): 2 to reduceMaxStages stages of chunkSize bytes with an mbarrier
 // each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), and 256 bytes
 // of alignment padding
@@ -431,13 +436,32 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
   auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
   auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
 
+  // The address arrays: the tensor addresses (8 bytes per tensor), the addresses at which the peers map this rank's
+  // tensors (8 per mapping) and, with NVLS, the tensors' identities and multicast addresses (16 per tensor). Kernel
+  // parameters are limited to 32764 bytes (an op with about 4000 tensor-peer mappings did not JIT), so an op whose
+  // arrays could exceed paramBufferMinBytes (counting the NVLS words, decided further below) has them in a buffer
+  // instead: a global array of the module with a copy per concurrency slot, which the module's second kernel,
+  // compile_op_params, fills from its own parameters before each launch (launchCompileOpKernel). A slot's ops are
+  // serialized on the GPU (customOp), so a launch's copy stays until its kernel has read it. MOODIST_COMPILE_OP_
+  // PARAM_BUFFER=1 uses the buffer for every op (tests).
+  static constexpr size_t paramBufferMinBytes = 32000;
+  const size_t numTensorWords = std::max(graph.tensors.size(), (size_t)1);
+  const size_t numMappingWords = std::max(graph.remoteCudaTensorMappings.size(), (size_t)1);
+  const char* forceParamBuffer = std::getenv("MOODIST_COMPILE_OP_PARAM_BUFFER");
+  const bool paramBuffer =
+      sizeof(CompileOpCopyParameters) + 8 * (numTensorWords + numMappingWords) + 16 * numTensorWords >
+          paramBufferMinBytes ||
+      (forceParamBuffer && std::string_view(forceParamBuffer) == "1");
+
   auto* fn = mod.newFunction("compile_op_copy");
   {
     FunctionScope fnScope(fn);
     fn->maxThreads = blockSize;
     fn->addParamBytes(8, sizeof(CompileOpCopyParameters));
-    fn->addParamBytes(8, sizeof(uint64_t) * std::max(graph.tensors.size(), (size_t)1));
-    fn->addParamBytes(8, sizeof(uint64_t) * std::max(graph.remoteCudaTensorMappings.size(), (size_t)1));
+    if (!paramBuffer) {
+      fn->addParamBytes(8, sizeof(uint64_t) * numTensorWords);
+      fn->addParamBytes(8, sizeof(uint64_t) * numMappingWords);
+    }
 
     activateNewBlock("entry");
 
@@ -446,9 +470,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 stepValue = loadParamField(params, 0, ValType::U32);
     u32 concurrencyIndex = loadParamField(params, 4, ValType::U32);
     static_assert(offsetof(CompileOpCopyParameters, nvlsCounterBase) == 8);
-
-    u32 inputAddrs = paramBase(1);
-    u32 mappedAddrs = paramBase(2);
 
     u32 threadIndex = threadIdx_x();
     u32 blockIndex = blockIdx_x();
@@ -824,13 +845,37 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // In NVLS ops, every rank publishes, besides the address at which a peer maps one of its tensors (the address
     // exchange below), where the tensor is in the group's multicast objects (its "NVLS identity", see nvlsIdentity
     // in processgroup.cc), into a table of the peer's with the layout of the address table. customOp passes the
-    // identities of the rank's tensors and their multicast addresses in a fourth kernel parameter: per tensor, 8
-    // bytes of identity (0 if none), then 8 bytes of multicast address (0 if none).
+    // identities of the rank's tensors and their multicast addresses in a fourth kernel parameter (or in the parameter
+    // buffer): per tensor, 8 bytes of identity (0 if none), then 8 bytes of multicast address (0 if none).
     std::optional<KernelMappedBuffers> nvlsIds;
     if (nvlsOp) {
       nvlsIds.emplace(map("nvlsids", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks));
-      fn->addParamBytes(8, 16 * std::max(graph.tensors.size(), (size_t)1));
+      if (!paramBuffer) {
+        fn->addParamBytes(8, 16 * numTensorWords);
+      }
     }
+
+    // A word of the address arrays (see paramBuffer above): array 1 (tensor addresses), 2 (the peers' mappings) or 3
+    // (NVLS words), at a byte offset. The parameter buffer holds the copies of all concurrency slots, each with the
+    // three arrays in this order.
+    u64 paramBufferAddr;
+    if (paramBuffer) {
+      rv->paramBuffer = true;
+      rv->paramMappingsOffset = 8 * numTensorWords;
+      rv->paramNvlsOffset = rv->paramMappingsOffset + 8 * numMappingWords;
+      rv->paramBufferStride = rv->paramNvlsOffset + (nvlsOp ? 16 * numTensorWords : 0);
+      CHECK((size_t)rv->paramBufferStride * maxConcurrency < (1ull << 31));
+      paramBufferAddr = addGlobalVar(16, rv->paramBufferStride * maxConcurrency, "params") +
+                        widen(concurrencyIndex * rv->paramBufferStride);
+    }
+    auto ldArrayWord = [&](int array, const u32& offset) -> u64 {
+      CHECK(array >= 1 && array <= 3);
+      if (paramBuffer) {
+        const uint32_t base = array == 1 ? 0 : array == 2 ? rv->paramMappingsOffset : rv->paramNvlsOffset;
+        return ld_global_nc_u64(paramBufferAddr + widen(offset + base));
+      }
+      return ld_param_u64(paramBase(array) + offset, 0);
+    };
 
     auto nodeSetup = [&](const Node& n) {
       NodeSetup s;
@@ -1226,15 +1271,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u32 stride = predicated(pred, ld_global_nc_u32)(caddr + 16);
       u32 slot = predicated(pred, ld_global_nc_u32)(caddr + 20);
       u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
-      predicated(pred, st_global_relaxed_sys_u64)(
-          addr, predicated(pred, ld_param_u64)(mappedAddrs + paramOffset, 0) | parityTag);
+      predicated(pred, st_global_relaxed_sys_u64)(addr, predicated(pred, [&](const u32& o) {
+        return ldArrayWord(2, o);
+      })(paramOffset) | parityTag);
       if (nvlsIds) {
         u64 idBase = predicated(pred, ld_global_nc_u64)(caddr + 24);
         u32 idItembytes = predicated(pred, ld_global_nc_u32)(caddr + 32);
         u32 idParamOffset = predicated(pred, ld_global_nc_u32)(caddr + 36);
         u64 idAddr = idBase + widen(idItembytes * concurrencyIndex + slot + stride * blockIndex);
-        predicated(pred, st_global_relaxed_sys_u64)(
-            idAddr, predicated(pred, ld_param_u64)(paramBase(3) + idParamOffset, 0) | parityTag);
+        predicated(pred, st_global_relaxed_sys_u64)(idAddr, predicated(pred, [&](const u32& o) {
+          return ldArrayWord(3, o);
+        })(idParamOffset) | parityTag);
       }
     }
 
@@ -1252,7 +1299,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     auto nodeaddr = [&](const u32& slot, const u32& offsetlo, const u32& offsethi) {
       u64 r;
       IF_D((slot & 1) != 0) {
-        r = ld_param_u64(inputAddrs + (slot & ~3u), 0);
+        r = ldArrayWord(1, slot & ~3u);
       }
       ELSE {
         u64 gaddr = addrAddrsLocalBase + widen(slot);
@@ -1273,7 +1320,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u64 r;
       Value done = !pred;
       Value isParam = (slot & 1) != 0;
-      r = predicated(!done & isParam, ld_param_u64)(inputAddrs + (slot & ~3u), 0);
+      r = predicated(!done & isParam, [&](const u32& o) {
+        return ldArrayWord(1, o);
+      })(slot & ~3u);
       done |= isParam;
       u64 gaddr = addrAddrsLocalBase + widen(slot);
       r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
@@ -1498,7 +1547,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           // An NVLS slot (the local destination's setup, slot = 8 * tensorIndex | 3): the destination through the
           // multicast address of its tensor, if it has one, else 0
           Value isNvls = valid & ((slot & 2) != 0);
-          u64 mcTensor = predicated(isNvls, ld_param_u64)(paramBase(3) + (slot & ~3u) * 2 + 8, 0);
+          u64 mcTensor = predicated(isNvls, [&](const u32& o) {
+            return ldArrayWord(3, o);
+          })((slot & ~3u) * 2 + 8);
           u64 mcAddr = selp_u64(mcTensor + (widen(offsetLow) | (widen(offsetHigh) << 32)), 0, mcTensor != 0);
           addr = selp_u64(mcAddr, addr, isNvls);
         }
@@ -1535,7 +1586,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 nvlsSlot = addrSlot + 1 + numDestinations;
           u64 nvlsAddr = ld_u64(table + widen(nvlsSlot * 8));
           u32 localSlot = ld_global_nc_u32(tables + pipeAddrSetupOffset + widen(nvlsSlot * sizeof(NodeSetup)));
-          u64 identity = ld_param_u64(paramBase(3) + (localSlot & ~3u) * 2, 0);
+          u64 identity = ldArrayWord(3, (localSlot & ~3u) * 2);
           Value ok = (nvlsAddr != 0) & (identity != 0);
           FOR(u32 d0 = 0, d0 < numDestinations, d0 += 32) {
             u32 d = d0 + laneIndex;
@@ -2342,9 +2393,82 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     ret();
   }
 
+  // compile_op_params (see paramBuffer above): copies the first `words` words of its second parameter to the copy of
+  // concurrency slot `slot` in the parameter buffer, from word `first` of the copy on
+  if (paramBuffer) {
+    auto* pf = mod.newFunction("compile_op_params");
+    FunctionScope pfScope(pf);
+    pf->maxThreads = paramFillBlockSize;
+    pf->addParamBytes(8, 16); // slot, first, words (uint32_t each)
+    pf->addParamBytes(8, 8 * paramFillWords);
+    activateNewBlock("entry");
+    u32 header = paramBase(0);
+    u32 slot = loadParamField(header, 0, ValType::U32);
+    u32 first = loadParamField(header, 4, ValType::U32);
+    u32 words = loadParamField(header, 8, ValType::U32);
+    u32 i = blockIdx_x() * paramFillBlockSize + threadIdx_x();
+    IF_D(i < words) {
+      u64 v = ld_param_u64(paramBase(1) + i * 8, 0);
+      st_global_u64(globalAddr("global_params") + widen(slot * rv->paramBufferStride + (first + i) * 8), v);
+    }
+    ret();
+  }
+
   std::string ptx = mod.finalize();
   rv->ptx = ptx;
   return rv;
+}
+
+void fillCompileOpParamBuffer(const KernelHandle& kh, const CompiledKernel& kernel, CUstream stream, uint32_t slot,
+    std::span<const uintptr_t> tensorAddrs, std::span<const uintptr_t> mappedAddrs,
+    std::span<const uint64_t> nvlsTensors) {
+  CHECK(kh.paramBuffer && kernel.paramsFunction != nullptr && slot < maxConcurrency);
+  CHECK(8 * tensorAddrs.size() <= kh.paramMappingsOffset);
+  CHECK(kh.paramMappingsOffset + 8 * mappedAddrs.size() <= kh.paramNvlsOffset);
+  CHECK(kh.paramNvlsOffset + 8 * nvlsTensors.size() <= kh.paramBufferStride);
+  std::vector<uint64_t> words(kh.paramBufferStride / 8);
+  std::ranges::copy(tensorAddrs, words.begin());
+  std::ranges::copy(mappedAddrs, words.begin() + kh.paramMappingsOffset / 8);
+  std::ranges::copy(nvlsTensors, words.begin() + kh.paramNvlsOffset / 8);
+  // (the launch copies its parameters, so the arrays can be reused at once)
+  struct Header {
+    uint32_t slot;
+    uint32_t first;
+    uint32_t words;
+    uint32_t pad;
+  };
+  static_assert(sizeof(Header) == 16);
+  std::vector<uint64_t> data(paramFillWords);
+  for (size_t first = 0; first < words.size(); first += paramFillWords) {
+    Header header = {slot, (uint32_t)first, (uint32_t)std::min<size_t>(paramFillWords, words.size() - first), 0};
+    std::copy_n(words.begin() + first, header.words, data.begin());
+    std::array<void*, 2> args = {&header, data.data()};
+    CHECK_CU(cuLaunchKernel(kernel.paramsFunction, (header.words + paramFillBlockSize - 1) / paramFillBlockSize, 1, 1,
+        paramFillBlockSize, 1, 1, 0, stream, args.data(), nullptr));
+  }
+}
+
+void launchCompileOpKernel(const KernelHandle& kh, const CompiledKernel& kernel, const KernelConfig& config,
+    CUstream stream, const CompileOpCopyParameters& params, std::span<const uintptr_t> tensorAddrs,
+    std::span<const uintptr_t> mappedAddrs, std::span<const uint64_t> nvlsTensors, bool fill) {
+  if (kh.paramBuffer && fill) {
+    fillCompileOpParamBuffer(kh, kernel, stream, params.concurrencyIndex, tensorAddrs, mappedAddrs, nvlsTensors);
+  }
+  // (with the parameter buffer, the kernel takes params only; without NVLS, it takes no NVLS words)
+  CompileOpCopyParameters p = params;
+  std::array<void*, 4> kparams = {&p, (void*)tensorAddrs.data(), (void*)mappedAddrs.data(), (void*)nvlsTensors.data()};
+  CUlaunchConfig launchConfig;
+  CUlaunchAttribute attr;
+  std::memset(&launchConfig, 0, sizeof(launchConfig));
+  launchConfig.grid = {config.gridSize, 1, 1};
+  launchConfig.block = {config.blockSize, 1, 1};
+  launchConfig.sharedMemBytes = 0;
+  launchConfig.hStream = stream;
+  launchConfig.attrs = &attr;
+  launchConfig.numAttrs = 1;
+  attr.id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN;
+  attr.value.value = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE;
+  CHECK_CU(cuLaunchKernelEx(&launchConfig, kernel.function, kparams.data(), nullptr));
 }
 
 } // namespace moodist

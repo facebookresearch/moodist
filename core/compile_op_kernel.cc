@@ -56,6 +56,9 @@ CompiledKernel compileKernelPtx(const std::string& ptx, const char* functionName
     CHECK_CU(jitErr);
   }
   CHECK_CU(cuModuleGetFunction(&result.function, result.module.module, functionName));
+  if (ptx.find(".entry compile_op_params(") != std::string::npos) {
+    CHECK_CU(cuModuleGetFunction(&result.paramsFunction, result.module.module, "compile_op_params"));
+  }
 
   int numRegs = 0;
   CHECK_CU(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, result.function));

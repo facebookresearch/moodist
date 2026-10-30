@@ -383,6 +383,26 @@ def test_all_reduce_two_phases(ctx: TestContext):
         run_reduce(ctx, pg, "sum", torch.float32, spec)
 
 
+@test
+def test_reduce_small_edges(ctx: TestContext):
+    """Regions split into many edges (MOODIST_COMPILE_OP_MAX_EDGE_BYTES=4096; by default 1 GiB, as the kernel's tables
+    hold 32-bit sizes): the pieces of reductions become several parts. Reduce-scatter, all-reduce, in place, and in two
+    rounds."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    with environment("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", "4096"):
+        for numel in [8, 20000]:
+            spec = {"0": ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])}
+            run_reduce(ctx, pg, "sum", torch.float32, spec)
+        numel = 100000
+        whole = [((0,), (numel,))]
+        spec = {"0": ([numel], [whole] * n, [whole] * n)}
+        run_reduce(ctx, pg, "avg", torch.bfloat16, spec)
+        run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=2)
+        with environment("MOODIST_COMPILE_OP_ROUNDS", "2"):
+            run_reduce(ctx, pg, "sum", torch.float32, spec)
+
+
 def node_local_ranks(ctx, pg):
     """Every rank's index among the ranks on its node, in rank order (as moodist numbers them)."""
     host = torch.tensor([zlib.crc32(socket.gethostname().encode())], dtype=torch.int64, device="cuda")
