@@ -1033,13 +1033,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         CHECK(e.partialSources <= e.sources.size());
         p.inputSources = e.sources.size() - e.partialSources;
         p.divisor = e.divisor != 0 ? e.divisor : e.sources.size();
-        if (!e.sourceSignals.empty() || !e.sourceDoneSignals.empty()) {
+        // (the tuning launches run without the CPU thread: they do not wait for its RDMA reads, but for the done
+        // signals of their own edges, which they write as the op's launches do; tuneKernels resets cpuInBuffer before
+        // and after them)
+        if (!e.sourceDoneSignals.empty() || (!e.sourceSignals.empty() && !tuning)) {
           CHECK(e.sourceSignals.empty() || e.sourceSignals.size() == e.sources.size());
           CHECK(e.sourceDoneSignals.empty() || e.sourceDoneSignals.size() == e.sources.size());
           p.flags |= edgeSourceWaits;
           p.waits = pipeWaits.size();
           for (size_t s : indices(e.sources)) {
-            const int32_t signal = e.sourceSignals.empty() ? -1 : e.sourceSignals[s];
+            const int32_t signal = e.sourceSignals.empty() || tuning ? -1 : e.sourceSignals[s];
             const int32_t doneSignal = e.sourceDoneSignals.empty() ? -1 : e.sourceDoneSignals[s];
             CHECK(signal < 0 || doneSignal < 0);
             CHECK((uint32_t)doneSignal + 1 < waitDoneSignal);
@@ -1901,14 +1904,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
         u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
 
-        // Reductions across NVLink domains (not in the tuning launches, which run without the CPU thread): sources
-        // that the CPU thread reads from other domains, and partial results that it sends to them, or that this
-        // kernel combines itself (see crossDomainReductions in compile_op.cc)
+        // Reductions across NVLink domains: sources that the CPU thread reads from other domains (not in the tuning
+        // launches, which run without the CPU thread), and partial results that it sends to them, or that this kernel
+        // combines itself (see crossDomainReductions in compile_op.cc); in one domain in two phases, the pieces that
+        // this kernel computes into its scratch tensor and then copies to their destinations (see twoPhaseReductions
+        // in compile_op.cc)
         bool anyWaits = false;
         bool anyDoneSignals = false;
         for (const PipeEdge& p : pipeEdges) {
-          anyWaits |= !tuning && (p.flags & edgeSourceWaits) != 0;
-          anyDoneSignals |= !tuning && (p.flags & edgeDoneSignal) != 0;
+          anyWaits |= (p.flags & edgeSourceWaits) != 0;
+          anyDoneSignals |= (p.flags & edgeDoneSignal) != 0;
         }
         // Per concurrency slot and edge: the items of a partial result stored so far
         std::optional<u64> partialDone;

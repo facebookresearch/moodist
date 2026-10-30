@@ -1711,6 +1711,79 @@ struct CompileOpConstructor {
     return "";
   }
 
+  // Reductions in one NVLink domain in two phases (a graph variant for tuneKernels, see compile): an edge of this
+  // rank's that combines several sources into several destinations (a piece of an all-reduce), and that does not
+  // take part in a reduction across domains, becomes an edge that computes the piece into a region of the scratch
+  // tensor, with a done signal, and an edge that copies it from there (as stored) to the destinations once that is
+  // set (Edge::sourceDoneSignals): the kernel computes all such pieces before it copies any (see generateKernel),
+  // first reading the sources, then writing the destinations, instead of both for every item. The same bits as in
+  // one pass (the copies store the rounded result as it is), and in place too (a piece's sources and destinations
+  // are those of its executor's two edges, the second of which waits for the first). Only pieces of at least minBytes.
+  // Returns whether this rank has such edges.
+  bool twoPhaseReductions(InternalContext& ictx, Graph& graph, DType dtype, size_t minBytes) {
+    // The scratch tensor (the last tensor): the one of crossDomainReductions, or a new one
+    const size_t numTensors = graph.numInputs + graph.numInputCopies + graph.numOutputs + graph.numOutputCopies;
+    CHECK(graph.tensors.size() == numTensors || graph.tensors.size() == numTensors + 1);
+    size_t scratchBytes = graph.tensors.size() > numTensors ? graph.tensors.back().bytes : 0;
+    int32_t numFlags = 0;
+    for (const Edge& e : graph.edges) {
+      numFlags = std::max(numFlags, e.doneSignal + 1);
+    }
+    const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
+    uint32_t nextNodeIndex = 0;
+    auto scratchNode = [&](size_t offset, bool filled) {
+      Node n;
+      // (ids from a range of this rank's that Phase 5, proxyRemoteEdges and crossDomainReductions do not use)
+      n.id = ((uint64_t)(rank + 1) << 32) | (0xe0000000u + nextNodeIndex++);
+      n.rank = rank;
+      n.tensorIndex = numTensors;
+      n.offset = offset;
+      n.filled = filled;
+      n.device = DeviceType::CUDA;
+      return n;
+    };
+    Vector<Edge> copies;
+    for (Edge& e : graph.edges) {
+      if (e.sources.size() < 2 || e.destinations.size() < 2 || !e.sourceSignals.empty() ||
+          !e.sourceDoneSignals.empty() || e.doneSignal >= 0 || e.bytes < minBytes || (size_t)numFlags >= maxFlags) {
+        continue;
+      }
+      CHECK(e.executorRank == rank);
+      const size_t offset = scratchBytes;
+      scratchBytes += (e.bytes + 4095) / 4096 * 4096;
+      Edge copy;
+      copy.id = ictx.nextEdgeId();
+      copy.sources.push_back(scratchNode(offset, true));
+      copy.sourceDoneSignals.push_back(numFlags);
+      copy.destinations = std::move(e.destinations);
+      copy.bytes = e.bytes;
+      copy.cellIndex = e.cellIndex;
+      copy.chunkIndex = e.chunkIndex;
+      copy.executorRank = rank;
+      e.destinations.clear();
+      e.destinations.push_back(scratchNode(offset, false));
+      e.doneSignal = numFlags++;
+      copies.push_back(std::move(copy));
+    }
+    if (copies.empty()) {
+      return false;
+    }
+    for (Edge& copy : copies) {
+      graph.edges.push_back(std::move(copy));
+    }
+    if (graph.tensors.size() == numTensors) {
+      Graph::TensorDescr t;
+      t.dtype = dtype;
+      t.device = DeviceType::CUDA;
+      graph.tensors.push_back(t);
+    }
+    Graph::TensorDescr& t = graph.tensors.back();
+    t.bytes = scratchBytes;
+    t.shape.clear();
+    t.shape.push_back(scratchBytes / wrapperApi.dtypeSize(dtype));
+    return true;
+  }
+
   Setting tuneKernels(Vector<Graph> graphs, std::string target) {
     auto start = std::chrono::steady_clock::now();
     // One pipeline of 32K chunks per block reaches an SM's NVLink bandwidth; the grid size is what is tuned.
@@ -2159,12 +2232,17 @@ struct CompileOpConstructor {
     REQUIRE(mismatch.empty(), "moodist.compile_op: ranks specified different dtypes or reduce ops (%s)", mismatch);
     const Domains domains(domainIds);
     // MOODIST_COMPILE_OP_ROUNDS: all-reduces across NVLink domains in one round, in two wherever they can be, or
-    // ("auto") as the cost model in reductionPieces picks
+    // ("auto") as the cost model in reductionPieces picks. MOODIST_COMPILE_OP_PHASES: reductions in one domain in one
+    // pass, in two phases (see twoPhaseReductions), or ("auto") as tuneKernels picks.
     std::string rounds = "auto";
+    std::string phases = "auto";
     if (isReduction(reduce)) {
       rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
       REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
           "compile_op: MOODIST_COMPILE_OP_ROUNDS must be auto, 1 or 2 (not '%s')", rounds);
+      phases = agreedEnv("MOODIST_COMPILE_OP_PHASES", "auto");
+      REQUIRE(phases == "auto" || phases == "1" || phases == "2",
+          "compile_op: MOODIST_COMPILE_OP_PHASES must be auto, 1 or 2 (not '%s')", phases);
     }
 
     // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
@@ -3269,11 +3347,35 @@ struct CompileOpConstructor {
     //   read        every destination rank reads its chunks itself
     //   ring_read   the destinations of a chunk form a chain, each reading it from the previous one
     //   ring_write  the same chain, each rank writing the chunk to the next one
-    // Reductions use the multicast graph only, where every reduced element is computed once (see mergeReductions).
+    // Reductions use the multicast graph only, where every reduced element is computed once (see mergeReductions):
+    // as it is, and in two phases (twoPhaseReductions) if some rank has such edges, which tuneKernels then times
+    // against each other (MOODIST_COMPILE_OP_PHASES=1 or 2 keeps one of them). Two phases only for pieces of at least
+    // twoPhaseMinBytes (unless forced): they were slower below that, and the variant doubles the kernels that
+    // tuneKernels generates and times (bfloat16 all-reduce on 32 GB300 in one domain, one pass / two phases: 64 MiB,
+    // i.e. pieces of 2 MiB, 223 / 232 us; 128 MiB 470 / 437 us; 256 MiB 937 / 894 us; 512 MiB 1.86 / 1.65 ms; on 16:
+    // 64 MiB 226 / 227 us, 256 MiB 881 / 825 us).
+    static constexpr size_t twoPhaseMinBytes = 2 << 20;
     Vector<std::string> graphNames = agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast");
     if (isReduction(reduce)) {
       graphNames.clear();
-      graphNames.push_back("multicast");
+      Graph twoPhase = baseGraph;
+      const bool mine =
+          phases != "1" && twoPhaseReductions(ictx, twoPhase, dtype, phases == "2" ? 0 : twoPhaseMinBytes);
+      for (size_t i : range(size)) {
+        ctx.send(i, mine);
+      }
+      bool anyTwoPhase = false;
+      for (size_t i : range(size)) {
+        bool v;
+        ctx.receive(i, v);
+        anyTwoPhase |= v;
+      }
+      if (phases != "2" || !anyTwoPhase) {
+        graphs.push_back(buildMulticast(ictx, baseGraph));
+      }
+      if (anyTwoPhase) {
+        graphs.push_back(buildMulticast(ictx, twoPhase));
+      }
     }
     for (const std::string& name : graphNames) {
       if (name == "multicast") {
@@ -3309,6 +3411,11 @@ struct CompileOpConstructor {
 
       op->graph = setting.graph;
       op->config = setting.config;
+      // The scratch tensor of the graph chosen (two phases may have one where the other graph has none, or a larger
+      // one): the last tensor, after the inputs, outputs and their copies
+      const size_t numTensors =
+          baseGraph.numInputs + baseGraph.numInputCopies + baseGraph.numOutputs + baseGraph.numOutputCopies;
+      op->scratchBytes = setting.graph.tensors.size() > numTensors ? setting.graph.tensors.back().bytes : 0;
 
       for (size_t i : range(size)) {
         ctx.barrier();

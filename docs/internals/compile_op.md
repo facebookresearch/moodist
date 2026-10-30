@@ -199,7 +199,19 @@ Every step is collective: all ranks of the group take part (through per-rank que
    Edges have unfilled sources, i.e. depend on other edges, in the ring graphs and for proxied transfers (the
    copies from a proxy's node). Relay edges stay with the proxy in every variant.
 
-   Reductions use the `multicast` graph only, which leaves their edges (merged in step 7) with their executors.
+   Reductions use the `multicast` graph only, which leaves their edges (merged in step 7) with their executors: as
+   it is, and in two phases (`twoPhaseReductions`) if some rank has a piece of at least 2 MiB that combines
+   several sources into several destinations in one NVLink domain (a piece of an all-reduce that takes no part in a
+   reduction across domains). Such an edge becomes an edge that computes the piece into a region of the scratch
+   tensor (adding one if the op has none), with a `doneSignal`, and an edge with one source that copies it from there
+   to the destinations once that is set (`sourceDoneSignals`). The kernel computes all such pieces before it copies
+   any (the edges with a done signal and no waits come first), so the blocks first read all the sources, then write
+   all the destinations, instead of both in every item. The same bits (the copies store the rounded result as it
+   is), and in place too (a piece's sources and destinations are those of its executor's two edges, the second of
+   which waits for the first). Tuning times the two graphs against each other (step 12), and the op takes the scratch
+   tensor of the one chosen; `MOODIST_COMPILE_OP_PHASES=1` or `2` keeps one of them (2: pieces of any size). Two
+   phases win from 128 MiB on 32 GPUs (see Performance notes); below 2 MiB per piece they were slower, and the
+   variant doubles the kernels that tuning generates and times.
 
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
@@ -215,7 +227,10 @@ Every step is collective: all ranks of the group take part (through per-rank que
     lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it is for copies limited by the
     SMs' bandwidth). The kernel of the chosen setting is generated and compiled once more for the op. Tuning
     launches run without the CPU thread, so in tuning kernels, relay edges and the reduce loop's sources from other
-    domains do not wait for a signal, and partial results signal nothing.
+    domains do not wait for a signal; the reduce loop's done signals and its waits for them work as in the op's
+    launches (the pieces of two phases, an executor's own partial result), in `cpuInBuffer`, which the step value
+    reset before and after the tuning launches (`resetBarriers`) clears: the tuning launches number their steps from
+    1 on, and their flags would otherwise mislead the op's launches.
 
 ## The kernel (`generateKernel`)
 
@@ -408,6 +423,8 @@ on new tensors at every call.
 - `MOODIST_COMPILE_OP_PROFILE=N` - kernel profiling (see Tracing).
 - `MOODIST_COMPILE_OP_ROUNDS=1|2` - all-reduces across NVLink domains in one round, or in two wherever they can be,
   instead of as the cost model picks (`auto`, the default; see compile phase step 7). Same on all ranks.
+- `MOODIST_COMPILE_OP_PHASES=1|2` - reductions in one NVLink domain in one pass, or in two phases (pieces of any
+  size), instead of as tuning picks (`auto`, the default; see compile phase step 11). Same on all ranks.
 
 ## Tracing
 
@@ -561,6 +578,7 @@ times as large); all-reduce: the tensor's size:
 | reduce-scatter, NCCL with `NCCL_MNNVL_ENABLE=0` | 316 us | 392 us | 1.88 ms | 5.69 ms | 22.2 ms |
 | reduce-scatter, moodist's process group | 139 us | 236 us | 2.52 ms | 9.65 ms | 39.7 ms |
 | all-reduce, compile_op | 30 us | 46 us | 72 us | 222 us | 937 us |
+| all-reduce, compile_op, two phases from 128 MiB on (October 30) | 31 us | 46 us | 72 us | 226 us | 888 us |
 | all-reduce, NCCL | 163 us | 132 us | 132 us | 334 us | 900 us |
 | all-reduce, NCCL with `NCCL_MNNVL_ENABLE=0` | 84 us | 153 us | 974 us | 1.66 ms | 5.04 ms |
 | all-reduce, moodist's process group | 158 us | 194 us | 321 us | 703 us | 2.12 ms |
@@ -570,7 +588,11 @@ writes. NCCL (`NCCL_DEBUG_SUBSYS=TUNING`) used NVLS (`multimem` reductions) for 
 for the reduce-scatter at 64 KiB and 1 MiB only (ring from 16 MiB on). With `NCCL_NVLS_ENABLE=0` (ring; a rerun of the default in
 the same session came within 3% of the table from 1 MiB on): reduce-scatter 110 us, 110 us, 811 us, 3.24 ms and
 12.3 ms; all-reduce 149 us, 143 us, 169 us, 313 us and 1.05 ms. compile_op's all-reduce, without NVLS, is faster
-than NCCL's without at every size, and 4% slower than NCCL's with it at 256 MiB.
+than NCCL's without at every size, and was 4% slower than NCCL's with it at 256 MiB, before the reductions in two
+phases (compile phase step 11). One pass / two phases on the same 32 GPUs (another session; tuning, the default,
+picked the faster one at every size): 64 MiB 223 / 232 us, 128 MiB 470 / 437 us, 256 MiB 937 / 894 us, 512 MiB 1.86
+/ 1.65 ms (558 and 629 GB/s); below 64 MiB two phases were 4-13% slower. On 16 GPUs: 64 MiB 226 / 227 us, 256 MiB
+881 / 825 us.
 
 Reduce-scatter (`bfloat16`) on 64 GPUs in two NVL72 domains of 32 (across domains, see compile phase step 7), and
 with `MOODIST_FABRIC=0`, i.e. 16 domains of one node:
@@ -818,10 +840,10 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    (Performance notes) picks two rounds a little early with 8 domains; its parts are those of one round (Phase 2),
    which were not tuned for two rounds. CPU tensors (an error): the CPU thread could combine them (`CpuReductions` in
    cputhread.cc, which the process group's CPU reduce-scatter uses).
-3. All-reduce in one domain in two phases, as across domains: an executor computes its piece into its scratch
-   tensor, then stores it from there to every destination (an edge that waits for the first one's done signal).
-   Across two domains, the two phases took 846 us at 256 MiB, against 937 us for the single pass in one domain of 32
-   GPUs (see Performance notes), where NCCL takes 900 us with NVLS.
+3. All-reduce in one domain in two phases (compile phase step 11): 5-11% faster from 128 MiB on 32 GPUs, but the
+   copies of a piece wait for all of it, and the kernel computes every piece before it copies any. In parts (as
+   across domains, Phase 2), the copies of the first parts could overlap the computation of the last ones (across
+   two domains, with 1 MiB parts, 846 us at 256 MiB on 64 GPUs; in two phases in one domain of 32, 888 us).
 4. NVLS (`multimem.ld_reduce`: the switches add the values of every member of the multicast object). For an
    all-reduce, each GPU then sends its input once and receives the result once, (1 + 1/N) times the data instead of
    2 (N - 1) / N for the unicast pieces, about half on 32 ranks: this is where NCCL is faster at 256 MiB (see the
