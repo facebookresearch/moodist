@@ -14,7 +14,9 @@ results of the domains are divided and rounded to the dtype first, which is exac
 import contextlib
 import math
 import os
+import random
 import socket
+import time
 import zlib
 
 import torch
@@ -691,3 +693,78 @@ def test_reduce_configs(ctx: TestContext):
         else:
             os.environ[name] = previous
     run_reduce(ctx, pg, "sum", torch.float32, all_reduce)
+
+
+@test
+def test_reduce_interleaved(ctx: TestContext):
+    """Reductions interleaved with the process group's collectives: 400 ops without waiting in between, with random
+    delays between the calls on every rank. Each op's words in the concurrency slots (tensor lists, step values,
+    notification slots) are reused by the op 16 later, of any kind, and in a reduction a rank exchanges data over RDMA
+    only with some ranks (here also one of the inputs of two ranks, in which most ranks only receive)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 4096
+    whole = [TensorRegion(offset=[0], shape=[numel], device="cuda")]
+    full = [TensorRegion(offset=[0], shape=[n * numel], device="cuda")]
+    shard = [TensorRegion(offset=[ctx.rank * numel], shape=[numel], device="cuda")]
+    two = ctx.rank in (0, n - 1)
+    all_reduce = moodist.compile_op(pg, dtype=torch.float32, inputs=whole, outputs=whole, reduce="sum")
+    reduce_scatter = moodist.compile_op(pg, dtype=torch.float32, inputs=full, outputs=shard, reduce="sum")
+    two_inputs = moodist.compile_op(pg, dtype=torch.float32, inputs=whole if two else [], outputs=whole, reduce="sum")
+    value = float(ctx.rank + 1)
+    total = float(n * (n + 1) // 2)
+    total_two = float(sum(r + 1 for r in {0, n - 1}))
+    gathered = torch.arange(1, n + 1, dtype=torch.float32, device="cuda").repeat_interleave(numel)
+
+    def filled(numel):
+        return torch.full((numel,), value, device="cuda")
+
+    kinds = random.Random(1)  # the same ops on every rank
+    delays = random.Random(ctx.rank)
+    checks = []
+    for i in range(400):
+        if delays.random() < 0.05:
+            time.sleep(delays.uniform(0, 0.003))
+        kind = kinds.randrange(7)
+        if kind == 0:
+            y = torch.empty(numel, device="cuda")
+            all_reduce([filled(numel)], [y])
+            checks.append(("compile_op all-reduce", y, total))
+        elif kind == 1:
+            y = torch.empty(numel, device="cuda")
+            reduce_scatter([filled(n * numel)], [y])
+            checks.append(("compile_op reduce-scatter", y, total))
+        elif kind == 2:
+            y = torch.empty(numel, device="cuda")
+            two_inputs([filled(numel)] if two else [], [y])
+            checks.append(("compile_op reduction of two inputs", y, total_two))
+        elif kind == 3:
+            t = filled(numel)
+            pg.allreduce([t]).wait()
+            checks.append(("all-reduce", t, total))
+        elif kind == 4:
+            t = torch.empty(n * numel, device="cuda")
+            pg._allgather_base(t, filled(numel)).wait()
+            checks.append(("all-gather", t, gathered))
+        elif kind == 5:
+            t = torch.empty(numel, device="cuda")
+            pg._reduce_scatter_base(t, filled(n * numel)).wait()
+            checks.append(("reduce-scatter", t, total))
+        else:
+            root = i % n
+            t = filled(numel)
+            pg.broadcast(t, root).wait()
+            checks.append((f"broadcast from {root}", t, float(root + 1)))
+    torch.cuda.synchronize()
+    errors = []
+    for i, (name, t, expected) in enumerate(checks):
+        if not isinstance(expected, torch.Tensor):
+            expected = torch.full_like(t, expected)
+        if not torch.equal(t, expected):
+            bad = (t != expected).nonzero()
+            first = bad[0].item()
+            errors.append(
+                f"op {i} ({name}): {len(bad)} of {t.numel()} wrong, first at {first}: {t[first].item()} expected "
+                f"{expected[first].item()}"
+            )
+    raise_on_all_ranks(ctx, pg, errors)

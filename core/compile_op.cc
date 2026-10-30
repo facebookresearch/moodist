@@ -3407,9 +3407,21 @@ struct CompileOpConstructor {
       }
       const bool dense = numRemoteRead == numRemote && (numLocalRead == 0 || numLocalRead == numLocal);
 
+      // The ranks this rank exchanges with over RDMA (CustomOpDescriptor::peers): it knows those it reads from,
+      // writes to or notifies, and each rank tells the others whether it does any of that with them
+      Vector<uint8_t> exchanges(size);
+      for (const auto& read : op->ibReads) {
+        exchanges[read.rank] = 1;
+      }
+      for (const auto& write : op->ibWrites) {
+        exchanges[write.rank] = 1;
+      }
+      for (const auto& n : op->notifications) {
+        exchanges[n.rank] = 1;
+      }
       bool localNeedsRdma = !op->ibReads.empty() || !op->ibWrites.empty();
       for (size_t i : range(size)) {
-        ctx.send(i, localNeedsRdma, hasReads, dense, minBytes, maxBytes);
+        ctx.send(i, localNeedsRdma, hasReads, dense, minBytes, maxBytes, exchanges[i] != 0);
       }
       bool anyRankNeedsRdma = false;
       bool uniform = true;
@@ -3421,8 +3433,10 @@ struct CompileOpConstructor {
         bool peerDense;
         size_t peerMin;
         size_t peerMax;
-        ctx.receive(i, needsRdma, peerHasReads, peerDense, peerMin, peerMax);
+        bool peerExchanges;
+        ctx.receive(i, needsRdma, peerHasReads, peerDense, peerMin, peerMax, peerExchanges);
         anyRankNeedsRdma |= needsRdma;
+        exchanges[i] |= peerExchanges;
         if (peerHasReads) {
           uniform &= peerDense;
           globalMinBytes = std::min(globalMinBytes, peerMin);
@@ -3431,6 +3445,17 @@ struct CompileOpConstructor {
       }
       uniform &= globalMaxBytes == 0 || globalMaxBytes - globalMinBytes <= globalMaxBytes / 16;
       op->anyRankNeedsRdma = anyRankNeedsRdma;
+      op->dynSelf = exchanges[rank] != 0;
+      op->peers.clear();
+      op->isPeer.clear();
+      op->isPeer.resize(size);
+      for (size_t o = 1; o < size; ++o) {
+        const size_t i = (rank + o) % size;
+        if (exchanges[i]) {
+          op->peers.push_back(i);
+          op->isPeer[i] = 1;
+        }
+      }
       op->readSources = uniform ? 1 : 8;
       log.debug("compile_op: rank %zu: reads %s (%zu of %zu remote sources, %zu of %zu local, %zu-%zu bytes each); "
                 "readSources %u\n",

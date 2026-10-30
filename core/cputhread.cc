@@ -559,14 +559,16 @@ struct CpuThreadImpl {
     }
   }
 
+  // A small write whose completion is counted in the concurrency slot's live control transfers (which the next work on
+  // the slot waits for, see ENTER), or in *counter instead
   void writeControl(size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey,
-      void* remoteAddress, uint32_t rkey, size_t bytes) {
+      void* remoteAddress, uint32_t rkey, size_t bytes, size_t* counter = nullptr) {
     CHECK(i >= 0 && i < size);
 
     auto callbackobj = makeCallback(nullptr);
     Callback* callback = callbackobj;
-    callback->counter = &concurrencyLiveControlTransfers[concurrencyIndex];
-    ++concurrencyLiveControlTransfers[concurrencyIndex];
+    callback->counter = counter ? counter : &concurrencyLiveControlTransfers[concurrencyIndex];
+    ++*callback->counter;
     postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
   }
 
@@ -1277,13 +1279,14 @@ struct CpuThreadImpl {
         (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses) * numDyns);
   }
 
-  void writeStepValue(size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex) {
+  void writeStepValue(
+      size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex, size_t* counter = nullptr) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inStepValue(concurrencyIndex, dstIndex));
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
-        sizeof(uint32_t));
+        sizeof(uint32_t), counter);
   }
 
   void writeStepValueDeviceChunk(
@@ -5870,6 +5873,12 @@ struct CpuThreadImpl {
     size_t writesLeft = 0; // writes whose signal has not been sent
     size_t liveWrites = 0; // parts of writes and their flushes in flight
 
+    // Step values (see step()): the writes of the op's step value to the peers in flight, and the next rank (as an
+    // offset from this one) that postOtherStepValues considers
+    size_t livePeerStepValues = 0;
+    size_t nextOtherRank = 1;
+    static constexpr size_t otherStepValuesPerRound = 8;
+
     Vector<MemoryRegistration*> outputMrs;
 
     WorkCustom(CpuThreadImpl& self, QueueEntryCustom& params) : Work(self, params), params(params) {}
@@ -6150,6 +6159,21 @@ struct CpuThreadImpl {
       }
     }
 
+    // Posts the op's step value to up to n more of the ranks that are not peers, in the order rank + 1, rank + 2, ...
+    void postOtherStepValues(size_t n) {
+      while (n != 0 && nextOtherRank != size) {
+        size_t r = rank + nextOtherRank;
+        if (r >= size) {
+          r -= size;
+        }
+        ++nextOtherRank;
+        if (!op->isPeer[r]) {
+          self.writeStepValue(concurrencyIndex, r, 0, rank);
+          --n;
+        }
+      }
+    }
+
     // Checks the writes against the tensors of their destinations, once their lists have arrived
     void checkWrite(const CustomOpDescriptor::IbWrite& write) {
       CHECK(write.rank < size && write.rank != rank);
@@ -6338,13 +6362,12 @@ struct CpuThreadImpl {
           }
         }
 
-        for (o = 0; o != size; ++o) {
-          i = self.rank + o;
-          if (i >= size) {
-            i -= size;
-          }
-          CHECK(i >= 0 && i < size);
-          self.writeDyn(concurrencyIndex, i, 0, rank);
+        // (to the peers, see CustomOpDescriptor::peers, and to itself if it reads from its own tensors)
+        if (op->dynSelf) {
+          self.writeDyn(concurrencyIndex, rank, 0, rank);
+        }
+        for (uint32_t peer : op->peers) {
+          self.writeDyn(concurrencyIndex, peer, 0, rank);
         }
       }
 
@@ -6354,11 +6377,9 @@ struct CpuThreadImpl {
       remoteInputListReady.resize(size);
       remoteFlags.resize(size);
 
-      for (o = 0; o != size; ++o) {
-        i = self.rank - o;
-        if (i >= size) {
-          i += size;
-        }
+      // (its own list first if it reads from itself, then the peers' in the order rank - 1, rank - 2, ...)
+      for (o = op->dynSelf ? 0 : 1; o <= op->peers.size(); ++o) {
+        i = o == 0 ? rank : op->peers[op->peers.size() - o];
         CHECK(i >= 0 && i < size);
 
         if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
@@ -6423,19 +6444,15 @@ struct CpuThreadImpl {
           YIELD
         }
       }
+      // Step values (the rank's stream has reached the op, so its tensors are ready): first with the peers, whose
+      // tensors the reads and writes below use, then to all other ranks a few at a time while the reads and writes go
+      // on (postOtherStepValues); only the end of the op waits for theirs
       self.trace(concurrencyIndex, 0, "%#x step exchange", stepValue);
-      for (size_t o = 1; o < size; ++o) {
-        i = self.rank + o;
-        if (i >= size) {
-          i -= size;
-        }
-        self.writeStepValue(concurrencyIndex, i, 0, rank);
+      for (uint32_t peer : op->peers) {
+        self.writeStepValue(concurrencyIndex, peer, 0, rank, &livePeerStepValues);
       }
-      for (o = 1; o < size; ++o) {
-        i = self.rank - o;
-        if (i >= size) {
-          i += size;
-        }
+      for (o = 1; o <= op->peers.size(); ++o) {
+        i = op->peers[op->peers.size() - o];
         if (self.inStepValue(concurrencyIndex, i) < stepValue) {
           self.trace(concurrencyIndex, 0, "%#x wait step %d", stepValue, i);
         }
@@ -6470,8 +6487,10 @@ struct CpuThreadImpl {
             tryRead(bestDevice);
           }
         }
+        postOtherStepValues(otherStepValuesPerRound);
         YIELD
       }
+      postOtherStepValues(size);
 
       if (liveReads || liveWrites) {
         self.trace(concurrencyIndex, 0, "%#x wait read and write completions", stepValue);
@@ -6481,28 +6500,43 @@ struct CpuThreadImpl {
       }
       flushUnsignaledReads();
 
-      // Ensure first writeStepValue loop (stepValue) completes before second loop (stepValue+1).
-      // Both write to the same remote address; without this, RDMA reordering could cause
-      // stepValue+1 to arrive first and then be overwritten by stepValue.
-      WAIT_CONTROL
+      // The step values to the peers have arrived: stepValue + 1 goes to the same address, and RDMA writes may land
+      // out of order, so it could otherwise be overwritten by stepValue
+      while (livePeerStepValues != 0) {
+        YIELD
+      }
 
-      for (size_t o = 1; o < size; ++o) {
-        i = self.rank + o;
-        if (i >= size) {
-          i -= size;
-        }
-        self.writeStepValue(concurrencyIndex, i, 1, rank);
+      for (uint32_t peer : op->peers) {
+        self.writeStepValue(concurrencyIndex, peer, 1, rank);
       }
       self.trace(concurrencyIndex, 0, "%#x wait for remote reads", stepValue);
+      for (o = 1; o <= op->peers.size(); ++o) {
+        i = op->peers[op->peers.size() - o];
+        if (self.inStepValue(concurrencyIndex, i) < stepValue + 1) {
+          self.trace(concurrencyIndex, 0, "%#x wait reads of %d", stepValue, i);
+        }
+        while (self.inStepValue(concurrencyIndex, i) < stepValue + 1) {
+          YIELD
+        }
+      }
+
+      // All other ranks have reached the op too (their step values) before its stream goes on, so that no rank gets
+      // more than an op ahead of another, as when all ranks waited for each other's reads. Each concurrency slot's
+      // words that ranks write into each other's memory (tensor lists, step values, notification slots) are reused by
+      // the op 16 later, of any kind (process group collectives too, some of which wait for exact values): a rank must
+      // not write there for a later op while another still waits for the earlier op's values.
       for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
           i += size;
         }
-        if (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
-          self.trace(concurrencyIndex, 0, "%#x wait reads of %d", stepValue, i);
+        if (op->isPeer[i]) {
+          continue;
         }
-        while (self.inStepValue(concurrencyIndex, i) != stepValue + 1) {
+        if (self.inStepValue(concurrencyIndex, i) < stepValue) {
+          self.trace(concurrencyIndex, 0, "%#x wait arrival of %d", stepValue, i);
+        }
+        while (self.inStepValue(concurrencyIndex, i) < stepValue) {
           YIELD
         }
       }

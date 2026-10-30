@@ -394,6 +394,13 @@ struct CustomOpDescriptor {
   uint32_t readSources = 1;
   Vector<Notification> notifications;
   Vector<IbWrite> ibWrites;
+  // The ranks this rank exchanges with over RDMA in the op (its peers): those it reads from, writes to or notifies,
+  // and those that read from it, write to it or notify it, in the order rank + 1, rank + 2, ... (mod the group size);
+  // isPeer per rank. Only peers exchange tensor lists and wait for each other's reads and writes; all ranks exchange
+  // step values (see WorkCustom). dynSelf: the rank reads from its own tensors, and so publishes its list to itself.
+  Vector<uint32_t> peers;
+  Vector<uint8_t> isPeer;
+  bool dynSelf = false;
   // Reductions across NVLink domains: the bytes of the scratch tensor (a CUDA tensor of the op's dtype that customOp
   // allocates per launch, after the output copies: the last tensor), which holds the partial results that this rank
   // computes (for other domains, and in an all-reduce for itself) and the ones that it reads from them (or that they
