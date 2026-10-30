@@ -11,6 +11,7 @@ by the number of inputs, rounded once in float32, then to the dtype, as the kern
 results of the domains are divided and rounded to the dtype first, which is exact with a power of 2 ranks).
 """
 
+import contextlib
 import math
 import os
 import socket
@@ -263,6 +264,86 @@ def test_all_reduce_in_place_one_source(ctx: TestContext):
         spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
         for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
             run_reduce(ctx, pg, op_name, dtype, spec, in_place=True, repeat=3)
+
+
+@contextlib.contextmanager
+def environment(name, value):
+    """The environment variable `name` set to `value` (on every rank: compile_op checks that they agree)."""
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+@test
+def test_all_reduce_two_rounds(ctx: TestContext):
+    """All-reduces across NVLink domains in two rounds wherever they can be (MOODIST_COMPILE_OP_ROUNDS=2; by default
+    only with 3 or more domains, and large enough): each executor computes a share of its piece from the shares of
+    the contributions of all domains, then copies the other executors' shares to its domain. All sizes (a few
+    elements: one round), in place, inputs or outputs on some ranks only, 64 MiB (parts), and in place with inputs on
+    two ranks (copies of the inputs)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    with environment("MOODIST_COMPILE_OP_ROUNDS", "2"):
+        for numel, combinations in [(4096, SOME), (8, SOME), ((1 << 20) + 64, SOME)]:
+            spec = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+            for dtype, op_name in combinations:
+                run_reduce(ctx, pg, op_name, dtype, spec, salt=numel)
+        numel = 300000
+        whole = [((0,), (numel,))]
+        spec = {"0": ([numel], [whole] * n, [whole] * n)}
+        run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=2)
+        run_reduce(ctx, pg, "max", torch.bfloat16, spec, in_place=True)
+        first_two = [whole if r < 2 else [] for r in range(n)]
+        first_last = [whole if r in (0, n - 1) else [] for r in range(n)]
+        first_eight = [whole if r < 8 else [] for r in range(n)]
+        for ins, outs in [(first_two, [whole] * n), (first_last, [whole] * n), ([whole] * n, first_eight)]:
+            for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
+                run_reduce(ctx, pg, op_name, dtype, {"0": ([numel], ins, outs)})
+        for dtype, op_name in [(torch.float32, "sum"), (torch.bfloat16, "avg")]:
+            numel = (64 << 20) // torch.tensor([], dtype=dtype).element_size()
+            spec = {"0": ([numel], [[((0,), (numel,))]] * n, [[((0,), (numel,))]] * n)}
+            run_reduce(ctx, pg, op_name, dtype, spec)
+        for numel in [1 << 18, 1 << 24]:
+            whole = [((0,), (numel,))]
+            spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
+            run_reduce(ctx, pg, "avg", torch.bfloat16, spec, in_place=True, repeat=3)
+
+
+@test
+def test_all_reduce_rounds_same_bits(ctx: TestContext):
+    """Random floats: an all-reduce gives the same bits in one round and in two (MOODIST_COMPILE_OP_ROUNDS), on every
+    rank: the executors combine the same values in the same order either way."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    for dtype, op_name, numel in [(torch.bfloat16, "sum", 1 << 20), (torch.float32, "avg", 3 << 20)]:
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(4321 + ctx.rank)
+        x = torch.randn(numel, generator=gen, device="cuda").to(dtype)
+        region = [TensorRegion(offset=[0], shape=[numel], device="cuda")]
+        results = []
+        for rounds in ["1", "2"]:
+            with environment("MOODIST_COMPILE_OP_ROUNDS", rounds):
+                op = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=region, reduce=op_name)
+            out = torch.full((numel,), 99, dtype=dtype, device="cuda")
+            op([x], [out]).wait()
+            results.append(out)
+        errors = []
+        bits = torch.int16 if dtype == torch.bfloat16 else torch.int32
+        if not torch.equal(results[0].view(bits), results[1].view(bits)):
+            errors.append(f"reduce={op_name} {dtype}: one and two rounds gave different bits")
+        everyone = torch.empty(n * numel, dtype=dtype, device="cuda")
+        pg._allgather_base(everyone, results[1]).wait()
+        for r in range(n):
+            if not torch.equal(everyone[r * numel : (r + 1) * numel], results[1]):
+                errors.append(f"reduce={op_name} {dtype}: rank {r} has different bits")
+                break
+        raise_on_all_ranks(ctx, pg, errors)
 
 
 def node_local_ranks(ctx, pg):

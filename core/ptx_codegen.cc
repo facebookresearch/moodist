@@ -559,7 +559,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           //        not really sure if that should be handled here, though.
           //        might be better to have a pass in compile_op.cc which sets
           //        up a dependency chain.
-          CHECK(localdst == nullptr);
+          // (the reduce loop stores to any destinations: in an all-reduce in two rounds, an executor stores its share
+          // to its output and to its scratch tensor, see crossDomainReductions in compile_op.cc)
+          CHECK(localdst == nullptr || compile_op::isReduction(graph.reduce));
           localdst = &n;
         }
       }
@@ -569,47 +571,57 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         localCopies.push_back(v);
       }
     }
-    // Relay edges first: the scan for ready edges below stops at the first ready copy, and always reaches them
-    auto firstCopy = std::stable_partition(localCopies.begin(), localCopies.end(), [](const Edge& e) {
-      return e.sources.empty();
+    // reduceKernel: this rank executes reductions (edges with several sources, or parts of a reduction across NVLink
+    // domains), and runs the reduce loop below
+    const bool reduceKernel = std::ranges::any_of(localCopies, [](const Edge& e) {
+      return e.sources.size() > 1 || !e.sourceSignals.empty() || !e.sourceDoneSignals.empty() || e.doneSignal >= 0;
     });
-    // Then the copies in the order of the peer they move data to, or from, rotated to start at this rank: in rank
-    // order, every rank would write to the same peer at once (in an all-to-all, all ranks to rank 0 first, then to
-    // rank 1, ...), whose NVLink ingress then limits all of them while the other peers idle. An edge counts by its
-    // first destination (multicast edges list their destinations rotated the same way), or by its source if it
-    // reads another rank's node into this rank (the read graphs), where the source's egress limits the readers in
-    // the same way (all-gather on 32 GB300 with the read graph and 16 blocks: 74 GB/s per GPU, 631 rotated by source).
-    std::stable_sort(firstCopy, localCopies.end(), [&](const Edge& a, const Edge& b) {
-      auto key = [&](const Edge& e) {
-        size_t r = e.destinations.at(0).rank;
-        if (r == rank && !e.sources.empty() && e.sources[0].rank != rank) {
-          r = e.sources[0].rank;
-        }
-        return (r + group->size - rank) % group->size;
-      };
-      return key(a) < key(b);
-    });
-    // The edges that compute partial results which ranks in other NVLink domains (or other edges of this rank's)
-    // wait for (see crossDomainReductions in compile_op.cc) come first: the reduce loop's blocks take items in order,
-    // so these have all been taken before any block waits for a partial result
-    std::stable_partition(firstCopy, localCopies.end(), [](const Edge& e) {
-      return e.doneSignal >= 0;
-    });
+    if (reduceKernel) {
+      // The reduce loop's blocks take items in order, and a block waits for a source from another NVLink domain only
+      // once it has finished its items before (see reduceLoop). The edges go in the order of crossDomainReductions in
+      // compile_op.cc, except that the edges that compute partial results which ranks in other NVLink domains (or
+      // other edges of this rank's) wait for, and wait for nothing, come first: they have all been taken before any
+      // block waits. In an all-reduce in two rounds, the edges that compute shares of a part (which other ranks wait
+      // for) and the copies of the other shares follow part by part, in the same order on every rank: a copy waits
+      // for shares of its part, which wait only for partial results, so no rank waits for a rank that waits for it.
+      // (The order of peers below is for copies: a reduction's item reads all its sources and stores to all its
+      // destinations.)
+      std::stable_partition(localCopies.begin(), localCopies.end(), [](const Edge& e) {
+        return e.doneSignal >= 0 && e.sourceSignals.empty() && e.sourceDoneSignals.empty();
+      });
+    } else {
+      // Relay edges first: the scan for ready edges below stops at the first ready copy, and always reaches them
+      auto firstCopy = std::stable_partition(localCopies.begin(), localCopies.end(), [](const Edge& e) {
+        return e.sources.empty();
+      });
+      // Then the copies in the order of the peer they move data to, or from, rotated to start at this rank: in rank
+      // order, every rank would write to the same peer at once (in an all-to-all, all ranks to rank 0 first, then to
+      // rank 1, ...), whose NVLink ingress then limits all of them while the other peers idle. An edge counts by its
+      // first destination (multicast edges list their destinations rotated the same way), or by its source if it
+      // reads another rank's node into this rank (the read graphs), where the source's egress limits the readers in
+      // the same way (all-gather on 32 GB300 with the read graph and 16 blocks: 74 GB/s per GPU, 631 rotated by
+      // source).
+      std::stable_sort(firstCopy, localCopies.end(), [&](const Edge& a, const Edge& b) {
+        auto key = [&](const Edge& e) {
+          size_t r = e.destinations.at(0).rank;
+          if (r == rank && !e.sources.empty() && e.sources[0].rank != rank) {
+            r = e.sources[0].rank;
+          }
+          return (r + group->size - rank) % group->size;
+        };
+        return key(a) < key(b);
+      });
+    }
 
     // nowaits: no edge waits for another edge or for the CPU thread, so the edges run in order (the reduce loop's
     // waits for the sources that the CPU thread reads from other NVLink domains aside, see Edge::sourceSignals)
     bool nowaits = true;
     bool hasRemoteWrites = false;
     size_t maxDestinations = 0;
-    // reduceKernel: this rank executes reductions (edges with several sources, or parts of a reduction across NVLink
-    // domains), and runs the reduce loop below
-    bool reduceKernel = false;
     for (const Edge& e : localCopies) {
       if (e.sources.empty() || !std::ranges::all_of(e.sources, &Node::filled)) {
         nowaits = false;
       }
-      reduceKernel |=
-          e.sources.size() > 1 || !e.sourceSignals.empty() || !e.sourceDoneSignals.empty() || e.doneSignal >= 0;
       for (const Node& n : e.destinations) {
         if (n.rank != rank) {
           hasRemoteWrites = true;
@@ -1977,7 +1989,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         // cpuInBuffer): until then, the loads stop there, and the block goes on with the stages it has. It waits for
         // the signal only when it has combined all stages loaded before (blocking, at the start of a stage): its
         // earlier items are then complete, including the partial results among them, which come before anything that
-        // waits (see localCopies), so all blocks of all ranks make progress.
+        // waits, and in an all-reduce in two rounds the shares of a part, which come before the copies of the part's
+        // other shares (see localCopies), so all blocks of all ranks make progress.
         u64 signalFlags = concurrency(group->cpuOutBuffer) + 4 * 16;
         u64 doneFlags = concurrency(group->cpuInBuffer) + 4 * 16;
         auto fill = [&](bool blocking) {

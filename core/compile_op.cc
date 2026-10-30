@@ -404,15 +404,38 @@ struct PartialResponse {
     x(tensorIndex, offset, slot);
   }
 };
+// In two rounds: the share of a part's result that an executor asks the share's owner for (answered with a
+// PartialResponse: where the share will be, and the notification slot)
+struct ResultRequest {
+  uint32_t cellIndex;
+  uint32_t chunkIndex;
+  template<typename X>
+  void serialize(X& x) {
+    x(cellIndex, chunkIndex);
+  }
+};
 // A piece of a reduced cell with destinations in several NVLink domains (an all-reduce's, see reductionPieces), per
 // domain: the rank that computes it there, or in a domain without destinations, the partial result of the sources
 // there; and whether the domain's only source rank is one of its destinations too, whose input can then be the very
 // output that the domain's executor stores the result to (an in-place op): the executors read a copy of it instead
-// (see crossDomainReductions)
+// (see crossDomainReductions). In two rounds, the executors of the domains with destinations, in domain order: the
+// piece is split into as many shares, and the j-th of them computes share j (empty in one round)
 struct AllReducePiece {
   Vector<uint32_t> ranks;
   Vector<uint8_t> copySource;
+  Vector<uint32_t> shareOwners;
 };
+
+// Share j of n of a part of `bytes` bytes in two rounds (see crossDomainReductions): its offset and size, in whole
+// 16-byte units (in whole pages if the shares have 64 KiB or more: RDMA reads that start at page boundaries), the
+// remainder in the last share; every share has some if the part has at least n units
+inline std::pair<size_t, size_t> shareRange(size_t bytes, size_t n, size_t j) {
+  const size_t granule = bytes / n >= 65536 ? 4096 : 16;
+  const size_t units = bytes / granule;
+  const size_t begin = units * j / n * granule;
+  const size_t end = j + 1 == n ? bytes : units * (j + 1) / n * granule;
+  return {begin, end - begin};
+}
 
 struct InternalContext {
   CompileContext& ctx;
@@ -1143,6 +1166,12 @@ struct CompileOpConstructor {
   // as loaded) and combines itself, as the other executors do: in an in-place op the input is the output that the
   // executor stores the result to, which the other domains would otherwise read over RDMA while it changes. The copy
   // takes the input's place in the order (an average divides it with the other inputs).
+  // In two rounds (AllReducePiece::shareOwners), each executor computes one share of the part (shareRange) from the
+  // same values, of which it reads only that share: a reduce-scatter among the executors. It stores its share to the
+  // destinations of its domain and to its scratch tensor (an edge with a doneSignal), where the other executors read
+  // it once notified (a ResultRequest each), and copies the shares of the others to the destinations of its domain
+  // (an edge per share, with one source): an all-gather. The bits are those of one round. An executor then reads
+  // (n - 1) / k + (k - 1) / k parts instead of n - 1 (n domains with sources, k with destinations).
   // Every rank takes part (the requests are exchanged); returns an error message (a full signal table), or an empty
   // string.
   std::string crossDomainReductions(InternalContext& ictx, Graph& graph, CustomOpDescriptor& op, const Domains& domains,
@@ -1268,7 +1297,16 @@ struct CompileOpConstructor {
       return partial;
     };
 
-    // The new sources of an edge of this rank's (the partial results of other ranks are filled in from the responses)
+    // The new sources of an edge of this rank's (the partial results of other ranks are filled in from the responses),
+    // and the range of the edge that they cover: in two rounds, this rank's share of the part, else all of it. In two
+    // rounds also the result of the share (a region of the scratch tensor, and the edge's done signal), and the
+    // other shares of the part, which this rank reads from their owners (filled in from the responses).
+    struct Share {
+      uint32_t owner;
+      size_t requestIndex;
+      size_t offset;
+      size_t bytes;
+    };
     struct Plan {
       size_t edgeIndex;
       Vector<Node> sources;
@@ -1277,18 +1315,31 @@ struct CompileOpConstructor {
       uint32_t partialSources = 0;
       uint32_t divisor;
       Vector<std::tuple<size_t, uint32_t, size_t>> partials; // (source position, partial rank, request index)
+      size_t offset = 0;
+      size_t bytes = 0;
+      int32_t doneSignal = -1;
+      size_t resultOffset = 0;
+      Vector<Share> shares;
     };
     Vector<Plan> plans;
     Vector<Vector<PartialRequest>> requests(size);
+    Vector<Vector<ResultRequest>> resultRequests(size);
+    // Two rounds: the shares of results that this rank computes, by cell and chunk index: their done signals and
+    // regions of the scratch tensor
+    HashMap<uint64_t, std::pair<int32_t, size_t>> results;
     Vector<size_t> requestedFrom(numDomains); // per domain, the partial results picked by pickPartialRank so far
-    // The edges part by part (chunkIndex, see reductionPieces): the order in which the partial results are computed
-    // (see below), and in which this rank reads and combines them
+    // The edges part by part (chunkIndex, see reductionPieces), and within a part by cell: the order in which the
+    // partial results are computed (see below), and in which this rank reads and combines them. In two rounds, the
+    // kernel computes the shares in this order, with the copies of the other shares of a part after the next share
+    // (see below), and so does every rank: a copy waits for a share of its part on another rank, which comes before
+    // it in that rank's order too, and a share waits for partial results only, which come first (see
+    // generateKernel), so that no rank waits for a rank that waits for it.
     Vector<size_t> edgeOrder;
     for (size_t ei : indices(graph.edges)) {
       edgeOrder.push_back(ei);
     }
     std::ranges::stable_sort(edgeOrder, {}, [&](size_t ei) {
-      return graph.edges[ei].chunkIndex;
+      return std::make_pair(graph.edges[ei].chunkIndex, graph.edges[ei].cellIndex);
     });
     for (size_t ei : edgeOrder) {
       const Edge& e = graph.edges[ei];
@@ -1313,6 +1364,17 @@ struct CompileOpConstructor {
       Plan plan;
       plan.edgeIndex = ei;
       plan.divisor = e.sources.size();
+      plan.bytes = e.bytes;
+      // A piece in two rounds: this rank's share of it
+      const AllReducePiece* piece = allReduce == allReducePieces.end() ? nullptr : &allReduce->second;
+      const size_t numShares = piece ? piece->shareOwners.size() : 0;
+      size_t shareIndex = 0;
+      if (numShares != 0) {
+        auto it = std::ranges::find(piece->shareOwners, (uint32_t)rank);
+        CHECK(it != piece->shareOwners.end());
+        shareIndex = it - piece->shareOwners.begin();
+        std::tie(plan.offset, plan.bytes) = shareRange(e.bytes, numShares, shareIndex);
+      }
       // The domains with sources, in order, and the sources of each in (rank, tensor, offset) order
       Vector<size_t> sourceDomains;
       for (const Node& n : e.sources) {
@@ -1333,19 +1395,21 @@ struct CompileOpConstructor {
         });
         return r;
       };
-      // An input as it is: over NVLink from this domain, else read into the scratch tensor
-      auto addInput = [&](const Node& n) {
+      // An input as it is (the range of the plan): over NVLink from this domain, else read into the scratch tensor
+      auto addInput = [&](Node n) {
+        n.offset += plan.offset;
         if (inMyDomain(n)) {
           plan.sources.push_back(n);
           plan.signals.push_back(-1);
         } else {
-          auto r = read(n.rank, n.tensorIndex, n.offset, e.bytes, -1);
+          auto r = read(n.rank, n.tensorIndex, n.offset, plan.bytes, -1);
           plan.sources.push_back(scratchNode(r.outputOffset, true));
           plan.signals.push_back(r.signalIndex);
         }
         plan.doneSignals.push_back(-1);
       };
-      // A partial result of another rank's, or a copy of an input that it makes (filled in from its response)
+      // A partial result of another rank's, or a copy of an input that it makes, of the whole edge (filled in from its
+      // response; this rank reads the range of the plan)
       auto addRequest = [&](uint32_t partialRank, Vector<Node> sources, bool partial) {
         CHECK(partialRank != rank);
         plan.partials.emplace_back(plan.sources.size(), partialRank, requests[partialRank].size());
@@ -1362,15 +1426,15 @@ struct CompileOpConstructor {
         plan.partialSources += partial;
       };
       // A partial result of this rank's own domain, or a copy of an input there, that this rank computes for itself
-      // and for the executors of other domains (once its kernel has stored it)
+      // and for the executors of other domains (once its kernel has stored it), of the whole edge
       auto computeOwn = [&](const Vector<Node>& sources, bool partial) {
         Partial own = computePartial(sources, e.bytes, plan.divisor, e.cellIndex, e.chunkIndex, {e.chunkIndex, 0, 0});
-        plan.sources.push_back(scratchNode(own.offset, true));
+        plan.sources.push_back(scratchNode(own.offset + plan.offset, true));
         plan.signals.push_back(-1);
         plan.doneSignals.push_back(own.doneSignal);
         plan.partialSources += partial;
       };
-      if (allReduce == allReducePieces.end()) {
+      if (!piece) {
         for (const Node& n : e.sources) {
           if (inMyDomain(n)) {
             addInput(n);
@@ -1389,10 +1453,9 @@ struct CompileOpConstructor {
           }
         }
       } else {
-        const AllReducePiece& piece = allReduce->second;
-        const Vector<uint32_t>& partialRanks = piece.ranks;
+        const Vector<uint32_t>& partialRanks = piece->ranks;
         CHECK(partialRanks.size() == numDomains && partialRanks[myDomain] == rank);
-        CHECK(piece.copySource.size() == numDomains);
+        CHECK(piece->copySource.size() == numDomains);
         // The inputs of the domains with one source (as they are, or copies, see above), then the partial results
         // of the others
         for (int pass : {0, 1}) {
@@ -1402,7 +1465,7 @@ struct CompileOpConstructor {
               continue;
             }
             const bool partial = pass == 1;
-            if (!partial && !piece.copySource[domain]) {
+            if (!partial && !piece->copySource[domain]) {
               addInput(s[0]);
             } else if (domain != myDomain) {
               CHECK(domains.index.at(partialRanks[domain]) == domain);
@@ -1412,13 +1475,30 @@ struct CompileOpConstructor {
             }
           }
         }
+        // Two rounds: the result of this rank's share, and the other shares, from their owners
+        if (numShares != 0) {
+          plan.doneSignal = numFlags++;
+          plan.resultOffset = allocate(plan.bytes);
+          results[((uint64_t)e.cellIndex << 32) | e.chunkIndex] = {plan.doneSignal, plan.resultOffset};
+          for (size_t j : range(numShares)) {
+            if (j != shareIndex) {
+              const uint32_t owner = piece->shareOwners[j];
+              auto [offset, bytes] = shareRange(e.bytes, numShares, j);
+              plan.shares.push_back({owner, resultRequests[owner].size(), offset, bytes});
+              resultRequests[owner].push_back({e.cellIndex, e.chunkIndex});
+            }
+          }
+        }
       }
       plans.push_back(std::move(plan));
     }
 
     // As a partial rank: the partial results that other ranks request, and a notification for each request. A rank
     // has numNotificationSlots slots for the notifications from each other rank: with more requests, consecutive ones
-    // share a slot (notified once all of them are done).
+    // share a slot (notified once all of them are done). In two rounds, also the shares of results that the other
+    // owners of a part request, which never share a slot with partial results: the owners read each other's partial
+    // results to compute their shares, so an owner waiting for a share to read a partial result could wait for an
+    // owner waiting for it.
     // The kernel computes the partial results in the order of their edges (see generateKernel): part by part
     // (chunkIndex, see reductionPieces), so that every executor gets the first parts from all domains early and can
     // combine them while the next ones are on their way; within a part, those of this rank's own pieces first, then
@@ -1427,16 +1507,31 @@ struct CompileOpConstructor {
     // ranks (as in the read order below; with all partial ranks starting at the same executor, its NIC took all of
     // their data at first while the others had nothing to read).
     for (size_t i : range(size)) {
-      ctx.send(i, requests[i]);
+      ctx.send(i, requests[i], resultRequests[i]);
     }
     Vector<Vector<PartialRequest>> incoming(size);
+    Vector<Vector<ResultRequest>> incomingResults(size);
     Vector<std::pair<uint32_t, uint32_t>> order; // (requesting rank, request index)
     for (size_t i : range(size)) {
-      ctx.receive(i, incoming[i]);
+      ctx.receive(i, incoming[i], incomingResults[i]);
       for (size_t j : indices(incoming[i])) {
         order.emplace_back(i, j);
       }
     }
+    // The notification slot of request j of n of one kind from a rank, which has the slots [first, first + slots) for
+    // that kind: [0, partialSlots(i)) for the partial results that rank i requests, the others for shares of results
+    static constexpr size_t numSlots = CustomOpDescriptor::numNotificationSlots;
+    auto partialSlots = [&](size_t i) {
+      const size_t n = incoming[i].size();
+      const size_t total = n + incomingResults[i].size();
+      if (total <= numSlots || n == 0 || n == total) {
+        return std::min(n, numSlots);
+      }
+      return std::clamp<size_t>(n * numSlots / total, 1, numSlots - 1);
+    };
+    auto slotOf = [&](size_t j, size_t n, size_t first, size_t slots) {
+      return (uint32_t)(first + (n <= slots ? j : j * slots / n));
+    };
     auto requestOrder = [&](const std::pair<uint32_t, uint32_t>& x) {
       const uint32_t e = x.first;
       const size_t n = domains.sizes[domains.index[e]];
@@ -1449,18 +1544,33 @@ struct CompileOpConstructor {
     for (size_t i : range(size)) {
       responses[i].resize(incoming[i].size());
     }
+    // (the index of the scratch tensor in the list of tensors that WorkCustom publishes: after the inputs and input
+    // copies)
+    const uint32_t publishedScratchIndex = graph.numInputs + graph.numInputCopies;
     for (auto [i, j] : order) {
-      const size_t numRequests = incoming[i].size();
       const PartialRequest& request = incoming[i][j];
       Partial partial = computePartial(
           request.sources, request.bytes, request.divisor, request.cellIndex, request.chunkIndex, requestOrder({i, j}));
-      const uint32_t slot = numRequests <= CustomOpDescriptor::numNotificationSlots
-                                ? j
-                                : j * CustomOpDescriptor::numNotificationSlots / numRequests;
+      const uint32_t slot = slotOf(j, incoming[i].size(), 0, partialSlots(i));
       op.notifications.push_back({(uint32_t)partial.doneSignal, i, slot});
-      // (the index of the scratch tensor in the list of tensors that WorkCustom publishes: after the inputs and input
-      // copies)
-      responses[i][j] = {(uint32_t)(graph.numInputs + graph.numInputCopies), partial.offset, slot};
+      responses[i][j] = {publishedScratchIndex, partial.offset, slot};
+    }
+    Vector<Vector<PartialResponse>> resultResponses(size);
+    for (size_t i : range(size)) {
+      const size_t first = partialSlots(i);
+      for (size_t j : indices(incomingResults[i])) {
+        const ResultRequest& request = incomingResults[i][j];
+        auto it = results.find(((uint64_t)request.cellIndex << 32) | request.chunkIndex);
+        const uint32_t slot = slotOf(j, incomingResults[i].size(), first, numSlots - first);
+        if (it == results.end()) {
+          // (this rank has no plan for the part: its edge is one that the kernel cannot take, an error that compile()
+          // raises on every rank before the op runs)
+          resultResponses[i].push_back({publishedScratchIndex, 0, slot});
+          continue;
+        }
+        op.notifications.push_back({(uint32_t)it->second.first, (uint32_t)i, slot});
+        resultResponses[i].push_back({publishedScratchIndex, it->second.second, slot});
+      }
     }
     std::ranges::stable_sort(partialEdges, {}, [](const std::pair<PartialOrder, Edge>& x) {
       return x.first;
@@ -1469,30 +1579,39 @@ struct CompileOpConstructor {
       graph.edges.push_back(std::move(x.second));
     }
     for (size_t i : range(size)) {
-      ctx.send(i, responses[i]);
+      ctx.send(i, responses[i], resultResponses[i]);
     }
     Vector<Vector<PartialResponse>> received(size);
+    Vector<Vector<PartialResponse>> receivedResults(size);
     for (size_t i : range(size)) {
-      ctx.receive(i, received[i]);
-      CHECK(received[i].size() == requests[i].size());
+      ctx.receive(i, received[i], receivedResults[i]);
+      CHECK(received[i].size() == requests[i].size() && receivedResults[i].size() == resultRequests[i].size());
     }
 
     // The executor's edges, with the partial results of other ranks read from their scratch tensors once notified.
     // The CPU thread issues the reads in signal order: per part, from the domain before this rank's first, then the
     // one before that, ..., which is the order in which the partial ranks compute them (see above): at any time,
     // every partial rank has one reader. (The kernel combines them in the order of the domains, the same for every
-    // part.) The edges go in the order of the plans (part by part), in which the kernel takes them.
+    // part.) In two rounds, an executor's edge computes its share of the part, which it stores to the destinations of
+    // its domain and to its scratch tensor, where the other owners read it once notified (it has a done signal); then
+    // an edge per other share of the part copies the share from where this rank has read it (in the same order of
+    // domains, after the partial results of the part) to the destinations of its domain. The edges go in the order of
+    // the plans (part by part), in which the kernel takes them.
+    auto readOrder = [&](uint32_t r) {
+      return (myDomain + numDomains - 1 - domains.index[r]) % numDomains;
+    };
     Vector<size_t> positions;
     Vector<Edge> planned;
+    Vector<Vector<Edge>> plannedCopies;
     for (Plan& plan : plans) {
       Edge& e = graph.edges[plan.edgeIndex];
-      auto readOrder = plan.partials;
-      std::ranges::stable_sort(readOrder, {}, [&](const auto& x) {
-        return (myDomain + numDomains - 1 - domains.index[std::get<1>(x)]) % numDomains;
+      auto partials = plan.partials;
+      std::ranges::stable_sort(partials, {}, [&](const auto& x) {
+        return readOrder(std::get<1>(x));
       });
-      for (auto [sourcePosition, partialRank, requestIndex] : readOrder) {
+      for (auto [sourcePosition, partialRank, requestIndex] : partials) {
         const PartialResponse& response = received[partialRank].at(requestIndex);
-        auto r = read(partialRank, response.tensorIndex, response.offset, e.bytes, response.slot);
+        auto r = read(partialRank, response.tensorIndex, response.offset + plan.offset, plan.bytes, response.slot);
         plan.sources[sourcePosition] = scratchNode(r.outputOffset, true);
         plan.signals[sourcePosition] = r.signalIndex;
       }
@@ -1501,6 +1620,27 @@ struct CompileOpConstructor {
           return x >= 0;
         });
       };
+      Vector<Edge> copies;
+      std::ranges::stable_sort(plan.shares, {}, [&](const Share& s) {
+        return readOrder(s.owner);
+      });
+      for (const Share& s : plan.shares) {
+        const PartialResponse& response = receivedResults[s.owner].at(s.requestIndex);
+        auto r = read(s.owner, response.tensorIndex, response.offset, s.bytes, response.slot);
+        Edge copy;
+        copy.id = ictx.nextEdgeId();
+        copy.sources.push_back(scratchNode(r.outputOffset, true));
+        copy.sourceSignals.push_back(r.signalIndex);
+        copy.destinations = e.destinations;
+        for (Node& n : copy.destinations) {
+          n.offset += s.offset;
+        }
+        copy.bytes = s.bytes;
+        copy.cellIndex = e.cellIndex;
+        copy.chunkIndex = e.chunkIndex;
+        copy.executorRank = rank;
+        copies.push_back(std::move(copy));
+      }
       e.sources = std::move(plan.sources);
       if (any(plan.signals)) {
         e.sourceSignals = std::move(plan.signals);
@@ -1510,13 +1650,43 @@ struct CompileOpConstructor {
       }
       e.partialSources = plan.partialSources;
       e.divisor = plan.divisor;
+      if (plan.doneSignal >= 0) {
+        for (Node& n : e.destinations) {
+          n.offset += plan.offset;
+        }
+        e.destinations.push_back(scratchNode(plan.resultOffset, false));
+        e.bytes = plan.bytes;
+        e.doneSignal = plan.doneSignal;
+      }
       positions.push_back(plan.edgeIndex);
       planned.push_back(std::move(e));
+      plannedCopies.push_back(std::move(copies));
     }
+    // The planned edges in the places of the plans' edges, in the order of the plans, with the copies of a plan's
+    // other shares after the edge of the next plan: blocks that wait for the shares of a part then wait behind the
+    // share of the next part, which they can compute meanwhile, so that the other owners get it early
     std::ranges::sort(positions);
-    for (size_t i : indices(planned)) {
-      graph.edges[positions[i]] = std::move(planned[i]);
+    Vector<Edge> ordered;
+    auto appendCopies = [&](size_t p) {
+      for (Edge& x : plannedCopies[p]) {
+        ordered.push_back(std::move(x));
+      }
+    };
+    for (size_t i = 0, next = 0; i != graph.edges.size(); ++i) {
+      if (next != positions.size() && positions[next] == i) {
+        ordered.push_back(std::move(planned[next]));
+        if (next != 0) {
+          appendCopies(next - 1);
+        }
+        if (next + 1 == positions.size()) {
+          appendCopies(next);
+        }
+        ++next;
+      } else {
+        ordered.push_back(std::move(graph.edges[i]));
+      }
     }
+    graph.edges = std::move(ordered);
 
     if (scratchBytes != 0) {
       Graph::TensorDescr t;
@@ -1527,15 +1697,15 @@ struct CompileOpConstructor {
       graph.tensors.push_back(t);
       op.scratchBytes = scratchBytes;
     }
-    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains, %d partial results or input copies (for "
-              "this and other ranks), %d signals, %zu bytes of scratch\n",
-        rank, plans.size(), numFlags, nextSignal, scratchBytes);
+    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds), %d partial results, "
+              "input copies or shares (for this and other ranks), %d signals, %zu bytes of scratch\n",
+        rank, plans.size(), results.size(), numFlags, nextSignal, scratchBytes);
 
     const size_t maxSignals = group->cpuOutBuffer.itembytes / sizeof(uint32_t) - 16;
     const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
     if ((size_t)nextSignal > maxSignals || (size_t)numFlags > maxFlags) {
-      return fmt::sprintf("rank %zu would read %d regions from other NVLink domains and compute %d partial results "
-                          "or input copies, more than its signals allow (%zu and %zu)",
+      return fmt::sprintf("rank %zu would read %d regions from other NVLink domains and compute %d partial results, "
+                          "input copies or shares, more than its signals allow (%zu and %zu)",
           rank, nextSignal, numFlags, maxSignals, maxFlags);
     }
     return "";
@@ -1988,6 +2158,14 @@ struct CompileOpConstructor {
     }
     REQUIRE(mismatch.empty(), "moodist.compile_op: ranks specified different dtypes or reduce ops (%s)", mismatch);
     const Domains domains(domainIds);
+    // MOODIST_COMPILE_OP_ROUNDS: all-reduces across NVLink domains in one round, in two wherever they can be, or
+    // ("auto") as the cost model in reductionPieces picks
+    std::string rounds = "auto";
+    if (isReduction(reduce)) {
+      rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
+      REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
+          "compile_op: MOODIST_COMPILE_OP_ROUNDS must be auto, 1 or 2 (not '%s')", rounds);
+    }
 
     // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
     // least 32 bits) and 32- and 64-bit integers
@@ -2126,6 +2304,24 @@ struct CompileOpConstructor {
       const size_t minPartBytes =
           allReduce ? std::clamp<size_t>((32 << 20) / maxDomainDestinations, 1 << 20, 4 << 20) : 4 << 20;
       static constexpr size_t maxParts = 32;
+      // An all-reduce in two rounds (see crossDomainReductions): with k domains with destinations and n with sources,
+      // an executor reads (n - 1) B for a part of B bytes in one round (the contributions of the other domains), and
+      // (n - 1) B / k + (k - 1) B / k in two (its share of those, and the other shares of the result), the same with
+      // two domains; the second round adds a notification and a read, about 25 us. The executors of a domain take
+      // up to bytes / m each: two rounds if they save at least twoRoundsMinSavedBytes (25 us at 80 GB/s).
+      // MOODIST_COMPILE_OP_ROUNDS=1 or 2 overrides this (2: wherever every share gets some bytes, with two domains
+      // too).
+      static constexpr size_t twoRoundsMinSavedBytes = 2 << 20;
+      bool twoRounds = false;
+      if (allReduce && bytes % 16 == 0 && rounds != "1") {
+        size_t sourceDomains = 0;
+        for (size_t d : range(domains.count)) {
+          sourceDomains += !domainSourceRanks[d].empty();
+        }
+        const size_t k = destinationDomains;
+        const size_t savedBytes = sourceDomains < 2 ? 0 : bytes / m * (k - 1) * (sourceDomains - 2) / k;
+        twoRounds = rounds == "2" || savedBytes >= twoRoundsMinSavedBytes;
+      }
       Vector<ReducedPiece> pieces;
       for (size_t p : range(numPieces)) {
         size_t begin = numPieces == 1 ? 0 : units * p / numPieces * 16;
@@ -2151,6 +2347,14 @@ struct CompileOpConstructor {
         for (size_t offset = begin; offset < end; offset += partBytes) {
           piece.offset = offset;
           piece.bytes = std::min(partBytes, end - offset);
+          piece.allReduce.shareOwners.clear();
+          if (twoRounds && piece.bytes / 16 >= destinationDomains) {
+            for (size_t d : range(domains.count)) {
+              if (!domainDestinations[d].empty()) {
+                piece.allReduce.shareOwners.push_back(piece.allReduce.ranks[d]);
+              }
+            }
+          }
           pieces.push_back(piece);
         }
       }
