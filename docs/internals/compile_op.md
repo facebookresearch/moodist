@@ -421,13 +421,16 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   part has completed. Small parts keep a rank on one or two sources at a time (with `readSources` 1), which with the
   read order keeps the ranks in step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
-  has arrived (slot `waitSlot` of the partial rank's slots in `inStepValueDeviceChunk`), and lets the reads after it
-  go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as soon as they are
-  ready, which keeps the order; the search skips the parts of a read together, which share its readiness). The CPU
-  thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the flags of all partial results
-  of a notification slot are set, it writes the step value into that slot of the executor
-  (`writeStepValueDeviceChunk`; a partial result that the executors of several domains read has a notification for
-  each).
+  has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`, words of their own: the
+  process group rings write step values under the indices of other ranks into the `inStepValueDeviceChunk` words of
+  their send neighbor without waiting for it to reach the op, so there a ring 16 ops later on another stream could
+  tell a rank still in the op that a partial result was ready before it was; the all-gather ring, the only one in
+  use, writes a rank's index only once that rank is in the ring op, i.e. done with the reads from it), and lets the
+  reads after it go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as
+  soon as they are ready, which keeps the order; the search skips the parts of a read together, which share its
+  readiness). The CPU thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the flags of
+  all partial results of a notification slot are set, it writes the step value into that slot of the executor
+  (`writeNotification`; a partial result that the executors of several domains read has a notification for each).
   With writes (`MOODIST_COMPILE_OP_TRANSFER=write`), the CPU thread of a partial rank watches the flags of its
   `IbWrite`s instead: once one is set (and the destination's input list has arrived), it splits the write into parts
   like a read (about 128 KiB, round robin over the NICs from one that rotates per write) and queues them on their

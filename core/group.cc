@@ -1352,6 +1352,7 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
     get(atomicStepValue, size * Group::maxConcurrency);
     get(cpuArrivalValues, size * Group::maxConcurrency);
     get(customDyns, size * Group::maxConcurrency);
+    get(customNotifications, Group::numNotificationSlots * size * Group::maxConcurrency);
 
     mySharedMemSize = offset;
 

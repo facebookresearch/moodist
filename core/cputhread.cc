@@ -262,6 +262,7 @@ struct CpuThreadImpl {
   uint32_t* cpuStepValues = group->cpuStepValues;
   uint32_t* cpuStepValuesDeviceChunks = group->cpuStepValuesDeviceChunks;
   uint32_t* cpuArrivalValues = group->cpuArrivalValues;
+  uint32_t* customNotifications = group->customNotifications;
 
   // uint32_t* cudaStepValues = group->cudaStepValues;
   // uint32_t* cudaStepValuesDeviceChunks = group->cudaStepValuesDeviceChunks;
@@ -423,6 +424,11 @@ struct CpuThreadImpl {
   uint32_t& inArrivalValue(size_t concurrencyIndex, size_t index) {
     CHECK(index < size);
     return cpuArrivalValues[size * concurrencyIndex + index];
+  }
+  // compile_op's notifications (Group::customNotifications): slot `slot` of rank `index`'s, in this rank's memory
+  uint32_t& inNotification(size_t concurrencyIndex, size_t index, size_t slot) {
+    CHECK(index < size && slot < Group::numNotificationSlots);
+    return customNotifications[Group::numNotificationSlots * (size * concurrencyIndex + index) + slot];
   }
 
   size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
@@ -1316,6 +1322,17 @@ struct CpuThreadImpl {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inArrivalValue(concurrencyIndex, rank));
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, 0),
+        outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
+        sizeof(uint32_t));
+  }
+
+  // Writes the op's step value (outStepValue slot 0) into notification slot `slot` of this rank's in the memory of
+  // rank i (see Group::customNotifications and WorkCustom)
+  void writeNotification(size_t concurrencyIndex, size_t i, size_t slot) {
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    auto offset = group->getSharedOffset(&inNotification(concurrencyIndex, rank, slot));
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, 0),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(uint32_t));
@@ -5921,8 +5938,7 @@ struct CpuThreadImpl {
       if (!remoteInputListReady[read.rank]) {
         return false;
       }
-      return read.waitSlot < 0 || self.inStepValueDeviceChunk(concurrencyIndex, read.rank, read.waitSlot / maxChunks,
-                                      read.waitSlot % maxChunks) >= stepValue;
+      return read.waitSlot < 0 || self.inNotification(concurrencyIndex, read.rank, read.waitSlot) >= stepValue;
     }
 
     // Write the notifications whose flags the kernel has written (all flags of their rank and slot)
@@ -5937,7 +5953,7 @@ struct CpuThreadImpl {
         const auto& n = notifications[i];
         if (--slotFlagsLeft[n.rank * CustomOpDescriptor::numNotificationSlots + n.slot] == 0) {
           self.trace(concurrencyIndex, 0, "%#x notify %d", stepValue, n.rank);
-          self.writeStepValueDeviceChunk(concurrencyIndex, n.rank, 0, rank, n.slot / maxChunks, n.slot % maxChunks);
+          self.writeNotification(concurrencyIndex, n.rank, n.slot);
         }
       }
       while (firstUnseen != notifications.size() && flagSeen[firstUnseen]) {

@@ -211,6 +211,15 @@ struct Group {
   // that the rank publishes to this one. Process group collectives use localDyns, the rings with list slots that are
   // not rank indices (the neighbor's lists in slots 0 and 1).
   DynamicAddresses* customDyns = nullptr;
+  // compile_op's notifications (see CustomOpDescriptor::Notification): per concurrency slot, rank and notification
+  // slot, the step value of the latest op of the slot in which the rank has notified this one in that slot. In
+  // cpuStepValuesDeviceChunks, process group rings write step values under the indices of other ranks into their send
+  // neighbor's memory without waiting for it to reach the op, so a ring 16 ops later (on another stream) could tell a
+  // rank still in a compile_op that a partial result was ready before it was. (The all-gather ring writes a rank's
+  // index only once that rank is in the ring op, i.e. done with the reads from it; the reduce-scatter ring, unused,
+  // writes its first one at once.)
+  static constexpr size_t numNotificationSlots = 32;
+  uint32_t* customNotifications = nullptr;
 
   AllocatedArray cudaStepValuesBuffer;
   AllocatedArray cudaStepValuesDeviceChunksBuffer;

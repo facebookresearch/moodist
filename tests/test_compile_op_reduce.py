@@ -699,9 +699,9 @@ def test_reduce_configs(ctx: TestContext):
 def test_reduce_interleaved(ctx: TestContext):
     """Reductions interleaved with the process group's collectives on one stream: 400 ops without waiting in between,
     with random delays between the calls on every rank. Each op's words in the concurrency slots (tensor lists, step
-    values, notification slots) are reused by the op 16 later, of any kind, and in a reduction a rank exchanges data
-    over RDMA only with some ranks (here also one of the inputs of two ranks, in which most ranks only receive). See
-    also test_reduce_two_streams."""
+    values, notifications, arrival values) are reused by the op 16 later (the step values by ops of any kind), and in
+    a reduction a rank exchanges data over RDMA only with some ranks (here also one of the inputs of two ranks, in
+    which most ranks only receive). See also test_reduce_two_streams."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     numel = 4096

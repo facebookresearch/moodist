@@ -360,9 +360,8 @@ struct CustomOpDescriptor {
     uint32_t rank;
     uint32_t slot;
   };
-  // Notification slots per pair of ranks (inStepValueDeviceChunk: maxDevices x maxChunks)
-  static constexpr size_t numNotificationSlots = 32;
-  static_assert(numNotificationSlots == maxDevices * maxChunks);
+  // Notification slots per pair of ranks (Group::customNotifications)
+  static constexpr size_t numNotificationSlots = Group::numNotificationSlots;
 
   // With writes instead of reads (MOODIST_COMPILE_OP_TRANSFER=write, see crossDomainReductions in compile_op.cc): a
   // range of a partial result (or of a share of a result) that this rank's kernel computes for a rank in another
