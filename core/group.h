@@ -220,11 +220,12 @@ struct Group {
   DynamicAddresses* customDyns = nullptr;
   // compile_op's notifications (see CustomOpDescriptor::Notification): per concurrency slot, rank and notification
   // slot, the step value of the latest op of the slot in which the rank has notified this one in that slot. In
-  // cpuStepValuesDeviceChunks, process group rings write step values under the indices of other ranks into their send
-  // neighbor's memory without waiting for it to reach the op, so a ring 16 ops later (on another stream) could tell a
-  // rank still in a compile_op that a partial result was ready before it was. (The all-gather ring writes a rank's
-  // index only once that rank is in the ring op, i.e. done with the reads from it; the reduce-scatter ring, unused,
-  // writes its first one at once.)
+  // cpuStepValuesDeviceChunks, the process group's all-gather and reduce-scatter rings write step values under the
+  // indices of other ranks into their send neighbor's memory without waiting for it to reach the op (the broadcast
+  // rings only into ranks that have reached it), so such a ring 16 ops later (on another stream) could tell a rank
+  // still in a compile_op that a partial result was ready before it was. (The all-gather ring writes a rank's index
+  // only once that rank is in the ring op: that rank has then finished the compile_op, which it does only once the
+  // reads from it are over; the reduce-scatter ring, unused, writes its first one at once.)
   static constexpr size_t numNotificationSlots = 32;
   uint32_t* customNotifications = nullptr;
 

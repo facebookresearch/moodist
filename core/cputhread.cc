@@ -425,8 +425,10 @@ struct CpuThreadImpl {
     CHECK(index < size);
     return cpuArrivalValues[size * concurrencyIndex + index];
   }
-  // (both words in one load: they come in one write)
+  // (both words in one load: they come in one write; lock-free, as a lock would not keep the NIC out)
   ArrivalValue loadArrivalValue(size_t concurrencyIndex, size_t index) {
+    static_assert(std::atomic_ref<ArrivalValue>::is_always_lock_free &&
+                  std::atomic_ref<ArrivalValue>::required_alignment <= alignof(ArrivalValue));
     return std::atomic_ref(inArrivalValue(concurrencyIndex, index)).load(std::memory_order_relaxed);
   }
   // compile_op's notifications (Group::customNotifications): slot `slot` of rank `index`'s, in this rank's memory
@@ -1327,6 +1329,8 @@ struct CpuThreadImpl {
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inArrivalValue(concurrencyIndex, rank));
     static_assert(sizeof(ArrivalValue) == 2 * sizeof(uint32_t) && arrivalWords % 2 == 0);
+    // (after the signals' outStepValue slots, within the 32 of a concurrency slot)
+    static_assert(signalStepValues + maxDevices <= arrivalWords && arrivalWords + 2 <= 32);
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, arrivalWords),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(ArrivalValue));
@@ -6606,13 +6610,13 @@ struct CpuThreadImpl {
       // values in the slot's words), except into words of their own: its tensor list, which its peers read before the
       // op can end on this rank, and its arrival values. And the words that it waits on (step values, notifications,
       // arrival values) only the rank that they come from writes, with ever larger values (the notifications have
-      // words of their own: process group rings write step values under the indices of other ranks). But the process
-      // group collectives need it: they write their tensor lists into the memory of other ranks without waiting for
-      // them to reach the op (the rings also those step values, and they keep a neighbor's list in list slots 0 and 1,
-      // which the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's
-      // previous op (16 ops earlier) by then. Between process group collectives, which wait for all ranks, that holds
-      // on one stream; the peers alone would let a rank get any number of ops ahead of the ranks that it does not
-      // exchange with.
+      // words of their own, see Group::customNotifications). But the process group collectives need it: they write
+      // their tensor lists into the memory of other ranks without waiting for them to reach the op (the all-gather
+      // ring also writes step values under the indices of other ranks, and keeps its neighbor's lists in list slots 0
+      // and 1, which the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished the
+      // slot's previous op (16 ops earlier) by then. On one stream, the collectives that wait for all ranks (barriers,
+      // all-gathers, reduce-scatters, all-reduces) keep every rank within an op of every other too; the peers alone
+      // would let a rank get any number of ops ahead of the ranks that it does not exchange with.
       for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {

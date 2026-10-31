@@ -415,29 +415,32 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   in the earlier one: a rank writes its step value into another rank's memory only once that rank's input list for
   the same op has arrived (it is then done with the slot's previous op). The last wait keeps every rank within an op
   of every other, as when all ranks waited for each other's reads. The process group collectives need that: they
-  write their lists into the memory of other ranks without waiting for them to reach the op (the rings also step
-  values under the indices of other ranks, and they keep a neighbor's list in list slots 0 and 1, which the other
-  collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's previous op by then;
-  between process group collectives, which wait for all ranks, that holds on one stream, but the peers alone would
-  let a rank get any number of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival
-  value (its step value and op id) into the memory of the ranks that are not its peers, a few at a time while its
-  reads go on, into words of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it
-  writes them without knowing whether the other rank is done with the slot's previous op, which may be a process
-  group collective waiting for an exact step value); with the op's step value, the op ids must match (the peers
-  compare theirs in their input lists). The parts of a read with a signal share it: the signal is written when the
-  last part has completed. Small parts keep a rank on one or two sources at a time (with `readSources` 1), which with
-  the read order keeps the ranks in step (see the RDMA read notes under Performance).
+  write their lists into the memory of other ranks without waiting for them to reach the op (the all-gather ring also
+  writes step values under the indices of other ranks, and keeps its neighbor's lists in list slots 0 and 1, which
+  the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's previous
+  op by then; on one stream, the collectives that wait for all ranks (barriers, all-gathers, reduce-scatters,
+  all-reduces) keep every rank within an op of every other too, but the peers alone would let a rank get any number
+  of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival value (its step value and op
+  id) into the memory of the ranks that are not its peers, a few at a time while its reads go on, into words of their
+  own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it writes them without knowing
+  whether the other rank is done with the slot's previous op, which may be a process group collective waiting for an
+  exact step value); with the op's step value, the op ids must match (the peers compare theirs in their input lists).
+  The parts of a read with a signal share it: the signal is written when the last part has completed. Small parts
+  keep a rank on one or two sources at a time (with `readSources` 1), which with the read order keeps the ranks in
+  step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
-  has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`, words of their own: the
-  process group rings write step values under the indices of other ranks into the `inStepValueDeviceChunk` words of
-  their send neighbor without waiting for it to reach the op, so there a ring 16 ops later on another stream could
-  tell a rank still in the op that a partial result was ready before it was; the all-gather ring, the only one in
-  use, writes a rank's index only once that rank is in the ring op, i.e. done with the reads from it), and lets the
-  reads after it go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as
-  soon as they are ready, which keeps the order; the search skips the parts of a read together, which share its
-  readiness). The CPU thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the flags of
-  all partial results of a notification slot are set, it writes the step value into that slot of the executor
-  (`writeNotification`; a partial result that the executors of several domains read has a notification for each).
+  has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`), and lets the reads after
+  it go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as soon as they
+  are ready, which keeps the order; the search skips the parts of a read together, which share its readiness). The
+  CPU thread of a partial rank meanwhile watches its kernel's `doneSignal` flags: once the flags of all partial
+  results of a notification slot are set, it writes the step value into that slot of the executor
+  (`writeNotification`; a partial result that the executors of several domains read has a notification for each). The
+  notifications have words of their own: in the `inStepValueDeviceChunk` words, where they were before, the process
+  group's all-gather and reduce-scatter rings write step values under the indices of other ranks into their send
+  neighbor's memory without waiting for it to reach the op (the broadcast rings only into ranks that have reached
+  it), so a ring 16 ops later on another stream could tell a rank still in the op that a partial result was ready
+  before it was (the all-gather ring, the only one of the two in use, writes a rank's index only once that rank is in
+  the ring op: that rank has then finished the compile_op, which it does only once the reads from it are over).
   With writes (`MOODIST_COMPILE_OP_TRANSFER=write`), the CPU thread of a partial rank watches the flags of its
   `IbWrite`s instead: once one is set (and the destination's input list has arrived), it splits the write into parts
   like a read (about 128 KiB, round robin over the NICs from one that rotates per write) and queues them on their
@@ -887,12 +890,16 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   need every rank to be done with an op before another starts the op 16 later (in the same concurrency slot):
   arrival values every few ops, with a wait for an earlier op's, would save most of them, but let the ranks drift
   further apart, which the read order does not like (how much the ops need them for speed has not been measured).
-- Ranks that call different ops at the same point (a bug in the caller) fail with "Mismatched custom operation" if
-  both ops are compile_op ops (the peers compare the op ids in their input lists, the other ranks in their arrival
-  values), but a compile_op op and a process group collective wait for each other forever: the input lists of
-  compile_op have words of their own, so neither sees the other's (before, a rank in a compile_op op failed on the
-  list of a direct collective in the slot of its rank, though not on a ring's). `WorkCustom` could watch the process
-  group's list slots while it waits: a list there with the op's step value means a mismatch.
+- Ranks that call different ops at the same point (a bug in the caller) usually fail with "Mismatched custom
+  operation" if both ops are compile_op ops (the peers compare the op ids in their input lists, the other ranks in
+  their arrival values), but can also wait forever: two ranks of which only one counts the other as its peer wait for
+  each other (one for an input list, which goes only to peers, the other for an arrival value, which goes only to the
+  other ranks), as do the ranks of an op with RDMA for those of one without (which run no `WorkCustom`), and a rank
+  that waits forever compares no further op ids. A compile_op op and a process group collective wait for each other
+  forever: the input lists of compile_op have words of their own, so neither sees the other's (before, a rank in a
+  compile_op op failed on the list of a direct collective in the slot of its rank, though not on a ring's).
+  `WorkCustom` could watch the process group's list slots while it waits: a list there with the op's step value means
+  a mismatch.
 - RDMA bandwidth on GB300 (one ConnectX-8 card with 4 ports of 200 Gb/s per GPU, i.e. 100 GB/s): the card's PCIe
   link to the CPU is Gen5 x16, and without Data Direct the NICs reach GPU memory through it, at about 52 GB/s per GPU.
   Each card also has a Data Direct DMA function behind its own PCIe switch, to which one GPU is attached (Gen6 x16).
