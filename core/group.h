@@ -61,6 +61,13 @@ struct alignas(64) CpuDynamicAddresses {
   size_t gatherBytes;
 };
 
+// A rank's compile_op arrival value (see Group::cpuArrivalValues): one RDMA write puts both words, and the reader
+// loads both at once (assuming, as the step values do for 4 bytes, that an aligned write of 8 bytes is not torn)
+struct alignas(8) ArrivalValue {
+  uint32_t stepValue;
+  uint32_t opid;
+};
+
 struct StreamData {
   size_t cpuThreadIndex = -1;
   StreamData();
@@ -201,12 +208,12 @@ struct Group {
 
   std::atomic_uint32_t* atomicStepValue = nullptr;
 
-  // compile_op's arrival values (see WorkCustom in cputhread.cc): per concurrency slot and rank, the step value of the
-  // latest op of the slot that the rank has reached, which it writes into the memory of the ranks that are not its
-  // peers in the op. Only compile_op reads them, and only with >=, so a rank can write them without knowing whether
-  // the other rank has finished the slot's previous op, which may be a process group collective that waits for an
-  // exact value in cpuStepValues.
-  uint32_t* cpuArrivalValues = nullptr;
+  // compile_op's arrival values (see WorkCustom in cputhread.cc): per concurrency slot and rank, the step value and op
+  // id of the latest op of the slot that the rank has reached, which it writes into the memory of the ranks that are
+  // not its peers in the op. Only compile_op reads them, and only with >=, so a rank can write them without knowing
+  // whether the other rank has finished the slot's previous op, which may be a process group collective that waits
+  // for an exact value in cpuStepValues.
+  ArrivalValue* cpuArrivalValues = nullptr;
   // compile_op's tensor lists (see WorkCustom in cputhread.cc): per concurrency slot and rank, the header of the list
   // that the rank publishes to this one. Process group collectives use localDyns, the rings with list slots that are
   // not rank indices (the neighbor's lists in slots 0 and 1).

@@ -400,26 +400,31 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   (addresses, sizes, rkeys; CUDA tensors are registered on first use; the inputs, the input copies and the scratch
   tensor) to its peers, into words of its own (`Group::customDyns`: process group rings keep the lists of a rank's
   ring neighbor in its list slots 0 and 1, which a compile_op of rank 0 or 1 16 ops later overwrote while the rank
-  still read from its neighbor), registers the outputs, collects its peers' input lists, waits for `cpuIn`,
-  exchanges step values with its peers (their inputs are ready), issues its ibReads
-  (split into parts of about 128 KiB, and if the op has fewer reads than NICs, smaller reads too, into parts of at
-  least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in order, then the
-  others in the order of the compile phase, `readSources` at a time: with more than one, the parts of that many
-  reads go round robin, and a read whose parts have all been issued makes room for the next; each part on the NIC
-  with the fewest in flight, up to 8), waits for them, runs a second barrier with its peers (nobody reads this rank's
-  inputs any more), waits until all other ranks have reached the op too, and writes `cpuOut`. The step values and
-  notification slots that ranks write into each other's memory per concurrency slot are reused by the op 16 later, of
-  any kind, and some process group collectives wait for exact values in them, so a rank must not write there for a
-  later op while another still waits in the earlier one: a rank writes into another rank's only once that rank's
-  input list for the same op has arrived (it is then done with the slot's previous op), and the peers read its input
-  list (in words of its own) before the op can end on the rank. The last wait, which correctness does not need, keeps
-  every rank within an op of every other, as when all ranks waited for each other's reads: every rank writes an
-  arrival value into the memory of the ranks that are not its peers, a few at a time while its reads go on, into
-  words of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`), since it writes them
-  without knowing whether the other rank is done with the slot's previous op (which may be a process group collective
-  waiting for an exact step value). The parts of a read with a signal share it: the signal is written when the last
-  part has completed. Small parts keep a rank on one or two sources at a time (with `readSources` 1), which with the
-  read order keeps the ranks in step (see the RDMA read notes under Performance).
+  still read from its neighbor), registers the outputs, collects its peers' input lists, waits for `cpuIn`, exchanges
+  step values with its peers (their inputs are ready), issues its ibReads (split into parts of about 128 KiB, and if
+  the op has fewer reads than NICs, smaller reads too, into parts of at least 64 KiB; reads with a signal first, in
+  signal order, i.e. the chunks of a transfer in order, then the others in the order of the compile phase,
+  `readSources` at a time: with more than one, the parts of that many reads go round robin, and a read whose parts
+  have all been issued makes room for the next; each part on the NIC with the fewest in flight, up to 8), waits for
+  them, runs a second barrier with its peers (nobody reads this rank's inputs any more), waits until all other ranks
+  have reached the op too, and writes `cpuOut`. The step values that ranks write into each other's memory per
+  concurrency slot are reused by the op 16 later, of any kind, and some process group collectives wait for exact
+  values in them, so a rank must not write there for a later op while another still waits in the earlier one: a rank
+  writes its step value into another rank's memory only once that rank's input list for the same op has arrived (it
+  is then done with the slot's previous op). The last wait keeps every rank within an op of every other, as when all
+  ranks waited for each other's reads. The process group collectives need that: they write their lists into the
+  memory of other ranks without waiting for them to reach the op (the rings also step values under the indices of
+  other ranks, and they keep a neighbor's list in list slots 0 and 1, which the other collectives use for ranks 0 and
+  1), which is safe only if those ranks have finished the slot's previous op by then; between process group
+  collectives, which wait for all ranks, that holds on one stream, but the peers alone would let a rank get any
+  number of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival value (its step value
+  and op id) into the memory of the ranks that are not its peers, a few at a time while its reads go on, into words
+  of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it writes them without
+  knowing whether the other rank is done with the slot's previous op, which may be a process group collective waiting
+  for an exact step value); with the op's step value, the op ids must match (the peers compare theirs in their input
+  lists). The parts of a read with a signal share it: the signal is written when the last part has completed. Small
+  parts keep a rank on one or two sources at a time (with `readSources` 1), which with the read order keeps the ranks
+  in step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
   has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`, words of their own: the
   process group rings write step values under the indices of other ranks into the `inStepValueDeviceChunk` words of
@@ -876,12 +881,16 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   others (see the all-to-all-v table). compile_op would need a staging copy in another GPU's memory.
 - `WorkCustom` still sends an arrival value to every rank that is not its peer per op (on 64 GPUs, about 60 of the
   about 70 small RDMA writes of an op), so that every rank stays within an op of every other (see Runtime). They go
-  out while the reads go on, off the critical path, but keep the CPU thread busy; sending them every few ops, with a
-  wait for an earlier op's, would save most of them. They are not needed for correctness; how much the ops need
-  them (the read order wants the ranks in step) has not been measured.
-- A rank checks that the others run the same op (the op id in their input lists) only for its peers: ranks that call
-  different ops at the same point (a bug in the caller) can now wait forever instead of failing with "Mismatched
-  custom operation".
+  out while the reads go on, off the critical path, but keep the CPU thread busy. The process group collectives only
+  need every rank to be done with an op before another starts the op 16 later (in the same concurrency slot):
+  arrival values every few ops, with a wait for an earlier op's, would save most of them, but let the ranks drift
+  further apart, which the read order does not like (how much the ops need them for speed has not been measured).
+- Ranks that call different ops at the same point (a bug in the caller) fail with "Mismatched custom operation" if
+  both ops are compile_op ops (the peers compare the op ids in their input lists, the other ranks in their arrival
+  values), but a compile_op op and a process group collective wait for each other forever: the input lists of
+  compile_op have words of their own, so neither sees the other's (before, a rank in a compile_op op failed on the
+  list of a direct collective in the slot of its rank, though not on a ring's). `WorkCustom` could watch the process
+  group's list slots while it waits: a list there with the op's step value means a mismatch.
 - RDMA bandwidth on GB300 (one ConnectX-8 card with 4 ports of 200 Gb/s per GPU, i.e. 100 GB/s): the card's PCIe
   link to the CPU is Gen5 x16, and without Data Direct the NICs reach GPU memory through it, at about 52 GB/s per GPU.
   Each card also has a Data Direct DMA function behind its own PCIe switch, to which one GPU is attached (Gen6 x16).

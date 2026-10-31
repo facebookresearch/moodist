@@ -261,7 +261,7 @@ struct CpuThreadImpl {
   // Progress* localProgress2 = group->localProgress2;
   uint32_t* cpuStepValues = group->cpuStepValues;
   uint32_t* cpuStepValuesDeviceChunks = group->cpuStepValuesDeviceChunks;
-  uint32_t* cpuArrivalValues = group->cpuArrivalValues;
+  ArrivalValue* cpuArrivalValues = group->cpuArrivalValues;
   uint32_t* customNotifications = group->customNotifications;
 
   // uint32_t* cudaStepValues = group->cudaStepValues;
@@ -421,9 +421,13 @@ struct CpuThreadImpl {
     return cpuStepValues[size * concurrencyIndex + index];
   }
   // compile_op's arrival values (Group::cpuArrivalValues): rank `index`'s, in this rank's memory
-  uint32_t& inArrivalValue(size_t concurrencyIndex, size_t index) {
+  ArrivalValue& inArrivalValue(size_t concurrencyIndex, size_t index) {
     CHECK(index < size);
     return cpuArrivalValues[size * concurrencyIndex + index];
+  }
+  // (both words in one load: they come in one write)
+  ArrivalValue loadArrivalValue(size_t concurrencyIndex, size_t index) {
+    return std::atomic_ref(inArrivalValue(concurrencyIndex, index)).load(std::memory_order_relaxed);
   }
   // compile_op's notifications (Group::customNotifications): slot `slot` of rank `index`'s, in this rank's memory
   uint32_t& inNotification(size_t concurrencyIndex, size_t index, size_t slot) {
@@ -1316,16 +1320,19 @@ struct CpuThreadImpl {
         sizeof(uint32_t), counter);
   }
 
-  // Writes the op's step value (outStepValue slot 0) as this rank's arrival value into the memory of rank i (see
-  // Group::cpuArrivalValues and WorkCustom)
+  // Writes the op's step value and id (outStepValue slots arrivalWords and arrivalWords + 1) as this rank's arrival
+  // value into the memory of rank i (see Group::cpuArrivalValues and WorkCustom)
   void writeArrivalValue(size_t concurrencyIndex, size_t i) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inArrivalValue(concurrencyIndex, rank));
-    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, 0),
+    static_assert(sizeof(ArrivalValue) == 2 * sizeof(uint32_t) && arrivalWords % 2 == 0);
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, arrivalWords),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
-        sizeof(uint32_t));
+        sizeof(ArrivalValue));
   }
+  // (outStepValue slots arrivalWords and arrivalWords + 1 hold the step value and the op id, see WorkCustom)
+  static constexpr size_t arrivalWords = 8;
 
   // Writes the op's step value (outStepValue slot 0) into notification slot `slot` of this rank's in the memory of
   // rank i (see Group::customNotifications and WorkCustom)
@@ -6223,6 +6230,19 @@ struct CpuThreadImpl {
       }
     }
 
+    // Whether rank i, not a peer, has reached the op: its arrival value is at least the op's step value. With the
+    // op's step value, the op ids must match (the peers compare theirs in their tensor lists). A larger value is from
+    // a later op of the slot, so rank i has finished this one, and has seen this rank's arrival value for it (this
+    // rank's later ones come after this wait), so it has checked the pair.
+    bool arrived(size_t i) {
+      const ArrivalValue v = self.loadArrivalValue(concurrencyIndex, i);
+      if (v.stepValue == stepValue && v.opid != op->id) [[unlikely]] {
+        fatal("Mismatched custom operation: Local id is %d, remote id is %d (rank %d, in its arrival value)", op->id,
+            v.opid, i);
+      }
+      return v.stepValue >= stepValue;
+    }
+
     // Checks the writes against the tensors of their destinations, once their lists have arrived
     void checkWrite(const CustomOpDescriptor::IbWrite& write) {
       CHECK(write.rank < size && write.rank != rank);
@@ -6346,6 +6366,8 @@ struct CpuThreadImpl {
       for (size_t d : range(maxDevices)) {
         self.outStepValue(concurrencyIndex, signalStepValues + d) = stepValue;
       }
+      self.outStepValue(concurrencyIndex, arrivalWords) = stepValue;
+      self.outStepValue(concurrencyIndex, arrivalWords + 1) = op->id;
 
       // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
       {
@@ -6450,7 +6472,7 @@ struct CpuThreadImpl {
         Dyn& dyn = (Dyn&)self.inCustomDyn(concurrencyIndex, i);
 
         if (dyn.custom.opid != op->id) {
-          fatal("Mismatched custom operation: Local id is %d, remote id is %d", dyn.custom.opid, op->id);
+          fatal("Mismatched custom operation: Local id is %d, remote id is %d (rank %d)", op->id, dyn.custom.opid, i);
         }
         remoteFlags[i] = dyn.custom.flags;
 
@@ -6572,14 +6594,19 @@ struct CpuThreadImpl {
       }
 
       // All other ranks have reached the op too (their arrival values) before its stream goes on, so that no rank gets
-      // more than an op ahead of another, as when all ranks waited for each other's reads. This is not needed for
-      // correctness. Each concurrency slot's step values and notification slots, which ranks write into each other's
-      // memory, are reused by the op 16 later, of any kind, and some process group collectives wait for exact values
-      // in them; but a rank writes into another rank's only once that rank's tensor list for the same op has arrived,
-      // i.e. once that rank is done with the slot's previous op (the tensor lists have words of their own, which the
-      // peers read before the op can end on this rank). Arrival values have words of their own too, which only
-      // WorkCustom reads, with >=: with step values instead, a rank could overwrite one that a process group
-      // collective of another rank (16 ops earlier, on another stream) had not read yet, which then waited forever.
+      // more than an op ahead of another, as when all ranks waited for each other's reads. The op itself does not need
+      // this. It writes into another rank's memory only once that rank's tensor list for the same op has arrived (that
+      // rank is then done with the slot's previous op, which may be a process group collective waiting for exact
+      // values in the slot's words), except into words of their own: its tensor list, which its peers read before the
+      // op can end on this rank, and its arrival values. And the words that it waits on (step values, notifications,
+      // arrival values) only the rank that they come from writes, with ever larger values (the notifications have
+      // words of their own: process group rings write step values under the indices of other ranks). But the process
+      // group collectives need it: they write their tensor lists into the memory of other ranks without waiting for
+      // them to reach the op (the rings also those step values, and they keep a neighbor's list in list slots 0 and 1,
+      // which the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's
+      // previous op (16 ops earlier) by then. Between process group collectives, which wait for all ranks, that holds
+      // on one stream; the peers alone would let a rank get any number of ops ahead of the ranks that it does not
+      // exchange with.
       for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
@@ -6588,10 +6615,10 @@ struct CpuThreadImpl {
         if (op->isPeer[i]) {
           continue;
         }
-        if (self.inArrivalValue(concurrencyIndex, i) < stepValue) {
+        if (!arrived(i)) {
           self.trace(concurrencyIndex, 0, "%#x wait arrival of %d", stepValue, i);
         }
-        while (self.inArrivalValue(concurrencyIndex, i) < stepValue) {
+        while (!arrived(i)) {
           YIELD
         }
       }
