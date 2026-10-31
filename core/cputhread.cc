@@ -1399,7 +1399,7 @@ struct CpuThreadImpl {
   // dev.
   void writeRdmaSignal(size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end) {
     CHECK(i < size && first < end && end <= maxDevices);
-    CHECK(Group::rdmaSignalBytes * (signal + 1) <= group->rdmaSignalBuffer.itembytes);
+    CHECK(signal < group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes);
     size_t di = &dev - devices.data();
     auto offset = group->rdmaSignalBuffer.itembytes * concurrencyIndex + Group::rdmaSignalBytes * signal +
                   sizeof(uint32_t) * first;
@@ -5856,13 +5856,16 @@ struct CpuThreadImpl {
 
     static constexpr size_t maxInlinedInputs = 2;
 
+    // (stepValue last: other ranks read the fields once they see the new step value, so none may follow it in the
+    // write)
     struct Header {
       uint32_t opid;
       uint32_t numInputs;
       std::array<InputTensor, maxInlinedInputs> inputs;
-      uint32_t stepValue;
       uint32_t flags;
+      uint32_t stepValue;
     };
+    static_assert(offsetof(Header, stepValue) + sizeof(uint32_t) == sizeof(Header));
     // Header::flags: the signals of writes into this rank's tensors cannot follow the data (see writeRdmaSignal): the
     // writers flush first
     static constexpr uint32_t flagSignalsNeedFlush = 1;
@@ -5904,13 +5907,16 @@ struct CpuThreadImpl {
     const size_t numDevices = self.devices.size();
 
     // The signals of reads into CUDA tensors (see writeRdmaSignal): per signal index, the NICs that carried parts of
-    // its read (a bit each) and a destination of the read (address and output index). The NICs that carried parts of
+    // its read (a bit each) and a destination of the read (address and output index). The paths that carried parts of
     // reads without a signal index into CUDA tensors, and a destination of such a read for each, flushed at the end
-    // (see flushRead).
+    // (see flushRead): a bit per NIC and kind of registration of the destination on it (index 2 * NIC + Data Direct),
+    // since a flush read only orders the writes that took its own path (a NIC that failed to register memory through
+    // Data Direct registers the later tensors without it, see RdmaMr::dataDirect).
     Vector<uint8_t> signalDevices;
     Vector<std::pair<uintptr_t, uint32_t>> signalDestination;
-    uint8_t unsignaledDevices = 0;
-    std::array<std::pair<uintptr_t, uint32_t>, maxDevices> unsignaledDestination{};
+    uint8_t unsignaledPaths = 0;
+    std::array<std::pair<uintptr_t, uint32_t>, 2 * maxDevices> unsignaledDestination{};
+    static_assert(2 * maxDevices <= 8);
     size_t liveFlushes = 0;
 
     // Writes (see CustomOpDescriptor::IbWrite). Once the kernel has written a write's flag, its parts go into the
@@ -6041,8 +6047,9 @@ struct CpuThreadImpl {
           signalDevices.at(signal) |= 1 << di;
           signalDestination.at(signal) = {localAddress, read.outputIndex};
         } else {
-          unsignaledDevices |= 1 << di;
-          unsignaledDestination[di] = {localAddress, read.outputIndex};
+          const size_t path = 2 * di + outputMrs[read.outputIndex]->mrs[di]->dataDirect;
+          unsignaledPaths |= 1 << path;
+          unsignaledDestination[path] = {localAddress, read.outputIndex};
         }
       }
 
@@ -6099,16 +6106,17 @@ struct CpuThreadImpl {
     // once the CPU thread writes cpuOutBuffer slot 0, after them
     void flushUnsignaledReads() {
       CHECK(liveReads == 0);
-      if (unsignaledDevices == 0) {
+      if (unsignaledPaths == 0) {
         return;
       }
       ++liveFlushes;
       auto callback = self.makeCallback([this]() {
         --liveFlushes;
       });
-      for (size_t di : range(numDevices)) {
-        if (unsignaledDevices & (1 << di)) {
-          auto [address, outputIndex] = unsignaledDestination[di];
+      for (size_t path : range(2 * numDevices)) {
+        if (unsignaledPaths & (1 << path)) {
+          auto [address, outputIndex] = unsignaledDestination[path];
+          const size_t di = path / 2;
           self.flushRead(self.devices[di], rank, address, outputMrs[outputIndex]->mrs[di]->rkey, callback);
         }
       }

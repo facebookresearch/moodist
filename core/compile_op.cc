@@ -964,6 +964,25 @@ struct CompileOpConstructor {
     return value;
   }
 
+  // Raises the first rank's error (empty: none) on every rank, for errors that only some ranks may find: a rank
+  // that raised alone would leave the others waiting for it, in the next exchange or in the op's first run
+  void raiseFirstError(const std::string& error) {
+    for (size_t i : range(size)) {
+      ctx.send(i, error);
+    }
+    std::string first;
+    size_t firstRank = 0;
+    for (size_t i : range(size)) {
+      std::string e;
+      ctx.receive(i, e);
+      if (first.empty() && !e.empty()) {
+        first = std::move(e);
+        firstRank = i;
+      }
+    }
+    REQUIRE(first.empty(), "%s (found on rank %zu)", first, firstRank);
+  }
+
   // A comma separated list from agreedEnv.
   Vector<std::string> agreedEnvList(const char* name, const char* defaultValue) {
     std::string value = agreedEnv(name, defaultValue);
@@ -1962,21 +1981,52 @@ struct CompileOpConstructor {
     Vector<std::shared_ptr<KernelHandle>> sources;
     Vector<CompiledKernel> kernels;
 
+    // Errors in generating or compiling the kernels are raised on every rank, after the exchange below: a rank's
+    // kernels have its own edges (e.g. too many for a configuration's shared memory). generateKernel exchanges with
+    // the peers before its checks, so after an error a rank goes on with the other settings, for their exchanges.
+    // MOODIST_COMPILE_OP_PROFILE applies to the op's kernel (generated after the tuning, see generateKernel): checked
+    // here, where every rank takes part.
+    std::string error;
+    if (const char* env = std::getenv("MOODIST_COMPILE_OP_PROFILE"); env && std::atoi(env) < 1) {
+      error = "compile_op: MOODIST_COMPILE_OP_PROFILE must be the number of the launch to trace (1 or more)";
+    }
+    auto attempt = [&](auto&& f) {
+      try {
+        f();
+      } catch (const std::exception& e) {
+        if (error.empty()) {
+          error = e.what();
+        }
+      }
+    };
+
     for (const auto& s : settings) {
       // Tuning launches run without the CPU thread: nodes filled over RDMA count as filled. A rank that no kernel edge
       // touches has no kernel; it takes part in the barriers and the exchange of timings (with none of its own).
-      sources.push_back(
-          s.graph.cudaEdges.empty() ? nullptr : generateKernel(group, s.config, target, s.graph, ctx, true));
+      std::shared_ptr<KernelHandle> h;
+      if (!s.graph.cudaEdges.empty()) {
+        attempt([&] {
+          h = generateKernel(group, s.config, target, s.graph, ctx, true);
+        });
+      }
+      sources.push_back(std::move(h));
     }
 
     log.info("Generated %d kernels in %gs\n", sources.size(), seconds(std::chrono::steady_clock::now() - start));
     start = std::chrono::steady_clock::now();
 
     for (const auto& h : sources) {
-      kernels.push_back(h ? compileKernelPtx(h->ptx, "compile_op_copy") : CompiledKernel());
+      CompiledKernel k;
+      if (h) {
+        attempt([&] {
+          k = compileKernelPtx(h->ptx, "compile_op_copy");
+        });
+      }
+      kernels.push_back(std::move(k));
     }
 
     log.info("Compiled %d kernels in %gs\n", kernels.size(), seconds(std::chrono::steady_clock::now() - start));
+    raiseFirstError(error);
     start = std::chrono::steady_clock::now();
 
     uint32_t stepValue = 1;
@@ -3591,23 +3641,30 @@ struct CompileOpConstructor {
         ctx.barrier();
       }
 
-      // A rank that no kernel edge touches runs no kernel
+      // A rank that no kernel edge touches runs no kernel. Errors are raised on every rank, as in tuneKernels: this
+      // kernel is not one of the tuned ones (it waits for the RDMA transfers, and it may record a profile).
+      std::string error;
       if (!setting.graph.cudaEdges.empty()) {
-        std::shared_ptr<KernelHandle> kernelHandle =
-            generateKernel(group, setting.config, target, setting.graph, ctx, false);
-        const std::string& ptx = kernelHandle->ptx;
-        if (std::getenv("MOODIST_DUMP_KERNELS")) {
-          std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
-          FILE* f = fopen(fn.c_str(), "wb");
-          if (f) {
-            fwrite(ptx.data(), ptx.size(), 1, f);
-            fclose(f);
-            log.info("compile_op PTX dumped to %s\n", fn);
+        try {
+          std::shared_ptr<KernelHandle> kernelHandle =
+              generateKernel(group, setting.config, target, setting.graph, ctx, false);
+          const std::string& ptx = kernelHandle->ptx;
+          if (std::getenv("MOODIST_DUMP_KERNELS")) {
+            std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
+            FILE* f = fopen(fn.c_str(), "wb");
+            if (f) {
+              fwrite(ptx.data(), ptx.size(), 1, f);
+              fclose(f);
+              log.info("compile_op PTX dumped to %s\n", fn);
+            }
           }
+          op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+          op->kernelHandle = std::move(kernelHandle);
+        } catch (const std::exception& e) {
+          error = e.what();
         }
-        op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
-        op->kernelHandle = std::move(kernelHandle);
       }
+      raiseFirstError(error);
     } else {
       op->graph = graphs[0];
     }

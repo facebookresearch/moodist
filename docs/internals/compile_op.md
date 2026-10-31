@@ -474,9 +474,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   GPU does not order the writes, or it has `MOODIST_RDMA_FLUSH=1`), it asks the writers to flush (`Header::flags`).
   Signals without flushes rely on the NIC relaxing the order only of the writes into registrations that allow it: a
   NIC set to relax the order of all its writes needs `MOODIST_RDMA_FLUSH=1` on every rank. The reads without a signal
-  (into CUDA tensors) are flushed once they have all completed, through each NIC that carried some, before the CPU
-  thread lets the stream go on (`cpuOut`; it is one word, which the stream waits for). Data in CPU tensors needs no
-  flush (the completion, written to host memory too, does not pass it).
+  (into CUDA tensors) are flushed once they have all completed, through each NIC that carried some (a read for each
+  kind of registration that its data went into, through Data Direct or not), before the CPU thread lets the stream go
+  on (`cpuOut`; it is one word, which the stream waits for). Data in CPU tensors needs no flush (the completion,
+  written to host memory too, does not pass it).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU threads
   signal the kernel when the data of an RDMA transfer is in place (see Signals), and the kernel signals the CPU thread
   when it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).

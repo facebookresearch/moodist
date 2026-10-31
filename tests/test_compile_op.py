@@ -685,6 +685,14 @@ def test_compile_op_errors_on_all_ranks(ctx: TestContext, device: str):
     bad = [TensorRegion(offset=[0.5], shape=[k], device=device)] if ctx.rank == 1 else inputs
     expect_error(TypeError, "offset[0] must be an int", bad, everything)
 
+    # A kernel that the ranks with kernel edges fail to generate (too little shared memory for the copy pipelines):
+    # rank 0 copies to rank 1, and the other ranks have no kernel to generate (before, they waited in the tuning)
+    if device == "cuda":
+        with environment("MOODIST_COMPILE_OP_CONFIGS", "128:1024:4"):
+            source = [region(0, k)] if ctx.rank == 0 else []
+            destination = [region(0, k)] if ctx.rank == 1 else []
+            expect_error(RuntimeError, "shared memory are not enough", source, destination)
+
     # The group still compiles and runs ops
     op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=everything)
     x = torch.arange(k, dtype=dtype, device=device) + 100 * ctx.rank
