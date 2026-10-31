@@ -201,6 +201,11 @@ struct Group {
 
   std::atomic_uint32_t* atomicStepValue = nullptr;
 
+  // compile_op's tensor lists (see WorkCustom in cputhread.cc): per concurrency slot and rank, the header of the list
+  // that the rank publishes to this one. Process group collectives use localDyns, the rings with list slots that are
+  // not rank indices (the neighbor's lists in slots 0 and 1).
+  DynamicAddresses* customDyns = nullptr;
+
   AllocatedArray cudaStepValuesBuffer;
   AllocatedArray cudaStepValuesDeviceChunksBuffer;
 

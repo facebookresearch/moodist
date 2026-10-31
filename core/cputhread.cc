@@ -256,6 +256,7 @@ struct CpuThreadImpl {
   MemoryRegistration* commsMr = regMr((uintptr_t)group->mySharedMem, group->mySharedMemSize);
 
   DynamicAddresses* inDyns = group->localDyns;
+  DynamicAddresses* inCustomDyns = group->customDyns;
   // Progress* localProgress = group->localProgress;
   // Progress* localProgress2 = group->localProgress2;
   uint32_t* cpuStepValues = group->cpuStepValues;
@@ -402,6 +403,11 @@ struct CpuThreadImpl {
   DynamicAddresses& inDyn(size_t concurrencyIndex, size_t index) {
     CHECK(index < size);
     return inDyns[size * concurrencyIndex + index];
+  }
+  // compile_op's tensor lists (Group::customDyns): rank `index`'s, in this rank's memory
+  DynamicAddresses& inCustomDyn(size_t concurrencyIndex, size_t index) {
+    CHECK(index < size);
+    return inCustomDyns[size * concurrencyIndex + index];
   }
 
   uint32_t& outStepValue(size_t concurrencyIndex, size_t index) {
@@ -1277,6 +1283,16 @@ struct CpuThreadImpl {
     auto offset = group->getSharedOffset(&inDyn(concurrencyIndex, dstIndex));
     writeControl(concurrencyIndex, dev, i, (void*)&outDyn(concurrencyIndex, srcIndex), outDynsMr->mrs[di]->lkey,
         (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses) * numDyns);
+  }
+
+  // Writes this rank's compile_op tensor list header (outDyn slot 0) into its slot of rank i's Group::customDyns (see
+  // WorkCustom)
+  void writeCustomDyn(size_t concurrencyIndex, size_t i) {
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    auto offset = group->getSharedOffset(&inCustomDyn(concurrencyIndex, rank));
+    writeControl(concurrencyIndex, dev, i, (void*)&outDyn(concurrencyIndex, 0), outDynsMr->mrs[di]->lkey,
+        (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses));
   }
 
   void writeStepValue(
@@ -6362,12 +6378,14 @@ struct CpuThreadImpl {
           }
         }
 
-        // (to the peers, see CustomOpDescriptor::peers, and to itself if it reads from its own tensors)
+        // (to the peers, see CustomOpDescriptor::peers, and to itself if it reads from its own tensors; into words of
+        // their own, Group::customDyns: process group rings keep their neighbor's lists in list slots 0 and 1, which
+        // the lists of ranks 0 and 1 overwrote when a peer was still in a ring 16 ops earlier)
         if (op->dynSelf) {
-          self.writeDyn(concurrencyIndex, rank, 0, rank);
+          self.writeCustomDyn(concurrencyIndex, rank);
         }
         for (uint32_t peer : op->peers) {
-          self.writeDyn(concurrencyIndex, peer, 0, rank);
+          self.writeCustomDyn(concurrencyIndex, peer);
         }
       }
 
@@ -6382,21 +6400,21 @@ struct CpuThreadImpl {
         i = o == 0 ? rank : op->peers[op->peers.size() - o];
         CHECK(i >= 0 && i < size);
 
-        if (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+        if (self.inCustomDyn(concurrencyIndex, i).stepValue != stepValue) {
           self.trace(concurrencyIndex, 0, "%#x wait dyn %d", stepValue, i);
         }
-        while (self.inDyn(concurrencyIndex, i).stepValue != stepValue) {
+        while (self.inCustomDyn(concurrencyIndex, i).stepValue != stepValue) {
           YIELD
         }
         {
-          Dyn& dyn = (Dyn&)self.inDyn(concurrencyIndex, i);
+          Dyn& dyn = (Dyn&)self.inCustomDyn(concurrencyIndex, i);
           CHECK_DYN(dyn, opTypeCustom, stepValue, 0);
         }
 
-        while (((Dyn&)self.inDyn(concurrencyIndex, i)).custom.stepValue != stepValue) {
+        while (((Dyn&)self.inCustomDyn(concurrencyIndex, i)).custom.stepValue != stepValue) {
           YIELD
         }
-        Dyn& dyn = (Dyn&)self.inDyn(concurrencyIndex, i);
+        Dyn& dyn = (Dyn&)self.inCustomDyn(concurrencyIndex, i);
 
         if (dyn.custom.opid != op->id) {
           fatal("Mismatched custom operation: Local id is %d, remote id is %d", dyn.custom.opid, op->id);

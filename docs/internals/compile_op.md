@@ -398,8 +398,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   (`CustomOpDescriptor::peers`: the ranks it reads from, writes to or notifies, and those that read from it, write to
   it or notify it; the compile phase finds them in an exchange it already has). It publishes the rank's input list
   (addresses, sizes, rkeys; CUDA tensors are registered on first use; the inputs, the input copies and the scratch
-  tensor) to its peers, registers the outputs, collects its peers' input lists, waits for `cpuIn`, exchanges step
-  values with its peers (their inputs are ready), issues its ibReads
+  tensor) to its peers, into words of its own (`Group::customDyns`: process group rings keep the lists of a rank's
+  ring neighbor in its list slots 0 and 1, which a compile_op of rank 0 or 1 16 ops later overwrote while the rank
+  still read from its neighbor), registers the outputs, collects its peers' input lists, waits for `cpuIn`,
+  exchanges step values with its peers (their inputs are ready), issues its ibReads
   (split into parts of about 128 KiB, and if the op has fewer reads than NICs, smaller reads too, into parts of at
   least 64 KiB; reads with a signal first, in signal order, i.e. the chunks of a transfer in order, then the
   others in the order of the compile phase, `readSources` at a time: with more than one, the parts of that many
