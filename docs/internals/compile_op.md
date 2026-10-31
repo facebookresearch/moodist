@@ -406,25 +406,27 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   signal order, i.e. the chunks of a transfer in order, then the others in the order of the compile phase,
   `readSources` at a time: with more than one, the parts of that many reads go round robin, and a read whose parts
   have all been issued makes room for the next; each part on the NIC with the fewest in flight, up to 8), waits for
-  them, runs a second barrier with its peers (nobody reads this rank's inputs any more), waits until all other ranks
-  have reached the op too, and writes `cpuOut`. The step values that ranks write into each other's memory per
-  concurrency slot are reused by the op 16 later, of any kind, and some process group collectives wait for exact
-  values in them, so a rank must not write there for a later op while another still waits in the earlier one: a rank
-  writes its step value into another rank's memory only once that rank's input list for the same op has arrived (it
-  is then done with the slot's previous op). The last wait keeps every rank within an op of every other, as when all
-  ranks waited for each other's reads. The process group collectives need that: they write their lists into the
-  memory of other ranks without waiting for them to reach the op (the rings also step values under the indices of
-  other ranks, and they keep a neighbor's list in list slots 0 and 1, which the other collectives use for ranks 0 and
-  1), which is safe only if those ranks have finished the slot's previous op by then; between process group
-  collectives, which wait for all ranks, that holds on one stream, but the peers alone would let a rank get any
-  number of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival value (its step value
-  and op id) into the memory of the ranks that are not its peers, a few at a time while its reads go on, into words
-  of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it writes them without
-  knowing whether the other rank is done with the slot's previous op, which may be a process group collective waiting
-  for an exact step value); with the op's step value, the op ids must match (the peers compare theirs in their input
-  lists). The parts of a read with a signal share it: the signal is written when the last part has completed. Small
-  parts keep a rank on one or two sources at a time (with `readSources` 1), which with the read order keeps the ranks
-  in step (see the RDMA read notes under Performance).
+  them (and for its reads of the peers' input lists of more than two tensors, also of the lists that it does not use,
+  of peers that only read from it or write to it: their completions could otherwise come after the op had ended and
+  its `WorkCustom` was reused), runs a second barrier with its peers (nobody reads this rank's inputs any more),
+  waits until all other ranks have reached the op too, and writes `cpuOut`. The step values that ranks write into
+  each other's memory per concurrency slot are reused by the op 16 later, of any kind, and some process group
+  collectives wait for exact values in them, so a rank must not write there for a later op while another still waits
+  in the earlier one: a rank writes its step value into another rank's memory only once that rank's input list for
+  the same op has arrived (it is then done with the slot's previous op). The last wait keeps every rank within an op
+  of every other, as when all ranks waited for each other's reads. The process group collectives need that: they
+  write their lists into the memory of other ranks without waiting for them to reach the op (the rings also step
+  values under the indices of other ranks, and they keep a neighbor's list in list slots 0 and 1, which the other
+  collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's previous op by then;
+  between process group collectives, which wait for all ranks, that holds on one stream, but the peers alone would
+  let a rank get any number of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival
+  value (its step value and op id) into the memory of the ranks that are not its peers, a few at a time while its
+  reads go on, into words of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it
+  writes them without knowing whether the other rank is done with the slot's previous op, which may be a process
+  group collective waiting for an exact step value); with the op's step value, the op ids must match (the peers
+  compare theirs in their input lists). The parts of a read with a signal share it: the signal is written when the
+  last part has completed. Small parts keep a rank on one or two sources at a time (with `readSources` 1), which with
+  the read order keeps the ranks in step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
   has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`, words of their own: the
   process group rings write step values under the indices of other ranks into the `inStepValueDeviceChunk` words of

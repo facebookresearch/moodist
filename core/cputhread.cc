@@ -5871,6 +5871,8 @@ struct CpuThreadImpl {
 
     Vector<TemporaryBufferHandle> remoteInputList;
     Vector<bool> remoteInputListReady;
+    // Reads of input lists in flight (lists of more than maxInlinedInputs tensors)
+    size_t liveListReads = 0;
     // Per rank: its Header::flags
     Vector<uint32_t> remoteFlags;
 
@@ -6486,9 +6488,11 @@ struct CpuThreadImpl {
         } else {
           size_t di = o % self.devices.size();
           auto& dev = self.devices[di];
+          ++liveListReads;
           self.readData(dev, i, targetBuffer->cpuPointer, targetBuffer.mr->mrs[di]->lkey, (void*)dyn.gatherAddress,
               dyn.gatherKey[di], bytes, self.makeCallback([this, i = this->i] {
                 remoteInputListReady[i] = true;
+                --liveListReads;
               }));
         }
       }
@@ -6565,10 +6569,12 @@ struct CpuThreadImpl {
       }
       postArrivals(size);
 
-      if (liveReads || liveWrites) {
+      // (and of the reads of input lists: nothing else waits for those of the peers that this rank neither reads from
+      // nor writes to, and their completions use this Work)
+      if (liveReads || liveWrites || liveListReads) {
         self.trace(concurrencyIndex, 0, "%#x wait read and write completions", stepValue);
       }
-      while (liveReads || liveWrites) {
+      while (liveReads || liveWrites || liveListReads) {
         YIELD
       }
       flushUnsignaledReads();
