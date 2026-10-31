@@ -396,8 +396,9 @@ struct CustomOpDescriptor {
   Vector<IbWrite> ibWrites;
   // The ranks this rank exchanges with over RDMA in the op (its peers): those it reads from, writes to or notifies,
   // and those that read from it, write to it or notify it, in the order rank + 1, rank + 2, ... (mod the group size);
-  // isPeer per rank. Only peers exchange tensor lists and wait for each other's reads and writes; all ranks exchange
-  // step values (see WorkCustom). dynSelf: the rank reads from its own tensors, and so publishes its list to itself.
+  // isPeer per rank. Only peers exchange tensor lists and step values and wait for each other's reads and writes; the
+  // other ranks exchange arrival values (Group::cpuArrivalValues, see WorkCustom). dynSelf: the rank reads from its own
+  // tensors, and so publishes its list to itself.
   Vector<uint32_t> peers;
   Vector<uint8_t> isPeer;
   bool dynSelf = false;

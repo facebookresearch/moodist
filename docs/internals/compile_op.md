@@ -407,15 +407,19 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   others in the order of the compile phase, `readSources` at a time: with more than one, the parts of that many
   reads go round robin, and a read whose parts have all been issued makes room for the next; each part on the NIC
   with the fewest in flight, up to 8), waits for them, runs a second barrier with its peers (nobody reads this rank's
-  inputs any more), waits until all other ranks have reached the op too (their step values, which every rank sends
-  to the ranks that are not its peers a few at a time while its reads go on), and writes `cpuOut`. That last wait
-  keeps every rank within an op of every other, as when all ranks waited for each other's reads: the words that ranks
-  write into each other's memory per concurrency slot (input lists, step values, notification slots) are reused by
-  the op 16 later, of any kind, and some process group collectives wait for exact values in them, so a rank must not
-  write there for a later op while another still waits in the earlier one. The parts of a read with a signal share
-  it: the signal is written when the last part has completed. Small parts keep a rank on one or two sources at a time
-  (with `readSources` 1), which with the read order keeps the ranks in step (see the RDMA read notes under
-  Performance).
+  inputs any more), waits until all other ranks have reached the op too, and writes `cpuOut`. The step values and
+  notification slots that ranks write into each other's memory per concurrency slot are reused by the op 16 later, of
+  any kind, and some process group collectives wait for exact values in them, so a rank must not write there for a
+  later op while another still waits in the earlier one: a rank writes into another rank's only once that rank's
+  input list for the same op has arrived (it is then done with the slot's previous op), and the peers read its input
+  list (in words of its own) before the op can end on the rank. The last wait, which correctness does not need, keeps
+  every rank within an op of every other, as when all ranks waited for each other's reads: every rank writes an
+  arrival value into the memory of the ranks that are not its peers, a few at a time while its reads go on, into
+  words of their own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`), since it writes them
+  without knowing whether the other rank is done with the slot's previous op (which may be a process group collective
+  waiting for an exact step value). The parts of a read with a signal share it: the signal is written when the last
+  part has completed. Small parts keep a rank on one or two sources at a time (with `readSources` 1), which with the
+  read order keeps the ranks in step (see the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
   has arrived (slot `waitSlot` of the partial rank's slots in `inStepValueDeviceChunk`), and lets the reads after it
   go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as soon as they are
@@ -727,8 +731,8 @@ the same time (two domains: all-reduce 64 MiB 241 us, 256 MiB 852 us; reduce-sca
 except with 16 domains at 256 MiB: the all-reduce is 1.7% faster (1.91 ms), the reduce-scatter 1.5% slower at the
 median (47.9 ms instead of 47.2; the fastest 10% 46.5 ms instead of 44.4, the slowest 10% 55 ms instead of 63). The
 barrier with all ranks at the end of each op started the next op's reads on all ranks at once, which their order
-(every source one reader per step) needs; a temporary switch back to it for the final barrier brought the
-reduce-scatter back (46.4 ms) and the all-reduce too (1.94 ms).
+(every source one reader per step) needs: with a temporary switch back to it for the final barrier, the
+reduce-scatter took 46.4 ms and the all-reduce 1.94 ms.
 
 The cost model (step 7) against `MOODIST_COMPILE_OP_ROUNDS=1` and `2` (`bfloat16` all-reduce, k domains of 4 GPUs
 with `MOODIST_FABRIC=0`; one round / two rounds, in us; the model's crossover in the last column):
@@ -867,10 +871,14 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 - A GPU's RDMA traffic goes through its own NICs only. NCCL (PXN) also routes a GPU's data through the NICs of the
   other GPUs of its node, over NVLink first, and was 2.3 times faster when one source sent 4 times as much as the
   others (see the all-to-all-v table). compile_op would need a staging copy in another GPU's memory.
-- `WorkCustom` still sends its step value to every rank per op (on 64 GPUs, 63 of the about 70 small RDMA writes
-  of an op), so that every rank stays within an op of every other (see Runtime). They go out while the reads go on,
-  off the critical path, but keep the CPU thread busy; sending them every few ops, with a wait for an earlier op's,
-  would save most of them.
+- `WorkCustom` still sends an arrival value to every rank that is not its peer per op (on 64 GPUs, about 60 of the
+  about 70 small RDMA writes of an op), so that every rank stays within an op of every other (see Runtime). They go
+  out while the reads go on, off the critical path, but keep the CPU thread busy; sending them every few ops, with a
+  wait for an earlier op's, would save most of them. They are not needed for correctness; how much the ops need
+  them (the read order wants the ranks in step) has not been measured.
+- A rank checks that the others run the same op (the op id in their input lists) only for its peers: ranks that call
+  different ops at the same point (a bug in the caller) can now wait forever instead of failing with "Mismatched
+  custom operation".
 - RDMA bandwidth on GB300 (one ConnectX-8 card with 4 ports of 200 Gb/s per GPU, i.e. 100 GB/s): the card's PCIe
   link to the CPU is Gen5 x16, and without Data Direct the NICs reach GPU memory through it, at about 52 GB/s per GPU.
   Each card also has a Data Direct DMA function behind its own PCIe switch, to which one GPU is attached (Gen6 x16).
@@ -913,20 +921,21 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   for about 200 us before sleeping removed them in that test.
 - Pieces that are not contiguous go through separate copies before and after the op.
 - After tuning, the ranks log their graphs one after the other, with two barriers per rank.
-- Code layout (fixed in October 2026): small ops across two NVL72 domains (64 GPUs, all-reduce of 64 KiB to 4 MiB)
-  depended on the build's code layout while `WorkCustom` exchanged with all ranks. 9c67f3a's build took 91 us at
-  64 KiB (median; p90 100). Every build of it with code shifted took 102-109 us (p90 about 120; the fastest 10% the
-  same): a `nop` in `RdmaIb`'s constructor, 8 bytes of padding at the end of `RdmaIb` with an initializer (one store
-  more), a member more in `CustomOpDescriptor` or in `Rdma`, unused code in the CPU thread's loop, or the same source
-  built with `-falign-functions=64`. Data layout alone made no difference (the same padding without an initializer,
-  which leaves the code as it is; every malloc rounded up to whole cache lines by an LD_PRELOAD shim, in both
-  builds), nor did a changed log message: 9c67f3a's build was the lucky one. In CPU-thread traces of the two, the
-  slow build's phases that post RDMA writes took 6-7% longer (`start`, which sent the input list to all 64 ranks:
-  18.9 instead of 17.9 us; `step exchange`, the step value to the 63 others: 17.0 instead of 15.9 us), and its waits
-  for the last rank of a barrier 2-3 times as long. Each op posted about 190 small RDMA writes per rank, which kept
-  the CPU thread busy for most of the op, so a few percent of its speed became 20% of the op's time (`perf` is not
-  usable on these nodes, so the code that the layout slowed down is unknown). With the exchanges limited to the op's
-  peers (see Runtime), builds that differ by a `nop` take the same time (63 us at 64 KiB, p90 67).
+- Code layout (no longer visible since October 2026): small ops across two NVL72 domains (64 GPUs, all-reduce of
+  64 KiB to 4 MiB) depended on the build's code layout while `WorkCustom` exchanged with all ranks. 9c67f3a's build
+  took 91 us at 64 KiB (median; p90 100). Every build of it with code shifted took 102-109 us (p90 about 120; the
+  fastest 10% the same): a `nop` in `RdmaIb`'s constructor, 8 bytes of padding at the end of `RdmaIb` with an
+  initializer (one store more), a member more in `CustomOpDescriptor` or in `Rdma`, unused code in the CPU thread's
+  loop, or the same source built with `-falign-functions=64`. Data layout alone made no difference (the same padding
+  without an initializer, which leaves the code as it is; every malloc rounded up to whole cache lines by an
+  LD_PRELOAD shim, in both builds), nor did a changed log message: 9c67f3a's build was the lucky one. In CPU-thread
+  traces of the two, the slow build's phases that post RDMA writes took 6-7% longer (`start`, which sent the input
+  list to all 64 ranks: 18.9 instead of 17.9 us; `step exchange`, the step value to the 63 others: 17.0 instead of
+  15.9 us), and its waits for the last rank of a barrier 2-3 times as long. Each op posted about 190 small RDMA
+  writes per rank, which kept the CPU thread busy for most of the op, so a few percent of its speed became 20% of the
+  op's time (`perf` is not usable on these nodes, so the code that the layout slowed down is unknown). With the
+  exchanges limited to the op's peers (see Runtime), builds that differ by a `nop` take the same time (63 us at
+  64 KiB, p90 67).
 
 ### Cleanup
 - `docs/api/compile_op.md`: the examples predate `TensorRegion`'s `device` field.

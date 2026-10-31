@@ -697,10 +697,11 @@ def test_reduce_configs(ctx: TestContext):
 
 @test
 def test_reduce_interleaved(ctx: TestContext):
-    """Reductions interleaved with the process group's collectives: 400 ops without waiting in between, with random
-    delays between the calls on every rank. Each op's words in the concurrency slots (tensor lists, step values,
-    notification slots) are reused by the op 16 later, of any kind, and in a reduction a rank exchanges data over RDMA
-    only with some ranks (here also one of the inputs of two ranks, in which most ranks only receive)."""
+    """Reductions interleaved with the process group's collectives on one stream: 400 ops without waiting in between,
+    with random delays between the calls on every rank. Each op's words in the concurrency slots (tensor lists, step
+    values, notification slots) are reused by the op 16 later, of any kind, and in a reduction a rank exchanges data
+    over RDMA only with some ranks (here also one of the inputs of two ranks, in which most ranks only receive). See
+    also test_reduce_two_streams."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     numel = 4096
@@ -767,4 +768,54 @@ def test_reduce_interleaved(ctx: TestContext):
                 f"op {i} ({name}): {len(bad)} of {t.numel()} wrong, first at {first}: {t[first].item()} expected "
                 f"{expected[first].item()}"
             )
+    raise_on_all_ranks(ctx, pg, errors)
+
+
+@test
+def test_reduce_two_streams(ctx: TestContext):
+    """Reductions on one stream, the process group's reduce-scatters and all-reduces on another. An op starts on a
+    rank once the rank is done with the previous op of its concurrency slot (16 ops earlier), while other ranks may
+    still be in it, here in a collective on the other stream that waits for exact step values from every rank (the
+    process group's reduce-scatter across nodes: each reader tells each source that it is done). A reduction across
+    NVLink domains writes into the memory of ranks it exchanges nothing with too (arrival values, see WorkCustom),
+    which must not overwrite such a step value before the collective has read it, or the collective waits forever.
+    Each round: a large reduce-scatter or all-reduce, which takes longer than the reductions and which the ranks finish
+    at different times (random delays before it), then 16 small reductions, one of which reuses the slot of the
+    reduce-scatter. The reduce-scatter's RDMA goes between ranks of the same local rank on different nodes only, which
+    with 2 nodes are also the reduction's peers: this needs 3 nodes or more, and a rank that is late to read the
+    collective's step values (its CPU thread preempted, say); with step values as arrival values, a run on 4 nodes in
+    which one rank waited 3 ms before reading them hung. The all-reduces' all-gathers (rings) also check that the
+    reductions' tensor lists do not overwrite a ring's (see Group::customDyns): on 64 GPUs (16 nodes) they did, and
+    a rank read from its ring neighbor with another rank's address and key (a remote access error)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    side = torch.cuda.Stream()
+    shard = max((32 << 20) // n, 4096)  # float32 elements per rank (128 MiB per reduce-scatter in all)
+    numel = 4096
+    whole = [TensorRegion(offset=[0], shape=[numel], device="cuda")]
+    all_reduce = moodist.compile_op(pg, dtype=torch.float32, inputs=whole, outputs=whole, reduce="sum")
+    value = float(ctx.rank + 1)
+    total = float(n * (n + 1) // 2)
+    delays = random.Random(ctx.rank)
+    checks = []  # (name, a bool tensor: whether the output was right, computed on the op's stream)
+    for i in range(100):
+        if delays.random() < 0.3:
+            time.sleep(delays.uniform(0, 0.003))
+        # (nothing orders the two streams but the ops' concurrency slots)
+        with torch.cuda.stream(side):
+            x = torch.full((n * shard,), value, device="cuda")
+            if i % 2 == 0:
+                y = torch.empty(shard, device="cuda")
+                pg._reduce_scatter_base(y, x).wait()
+                checks.append((f"round {i}: reduce-scatter", (y == total).all()))
+            else:
+                pg.allreduce([x]).wait()  # (a reduce-scatter and an all-gather)
+                checks.append((f"round {i}: all-reduce", (x == total).all()))
+            del x
+        for j in range(16):
+            y = torch.empty(numel, device="cuda")
+            all_reduce([torch.full((numel,), value, device="cuda")], [y])
+            checks.append((f"round {i}: compile_op all-reduce {j}", (y == total).all()))
+    torch.cuda.synchronize()
+    errors = [f"{name}: wrong result" for name, ok in checks if not ok.item()]
     raise_on_all_ranks(ctx, pg, errors)

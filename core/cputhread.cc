@@ -261,6 +261,7 @@ struct CpuThreadImpl {
   // Progress* localProgress2 = group->localProgress2;
   uint32_t* cpuStepValues = group->cpuStepValues;
   uint32_t* cpuStepValuesDeviceChunks = group->cpuStepValuesDeviceChunks;
+  uint32_t* cpuArrivalValues = group->cpuArrivalValues;
 
   // uint32_t* cudaStepValues = group->cudaStepValues;
   // uint32_t* cudaStepValuesDeviceChunks = group->cudaStepValuesDeviceChunks;
@@ -417,6 +418,11 @@ struct CpuThreadImpl {
   uint32_t& inStepValue(size_t concurrencyIndex, size_t index) {
     CHECK(index < size);
     return cpuStepValues[size * concurrencyIndex + index];
+  }
+  // compile_op's arrival values (Group::cpuArrivalValues): rank `index`'s, in this rank's memory
+  uint32_t& inArrivalValue(size_t concurrencyIndex, size_t index) {
+    CHECK(index < size);
+    return cpuArrivalValues[size * concurrencyIndex + index];
   }
 
   size_t stepValueDeviceChunkIndex(size_t concurrencyIndex, size_t index, size_t device, size_t chunk) {
@@ -1295,14 +1301,24 @@ struct CpuThreadImpl {
         (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di], sizeof(DynamicAddresses));
   }
 
-  void writeStepValue(
-      size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex, size_t* counter = nullptr) {
+  void writeStepValue(size_t concurrencyIndex, size_t i, size_t srcIndex, size_t dstIndex, size_t* counter = nullptr) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inStepValue(concurrencyIndex, dstIndex));
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, srcIndex),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(uint32_t), counter);
+  }
+
+  // Writes the op's step value (outStepValue slot 0) as this rank's arrival value into the memory of rank i (see
+  // Group::cpuArrivalValues and WorkCustom)
+  void writeArrivalValue(size_t concurrencyIndex, size_t i) {
+    size_t di = (rank + i) % devices.size();
+    auto& dev = devices[di];
+    auto offset = group->getSharedOffset(&inArrivalValue(concurrencyIndex, rank));
+    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, 0),
+        outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
+        sizeof(uint32_t));
   }
 
   void writeStepValueDeviceChunk(
@@ -5889,11 +5905,11 @@ struct CpuThreadImpl {
     size_t writesLeft = 0; // writes whose signal has not been sent
     size_t liveWrites = 0; // parts of writes and their flushes in flight
 
-    // Step values (see step()): the writes of the op's step value to the peers in flight, and the next rank (as an
-    // offset from this one) that postOtherStepValues considers
+    // The writes of the op's step value to the peers in flight (see step()), and the next rank (as an offset from this
+    // one) that postArrivals considers
     size_t livePeerStepValues = 0;
-    size_t nextOtherRank = 1;
-    static constexpr size_t otherStepValuesPerRound = 8;
+    size_t nextArrivalRank = 1;
+    static constexpr size_t arrivalsPerRound = 8;
 
     Vector<MemoryRegistration*> outputMrs;
 
@@ -6175,16 +6191,17 @@ struct CpuThreadImpl {
       }
     }
 
-    // Posts the op's step value to up to n more of the ranks that are not peers, in the order rank + 1, rank + 2, ...
-    void postOtherStepValues(size_t n) {
-      while (n != 0 && nextOtherRank != size) {
-        size_t r = rank + nextOtherRank;
+    // Writes the rank's arrival value (Group::cpuArrivalValues) into the memory of up to n more of the ranks that are
+    // not peers, in the order rank + 1, rank + 2, ...
+    void postArrivals(size_t n) {
+      while (n != 0 && nextArrivalRank != size) {
+        size_t r = rank + nextArrivalRank;
         if (r >= size) {
           r -= size;
         }
-        ++nextOtherRank;
+        ++nextArrivalRank;
         if (!op->isPeer[r]) {
-          self.writeStepValue(concurrencyIndex, r, 0, rank);
+          self.writeArrivalValue(concurrencyIndex, r);
           --n;
         }
       }
@@ -6462,9 +6479,9 @@ struct CpuThreadImpl {
           YIELD
         }
       }
-      // Step values (the rank's stream has reached the op, so its tensors are ready): first with the peers, whose
-      // tensors the reads and writes below use, then to all other ranks a few at a time while the reads and writes go
-      // on (postOtherStepValues); only the end of the op waits for theirs
+      // Step values with the peers (the rank's stream has reached the op, so its tensors are ready), whose tensors the
+      // reads and writes below use; the other ranks get arrival values, a few at a time while the reads and writes go
+      // on (postArrivals), which only the end of the op waits for
       self.trace(concurrencyIndex, 0, "%#x step exchange", stepValue);
       for (uint32_t peer : op->peers) {
         self.writeStepValue(concurrencyIndex, peer, 0, rank, &livePeerStepValues);
@@ -6505,10 +6522,10 @@ struct CpuThreadImpl {
             tryRead(bestDevice);
           }
         }
-        postOtherStepValues(otherStepValuesPerRound);
+        postArrivals(arrivalsPerRound);
         YIELD
       }
-      postOtherStepValues(size);
+      postArrivals(size);
 
       if (liveReads || liveWrites) {
         self.trace(concurrencyIndex, 0, "%#x wait read and write completions", stepValue);
@@ -6538,11 +6555,15 @@ struct CpuThreadImpl {
         }
       }
 
-      // All other ranks have reached the op too (their step values) before its stream goes on, so that no rank gets
-      // more than an op ahead of another, as when all ranks waited for each other's reads. Each concurrency slot's
-      // words that ranks write into each other's memory (tensor lists, step values, notification slots) are reused by
-      // the op 16 later, of any kind (process group collectives too, some of which wait for exact values): a rank must
-      // not write there for a later op while another still waits for the earlier op's values.
+      // All other ranks have reached the op too (their arrival values) before its stream goes on, so that no rank gets
+      // more than an op ahead of another, as when all ranks waited for each other's reads. This is not needed for
+      // correctness. Each concurrency slot's step values and notification slots, which ranks write into each other's
+      // memory, are reused by the op 16 later, of any kind, and some process group collectives wait for exact values
+      // in them; but a rank writes into another rank's only once that rank's tensor list for the same op has arrived,
+      // i.e. once that rank is done with the slot's previous op (the tensor lists have words of their own, which the
+      // peers read before the op can end on this rank). Arrival values have words of their own too, which only
+      // WorkCustom reads, with >=: with step values instead, a rank could overwrite one that a process group
+      // collective of another rank (16 ops earlier, on another stream) had not read yet, which then waited forever.
       for (o = 1; o < size; ++o) {
         i = self.rank - o;
         if (i >= size) {
@@ -6551,10 +6572,10 @@ struct CpuThreadImpl {
         if (op->isPeer[i]) {
           continue;
         }
-        if (self.inStepValue(concurrencyIndex, i) < stepValue) {
+        if (self.inArrivalValue(concurrencyIndex, i) < stepValue) {
           self.trace(concurrencyIndex, 0, "%#x wait arrival of %d", stepValue, i);
         }
-        while (self.inStepValue(concurrencyIndex, i) < stepValue) {
+        while (self.inArrivalValue(concurrencyIndex, i) < stepValue) {
           YIELD
         }
       }
