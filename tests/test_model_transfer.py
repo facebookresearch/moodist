@@ -153,7 +153,7 @@ def _create_moodist_group(
 
     prefix_store = dist.PrefixStore(prefix, store)
     return moodist.create_moodist_backend(
-        prefix_store, group_rank, group_size, timedelta(seconds=30)
+        prefix_store, group_rank, group_size, timedelta(minutes=5)
     )
 
 
@@ -451,7 +451,7 @@ def _run_model_transfer_test(ctx: TestContext, trainer_ratio: float):
             store=inner_store,
             rank=inner_rank,
             world_size=inner_size,
-            timeout=timedelta(seconds=30),
+            timeout=timedelta(minutes=5),
         )
 
         # Create all_group for final barrier (all ranks)

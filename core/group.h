@@ -96,6 +96,12 @@ struct Group {
 
   std::unique_ptr<SetupComms> setupComms;
   std::unique_ptr<IpcMapper> ipcMapper;
+
+  // The process group's timeout (see setTimeout): how long a wait for other ranks may take, in the setup (which then
+  // fails, see SetupComms) and for mappings of other ranks' memory (see IpcMapper::checkSpin)
+  std::chrono::steady_clock::duration timeout = std::chrono::minutes(30);
+  void setTimeout(std::chrono::steady_clock::duration timeout);
+
   std::vector<std::unique_ptr<Rdma>> rdmaDevs;
   size_t numTrueIbDevs = 0;
   bool rdmaSupportsCuda = false;

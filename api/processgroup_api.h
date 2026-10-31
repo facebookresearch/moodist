@@ -9,6 +9,7 @@
 #include "tensor_ptr.h"
 #include "types.h"
 
+#include <chrono>
 #include <span>
 
 namespace moodist {
@@ -17,7 +18,9 @@ using namespace cuda;
 
 // Factory function - returns ApiHandle (ownership via RVO)
 // c10dStore is opaque pointer to c10d::Store - core calls back via WrapperApi for store ops
-api::ProcessGroupHandle createProcessGroup(void* c10dStore, int rank, int size);
+// timeout: the process group's timeout (0: the default, 30 minutes; MOODIST_TIMEOUT overrides it)
+api::ProcessGroupHandle createProcessGroup(
+    void* c10dStore, int rank, int size, std::chrono::steady_clock::duration timeout);
 
 // Destroy function - called by ApiHandle when refcount reaches 0
 void processGroupDestroy(api::ProcessGroup* pg);

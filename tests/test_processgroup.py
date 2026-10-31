@@ -6,6 +6,8 @@ ProcessGroup is created directly (not via torch.distributed.init_process_group)
 to avoid side effects and allow per-test isolation.
 """
 
+import os
+
 import torch
 from framework import TestContext, test, test_cpu_cuda, test_cpu_cuda_kernel_modes, create_process_group
 
@@ -16,6 +18,30 @@ def test_pg_creation(ctx: TestContext):
     pg = create_process_group(ctx)
     ctx.assert_equal(pg.rank(), ctx.rank)
     ctx.assert_equal(pg.size(), ctx.world_size)
+
+
+@test
+def test_pg_timeout(ctx: TestContext):
+    """A process group's timeout: the one given (PyTorch's), else 30 minutes; MOODIST_TIMEOUT overrides both."""
+    from datetime import timedelta
+
+    import moodist
+
+    if "MOODIST_TIMEOUT" in os.environ:
+        return
+    store = ctx.create_store(key=f"pg_timeout_{ctx._current_test_id}", timeout=timedelta(seconds=60))
+    pg = moodist.MoodistProcessGroup(store, ctx.rank, ctx.world_size, timeout=timedelta(seconds=123))
+    ctx.assert_equal(pg._get_option("timeout_ms"), 123000)
+    pg.barrier()
+    ctx.assert_equal(create_process_group(ctx)._get_option("timeout_ms"), 30 * 60 * 1000)
+    os.environ["MOODIST_TIMEOUT"] = "45.5"
+    try:
+        store = ctx.create_store(key=f"pg_timeout_env_{ctx._current_test_id}", timeout=timedelta(seconds=60))
+        pg = moodist.MoodistProcessGroup(store, ctx.rank, ctx.world_size, timeout=timedelta(seconds=123))
+    finally:
+        del os.environ["MOODIST_TIMEOUT"]
+    ctx.assert_equal(pg._get_option("timeout_ms"), 45500)
+    pg.barrier()
 
 
 @test_cpu_cuda_kernel_modes

@@ -8,11 +8,22 @@
 
 namespace moodist {
 
+// The error of a wait of the setup's ring (see SetupComms): the setup has failed, or the wait timed out
+struct SetupCommsError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// The ranks' TCP ring for the exchanges of the process group's setup (and of later setup steps, e.g. NVLS). Its waits
+// fail instead of waiting forever: once the ring's connection to a neighbor closes (that rank failed or exited), once
+// another rank reports a failure (see fail), or after the timeout.
 struct SetupComms {
   const size_t rank;
   const size_t size;
 
   std::string key;
+
+  // How long a wait for other ranks may take (set from the process group's timeout, see Group::setTimeout)
+  std::chrono::steady_clock::duration timeout = std::chrono::minutes(30);
 
   SetupComms(size_t rank, size_t size) : rank(rank), size(size) {}
   virtual ~SetupComms() {}
@@ -21,13 +32,30 @@ struct SetupComms {
   std::vector<std::string> listenerAddresses();
   void waitForConnections();
 
+  // Makes this rank's waits fail from now on, and tells the other ranks (around the ring, best effort), whose waits
+  // then fail too: for errors in the setup that only this rank has found
+  void fail(std::string reason);
+  // Throws if the waits have failed (see fail): for other waits of the setup
+  void checkFailed();
+  // Why the waits fail (see fail), or empty if they do not
+  std::string failureReason();
+  // Throws (after fail, which tells the other ranks) if a wait that began at `start` has taken longer than the
+  // timeout; what() describes what it waits for
+  template<typename F>
+  void checkTimeout(std::chrono::steady_clock::time_point start, F&& what) {
+    if (std::chrono::steady_clock::now() - start >= timeout) {
+      timedOut(start, what());
+    }
+  }
+  [[noreturn]] void timedOut(std::chrono::steady_clock::time_point start, std::string what);
+
   std::vector<std::string_view>& allgather(BufferHandle);
 
   template<typename T>
   std::vector<T> allgather(const T& v) {
+    auto buffer = serializeToBuffer((uint64_t)0, (uint64_t)0, (uint32_t)0, (uint32_t)0, (uint32_t)0, v);
+    auto& outputList = allgather(std::move(buffer));
     try {
-      auto buffer = serializeToBuffer((uint64_t)0, (uint64_t)0, (uint32_t)0, (uint32_t)0, (uint32_t)0, v);
-      auto& outputList = allgather(std::move(buffer));
       std::vector<T> r;
       r.resize(size);
       for (size_t i = 0; i != size; ++i) {
@@ -50,8 +78,8 @@ struct SetupComms {
   }
   template<typename T>
   T recvFrom(size_t rank) {
+    auto view = recvBufferFrom(rank);
     try {
-      auto view = recvBufferFrom(rank);
       std::string_view tname;
       view = deserializeBufferPart(view, tname);
       if (tname != typeid(T).name()) {

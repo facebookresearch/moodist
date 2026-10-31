@@ -488,16 +488,28 @@ struct IpcMapper {
   }
 
   void wait() {
+    // (a spin: it reads the clock now and then, for the process group's timeout, after which it ends the process,
+    // since the requests refer to the callers' memory)
+    std::chrono::steady_clock::time_point start;
+    uint64_t spins = 0;
     while (waitCount.load(std::memory_order_relaxed)) {
       if (hasException.load(std::memory_order_relaxed)) {
         std::lock_guard l(mutex);
         std::rethrow_exception(*exception);
+      }
+      if (++spins % 65536 == 0) {
+        checkSpin(start, spins, "mappings of other ranks' memory");
       }
     }
     for (auto& v : peerMapCallbacks) {
       CHECK(v.empty());
     }
   }
+
+  // For the spins of wait and of the requests (called every 65536 spins): ends the process after the process group's
+  // timeout, or in the setup once it has failed (see SetupComms; the requests refer to the callers' memory, so these
+  // waits cannot throw)
+  void checkSpin(std::chrono::steady_clock::time_point& start, uint64_t spins, const char* what);
 
   void push(size_t peerIndex, const void* ptr, size_t n);
   void pop(size_t peerIndex, void* ptr, size_t n);

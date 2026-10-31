@@ -441,6 +441,12 @@ Group::~Group() {
   }
 }
 
+void Group::setTimeout(std::chrono::steady_clock::duration t) {
+  CHECK(t > std::chrono::steady_clock::duration::zero());
+  timeout = t;
+  setupComms->timeout = t;
+}
+
 void Group::init(Function<void()> f, Function<void()> pghandle) {
 
   installCrashHandler();

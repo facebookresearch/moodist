@@ -5,10 +5,17 @@
 #include "common.h"
 #include "hash_map.h"
 
+#include <chrono>
+
 #define RDMA_STATIC_PROVIDERS mlx5
 #include "libibverbs/verbs.h"
 
 namespace moodist {
+
+// About how long the RDMA transport takes to fail a request to a peer that does not answer (from MOODIST_IB_TIMEOUT,
+// as measured on ConnectX-8; duration::max() if it never does)
+std::chrono::steady_clock::duration ibTransportTimeout();
+int ibAckTimeout();
 
 struct IbAddress {
   uint16_t lid;

@@ -88,8 +88,9 @@ struct WorkImpl : c10d::Work {
 // Construction
 // ============================================================================
 
-ProcessGroup::ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
-    : c10d::ProcessGroup(rank, size), handle(coreApi.createProcessGroup(store.get(), rank, size)) {
+ProcessGroup::ProcessGroup(
+    const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size, std::chrono::steady_clock::duration timeout)
+    : c10d::ProcessGroup(rank, size), handle(coreApi.createProcessGroup(store.get(), rank, size, timeout)) {
   setBackend(torch::DeviceType::CPU, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
   setBackend(torch::DeviceType::CUDA, c10d::ProcessGroup::CUSTOM, c10::make_intrusive<Backend>(*this));
 }

@@ -993,25 +993,35 @@ struct CpuThreadImpl {
     }
   }
 
+  // The time limit of the setup's connection tests (RDMA writes to every rank): longer than the transport takes to
+  // fail a write to a peer that does not answer (ibTransportTimeout), so that such a write fails with the transport's
+  // error, which names the peer; at least 60 s, at most the process group's timeout. The tests also end as soon as
+  // the setup has failed on another rank (see SetupComms::fail).
   struct TimeoutHelper {
+    const Group* group;
+    const char* what;
+    std::chrono::steady_clock::duration timeout;
     std::chrono::steady_clock::time_point start;
-    std::chrono::steady_clock::time_point end;
-    TimeoutHelper(std::chrono::steady_clock::duration timeout) {
+    TimeoutHelper(const Group* group, const char* what) : group(group), what(what) {
+      const auto transport = ibTransportTimeout();
+      timeout = transport >= group->timeout ? group->timeout
+                                            : std::min<std::chrono::steady_clock::duration>(group->timeout,
+                                                  std::max<std::chrono::steady_clock::duration>(
+                                                      std::chrono::seconds(60), transport + std::chrono::seconds(30)));
       start = std::chrono::steady_clock::now();
-      end = start + timeout;
     }
     void check() {
-      auto now = std::chrono::steady_clock::now();
-      if (now >= end) {
-        throw std::runtime_error(
-            "Moodist timed out while initializing communication. This indicates that some process had an error during "
-            "early process-group startup.");
+      group->setupComms->checkFailed();
+      if (std::chrono::steady_clock::now() - start >= timeout) {
+        throw std::runtime_error(fmt::sprintf("Moodist timed out after %g s in %s: some RDMA writes to other ranks did "
+                                              "not complete (some process may have failed early in its setup)",
+            seconds(timeout), what));
       }
     }
   };
 
   void runTests() {
-    TimeoutHelper timeout(std::chrono::seconds(60));
+    TimeoutHelper timeout(group, "its connection test");
     AllocatedBuffer testBuffer = group->allocateHost(0x1000 * size);
     for (size_t i = 0; i != 1; ++i) {
       log.debug("rank %d starting CPU test %d!\n", rank, i);
@@ -6829,7 +6839,7 @@ struct CpuThreadImpl {
   }
 
   void sendRankInfo() {
-    TimeoutHelper timeout(std::chrono::seconds(60));
+    TimeoutHelper timeout(group, "sending its rank's information");
 
     auto buffer = group->allocateCpu(sizeof(RankInfo));
     RankInfo* local = new (buffer.cpuPointer) RankInfo();
@@ -7260,6 +7270,19 @@ void CpuThread::kill() {
 void CpuThread::start(Function<void()> pghandle) {
   thread = std::thread(
       [this](Function<void()> pghandle) {
+        // An error of this rank in the setup, which the other ranks' setup must not wait for (see SetupComms::fail).
+        // If the setup had already failed (e.g. on another rank) and the error does not come from a wait of the setup's
+        // ring, which reports that failure (e.g. a wait of the store, which does not check for one, ended with an error
+        // of its own), the failure is logged.
+        auto setupError = [this](const std::exception& e) {
+          if (!dynamic_cast<const SetupCommsError*>(&e)) {
+            if (const std::string reason = group->setupComms->failureReason(); !reason.empty()) {
+              log.error("rank %d: the setup of the process group had failed (%s) before this error: %s\n", group->rank,
+                  reason, e.what());
+            }
+          }
+          group->setupComms->fail(fmt::sprintf("rank %d failed: %s", group->rank, e.what()));
+        };
         try {
           async::setCurrentThreadName("moodist-cputhread");
           numa_run_on_node(group->allocationNode);
@@ -7268,6 +7291,7 @@ void CpuThread::start(Function<void()> pghandle) {
 
           group->init2();
         } catch (const std::exception& e) {
+          setupError(e);
           initExceptionPtr = std::current_exception();
           initException = true;
           return;
@@ -7283,7 +7307,15 @@ void CpuThread::start(Function<void()> pghandle) {
           const CudaError* ce = dynamic_cast<const CudaError*>(&e);
           if (ce && ce->error == CUDA_ERROR_DEINITIALIZED) {
             log.verbose("CPU thread got a CUDA deinitialized error.\n");
+            // (in the setup, the main thread waits for it)
+            if (!ready) {
+              initExceptionPtr = std::current_exception();
+              initException = true;
+            }
           } else {
+            if (!ready) {
+              setupError(e);
+            }
             fatal("CPU thread error: %s\n", e.what());
           }
         }

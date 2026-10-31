@@ -370,6 +370,22 @@ struct CustomOpImpl : api::CustomOp {
 // Forward declaration for futureWait (defined later, used by scatter)
 void futureWait(api::Future* future);
 
+// The process group's timeout (see Group::timeout): MOODIST_TIMEOUT (seconds) if set, else the one given (the
+// process group's timeout in PyTorch, e.g. init_process_group's), or 30 minutes if none is. At most 1e9 s (about 32
+// years, e.g. for a given duration::max()): the waits' deadlines must not overflow.
+static std::chrono::steady_clock::duration timeoutFromEnv(std::chrono::steady_clock::duration timeout) {
+  if (const char* env = std::getenv("MOODIST_TIMEOUT"); env && *env) {
+    char* end = nullptr;
+    double s = std::strtod(env, &end);
+    REQUIRE(end != env && *end == 0 && s > 0 && s < 1e9, "MOODIST_TIMEOUT must be a number of seconds (got '%s')", env);
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(s));
+  }
+  if (timeout <= std::chrono::steady_clock::duration::zero()) {
+    return std::chrono::minutes(30);
+  }
+  return std::min<std::chrono::steady_clock::duration>(timeout, std::chrono::seconds(1000000000));
+}
+
 struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
   size_t size = 0;
@@ -432,7 +448,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
   compile_op::CompileContext persistentCompileContext;
 
-  ProcessGroupImpl(void* c10dStore, int rank_, int size_) : rank(rank_), size(size_), c10dStore_(c10dStore) {
+  ProcessGroupImpl(void* c10dStore, int rank_, int size_, std::chrono::steady_clock::duration timeout)
+      : rank(rank_), size(size_), c10dStore_(c10dStore) {
     CHECK(rank_ >= 0 && size_ > 0 && rank_ < size_);
 
     // Initialize options from globals
@@ -441,6 +458,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
     log.init();
 
     group = makeShared<Group>(rank, size);
+    group->setTimeout(timeoutFromEnv(timeout));
 
     init();
 
@@ -2800,8 +2818,9 @@ api::FutureHandle processGroupCat(
   return static_cast<ProcessGroupImpl*>(pg)->cat(indices, tensors, count, out);
 }
 
-api::ProcessGroupHandle createProcessGroup(void* c10dStore, int rank, int size) {
-  return api::ProcessGroupHandle::create(internalNew<ProcessGroupImpl>(c10dStore, rank, size));
+api::ProcessGroupHandle createProcessGroup(
+    void* c10dStore, int rank, int size, std::chrono::steady_clock::duration timeout) {
+  return api::ProcessGroupHandle::create(internalNew<ProcessGroupImpl>(c10dStore, rank, size, timeout));
 }
 
 void processGroupDestroy(api::ProcessGroup* pg) {
@@ -2841,6 +2860,9 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
     return impl->options.chunkSize;
   } else if (key == "method") {
     return impl->options.method;
+  } else if (key == "timeout_ms") {
+    // Read-only: the process group's timeout (see Group::timeout)
+    return std::chrono::duration_cast<std::chrono::milliseconds>(impl->group->timeout).count();
   } else if (key == "nvls_launches") {
     // Read-only: how many compile_op launches of this rank in this group stored with NVLS (see generateKernel); as
     // of the launches that have completed

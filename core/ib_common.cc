@@ -14,6 +14,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -40,6 +41,21 @@ static int intEnv(const char* name, int fallback, int minValue, int maxValue) {
     return fallback;
   }
   return (int)value;
+}
+
+// The ACK timeout exponent of the queue pairs (MOODIST_IB_TIMEOUT, see its use below)
+int ibAckTimeout() {
+  return intEnv("MOODIST_IB_TIMEOUT", 20, 0, 31);
+}
+
+std::chrono::steady_clock::duration ibTransportTimeout() {
+  const int t = ibAckTimeout();
+  if (t == 0) {
+    return std::chrono::steady_clock::duration::max();
+  }
+  // (8 attempts, retry_cnt 7, of about twice 4.096 us * 2^t, with exponents below 16 counting as 16: see below)
+  const double s = 2 * 8 * 4.096e-6 * std::ldexp(1.0, std::max(t, 16));
+  return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(s));
 }
 
 // Select the best GID index for the given port.
@@ -384,7 +400,7 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   // docs: about 30 s): with 14, one direction of a link between two GPUs of a node that dropped everything for over
   // 4.3 s at startup failed a 64-rank job. Losses that the NIC recovers by itself (adaptive retransmission) do not
   // wait for this timer.
-  const int ackTimeout = intEnv("MOODIST_IB_TIMEOUT", 20, 0, 31);
+  const int ackTimeout = ibAckTimeout();
 
   IbAddress loopbackAddress;
 

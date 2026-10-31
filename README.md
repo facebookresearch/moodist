@@ -43,6 +43,20 @@ If it throws an error about building wheels and not finding CUDA static librarie
 
 
 
+## Timeouts
+
+A Moodist process group uses the timeout that PyTorch gives it (`init_process_group(timeout=...)`, 30 minutes by
+default), or the one given to `moodist.create_moodist_backend`; the environment variable `MOODIST_TIMEOUT`, in
+seconds, overrides it:
+
+- Setup: once the ranks have connected to each other, if a rank fails or exits while the process group is being set
+  up, the other ranks raise an error at once, naming that rank; a rank that hangs makes the others raise an error
+  after the timeout. (In some steps of the setup, the process ends instead, with the same message. Before the ranks
+  connect, while they meet through the store, the store's timeout applies.)
+
+Collectives (barriers too) and `compile_op` have no timeout yet; once a rank's process has ended, the other ranks
+notice within a few minutes and end theirs.
+
 ## Documentation
 
 API documentation is available in the [docs/](docs/) directory:

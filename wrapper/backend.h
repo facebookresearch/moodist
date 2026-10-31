@@ -16,8 +16,9 @@ public:
   std::unique_ptr<ProcessGroup> pgptr;
   ProcessGroup& pg;
 
-  Backend(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size)
-      : c10d::Backend(rank, size), pgptr(std::make_unique<ProcessGroup>(store, rank, size)), pg(*pgptr) {}
+  Backend(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size,
+      std::chrono::steady_clock::duration timeout = std::chrono::steady_clock::duration::zero())
+      : c10d::Backend(rank, size), pgptr(std::make_unique<ProcessGroup>(store, rank, size, timeout)), pg(*pgptr) {}
   Backend(ProcessGroup& pg) : c10d::Backend(pg.getRank(), pg.getSize()), pg(pg) {}
   ~Backend() {}
 

@@ -183,7 +183,8 @@ struct CoreApi {
   void (*allocatorRemoveFreeCallback)(CudaAllocatorImpl* impl, uintptr_t baseAddress, void* handle);
 
   // ProcessGroup functions - refcounted via ApiHandle
-  api::ProcessGroupHandle (*createProcessGroup)(void* c10dStore, int rank, int size);
+  api::ProcessGroupHandle (*createProcessGroup)(
+      void* c10dStore, int rank, int size, std::chrono::steady_clock::duration timeout);
   void (*processGroupDestroy)(api::ProcessGroup* pg);
   void (*processGroupShutdown)(api::ProcessGroup* pg); // Optional: explicitly trigger shutdown
   int (*processGroupRank)(api::ProcessGroup* pg);

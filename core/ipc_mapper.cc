@@ -11,6 +11,7 @@
 #include "socket.h"
 #include "synchronization.h"
 
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -590,6 +591,9 @@ struct IpcMapperImpl : IpcMapper {
     size_t slotIndex = 0;
     SharedStruct* nshared = peershared.at(peerIndex);
     CHECK(nshared != nullptr);
+    // (a spin, for a slot that the peer frees: for at most the process group's timeout, see wait)
+    std::chrono::steady_clock::time_point start;
+    uint64_t spins = 0;
     while (true) {
       if (hasException) {
         std::lock_guard l(mutex);
@@ -603,6 +607,9 @@ struct IpcMapperImpl : IpcMapper {
         slotIndex = 0;
       } else {
         ++slotIndex;
+      }
+      if (++spins % 65536 == 0) {
+        checkSpin(start, spins, "a free request slot of a process on its node");
       }
     }
 
@@ -968,13 +975,26 @@ struct IpcMapperImpl : IpcMapper {
       });
     });
 
+    // Until the listener and the connections it accepted are closed (below), their callbacks refer to onRead, a local
+    // of this function: the waits until then end the process when they fail or time out, rather than throw out of it
+    auto endProcessOnError = [](auto&& wait) {
+      try {
+        return wait();
+      } catch (const std::exception& e) {
+        fatal("%s", e.what());
+      }
+    };
+
     for (size_t i : group->ipcRanks) {
       group->setupComms->sendTo(i, myAddress);
     }
     auto data = serializeToBuffer(signature, (uint32_t)group->rank);
     for (size_t i : group->ipcRanks) {
       auto s = std::make_shared<SocketHelper>(Socket::Unix());
-      s->socket.connect(group->setupComms->recvFrom<std::string>(i), [](Error* error) {
+      std::string address = endProcessOnError([&] {
+        return group->setupComms->recvFrom<std::string>(i);
+      });
+      s->socket.connect(address, [](Error* error) {
         if (error) {
           log.error("connect error %s\n", error->what());
         }
@@ -998,11 +1018,18 @@ struct IpcMapperImpl : IpcMapper {
       sockets.push_back(s);
     }
 
+    const auto start = std::chrono::steady_clock::now();
     for (size_t i : group->ipcRanks) {
       size_t index = group->getPeerIndex(i);
       std::unique_lock l(mutex);
       while (!peermem[index].base) {
         l.unlock();
+        endProcessOnError([&] {
+          group->setupComms->checkFailed();
+          group->setupComms->checkTimeout(start, [&] {
+            return fmt::sprintf("the shared memory of rank %d (on its node)", i);
+          });
+        });
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         l.lock();
       }
@@ -1031,9 +1058,12 @@ struct IpcMapperImpl : IpcMapper {
     if (!useFabric) {
       std::string vmmAddress = fmt::sprintf("ipc-vmm-%d-%s", ::getpid(), randomName());
 
-      // Create listener
+      // Create listener (closed at the end of this block, also when a wait below throws)
       int listenFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
       CHECK(listenFd >= 0);
+      DeferredCleanup closeListenFd(Function<void()>([listenFd] {
+        ::close(listenFd);
+      }));
 
       {
         sockaddr_un sa;
@@ -1075,7 +1105,15 @@ struct IpcMapperImpl : IpcMapper {
         do {
           rc = ::connect(sockFd, (const sockaddr*)&sa, sizeof(sa));
         } while (rc == -1 && errno == EINTR);
-        CHECK(rc == 0);
+        if (rc != 0) {
+          // (rank i closed its listener: it failed, and the setup's failure may have reached this rank already)
+          const int error = errno;
+          ::close(sockFd);
+          group->setupComms->checkFailed();
+          throw std::runtime_error(
+              fmt::sprintf("rank %d could not connect to the socket of rank %d (on its node) for memory handles: %s",
+                  group->rank, i, std::strerror(error)));
+        }
 
         // Send our rank for identification
         ssize_t n;
@@ -1087,18 +1125,41 @@ struct IpcMapperImpl : IpcMapper {
         vmmSendFds[peerIndex] = sockFd;
       }
 
+      // Waits until fd is readable (a connection to accept, or data), at most the setup's timeout
+      const auto start = std::chrono::steady_clock::now();
+      auto waitReadable = [&](int fd, const char* what) {
+        while (true) {
+          pollfd p{.fd = fd, .events = POLLIN, .revents = 0};
+          int r = ::poll(&p, 1, 1000);
+          if (r > 0) {
+            return;
+          }
+          CHECK(r == 0 || errno == EINTR);
+          group->setupComms->checkFailed();
+          group->setupComms->checkTimeout(start, [&] {
+            return std::string(what);
+          });
+        }
+      };
+
       // Accept connections from all peers (creates recv fd for each peer)
       for (size_t c = 0; c < group->ipcRanks.size(); ++c) {
+        waitReadable(listenFd, "the connections of the other processes of its node (for memory handles)");
         int connFd;
         do {
           connFd = ::accept(listenFd, nullptr, nullptr);
         } while (connFd == -1 && errno == EINTR);
         CHECK(connFd >= 0);
+        // (closed if a wait below throws before it is stored)
+        DeferredCleanup closeConnFd(Function<void()>([connFd] {
+          ::close(connFd);
+        }));
 
         // Read the rank identification
         char buf[12];
         size_t totalRead = 0;
         while (totalRead < sizeof(buf)) {
+          waitReadable(connFd, "the rank of a process of its node (for memory handles)");
           ssize_t n;
           do {
             n = ::recv(connFd, buf + totalRead, sizeof(buf) - totalRead, 0);
@@ -1115,9 +1176,8 @@ struct IpcMapperImpl : IpcMapper {
 
         size_t peerIndex = group->getPeerIndex(sourceRank);
         vmmRecvFds[peerIndex] = connFd;
+        closeConnFd.destructor = nullptr; // (stored: closed by the destructor)
       }
-
-      ::close(listenFd);
     } // !useFabric
 
     thread = std::thread([this] {
@@ -1279,6 +1339,24 @@ void IpcMapper::streamRecord(size_t peerIndex, CUstream stream) {
 
 void IpcMapper::streamWait(size_t peerIndex, CUstream stream) {
   return ((IpcMapperImpl*)this)->streamWait(peerIndex, stream);
+}
+
+void IpcMapper::checkSpin(std::chrono::steady_clock::time_point& start, uint64_t spins, const char* what) {
+  const auto now = std::chrono::steady_clock::now();
+  if (spins == 65536) {
+    start = now;
+  }
+  if (!group->cpuThread->ready) {
+    try {
+      group->setupComms->checkFailed();
+    } catch (const std::exception& e) {
+      fatal("%s", e.what());
+    }
+  }
+  if (now - start >= group->timeout) {
+    fatal("rank %d timed out after %g s waiting for %s (the process group's timeout; MOODIST_TIMEOUT overrides it)",
+        group->rank, seconds(now - start), what);
+  }
 }
 
 std::unique_ptr<IpcMapper> createIpcMapper(Group* group) {

@@ -600,20 +600,52 @@ static c10::intrusive_ptr<c10d::Store> extract_store(PyObject* store_obj) {
 
 using MoodistProcessGroup = moodist::wrapper::ProcessGroup;
 
+// The timeout argument of a process group (a number of seconds or a timedelta; None: moodist's default)
+static bool parse_pg_timeout(PyObject* obj, std::chrono::steady_clock::duration* out) {
+  *out = std::chrono::steady_clock::duration::zero();
+  if (obj == nullptr || obj == Py_None) {
+    return true;
+  }
+  double seconds;
+  if (!parse_timeout(obj, &seconds)) {
+    return false;
+  }
+  if (!(seconds > 0)) {
+    PyErr_SetString(PyExc_ValueError, "timeout must be positive");
+    return false;
+  }
+  // (at most 1e9 s, as the core takes it: e.g. inf or timedelta.max would overflow the conversion)
+  seconds = std::min(seconds, 1e9);
+  *out = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+  return true;
+}
+
 // ProcessGroup tp_init
 static int processgroup_init(PyObject* self, PyObject* args, PyObject* kwds) {
-  static const char* kwlist[] = {"store", "rank", "size", nullptr};
+  static const char* kwlist[] = {"store", "rank", "size", "timeout", nullptr};
   PyObject* store_obj = nullptr;
   int rank = 0;
   int size = 0;
+  PyObject* timeout_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist), &store_obj, &rank, &size)) {
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwds, "Oii|O", const_cast<char**>(kwlist), &store_obj, &rank, &size, &timeout_obj)) {
+    return -1;
+  }
+  std::chrono::steady_clock::duration timeout;
+  if (!parse_pg_timeout(timeout_obj, &timeout)) {
     return -1;
   }
 
   try {
     auto store = extract_store(store_obj);
-    return init_holder(self, c10::make_intrusive<MoodistProcessGroup>(store, rank, size));
+    c10::intrusive_ptr<MoodistProcessGroup> pg;
+    {
+      // (the setup waits for the other ranks, and calls the store, which may need the GIL)
+      GilRelease gil;
+      pg = c10::make_intrusive<MoodistProcessGroup>(store, rank, size, timeout);
+    }
+    return init_holder(self, std::move(pg));
   } catch (const moodist::PythonErrorAlreadySet&) {
     return -1;
   } catch (const std::exception& e) {
@@ -1035,18 +1067,30 @@ using MoodistBackend = moodist::wrapper::Backend;
 
 // Backend tp_init
 static int backend_init(PyObject* self, PyObject* args, PyObject* kwds) {
-  static const char* kwlist[] = {"store", "rank", "size", nullptr};
+  static const char* kwlist[] = {"store", "rank", "size", "timeout", nullptr};
   PyObject* store_obj = nullptr;
   int rank = 0;
   int size = 0;
+  PyObject* timeout_obj = nullptr;
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oii", const_cast<char**>(kwlist), &store_obj, &rank, &size)) {
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwds, "Oii|O", const_cast<char**>(kwlist), &store_obj, &rank, &size, &timeout_obj)) {
+    return -1;
+  }
+  std::chrono::steady_clock::duration timeout;
+  if (!parse_pg_timeout(timeout_obj, &timeout)) {
     return -1;
   }
 
   try {
     auto store = extract_store(store_obj);
-    return init_holder(self, c10::make_intrusive<MoodistBackend>(store, rank, size));
+    c10::intrusive_ptr<MoodistBackend> backend;
+    {
+      // (see processgroup_init)
+      GilRelease gil;
+      backend = c10::make_intrusive<MoodistBackend>(store, rank, size, timeout);
+    }
+    return init_holder(self, std::move(backend));
   } catch (const moodist::PythonErrorAlreadySet&) {
     return -1;
   } catch (const std::exception& e) {

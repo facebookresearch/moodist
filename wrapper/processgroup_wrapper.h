@@ -9,6 +9,7 @@
 #include "api/types.h"
 #include "torch_includes.h"
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -100,7 +101,9 @@ class TORCH_API ProcessGroup final : public c10d::ProcessGroup {
 public:
   api::ProcessGroupHandle handle; // Manages refcount automatically
 
-  ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size);
+  // timeout: the process group's timeout (0: moodist's default), see createProcessGroup
+  ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size,
+      std::chrono::steady_clock::duration timeout = std::chrono::steady_clock::duration::zero());
   ~ProcessGroup() = default; // ApiHandle destructor handles cleanup
 
   const std::string getBackendName() const override {

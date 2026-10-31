@@ -4,6 +4,7 @@
 
 import weakref
 from datetime import timedelta
+from typing import Optional
 
 import torch
 import torch.distributed
@@ -69,7 +70,7 @@ def find_process_group(name: str):
 
 
 def create_moodist_backend(
-    store: torch.distributed.Store, rank: int, size: int, timeout: timedelta
+    store: torch.distributed.Store, rank: int, size: int, timeout: Optional[timedelta] = None
 ):
     """Create a MoodistProcessGroup directly.
 
@@ -81,7 +82,8 @@ def create_moodist_backend(
         store: A torch.distributed.Store for coordination
         rank: This process's rank within the group
         size: Total number of processes in the group
-        timeout: Timeout for operations
+        timeout: How long the setup, and the waits for other ranks of the process group (barriers, compile_op),
+            may take; None: moodist's default (30 minutes). MOODIST_TIMEOUT (seconds) overrides it.
 
     Returns:
         A MoodistProcessGroup instance with custom moodist methods available.
@@ -89,7 +91,7 @@ def create_moodist_backend(
     if MoodistProcessGroup is None:
         raise RuntimeError("MoodistProcessGroup not available in this build")
 
-    moodist_obj = MoodistProcessGroup(store, rank, size)
+    moodist_obj = MoodistProcessGroup(store, rank, size, timeout=timeout)
     _name_to_group[moodist_obj.moodist_name()] = moodist_obj
     return moodist_obj
 
@@ -120,8 +122,8 @@ def _create_pytorch_backend(dist_backend_opts, backend_options):
     size = dist_backend_opts.group_size
     global_ranks = list(dist_backend_opts.global_ranks_in_group)
 
-    # Create the moodist ProcessGroup
-    moodist_obj = MoodistProcessGroup(store, rank, size)
+    # Create the moodist ProcessGroup (with the process group's timeout, e.g. init_process_group's)
+    moodist_obj = MoodistProcessGroup(store, rank, size, timeout=dist_backend_opts.timeout)
     temp_name = f"__moodist_temp_{id(moodist_obj)}"
 
     # Register temporarily to cache pybind11 wrapper in PyTorch's instance registry.
