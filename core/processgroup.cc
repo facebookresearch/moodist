@@ -596,9 +596,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
     e->concurrencyIndex = concurrencyIndex;
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
-    while (cpuDone == 0) {
-      futexWait(&cpuDone, 0, std::chrono::seconds(10));
-    }
+    group->waitForCpuThread(cpuDone, "an internal barrier");
   }
 
   void resetStepValue() {
@@ -606,7 +604,12 @@ struct ProcessGroupImpl : api::ProcessGroup {
     // All ranks must collectively reach this point — we synchronize with
     // internalBarrier before and after zeroing the barrier arrays.
     log.verbose("Reset step value begin\n");
-    while (group->cpuThread->busy) {
+    for (const auto start = std::chrono::steady_clock::now(); group->cpuThread->busy;) {
+      if (std::chrono::steady_clock::now() - start >= group->timeout) {
+        fatal("rank %d: the CPU thread's work did not complete within %g s (the process group's timeout; "
+              "MOODIST_TIMEOUT overrides it); some rank may have failed",
+            rank, seconds(group->timeout));
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     internalBarrier();
@@ -1308,9 +1311,7 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
     l.unlock();
-    while (cpuDone == 0) {
-      futexWait(&cpuDone, 0, std::chrono::seconds(10));
-    }
+    group->waitForCpuThread(cpuDone, "an all-gather of CPU tensors");
     return;
   }
 
@@ -1565,9 +1566,7 @@ void ProcessGroupImpl::reduce_scatter(
     e->opindex = opindex;
     group->cpuThread->enqueue(e);
     l.unlock();
-    while (cpuDone == 0) {
-      futexWait(&cpuDone, 0, std::chrono::seconds(10));
-    }
+    group->waitForCpuThread(cpuDone, "a reduce-scatter of CPU tensors");
     if (workaroundMean) {
       output.mul_(1.0f / size);
     }
@@ -1967,9 +1966,7 @@ void ProcessGroupImpl::broadcast(TensorPtr& tensor, int sourceRank, CUstream str
     e->cpuDone = &cpuDone;
     group->cpuThread->enqueue(e);
     l.unlock();
-    while (cpuDone == 0) {
-      futexWait(&cpuDone, 0, std::chrono::seconds(10));
-    }
+    group->waitForCpuThread(cpuDone, "a broadcast of CPU tensors");
     return;
   }
 
@@ -2384,9 +2381,7 @@ void ProcessGroupImpl::barrier() {
   e->cpuDone = &cpuDone;
   group->cpuThread->enqueue(e);
   l.unlock();
-  while (cpuDone == 0) {
-    futexWait(&cpuDone, 0, std::chrono::seconds(10));
-  }
+  group->waitForCpuThread(cpuDone, "a barrier");
 }
 
 // ============================================================================
@@ -3340,6 +3335,9 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   };
   ctx.nextOpId = &nextCustomOpId;
   ctx.collectiveOp = collectiveOp;
+  ctx.timeout = group->timeout;
+  REQUIRE(!ctx.timedOut, "moodist.compile_op: an earlier compile_op of this process group timed out, which left its "
+                         "exchanges out of step");
 
   // Call compile_op
   auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce, cpuSync);

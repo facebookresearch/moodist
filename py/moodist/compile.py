@@ -1,5 +1,7 @@
+import time
 import weakref
 from dataclasses import dataclass
+from queue import Empty
 from typing import List, Union
 
 import torch
@@ -10,6 +12,8 @@ from .sharding import dtensor_shards
 
 weak_group = weakref.WeakValueDictionary()
 weak_queue = weakref.WeakKeyDictionary()
+# The queues (names) of the groups in which a compile_op timed out: their messages are out of step
+timed_out = set()
 
 
 class Name(str):
@@ -210,6 +214,11 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
         - The function uses an internal queue for coordination, which is cached per group.
     """
     name = Name(group.moodist_name() + ".{compile_collective_queue}")
+    if name in timed_out:
+        raise RuntimeError(
+            "moodist.compile_op: an earlier compile_op of this process group timed out, which left its exchanges "
+            "out of step"
+        )
     if name not in weak_group:
         queue = Queue(group, range(group.size()), name=name)
         weak_queue[name] = queue
@@ -283,7 +292,22 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
     all_outputs = []
 
     # Every rank reads every rank's spec before any checks, so that all ranks raise alike and the queue stays empty
-    infos = [queue.get_object() for _ in range(group.size())]
+    # (for at most the process group's timeout: a rank that raised after the barrier above, before its put, leaves the
+    # others waiting here; a rank that does not call compile_op leaves them in the barrier, which ends the process)
+    timeout = group._get_option("timeout_ms") / 1000
+    deadline = time.monotonic() + timeout
+    infos = []
+    for _ in range(group.size()):
+        try:
+            infos.append(queue.get_object(timeout=max(deadline - time.monotonic(), 0.001)))
+        except Empty:
+            timed_out.add(name)
+            missing = sorted(set(range(group.size())) - {info[0] for info in infos})
+            raise RuntimeError(
+                f"moodist.compile_op: rank {group.rank()} timed out after {timeout:g} s waiting for the arguments "
+                f"of rank(s) {', '.join(map(str, missing[:8]))}{' ...' if len(missing) > 8 else ''} (the process "
+                "group's timeout; MOODIST_TIMEOUT overrides it)"
+            ) from None
     if error is not None:
         raise error
     for source_rank, _, _, _, _, nerror in infos:

@@ -447,6 +447,18 @@ void Group::setTimeout(std::chrono::steady_clock::duration t) {
   setupComms->timeout = t;
 }
 
+void Group::waitForCpuThread(std::atomic_uint32_t& done, const char* what) {
+  const auto start = std::chrono::steady_clock::now();
+  while (done.load(std::memory_order_acquire) == 0) {
+    futexWait(&done, 0, std::chrono::seconds(1));
+    if (done.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() - start >= timeout) {
+      fatal("rank %d: %s did not complete within %g s (the process group's timeout; MOODIST_TIMEOUT overrides it); "
+            "some rank may have failed or not called it",
+          rank, what, seconds(timeout));
+    }
+  }
+}
+
 void Group::init(Function<void()> f, Function<void()> pghandle) {
 
   installCrashHandler();

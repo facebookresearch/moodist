@@ -53,9 +53,13 @@ seconds, overrides it:
   up, the other ranks raise an error at once, naming that rank; a rank that hangs makes the others raise an error
   after the timeout. (In some steps of the setup, the process ends instead, with the same message. Before the ranks
   connect, while they meet through the store, the store's timeout applies.)
+- Barriers, the all-gathers, reduce-scatters, all-reduces and broadcasts of CPU tensors, and the compilation in
+  `compile_op` wait for the other ranks for at most the timeout. Then `compile_op` raises an error where it waits in
+  an exchange; barriers (also those in `compile_op`) and the other waits end the process, as they cannot be
+  cancelled.
 
-Collectives (barriers too) and `compile_op` have no timeout yet; once a rank's process has ended, the other ranks
-notice within a few minutes and end theirs.
+Collectives of CUDA tensors, scatters and gathers of CPU tensors, and the ops that `compile_op` returns have no
+timeout yet; once a rank's process has ended, the other ranks notice within a few minutes and end theirs.
 
 ## Documentation
 

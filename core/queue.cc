@@ -163,9 +163,7 @@ void barrier(Group* group) {
   e->concurrencyIndex = concurrencyIndex;
   e->cpuDone = &cpuDone;
   group->cpuThread->enqueue(e);
-  while (cpuDone == 0) {
-    futexWait(&cpuDone, 0, std::chrono::seconds(10));
-  }
+  group->waitForCpuThread(cpuDone, "a barrier for a queue");
 }
 
 uintptr_t sendCreateQueue(
@@ -187,9 +185,7 @@ uintptr_t sendCreateQueue(
   e->streaming = streaming;
   e->name = name;
   group->cpuThread->enqueue(e);
-  while (cpuDone == 0) {
-    futexWait(&cpuDone, 0, std::chrono::seconds(10));
-  }
+  group->waitForCpuThread(cpuDone, "the creation of a queue");
   if (!outError.empty()) {
     throw std::runtime_error(outError);
   }

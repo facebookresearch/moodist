@@ -166,6 +166,11 @@ struct CompileContext {
 
   Vector<std::pair<uint32_t, TensorDataPtr>> queuedReceives;
 
+  // How long a receive waits for the other rank (the process group's timeout). After a receive has timed out, the
+  // exchanges are out of step (a late message would be taken for a later one): compile fails from then on.
+  std::chrono::steady_clock::duration timeout = std::chrono::minutes(30);
+  bool timedOut = false;
+
   HashMap<std::string, Vector<std::unique_ptr<AllocatedArray>>> cachedBuffers;
 
   template<typename... T>
@@ -190,14 +195,27 @@ struct CompileContext {
       }
     }
     auto& q = queues[group->rank];
+    const auto start = std::chrono::steady_clock::now();
+    auto get = [&] {
+      const float left = std::chrono::duration<float>(timeout - (std::chrono::steady_clock::now() - start)).count();
+      TensorDataPtr t = left > 0 ? q->get(true, left) : nullptr;
+      if (!t) {
+        timedOut = true;
+        throw std::runtime_error(
+            fmt::sprintf("moodist.compile_op: rank %d timed out after %g s waiting for rank %d (the "
+                         "process group's timeout; MOODIST_TIMEOUT overrides it)",
+                group->rank, std::chrono::duration<float>(timeout).count(), fromrank));
+      }
+      return t;
+    };
     while (true) {
       uint32_t sourceRank;
-      deserialize(q->get(), sourceRank);
+      deserialize(get(), sourceRank);
       if (sourceRank == fromrank) {
-        deserialize(q->get(), v...);
+        deserialize(get(), v...);
         return;
       }
-      queuedReceives.emplace_back(sourceRank, q->get());
+      queuedReceives.emplace_back(sourceRank, get());
     }
   }
 };

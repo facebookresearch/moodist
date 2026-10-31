@@ -98,9 +98,13 @@ struct Group {
   std::unique_ptr<IpcMapper> ipcMapper;
 
   // The process group's timeout (see setTimeout): how long a wait for other ranks may take, in the setup (which then
-  // fails, see SetupComms) and for mappings of other ranks' memory (see IpcMapper::checkSpin)
+  // fails, see SetupComms), for mappings of other ranks' memory (see IpcMapper::checkSpin) and where the main thread
+  // waits for the CPU thread (which then ends the process, see waitForCpuThread)
   std::chrono::steady_clock::duration timeout = std::chrono::minutes(30);
   void setTimeout(std::chrono::steady_clock::duration timeout);
+  // Waits until the CPU thread sets `done` (the end of a task that the main thread waits for); after the timeout, ends
+  // the process (the task may still refer to the caller's memory). what: the task, for the message.
+  void waitForCpuThread(std::atomic_uint32_t& done, const char* what);
 
   std::vector<std::unique_ptr<Rdma>> rdmaDevs;
   size_t numTrueIbDevs = 0;

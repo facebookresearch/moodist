@@ -44,8 +44,10 @@ Every step is collective: all ranks of the group take part (through per-rank que
    `ValueError` or else a `RuntimeError`), the regions (the device index of a rank's own regions, which only it
    knows) in `compile`'s first exchange, the gaps and overlaps of a rank's outputs (Phase 2) with the read requests
    of Phase 3, the reductions' errors with the agreement on the kernel path (step 9), and the 16-byte check (step 10)
-   in an exchange of its own. Failures inside the steps (e.g. running out of memory in the tuning) still leave the
-   other ranks waiting (see Known issues).
+   in an exchange of its own, and the errors in generating and compiling the kernels (step 12: in the tuning, a
+   rank's kernels have its own edges, e.g. too many for a configuration's shared memory, and ranks that no kernel
+   edge touches generate none; `raiseFirstError`). Failures inside the steps (e.g. running out of memory in the
+   tuning) still leave the other ranks waiting, for at most the process group's timeout (see Known issues).
 2. **Phase 1**: each rank intersects its own inputs with every output (same `tensor_id`) and sends the
    intersections to the rank of the output.
 3. **Phase 2**, cell decomposition: per `tensor_id`, the boundaries of all regions of all ranks cut each
@@ -244,13 +246,15 @@ Every step is collective: all ranks of the group take part (through per-rank que
     chunks in 226 KiB of shared memory; reductions: {8, 16, 24, 32} with blocks of 256 threads, as their blocks
     also combine the data, and reading from other GPUs takes more SMs than writing), for every graph variant (4
     settings per variant; `MOODIST_COMPILE_OP_CONFIGS` replaces these configurations, which every rank checks
-    against the reduce loop's needs for reductions). Each setting is generated and JIT compiled, then run on zeroed
-    scratch tensors: 12 warmup launches, then 2 timed batches of 12 launches. The ranks exchange their timings and
-    take the slowest rank's per setting (of the ranks with a kernel): an op takes as long as its slowest rank, e.g.
-    the executors of a reduction across domains, which combine more than the others. The fastest setting
-    wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which the computation it overlaps with
-    lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it is for copies limited by the
-    SMs' bandwidth). The kernel of the chosen setting is generated and compiled once more for the op. Tuning
+    against the reduce loop's needs for reductions). Each setting is generated and JIT compiled (errors are raised on
+    every rank, see step 1), then run on zeroed scratch tensors: 12 warmup launches, then 2 timed batches of 12
+    launches. The ranks exchange their timings and take the slowest rank's per setting (of the ranks with a kernel):
+    an op takes as long as its slowest rank, e.g. the executors of a reduction across domains, which combine more
+    than the others. The fastest setting wins, with a penalty of 0.5% per block: the kernel occupies its SMs, which
+    the computation it overlaps with lacks meanwhile, so a bigger grid has to be clearly faster to be chosen (as it
+    is for copies limited by the SMs' bandwidth). The kernel of the chosen setting is generated and compiled once
+    more for the op (its errors too are raised on every rank). The tuning launches wait for each other across the
+    ranks, for at most the process group's timeout (the process then ends: a kernel cannot be stopped). Tuning
     launches run without the CPU thread, so in tuning kernels, relay edges and the reduce loop's sources from other
     domains do not wait for a signal; the reduce loop's done signals and its waits for them work as in the op's
     launches (the pieces of two phases, an executor's own partial result), in `cpuInBuffer`, which the step value
@@ -528,6 +532,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   large for kernel parameters do (see The kernel), for tests.
 - `MOODIST_IB_TIMEOUT` - the RDMA transport's ACK timeout exponent (not specific to compile_op; default 20, as
   NCCL's: on ConnectX-8, about 64 s of an unanswered request before the error that ends the job; see ib_common.cc).
+- `MOODIST_TIMEOUT` - the process group's timeout in seconds (not specific to compile_op; it overrides the one that
+  PyTorch gives the process group, by default 30 minutes): how long compile_op's exchanges, barriers and tuning
+  launches wait for the other ranks.
 
 ## Tracing
 
@@ -845,11 +852,13 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 ## Known issues and TODO
 
 ### Correctness
-- Failures inside the collective steps of the compile phase are raised by the rank that hits them only, and the other
-  ranks then wait forever in the next exchange: e.g. running out of memory for the tuning's scratch tensors, a kernel
-  that fails to JIT on one rank, or a check in `generateKernel` (a shared memory size in `MOODIST_COMPILE_OP_CONFIGS`
-  too small for the copy kernel of a rank's graph, a bad `MOODIST_COMPILE_OP_PROFILE`). The errors that step 1 lists
-  are raised on all ranks.
+- Failures inside the collective steps of the compile phase that only one rank hits (e.g. running out of memory for
+  the tuning's scratch tensors) are raised by that rank only. The other ranks wait for it until the process group's
+  timeout (`MOODIST_TIMEOUT` overrides it): waiting in an exchange (`CompileContext::receive`), they then raise an
+  error, after which the group's compile_op raises too (its exchanges are out of step); waiting in a barrier or for
+  the tuning launches, they end the process instead (as after running out of memory for the scratch tensors: the
+  others wait in the tuning's barrier). The errors that step 1 lists are raised on all ranks. The failing rank could
+  tell the others through the queues, so that they fail at once.
 - The process group's own collectives (all-gather, reduce-scatter, broadcast and reduce in cputhread.cc) signal their
   kernels as soon as the completions of their RDMA reads arrive (`writeCpuOut`), through the first NIC into memory
   registered with relaxed ordering, so the signal may land before data that another NIC wrote, or that the same NIC

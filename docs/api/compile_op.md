@@ -560,7 +560,7 @@ Note that the compiled operation only transfers the data each rank actually need
 
 `compile_op` is a **synchronous collective operation** that must be called by all ranks in the group. The function performs collective coordination to exchange and validate each rank's input/output specifications before returning.
 
-**Important:** If any rank fails to call `compile_op`, the operation will hang indefinitely waiting for all ranks to participate.
+**Important:** If any rank does not call `compile_op`, the other ranks wait for it in the barrier that `compile_op` begins with, for at most the process group's timeout (`init_process_group(timeout=...)`, 30 minutes by default; the environment variable `MOODIST_TIMEOUT`, in seconds, overrides it), and then end their process (a barrier cannot be cancelled). An error that one rank raises alone (e.g. running out of memory; errors in the arguments are raised on every rank) leaves the others waiting for the timeout too: then, where they wait in an exchange, they raise an error, and the process group's `compile_op` raises from then on (its exchanges are out of step); where they wait in a barrier, they end their process.
 
 ### Performance Considerations
 

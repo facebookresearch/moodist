@@ -2130,6 +2130,23 @@ struct CompileOpConstructor {
         }
         events[i].second.record(stream);
       }
+      // (the kernels wait for each other across the ranks: for at most the process group's timeout, after which the
+      // process ends, since a kernel cannot be stopped)
+      for (const auto waitStart = std::chrono::steady_clock::now();;) {
+        CUresult r = cuEventQuery(events.back().second);
+        if (r == CUDA_SUCCESS) {
+          break;
+        }
+        if (r != CUDA_ERROR_NOT_READY) {
+          CHECK_CU(r);
+        }
+        if (std::chrono::steady_clock::now() - waitStart >= group->timeout) {
+          fatal("rank %d: compile_op's tuning launches did not complete within %g s (the process group's timeout; "
+                "MOODIST_TIMEOUT overrides it); some rank may have failed",
+              rank, seconds(group->timeout));
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
       stream.synchronize();
       std::chrono::nanoseconds timing;
       for (size_t i : range(nRuns)) {
