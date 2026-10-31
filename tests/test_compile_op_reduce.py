@@ -780,13 +780,14 @@ def test_reduce_two_streams(ctx: TestContext):
     NVLink domains writes into the memory of ranks it exchanges nothing with too (arrival values, see WorkCustom),
     which must not overwrite such a step value before the collective has read it, or the collective waits forever.
     Each round: a large reduce-scatter or all-reduce, which takes longer than the reductions and which the ranks finish
-    at different times (random delays before it), then 16 small reductions, one of which reuses the slot of the
-    reduce-scatter. The reduce-scatter's RDMA goes between ranks of the same local rank on different nodes only, which
-    with 2 nodes are also the reduction's peers: this needs 3 nodes or more, and a rank that is late to read the
-    collective's step values (its CPU thread preempted, say); with step values as arrival values, a run on 4 nodes in
-    which one rank waited 3 ms before reading them hung. The all-reduces' all-gathers (rings) also check that the
-    reductions' tensor lists do not overwrite a ring's (see Group::customDyns): on 64 GPUs (16 nodes) they did, and
-    a rank read from its ring neighbor with another rank's address and key (a remote access error)."""
+    at different times (random delays before it), then 16 small reductions, the last one or two of which reuse the
+    collective's concurrency slots (a reduce-scatter takes one, an all-reduce two: those of its reduce-scatter and
+    its all-gather). The reduce-scatter's RDMA goes between ranks of the same local rank on different nodes only,
+    which with 2 nodes are also the reduction's peers: this needs 3 nodes or more, and a rank that is late to read
+    the collective's step values (its CPU thread preempted, say); with step values as arrival values, a run on 4
+    nodes in which one rank waited 3 ms before reading them hung. The all-reduces' all-gathers (rings) also check
+    that the reductions' tensor lists do not overwrite a ring's (see Group::customDyns): on 64 GPUs (16 nodes) they
+    did, and a rank read from its ring neighbor with another rank's address and key (a remote access error)."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     side = torch.cuda.Stream()

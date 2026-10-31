@@ -215,8 +215,8 @@ struct Group {
   // for an exact value in cpuStepValues.
   ArrivalValue* cpuArrivalValues = nullptr;
   // compile_op's tensor lists (see WorkCustom in cputhread.cc): per concurrency slot and rank, the header of the list
-  // that the rank publishes to this one. Process group collectives use localDyns, the rings with list slots that are
-  // not rank indices (the neighbor's lists in slots 0 and 1).
+  // that the rank publishes to this one. Process group collectives use localDyns, in the slots of the ranks that the
+  // lists come from, but the all-gather ring keeps its neighbor's lists in slots 0 and 1.
   DynamicAddresses* customDyns = nullptr;
   // compile_op's notifications (see CustomOpDescriptor::Notification): per concurrency slot, rank and notification
   // slot, the step value of the latest op of the slot in which the rank has notified this one in that slot. In

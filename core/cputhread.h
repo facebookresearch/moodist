@@ -401,10 +401,11 @@ struct CustomOpDescriptor {
   Vector<uint32_t> peers;
   Vector<uint8_t> isPeer;
   bool dynSelf = false;
-  // Reductions across NVLink domains: the bytes of the scratch tensor (a CUDA tensor of the op's dtype that customOp
-  // allocates per launch, after the output copies: the last tensor), which holds the partial results that this rank
-  // computes (for other domains, and in an all-reduce for itself) and the ones that it reads from them (or that they
-  // write into it); 0 if none
+  // Reductions across NVLink domains or in two phases: the bytes of the scratch tensor (a CUDA tensor of the op's
+  // dtype that customOp allocates per launch, after the output copies: the last tensor), which holds the partial
+  // results that this rank computes (for other domains, and in an all-reduce for itself) and the ones that it reads
+  // from them (or that they write into it), and the pieces that it computes in two phases before it copies them to
+  // their destinations (see twoPhaseReductions in compile_op.cc); 0 if none
   size_t scratchBytes = 0;
 
   Vector<compile_op::Graph::TensorDescr> inputs;

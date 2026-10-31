@@ -593,7 +593,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
     // reduceKernel: this rank executes reductions (edges with several sources, or parts of a reduction across NVLink
-    // domains), and runs the reduce loop below
+    // domains or in two phases), and runs the reduce loop below
     const bool reduceKernel = std::ranges::any_of(localCopies, [](const Edge& e) {
       return e.sources.size() > 1 || !e.sourceSignals.empty() || !e.sourceDoneSignals.empty() || e.doneSignal >= 0;
     });
@@ -717,7 +717,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
     static constexpr uint32_t edgeNvls = 16;   // stored with NVLS when the launch can: the NVLS slot follows the dsts
     static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for signals (PipeEdge::waits)
-    static constexpr uint32_t edgeDoneSignal = 64;  // reduce loop: signals the CPU thread when stored (doneSignal)
+    static constexpr uint32_t edgeDoneSignal = 64;  // reduce loop: writes doneSignal once stored (see Edge::doneSignal)
     // A wait table word for a source that waits for a done signal of this kernel's (in cpuInBuffer), with the index
     // + 1 in the other bits (without this bit, the signal of an RDMA transfer, in rdmaSignalBuffer)
     static constexpr uint32_t waitDoneSignal = 0x80000000;
@@ -2200,8 +2200,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
             cp_async_bulk_commit_group();
             if (anyDoneSignals) {
-              // A partial result that another domain reads: once all its items (of any block) are stored, the last
-              // one signals the CPU thread (per launch, every item counts once, so the counter wraps back to 0)
+              // An edge with a done signal (a partial result that another domain reads, or a result that this kernel
+              // waits for: its own domain's partial result, a piece of two phases): once all its items (of any block)
+              // are stored, the last one writes the signal (per launch, every item counts once, so the counter wraps
+              // back to 0)
               u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
               IF((flags & edgeDoneSignal) != 0) {
                 cp_async_bulk_wait_group(0);

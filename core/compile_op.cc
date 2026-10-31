@@ -752,7 +752,7 @@ struct GraphBuilder {
   }
 
   void ring(bool writeMode) {
-    // Chains are per cell, and per chunk for cells whose proxied transfer is split into chunks
+    // Chains are per cell and chunkIndex (a part of a cell larger than maxEdgeBytes, a chunk of a proxied transfer)
     auto key = [](const Edge& e) {
       return ((uint64_t)e.cellIndex << 32) | e.chunkIndex;
     };

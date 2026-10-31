@@ -1391,10 +1391,10 @@ struct CpuThreadImpl {
   // relaxed-ordered (PCIe lets a write pass earlier ones only with relaxed ordering, which the data's registrations
   // allow for speed), and a GPU whose GPUDirect RDMA writes ordering is "owner" lets its kernels see them in that
   // order. So a signal is a write through each NIC that carried some of the data, after that NIC has placed it (the
-  // completion of its reads, or of the other rank's writes to it), into a registration without relaxed ordering
-  // (rdmaSignalMr) on the same path as the data's (both registered through Data Direct or both not): a word per NIC,
-  // and the kernel waits until all words of the signal have the step value (see signalWords). Elsewhere (or with
-  // MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
+  // completion of this rank's reads, or of its writes into the other rank), into a registration without relaxed
+  // ordering (rdmaSignalMr) on the same path as the data's (both registered through Data Direct or both not): a word
+  // per NIC, and the kernel waits until all words of the signal have the step value (see signalWords). Elsewhere (or
+  // with MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
   // writeRdmaSignal writes words [first, end) of signal `signal` of rank i (of this rank: a loopback write), through
   // dev.
   void writeRdmaSignal(size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end) {
@@ -1403,7 +1403,8 @@ struct CpuThreadImpl {
     size_t di = &dev - devices.data();
     auto offset = group->rdmaSignalBuffer.itembytes * concurrencyIndex + Group::rdmaSignalBytes * signal +
                   sizeof(uint32_t) * first;
-    // (from 4 copies of the step value; inline, so the copies may change once posted)
+    // (from 4 copies of the step value, which the slot's next work changes only once this write has completed, see
+    // WAIT_CONTROL)
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, signalStepValues + first),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteRdmaSignals[i].address + offset),
         remoteRdmaSignals[i].keys[di], sizeof(uint32_t) * (end - first));
@@ -6162,10 +6163,10 @@ struct CpuThreadImpl {
     }
 
     // Posts the queued parts of writes, up to numParallel parts (of reads and writes) in flight per NIC. A NIC writes
-    // its words of a write's signal once its parts of the write have completed (they are then in the destination's
-    // memory), or with flushes, posts its flush read right after its last part (the peer executes it after the
-    // writes before it, see Rdma::inOrder; otherwise once they have completed), and the signal goes once all the
-    // flushes of the write have completed.
+    // its words of a write's signal once its parts of the write have completed (the destination's NIC has then
+    // received them and issued their writes, which the signal's cannot pass), or with flushes, posts its flush read
+    // right after its last part (the peer executes it after the writes before it, see Rdma::inOrder; otherwise once
+    // they have completed), and the signal goes once all the flushes of the write have completed.
     void issueWrites() {
       for (size_t di : range(numDevices)) {
         auto& queue = writeQueues[di];
@@ -6440,8 +6441,8 @@ struct CpuThreadImpl {
         }
 
         // (to the peers, see CustomOpDescriptor::peers, and to itself if it reads from its own tensors; into words of
-        // their own, Group::customDyns: process group rings keep their neighbor's lists in list slots 0 and 1, which
-        // the lists of ranks 0 and 1 overwrote when a peer was still in a ring 16 ops earlier)
+        // their own, Group::customDyns: the process group's all-gather ring keeps its neighbor's lists in list slots 0
+        // and 1, which the lists of ranks 0 and 1 overwrote when a peer was still in the ring op 16 ops earlier)
         if (op->dynSelf) {
           self.writeCustomDyn(concurrencyIndex, rank);
         }

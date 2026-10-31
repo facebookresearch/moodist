@@ -26,8 +26,8 @@ work. For the user-facing API, see [api/compile_op.md](../api/compile_op.md).
   several source nodes into its destination nodes. `executorRank` is the rank whose kernel performs the copy.
   `cellIndex` identifies the piece of the global tensor.
 - Tensor indices on a rank: its inputs, then its input copies (contiguous copies of input pieces that are not
-  contiguous in the input), then its outputs, then its output copies, and for reductions across NVLink domains, a
-  scratch tensor (see step 7).
+  contiguous in the input), then its outputs, then its output copies, and for reductions across NVLink domains or in
+  two phases, a scratch tensor (see steps 7 and 11).
 
 ## Compile phase
 
@@ -39,11 +39,13 @@ Every step is collective: all ranks of the group take part (through per-rank que
 
    Errors are raised on every rank: a rank that raised alone would leave the others waiting in the next
    exchange (and the queues out of step). A rank that finds an error sends it in the next exchange, and every rank
-   raises the first one (lowest rank): compile.py's checks of a rank's own arguments in the spec exchange, the
-   regions (the device index of a rank's own regions, which only it knows) in `compile`'s first exchange, the gaps and
-   overlaps of a rank's outputs (Phase 2) with the read requests of Phase 3, the reductions' errors with the
-   agreement on the kernel path (step 9), and the 16-byte check (step 10) in an exchange of its own. Failures inside
-   the steps (e.g. running out of memory in the tuning) still leave the other ranks waiting.
+   raises the first one (lowest rank): compile.py's checks of a rank's own arguments in the spec exchange (where a
+   rank with an error of its own raises that one, and the others raise the first one's message, as a `TypeError`, a
+   `ValueError` or else a `RuntimeError`), the regions (the device index of a rank's own regions, which only it
+   knows) in `compile`'s first exchange, the gaps and overlaps of a rank's outputs (Phase 2) with the read requests
+   of Phase 3, the reductions' errors with the agreement on the kernel path (step 9), and the 16-byte check (step 10)
+   in an exchange of its own. Failures inside the steps (e.g. running out of memory in the tuning) still leave the
+   other ranks waiting (see Known issues).
 2. **Phase 1**: each rank intersects its own inputs with every output (same `tensor_id`) and sends the
    intersections to the rank of the output.
 3. **Phase 2**, cell decomposition: per `tensor_id`, the boundaries of all regions of all ranks cut each
@@ -63,12 +65,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    piece p for the destinations there (step 7); or in two rounds, which `reductionPieces` picks per cell, these
    executors compute a share of piece p each and gather the others' (step 7). Every destination rank of a cell
    computes the same pieces, from the same regions. In a cell whose sources and destinations are not all in one
-   NVLink domain, pieces are split further into parts (at most 32, with the same executors), so that the partial
-   results of other domains (step 7) arrive in parts: pieces of 8 MiB or more into parts of at least 4 MiB, and with
-   destinations in several domains, into parts of at least 32 MiB / m (from 1 to 4 MiB; m: the most destination ranks
-   of a domain), since such an executor writes each part to the m destinations of its domain, which with many of them
-   takes longer than reading the part, and smaller parts then overlap the two better (see the measurements in
-   `reductionPieces`).
+   NVLink domain, pieces are split further into parts (with the same executors; at most 32, more only where parts
+   would exceed 1 GiB, see Phase 5), so that the partial results of other domains (step 7) arrive in parts: pieces of
+   8 MiB or more into parts of at least 4 MiB, and with destinations in several domains, into parts of at least
+   32 MiB / m (from 1 to 4 MiB; m: the most destination ranks of a domain), since such an executor writes each part
+   to the m destinations of its domain, which with many of them takes longer than reading the part, and smaller parts
+   then overlap the two better (see the measurements in `reductionPieces`).
 4. **Phase 3**: one read request per cell and source, to the rank that owns the input.
 5. **Phase 4**: that rank resolves the offset. A piece that is not contiguous in the input becomes an input copy
    (deduplicated).
@@ -314,8 +316,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   an edge: the pipeline that completes the edge's last item (a per-edge counter that wraps around after every
   launch) writes the slots of all blocks. The lane that sees a dependency met executes
   `fence.acquire.sys` before the selection barrier; before copying from a peer's tensor, every thread does.
-- **Relay edges** (proxied transfers): ready once the CPU thread's signal, slot 16 + `rdmaSignal` of
-  `cpuOutBuffer` for the concurrency index, has reached stepValue (always ready when tuning); nothing to copy.
+- **Relay edges** (proxied transfers): ready once the words of signal `rdmaSignal` in `Group::rdmaSignalBuffer` for
+  the concurrency index (one per NIC, see Runtime, Signals) have all reached stepValue (always ready when tuning);
+  nothing to copy.
 - **Reductions** (`reduceLoop`): a rank that executes a reduction (an edge with several sources, or a part of one
   across NVLink domains, see compile phase step 7) runs this loop instead of the copy pipelines. The blocks (of 256
   threads) take items one at a time from the sequence (an item: a chunk of an edge, with all its destinations).
@@ -335,17 +338,17 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   and store to all their destinations). A block that has stored an item of an edge with a `doneSignal` waits for its
   stores to complete and counts the item (a per-edge counter, which wraps around after every launch); the block that
   counts the last one writes the step value into slot 16 + `doneSignal` of `cpuInBuffer` (host memory) for the CPU
-  thread. A source that the CPU thread reads from another domain is loaded once the read's signal (slot 16 + signal
-  of `cpuOutBuffer`) has arrived, and in an all-reduce, the partial result of the executor's own domain once that
-  `cpuInBuffer` slot has the step value (the wait table word has bit 31 set for these). Until then, thread 0 stops
-  loading at that source, and the block goes on with the stages it has; it waits for the signal only when it has
-  combined every stage loaded before (at the start of a stage). Its earlier items are then complete, including any
-  partial results among them, so a block never holds back a partial result that a rank (its own included) waits for
-  while it waits itself, and the blocks of all ranks make progress. In an all-reduce in two rounds, the edges of the
-  shares (which wait for partial results, and which other ranks wait for) and the copies of other shares (which wait
-  for shares of their part) follow part by part, the copies of a part after the next part's share, in the same order
-  on every rank: every wait is for an item that comes earlier in its rank's sequence (by part, then by round), so
-  there is no cycle of waits.
+  thread. A source that the CPU thread reads from another domain is loaded once the read's signal (in
+  `Group::rdmaSignalBuffer`) has arrived, and in an all-reduce, the partial result of the executor's own domain once
+  that `cpuInBuffer` slot has the step value (the wait table word has bit 31 set for these). Until then, thread 0
+  stops loading at that source, and the block goes on with the stages it has; it waits for the signal only when it
+  has combined every stage loaded before (at the start of a stage). Its earlier items are then complete, including
+  any partial results among them, so a block never holds back a partial result that a rank (its own included) waits
+  for while it waits itself, and the blocks of all ranks make progress. In an all-reduce in two rounds, the edges of
+  the shares (which wait for partial results, and which other ranks wait for) and the copies of other shares (which
+  wait for shares of their part) follow part by part, the copies of a part after the next part's share, in the same
+  order on every rank: every wait is for an item that comes earlier in its rank's sequence (by part, then by round),
+  so there is no cycle of waits.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
 - **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
@@ -362,26 +365,26 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   and the offset in it: `nvlsIdentity` in processgroup.cc) into a table of each peer's with the layout of the
   address table. If every destination has the local destination's identity, block 0 stores the chunks with one
   multicast store each (to the multicast address of the local destination's tensor, which `customOp` passes with the
-  identities in a fourth kernel parameter; chunks of 64 KiB, through a ring of its own over the stage memory: per
-  chunk, the window and the counter cost time) and the other blocks only take part in the address exchange and the
-  exit sync; otherwise the launch stores to each destination as usual. Multicast stores at full speed from all ranks
-  overload the switches' links to the GPUs, which then deliver about 2/3 of their bandwidth, so the ranks advance in
-  step: an op has a step counter per concurrency slot in the counter area; once the stores of a chunk have completed,
-  a rank adds 1 to it through the multicast mapping (`multimem.red`, relaxed: a release waits for all outstanding
-  stores), and it stores chunk c once its local copy of the counter shows every rank's chunks up to c - 8 complete.
-  The counter only grows; `customOp` passes its value before the launch (launches of the slot times the chunks of
-  all ranks); a launch that does not use NVLS adds its chunks at the end.
+  identities in a fourth kernel parameter, or through the parameter buffer; chunks of 64 KiB, through a ring of its
+  own over the stage memory: per chunk, the window and the counter cost time) and the other blocks only take part in
+  the address exchange and the exit sync; otherwise the launch stores to each destination as usual. Multicast stores
+  at full speed from all ranks overload the switches' links to the GPUs, which then deliver about 2/3 of their
+  bandwidth, so the ranks advance in step: an op has a step counter per concurrency slot in the counter area; once
+  the stores of a chunk have completed, a rank adds 1 to it through the multicast mapping (`multimem.red`, relaxed: a
+  release waits for all outstanding stores), and it stores chunk c once its local copy of the counter shows every
+  rank's chunks up to c - 8 complete. The counter only grows; `customOp` passes its value before the launch (launches
+  of the slot times the chunks of all ranks); a launch that does not use NVLS adds its chunks at the end.
 
 ## Runtime (`customOp`, `WorkCustom`)
 
 - `customOp` checks the tensors (shape, dtype, device; for user ops also that CUDA tensors come from the moodist
   CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies
   (`narrow().contiguous()`), allocates the output copies (copied into the outputs when the op is waited on) and the
-  scratch tensor of reductions across NVLink domains (on the op's stream: its memory is reused only by work after the
-  op on that stream, which comes after the op's RDMA reads into and from it). A rank with a scratch tensor counts as
-  one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need not have any): its
-  stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch tensor's memory
-  while other ranks still read from it.
+  scratch tensor of reductions across NVLink domains or in two phases (on the op's stream: its memory is reused only
+  by work after the op on that stream, which comes after the op's RDMA transfers into and from it). A rank with a
+  scratch tensor counts as one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need
+  not have any): its stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch
+  tensor's memory while other ranks still read from it or write into it.
 - Stream order (a rank with CUDA tensors, when any rank needs RDMA): write `cpuIn` = stepValue (the CPU thread may
   start), then the kernel, then wait until `cpuOut` >= stepValue.
 - The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream
@@ -398,36 +401,21 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   (`CustomOpDescriptor::peers`: the ranks it reads from, writes to or notifies, and those that read from it, write to
   it or notify it; the compile phase finds them in an exchange it already has). It publishes the rank's input list
   (addresses, sizes, rkeys; CUDA tensors are registered on first use; the inputs, the input copies and the scratch
-  tensor) to its peers, into words of its own (`Group::customDyns`: process group rings keep the lists of a rank's
-  ring neighbor in its list slots 0 and 1, which a compile_op of rank 0 or 1 16 ops later overwrote while the rank
-  still read from its neighbor), registers the outputs, collects its peers' input lists, waits for `cpuIn`, exchanges
-  step values with its peers (their inputs are ready), issues its ibReads (split into parts of about 128 KiB, and if
-  the op has fewer reads than NICs, smaller reads too, into parts of at least 64 KiB; reads with a signal first, in
-  signal order, i.e. the chunks of a transfer in order, then the others in the order of the compile phase,
-  `readSources` at a time: with more than one, the parts of that many reads go round robin, and a read whose parts
-  have all been issued makes room for the next; each part on the NIC with the fewest in flight, up to 8), waits for
-  them (and for its reads of the peers' input lists of more than two tensors, also of the lists that it does not use,
-  of peers that only read from it or write to it: their completions could otherwise come after the op had ended and
-  its `WorkCustom` was reused), runs a second barrier with its peers (nobody reads this rank's inputs any more),
-  waits until all other ranks have reached the op too, and writes `cpuOut`. The step values that ranks write into
-  each other's memory per concurrency slot are reused by the op 16 later, of any kind, and some process group
-  collectives wait for exact values in them, so a rank must not write there for a later op while another still waits
-  in the earlier one: a rank writes its step value into another rank's memory only once that rank's input list for
-  the same op has arrived (it is then done with the slot's previous op). The last wait keeps every rank within an op
-  of every other, as when all ranks waited for each other's reads. The process group collectives need that: they
-  write their lists into the memory of other ranks without waiting for them to reach the op (the all-gather ring also
-  writes step values under the indices of other ranks, and keeps its neighbor's lists in list slots 0 and 1, which
-  the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished the slot's previous
-  op by then; on one stream, the collectives that wait for all ranks (barriers, all-gathers, reduce-scatters,
-  all-reduces) keep every rank within an op of every other too, but the peers alone would let a rank get any number
-  of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival value (its step value and op
-  id) into the memory of the ranks that are not its peers, a few at a time while its reads go on, into words of their
-  own (`Group::cpuArrivalValues`) that only `WorkCustom` reads (with `>=`, since it writes them without knowing
-  whether the other rank is done with the slot's previous op, which may be a process group collective waiting for an
-  exact step value); with the op's step value, the op ids must match (the peers compare theirs in their input lists).
-  The parts of a read with a signal share it: the signal is written when the last part has completed. Small parts
-  keep a rank on one or two sources at a time (with `readSources` 1), which with the read order keeps the ranks in
-  step (see the RDMA read notes under Performance).
+  tensor) to its peers, into words of its own (`Group::customDyns`: the process group's all-gather ring keeps the
+  lists of a rank's ring neighbor in its list slots 0 and 1, which a compile_op of rank 0 or 1 16 ops later overwrote
+  while the rank still read from its neighbor), registers the outputs, collects its peers' input lists, waits for
+  `cpuIn`, exchanges step values with its peers (their inputs are ready), issues its ibReads (split into parts of
+  about 128 KiB, and if the op has fewer reads than NICs, smaller reads too, into parts of at least 64 KiB; reads
+  with a signal first, in signal order, i.e. the chunks of a transfer in order, then the others in the order of the
+  compile phase, `readSources` at a time: with more than one, the parts of that many reads go round robin, and a read
+  whose parts have all been issued makes room for the next; each part on the NIC with the fewest in flight, up to 8),
+  waits for them (and for its reads of the peers' input lists of more than two tensors, also of the lists that it
+  does not use, of peers that only read from it or write to it: their completions could otherwise come after the op
+  had ended and its `WorkCustom` was reused), runs a second barrier with its peers (nobody reads this rank's inputs
+  any more), waits until all other ranks have reached the op too (see Slot reuse below), and writes `cpuOut`. The
+  parts of a read with a signal share it: the signal is written when the last part has completed. Small parts keep a
+  rank on one or two sources at a time (with `readSources` 1), which with the read order keeps the ranks in step (see
+  the RDMA read notes under Performance).
   Reductions across NVLink domains (compile phase step 7): a read of a partial result waits until its notification
   has arrived (slot `waitSlot` of the partial rank's slots in `Group::customNotifications`), and lets the reads after
   it go first meanwhile: the first part of a read that is ready goes next (the reads before it go on as soon as they
@@ -448,26 +436,47 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   parts of a write have completed, it sets its words of the write's signal in the destination (see Signals below).
   The writes go before the reads in each round of the loop: other ranks' kernels wait for them. The second barrier
   then also tells a rank that nobody writes into its scratch tensor any more.
+- Slot reuse (`WorkCustom`): the step values that ranks write into each other's memory per concurrency slot are
+  reused by the op 16 later, of any kind, and some process group collectives wait for exact values in them, so a rank
+  must not write there for a later op while another still waits in the earlier one: a rank writes its step value into
+  another rank's memory only once that rank's input list for the same op has arrived (it is then done with the slot's
+  previous op). The wait for all other ranks at the end of the op (for their arrival values, see below) keeps every
+  rank within an op of every other, as when all ranks waited for each other's reads. The process group collectives
+  need that: they write their lists into the memory of other ranks without waiting for them to reach the op (the
+  all-gather ring also writes step values under the indices of other ranks, and keeps its neighbor's lists in list
+  slots 0 and 1, which the other collectives use for ranks 0 and 1), which is safe only if those ranks have finished
+  the slot's previous op by then; on one stream, the collectives that wait for all ranks (barriers, all-gathers,
+  reduce-scatters, all-reduces) keep every rank within an op of every other too, but the peers alone would let a rank
+  get any number of ops ahead of the ranks that it does not exchange with. Every rank writes an arrival value (its
+  step value and op id) into the memory of the ranks that are not its peers, a few at a time while its reads go on,
+  into words of their own (`Group::cpuArrivalValues`). Only `WorkCustom` reads them, and only with `>=`, so a rank
+  can write them without knowing whether the other rank is done with the slot's previous op (which may be a process
+  group collective waiting for an exact step value); a larger value is a later op's (that rank has finished this
+  one). With the op's step value, the op ids must match (the peers compare theirs in their input lists).
 - Signals (`writeRdmaSignal`): a kernel waits for the data of an RDMA transfer (a proxied transfer's read, a
   reduction's source from another NVLink domain) until its signal in `Group::rdmaSignalBuffer` is set: 16 bytes per
-  signal index, a word per NIC, all of which must have the step value. A NIC's writes into GPU memory reach the GPU in
-  the order the NIC issued them unless the later one is relaxed-ordered (PCIe lets a write pass earlier ones only with
-  relaxed ordering, which the data's registrations allow, for speed), and a GPU whose GPUDirect RDMA writes ordering
-  is "owner" (`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING`; GB300) lets its kernels see them in that order. So
-  each NIC that carried some of the data writes its word (and the words of the NICs next to it that carried none, see
-  `signalWords`) once its data is in place: for a read, a loopback write once all parts have completed; for writes,
-  a write to the destination once that NIC's parts have completed (its completions mean the data is in the
-  destination's memory, even if the network delivered it out of order). The signal buffer has a registration of its
-  own without relaxed ordering (`rdmaSignalMr`, `Rdma::regMrCuda`), on the same path as the data's: registered
-  through Data Direct like the data, or like it without (`RdmaMr::dataDirect`; a destination whose registrations
-  differ asks the writers to flush, `Header::flags`). Elsewhere, or with `MOODIST_RDMA_FLUSH=1`, the CPU thread
+  signal index, a word per NIC, all of which must have the step value. A NIC's writes into GPU memory reach the GPU
+  in the order the NIC issued them unless the later one is relaxed-ordered (PCIe lets a write pass earlier ones only
+  with relaxed ordering, which the data's registrations allow, for speed), and a GPU whose GPUDirect RDMA writes
+  ordering is "owner" (`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING`; GB300) lets its kernels see them in
+  that order. So each NIC that carried some of the data writes its word (and the words of the NICs next to it that
+  carried none, see `signalWords`) once its data is in place: for a read, a loopback write once all parts have
+  completed; for writes, a write to the destination once that NIC's parts have completed (by then the destination's
+  NIC has received all of them, even if the network delivered them out of order, and issued their writes into its
+  memory, which the signal's write cannot pass). The signal buffer has a registration of its own without relaxed
+  ordering (`rdmaSignalMr`, `Rdma::regMrCuda`), on the same path as the data's: registered through Data Direct like
+  the data, or like it without (`RdmaMr::dataDirect`). Elsewhere, or with `MOODIST_RDMA_FLUSH=1`, the CPU thread
   flushes the data first (`flushRead`): a read of one byte of it through every NIC that carried some (PCIe does not
   let a read pass the writes before it), a loopback read for the reads of a signal, a read of the destination for
   writes (on the same connection right after the last part, which the peer executes after them, `Rdma::inOrder`; on
-  EFA, whose SRD queue pairs deliver out of order, once the parts have completed), then sets all words with one write.
-  The reads without a signal (into CUDA tensors) are flushed once they have all completed, through each NIC that
-  carried some, before the CPU thread lets the stream go on (`cpuOut`; it is one word, which the stream waits for).
-  Data in CPU tensors needs no flush (the completion, written to host memory too, does not pass it).
+  EFA, whose SRD queue pairs deliver out of order, once the parts have completed), then sets all words with one
+  write. For writes, the destination decides: if its signals cannot follow the data (its registrations differ, its
+  GPU does not order the writes, or it has `MOODIST_RDMA_FLUSH=1`), it asks the writers to flush (`Header::flags`).
+  Signals without flushes rely on the NIC relaxing the order only of the writes into registrations that allow it: a
+  NIC set to relax the order of all its writes needs `MOODIST_RDMA_FLUSH=1` on every rank. The reads without a signal
+  (into CUDA tensors) are flushed once they have all completed, through each NIC that carried some, before the CPU
+  thread lets the stream go on (`cpuOut`; it is one word, which the stream waits for). Data in CPU tensors needs no
+  flush (the completion, written to host memory too, does not pass it).
 - The kernel and the CPU thread run concurrently. Besides `cpuIn` and `cpuOut` on the stream, the CPU threads
   signal the kernel when the data of an RDMA transfer is in place (see Signals), and the kernel signals the CPU thread
   when it has stored a partial result (`cpuInBuffer` slot 16 + `doneSignal`).
@@ -511,7 +520,7 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   compile phase step 7). Same on all ranks.
 - `MOODIST_RDMA_FLUSH=1` - the data of RDMA transfers is flushed before their signals even where the signals can
   follow it (see Runtime, Signals), for tests and comparisons. Read when the CPU thread starts; may differ between
-  ranks.
+  ranks (for writes, the destination's applies).
 - `MOODIST_COMPILE_OP_MAX_EDGE_BYTES=N` - the largest edge (a multiple of 4096 up to 2 GiB; by default 1 GiB, see
   Phase 5), for tests: small values split regions into many edges. Same on all ranks.
 - `MOODIST_COMPILE_OP_PARAM_BUFFER=1` - the kernel takes its address arrays from its parameter buffer, as ops too
@@ -524,15 +533,15 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 `moodist.enable_profiling(True)` makes the CPU thread record Chrome trace spans; after
 `moodist.enable_profiling(False)`, its next traced point writes them to `moodist-trace-cpu-<group>-<rank>.json` in
 the current directory (so run one more op). For compile_op the spans are `WorkCustom`'s phases, named with the op's
-step value: `start`, `wait dyn N` (waiting for peer N's input list), `wait kernel` (for the stream to reach the
-op), `step exchange`, `wait step N` (peer N's step value), `reads`, `wait read and write completions`,
-`wait reads of N` (peer N still reading or writing), `wait arrival of N` (rank N, not a peer, has not reached the
-op) and `wait flushes`, where only the ranks actually waited for appear; and each NIC's reads and writes (`read N`,
-from rank N, and `write N`, to rank N). The CPU thread also
-records how long each op waited from the call until the CPU thread picked it up, and its sleeps, stalls of 20 us
-or more and moves between cores, with the core numbers. Timestamps are the system clock, so the files of all
-ranks can be merged into one trace (align the nodes' clocks, e.g. on the end of `step exchange`, which a rank and
-its peers leave within a few microseconds).
+step value: `start`, `wait dyn N` (waiting for the input list of peer N, or of the rank itself), `wait kernel` (for
+the stream to reach the op), `step exchange`, `wait step N` (peer N's step value), `reads`,
+`wait read and write completions`, `wait reads of N` (peer N still reading or writing), `wait arrival of N` (rank N,
+not a peer, has not reached the op) and `wait flushes`, where only the ranks actually waited for appear; and each
+NIC's reads and writes (`read N`, from rank N, and `write N`, to rank N). The CPU thread also records how long each
+op waited from the call until the CPU thread picked it up, and its sleeps, stalls of 20 us or more and moves between
+cores, with the core numbers. Timestamps are the system clock, so the files of all ranks can be merged into one trace
+(align the nodes' clocks, e.g. on the end of `step exchange`, which a rank and its peers leave within a few
+microseconds).
 
 With `MOODIST_COMPILE_OP_PROFILE=N`, the kernel of every op compiled from then on records a timestamp at each
 marker in `generateKernel` (`profiling.enter`: the phases of the kernel, such as the address exchange, the
@@ -686,7 +695,7 @@ the same session came within 3% of the table from 1 MiB on): reduce-scatter 110 
 than NCCL's without at every size, and was 4% slower than NCCL's with it at 256 MiB, before the reductions in two
 phases (compile phase step 11). One pass / two phases on the same 32 GPUs (another session; tuning, the default,
 picked the faster one at every size): 64 MiB 223 / 232 us, 128 MiB 470 / 437 us, 256 MiB 937 / 894 us, 512 MiB 1.86
-/ 1.65 ms (558 and 629 GB/s); below 64 MiB two phases were 4-13% slower. On 16 GPUs: 64 MiB 226 / 227 us, 256 MiB
+/ 1.65 ms (558 and 629 GB/s); below 64 MiB two phases were 8-17% slower. On 16 GPUs: 64 MiB 226 / 227 us, 256 MiB
 881 / 825 us.
 
 Reduce-scatter (`bfloat16`) on 64 GPUs in two NVL72 domains of 32 (across domains, see compile phase step 7), and
@@ -835,13 +844,16 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
 ## Known issues and TODO
 
 ### Correctness
-- Failures inside the collective steps of the compile phase (e.g. running out of memory for the tuning's scratch
-  tensors, or a kernel that fails to JIT on one rank) are raised by that rank only, and the other ranks then wait
-  forever in the next exchange (the errors the compile phase checks for are raised on all ranks, see step 1).
+- Failures inside the collective steps of the compile phase are raised by the rank that hits them only, and the other
+  ranks then wait forever in the next exchange: e.g. running out of memory for the tuning's scratch tensors, a kernel
+  that fails to JIT on one rank, or a check in `generateKernel` (a shared memory size in `MOODIST_COMPILE_OP_CONFIGS`
+  too small for the copy kernel of a rank's graph, a bad `MOODIST_COMPILE_OP_PROFILE`). The errors that step 1 lists
+  are raised on all ranks.
 - The process group's own collectives (all-gather, reduce-scatter, broadcast and reduce in cputhread.cc) signal their
   kernels as soon as the completions of their RDMA reads arrive (`writeCpuOut`), through the first NIC into memory
-  registered with relaxed ordering, so the signal may land before data that another NIC wrote (compile_op's signals
-  follow their data, see Runtime).
+  registered with relaxed ordering, so the signal may land before data that another NIC wrote, or that the same NIC
+  wrote before it (a write with relaxed ordering may pass earlier ones; compile_op's signals follow their data, see
+  Runtime).
 - `computeTarget` returns `sm_100a` for every compute capability from 10 up except 10.3, so devices such as sm_110
   or sm_120 get a target their driver cannot load. The copy kernel does not seem to need arch-specific (`a`)
   instructions, so a plain target would do.
@@ -897,9 +909,9 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   other ranks), as do the ranks of an op with RDMA for those of one without (which run no `WorkCustom`), and a rank
   that waits forever compares no further op ids. A compile_op op and a process group collective wait for each other
   forever: the input lists of compile_op have words of their own, so neither sees the other's (before, a rank in a
-  compile_op op failed on the list of a direct collective in the slot of its rank, though not on a ring's).
-  `WorkCustom` could watch the process group's list slots while it waits: a list there with the op's step value means
-  a mismatch.
+  compile_op op that waited for a peer's list failed on a direct collective's list in that peer's slot, and on a
+  ring's if the peer was rank 0 or 1). `WorkCustom` could watch the process group's list slots while it waits: a list
+  there with the op's step value means a mismatch.
 - RDMA bandwidth on GB300 (one ConnectX-8 card with 4 ports of 200 Gb/s per GPU, i.e. 100 GB/s): the card's PCIe
   link to the CPU is Gen5 x16, and without Data Direct the NICs reach GPU memory through it, at about 52 GB/s per GPU.
   Each card also has a Data Direct DMA function behind its own PCIe switch, to which one GPU is attached (Gen6 x16).
@@ -968,10 +980,10 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
 1. The write variant: the source writes the data and the signal into the proxy's memory (as reductions across
    domains can, see compile phase step 7).
 2. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
-   fixed neighbor, which relays the data of the ranks before it): fixed neighbors and synchronization with neighbors
-   only, instead of `WorkCustom`'s exchanges with all ranks. It needs a heuristic for when it applies, and
-   measurements against the proxy pass. The same for reductions across domains (a reduce-scatter in a ring): a ring
-   has no incast, which makes large reduce-scatters with writes twice as slow (see Performance notes).
+   fixed neighbor, which relays the data of the ranks before it): one source per rank, and its two neighbors as its
+   only peers in `WorkCustom` (see Runtime). It needs a heuristic for when it applies, and measurements against the
+   proxy pass. The same for reductions across domains (a reduce-scatter in a ring): a ring has no incast (with
+   writes, incast makes large reduce-scatters twice as slow, see Performance notes).
 
 ### Reductions: next steps
 1. TODO, a problem: the scratch tensor of reductions across NVLink domains holds every partial result whole, for the
@@ -990,11 +1002,11 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    (see Performance notes); which to use when (e.g. writes for all-reduces in two rounds) is open, and so are rings
    (see Mixed NVLink and RDMA paths). In two rounds, owners could write their shares straight into the other owners'
    outputs instead of their scratch tensors. With 16 domains, the reduce-scatter is 6-9% slower than NCCL from
-   64 MiB on (above). Small reductions across domains take 63 us on 64 GPUs in two domains (all-reduce of 64 KiB; 79 us
-   with 16 domains of 4), against 30 us in one domain of 32 (two rounds about 35 us more). The cost model of two rounds
-   (Performance notes) picks two rounds a little early with 8 domains; its parts are those of one round (Phase 2),
-   which were not tuned for two rounds. CPU tensors (an error): the CPU thread could combine them (`CpuReductions` in
-   cputhread.cc, which the process group's CPU reduce-scatter uses).
+   64 MiB on (above). Small reductions across domains take 63 us on 64 GPUs in two domains (all-reduce of 64 KiB;
+   79 us with 16 domains of 4), against 30 us in one domain of 32 (two rounds about 35 us more). The cost model of
+   two rounds (Performance notes) picks two rounds a little early with 8 domains; its parts are those of one round
+   (Phase 2), which were not tuned for two rounds. CPU tensors (an error): the CPU thread could combine them
+   (`CpuReductions` in cputhread.cc, which the process group's CPU reduce-scatter uses).
 3. All-reduce in one domain in two phases (compile phase step 11): 5-11% faster from 128 MiB on 32 GPUs, but the
    copies of a piece wait for all of it, and the kernel computes every piece before it copies any. In parts (as
    across domains, Phase 2), the copies of the first parts could overlap the computation of the last ones (across

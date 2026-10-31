@@ -58,27 +58,32 @@ struct Graph {
     uint32_t cellIndex;
     uint32_t executorRank;
     // >= 0 for the two edges of a proxied transfer on the proxy rank (see proxyRemoteEdges in compile_op.cc):
-    // the RDMA edge, whose read signals flag rdmaSignal once done, and the relay edge (no sources, the same
-    // destination), with which the kernel waits for that flag and then marks the destination as filled.
+    // the RDMA edge, whose read sets signal rdmaSignal once done (see writeRdmaSignal in cputhread.cc), and the relay
+    // edge (no sources, the same destination), with which the kernel waits for that signal and then marks the
+    // destination as filled.
     int32_t rdmaSignal = -1;
-    // The part of the cell, for cells whose proxied transfer is split into chunks (0 otherwise)
+    // Which part of its cell the edge moves (0 if the cell is one edge): its part of at most maxEdgeBytes (Phase 5 in
+    // compile_op.cc), its piece or part of a piece in a reduction (reductionPieces), or for a chunk of a proxied
+    // transfer, part * 32 + chunk (proxyRemoteEdges)
     uint32_t chunkIndex = 0;
 
     // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc):
     // per source, the signal index of the RDMA transfer that fills it (the kernel waits for the signal in
     // rdmaSignalBuffer before it loads the source), or -1; empty if no source waits for a transfer
     Vector<int32_t> sourceSignals;
-    // per source, the doneSignal of the edge of this rank's that computes it (in an all-reduce, the partial result of
-    // the executor's own domain; the kernel waits for cpuInBuffer slot 16 + doneSignal), or -1; empty if none
+    // per source, the doneSignal of the edge of this rank's that computes it (in an all-reduce across domains, the
+    // partial result of the executor's own domain, and in two phases, the piece that the edge copies; the kernel waits
+    // for cpuInBuffer slot 16 + doneSignal), or -1; empty if none
     Vector<int32_t> sourceDoneSignals;
     // The number of sources, at the end, that are partial results of NVLink domains: an average has divided those
     // by the divisor already, the others it divides after combining them
     uint32_t partialSources = 0;
     // Avg: the number of inputs the result is the average of (0: the number of sources)
     uint32_t divisor = 0;
-    // >= 0: a partial result that ranks in other domains read over RDMA (or that the executor combines itself, see
-    // sourceDoneSignals). Once all of the edge has been stored, the kernel writes the step value into cpuInBuffer slot
-    // 16 + doneSignal, for its CPU thread.
+    // >= 0: a partial result that ranks in other domains read over RDMA (or that the executor combines itself), or a
+    // piece computed in two phases (see twoPhaseReductions in compile_op.cc). Once all of the edge has been stored,
+    // the kernel writes the step value into cpuInBuffer slot 16 + doneSignal, for its CPU thread or for the edges of
+    // its own that wait for it (sourceDoneSignals).
     int32_t doneSignal = -1;
 
     template<typename X>
