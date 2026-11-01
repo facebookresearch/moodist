@@ -209,6 +209,33 @@ Every step is collective: all ranks of the group take part (through per-rank que
    order; see Performance notes). The items of pieces with executors in several domains are in piece order on every
    rank, which an item that several executors read needs.
 
+   Rings of the domains (`MOODIST_COMPILE_OP_RING`, with reads): an RDMA read from one source at a time is faster than
+   from several at once (each GPU receiving 15 parts of 256 MiB over RDMA, 16 domains of 4 GB300: 95 GB/s from one rank
+   at a time, 86 from two, 82 from eight, as the partial results of a reduce-scatter came; with several senders per
+   receiver, the switches mark packets for congestion, and the NICs slow down). So with 3 or more domains of the same
+   size, a cell with one executor (a reduce-scatter's, a reduce to one rank's) and sources in every domain can go along
+   a ring of the domains instead: the domain after the executor's computes its partial result (step 0; with one source,
+   a copy of it, which the next step adds as an input: an average divides it), the next one adds its own to it (step 1:
+   an item whose sources are its domain's and the item of step 0, read over RDMA), and so on around the ring, and the
+   executor adds its domain's sources to the last one. Every step is computed by the rank at the executor's position on
+   its rail (`pickPartialRank`), so that every rank reads from one rank (at its position in the domain before its own)
+   and is read by one. Each step rounds its running sum to the op's dtype: as many roundings as with a partial result
+   per domain, but of sums that grow along the ring, which in 16-bit types is less accurate. The executor asks for every
+   step at once: a step's request names the rank of the step before (`ringFrom`) and the rank that reads the item
+   (`ringTo`), to which the computing rank sends its answer (`RingAnswer`). The items of a rank's steps go through one
+   ring (read by the next domain's rank), and it reads into one ring (from the domain before). Their keys are (group of
+   parts, step, cell, part), with groups of 8 parts (`MOODIST_COMPILE_OP_RING_GROUP`): the links carry the items of a
+   group in order, and the item of the step before that a rank needs came 8 parts earlier. A ring has at least half as
+   many slots as its two largest consecutive rows (the uses of one group and step) have uses, which keeps every wait for
+   a smaller key (an item waits for its slot's previous use to be read by the rank after, into a slot whose previous use
+   is at least two rows back). With groups of 8, that is the 8 slots of 2 MiB per ring that the scratch budget gives a
+   rank's two rings anyway (groups of 4 were 5% slower at 256 MiB, groups of 16 1% faster with twice the scratch). A
+   rank credits the rank before it for every item that it reads; on the queue pairs of its reads from that rank, the
+   credits slowed the reads down, so they go through queue pairs of their own (see Runtime). A rank takes the ring for
+   its cell if it has one such cell (a rank with two reduce-scattered tensors has two and takes none), of 6 MiB or more:
+   below that, the steps one after the other take longer than the reads from every domain at once (see Performance
+   notes). `MOODIST_COMPILE_OP_RING=1` takes it at any size, `0` never.
+
    With writes (`MOODIST_COMPILE_OP_TRANSFER=write`; reads by default), the data goes the other way: an executor
    allocates a region of its scratch tensor and the signal for each item (or share) that it needs when it makes its
    request, and sends them with it (`WriteTarget`). The rank that computes it gets a `CustomOpDescriptor::IbWrite`
@@ -494,20 +521,22 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   each). The credits go through a second queue pair per peer and NIC (`IbCommon::controlQps`, `Rdma::postWriteControl`),
   not the one of the reads from that rank: small writes to a rank through the queue pair of reads from it slow the reads
   down (a GPU reading 3.75 GiB from one rank: 95 GB/s; with a write of 4 bytes to it per part of 128 KiB, 29 GB/s; with
-  one per 16 parts, 78 GB/s). All credits to a signal go through the same queue pair, so they arrive in order. The
-  control queue pairs have send queues of 256 work requests (the others 2048), and `RdmaIb` keeps at most 256 control
-  writes in flight per NIC. The notifications stay on the queue pair of the reads: through the control queue pair, they
-  made no difference at large sizes, and the times of small ops varied more (reduce-scatter of 1 MiB across 2 domains of
-  32 GPUs: 167 us at the median instead of 159, the fastest 10% 140 us instead of 156). The values that the CPU thread
-  writes come from a table per concurrency slot (`generationValue`), which an op fills when it starts (the slot's
-  previous op has finished its writes from it), for the generations of the uses of its rank's slots and those of its
-  credits, the partial ranks' (`CustomOpDescriptor::numGenerations`). The notifications have words of their own: in the
-  `inStepValueDeviceChunk` words, where they were before, the process group's all-gather and reduce-scatter rings write
-  step values under the indices of other ranks into their send neighbor's memory without waiting for it to reach the op
-  (the broadcast rings only into ranks that have reached it), so a ring 16 ops later on another stream could tell a rank
-  still in the op that a partial result was ready before it was (the all-gather ring, the only one of the two in use,
-  writes a rank's index only once that rank is in the ring op: that rank has then finished the compile_op, which it does
-  only once the reads from it are over).
+  one per 16 parts, 78 GB/s), and in a ring of the domains (step 7) a rank credits the rank that it reads from for every
+  item (reduce-scatter of 256 MiB across 16 domains of 4 GPUs: 52.1 ms with the credits on the queue pairs of the reads,
+  45.6 ms without, with groups of 4 parts). All credits to a signal go through the same queue pair, so they arrive in
+  order. The control queue pairs have send queues of 256 work requests (the others 2048), and `RdmaIb` keeps at most 256
+  control writes in flight per NIC. The notifications stay on the queue pair of the reads: through the control queue
+  pair, they made no difference at large sizes, and the times of small ops varied more (reduce-scatter of 1 MiB across 2
+  domains of 32 GPUs: 167 us at the median instead of 159, the fastest 10% 140 us instead of 156). The values that the
+  CPU thread writes come from a table per concurrency slot (`generationValue`), which an op fills when it starts (the
+  slot's previous op has finished its writes from it), for the generations of the uses of its rank's slots and those of
+  its credits, the partial ranks' (`CustomOpDescriptor::numGenerations`). The notifications have words of their own: in
+  the `inStepValueDeviceChunk` words, where they were before, the process group's all-gather and reduce-scatter rings
+  write step values under the indices of other ranks into their send neighbor's memory without waiting for it to reach
+  the op (the broadcast rings only into ranks that have reached it), so a ring 16 ops later on another stream could tell
+  a rank still in the op that a partial result was ready before it was (the all-gather ring, the only one of the two in
+  use, writes a rank's index only once that rank is in the ring op: that rank has then finished the compile_op, which it
+  does only once the reads from it are over).
   With writes (`MOODIST_COMPILE_OP_TRANSFER=write`), the CPU thread of a partial rank watches the flags of its
   `IbWrite`s instead: once one is set (and the destination's input list has arrived), it splits the write into parts
   like a read (about 128 KiB, round robin over the NICs from one that rotates per write) and queues them on their
@@ -605,6 +634,12 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   number of rings if that is more, from 2 to 16), and the most that a slot holds (a multiple of 4096; by default 2
   MiB), which also limits their parts (see compile phase steps 3 and 7), for tests: one slot of 4 KiB uses every slot
   many times. Same on all ranks.
+- `MOODIST_COMPILE_OP_RING=auto|1|0` - with reads, reductions along a ring of the NVLink domains (see compile phase
+  step 7) where they are faster (`auto`, the default: with 3 or more domains of the same size, a rank's one cell with
+  one executor and sources in every domain, of 6 MiB or more), wherever they can be (`1`), or never (`0`). Same on
+  all ranks.
+- `MOODIST_COMPILE_OP_RING_GROUP=N` - the parts per group in the order of such a ring (1 to 16; by default 8), for
+  tests and measurements. Same on all ranks.
 - `MOODIST_RDMA_FLUSH=1` - the data of RDMA transfers is flushed before their signals even where the signals can
   follow it (see Runtime, Signals), for tests and comparisons. Read when the CPU thread starts; may differ between
   ranks (for writes, the destination's applies).
@@ -805,7 +840,8 @@ domains, by RDMA: a GPU reads 15 partial results of the size of its output, at a
 orders of the partial results and the reads (step 7), the 16 domains took 443 us, 4.65 ms, 16.8 ms and 68.7 ms from
 1 MiB on; with 1 MiB parts instead of 128 KiB (see the RDMA notes), 442 us, 3.99 ms, 13.9 ms and 50.7 ms. NCCL's
 reduce-scatter on the 64 GPUs is a ring at every size, NVLS or not (`NCCL_NVLS_ENABLE=0`: 420 us, 747 us, 2.02 ms,
-6.71 ms and 26.2 ms).
+6.71 ms and 26.2 ms). Along rings of the domains (step 7, from 6 MiB per rank on), the 16 domains take 2.72 ms,
+10.9 ms and 43.5 ms at 16, 64 and 256 MiB (see the ring table below).
 
 All-reduce (`bfloat16`) on the same 64 GPUs (one session):
 
@@ -880,6 +916,28 @@ reads), which the transfers that follow feel too: 3% slower at 16 MiB, 20-40% at
 With reads, two readers on one source share its link, and nothing queues in the network. More writes in flight per
 NIC (2 MiB instead of 1) brought 64 MiB level with reads, but left 256 MiB at 79 ms. On 64 GPUs in two domains of 32,
 reads and writes took the same time from 16 MiB on (an all-reduce of 256 MiB 847 us, a reduce-scatter 25.7 ms).
+
+Reductions along rings of the domains (step 7) against the reads from every domain at once
+(`MOODIST_COMPILE_OP_RING=1` / `0`), `bfloat16`, k domains of 4 GB300 with `MOODIST_FABRIC=0`, size per rank
+(groups of 8 parts; ring / reads from every domain, in us):
+
+| | 1 MiB | 2 MiB | 4 MiB | 6 MiB | 8 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|---|---|---|
+| reduce-scatter, k = 4 | 151 / 102 | 207 / 141 | 252 / 227 | 295 / 334 | 343 / 414 | 598 / 768 | 2369 / 2914 | 9417 / 11360 |
+| reduce-scatter, k = 8 | 286 / 165 | 429 / 250 | 516 / 432 | 612 / 608 | 708 / 789 | 1310 / 1513 | 5212 / 5774 | 20838 / 22823 |
+| reduce-scatter, k = 16 | 605 / 319 | 908 / 488 | 1045 / 866 | 1275 / 1256 | 1454 / 1672 | 2726 / 3177 | 10869 / 12271 | 43454 / 48889 |
+| reduce to rank 0, k = 4 | 106 / 74 | 151 / 113 | 183 / 180 | | 242 / 312 | | 898 / 2124 | |
+| reduce to rank 0, k = 8 | 156 / 121 | 201 / 201 | 231 / 353 | | 277 / 654 | | 957 / 4881 | |
+| reduce to rank 0, k = 16 | 422 / 223 | 620 / 395 | 651 / 717 | | 694 / 1365 | 705 / 2658 | 998 / 10414 | 3119 / 41423 |
+
+In a reduce-scatter, every GPU reads k - 1 partial results of the size of its output either way: along the rings
+from one source (93 GB/s at 256 MiB, without ECN-marked packets), otherwise from several at once (82 GB/s, with
+congestion marks). But the ring's k - 1 steps go one after the other, each with a notification and a read (about
+40 us per step at 1 MiB), which takes longer at small sizes: the ring is 2-4% slower at 5 MiB per rank, within 2% at
+6 MiB (12% faster with 4 domains), and `auto` takes it from 6 MiB on. To one rank, the reads from every domain at
+once all go into the one GPU, (k - 1) times its output, while the ring's steps are spread over k - 1 GPUs: faster
+from 4 MiB on with 8 and 16 domains (from 8 MiB with 4), 13 times faster at 256 MiB with 16 domains (only the GPUs
+at the executor's position work; see Reductions: next steps). Also from 6 MiB on, for simplicity.
 
 RDMA reads, measured with per-read logs (issue and completion time of every read on every rank, merged) on the
 1 GiB all-to-all above. The reads used to be split into one part per NIC (from 4 MiB on), with 2 in flight per NIC,
@@ -1074,8 +1132,9 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
 2. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
    fixed neighbor, which relays the data of the ranks before it): one source per rank, and its two neighbors as its
    only peers in `WorkCustom` (see Runtime). It needs a heuristic for when it applies, and measurements against the
-   proxy pass. The same for reductions across domains (a reduce-scatter in a ring): a ring has no incast (with
-   writes, incast makes large reduce-scatters twice as slow, see Performance notes).
+   proxy pass. Reductions across domains have rings for cells with one executor (compile phase step 7: reduce-scatters
+   9-22% faster from 8 MiB per rank on, with 4 to 16 domains), and a ring has no incast (with writes, incast makes
+   large reduce-scatters twice as slow, see Performance notes).
 
 ### Reductions: next steps
 1. Rings for writes (compile phase step 7): with writes, every item and every write still has a region of its own,
@@ -1085,16 +1144,15 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    rounds, the copies of other shares could also read them into the outputs instead (the RDMA read into the
    executor's own output, the kernel copying it to the others of its domain).
 2. Across NVLink domains (compile phase step 7): reads or writes (`MOODIST_COMPILE_OP_TRANSFER`, reads by default).
-   Writes are faster for all-reduces across many domains from 16 MiB on and much slower for large reduce-scatters
-   (see Performance notes); which to use when (e.g. writes for all-reduces in two rounds) is open, and so are ring
-   algorithms (a reduce-scatter along a ring of ranks, see Mixed NVLink and RDMA paths). In two rounds, owners could
-   write their shares straight into the other owners' outputs instead of their scratch tensors. With 16 domains, the
-   reduce-scatter is 6-9% slower than NCCL from 64 MiB on (above). Small reductions across domains take 63 us on 64
-   GPUs in two domains (all-reduce of 64 KiB; 79 us with 16 domains of 4), against 30 us in one domain of 32 (two
-   rounds about 35 us more). The cost model of two rounds (Performance notes) picks two rounds a little early with 8
-   domains; its parts are those of one round (Phase 2), which were not tuned for two rounds. CPU tensors (an error):
-   the CPU thread could combine them (`CpuReductions` in cputhread.cc, which the process group's CPU reduce-scatter
-   uses).
+   Writes are faster for all-reduces across many domains from 16 MiB on and much slower for large reduce-scatters (see
+   Performance notes); which to use when (e.g. writes for all-reduces in two rounds) is open. In two rounds, owners
+   could write their shares straight into the other owners' outputs instead of their scratch tensors. With 16 domains,
+   the reduce-scatter along rings is 27%, 5% and 3% faster than NCCL at 16, 64 and 256 MiB (above; NCCL from an earlier
+   session). Small reductions across domains take 63 us on 64 GPUs in two domains (all-reduce of 64 KiB; 79 us with 16
+   domains of 4), against 30 us in one domain of 32 (two rounds about 35 us more). The cost model of two rounds
+   (Performance notes) picks two rounds a little early with 8 domains; its parts are those of one round (Phase 2), which
+   were not tuned for two rounds. CPU tensors (an error): the CPU thread could combine them (`CpuReductions` in
+   cputhread.cc, which the process group's CPU reduce-scatter uses).
 3. All-reduce in one domain in two phases (compile phase step 11): 5-11% faster from 128 MiB on 32 GPUs, but the
    copies of a piece wait for all of it, and the kernel computes every piece before it copies any. In parts (as
    across domains, Phase 2), the copies of the first parts could overlap the computation of the last ones (across
@@ -1115,6 +1173,17 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
 6. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: needs ops
    parameterized by size (compiling takes 1-2 s, once per size), and `avg` (FSDP2's default `ReduceOp.AVG` is a
    fatal error in moodist's process group reduce-scatter today).
+7. Rings of the domains (compile phase step 7) where there are none yet: a reduce to one rank uses only the GPUs at
+   the executor's position (one ring of k - 1 steps; a ring per position, each for a part of the cell that a rank of
+   the executor's domain then writes to it over NVLink, would use every NIC); ranks with several cells with one
+   executor (e.g. two reduce-scattered tensors: the steps of several cells in one ring); domains of different sizes;
+   writes (item 1). All-gathers, and the proxy pass, could go along rings too (see Mixed NVLink and RDMA paths), not
+   all-to-alls (every pair of ranks exchanges different data).
+8. Fewer connections: every rank connects to every rank, with two queue pairs per peer and NIC (send queues of 2048
+   and 256 work requests; setting them up takes 0.8 s with 64 ranks of 4 NICs, 0.55 s before the second), but a rank
+   of a ring exchanges with its two neighbors (and its own domain) only, and the reductions across domains with the
+   ranks of its rail. At large world sizes, connecting only the pairs of ranks that an op needs (when it is compiled)
+   would save most of them.
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`

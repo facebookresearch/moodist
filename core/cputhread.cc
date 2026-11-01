@@ -6132,8 +6132,9 @@ struct CpuThreadImpl {
     // the data (see writeRdmaSignal): through every NIC that carried a part (loopback writes), or after flushes through
     // them; and if the read's source is a slot of a ring of the source rank's scratch tensor, tell that rank that the
     // slot is free (a credit, after the signal: any path will do, the data has left). Credits go through the control
-    // queue pair, not the one of the reads from that rank (see IbCommon::controlQps); all credits to a signal go that
-    // way, so they arrive in order.
+    // queue pair, not the one of the reads from that rank (see IbCommon::controlQps; reduce-scatter of 256 MiB across
+    // 16 domains of 4 GPUs along rings of the domains, groups of 4 parts, a credit per 2 MiB read: 52.1 ms instead of
+    // 45.6); all credits to a signal go that way, so they arrive in order.
     void partDone(uint32_t r) {
       if (--readPartsLeft.at(r) != 0) {
         return;

@@ -475,6 +475,59 @@ def test_reduce_uneven_rings(ctx: TestContext):
 
 
 @test
+def test_reduce_ring(ctx: TestContext):
+    """Reductions along a ring of the NVLink domains wherever they can be (MOODIST_COMPILE_OP_RING=1; by default with 3
+    or more domains of the same size, for a rank's one cell with sources in every domain, of 6 MiB or more): the domain
+    after the executor's computes its partial result, each next one adds its own, and the executor its domain's. With
+    fewer domains, plain reductions. Reduce-scatter of every dtype and op, in parts, in slots of 4 KiB (many parts, many
+    uses of a slot) with groups of 1, 2, 4, 8 and 16 parts (MOODIST_COMPILE_OP_RING_GROUP), reduce to one rank, a
+    reduce-scatter and an all-reduce in one op (the all-reduce not along a ring), two reduce-scattered tensors (two such
+    cells per rank: none along a ring), a reduce-scatter with a second tensor reduced to rank 0 (rank 0 has two cells,
+    the others go along rings: the ranks at rank 0's position compute steps of rings and partial results for rank 0),
+    domains with one source (rings that start from a copy of an input); then by default, 1 and 8 MiB per rank."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+
+    def reduce_scatter(numel):
+        return {"0": ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])}
+
+    def whole(numel):
+        return [((0,), (numel,))]
+
+    with environment("MOODIST_COMPILE_OP_RING", "1"):
+        for dtype, op_name in all_combinations():
+            run_reduce(ctx, pg, op_name, dtype, reduce_scatter(64))
+        for numel in [100000, 5 << 19]:
+            for dtype, op_name in SOME:
+                run_reduce(ctx, pg, op_name, dtype, reduce_scatter(numel), salt=numel, repeat=2)
+        with environment("MOODIST_COMPILE_OP_SLOT_BYTES", "4096"):
+            for group in ["1", "2", "4", "8", "16"]:
+                with environment("MOODIST_COMPILE_OP_RING_GROUP", group):
+                    run_reduce(ctx, pg, "sum", torch.float32, reduce_scatter(20000), repeat=2)
+                    run_reduce(ctx, pg, "avg", torch.bfloat16, reduce_scatter(1 << 16))
+        for numel in [64, 300000]:
+            to_last = [[] for _ in range(n - 1)] + [whole(numel)]
+            run_reduce(ctx, pg, "sum", torch.float32, {"0": ([numel], [whole(numel)] * n, to_last)})
+        w = ([8, 4096], [[((0, 0), (8, 4096))]] * n, [[((0, 0), (8, 4096))]] * n)
+        run_reduce(ctx, pg, "sum", torch.float32, {"w": w, "b": reduce_scatter(50000)["0"]}, repeat=2)
+        run_reduce(ctx, pg, "avg", torch.float32, {"a": reduce_scatter(1000)["0"], "b": reduce_scatter(3000)["0"]})
+        to_first = [whole(1000)] + [[] for _ in range(n - 1)]
+        for numel in [3000, 300000]:
+            b = ([1000], [whole(1000)] * n, to_first)
+            run_reduce(ctx, pg, "sum", torch.float32, {"a": reduce_scatter(numel)["0"], "b": b}, salt=numel, repeat=2)
+        # Domains (nodes here) with one source: the odd ones, where only the first rank has inputs; a ring whose first
+        # step is there starts from a copy of that input, which the next step adds as an input, not as a partial result.
+        # (Three sources in the others: 2 per domain on average, so that averages of the test's inputs are exact.)
+        local = int(os.environ.get("LOCAL_WORLD_SIZE", n))
+        some = [whole(n * 1000) if r % local == 0 or (r // local % 2 == 0 and r % local < 3) else [] for r in range(n)]
+        for op_name in ["sum", "avg", "max"]:
+            run_reduce(ctx, pg, op_name, torch.float32, {"0": ([n * 1000], some, reduce_scatter(1000)["0"][2])})
+    for numel in [1 << 18, 2 << 20]:
+        run_reduce(ctx, pg, "sum", torch.float32, reduce_scatter(numel))
+        run_reduce(ctx, pg, "avg", torch.bfloat16, reduce_scatter(numel * 2))
+
+
+@test
 def test_all_reduce_two_phases(ctx: TestContext):
     """All-reduces in two phases within each NVLink domain (MOODIST_COMPILE_OP_PHASES=2): each executor computes its
     piece into its scratch tensor, then copies it to the destinations. All sizes, in place, inputs or outputs on some

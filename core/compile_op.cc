@@ -401,8 +401,14 @@ struct WriteTarget {
 // partial result of the sources (with one source, a copy of it) over the range [offset, offset + bytes) of their part
 // (in two rounds, the executor's share; else all of it), and where it goes in the kernel order of the rank that
 // computes it (see itemKey): whether the executor's piece has executors in several domains (allReduce), and `order`,
-// the piece's key there (pieceKey), else the index of the executor's plan among its plans of the chunk without them
+// the piece's key there (pieceKey), else the index of the executor's plan among its plans of the chunk without them.
+// In a ring (see crossDomainReductions), the item's step, the rank whose item of the step before it adds (none at the
+// first step), and the rank that reads it: the rank of the next step, with the index of the executor's request to
+// that rank, or at the last step the executor; and whether the item of the step before is a copy of an input (the
+// first step's domain has one source), which this item then combines as an input, not as a partial result (an
+// average divides it, see Edge::partialSources)
 struct PartialRequest {
+  static constexpr uint32_t noRank = (uint32_t)-1;
   Vector<Node> sources; // in (rank, tensor, offset) order, at the offsets of the part
   size_t offset;
   size_t bytes;
@@ -412,9 +418,15 @@ struct PartialRequest {
   bool allReduce;
   size_t order;
   WriteTarget target; // with writes
+  int32_t ringStep = -1;
+  uint32_t ringFrom = noRank;
+  uint32_t ringTo = noRank;
+  size_t ringToRequest = 0;
+  bool ringFromCopy = false;
   template<typename X>
   void serialize(X& x) {
-    x(sources, offset, bytes, divisor, cellIndex, chunkIndex, allReduce, order, target);
+    x(sources, offset, bytes, divisor, cellIndex, chunkIndex, allReduce, order, target, ringStep, ringFrom, ringTo,
+        ringToRequest, ringFromCopy);
   }
 };
 // The answer with reads (with writes, it is not used): where the item will be (a slot of the computing rank's ring
@@ -430,6 +442,17 @@ struct PartialResponse {
   template<typename X>
   void serialize(X& x) {
     x(tensorIndex, offset, slot, generation, credit);
+  }
+};
+// In a ring: the answer for an item of a step before the last, which goes to the rank of the next step (the rank that
+// reads it) instead of the executor that asked for it; `request` is the index of the executor's request to that rank
+struct RingAnswer {
+  uint32_t executor;
+  size_t request;
+  PartialResponse response;
+  template<typename X>
+  void serialize(X& x) {
+    x(executor, request, response);
   }
 };
 // In two rounds: the share of a part's result that an executor asks the share's owner for (answered with a
@@ -1259,6 +1282,31 @@ struct CompileOpConstructor {
   // order on both of its ranks: items with executors in several domains in the order of their pieces on every rank,
   // the others in the order of their executor's plans); the copies of the shares of a plan come after the next plan,
   // and the shares that wait for them (the previous uses of their slots) come after that.
+  // Ring reductions (with reads): an RDMA read from one source at a time is faster than from several at once (each GPU
+  // receiving 15 parts of 256 MiB over RDMA, 16 domains of 4 GB300: 95 GB/s from one rank at a time, 86 from two, 82
+  // from eight, as the partial results of a reduce-scatter came), so with 3 or more domains (of the same size), a cell
+  // with one executor (e.g. a reduce-scatter's, a reduce to one rank's) and sources in every domain can go along a ring
+  // of the domains instead: the domain after the executor's computes its partial result (an item, step 0; with one
+  // source, a copy of it, which the next step adds as an input), the next one adds its own to it (step 1: an item whose
+  // sources are its domain's and the item of step 0, read over RDMA), and so on around the ring, and the executor adds
+  // its own domain's sources to the last one. Every step is computed by the rank at the executor's position on its rail
+  // (pickPartialRank), so that every rank reads from one rank (at its position in the domain before its own) and is
+  // read by one. Each step rounds its running sum to the op's dtype (as many roundings as with a partial result per
+  // domain, but of sums that grow along the ring: in 16-bit types, less accurate). The executor asks for every step at
+  // once: a step's request names the rank of the step before (ringFrom) and the rank that reads the item (ringTo), to
+  // which the computing rank sends its answer (RingAnswer). The items of a rank's steps go through one ring (its reader
+  // is the next domain's rank), and it reads into one ring (from the domain before); their key is (group of ringGroup
+  // parts, step, cell, part), and a ring has at least half as many slots as its two largest consecutive rows (uses of
+  // one group and step) have uses, which keeps every wait for a smaller key: an item waits for the item of the step
+  // before (on the rank before), and for its slot's previous use to be read by the rank after, into a slot whose
+  // previous use is at least two rows back (the uses of the rings that a rank reads from and stores to are in the same
+  // order, with the step one higher on the reading rank). The ranks' links then carry the items of a group in order,
+  // the item of the step before that a rank needs having come ringGroup items earlier (reduce-scatter of 256 MiB per
+  // rank across 16 domains of 4 GPUs: 43.5 ms instead of 48.9; across 4 domains, 9.4 ms instead of 11.4; to one rank
+  // across 16 domains, 3.1 ms instead of 41.4). A rank credits the rank before it for every item that it reads, which
+  // needs the credits on queue pairs of their own (see IbCommon::controlQps; on the queue pairs of the reads, 52.1 ms
+  // instead of 45.6, with groups of 4). A rank takes a ring for its cell if it has one such cell, of at least
+  // ringMinBytes (MOODIST_COMPILE_OP_RING=1: of any size, 0: never).
   // With writes (MOODIST_COMPILE_OP_TRANSFER=write), the rank that computes an item writes it to the ranks that need
   // it instead: an executor puts in its request a region of its scratch tensor and the signal for it (WriteTarget), and
   // the computing rank's CPU thread writes the item there once its kernel has stored it, then signals the executor's
@@ -1268,7 +1316,8 @@ struct CompileOpConstructor {
   // Every rank takes part (the requests are exchanged); returns an error message (more signals, done flags or uses of
   // a slot than there can be), or an empty string.
   std::string crossDomainReductions(InternalContext& ictx, Graph& graph, CustomOpDescriptor& op, const Domains& domains,
-      const HashMap<uint64_t, AllReducePiece>& allReducePieces, bool writes, size_t numSlots) {
+      const HashMap<uint64_t, AllReducePiece>& allReducePieces, bool writes, size_t numSlots,
+      const std::string& ringMode, size_t ringGroup) {
     const size_t myDomain = domains.index.at(rank);
     const size_t numDomains = domains.count;
     auto inMyDomain = [&](const Node& n) {
@@ -1329,7 +1378,8 @@ struct CompileOpConstructor {
     // come first) else 1, then for those the cell index and the piece's key (pieceKey), for the others the index of
     // the executor's plan among its plans of the chunk with one executor, then 0 for an item and 1 for a plan (2 for
     // an item that goes after the plans of an earlier part instead, see below), then the serve order of an item's
-    // (first) asking rank)
+    // (first) asking rank). The edges of rings of the domains have keys of their own (see ringKey): (1, the chunk
+    // index / ringGroup, 2, the step, the cell index, the chunk index).
     using Key = std::tuple<uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t, size_t, size_t>;
     // A piece's key: the offset of its first source (in (rank, tensor, offset) order); the same on every executor of
     // the piece, and different for every piece of a cell
@@ -1337,6 +1387,26 @@ struct CompileOpConstructor {
       return std::ranges::min(sources, {}, [](const Node& n) {
         return std::make_tuple(n.rank, n.tensorIndex, n.offset);
       }).offset;
+    };
+    // The key of a ring's edge (see above): the item of `step`, or with the last step + 1 the executor's plan
+    auto ringKey = [&](uint32_t chunk, size_t step, uint32_t cell) {
+      return Key{1, (uint32_t)(chunk / ringGroup), 2, step, cell, chunk, 0, 0};
+    };
+    // Half of the most uses of two consecutive rows of a ring of a ring reduction (rows: its uses' (group, step), in
+    // order), the fewest slots that it can have (see above)
+    auto ringMinSlots = [](const Vector<std::pair<uint32_t, uint64_t>>& rows) {
+      size_t most = 0;
+      size_t previous = 0;
+      size_t current = 0;
+      for (size_t i : indices(rows)) {
+        if (i != 0 && rows[i] != rows[i - 1]) {
+          previous = current;
+          current = 0;
+        }
+        ++current;
+        most = std::max(most, previous + current);
+      }
+      return (most + 1) / 2;
     };
 
     // The scratch tensor (the last tensor, see CustomOpDescriptor::scratchBytes): its regions start at page aligned
@@ -1407,6 +1477,10 @@ struct CompileOpConstructor {
       int flagsPerSlot = 1;
       size_t signalsPerSlot = 1;
       Vector<uint32_t> readers;
+      // The rings of ring reductions (see above): the items of a ring's steps, and the rings that this rank reads
+      // them into; at least minSlots slots (or all of their uses)
+      bool ring = false;
+      size_t minSlots = 0;
       size_t slots = 0;
       size_t slotBytes = 0;
       size_t offset = 0;
@@ -1456,7 +1530,8 @@ struct CompileOpConstructor {
         }
         r->slotBytes = (r->maxBytes + 4095) / 4096 * 4096;
         size_t slots = numSlots != 0 ? numSlots : std::clamp<size_t>(bytesPerRing / r->slotBytes, 2, maxSlots);
-        slots = std::min(slots, r->uses);
+        r->minSlots = std::min(r->minSlots, r->uses);
+        slots = std::min(std::max(slots, r->minSlots), r->uses);
         for (uint32_t e : r->readers) {
           slots = std::min(slots, CustomOpDescriptor::numNotificationSlots / readerRings[e]);
         }
@@ -1464,6 +1539,12 @@ struct CompileOpConstructor {
           return fmt::sprintf(
               "rank %zu has more rings of items that one rank reads than notification slots for it (%zu)", rank,
               CustomOpDescriptor::numNotificationSlots);
+        }
+        if (slots < r->minSlots) {
+          return fmt::sprintf("rank %zu has a ring of a reduction along the NVLink domains that needs %zu slots, more "
+                              "than its share of the %zu notification slots for the rank that reads it "
+                              "(MOODIST_COMPILE_OP_RING=0 avoids it)",
+              rank, r->minSlots, CustomOpDescriptor::numNotificationSlots);
         }
         r->slots = slots;
       }
@@ -1474,7 +1555,7 @@ struct CompileOpConstructor {
         for (Ring* r : rings) {
           flags += r->slots * r->flagsPerSlot;
           signals += r->slots * r->signalsPerSlot;
-          if (r->slots > 1 && (!most || r->slots > most->slots)) {
+          if (r->slots > std::max<size_t>(r->minSlots, 1) && (!most || r->slots > most->slots)) {
             most = r;
           }
         }
@@ -1486,7 +1567,7 @@ struct CompileOpConstructor {
                               "domains, more than it has (%zu and %zu)",
               rank, signals, flags, maxSignals, maxFlags);
         }
-        most->slots = (most->slots + 1) / 2;
+        most->slots = std::max((most->slots + 1) / 2, most->minSlots);
       }
       Vector<size_t> notifyUsed(size);
       for (Ring* r : rings) {
@@ -1545,6 +1626,7 @@ struct CompileOpConstructor {
       uint32_t rank = 0;  // input, item: the rank it comes from
       size_t request = 0; // item: the request's index among those to `rank`
       Use use;            // input, item of another rank: the receive slot
+      bool ring = false;  // item: the item of a ring's last step (received through this rank's ring receive rings)
     };
     struct Share {
       uint32_t owner;
@@ -1556,7 +1638,8 @@ struct CompileOpConstructor {
     struct Plan {
       size_t edgeIndex;
       bool allReduce = false;
-      std::tuple<uint32_t, uint32_t, uint32_t, size_t> sortKey; // (chunk, 0 or 1 as in Key, cell, pieceKey)
+      bool ring = false;
+      std::tuple<uint32_t, uint32_t, uint32_t, size_t> sortKey; // (chunk, 0 or 1 as in Key (2: ring), cell, pieceKey)
       Key key;
       Vector<PlanSource> sources;
       uint32_t partialSources = 0;
@@ -1571,6 +1654,47 @@ struct CompileOpConstructor {
     Vector<Vector<PartialRequest>> requests(size);
     Vector<Vector<ResultRequest>> resultRequests(size);
     Vector<size_t> requestedFrom(numDomains); // per domain, the partial results picked by pickPartialRank so far
+    // The cell that goes along a ring of the domains (see above), if any: this rank's only cell with one executor and
+    // sources in every domain (3 or more, of the same size), if it has at least ringMinBytes (any size with
+    // MOODIST_COMPILE_OP_RING=1). Below, the steps one after the other take longer than the reads from every domain at
+    // once: reduce-scatter across 4, 8 and 16 domains of 4 GPUs, the ring 2-4% slower at 5 MiB per rank, within 2% at
+    // 6 MiB (12% faster with 4 domains), 10-17% faster at 8 MiB (to one rank, faster from 4 MiB on with 8 and 16
+    // domains, from 8 MiB with 4).
+    static constexpr size_t ringMinBytes = 6 << 20;
+    int64_t ringCell = -1;
+    if (!writes && ringMode != "0" && numDomains >= 3 && std::ranges::all_of(domains.sizes, [&](size_t n) {
+          return n == domains.sizes[0];
+        })) {
+      Vector<std::pair<uint32_t, size_t>> cellBytes;
+      for (const Edge& e : graph.edges) {
+        if (e.sources.size() < 2 ||
+            allReducePieces.find(((uint64_t)e.cellIndex << 32) | e.chunkIndex) != allReducePieces.end()) {
+          continue;
+        }
+        bool supported = std::ranges::all_of(e.destinations, inMyDomain);
+        Vector<uint8_t> hasSources(numDomains);
+        for (const auto* l : {&e.sources, &e.destinations}) {
+          for (const Node& n : *l) {
+            supported &= n.device == DeviceType::CUDA;
+          }
+        }
+        for (const Node& n : e.sources) {
+          hasSources[domains.index[n.rank]] = 1;
+        }
+        if (!supported || std::ranges::find(hasSources, 0) != hasSources.end()) {
+          continue;
+        }
+        auto it = std::ranges::find(cellBytes, e.cellIndex, &std::pair<uint32_t, size_t>::first);
+        if (it == cellBytes.end()) {
+          cellBytes.emplace_back(e.cellIndex, e.bytes);
+        } else {
+          it->second += e.bytes;
+        }
+      }
+      if (cellBytes.size() == 1 && (ringMode == "1" || cellBytes[0].second >= ringMinBytes)) {
+        ringCell = cellBytes[0].first;
+      }
+    }
     for (size_t ei : indices(graph.edges)) {
       const Edge& e = graph.edges[ei];
       if (e.sources.size() < 2) {
@@ -1658,7 +1782,50 @@ struct CompileOpConstructor {
         request.order = key; // (with one executor: the plan's index, set below)
         requests[partialRank].push_back(std::move(request));
       };
-      if (!piece) {
+      if (!piece && (int64_t)e.cellIndex == ringCell) {
+        // Along a ring of the domains: this domain's sources, then the item of the last step, which adds up those of
+        // all other domains, from the domain after this one on (the requests for all steps go out now)
+        CHECK(sourceDomains.size() == numDomains);
+        plan.ring = true;
+        plan.sortKey = {e.chunkIndex, 2, e.cellIndex, key};
+        for (const Node& n : e.sources) {
+          if (inMyDomain(n)) {
+            addInput(n);
+          }
+        }
+        const size_t steps = numDomains - 1;
+        Vector<uint32_t> stepRanks(steps);
+        Vector<size_t> stepRequests(steps);
+        for (size_t t : range(steps)) {
+          stepRanks[t] = pickPartialRank((myDomain + 1 + t) % numDomains, 0);
+          stepRequests[t] = requests[stepRanks[t]].size();
+        }
+        for (size_t t : range(steps)) {
+          PartialRequest request;
+          request.sources = domainSources((myDomain + 1 + t) % numDomains);
+          request.offset = 0;
+          request.bytes = plan.bytes;
+          request.divisor = plan.divisor;
+          request.cellIndex = e.cellIndex;
+          request.chunkIndex = e.chunkIndex;
+          request.allReduce = false;
+          request.order = 0;
+          request.ringStep = t;
+          request.ringFrom = t == 0 ? PartialRequest::noRank : stepRanks[t - 1];
+          request.ringTo = t + 1 == steps ? (uint32_t)rank : stepRanks[t + 1];
+          request.ringToRequest = t + 1 == steps ? stepRequests[t] : stepRequests[t + 1];
+          // (an item of one source is a copy of it, see PartialRequest; the later steps have two or more)
+          request.ringFromCopy = t == 1 && domainSources((myDomain + 1) % numDomains).size() == 1;
+          requests[stepRanks[t]].push_back(std::move(request));
+        }
+        PlanSource s;
+        s.kind = PlanSource::item;
+        s.rank = stepRanks.back();
+        s.request = stepRequests.back();
+        s.ring = true;
+        plan.sources.push_back(s);
+        plan.partialSources = 1;
+      } else if (!piece) {
         for (const Node& n : e.sources) {
           if (inMyDomain(n)) {
             addInput(n);
@@ -1714,10 +1881,13 @@ struct CompileOpConstructor {
     for (size_t i : indices(plans)) {
       Plan& p = plans[i];
       const uint32_t chunk = std::get<0>(p.sortKey);
-      if (p.allReduce) {
+      if (p.ring) {
+        p.key = ringKey(chunk, numDomains - 1, std::get<2>(p.sortKey));
+      } else if (p.allReduce) {
         p.key = {1, chunk, 0, std::get<2>(p.sortKey), std::get<3>(p.sortKey), 1, 0, 0};
       } else {
-        const bool sameChunk = i != 0 && !plans[i - 1].allReduce && std::get<0>(plans[i - 1].sortKey) == chunk;
+        const bool sameChunk =
+            i != 0 && !plans[i - 1].allReduce && !plans[i - 1].ring && std::get<0>(plans[i - 1].sortKey) == chunk;
         const uint64_t index = sameChunk ? std::get<3>(plans[i - 1].key) + 1 : 0;
         p.key = {1, chunk, 1, index, 0, 1, 0, 0};
         for (const PlanSource& s : p.sources) {
@@ -1736,8 +1906,10 @@ struct CompileOpConstructor {
     // carry.)
     std::map<uint32_t, Ring> receiveRings;
     std::map<uint32_t, Ring> shareReceiveRings;
+    // (and for the items of the steps of rings, for this rank's steps and plans: laid out and used below)
+    std::map<uint32_t, Ring> ringReceiveRings;
     auto received = [&](const PlanSource& s) {
-      return s.kind == PlanSource::input || (s.kind == PlanSource::item && s.rank != rank);
+      return s.kind == PlanSource::input || (s.kind == PlanSource::item && s.rank != rank && !s.ring);
     };
     for (const Plan& p : plans) {
       for (const PlanSource& s : p.sources) {
@@ -1788,9 +1960,12 @@ struct CompileOpConstructor {
     // The items that this rank computes, in key order, and the ranks that asked for each (consumers, this rank among
     // them for the items that it uses itself). The requests for a piece with executors in several domains are merged by
     // their sources and range: all executors get the same partial result.
+    // (the item of a ring's step before the last: the rank of the next step, the index of the executor's request to it,
+    // and the executor)
     struct Consumer {
       uint32_t rank;
       size_t request;
+      uint32_t executor = PartialRequest::noRank;
     };
     struct Item {
       Vector<Node> sources;
@@ -1802,6 +1977,16 @@ struct CompileOpConstructor {
       Vector<Consumer> consumers;
       size_t ring = 0; // with reads: its ring (see below)
       Use use;         // with reads, its slot; with writes, its region and done flag
+      // A ring's step (see above): the rank of the step before (none at the first step), whose item this rank reads
+      // into receiveUse (where to read it from: receiveAnswer; a copy of an input with ringFromCopy, see
+      // PartialRequest), and the request that asked for it
+      int32_t ringStep = -1;
+      uint32_t ringFrom = PartialRequest::noRank;
+      bool ringFromCopy = false;
+      uint32_t requester = 0;
+      size_t requestIndex = 0;
+      Use receiveUse;
+      std::optional<PartialResponse> receiveAnswer;
     };
     Vector<Item> items;
     HashMap<std::string, size_t> merged;
@@ -1809,6 +1994,30 @@ struct CompileOpConstructor {
       for (size_t j : indices(incoming[i])) {
         const PartialRequest& r = incoming[i][j];
         CHECK(!r.sources.empty() && (i == rank || domains.index[i] != myDomain));
+        if (r.ringStep >= 0) {
+          CHECK(!r.allReduce && r.offset == 0 && r.ringTo != PartialRequest::noRank && r.ringTo != rank &&
+                r.ringFrom != rank);
+          Item item;
+          item.sources = r.sources;
+          // (from this rank's own, like mergeReductions)
+          std::ranges::rotate(item.sources, std::ranges::lower_bound(item.sources, rank, {}, [](const Node& n) {
+            return n.rank;
+          }));
+          item.bytes = r.bytes;
+          item.divisor = r.divisor;
+          item.cellIndex = r.cellIndex;
+          item.chunkIndex = r.chunkIndex;
+          item.key = ringKey(r.chunkIndex, r.ringStep, r.cellIndex);
+          item.consumers.push_back(
+              r.ringTo == i ? Consumer{(uint32_t)i, j} : Consumer{r.ringTo, r.ringToRequest, (uint32_t)i});
+          item.ringStep = r.ringStep;
+          item.ringFrom = r.ringFrom;
+          item.ringFromCopy = r.ringFromCopy;
+          item.requester = i;
+          item.requestIndex = j;
+          items.push_back(std::move(item));
+          continue;
+        }
         std::string key;
         if (r.allReduce) {
           key.append((const char*)&r.offset, sizeof(r.offset));
@@ -1900,6 +2109,7 @@ struct CompileOpConstructor {
         r.flagsPerSlot = self ? 2 : 1;
         r.signalsPerSlot = readers.size();
         r.readers = std::move(readers);
+        r.ring = kind == 2;
         itemRings.push_back(std::move(r));
       }
       return it->second;
@@ -1913,9 +2123,18 @@ struct CompileOpConstructor {
     Ring outbox;
     outbox.flagsPerSlot = 1;
     outbox.signalsPerSlot = 0;
+    // The items of the steps of rings that this rank reads (into its ring receive rings, from the rank of the step
+    // before): for its own steps, and its plans along rings
+    struct RingReceive {
+      Key key;
+      uint32_t from;
+      size_t bytes;
+      Use* use;
+    };
+    Vector<RingReceive> ringReceives;
     if (!writes) {
       for (Item& item : items) {
-        item.ring = ringOf(0, item.consumers);
+        item.ring = ringOf(item.ringStep >= 0 ? 2 : 0, item.consumers);
         count(itemRings[item.ring], item.bytes);
       }
       for (size_t pi : indices(plans)) {
@@ -1924,8 +2143,43 @@ struct CompileOpConstructor {
           count(itemRings[shareRing[pi]], plans[pi].bytes);
         }
       }
+      // The rings of ring reductions, in key order (the items are), and the fewest slots that they can have
+      for (Plan& p : plans) {
+        for (PlanSource& s : p.sources) {
+          if (s.ring) {
+            ringReceives.push_back({p.key, s.rank, p.bytes, &s.use});
+          }
+        }
+      }
+      for (Item& item : items) {
+        if (item.ringFrom != PartialRequest::noRank) {
+          ringReceives.push_back({item.key, item.ringFrom, item.bytes, &item.receiveUse});
+        }
+      }
+      std::ranges::stable_sort(ringReceives, {}, &RingReceive::key);
+      std::map<uint32_t, Vector<std::pair<uint32_t, uint64_t>>> receiveRows;
+      for (const RingReceive& x : ringReceives) {
+        count(ringReceiveRings[x.from], x.bytes);
+        receiveRows[x.from].emplace_back(std::get<1>(x.key), std::get<3>(x.key));
+      }
+      for (auto& [from, rows] : receiveRows) {
+        Ring& r = ringReceiveRings[from];
+        r.ring = true;
+        r.minSlots = ringMinSlots(rows);
+      }
+      Vector<Vector<std::pair<uint32_t, uint64_t>>> itemRows(itemRings.size());
+      for (const Item& item : items) {
+        if (itemRings[item.ring].ring) {
+          itemRows[item.ring].emplace_back(std::get<1>(item.key), std::get<3>(item.key));
+        }
+      }
+      for (size_t ri : indices(itemRings)) {
+        if (itemRings[ri].ring) {
+          itemRings[ri].minSlots = ringMinSlots(itemRows[ri]);
+        }
+      }
       Vector<Ring*> rings;
-      for (auto* m : {&receiveRings, &shareReceiveRings}) {
+      for (auto* m : {&receiveRings, &shareReceiveRings, &ringReceiveRings}) {
         for (auto& v : *m) {
           rings.push_back(&v.second);
         }
@@ -1938,6 +2192,9 @@ struct CompileOpConstructor {
       }
       if (layoutError.empty()) {
         takeReceiveSlots();
+        for (const RingReceive& x : ringReceives) {
+          *x.use = take(ringReceiveRings[x.from], x.bytes);
+        }
         // The uses of each ring, in key order
         Vector<Vector<size_t>> ringItems(itemRings.size());
         for (size_t i : indices(items)) {
@@ -1973,6 +2230,10 @@ struct CompileOpConstructor {
         }
         for (size_t ri : indices(itemRings)) {
           const Ring& r = itemRings[ri];
+          // (the items of rings' steps keep their keys, see above)
+          if (r.ring) {
+            continue;
+          }
           const size_t maxLookahead = r.flagsPerSlot >= 2 && r.slots >= 3 ? r.slots - 2 : r.slots - 1;
           const size_t lookahead = std::min<size_t>(maxLookahead, 2);
           for (size_t j : indices(ringItems[ri])) {
@@ -2027,31 +2288,66 @@ struct CompileOpConstructor {
       return PartialResponse{publishedScratchIndex, u.offset, (uint32_t)(r.notifyBase.at(j) + u.slot),
           (uint16_t)u.generation, u.last ? -1 : (int32_t)(u.signal + j)};
     };
-    if (!writes && layoutError.empty()) {
+    // (and those of the items of rings' steps before the last, to the ranks of the next steps). After an error in
+    // layoutRings, value-initialized answers, which the ranks that get them do not use: the op then fails on every
+    // rank with that error (see compile)
+    Vector<Vector<RingAnswer>> ringResponses(size);
+    if (!writes) {
       for (const Item& item : items) {
         for (const Consumer& c : item.consumers) {
-          if (c.rank != rank) {
-            responses[c.rank][c.request] = answer(itemRings[item.ring], item.use, c.rank);
+          if (c.rank == rank) {
+            continue;
+          }
+          const PartialResponse response =
+              layoutError.empty() ? answer(itemRings[item.ring], item.use, c.rank) : PartialResponse{};
+          if (c.executor == PartialRequest::noRank) {
+            responses[c.rank][c.request] = response;
+          } else {
+            ringResponses[c.rank].push_back({c.executor, c.request, response});
           }
         }
       }
-      for (size_t pi : indices(plans)) {
-        for (const Consumer& c : shareConsumers[pi]) {
-          resultResponses[c.rank][c.request] = answer(itemRings[shareRing[pi]], shareUse[pi], c.rank);
+      if (layoutError.empty()) {
+        for (size_t pi : indices(plans)) {
+          for (const Consumer& c : shareConsumers[pi]) {
+            resultResponses[c.rank][c.request] = answer(itemRings[shareRing[pi]], shareUse[pi], c.rank);
+          }
         }
       }
     }
     for (size_t i : range(size)) {
-      ctx.send(i, responses[i], resultResponses[i]);
+      ctx.send(i, responses[i], resultResponses[i], ringResponses[i]);
     }
     Vector<Vector<PartialResponse>> answers(size);
     Vector<Vector<PartialResponse>> resultAnswers(size);
+    Vector<Vector<RingAnswer>> ringAnswers(size);
     for (size_t i : range(size)) {
-      ctx.receive(i, answers[i], resultAnswers[i]);
+      ctx.receive(i, answers[i], resultAnswers[i], ringAnswers[i]);
       CHECK(answers[i].size() == requests[i].size() && resultAnswers[i].size() == resultRequests[i].size());
     }
     if (!layoutError.empty()) {
       return layoutError;
+    }
+    // Where this rank reads the items of the steps before its own from (by the executor's request for its own step)
+    {
+      HashMap<uint64_t, size_t> stepItems;
+      for (size_t i : indices(items)) {
+        if (items[i].ringFrom != PartialRequest::noRank) {
+          stepItems[((uint64_t)items[i].requester << 32) | items[i].requestIndex] = i;
+        }
+      }
+      for (size_t i : range(size)) {
+        for (const RingAnswer& a : ringAnswers[i]) {
+          auto it = stepItems.find(((uint64_t)a.executor << 32) | a.request);
+          CHECK(it != stepItems.end());
+          Item& item = items[it->second];
+          CHECK(item.ringFrom == i && !item.receiveAnswer);
+          item.receiveAnswer = a.response;
+        }
+      }
+      for (const Item& item : items) {
+        CHECK(item.ringFrom == PartialRequest::noRank || item.receiveAnswer);
+      }
     }
 
     // The edges, with their keys (and the index of their plan, or -1 for items), and the writes (with writes), in the
@@ -2108,8 +2404,38 @@ struct CompileOpConstructor {
         }
       }
     };
+    // The reads, by the key of the edge that uses them (and their order among the reads of a plan, see below), which is
+    // the order in which the CPU thread issues them
+    Vector<std::tuple<Key, size_t, CustomOpDescriptor::IbRead>> readList;
+    auto addRead = [&](const Key& key, size_t order, uint32_t source, uint32_t inputIndex, size_t inputOffset,
+                       size_t bytes, const Use& use, const PartialResponse* answer) {
+      CustomOpDescriptor::IbRead r;
+      r.rank = source;
+      r.inputIndex = inputIndex;
+      r.outputIndex = scratchOutputIndex;
+      r.inputOffset = inputOffset;
+      r.outputOffset = use.offset;
+      r.bytes = bytes;
+      r.signalIndex = use.signal;
+      r.signalGeneration = (uint16_t)use.generation;
+      if (use.generation != 0) {
+        r.freeFlag = use.flag;
+        r.freeGeneration = (uint16_t)(use.generation - 1);
+      }
+      if (answer) {
+        r.waitSlot = answer->slot;
+        r.waitGeneration = answer->generation;
+        r.creditSignal = answer->credit;
+        r.creditGeneration = (uint16_t)(answer->generation + 1);
+        if (r.creditSignal >= 0) {
+          maxCreditGeneration = std::max<size_t>(maxCreditGeneration, r.creditGeneration);
+        }
+      }
+      readList.emplace_back(key, order, r);
+    };
     // Items: from the sources (rotated to start at this rank's, see above) to their slot (or region), with its done
-    // flag
+    // flag; the item of a ring's step after the first adds the item of the step before, which this rank reads (a
+    // partial result, the last source)
     for (Item& item : items) {
       Edge p;
       p.id = ictx.nextEdgeId();
@@ -2128,6 +2454,18 @@ struct CompileOpConstructor {
           }
         }
       } else {
+        if (item.ringFrom != PartialRequest::noRank) {
+          const Use& u = item.receiveUse;
+          p.sources.push_back(scratchNode(u.offset, true));
+          p.sourceWaits.resize(p.sources.size());
+          p.sourceWaits.back() = rdmaSignal(u.signal, u.generation);
+          p.partialSources = item.ringFromCopy ? 0 : 1;
+          if (!u.last) {
+            p.doneFlags.push_back(doneFlag(u.flag, u.generation));
+          }
+          const PartialResponse& answer = *item.receiveAnswer;
+          addRead(item.key, 0, item.ringFrom, answer.tensorIndex, answer.offset, item.bytes, u, &answer);
+        }
         storeToSlot(p, itemRings[item.ring], item.use, item.key, item.consumers);
       }
       keyed.push_back({item.key, -1, std::move(p)});
@@ -2143,33 +2481,6 @@ struct CompileOpConstructor {
       Edge e = graph.edges[plan.edgeIndex];
       Vector<Node> sources;
       Vector<Graph::Signal> waits;
-      Vector<std::pair<size_t, CustomOpDescriptor::IbRead>> planReads;
-      auto addRead = [&](size_t order, uint32_t source, uint32_t inputIndex, size_t inputOffset, size_t bytes,
-                         const Use& use, const PartialResponse* answer) {
-        CustomOpDescriptor::IbRead r;
-        r.rank = source;
-        r.inputIndex = inputIndex;
-        r.outputIndex = scratchOutputIndex;
-        r.inputOffset = inputOffset;
-        r.outputOffset = use.offset;
-        r.bytes = bytes;
-        r.signalIndex = use.signal;
-        r.signalGeneration = (uint16_t)use.generation;
-        if (use.generation != 0) {
-          r.freeFlag = use.flag;
-          r.freeGeneration = (uint16_t)(use.generation - 1);
-        }
-        if (answer) {
-          r.waitSlot = answer->slot;
-          r.waitGeneration = answer->generation;
-          r.creditSignal = answer->credit;
-          r.creditGeneration = (uint16_t)(answer->generation + 1);
-          if (r.creditSignal >= 0) {
-            maxCreditGeneration = std::max<size_t>(maxCreditGeneration, r.creditGeneration);
-          }
-        }
-        planReads.emplace_back(order, r);
-      };
       for (const PlanSource& s : plan.sources) {
         if (s.kind == PlanSource::local) {
           sources.push_back(s.node);
@@ -2188,10 +2499,11 @@ struct CompileOpConstructor {
             e.doneFlags.push_back(doneFlag(s.use.flag, s.use.generation));
           }
           if (s.kind == PlanSource::input) {
-            addRead(0, s.rank, s.node.tensorIndex, s.node.offset, plan.bytes, s.use, nullptr);
+            addRead(plan.key, 0, s.rank, s.node.tensorIndex, s.node.offset, plan.bytes, s.use, nullptr);
           } else if (!writes) {
             const PartialResponse& answer = answers[s.rank].at(s.request);
-            addRead(1 + readOrder(s.rank), s.rank, answer.tensorIndex, answer.offset, plan.bytes, s.use, &answer);
+            addRead(
+                plan.key, 1 + readOrder(s.rank), s.rank, answer.tensorIndex, answer.offset, plan.bytes, s.use, &answer);
           }
         }
       }
@@ -2214,22 +2526,10 @@ struct CompileOpConstructor {
             copy.doneWhenLoaded = true;
           }
           const PartialResponse& answer = resultAnswers[s.owner].at(s.request);
-          addRead(
-              1 + numDomains + readOrder(s.owner), s.owner, answer.tensorIndex, answer.offset, s.bytes, s.use, &answer);
+          addRead(plan.key, 1 + numDomains + readOrder(s.owner), s.owner, answer.tensorIndex, answer.offset, s.bytes,
+              s.use, &answer);
         }
         planCopies[pi].push_back(std::move(copy));
-      }
-      std::ranges::stable_sort(planReads, {}, [](const auto& x) {
-        return x.first;
-      });
-      for (const auto& x : planReads) {
-        const auto& r = x.second;
-        log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d.%u, wait slot %d.%u, free "
-                 "flag %d.%u, credit %d.%u\n",
-            r.rank, r.inputIndex, r.inputOffset, r.outputIndex, r.outputOffset, r.bytes, r.signalIndex,
-            r.signalGeneration, r.waitSlot, r.waitGeneration, r.freeFlag, r.freeGeneration, r.creditSignal,
-            r.creditGeneration);
-        op.ibReads.push_back(r);
       }
       e.sources = std::move(sources);
       if (std::ranges::any_of(waits, [](const Graph::Signal& s) {
@@ -2261,6 +2561,18 @@ struct CompileOpConstructor {
         }
       }
       keyed.push_back({plan.key, (int64_t)pi, std::move(e)});
+    }
+    std::ranges::stable_sort(readList, {}, [](const auto& x) {
+      return std::make_pair(std::get<0>(x), std::get<1>(x));
+    });
+    for (const auto& x : readList) {
+      const auto& r = std::get<2>(x);
+      log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d.%u, wait slot %d.%u, free "
+               "flag %d.%u, credit %d.%u\n",
+          r.rank, r.inputIndex, r.inputOffset, r.outputIndex, r.outputOffset, r.bytes, r.signalIndex,
+          r.signalGeneration, r.waitSlot, r.waitGeneration, r.freeFlag, r.freeGeneration, r.creditSignal,
+          r.creditGeneration);
+      op.ibReads.push_back(r);
     }
 
     // The kernel's order (see above): the edges of other reductions and the copies first, as they were, then these by
@@ -2327,11 +2639,15 @@ struct CompileOpConstructor {
     // its reads, its notifications), and those of its credits. (A credit's generation is at most the largest of the
     // other rank's own, which the check below keeps less than maxGenerations - 1 there.)
     op.numGenerations = std::max(maxGeneration, maxCreditGeneration) + 1;
-    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds), %zu items (partial "
-              "results, input copies and shares, for this and other ranks), %d signals, %d done flags, %zu bytes of "
-              "scratch, %zu reads, %zu writes, up to %zu uses of a slot\n",
-        rank, plans.size(), planOfPart.size(), items.size(), nextSignal, numFlags, scratchBytes, op.ibReads.size(),
-        op.ibWrites.size(), maxGeneration + 1);
+    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds, %zu along a ring), %zu "
+              "items (partial results, input copies, shares and ring steps, for this and other ranks; %zu ring steps), "
+              "%d signals, %d done flags, %zu bytes of scratch, %zu reads, %zu writes, up to %zu uses of a slot\n",
+        rank, plans.size(), planOfPart.size(), (size_t)std::ranges::count_if(plans, &Plan::ring), items.size(),
+        (size_t)std::ranges::count_if(items,
+            [](const Item& item) {
+              return item.ringStep >= 0;
+            }),
+        nextSignal, numFlags, scratchBytes, op.ibReads.size(), op.ibWrites.size(), maxGeneration + 1);
 
     // (with writes; with reads, layoutRings has made them fit)
     if ((size_t)nextSignal > maxSignals || (size_t)numFlags > maxFlags) {
@@ -2854,6 +3170,13 @@ struct CompileOpConstructor {
     // slot holds (see reductionPieces); MOODIST_COMPILE_OP_SLOTS and MOODIST_COMPILE_OP_SLOT_BYTES set others (tests)
     size_t numSlots = 0;
     size_t slotBytes = 2 << 20;
+    // MOODIST_COMPILE_OP_RING: reductions along a ring of the NVLink domains where crossDomainReductions picks them
+    // (auto), wherever they can be (1), or never (0); MOODIST_COMPILE_OP_RING_GROUP: the parts per group of the ring's
+    // order (see crossDomainReductions; tests). With 8, the slots that the rings of a rank's steps need (8 each, see
+    // ringMinSlots) fit in the scratch budget of a rank's rings (reduce-scatter of 256 MiB across 16 domains of 4
+    // GPUs: 43.5 ms; 45.6 with 4; 42.9 with 16, and twice the scratch).
+    std::string ringMode = "auto";
+    size_t ringGroup = 8;
     if (isReduction(reduce)) {
       rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
       REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
@@ -2881,6 +3204,10 @@ struct CompileOpConstructor {
       // crossDomainReductions)
       numSlots = number("MOODIST_COMPILE_OP_SLOTS", numSlots, 1, 16, 1);
       slotBytes = number("MOODIST_COMPILE_OP_SLOT_BYTES", slotBytes, 4096, 1ull << 30, 4096);
+      ringMode = agreedEnv("MOODIST_COMPILE_OP_RING", "auto");
+      REQUIRE(ringMode == "auto" || ringMode == "1" || ringMode == "0",
+          "compile_op: MOODIST_COMPILE_OP_RING must be auto, 1 or 0 (not '%s')", ringMode);
+      ringGroup = number("MOODIST_COMPILE_OP_RING_GROUP", ringGroup, 1, 16, 1);
     }
     if (std::string value = agreedEnv("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", ""); !value.empty()) {
       const bool digits = value.size() <= 10 && std::ranges::all_of(value, [](char c) {
@@ -3889,8 +4216,8 @@ struct CompileOpConstructor {
       GraphBuilder merger(ictx, baseGraph);
       merger.mergeReductions();
       baseGraph.edges = std::move(merger.graph.edges);
-      crossDomainError =
-          crossDomainReductions(ictx, baseGraph, *op, domains, allReducePieces, transfer == "write", numSlots);
+      crossDomainError = crossDomainReductions(
+          ictx, baseGraph, *op, domains, allReducePieces, transfer == "write", numSlots, ringMode, ringGroup);
     }
 
     // Proxy transfers from outside the NVLink domain (MOODIST_COMPILE_OP_PROXY=0 disables it), except in reductions
