@@ -152,6 +152,8 @@ All ranks must pass the same `reduce`.
 
 Reductions need CUDA tensors (`compile_op` raises otherwise, on all ranks). The types are `float32`, `float64`, `float16`, `bfloat16`, `int32` and `int64` (`"avg"`: the floating point types). `float16` and `bfloat16` are combined in `float32` and rounded once per output element; across NVLink domains (nodes, or e.g. NVL72 racks), the inputs of each other domain are first combined into a partial result of the op's dtype per domain, which is rounded once too (for `"avg"`, already divided by the number of all inputs). Each output element is computed once, by one rank (which then stores it to every rank that has it in its outputs), or with outputs in several NVLink domains, once per such domain, from the partial results of all domains (its own included): always in the same order, so the results are the same on every run, and the same on every rank (e.g. after an all-reduce). Another implementation (NCCL, or a different version of moodist) can round differently. Floating point `"min"` and `"max"` propagate NaN. An op's outputs may be its inputs (an in-place all-reduce).
 
+Across NVLink domains, a reduction also takes a temporary CUDA tensor per call on the ranks that take part in it, from moodist's CUDA allocator, on the op's stream (freed when the op is done): slots for the partial results on their way, which do not grow with the op: up to 32 MiB with few ranks to exchange them with, about 8 to 12 MiB per such rank with many (across 16 domains of 4 GPUs: 120 MiB per rank for a reduce-scatter, 188 MiB for an all-reduce, at 256 MiB as at 1 GiB per rank).
+
 **Behavior with overlapping inputs:**
 
 When multiple ranks contribute data to the same region of the global tensor:

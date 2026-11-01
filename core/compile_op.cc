@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -382,48 +383,57 @@ struct Domains {
   }
 };
 
-// crossDomainReductions with writes: where the rank that computes a partial result (or a share of a result) writes the
-// range of it that a rank asks for: the range (from the start of the partial result or share), the region of the
-// asking rank's scratch tensor (the tensor's index in the list that WorkCustom publishes, and the offset), and the
-// signal that the asking rank's kernel waits for
+// crossDomainReductions with writes: where the rank that computes an item (a partial result, a copy of an input, or a
+// share of a result) writes it for the rank that asks for it: a region of the asking rank's scratch tensor (the
+// tensor's index in the list that WorkCustom publishes, and the offset), and the signal that the asking rank's kernel
+// waits for
 struct WriteTarget {
-  size_t offset = 0;
-  size_t bytes = 0;
   uint32_t tensorIndex = 0;
   size_t tensorOffset = 0;
   int32_t signal = -1;
   template<typename X>
   void serialize(X& x) {
-    x(offset, bytes, tensorIndex, tensorOffset, signal);
+    x(tensorIndex, tensorOffset, signal);
   }
 };
 
-// crossDomainReductions: a partial result that an executor asks a rank in another NVLink domain to compute, and the
-// answer: where it will be (the partial rank's scratch tensor) and the notification slot it will be announced in.
-// With writes, the request says where to write it instead, and the answer is not used.
+// crossDomainReductions: an item that an executor asks a rank to compute (in another NVLink domain, or itself): the
+// partial result of the sources (with one source, a copy of it) over the range [offset, offset + bytes) of their part
+// (in two rounds, the executor's share; else all of it), and where it goes in the kernel order of the rank that
+// computes it (see itemKey): whether the executor's piece has executors in several domains (allReduce), and `order`,
+// the piece's key there (pieceKey), else the index of the executor's plan among its plans of the chunk without them
 struct PartialRequest {
-  Vector<Node> sources; // in (rank, tensor, offset) order
+  Vector<Node> sources; // in (rank, tensor, offset) order, at the offsets of the part
+  size_t offset;
   size_t bytes;
   uint32_t divisor;
   uint32_t cellIndex;
   uint32_t chunkIndex;
-  WriteTarget target;
+  bool allReduce;
+  size_t order;
+  WriteTarget target; // with writes
   template<typename X>
   void serialize(X& x) {
-    x(sources, bytes, divisor, cellIndex, chunkIndex, target);
+    x(sources, offset, bytes, divisor, cellIndex, chunkIndex, allReduce, order, target);
   }
 };
+// The answer with reads (with writes, it is not used): where the item will be (a slot of the computing rank's ring
+// for the asking rank, see crossDomainReductions), the notification slot that announces it, the generation of the
+// slot's use, and the signal of the computing rank's that the asking rank sets (to the step value + generation + 1)
+// once it has read the item, which frees the slot
 struct PartialResponse {
-  uint32_t tensorIndex; // in the partial rank's published list (see WorkCustom)
+  uint32_t tensorIndex; // in the computing rank's published list (see WorkCustom)
   size_t offset;
   uint32_t slot;
+  uint16_t generation;
+  int32_t credit;
   template<typename X>
   void serialize(X& x) {
-    x(tensorIndex, offset, slot);
+    x(tensorIndex, offset, slot, generation, credit);
   }
 };
 // In two rounds: the share of a part's result that an executor asks the share's owner for (answered with a
-// PartialResponse: where the share will be, and the notification slot; with writes, where to write it)
+// PartialResponse; with writes, the request says where to write it)
 struct ResultRequest {
   uint32_t cellIndex;
   uint32_t chunkIndex;
@@ -505,7 +515,7 @@ struct GraphBuilder {
     HashMap<uint32_t, Vector<Edge>> singleSourceNodes;
     for (auto i = edges.begin(); i != edges.end();) {
       auto& e = *i;
-      if (e.sources.size() != 1 || !e.sourceSignals.empty() || !e.sourceDoneSignals.empty() || e.doneSignal >= 0) {
+      if (e.sources.size() != 1 || e.hasSignals()) {
         // a relay edge (no sources) or a reduction (several sources, see mergeReductions, or part of one across
         // NVLink domains, see crossDomainReductions), which stays with its executor
         ++i;
@@ -897,17 +907,26 @@ void logGraph(const Graph& graph) {
   };
   auto signal = [](const Edge& e) {
     std::string s = e.rdmaSignal >= 0 ? fmt::sprintf(" rdmaSignal=%d", e.rdmaSignal) : std::string();
-    if (!e.sourceSignals.empty()) {
-      s += fmt::sprintf(" sourceSignals=[%s]", fmt::to_string(fmt::join(e.sourceSignals, ",")));
+    // (a done flag as d<index>.<generation>, an RDMA signal as s<index>.<generation>, none as -)
+    auto list = [](const Vector<Graph::Signal>& v) {
+      std::string r;
+      for (const Graph::Signal& x : v) {
+        r += r.empty() ? "" : ",";
+        r += x.index < 0 ? std::string("-") : fmt::sprintf("%c%d.%u", x.done ? 'd' : 's', x.index, x.generation);
+      }
+      return r;
+    };
+    if (!e.sourceWaits.empty()) {
+      s += fmt::sprintf(" sourceWaits=[%s]", list(e.sourceWaits));
     }
-    if (!e.sourceDoneSignals.empty()) {
-      s += fmt::sprintf(" sourceDoneSignals=[%s]", fmt::to_string(fmt::join(e.sourceDoneSignals, ",")));
+    if (!e.destinationWaits.empty()) {
+      s += fmt::sprintf(" destinationWaits=[%s]", list(e.destinationWaits));
     }
-    if (e.partialSources != 0) {
+    if (!e.doneFlags.empty()) {
+      s += fmt::sprintf(" doneFlags=[%s]", list(e.doneFlags));
+    }
+    if (e.partialSources != 0 || e.divisor != 0) {
       s += fmt::sprintf(" partialSources=%u divisor=%u", e.partialSources, e.divisor);
-    }
-    if (e.doneSignal >= 0) {
-      s += fmt::sprintf(" doneSignal=%d divisor=%u", e.doneSignal, e.divisor);
     }
     return s;
   };
@@ -1192,44 +1211,64 @@ struct CompileOpConstructor {
   // computed by an executor in each NVLink domain with destinations of the piece, which stores the result to those:
   // one executor, unless the cell has outputs in several domains (e.g. an all-reduce). An executor reads the sources
   // of other domains over RDMA, combined within each domain first: for every other domain with several sources, a
-  // rank there (the partial rank) computes their partial result into its scratch tensor (an edge with a doneSignal),
-  // its CPU thread notifies the executor's once the kernel has stored it (CustomOpDescriptor::Notification), and the
-  // executor's CPU thread reads it into the executor's scratch tensor and signals the kernel (an ibRead with a
-  // waitSlot and a signalIndex). The input of a domain with one source is read as it is. The kernels compute the
-  // partial results before anything else (see generateKernel). Partial results are of the op's dtype (16-bit floats
-  // are rounded once per domain); for an average, they are already divided by the number of all inputs
-  // (Edge::partialSources, divisor), which keeps the sums of many 16-bit floats in range.
+  // rank there (the partial rank) computes their partial result (an item, see PartialRequest), its CPU thread notifies
+  // the executor's once the kernel has stored it (CustomOpDescriptor::Notification), and the executor's CPU thread
+  // reads it and signals the kernel (an ibRead with a waitSlot and a signalIndex). The input of a domain with one
+  // source is read as it is. Partial results are of the op's dtype (16-bit floats are rounded once per domain); for an
+  // average, they are already divided by the number of all inputs (Edge::partialSources, divisor), which keeps the sums
+  // of many 16-bit floats in range.
   // With one executor (e.g. reduce-scatter, reduce to one rank), its edge combines the sources of its own domain (in
   // the order of mergeReductions), the inputs read from other domains, and the partial results (in the order of their
-  // domains' first ranks), each once its read has arrived (Edge::sourceSignals); its partial ranks are on its rail
-  // (see pickPartialRank).
+  // domains' first ranks); its partial ranks are on its rail (see pickPartialRank).
   // With executors in several domains, they all combine the same values in the same order, so that every destination
   // gets the same bits: the inputs of the domains with one source, then the partial results of the others, in the
-  // order of the domains. The partial result of an executor's own domain is the one it computes for the other
-  // executors, used as rounded, which its kernel waits for (Edge::sourceDoneSignals). All executors read the partial
-  // result of a domain from the same rank, which computes it once (the requests for it are merged): the executor of
-  // that domain, or in a domain without destinations, a rank with sources there (see reductionPieces).
-  // A domain whose one source is on one of its destination ranks contributes a copy of that input instead, which the
-  // domain's executor makes into its scratch tensor (an edge with one source and a doneSignal, which the kernel stores
-  // as loaded) and combines itself, as the other executors do: in an in-place op the input is the output that the
-  // executor stores the result to, which the other domains would otherwise read over RDMA while it changes. The copy
-  // takes the input's place in the order (an average divides it with the other inputs).
+  // order of the domains. The partial result of an executor's own domain is an item that it computes for itself and
+  // for the other executors, used as rounded. All executors get the partial result of a domain from the same rank,
+  // which computes it once (the requests for it are merged): the executor of that domain, or in a domain without
+  // destinations, a rank with sources there (see reductionPieces).
+  // A domain whose one source is on one of its destination ranks contributes a copy of that input instead, an item
+  // that the domain's executor makes (an edge with one source, which the kernel stores as loaded) and combines itself,
+  // as the other executors do: in an in-place op the input is the output that the executor stores the result to,
+  // which the other domains would otherwise read over RDMA while it changes. The copy takes the input's place in the
+  // order (an average divides it with the other inputs).
   // In two rounds (AllReducePiece::shareOwners), each executor computes one share of the part (shareRange) from the
-  // same values, of which it reads only that share: a reduce-scatter among the executors. It stores its share to the
-  // destinations of its domain and to its scratch tensor (an edge with a doneSignal), where the other executors read
-  // it once notified (a ResultRequest each), and copies the shares of the others to the destinations of its domain
-  // (an edge per share, with one source): an all-gather. The bits are those of one round. An executor then reads
-  // (n - 1) / k + (k - 1) / k parts instead of n - 1 (n domains with sources, k with destinations).
-  // With writes (MOODIST_COMPILE_OP_TRANSFER=write), the rank that computes a partial result or a share writes it to
-  // the ranks that need it instead: an executor puts in its request the region of its scratch tensor and the signal
-  // for it (WriteTarget), and the computing rank's CPU thread writes it there once its kernel has stored it, then
-  // signals the executor's kernel directly (CustomOpDescriptor::IbWrite): no notification, and nothing to do for the
-  // executor's CPU thread. The inputs of domains with one source are read in both cases. The edges and their order are
-  // the same either way (and so are the results).
-  // Every rank takes part (the requests are exchanged); returns an error message (a full signal table), or an empty
-  // string.
+  // same values, of which it gets only that share (the items are per share): a reduce-scatter among the executors. It
+  // stores its share to the destinations of its domain and for the other executors, which read it once notified (a
+  // ResultRequest each), and copies the shares of the others to the destinations of its domain (an edge per share,
+  // with one source): an all-gather. The bits are those of one round. An executor then reads (n - 1) / k + (k - 1) / k
+  // parts instead of n - 1 (n domains with sources, k with destinations).
+  // Rings: the items and the data read go through slots of the scratch tensors (the last tensor, see
+  // CustomOpDescriptor::scratchBytes). A rank's kernel stores the items that it computes to rings of slots, one per
+  // kind (partial results and copies, shares) and set of ranks that read them (this rank among them for the items that
+  // it uses itself): an item that several ranks read is stored once. A rank's CPU thread reads into rings of slots, one
+  // per kind and rank that it reads from (inputs included). Rings have slots for about ringBytes each, more if the rank
+  // has few rings (fewer if fewer uses, or where the rank's signals and done flags would not do, see layoutRings). The
+  // uses of a ring take its slots in turn: use i takes slot i mod n with generation i / n (n slots), and the slot's
+  // signals and done flags are set to the step value + generation (Graph::Signal). A slot is used again once its
+  // previous use is over: the kernel stores an item to a slot once each rank that reads it has read the previous one (a
+  // credit per reader: its CPU thread sets a signal of the computing rank's, IbRead::creditSignal) and the computing
+  // rank's own edge that used it is done (a second done flag), and a CPU thread reads into a slot once its kernel has
+  // used the previous contents (the done flag of the edge that used them, IbRead::freeFlag); a slot's last use in the
+  // op needs neither. A slot holds the largest of its uses (a part, or in two rounds a share: reductionPieces makes
+  // parts whose transfers fit in slotBytes), so a rank's scratch tensor holds a few slots per peer instead of all that
+  // it exchanges with it (reduce-scatter of 256 MiB per rank across 16 domains of 4 GPUs: 120 MiB instead of 7.5 GiB).
+  // No rank waits for a rank that waits for it: every edge has a key (Key), and the kernels take their edges in key
+  // order; every wait is for an edge with a smaller key, or for a transfer that waits only for such edges. A plan (an
+  // executor's edge) waits for its items, which come before it (a few parts ahead, see the lookahead below); an item
+  // waits for the previous uses of its slots, which belong to plans with smaller keys (the uses of a ring are in key
+  // order on both of its ranks: items with executors in several domains in the order of their pieces on every rank,
+  // the others in the order of their executor's plans); the copies of the shares of a plan come after the next plan,
+  // and the shares that wait for them (the previous uses of their slots) come after that.
+  // With writes (MOODIST_COMPILE_OP_TRANSFER=write), the rank that computes an item writes it to the ranks that need
+  // it instead: an executor puts in its request a region of its scratch tensor and the signal for it (WriteTarget), and
+  // the computing rank's CPU thread writes the item there once its kernel has stored it, then signals the executor's
+  // kernel directly (CustomOpDescriptor::IbWrite): no notification, and nothing to do for the executor's CPU thread.
+  // Every item and every write has a region of its own (no rings). The inputs of domains with one source are read in
+  // both cases. The edges and their order are the same either way (and so are the results).
+  // Every rank takes part (the requests are exchanged); returns an error message (more signals, done flags or uses of
+  // a slot than there can be), or an empty string.
   std::string crossDomainReductions(InternalContext& ictx, Graph& graph, CustomOpDescriptor& op, const Domains& domains,
-      const HashMap<uint64_t, AllReducePiece>& allReducePieces, bool writes) {
+      const HashMap<uint64_t, AllReducePiece>& allReducePieces, bool writes, size_t numSlots) {
     const size_t myDomain = domains.index.at(rank);
     const size_t numDomains = domains.count;
     auto inMyDomain = [&](const Node& n) {
@@ -1269,6 +1308,36 @@ struct CompileOpConstructor {
       }
       return candidates.at((railPosition + k) % candidates.size());
     };
+    // The order in which this rank serves the ranks that ask it for items whose keys tie (see Key): itself, then the
+    // ranks of the domain after its own, starting at its own position, then those of the next domain, ..., so that at
+    // any time the partial ranks send to different executors (with all partial ranks starting at the same executor, its
+    // NIC took all of their data at first while the others had nothing to read); the executors read in the matching
+    // order (readOrder)
+    auto serveOrder = [&](uint32_t r) {
+      if (r == rank) {
+        return std::pair<size_t, size_t>(0, 0);
+      }
+      const size_t n = domains.sizes[domains.index[r]];
+      return std::pair<size_t, size_t>(1 + (domains.index[r] + numDomains - 1 - myDomain) % numDomains,
+          (domains.position[r] + n - domains.position[rank] % n) % n);
+    };
+    auto readOrder = [&](uint32_t r) {
+      return (myDomain + numDomains - 1 - domains.index[r]) % numDomains;
+    };
+    // The key of an edge (see above), which every rank computes the same: (0 for the items that come first (see
+    // below) else 1, the chunk index (see reductionPieces), 0 if its piece has executors in several domains (those
+    // come first) else 1, then for those the cell index and the piece's key (pieceKey), for the others the index of
+    // the executor's plan among its plans of the chunk with one executor, then 0 for an item and 1 for a plan (2 for
+    // an item that goes after the plans of an earlier part instead, see below), then the serve order of an item's
+    // (first) asking rank)
+    using Key = std::tuple<uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t, size_t, size_t>;
+    // A piece's key: the offset of its first source (in (rank, tensor, offset) order); the same on every executor of
+    // the piece, and different for every piece of a cell
+    auto pieceKey = [](const Vector<Node>& sources) {
+      return std::ranges::min(sources, {}, [](const Node& n) {
+        return std::make_tuple(n.rank, n.tensorIndex, n.offset);
+      }).offset;
+    };
 
     // The scratch tensor (the last tensor, see CustomOpDescriptor::scratchBytes): its regions start at page aligned
     // offsets (RDMA reads into page aligned destinations are faster)
@@ -1282,11 +1351,17 @@ struct CompileOpConstructor {
       scratchBytes += (bytes + 4095) / 4096 * 4096;
       return offset;
     };
+    // A node of a region: an id per region and role, stored to or loaded from (ids from a range of this rank's that
+    // Phase 5 and proxyRemoteEdges do not use; generateKernel takes no edge whose destination another edge loads)
+    HashMap<uint64_t, uint64_t> nodeIds;
     uint32_t nextNodeIndex = 0;
     auto scratchNode = [&](size_t offset, bool filled) {
+      uint64_t& id = nodeIds[offset * 2 + filled];
+      if (id == 0) {
+        id = ((uint64_t)(rank + 1) << 32) | (0xc0000000u + nextNodeIndex++);
+      }
       Node n;
-      // (ids from a range of this rank's that Phase 5 and proxyRemoteEdges do not use)
-      n.id = ((uint64_t)(rank + 1) << 32) | (0xc0000000u + nextNodeIndex++);
+      n.id = id;
       n.rank = rank;
       n.tensorIndex = scratchIndex;
       n.offset = offset;
@@ -1294,111 +1369,209 @@ struct CompileOpConstructor {
       n.device = DeviceType::CUDA;
       return n;
     };
+    auto doneFlag = [](int32_t index, uint32_t generation) {
+      return Graph::Signal{index, (uint16_t)generation, true};
+    };
+    auto rdmaSignal = [](int32_t index, uint32_t generation) {
+      return Graph::Signal{index, (uint16_t)generation, false};
+    };
+    // This rank's RDMA signals and done flags used so far, the largest generation of a use of a slot of its own, and
+    // the largest generation of the credits that it sets in other ranks, those of the next uses of their slots (a rank
+    // lays out its rings for itself: another rank's ring can have fewer slots than this rank's rings, and so more
+    // generations; e.g. with more rings, see layoutRings)
     int32_t nextSignal = 0;
-    auto read = [&](uint32_t sourceRank, uint32_t inputIndex, size_t inputOffset, size_t bytes, int32_t waitSlot) {
-      CustomOpDescriptor::IbRead r;
-      r.rank = sourceRank;
-      r.inputIndex = inputIndex;
-      r.outputIndex = scratchOutputIndex;
-      r.inputOffset = inputOffset;
-      r.outputOffset = allocate(bytes);
-      r.bytes = bytes;
-      r.signalIndex = nextSignal++;
-      r.waitSlot = waitSlot;
-      op.ibReads.push_back(r);
-      log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d, wait slot %d\n", r.rank,
-          r.inputIndex, r.inputOffset, r.outputIndex, r.outputOffset, r.bytes, r.signalIndex, r.waitSlot);
-      return r;
-    };
-
-    // The partial results this rank computes, for itself or for other ranks: an edge each, from the sources (in rank
-    // order from this rank's own, like mergeReductions) to a region of the scratch tensor, found by its sources (the
-    // executors of a piece in several domains ask for the same one). The edges join the graph at the end, in the
-    // order of their keys (see below).
-    struct Partial {
-      int32_t doneSignal;
-      size_t offset;
-      uint32_t divisor;
-    };
-    using PartialOrder = std::tuple<uint32_t, size_t, size_t>;
-    HashMap<std::string, Partial> partials;
-    Vector<std::pair<PartialOrder, Edge>> partialEdges;
     int32_t numFlags = 0;
-    auto computePartial = [&](const Vector<Node>& sources, size_t bytes, uint32_t divisor, uint32_t cellIndex,
-                              uint32_t chunkIndex, const PartialOrder& order) {
-      std::string key((const char*)&bytes, sizeof(bytes));
-      for (const Node& n : sources) {
-        key.append((const char*)&n.id, sizeof(n.id));
+    size_t maxGeneration = 0;
+    size_t maxCreditGeneration = 0;
+
+    // The slots of a ring by default (numSlots 0): enough to hold about ringBytes (2 slots of 2 MiB for the parts of a
+    // reduce-scatter; more for the smaller shares of an all-reduce in two rounds, whose transfers depend on more round
+    // trips: all-reduce of 256 MiB across 16 domains of 4 GPUs, 2.17 ms with 2 slots, 1.88 with 4), or if the rank has
+    // few rings, ringBudget / their number (the items of a ring go in bursts of its slots, see below: all-reduce of 256
+    // MiB across 2 domains of 32 GPUs, 8 parts of 1 MiB, 0.88 ms with 4 slots, 0.85 with 8), at least 2 (one being read
+    // while the next is computed), at most maxSlots (each takes a notification slot of every rank that reads it, of the
+    // numNotificationSlots per pair of ranks, see layoutRings)
+    static constexpr size_t ringBytes = 4 << 20;
+    static constexpr size_t ringBudget = 32 << 20;
+    static constexpr size_t maxSlots = 16;
+    static_assert(maxSlots <= CustomOpDescriptor::numNotificationSlots);
+    CHECK(numSlots <= maxSlots);
+    // A ring of slots of the scratch tensor (see above): its uses are counted first (count), then the rings are laid
+    // out (layoutRings), then their uses take their slots in the same order (take). Every slot has a done flag (and a
+    // second one for some, flagsPerSlot) and signalsPerSlot RDMA signals; the slots of a ring that other ranks read
+    // (readers) have a notification slot each for every reader. With writes, every use gets a region, done flags and
+    // a signal of its own.
+    struct Ring {
+      size_t uses = 0;
+      size_t maxBytes = 0;
+      int flagsPerSlot = 1;
+      size_t signalsPerSlot = 1;
+      Vector<uint32_t> readers;
+      size_t slots = 0;
+      size_t slotBytes = 0;
+      size_t offset = 0;
+      int32_t flags = -1;
+      int32_t flags2 = -1;
+      int32_t signals = -1;
+      Vector<uint32_t> notifyBase; // per reader: the notification slot of slot 0
+      size_t taken = 0;
+    };
+    struct Use {
+      size_t offset = 0;
+      uint32_t slot = 0;
+      uint32_t generation = 0;
+      int32_t flag = -1;
+      int32_t flag2 = -1;
+      int32_t signal = -1; // the slot's first signal (of signalsPerSlot)
+      // The slot's last use in the op: nothing waits for it to be free again (no credit, no done flag that frees it)
+      bool last = true;
+    };
+    auto count = [](Ring& r, size_t bytes) {
+      ++r.uses;
+      r.maxBytes = std::max(r.maxBytes, bytes);
+    };
+    const size_t maxSignals = group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes;
+    const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
+    // Lays out the rings (with reads): the slots of each (the default, see ringBytes, or numSlots; at most the uses,
+    // and for each reader an equal share of its numNotificationSlots notification slots of this rank's among the rings
+    // that it reads: a few, but more where the sets of ranks that read the items vary, e.g. with domains of different
+    // sizes), fewer where this rank's signals and done flags would not do (halving the most slots first), then their
+    // regions, done flags, signals and notification slots
+    auto layoutRings = [&](const Vector<Ring*>& rings) -> std::string {
+      const size_t numRings = std::ranges::count_if(rings, [](const Ring* r) {
+        return r->uses != 0;
+      });
+      const size_t bytesPerRing = std::max(ringBytes, ringBudget / std::max<size_t>(numRings, 1));
+      Vector<size_t> readerRings(size);
+      for (const Ring* r : rings) {
+        if (r->uses != 0) {
+          for (uint32_t e : r->readers) {
+            ++readerRings[e];
+          }
+        }
       }
-      if (auto it = partials.find(key); it != partials.end()) {
-        CHECK(it->second.divisor == divisor);
-        return it->second;
+      for (Ring* r : rings) {
+        if (r->uses == 0) {
+          continue;
+        }
+        r->slotBytes = (r->maxBytes + 4095) / 4096 * 4096;
+        size_t slots = numSlots != 0 ? numSlots : std::clamp<size_t>(bytesPerRing / r->slotBytes, 2, maxSlots);
+        slots = std::min(slots, r->uses);
+        for (uint32_t e : r->readers) {
+          slots = std::min(slots, CustomOpDescriptor::numNotificationSlots / readerRings[e]);
+        }
+        if (slots == 0) {
+          return fmt::sprintf(
+              "rank %zu has more rings of items that one rank reads than notification slots for it (%zu)", rank,
+              CustomOpDescriptor::numNotificationSlots);
+        }
+        r->slots = slots;
       }
-      Partial partial{numFlags++, allocate(bytes), divisor};
-      Edge p;
-      p.id = ictx.nextEdgeId();
-      p.sources = sources;
-      std::ranges::rotate(p.sources, std::ranges::lower_bound(p.sources, rank, {}, [](const Node& n) {
-        return n.rank;
-      }));
-      p.destinations.push_back(scratchNode(partial.offset, false));
-      p.bytes = bytes;
-      p.cellIndex = cellIndex;
-      p.chunkIndex = chunkIndex;
-      p.executorRank = rank;
-      p.divisor = divisor;
-      p.doneSignal = partial.doneSignal;
-      partials[key] = partial;
-      partialEdges.emplace_back(order, std::move(p));
-      return partial;
+      while (true) {
+        size_t flags = numFlags;
+        size_t signals = nextSignal;
+        Ring* most = nullptr;
+        for (Ring* r : rings) {
+          flags += r->slots * r->flagsPerSlot;
+          signals += r->slots * r->signalsPerSlot;
+          if (r->slots > 1 && (!most || r->slots > most->slots)) {
+            most = r;
+          }
+        }
+        if (flags <= maxFlags && signals <= maxSignals) {
+          break;
+        }
+        if (!most) {
+          return fmt::sprintf("rank %zu would need %zu signals and %zu done flags for its reductions across NVLink "
+                              "domains, more than it has (%zu and %zu)",
+              rank, signals, flags, maxSignals, maxFlags);
+        }
+        most->slots = (most->slots + 1) / 2;
+      }
+      Vector<size_t> notifyUsed(size);
+      for (Ring* r : rings) {
+        if (r->uses == 0) {
+          continue;
+        }
+        r->offset = allocate(r->slots * r->slotBytes);
+        r->flags = numFlags;
+        numFlags += r->slots;
+        if (r->flagsPerSlot >= 2) {
+          r->flags2 = numFlags;
+          numFlags += r->slots;
+        }
+        if (r->signalsPerSlot != 0) {
+          r->signals = nextSignal;
+          nextSignal += r->slots * r->signalsPerSlot;
+        }
+        for (uint32_t e : r->readers) {
+          r->notifyBase.push_back(notifyUsed[e]);
+          notifyUsed[e] += r->slots;
+        }
+      }
+      return "";
+    };
+    auto take = [&](Ring& r, size_t bytes) {
+      Use u;
+      const size_t i = r.taken++;
+      if (writes) {
+        u.slot = i;
+        u.offset = allocate(bytes);
+        u.flag = r.flagsPerSlot >= 1 ? numFlags++ : -1;
+        u.flag2 = r.flagsPerSlot >= 2 ? numFlags++ : -1;
+        u.signal = r.signalsPerSlot != 0 ? nextSignal++ : -1;
+        return u;
+      }
+      CHECK(i < r.uses && bytes <= r.slotBytes);
+      u.slot = i % r.slots;
+      const size_t generation = i / r.slots;
+      maxGeneration = std::max(maxGeneration, generation);
+      u.generation = std::min<size_t>(generation, maxGenerations);
+      u.offset = r.offset + r.slotBytes * u.slot;
+      u.flag = r.flags < 0 ? -1 : r.flags + u.slot;
+      u.flag2 = r.flags2 < 0 ? -1 : r.flags2 + u.slot;
+      u.signal = r.signals < 0 ? -1 : r.signals + u.slot * r.signalsPerSlot;
+      u.last = i + r.slots >= r.uses;
+      return u;
     };
 
-    // The new sources of an edge of this rank's (the partial results of other ranks are filled in from the responses),
-    // and the range of the edge that they cover: in two rounds, this rank's share of the part, else all of it. In two
-    // rounds also the result of the share (a region of the scratch tensor, and the edge's done signal), and the
-    // other shares of the part, which this rank reads from their owners (filled in from the responses).
+    // The plans: this rank's edges of reductions across domains (pieces, or parts of pieces, that it executes), and
+    // where their sources come from: this rank's domain (local), an input of another domain's one source rank, read
+    // as it is (input), or an item that a rank computes (item: in its domain for this rank, or this rank itself, see
+    // PartialRequest). In two rounds also the other shares of the part, which this rank reads from their owners.
+    struct PlanSource {
+      enum Kind : uint8_t { local, input, item } kind = local;
+      Node node;          // local: the node; input: the input (of rank `rank`, at the plan's range)
+      uint32_t rank = 0;  // input, item: the rank it comes from
+      size_t request = 0; // item: the request's index among those to `rank`
+      Use use;            // input, item of another rank: the receive slot
+    };
     struct Share {
       uint32_t owner;
-      size_t requestIndex;
+      size_t request; // among the result requests to `owner`
       size_t offset;
       size_t bytes;
-      WriteTarget target; // with writes
+      Use use; // the receive slot
     };
     struct Plan {
       size_t edgeIndex;
-      Vector<Node> sources;
-      Vector<int32_t> signals;
-      Vector<int32_t> doneSignals;
+      bool allReduce = false;
+      std::tuple<uint32_t, uint32_t, uint32_t, size_t> sortKey; // (chunk, 0 or 1 as in Key, cell, pieceKey)
+      Key key;
+      Vector<PlanSource> sources;
       uint32_t partialSources = 0;
-      uint32_t divisor;
-      Vector<std::tuple<size_t, uint32_t, size_t>> partials; // (source position, partial rank, request index)
+      uint32_t divisor = 0;
+      // The range of the edge that the plan computes: in two rounds, this rank's share of the part, else all of it
       size_t offset = 0;
       size_t bytes = 0;
-      int32_t doneSignal = -1;
-      size_t resultOffset = 0;
+      bool twoRounds = false;
       Vector<Share> shares;
     };
     Vector<Plan> plans;
     Vector<Vector<PartialRequest>> requests(size);
     Vector<Vector<ResultRequest>> resultRequests(size);
-    // Two rounds: the shares of results that this rank computes, by cell and chunk index: their done signals and
-    // regions of the scratch tensor
-    HashMap<uint64_t, std::pair<int32_t, size_t>> results;
     Vector<size_t> requestedFrom(numDomains); // per domain, the partial results picked by pickPartialRank so far
-    // The edges part by part (chunkIndex, see reductionPieces), and within a part by cell: the order in which the
-    // partial results are computed (see below), and in which this rank reads and combines them. In two rounds, the
-    // kernel computes the shares in this order, with the copies of the other shares of a part after the next share
-    // (see below), and so does every rank: a copy waits for a share of its part on another rank, which comes before
-    // it in that rank's order too, and a share waits for partial results only, which come first (see
-    // generateKernel), so that no rank waits for a rank that waits for it.
-    Vector<size_t> edgeOrder;
     for (size_t ei : indices(graph.edges)) {
-      edgeOrder.push_back(ei);
-    }
-    std::ranges::stable_sort(edgeOrder, {}, [&](size_t ei) {
-      return std::make_pair(graph.edges[ei].chunkIndex, graph.edges[ei].cellIndex);
-    });
-    for (size_t ei : edgeOrder) {
       const Edge& e = graph.edges[ei];
       if (e.sources.size() < 2) {
         continue;
@@ -1431,7 +1604,11 @@ struct CompileOpConstructor {
         CHECK(it != piece->shareOwners.end());
         shareIndex = it - piece->shareOwners.begin();
         std::tie(plan.offset, plan.bytes) = shareRange(e.bytes, numShares, shareIndex);
+        plan.twoRounds = true;
       }
+      plan.allReduce = piece != nullptr;
+      const size_t key = pieceKey(e.sources);
+      plan.sortKey = {e.chunkIndex, piece ? 0 : 1, e.cellIndex, key};
       // The domains with sources, in order, and the sources of each in (rank, tensor, offset) order
       Vector<size_t> sourceDomains;
       for (const Node& n : e.sources) {
@@ -1452,51 +1629,34 @@ struct CompileOpConstructor {
         });
         return r;
       };
-      // An input as it is (the range of the plan): over NVLink from this domain, else read into the scratch tensor
+      // An input as it is (the range of the plan): over NVLink from this domain, else read
       auto addInput = [&](Node n) {
         n.offset += plan.offset;
-        if (inMyDomain(n)) {
-          plan.sources.push_back(n);
-          plan.signals.push_back(-1);
-        } else {
-          auto r = read(n.rank, n.tensorIndex, n.offset, plan.bytes, -1);
-          plan.sources.push_back(scratchNode(r.outputOffset, true));
-          plan.signals.push_back(r.signalIndex);
-        }
-        plan.doneSignals.push_back(-1);
+        PlanSource s;
+        s.kind = inMyDomain(n) ? PlanSource::local : PlanSource::input;
+        s.node = n;
+        s.rank = n.rank;
+        plan.sources.push_back(s);
       };
-      // A partial result of another rank's, or a copy of an input that it makes, of the whole edge (filled in from its
-      // response; this rank reads the range of the plan). With writes, the partial rank writes that range into the
-      // scratch tensor.
-      auto addRequest = [&](uint32_t partialRank, Vector<Node> sources, bool partial) {
-        CHECK(partialRank != rank);
-        plan.partials.emplace_back(plan.sources.size(), partialRank, requests[partialRank].size());
+      // An item (the range of the plan) that partialRank computes: a partial result of a domain's sources, or a copy
+      // of its one source
+      auto addItem = [&](uint32_t partialRank, Vector<Node> sources, bool partial) {
+        PlanSource s;
+        s.kind = PlanSource::item;
+        s.rank = partialRank;
+        s.request = requests[partialRank].size();
+        plan.sources.push_back(s);
+        plan.partialSources += partial;
         PartialRequest request;
         request.sources = std::move(sources);
-        request.bytes = e.bytes;
+        request.offset = plan.offset;
+        request.bytes = plan.bytes;
         request.divisor = plan.divisor;
         request.cellIndex = e.cellIndex;
         request.chunkIndex = e.chunkIndex;
-        if (writes) {
-          request.target = {plan.offset, plan.bytes, publishedScratchIndex, allocate(plan.bytes), nextSignal++};
-          plan.sources.push_back(scratchNode(request.target.tensorOffset, true));
-          plan.signals.push_back(request.target.signal);
-        } else {
-          plan.sources.emplace_back();
-          plan.signals.push_back(-1);
-        }
+        request.allReduce = piece != nullptr;
+        request.order = key; // (with one executor: the plan's index, set below)
         requests[partialRank].push_back(std::move(request));
-        plan.doneSignals.push_back(-1);
-        plan.partialSources += partial;
-      };
-      // A partial result of this rank's own domain, or a copy of an input there, that this rank computes for itself
-      // and for the executors of other domains (once its kernel has stored it), of the whole edge
-      auto computeOwn = [&](const Vector<Node>& sources, bool partial) {
-        Partial own = computePartial(sources, e.bytes, plan.divisor, e.cellIndex, e.chunkIndex, {e.chunkIndex, 0, 0});
-        plan.sources.push_back(scratchNode(own.offset + plan.offset, true));
-        plan.signals.push_back(-1);
-        plan.doneSignals.push_back(own.doneSignal);
-        plan.partialSources += partial;
       };
       if (!piece) {
         for (const Node& n : e.sources) {
@@ -1513,7 +1673,7 @@ struct CompileOpConstructor {
         for (size_t domain : sourceDomains) {
           Vector<Node> s = domainSources(domain);
           if (domain != myDomain && s.size() > 1) {
-            addRequest(pickPartialRank(domain, requestedFrom[domain]++), std::move(s), true);
+            addItem(pickPartialRank(domain, requestedFrom[domain]++), std::move(s), true);
           }
         }
       } else {
@@ -1521,7 +1681,7 @@ struct CompileOpConstructor {
         CHECK(partialRanks.size() == numDomains && partialRanks[myDomain] == rank);
         CHECK(piece->copySource.size() == numDomains);
         // The inputs of the domains with one source (as they are, or copies, see above), then the partial results
-        // of the others
+        // of the others; those of this rank's own domain it computes itself
         for (int pass : {0, 1}) {
           for (size_t domain : sourceDomains) {
             Vector<Node> s = domainSources(domain);
@@ -1531,216 +1691,515 @@ struct CompileOpConstructor {
             const bool partial = pass == 1;
             if (!partial && !piece->copySource[domain]) {
               addInput(s[0]);
-            } else if (domain != myDomain) {
-              CHECK(domains.index.at(partialRanks[domain]) == domain);
-              addRequest(partialRanks[domain], std::move(s), partial);
             } else {
-              computeOwn(s, partial);
+              CHECK(domains.index.at(partialRanks[domain]) == domain);
+              addItem(partialRanks[domain], std::move(s), partial);
             }
           }
         }
-        // Two rounds: the result of this rank's share, and the other shares, from their owners
-        if (numShares != 0) {
-          plan.doneSignal = numFlags++;
-          plan.resultOffset = allocate(plan.bytes);
-          results[((uint64_t)e.cellIndex << 32) | e.chunkIndex] = {plan.doneSignal, plan.resultOffset};
-          for (size_t j : range(numShares)) {
-            if (j != shareIndex) {
-              const uint32_t owner = piece->shareOwners[j];
-              auto [offset, bytes] = shareRange(e.bytes, numShares, j);
-              ResultRequest request{e.cellIndex, e.chunkIndex};
-              if (writes) {
-                request.target = {0, bytes, publishedScratchIndex, allocate(bytes), nextSignal++};
-              }
-              plan.shares.push_back({owner, resultRequests[owner].size(), offset, bytes, request.target});
-              resultRequests[owner].push_back(request);
-            }
+        // Two rounds: the other shares, from their owners
+        for (size_t j : range(numShares)) {
+          if (j != shareIndex) {
+            const uint32_t owner = piece->shareOwners[j];
+            auto [offset, bytes] = shareRange(e.bytes, numShares, j);
+            plan.shares.push_back({owner, resultRequests[owner].size(), offset, bytes});
+            resultRequests[owner].push_back({e.cellIndex, e.chunkIndex});
           }
         }
       }
       plans.push_back(std::move(plan));
     }
+    // The plans in key order (see Key), which is the order of their edges in the kernel and of their uses of slots
+    std::ranges::stable_sort(plans, {}, &Plan::sortKey);
+    for (size_t i : indices(plans)) {
+      Plan& p = plans[i];
+      const uint32_t chunk = std::get<0>(p.sortKey);
+      if (p.allReduce) {
+        p.key = {1, chunk, 0, std::get<2>(p.sortKey), std::get<3>(p.sortKey), 1, 0, 0};
+      } else {
+        const bool sameChunk = i != 0 && !plans[i - 1].allReduce && std::get<0>(plans[i - 1].sortKey) == chunk;
+        const uint64_t index = sameChunk ? std::get<3>(plans[i - 1].key) + 1 : 0;
+        p.key = {1, chunk, 1, index, 0, 1, 0, 0};
+        for (const PlanSource& s : p.sources) {
+          if (s.kind == PlanSource::item) {
+            requests[s.rank][s.request].order = index;
+          }
+        }
+      }
+    }
 
-    // As a partial rank: the partial results that other ranks request, and a notification for each request. A rank
-    // has numNotificationSlots slots for the notifications from each other rank: with more requests, consecutive ones
-    // share a slot (notified once all of them are done). In two rounds, also the shares of results that the other
-    // owners of a part request, which never share a slot with partial results: the owners read each other's partial
-    // results to compute their shares, so an owner waiting for a share to read a partial result could wait for an
-    // owner waiting for it.
-    // The kernel computes the partial results in the order of their edges (see generateKernel): part by part
-    // (chunkIndex, see reductionPieces), so that every executor gets the first parts from all domains early and can
-    // combine them while the next ones are on their way; within a part, those of this rank's own pieces first, then
-    // those requested by the ranks of the domain after this rank's, starting at the position of this rank, so that
-    // at any time the partial ranks send to different executors, and the executors receive from different partial
-    // ranks (as in the read order below; with all partial ranks starting at the same executor, its NIC took all of
-    // their data at first while the others had nothing to read).
+    // This rank's receive rings, per rank that it gets data from: for partial results, copies and inputs, and for
+    // shares; used in plan order (the copies of the shares use theirs in that order too). With reads, an edge that
+    // has used a slot sets its done flag, which lets the CPU thread read into it again; every slot has a signal, which
+    // the CPU thread (with writes, the writer's) sets once the data has arrived. (With reads, they are laid out with
+    // the rings of the items, below; with writes, each use has a region and a signal of its own, which the requests
+    // carry.)
+    std::map<uint32_t, Ring> receiveRings;
+    std::map<uint32_t, Ring> shareReceiveRings;
+    auto received = [&](const PlanSource& s) {
+      return s.kind == PlanSource::input || (s.kind == PlanSource::item && s.rank != rank);
+    };
+    for (const Plan& p : plans) {
+      for (const PlanSource& s : p.sources) {
+        if (received(s)) {
+          count(receiveRings[s.rank], p.bytes);
+        }
+      }
+      for (const Share& s : p.shares) {
+        count(shareReceiveRings[s.owner], s.bytes);
+      }
+    }
+    auto takeReceiveSlots = [&]() {
+      for (Plan& p : plans) {
+        for (PlanSource& s : p.sources) {
+          if (received(s)) {
+            s.use = take(receiveRings[s.rank], p.bytes);
+            if (writes && s.kind == PlanSource::item) {
+              requests[s.rank][s.request].target = {publishedScratchIndex, s.use.offset, s.use.signal};
+            }
+          }
+        }
+        for (Share& s : p.shares) {
+          s.use = take(shareReceiveRings[s.owner], s.bytes);
+          if (writes) {
+            resultRequests[s.owner][s.request].target = {publishedScratchIndex, s.use.offset, s.use.signal};
+          }
+        }
+      }
+    };
+    if (writes) {
+      for (auto* rings : {&receiveRings, &shareReceiveRings}) {
+        for (auto& v : *rings) {
+          v.second.flagsPerSlot = 0;
+        }
+      }
+      takeReceiveSlots();
+    }
+
     for (size_t i : range(size)) {
       ctx.send(i, requests[i], resultRequests[i]);
     }
     Vector<Vector<PartialRequest>> incoming(size);
     Vector<Vector<ResultRequest>> incomingResults(size);
-    Vector<std::pair<uint32_t, uint32_t>> order; // (requesting rank, request index)
     for (size_t i : range(size)) {
       ctx.receive(i, incoming[i], incomingResults[i]);
+    }
+
+    // The items that this rank computes, in key order, and the ranks that asked for each (consumers, this rank among
+    // them for the items that it uses itself). The requests for a piece with executors in several domains are merged by
+    // their sources and range: all executors get the same partial result.
+    struct Consumer {
+      uint32_t rank;
+      size_t request;
+    };
+    struct Item {
+      Vector<Node> sources;
+      size_t bytes;
+      uint32_t divisor;
+      uint32_t cellIndex;
+      uint32_t chunkIndex;
+      Key key;
+      Vector<Consumer> consumers;
+      size_t ring = 0; // with reads: its ring (see below)
+      Use use;         // with reads, its slot; with writes, its region and done flag
+    };
+    Vector<Item> items;
+    HashMap<std::string, size_t> merged;
+    for (size_t i : range(size)) {
       for (size_t j : indices(incoming[i])) {
-        order.emplace_back(i, j);
+        const PartialRequest& r = incoming[i][j];
+        CHECK(!r.sources.empty() && (i == rank || domains.index[i] != myDomain));
+        std::string key;
+        if (r.allReduce) {
+          key.append((const char*)&r.offset, sizeof(r.offset));
+          key.append((const char*)&r.bytes, sizeof(r.bytes));
+          for (const Node& n : r.sources) {
+            key.append((const char*)&n.id, sizeof(n.id));
+          }
+          if (auto it = merged.find(key); it != merged.end()) {
+            Item& item = items[it->second];
+            CHECK(item.divisor == r.divisor && item.bytes == r.bytes && item.cellIndex == r.cellIndex &&
+                  item.chunkIndex == r.chunkIndex);
+            item.consumers.push_back({(uint32_t)i, j});
+            continue;
+          }
+          merged[key] = items.size();
+        }
+        Item item;
+        item.sources = r.sources;
+        for (Node& n : item.sources) {
+          n.offset += r.offset;
+        }
+        // (from this rank's own, like mergeReductions)
+        std::ranges::rotate(item.sources, std::ranges::lower_bound(item.sources, rank, {}, [](const Node& n) {
+          return n.rank;
+        }));
+        item.bytes = r.bytes;
+        item.divisor = r.divisor;
+        item.cellIndex = r.cellIndex;
+        item.chunkIndex = r.chunkIndex;
+        auto [a, b] = serveOrder(i);
+        item.key = r.allReduce ? Key{1, r.chunkIndex, 0, r.cellIndex, r.order, 0, a, b}
+                               : Key{1, r.chunkIndex, 1, r.order, 0, 0, a, b};
+        item.consumers.push_back({(uint32_t)i, j});
+        items.push_back(std::move(item));
       }
     }
-    // The notification slot of request j of n of one kind from a rank, which has the slots [first, first + slots) for
-    // that kind: [0, partialSlots(i)) for the partial results that rank i requests, the others for shares of results
-    static constexpr size_t numSlots = CustomOpDescriptor::numNotificationSlots;
-    auto partialSlots = [&](size_t i) {
-      const size_t n = incoming[i].size();
-      const size_t total = n + incomingResults[i].size();
-      if (total <= numSlots || n == 0 || n == total) {
-        return std::min(n, numSlots);
+    std::ranges::stable_sort(items, {}, &Item::key);
+
+    // Two rounds: the shares of this rank's plans that the other owners ask for (consumers per plan, in plan order)
+    HashMap<uint64_t, size_t> planOfPart; // (cell, chunk) -> index of a plan in two rounds
+    for (size_t i : indices(plans)) {
+      if (plans[i].twoRounds) {
+        const Edge& e = graph.edges[plans[i].edgeIndex];
+        planOfPart[((uint64_t)e.cellIndex << 32) | e.chunkIndex] = i;
       }
-      return std::clamp<size_t>(n * numSlots / total, 1, numSlots - 1);
+    }
+    Vector<Vector<Consumer>> shareConsumers(plans.size());
+    for (size_t i : range(size)) {
+      for (size_t j : indices(incomingResults[i])) {
+        const ResultRequest& r = incomingResults[i][j];
+        auto it = planOfPart.find(((uint64_t)r.cellIndex << 32) | r.chunkIndex);
+        // (no plan for the part: this rank's edge is one that the kernel cannot take, an error that compile() raises on
+        // every rank before the op runs)
+        if (it != planOfPart.end()) {
+          shareConsumers[it->second].push_back({(uint32_t)i, j});
+        }
+      }
+    }
+    Vector<size_t> shareRing(plans.size());
+    Vector<Use> shareUse(plans.size());
+    // (an error in laying out the rings is returned once the answers have been exchanged)
+    std::string layoutError;
+
+    // With reads, the slots of the items and of the shares: a ring per kind (items, shares) and set of ranks that read
+    // them (the ranks that asked for them, this rank among them for the items that it uses itself), so that an item
+    // that several ranks read is stored once. A slot has a done flag (the item is there: the CPU thread notifies the
+    // other ranks, this rank's kernel loads it), a signal per other rank (which it sets once it has read the item: a
+    // credit), and if this rank reads it too, a second done flag (the edge that used it is done); the slot's next use
+    // waits for all of them. With writes, a region and a done flag per item and per share.
+    Vector<Ring> itemRings;
+    HashMap<std::string, size_t> itemRingIndex;
+    auto ringOf = [&](int kind, const Vector<Consumer>& consumers) {
+      Vector<uint32_t> readers;
+      bool self = false;
+      for (const Consumer& c : consumers) {
+        if (c.rank == rank) {
+          self = true;
+        } else {
+          readers.push_back(c.rank);
+        }
+      }
+      std::ranges::sort(readers);
+      CHECK(std::unique(readers.begin(), readers.end()) == readers.end());
+      std::string key(1, (char)(2 * kind + self));
+      key.append((const char*)readers.data(), sizeof(uint32_t) * readers.size());
+      auto [it, inserted] = itemRingIndex.try_emplace(key, itemRings.size());
+      if (inserted) {
+        Ring r;
+        r.flagsPerSlot = self ? 2 : 1;
+        r.signalsPerSlot = readers.size();
+        r.readers = std::move(readers);
+        itemRings.push_back(std::move(r));
+      }
+      return it->second;
     };
-    auto slotOf = [&](size_t j, size_t n, size_t first, size_t slots) {
-      return (uint32_t)(first + (n <= slots ? j : j * slots / n));
+    // (the index of a rank among the readers of a ring)
+    auto readerIndex = [&](const Ring& r, uint32_t i) {
+      auto it = std::ranges::lower_bound(r.readers, i);
+      CHECK(it != r.readers.end() && *it == i);
+      return (size_t)(it - r.readers.begin());
     };
-    auto requestOrder = [&](const std::pair<uint32_t, uint32_t>& x) {
-      const uint32_t e = x.first;
-      const size_t n = domains.sizes[domains.index[e]];
-      return PartialOrder(incoming[e][x.second].chunkIndex,
-          1 + (domains.index[e] + numDomains - 1 - myDomain) % numDomains,
-          (domains.position[e] + n - domains.position[rank] % n) % n);
-    };
-    std::ranges::stable_sort(order, {}, requestOrder);
+    Ring outbox;
+    outbox.flagsPerSlot = 1;
+    outbox.signalsPerSlot = 0;
+    if (!writes) {
+      for (Item& item : items) {
+        item.ring = ringOf(0, item.consumers);
+        count(itemRings[item.ring], item.bytes);
+      }
+      for (size_t pi : indices(plans)) {
+        if (!shareConsumers[pi].empty()) {
+          shareRing[pi] = ringOf(1, shareConsumers[pi]);
+          count(itemRings[shareRing[pi]], plans[pi].bytes);
+        }
+      }
+      Vector<Ring*> rings;
+      for (auto* m : {&receiveRings, &shareReceiveRings}) {
+        for (auto& v : *m) {
+          rings.push_back(&v.second);
+        }
+      }
+      for (Ring& r : itemRings) {
+        rings.push_back(&r);
+      }
+      if (std::string error = layoutRings(rings); !error.empty()) {
+        layoutError = error;
+      }
+      if (layoutError.empty()) {
+        takeReceiveSlots();
+        // The uses of each ring, in key order
+        Vector<Vector<size_t>> ringItems(itemRings.size());
+        for (size_t i : indices(items)) {
+          Item& item = items[i];
+          item.use = take(itemRings[item.ring], item.bytes);
+          ringItems[item.ring].push_back(i);
+        }
+        for (size_t pi : indices(plans)) {
+          if (!shareConsumers[pi].empty()) {
+            shareUse[pi] = take(itemRings[shareRing[pi]], plans[pi].bytes);
+          }
+        }
+        // Where the items go in the kernel's order: as early as their slots let them (other ranks wait for them), i.e.
+        // after the plans of an earlier use of the ring, at the earliest of the slot's previous use (key 2 after the
+        // plans' key, which is the same on every rank that reads the item); the uses that no plan comes before go first
+        // (key 0, in their order). Use j goes after the plans of use j - 1 - lookahead, so that the transfers of the
+        // items of a part overlap the plans before it (lookahead is at most slots - 1, and slots - 2 if this rank's own
+        // plans use the ring (with 3 slots or more), so that the item does not wait right behind the plan that it waits
+        // for): right before their plans, the items of a part were computed only once the plans of the part before were
+        // done, which waited for the transfers of that part's items, and the ranks went from part to part in step
+        // (reduce-scatter of 256 MiB across 16 domains of 4 GPUs: 60 ms instead of 48; in bursts as below: 56 ms). In
+        // two rounds, the plans compute the shares that the other owners wait for, so items and plans alternate
+        // (all-reduce of 256 MiB across 16 domains of 4 GPUs: 1.86 ms, 2.00 with all first uses first). The items of a
+        // ring that this rank's own plans use in one round (an all-reduce's partial results of its own domain) go in
+        // bursts of the ring's slots instead: uses b * slots to b * slots + slots - 1 after the plans of use b * slots
+        // - 1, so that the kernel mostly loads, then stores, as when every item had a region of its own (all-reduce of
+        // 256 MiB across 2 domains of 32 GPUs, 4 slots: 0.88 ms, 0.91 with the items 2 uses ahead). (Every wait is
+        // still for an edge with a smaller key: the plans of the previous use of its slot, the reads of it, which wait
+        // for its item and for the plans that used their slots before, and the items before it in its ring.)
+        Vector<Key> keys(items.size());
+        for (size_t i : indices(items)) {
+          keys[i] = items[i].key;
+        }
+        for (size_t ri : indices(itemRings)) {
+          const Ring& r = itemRings[ri];
+          const size_t maxLookahead = r.flagsPerSlot >= 2 && r.slots >= 3 ? r.slots - 2 : r.slots - 1;
+          const size_t lookahead = std::min<size_t>(maxLookahead, 2);
+          for (size_t j : indices(ringItems[ri])) {
+            Item& item = items[ringItems[ri][j]];
+            auto piece = allReducePieces.find(((uint64_t)item.cellIndex << 32) | item.chunkIndex);
+            const bool twoRounds = piece != allReducePieces.end() && !piece->second.shareOwners.empty();
+            const bool bursts = r.flagsPerSlot >= 2 && !twoRounds;
+            // (the use whose plans the item goes after, if any)
+            const int64_t after = bursts ? (int64_t)(j / r.slots * r.slots) - 1 : (int64_t)j - 1 - (int64_t)lookahead;
+            if (after < 0) {
+              std::get<0>(item.key) = 0;
+            } else {
+              const Key& plans = keys[ringItems[ri][after]];
+              item.key = {1, std::get<1>(plans), std::get<2>(plans), std::get<3>(plans), std::get<4>(plans), 2,
+                  std::get<6>(item.key), std::get<7>(item.key)};
+            }
+          }
+        }
+      }
+    } else {
+      // (every item has a region of its own: all of them come first)
+      for (Item& item : items) {
+        item.use = take(outbox, item.bytes);
+        std::get<0>(item.key) = 0;
+      }
+      for (size_t pi : indices(plans)) {
+        if (plans[pi].twoRounds) {
+          shareUse[pi] = take(outbox, plans[pi].bytes);
+        }
+      }
+    }
+    // The uses of the items that this rank computes for itself, by request
+    Vector<Use> selfUses(incoming[rank].size());
+    for (const Item& item : items) {
+      for (const Consumer& c : item.consumers) {
+        if (c.rank == rank) {
+          selfUses[c.request] = item.use;
+        }
+      }
+    }
+
+    // The answers: with reads, where each item or share will be, its notification slot, the generation and the credit
+    // signal of the asking rank
     Vector<Vector<PartialResponse>> responses(size);
+    Vector<Vector<PartialResponse>> resultResponses(size);
     for (size_t i : range(size)) {
       responses[i].resize(incoming[i].size());
+      resultResponses[i].resize(incomingResults[i].size());
     }
-    // With writes, the writes in the order in which the kernel computes their data: the partial results in the order
-    // above, then the shares of results part by part (in plan order), each to the owners of the domains after this
-    // rank's first (as the partial results)
-    auto addWrite = [&](uint32_t requester, int32_t flag, size_t offset, const WriteTarget& t) {
-      CustomOpDescriptor::IbWrite w;
-      w.flag = flag;
-      w.rank = requester;
-      w.destinationIndex = t.tensorIndex;
-      w.sourceOffset = offset + t.offset;
-      w.destinationOffset = t.tensorOffset;
-      w.bytes = t.bytes;
-      w.signalIndex = t.signal;
-      op.ibWrites.push_back(w);
-      log.info("  ibWrite: flag %d, output[%u]+%zu -> rank %u tensor %u + %zu, %zu bytes, signal %d\n", w.flag,
-          scratchOutputIndex, w.sourceOffset, w.rank, w.destinationIndex, w.destinationOffset, w.bytes, w.signalIndex);
+    auto answer = [&](const Ring& r, const Use& u, uint32_t i) {
+      const size_t j = readerIndex(r, i);
+      return PartialResponse{publishedScratchIndex, u.offset, (uint32_t)(r.notifyBase.at(j) + u.slot),
+          (uint16_t)u.generation, u.last ? -1 : (int32_t)(u.signal + j)};
     };
-    for (auto [i, j] : order) {
-      const PartialRequest& request = incoming[i][j];
-      Partial partial = computePartial(
-          request.sources, request.bytes, request.divisor, request.cellIndex, request.chunkIndex, requestOrder({i, j}));
-      if (writes) {
-        CHECK(request.target.offset + request.target.bytes <= request.bytes);
-        addWrite(i, partial.doneSignal, partial.offset, request.target);
-        continue;
-      }
-      const uint32_t slot = slotOf(j, incoming[i].size(), 0, partialSlots(i));
-      op.notifications.push_back({(uint32_t)partial.doneSignal, i, slot});
-      responses[i][j] = {publishedScratchIndex, partial.offset, slot};
-    }
-    Vector<Vector<PartialResponse>> resultResponses(size);
-    Vector<std::tuple<uint32_t, uint32_t, size_t, uint32_t, uint32_t>> resultWrites; // (chunk, cell, order, i, j)
-    for (size_t i : range(size)) {
-      const size_t first = partialSlots(i);
-      for (size_t j : indices(incomingResults[i])) {
-        const ResultRequest& request = incomingResults[i][j];
-        auto it = results.find(((uint64_t)request.cellIndex << 32) | request.chunkIndex);
-        const uint32_t slot = slotOf(j, incomingResults[i].size(), first, numSlots - first);
-        if (it == results.end()) {
-          // (this rank has no plan for the part: its edge is one that the kernel cannot take, an error that compile()
-          // raises on every rank before the op runs)
-          resultResponses[i].push_back({publishedScratchIndex, 0, slot});
-          continue;
+    if (!writes && layoutError.empty()) {
+      for (const Item& item : items) {
+        for (const Consumer& c : item.consumers) {
+          if (c.rank != rank) {
+            responses[c.rank][c.request] = answer(itemRings[item.ring], item.use, c.rank);
+          }
         }
-        if (writes) {
-          resultWrites.emplace_back(request.chunkIndex, request.cellIndex,
-              (domains.index[i] + numDomains - 1 - myDomain) % numDomains, (uint32_t)i, (uint32_t)j);
-          resultResponses[i].push_back({publishedScratchIndex, 0, slot});
-          continue;
-        }
-        op.notifications.push_back({(uint32_t)it->second.first, (uint32_t)i, slot});
-        resultResponses[i].push_back({publishedScratchIndex, it->second.second, slot});
       }
-    }
-    std::ranges::sort(resultWrites);
-    for (auto [chunkIndex, cellIndex, o, i, j] : resultWrites) {
-      const ResultRequest& request = incomingResults[i][j];
-      auto [doneSignal, resultOffset] = results.at(((uint64_t)cellIndex << 32) | chunkIndex);
-      CHECK(request.target.offset == 0);
-      addWrite(i, doneSignal, resultOffset, request.target);
-    }
-    std::ranges::stable_sort(partialEdges, {}, [](const std::pair<PartialOrder, Edge>& x) {
-      return x.first;
-    });
-    for (auto& x : partialEdges) {
-      graph.edges.push_back(std::move(x.second));
+      for (size_t pi : indices(plans)) {
+        for (const Consumer& c : shareConsumers[pi]) {
+          resultResponses[c.rank][c.request] = answer(itemRings[shareRing[pi]], shareUse[pi], c.rank);
+        }
+      }
     }
     for (size_t i : range(size)) {
       ctx.send(i, responses[i], resultResponses[i]);
     }
-    Vector<Vector<PartialResponse>> received(size);
-    Vector<Vector<PartialResponse>> receivedResults(size);
+    Vector<Vector<PartialResponse>> answers(size);
+    Vector<Vector<PartialResponse>> resultAnswers(size);
     for (size_t i : range(size)) {
-      ctx.receive(i, received[i], receivedResults[i]);
-      CHECK(received[i].size() == requests[i].size() && receivedResults[i].size() == resultRequests[i].size());
+      ctx.receive(i, answers[i], resultAnswers[i]);
+      CHECK(answers[i].size() == requests[i].size() && resultAnswers[i].size() == resultRequests[i].size());
+    }
+    if (!layoutError.empty()) {
+      return layoutError;
     }
 
-    // The executor's edges, with the partial results of other ranks read from their scratch tensors once notified.
-    // The CPU thread issues the reads in signal order: per part, from the domain before this rank's first, then the
-    // one before that, ..., which is the order in which the partial ranks compute them (see above): at any time,
-    // every partial rank has one reader. (The kernel combines them in the order of the domains, the same for every
-    // part.) In two rounds, an executor's edge computes its share of the part, which it stores to the destinations of
-    // its domain and to its scratch tensor, where the other owners read it once notified (it has a done signal); then
-    // an edge per other share of the part copies the share from where this rank has read it (in the same order of
-    // domains, after the partial results of the part) to the destinations of its domain. The edges go in the order of
-    // the plans (part by part), in which the kernel takes them. (With writes, the regions and signals of the partial
-    // results and shares are those of the requests.)
-    auto readOrder = [&](uint32_t r) {
-      return (myDomain + numDomains - 1 - domains.index[r]) % numDomains;
+    // The edges, with their keys (and the index of their plan, or -1 for items), and the writes (with writes), in the
+    // order in which the kernel computes their data (the shares of a plan to the owners in serve order)
+    struct Keyed {
+      Key key;
+      int64_t plan;
+      Edge edge;
     };
-    Vector<size_t> positions;
-    Vector<Edge> planned;
-    Vector<Vector<Edge>> plannedCopies;
-    for (Plan& plan : plans) {
-      Edge& e = graph.edges[plan.edgeIndex];
-      auto partials = plan.partials;
-      std::ranges::stable_sort(partials, {}, [&](const auto& x) {
-        return readOrder(std::get<1>(x));
-      });
-      for (auto [sourcePosition, partialRank, requestIndex] : partials) {
-        if (writes) {
-          break;
+    Vector<Keyed> keyed;
+    Vector<std::pair<Key, CustomOpDescriptor::IbWrite>> writeList;
+    // (with reads, the notifications likewise: the CPU thread forwards them in key order, see WorkCustom)
+    Vector<std::pair<Key, CustomOpDescriptor::Notification>> notificationList;
+    auto addNotification = [&](const Key& key, uint32_t requester, const Use& use, uint32_t slot) {
+      auto [a, b] = serveOrder(requester);
+      Key k = key;
+      std::get<6>(k) = a;
+      std::get<7>(k) = b;
+      notificationList.emplace_back(
+          k, CustomOpDescriptor::Notification{(uint32_t)use.flag, (uint16_t)use.generation, requester, slot});
+    };
+    auto addWrite = [&](const Key& key, uint32_t requester, const Use& source, size_t bytes, const WriteTarget& t) {
+      CustomOpDescriptor::IbWrite w;
+      w.flag = source.flag;
+      w.rank = requester;
+      w.destinationIndex = t.tensorIndex;
+      w.sourceOffset = source.offset;
+      w.destinationOffset = t.tensorOffset;
+      w.bytes = bytes;
+      w.signalIndex = t.signal;
+      auto [a, b] = serveOrder(requester);
+      Key k = key;
+      std::get<6>(k) = a;
+      std::get<7>(k) = b;
+      writeList.emplace_back(k, w);
+    };
+    // A slot's use (with reads): the edge that stores to it waits until the previous use is over (a credit from each
+    // rank that has read it, and the second done flag if this rank's kernel has used it too), sets its done flag, and
+    // the CPU thread then notifies the ranks that read it
+    auto storeToSlot = [&](Edge& e, const Ring& r, const Use& u, const Key& key, const Vector<Consumer>& consumers) {
+      e.destinations.push_back(scratchNode(u.offset, false));
+      e.doneFlags.push_back(doneFlag(u.flag, u.generation));
+      if (u.generation != 0) {
+        for (size_t j : indices(r.readers)) {
+          e.destinationWaits.push_back(rdmaSignal(u.signal + j, u.generation));
         }
-        const PartialResponse& response = received[partialRank].at(requestIndex);
-        auto r = read(partialRank, response.tensorIndex, response.offset + plan.offset, plan.bytes, response.slot);
-        plan.sources[sourcePosition] = scratchNode(r.outputOffset, true);
-        plan.signals[sourcePosition] = r.signalIndex;
+        if (r.flags2 >= 0) {
+          e.destinationWaits.push_back(doneFlag(u.flag2, u.generation - 1));
+        }
       }
-      auto any = [](const Vector<int32_t>& v) {
-        return std::ranges::any_of(v, [](int32_t x) {
-          return x >= 0;
-        });
-      };
-      Vector<Edge> copies;
-      std::ranges::stable_sort(plan.shares, {}, [&](const Share& s) {
-        return readOrder(s.owner);
-      });
-      for (const Share& s : plan.shares) {
-        size_t offset = s.target.tensorOffset;
-        int32_t signal = s.target.signal;
-        if (!writes) {
-          const PartialResponse& response = receivedResults[s.owner].at(s.requestIndex);
-          auto r = read(s.owner, response.tensorIndex, response.offset, s.bytes, response.slot);
-          offset = r.outputOffset;
-          signal = r.signalIndex;
+      for (const Consumer& c : consumers) {
+        if (c.rank != rank) {
+          addNotification(key, c.rank, u, r.notifyBase.at(readerIndex(r, c.rank)) + u.slot);
         }
+      }
+    };
+    // Items: from the sources (rotated to start at this rank's, see above) to their slot (or region), with its done
+    // flag
+    for (Item& item : items) {
+      Edge p;
+      p.id = ictx.nextEdgeId();
+      p.sources = item.sources;
+      p.bytes = item.bytes;
+      p.cellIndex = item.cellIndex;
+      p.chunkIndex = item.chunkIndex;
+      p.executorRank = rank;
+      p.divisor = item.divisor;
+      if (writes) {
+        p.destinations.push_back(scratchNode(item.use.offset, false));
+        p.doneFlags.push_back(doneFlag(item.use.flag, 0));
+        for (const Consumer& c : item.consumers) {
+          if (c.rank != rank) {
+            addWrite(item.key, c.rank, item.use, item.bytes, incoming[c.rank][c.request].target);
+          }
+        }
+      } else {
+        storeToSlot(p, itemRings[item.ring], item.use, item.key, item.consumers);
+      }
+      keyed.push_back({item.key, -1, std::move(p)});
+    }
+
+    // The plans' edges, the copies of the other shares in two rounds, and the reads: per plan, the inputs, then the
+    // items in read order (from the domain before this rank's first, then the one before that, ..., which is the
+    // order in which the partial ranks compute them: at any time, every partial rank has one reader), then the
+    // shares likewise. With reads, an edge that has used receive or self slots sets their done flags.
+    Vector<Vector<Edge>> planCopies(plans.size());
+    for (size_t pi : indices(plans)) {
+      Plan& plan = plans[pi];
+      Edge e = graph.edges[plan.edgeIndex];
+      Vector<Node> sources;
+      Vector<Graph::Signal> waits;
+      Vector<std::pair<size_t, CustomOpDescriptor::IbRead>> planReads;
+      auto addRead = [&](size_t order, uint32_t source, uint32_t inputIndex, size_t inputOffset, size_t bytes,
+                         const Use& use, const PartialResponse* answer) {
+        CustomOpDescriptor::IbRead r;
+        r.rank = source;
+        r.inputIndex = inputIndex;
+        r.outputIndex = scratchOutputIndex;
+        r.inputOffset = inputOffset;
+        r.outputOffset = use.offset;
+        r.bytes = bytes;
+        r.signalIndex = use.signal;
+        r.signalGeneration = (uint16_t)use.generation;
+        if (use.generation != 0) {
+          r.freeFlag = use.flag;
+          r.freeGeneration = (uint16_t)(use.generation - 1);
+        }
+        if (answer) {
+          r.waitSlot = answer->slot;
+          r.waitGeneration = answer->generation;
+          r.creditSignal = answer->credit;
+          r.creditGeneration = (uint16_t)(answer->generation + 1);
+          if (r.creditSignal >= 0) {
+            maxCreditGeneration = std::max<size_t>(maxCreditGeneration, r.creditGeneration);
+          }
+        }
+        planReads.emplace_back(order, r);
+      };
+      for (const PlanSource& s : plan.sources) {
+        if (s.kind == PlanSource::local) {
+          sources.push_back(s.node);
+          waits.emplace_back();
+        } else if (s.kind == PlanSource::item && s.rank == rank) {
+          const Use& u = selfUses.at(s.request);
+          sources.push_back(scratchNode(u.offset, true));
+          waits.push_back(doneFlag(u.flag, u.generation));
+          if (!u.last) {
+            e.doneFlags.push_back(doneFlag(u.flag2, u.generation));
+          }
+        } else {
+          sources.push_back(scratchNode(s.use.offset, true));
+          waits.push_back(rdmaSignal(s.use.signal, s.use.generation));
+          if (!s.use.last) {
+            e.doneFlags.push_back(doneFlag(s.use.flag, s.use.generation));
+          }
+          if (s.kind == PlanSource::input) {
+            addRead(0, s.rank, s.node.tensorIndex, s.node.offset, plan.bytes, s.use, nullptr);
+          } else if (!writes) {
+            const PartialResponse& answer = answers[s.rank].at(s.request);
+            addRead(1 + readOrder(s.rank), s.rank, answer.tensorIndex, answer.offset, plan.bytes, s.use, &answer);
+          }
+        }
+      }
+      for (const Share& s : plan.shares) {
         Edge copy;
         copy.id = ictx.nextEdgeId();
-        copy.sources.push_back(scratchNode(offset, true));
-        copy.sourceSignals.push_back(signal);
+        copy.sources.push_back(scratchNode(s.use.offset, true));
+        copy.sourceWaits.push_back(rdmaSignal(s.use.signal, s.use.generation));
         copy.destinations = e.destinations;
         for (Node& n : copy.destinations) {
           n.offset += s.offset;
@@ -1749,54 +2208,111 @@ struct CompileOpConstructor {
         copy.cellIndex = e.cellIndex;
         copy.chunkIndex = e.chunkIndex;
         copy.executorRank = rank;
-        copies.push_back(std::move(copy));
+        if (!writes) {
+          if (!s.use.last) {
+            copy.doneFlags.push_back(doneFlag(s.use.flag, s.use.generation));
+            copy.doneWhenLoaded = true;
+          }
+          const PartialResponse& answer = resultAnswers[s.owner].at(s.request);
+          addRead(
+              1 + numDomains + readOrder(s.owner), s.owner, answer.tensorIndex, answer.offset, s.bytes, s.use, &answer);
+        }
+        planCopies[pi].push_back(std::move(copy));
       }
-      e.sources = std::move(plan.sources);
-      if (any(plan.signals)) {
-        e.sourceSignals = std::move(plan.signals);
+      std::ranges::stable_sort(planReads, {}, [](const auto& x) {
+        return x.first;
+      });
+      for (const auto& x : planReads) {
+        const auto& r = x.second;
+        log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d.%u, wait slot %d.%u, free "
+                 "flag %d.%u, credit %d.%u\n",
+            r.rank, r.inputIndex, r.inputOffset, r.outputIndex, r.outputOffset, r.bytes, r.signalIndex,
+            r.signalGeneration, r.waitSlot, r.waitGeneration, r.freeFlag, r.freeGeneration, r.creditSignal,
+            r.creditGeneration);
+        op.ibReads.push_back(r);
       }
-      if (any(plan.doneSignals)) {
-        e.sourceDoneSignals = std::move(plan.doneSignals);
+      e.sources = std::move(sources);
+      if (std::ranges::any_of(waits, [](const Graph::Signal& s) {
+            return s.index >= 0;
+          })) {
+        e.sourceWaits = std::move(waits);
       }
       e.partialSources = plan.partialSources;
       e.divisor = plan.divisor;
-      if (plan.doneSignal >= 0) {
+      // (with reads, the edge's done flags so far only free the receive and self slots that it has used)
+      e.doneWhenLoaded = !writes;
+      if (plan.twoRounds) {
+        // This rank's share: to the destinations of its domain, and for the other owners (with reads, to a slot for
+        // each, once the previous use is over; with writes, to a region, written to each)
         for (Node& n : e.destinations) {
           n.offset += plan.offset;
         }
-        e.destinations.push_back(scratchNode(plan.resultOffset, false));
         e.bytes = plan.bytes;
-        e.doneSignal = plan.doneSignal;
+        if (writes) {
+          const Use& u = shareUse[pi];
+          e.destinations.push_back(scratchNode(u.offset, false));
+          e.doneFlags.push_back(doneFlag(u.flag, 0));
+          for (const Consumer& c : shareConsumers[pi]) {
+            addWrite(plan.key, c.rank, u, plan.bytes, incomingResults[c.rank][c.request].target);
+          }
+        } else if (!shareConsumers[pi].empty()) {
+          e.doneWhenLoaded = false;
+          storeToSlot(e, itemRings[shareRing[pi]], shareUse[pi], plan.key, shareConsumers[pi]);
+        }
       }
-      positions.push_back(plan.edgeIndex);
-      planned.push_back(std::move(e));
-      plannedCopies.push_back(std::move(copies));
+      keyed.push_back({plan.key, (int64_t)pi, std::move(e)});
     }
-    // The planned edges in the places of the plans' edges, in the order of the plans, with the copies of a plan's
-    // other shares after the edge of the next plan: blocks that wait for the shares of a part then wait behind the
-    // share of the next part, which they can compute meanwhile, so that the other owners get it early
-    std::ranges::sort(positions);
+
+    // The kernel's order (see above): the edges of other reductions and the copies first, as they were, then these by
+    // key, with the copies of a plan's other shares after the next plan's edge: blocks that wait for the shares of a
+    // part then wait behind the share of the next part, which they can compute meanwhile, so that the other owners get
+    // it early
+    std::ranges::stable_sort(keyed, {}, [](const Keyed& x) {
+      return std::make_pair(x.key, x.plan);
+    });
+    Vector<uint8_t> planned(graph.edges.size());
+    for (const Plan& p : plans) {
+      planned[p.edgeIndex] = 1;
+    }
     Vector<Edge> ordered;
-    auto appendCopies = [&](size_t p) {
-      for (Edge& x : plannedCopies[p]) {
-        ordered.push_back(std::move(x));
-      }
-    };
-    for (size_t i = 0, next = 0; i != graph.edges.size(); ++i) {
-      if (next != positions.size() && positions[next] == i) {
-        ordered.push_back(std::move(planned[next]));
-        if (next != 0) {
-          appendCopies(next - 1);
-        }
-        if (next + 1 == positions.size()) {
-          appendCopies(next);
-        }
-        ++next;
-      } else {
+    for (size_t i : indices(graph.edges)) {
+      if (!planned[i]) {
         ordered.push_back(std::move(graph.edges[i]));
       }
     }
+    int64_t previousPlan = -1;
+    for (Keyed& x : keyed) {
+      ordered.push_back(std::move(x.edge));
+      if (x.plan >= 0) {
+        if (previousPlan >= 0) {
+          for (Edge& copy : planCopies[previousPlan]) {
+            ordered.push_back(std::move(copy));
+          }
+        }
+        previousPlan = x.plan;
+      }
+    }
+    if (previousPlan >= 0) {
+      for (Edge& copy : planCopies[previousPlan]) {
+        ordered.push_back(std::move(copy));
+      }
+    }
     graph.edges = std::move(ordered);
+    std::ranges::stable_sort(notificationList, {}, [](const auto& x) {
+      return x.first;
+    });
+    for (const auto& x : notificationList) {
+      op.notifications.push_back(x.second);
+    }
+    std::ranges::stable_sort(writeList, {}, [](const auto& x) {
+      return x.first;
+    });
+    for (const auto& x : writeList) {
+      const auto& w = x.second;
+      log.info("  ibWrite: flag %d, output[%u]+%zu -> rank %u tensor %u + %zu, %zu bytes, signal %d\n", w.flag,
+          scratchOutputIndex, w.sourceOffset, w.rank, w.destinationIndex, w.destinationOffset, w.bytes, w.signalIndex);
+      op.ibWrites.push_back(w);
+    }
 
     if (scratchBytes != 0) {
       Graph::TensorDescr t;
@@ -1807,37 +2323,55 @@ struct CompileOpConstructor {
       graph.tensors.push_back(t);
       op.scratchBytes = scratchBytes;
     }
-    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds), %d partial results, "
-              "input copies or shares (for this and other ranks), %d signals, %zu bytes of scratch, %zu writes\n",
-        rank, plans.size(), results.size(), numFlags, nextSignal, scratchBytes, op.ibWrites.size());
+    // The generations of the values that the CPU thread writes: those of the uses of this rank's slots (the signals of
+    // its reads, its notifications), and those of its credits. (A credit's generation is at most the largest of the
+    // other rank's own, which the check below keeps less than maxGenerations - 1 there.)
+    op.numGenerations = std::max(maxGeneration, maxCreditGeneration) + 1;
+    log.debug("compile_op: rank %zu: %zu reductions across NVLink domains (%zu in two rounds), %zu items (partial "
+              "results, input copies and shares, for this and other ranks), %d signals, %d done flags, %zu bytes of "
+              "scratch, %zu reads, %zu writes, up to %zu uses of a slot\n",
+        rank, plans.size(), planOfPart.size(), items.size(), nextSignal, numFlags, scratchBytes, op.ibReads.size(),
+        op.ibWrites.size(), maxGeneration + 1);
 
-    const size_t maxSignals = group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes;
-    const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
+    // (with writes; with reads, layoutRings has made them fit)
     if ((size_t)nextSignal > maxSignals || (size_t)numFlags > maxFlags) {
-      return fmt::sprintf("rank %zu would read %d regions from other NVLink domains and compute %d partial results, "
-                          "input copies or shares, more than its signals allow (%zu and %zu)",
+      return fmt::sprintf("rank %zu would need %d signals and %d done flags for its reductions across NVLink domains, "
+                          "more than it has (%zu and %zu)",
           rank, nextSignal, numFlags, maxSignals, maxFlags);
+    }
+    if (maxGeneration + 2 > maxGenerations) {
+      return fmt::sprintf("rank %zu would use a slot of the rings of its scratch tensor %zu times in one op, more than "
+                          "the %u that it can (MOODIST_COMPILE_OP_SLOTS and MOODIST_COMPILE_OP_SLOT_BYTES set more "
+                          "and larger slots)",
+          rank, maxGeneration + 1, maxGenerations - 1);
     }
     return "";
   }
 
   // Reductions in one NVLink domain in two phases (a graph variant for tuneKernels, see compile): an edge of this
-  // rank's that combines several sources into several destinations (a piece of an all-reduce), and that does not
-  // take part in a reduction across domains, becomes an edge that computes the piece into a region of the scratch
-  // tensor, with a done signal, and an edge that copies it from there (as stored) to the destinations once that is
-  // set (Edge::sourceDoneSignals): the kernel computes all such pieces before it copies any (see generateKernel),
-  // first reading the sources, then writing the destinations, instead of both for every item. The same bits as in
-  // one pass (the copies store the rounded result as it is), and in place too (a piece's sources and destinations
-  // are those of its executor's two edges, the second of which waits for the first). Only pieces of at least minBytes.
-  // Returns whether this rank has such edges.
+  // rank's that combines several sources into several destinations (a piece of an all-reduce), and that does not take
+  // part in a reduction across domains, becomes an edge that computes the piece into a region of the scratch tensor,
+  // with a done flag, and an edge that copies it from there (as stored) to the destinations once that is set
+  // (Edge::sourceWaits): the kernel computes all such pieces before it copies any (the copies go after all other edges,
+  // and the kernel takes them in order, see generateKernel), first reading the sources, then writing the destinations,
+  // instead of both for every item. The same bits as in one pass (the copies store the rounded result as it is), and in
+  // place too (a piece's sources and destinations are those of its executor's two edges, the second of which waits for
+  // the first). Only pieces of at least minBytes. Returns whether this rank has such edges.
   bool twoPhaseReductions(InternalContext& ictx, Graph& graph, DType dtype, size_t minBytes) {
     // The scratch tensor (the last tensor): the one of crossDomainReductions, or a new one
     const size_t numTensors = graph.numInputs + graph.numInputCopies + graph.numOutputs + graph.numOutputCopies;
     CHECK(graph.tensors.size() == numTensors || graph.tensors.size() == numTensors + 1);
     size_t scratchBytes = graph.tensors.size() > numTensors ? graph.tensors.back().bytes : 0;
+    // (after the done flags of crossDomainReductions)
     int32_t numFlags = 0;
     for (const Edge& e : graph.edges) {
-      numFlags = std::max(numFlags, e.doneSignal + 1);
+      for (const auto* l : {&e.sourceWaits, &e.destinationWaits, &e.doneFlags}) {
+        for (const Graph::Signal& s : *l) {
+          if (s.done) {
+            numFlags = std::max(numFlags, s.index + 1);
+          }
+        }
+      }
     }
     const size_t maxFlags = group->cpuInBuffer.itembytes / sizeof(uint32_t) - 16;
     uint32_t nextNodeIndex = 0;
@@ -1854,8 +2388,8 @@ struct CompileOpConstructor {
     };
     Vector<Edge> copies;
     for (Edge& e : graph.edges) {
-      if (e.sources.size() < 2 || e.destinations.size() < 2 || !e.sourceSignals.empty() ||
-          !e.sourceDoneSignals.empty() || e.doneSignal >= 0 || e.bytes < minBytes || (size_t)numFlags >= maxFlags) {
+      if (e.sources.size() < 2 || e.destinations.size() < 2 || e.hasSignals() || e.bytes < minBytes ||
+          (size_t)numFlags >= maxFlags) {
         continue;
       }
       CHECK(e.executorRank == rank);
@@ -1864,7 +2398,7 @@ struct CompileOpConstructor {
       Edge copy;
       copy.id = ictx.nextEdgeId();
       copy.sources.push_back(scratchNode(offset, true));
-      copy.sourceDoneSignals.push_back(numFlags);
+      copy.sourceWaits.push_back({numFlags, 0, true});
       copy.destinations = std::move(e.destinations);
       copy.bytes = e.bytes;
       copy.cellIndex = e.cellIndex;
@@ -1872,7 +2406,7 @@ struct CompileOpConstructor {
       copy.executorRank = rank;
       e.destinations.clear();
       e.destinations.push_back(scratchNode(offset, false));
-      e.doneSignal = numFlags++;
+      e.doneFlags.push_back({numFlags++, 0, true});
       copies.push_back(std::move(copy));
     }
     if (copies.empty()) {
@@ -2316,6 +2850,10 @@ struct CompileOpConstructor {
     // MOODIST_COMPILE_OP_TRANSFER: the data of reductions across NVLink domains goes over RDMA reads by the ranks that
     // need it, or writes by the ranks that compute it (see crossDomainReductions)
     std::string transfer = "read";
+    // With reads, the slots per ring of the scratch tensors (0: as crossDomainReductions picks), and the most that a
+    // slot holds (see reductionPieces); MOODIST_COMPILE_OP_SLOTS and MOODIST_COMPILE_OP_SLOT_BYTES set others (tests)
+    size_t numSlots = 0;
+    size_t slotBytes = 2 << 20;
     if (isReduction(reduce)) {
       rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
       REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
@@ -2326,6 +2864,23 @@ struct CompileOpConstructor {
       transfer = agreedEnv("MOODIST_COMPILE_OP_TRANSFER", "read");
       REQUIRE(transfer == "read" || transfer == "write",
           "compile_op: MOODIST_COMPILE_OP_TRANSFER must be read or write (not '%s')", transfer);
+      auto number = [&](const char* name, size_t defaultValue, size_t min, size_t max, size_t multiple) {
+        std::string value = agreedEnv(name, "");
+        if (value.empty()) {
+          return defaultValue;
+        }
+        const bool digits = value.size() <= 10 && std::ranges::all_of(value, [](char c) {
+          return c >= '0' && c <= '9';
+        });
+        const size_t n = digits ? std::stoull(value) : 0;
+        REQUIRE(n >= min && n <= max && n % multiple == 0,
+            "compile_op: %s must be a multiple of %zu from %zu to %zu (not '%s')", name, multiple, min, max, value);
+        return n;
+      };
+      // (by default as many as fit in about 4 MiB per ring, or in 32 MiB / the rank's number of rings if more, see
+      // crossDomainReductions)
+      numSlots = number("MOODIST_COMPILE_OP_SLOTS", numSlots, 1, 16, 1);
+      slotBytes = number("MOODIST_COMPILE_OP_SLOT_BYTES", slotBytes, 4096, 1ull << 30, 4096);
     }
     if (std::string value = agreedEnv("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", ""); !value.empty()) {
       const bool digits = value.size() <= 10 && std::ranges::all_of(value, [](char c) {
@@ -2625,6 +3180,29 @@ struct CompileOpConstructor {
         }
         // (more parts where they would exceed maxEdgeBytes)
         partBytes = std::min(partBytes, maxEdgeBytes);
+        // With reads, every transfer of a part across domains (the part, or in two rounds a share of it) must fit in a
+        // slot of the rings of the scratch tensors (slotBytes, see crossDomainReductions): more parts where it would
+        // not (a reduce-scatter of 256 MiB per rank: 128 parts of 2 MiB instead of 32 of 8 MiB). (In two rounds, the
+        // last share of a smaller last part can be up to a page larger, with the rest of shareRange: the slots of its
+        // rings are then that much larger.)
+        if (crossDomain && transfer == "read" && bytes % 16 == 0) {
+          auto largestTransfer = [&](size_t partBytes) {
+            if (!twoRounds || partBytes / 16 < destinationDomains) {
+              return partBytes;
+            }
+            size_t largest = 0;
+            for (size_t j : range(destinationDomains)) {
+              largest = std::max(largest, shareRange(partBytes, destinationDomains, j).second);
+            }
+            return largest;
+          };
+          const size_t perPart = twoRounds ? slotBytes * destinationDomains : slotBytes;
+          for (size_t numParts =
+                   std::max((end - begin + partBytes - 1) / partBytes, (end - begin + perPart - 1) / perPart);
+              largestTransfer(partBytes) > slotBytes; ++numParts) {
+            partBytes = ((end - begin + numParts - 1) / numParts + 4095) / 4096 * 4096;
+          }
+        }
         for (size_t offset = begin; offset < end; offset += partBytes) {
           piece.offset = offset;
           piece.bytes = std::min(partBytes, end - offset);
@@ -3311,7 +3889,8 @@ struct CompileOpConstructor {
       GraphBuilder merger(ictx, baseGraph);
       merger.mergeReductions();
       baseGraph.edges = std::move(merger.graph.edges);
-      crossDomainError = crossDomainReductions(ictx, baseGraph, *op, domains, allReducePieces, transfer == "write");
+      crossDomainError =
+          crossDomainReductions(ictx, baseGraph, *op, domains, allReducePieces, transfer == "write", numSlots);
     }
 
     // Proxy transfers from outside the NVLink domain (MOODIST_COMPILE_OP_PROXY=0 disables it), except in reductions
@@ -3422,20 +4001,24 @@ struct CompileOpConstructor {
         it = baseGraph.edges.erase(it);
       }
 
-      // The order of the reads. The CPU thread issues the reads that signal the kernel first (in signal order, see
-      // proxyRemoteEdges), then the others in this order, in small parts (see WorkCustom). Every rank takes the
-      // domains after its own in turn, and in a domain of n ranks, the ranks from its own position mod n on:
-      // (domain i, position p) reads (domain i + 1 + a, position p + b) in step (a, b), so that in each step every
-      // source has one reader (with domains of equal size). In random order, some sources had several readers and
-      // others none (all-to-all of 1 GiB per rank on 32 GB300 over RoCE: 12.2 ms instead of 10.2). A rotation by
-      // rank ((source - rank) mod size) does not work: the ranks of a domain skip its own ranks, so they all start
-      // on the same source. Sources in the rank's own domain (edges the kernel cannot take) come last.
+      // The order of the reads. The CPU thread issues the reads that signal the kernel first, in the order in which
+      // they come (the order of their signals, see proxyRemoteEdges; that of crossDomainReductions), then the others in
+      // this order, in small parts (see WorkCustom). Every rank takes the domains after its own in turn, and in a
+      // domain of n ranks, the ranks from its own position mod n on: (domain i, position p) reads (domain i + 1 + a,
+      // position p + b) in step (a, b), so that in each step every source has one reader (with domains of equal
+      // size). In random order, some sources had several readers and others none (all-to-all of 1 GiB per rank on 32
+      // GB300 over RoCE: 12.2 ms instead of 10.2). A rotation by rank ((source - rank) mod size) does not work: the
+      // ranks of a domain skip its own ranks, so they all start on the same source. Sources in the rank's own domain
+      // (edges the kernel cannot take) come last.
       std::ranges::stable_sort(op->ibReads, {}, [&](const CustomOpDescriptor::IbRead& read) {
+        if (read.signalIndex >= 0) {
+          return std::make_tuple(0, (size_t)0, (size_t)0);
+        }
         size_t j = domains.index[read.rank];
         size_t n = domains.sizes[j];
         size_t a = (j + domains.count - 1 - domains.index[rank]) % domains.count;
         size_t b = (domains.position[read.rank] + n - domains.position[rank] % n) % n;
-        return std::make_pair(a, b);
+        return std::make_tuple(1, a, b);
       });
 
       // How many sources a rank reads from at a time (readSources). In the order above, every source has one reader

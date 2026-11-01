@@ -36,7 +36,29 @@ namespace compile_op {
 // Use the ReduceOp enum from the API
 using ReduceOp = api::ReduceOp;
 
+// The generations of the values of an op (see Graph::Signal) are less than this. Step values advance by 0x1000 per op
+// (getNextStepValue in processgroup.cc; after a reset the next op gets 1, the one after it 0x1000), so the values of
+// an op stay below those of the next op on its concurrency slot.
+static constexpr uint32_t maxGenerations = 0xf00;
+
 struct Graph {
+
+  // A word that the kernel waits for, or writes, in reductions across NVLink domains or in two phases: an RDMA signal
+  // (Group::rdmaSignalBuffer, which the CPU threads set, see writeRdmaSignal in cputhread.cc) or a done flag
+  // (cpuInBuffer slot 16 + index, which the kernel sets once an edge is done), and its generation: the word is set to
+  // the op's step value + generation, and a wait waits until it is at least that. A slot of a ring of scratch regions
+  // is filled and freed once per use, with the use's generation (see crossDomainReductions in compile_op.cc); other
+  // words have generation 0.
+  struct Signal {
+    int32_t index = -1; // < 0: none
+    uint16_t generation = 0;
+    bool done = false; // a done flag, else an RDMA signal
+
+    template<typename X>
+    void serialize(X& x) {
+      x(index, generation, done);
+    }
+  };
 
   struct Node {
     uint64_t id;
@@ -67,29 +89,39 @@ struct Graph {
     // transfer, part * 32 + chunk (proxyRemoteEdges)
     uint32_t chunkIndex = 0;
 
-    // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc):
-    // per source, the signal index of the RDMA transfer that fills it (the kernel waits for the signal in
-    // rdmaSignalBuffer before it loads the source), or -1; empty if no source waits for a transfer
-    Vector<int32_t> sourceSignals;
-    // per source, the doneSignal of the edge of this rank's that computes it (in an all-reduce across domains, the
-    // partial result of the executor's own domain, and in two phases, the piece that the edge copies; the kernel waits
-    // for cpuInBuffer slot 16 + doneSignal), or -1; empty if none
-    Vector<int32_t> sourceDoneSignals;
+    // Reductions across NVLink domains (see crossDomainReductions in compile_op.cc) or in two phases (see
+    // twoPhaseReductions):
+    // per source, what the kernel waits for before it loads the source (none: index -1): the RDMA signal of the
+    // transfer that fills it, or the done flag of the edge of this rank's that computes it (in an all-reduce across
+    // domains, the partial result of the executor's own domain, and in two phases, the piece that the edge copies);
+    // empty if no source waits
+    Vector<Signal> sourceWaits;
+    // What the kernel waits for before the edge stores to its destinations: that the regions of rings of the scratch
+    // tensor that it stores to are free again (another rank has read their previous contents, or an edge of this
+    // rank's has used them)
+    Vector<Signal> destinationWaits;
+    // The done flags that the kernel sets once all of the edge has been stored: for its CPU thread (a partial result
+    // that ranks in other domains read over RDMA, the regions of a ring that the edge has used), or for the edges of
+    // its own that wait for it (sourceWaits, destinationWaits)
+    Vector<Signal> doneFlags;
+    // The done flags only say that the edge has loaded its sources (it has used regions of rings, which are then free
+    // again): the kernel sets them once all of the edge has been loaded, without waiting for its stores to complete
+    bool doneWhenLoaded = false;
     // The number of sources, at the end, that are partial results of NVLink domains: an average has divided those
     // by the divisor already, the others it divides after combining them
     uint32_t partialSources = 0;
     // Avg: the number of inputs the result is the average of (0: the number of sources)
     uint32_t divisor = 0;
-    // >= 0: a partial result that ranks in other domains read over RDMA (or that the executor combines itself), or a
-    // piece computed in two phases (see twoPhaseReductions in compile_op.cc). Once all of the edge has been stored,
-    // the kernel writes the step value into cpuInBuffer slot 16 + doneSignal, for its CPU thread or for the edges of
-    // its own that wait for it (sourceDoneSignals).
-    int32_t doneSignal = -1;
+
+    // Whether the edge waits for anything (a signal of the CPU thread, or another edge) or sets done flags
+    bool hasSignals() const {
+      return !sourceWaits.empty() || !destinationWaits.empty() || !doneFlags.empty();
+    }
 
     template<typename X>
     void serialize(X& x) {
-      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex, sourceSignals,
-          sourceDoneSignals, partialSources, divisor, doneSignal);
+      x(id, sources, destinations, bytes, cellIndex, executorRank, rdmaSignal, chunkIndex, sourceWaits,
+          destinationWaits, doneFlags, doneWhenLoaded, partialSources, divisor);
     }
   };
 

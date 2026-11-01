@@ -210,8 +210,8 @@ def test_reduce_scatter_large(ctx: TestContext):
 
 @test
 def test_reduce_scatter_tensor_ids(ctx: TestContext):
-    """Reduce-scatter of 40 tensors in one op (across NVLink domains, more partial results per pair of ranks than they
-    have notification slots, with small domains)."""
+    """Reduce-scatter of 40 tensors in one op (across NVLink domains, more partial results per pair of ranks than their
+    rings have slots, with small domains)."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     spec = {}
@@ -320,8 +320,9 @@ def test_all_reduce_two_rounds(ctx: TestContext):
 @test
 def test_all_reduce_rounds_same_bits(ctx: TestContext):
     """Random floats: an all-reduce gives the same bits in one round and in two (MOODIST_COMPILE_OP_ROUNDS), in one
-    pass and in two phases (MOODIST_COMPILE_OP_PHASES), and with reads and with writes (MOODIST_COMPILE_OP_TRANSFER),
-    on every rank: the executors combine the same values in the same order either way."""
+    pass and in two phases (MOODIST_COMPILE_OP_PHASES), with reads and with writes (MOODIST_COMPILE_OP_TRANSFER), and
+    with other slots for the rings of the scratch tensors (MOODIST_COMPILE_OP_SLOTS, MOODIST_COMPILE_OP_SLOT_BYTES: other
+    parts), on every rank: the executors combine the same values in the same order either way."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     variants = [
@@ -331,6 +332,8 @@ def test_all_reduce_rounds_same_bits(ctx: TestContext):
         ("MOODIST_COMPILE_OP_PHASES", "2"),
         ("MOODIST_COMPILE_OP_TRANSFER", "read"),
         ("MOODIST_COMPILE_OP_TRANSFER", "write"),
+        ("MOODIST_COMPILE_OP_SLOTS", "1"),
+        ("MOODIST_COMPILE_OP_SLOT_BYTES", "4096"),
     ]
     for dtype, op_name, numel in [(torch.bfloat16, "sum", 1 << 20), (torch.float32, "avg", 3 << 20)]:
         gen = torch.Generator(device="cuda")
@@ -397,6 +400,78 @@ def test_reduce_writes(ctx: TestContext):
             whole = [((0,), (numel,))]
             spec = {"0": ([numel], [whole if r in (0, n - 1) else [] for r in range(n)], [whole] * n)}
             run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=3)
+
+
+@test
+def test_reduce_rings(ctx: TestContext):
+    """Reductions across NVLink domains with one slot per ring of the scratch tensors, of 4 KiB
+    (MOODIST_COMPILE_OP_SLOTS=1, MOODIST_COMPILE_OP_SLOT_BYTES=4096; by default slots of up to 2 MiB, about 4 MiB per
+    ring): parts of 4 KiB (in two rounds, shares), and every partial result, input, copy and share that crosses domains
+    takes its slot only once the one before it there has been used, many times per op. Reduce-scatter (up to 128
+    parts), reduce to one, all-reduce in one round and in two (in place, inputs on two ranks: copies, outputs on 8
+    ranks), many tensors, an all-reduce and a reduce-scatter in one op; then 2 slots of 8 KiB."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+
+    def whole(numel):
+        return [((0,), (numel,))]
+
+    with environment("MOODIST_COMPILE_OP_SLOTS", "1"), environment("MOODIST_COMPILE_OP_SLOT_BYTES", "4096"):
+        for numel in [64, 20000, 1 << 17]:
+            spec = {"0": ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])}
+            run_reduce(ctx, pg, "sum", torch.float32, spec, salt=numel)
+        numel = 100000
+        outs = [[] for _ in range(n)]
+        outs[n - 1] = whole(numel)
+        run_reduce(ctx, pg, "avg", torch.bfloat16, {"0": ([numel], [whole(numel)] * n, outs)})
+        for rounds in ["1", "2"]:
+            with environment("MOODIST_COMPILE_OP_ROUNDS", rounds):
+                spec = {"0": ([numel], [whole(numel)] * n, [whole(numel)] * n)}
+                run_reduce(ctx, pg, "avg", torch.bfloat16, spec)
+                run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=2)
+                first_last = [whole(numel) if r in (0, n - 1) else [] for r in range(n)]
+                spec = {"0": ([numel], first_last, [whole(numel)] * n)}
+                run_reduce(ctx, pg, "sum", torch.float32, spec, in_place=True, repeat=2)
+                first_eight = [whole(numel) if r < 8 else [] for r in range(n)]
+                run_reduce(ctx, pg, "max", torch.int32, {"0": ([numel], [whole(numel)] * n, first_eight)})
+        spec = {}
+        for t in range(40):
+            numel = 64 * (t % 3 + 1)
+            spec[f"t{t}"] = ([n * numel], [[((0,), (n * numel,))]] * n, [[((r * numel,), (numel,))] for r in range(n)])
+        run_reduce(ctx, pg, "avg", torch.float32, spec)
+        w = ([8, 4096], [[((0, 0), (8, 4096))]] * n, [[((0, 0), (8, 4096))]] * n)
+        b = ([n * 4096], [[((0,), (n * 4096,))]] * n, [[((r * 4096,), (4096,))] for r in range(n)])
+        run_reduce(ctx, pg, "sum", torch.float32, {"w": w, "b": b}, repeat=2)
+    with environment("MOODIST_COMPILE_OP_SLOTS", "2"), environment("MOODIST_COMPILE_OP_SLOT_BYTES", "8192"):
+        numel = 1 << 18
+        run_reduce(ctx, pg, "sum", torch.float32, {"0": ([numel], [whole(numel)] * n, [whole(numel)] * n)})
+        spec = {"0": ([n * 50000], [[((0,), (n * 50000,))]] * n, [[((r * 50000,), (50000,))] for r in range(n)])}
+        run_reduce(ctx, pg, "avg", torch.bfloat16, spec)
+
+
+@test
+def test_reduce_uneven_rings(ctx: TestContext):
+    """Reductions across NVLink domains whose ranks lay out their rings differently (by default, a rank with more rings
+    gives each fewer slots): a rank sets the credits of the slots that it reads to generations of the rank that
+    computes them, whose ring can go through more generations than the rings of the reading rank. An all-reduce of
+    64 KiB and a reduce of 128 MiB to rank 0 in one op (the ranks that compute the partial results of the other domains
+    for rank 0 have more rings than rank 0), and an all-reduce of 128 MiB with outputs on all ranks but the last two
+    (the executors of their domain, fewer than in the others, have more rings), in one round and in two."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+
+    def whole(numel):
+        return [((0,), (numel,))]
+
+    small = 16384
+    numel = 32 << 20
+    to_first = [whole(numel)] + [[] for _ in range(n - 1)]
+    spec = {"w": ([small], [whole(small)] * n, [whole(small)] * n), "b": ([numel], [whole(numel)] * n, to_first)}
+    run_reduce(ctx, pg, "sum", torch.float32, spec)
+    most = [whole(numel) if r < n - 2 else [] for r in range(n)]
+    for rounds in ["1", "2"]:
+        with environment("MOODIST_COMPILE_OP_ROUNDS", rounds):
+            run_reduce(ctx, pg, "sum", torch.float32, {"0": ([numel], [whole(numel)] * n, most)})
 
 
 @test

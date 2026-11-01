@@ -331,6 +331,9 @@ struct CustomOpDescriptor {
     Vector<int64_t> shape;
   };
 
+  // The values that the CPU thread writes and waits for in reductions across NVLink domains are the op's step value
+  // + a generation (see compile_op::Graph::Signal): the generations of the uses of a slot of a ring of scratch regions,
+  // 0 elsewhere
   struct IbRead {
     uint32_t rank;
     uint32_t inputIndex;
@@ -338,25 +341,40 @@ struct CustomOpDescriptor {
     size_t inputOffset;
     size_t outputOffset;
     size_t bytes;
-    // >= 0: once the read has completed, set signal signalIndex (see writeRdmaSignal in cputhread.cc), which the
-    // kernel waits for (the proxy read of a mixed NVLink + RDMA op, a source of a reduction across NVLink domains)
+    // >= 0: once the read has completed, set signal signalIndex to the step value + signalGeneration (see
+    // writeRdmaSignal in cputhread.cc), which the kernel waits for (the proxy read of a mixed NVLink + RDMA op, a
+    // source of a reduction across NVLink domains)
     int32_t signalIndex = -1;
+    uint16_t signalGeneration = 0;
     // >= 0: read only once the source rank has notified this rank that its kernel has written the data (a partial
-    // result of a reduction, see Notification), in notification slot waitSlot
+    // result of a reduction, see Notification): notification slot waitSlot is at least the step value + waitGeneration
     int32_t waitSlot = -1;
+    uint16_t waitGeneration = 0;
+    // >= 0: read only once this rank's kernel has set done flag freeFlag (cpuInBuffer slot 16 + freeFlag) to the step
+    // value + freeGeneration: the destination, a slot of a ring of the scratch tensor, is free (the kernel has used
+    // its previous contents)
+    int32_t freeFlag = -1;
+    uint16_t freeGeneration = 0;
+    // >= 0: once the read has completed, set signal creditSignal of the source rank to the step value +
+    // creditGeneration: the source, a slot of a ring of that rank's scratch tensor, is free (that rank's kernel waits
+    // for this before it stores there again; the generation of the slot's next use, that rank's)
+    int32_t creditSignal = -1;
+    uint16_t creditGeneration = 0;
 
     template<typename X>
     void serialize(X& x) {
-      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes, signalIndex, waitSlot);
+      x(rank, inputIndex, outputIndex, inputOffset, outputOffset, bytes, signalIndex, signalGeneration, waitSlot,
+          waitGeneration, freeFlag, freeGeneration, creditSignal, creditGeneration);
     }
   };
 
-  // A partial result of a reduction that this rank's kernel computes for a rank in another NVLink domain (see
-  // crossDomainReductions in compile_op.cc): once the kernel has written the step value into cpuInBuffer slot
-  // 16 + flag, and into those of all other notifications for the same rank and slot, the CPU thread notifies that
-  // rank (slot `slot` of its notifications from this rank), which then reads the data
+  // A partial result of a reduction (or a share of a result) that this rank's kernel computes into a slot of a ring of
+  // its scratch tensor for a rank in another NVLink domain (see crossDomainReductions in compile_op.cc): once the
+  // kernel has set done flag `flag` (cpuInBuffer slot 16 + flag) to the step value + generation, the CPU thread writes
+  // that value into notification slot `slot` of this rank's in the memory of `rank`, which then reads the data
   struct Notification {
     uint32_t flag;
+    uint16_t generation;
     uint32_t rank;
     uint32_t slot;
   };
@@ -386,6 +404,7 @@ struct CustomOpDescriptor {
   // Vector<size_t> inputs;
   // Vector<size_t> outputs;
 
+  // The reads, those with a signal index first, in the order in which the CPU thread issues them (see WorkCustom)
   Vector<IbRead> ibReads;
   // How many of its reads without a signal index a rank reads at a time (WorkCustom): 1 if every rank reads the
   // same amount from every rank outside its NVLink domain (each source then has one reader at a time), 8 otherwise
@@ -402,11 +421,15 @@ struct CustomOpDescriptor {
   Vector<uint8_t> isPeer;
   bool dynSelf = false;
   // Reductions across NVLink domains or in two phases: the bytes of the scratch tensor (a CUDA tensor of the op's
-  // dtype that customOp allocates per launch, after the output copies: the last tensor), which holds the partial
-  // results that this rank computes (for other domains, and in an all-reduce for itself) and the ones that it reads
-  // from them (or that they write into it), and the pieces that it computes in two phases before it copies them to
-  // their destinations (see twoPhaseReductions in compile_op.cc); 0 if none
+  // dtype that customOp allocates per launch, after the output copies: the last tensor), which holds the rings of
+  // regions for the partial results that this rank computes (for other domains, and in an all-reduce for itself) and
+  // the ones that it reads from them (with writes, a region for each of those), and the pieces that it computes in two
+  // phases before it copies them to their destinations (see twoPhaseReductions in compile_op.cc); 0 if none
   size_t scratchBytes = 0;
+  // The generations of the values that the CPU thread writes are less than this (see IbRead; at least 1): those of
+  // this rank's own rings, and those of the credits, which are the source ranks' (whose rings can go through more
+  // generations than this rank's)
+  uint32_t numGenerations = 1;
 
   Vector<compile_op::Graph::TensorDescr> inputs;
   Vector<compile_op::Graph::TensorDescr> outputs;

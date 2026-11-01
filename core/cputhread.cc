@@ -336,6 +336,16 @@ struct CpuThreadImpl {
       regMr((uintptr_t)outStepValuesStorage.buffer.cpuPointer, outStepValuesStorage.buffer.bytes);
   uint32_t* outStepValues = (uint32_t*)outStepValuesStorage.buffer.cpuPointer;
 
+  // The values that compile_op's CPU thread work writes into the memory of other ranks and of its own GPU: per
+  // concurrency slot, the op's step value + generation for every generation (see compile_op::Graph::Signal), in
+  // maxDevices copies (a signal is a word per NIC, see writeRdmaSignal); WorkCustom sets those of its op's
+  // generations. The writes from them are control transfers: the slot's next work changes them only once those have
+  // completed (see WAIT_CONTROL).
+  AllocatedArray generationValuesStorage =
+      group->allocateArrayHost(sizeof(uint32_t) * maxDevices * compile_op::maxGenerations, Group::maxConcurrency);
+  MemoryRegistration* generationValuesMr =
+      regMr((uintptr_t)generationValuesStorage.buffer.cpuPointer, generationValuesStorage.buffer.bytes);
+
   SimpleVector<size_t> concurrencyLiveControlTransfers = SimpleVector<size_t>(Group::maxConcurrency);
 
   AllocatedArray outDynsBuffer = group->allocateArrayHost(sizeof(DynamicAddresses) * size, Group::maxConcurrency);
@@ -415,6 +425,12 @@ struct CpuThreadImpl {
   uint32_t& outStepValue(size_t concurrencyIndex, size_t index) {
     CHECK(index < 32);
     return outStepValues[32u * concurrencyIndex + index];
+  }
+  // Copy `word` of the value of generation `generation` (see generationValuesStorage)
+  uint32_t& generationValue(size_t concurrencyIndex, size_t generation, size_t word) {
+    CHECK(generation < compile_op::maxGenerations && word < maxDevices);
+    return ((uint32_t*)generationValuesStorage.buffer
+            .cpuPointer)[maxDevices * (compile_op::maxGenerations * concurrencyIndex + generation) + word];
   }
   uint32_t& inStepValue(size_t concurrencyIndex, size_t index) {
     CHECK(index < size);
@@ -1339,8 +1355,7 @@ struct CpuThreadImpl {
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inArrivalValue(concurrencyIndex, rank));
     static_assert(sizeof(ArrivalValue) == 2 * sizeof(uint32_t) && arrivalWords % 2 == 0);
-    // (after the signals' outStepValue slots, within the 32 of a concurrency slot)
-    static_assert(signalStepValues + maxDevices <= arrivalWords && arrivalWords + 2 <= 32);
+    static_assert(arrivalWords + 2 <= 32);
     writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, arrivalWords),
         outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(ArrivalValue));
@@ -1348,14 +1363,14 @@ struct CpuThreadImpl {
   // (outStepValue slots arrivalWords and arrivalWords + 1 hold the step value and the op id, see WorkCustom)
   static constexpr size_t arrivalWords = 8;
 
-  // Writes the op's step value (outStepValue slot 0) into notification slot `slot` of this rank's in the memory of
-  // rank i (see Group::customNotifications and WorkCustom)
-  void writeNotification(size_t concurrencyIndex, size_t i, size_t slot) {
+  // Writes the op's step value + generation into notification slot `slot` of this rank's in the memory of rank i (see
+  // Group::customNotifications and WorkCustom)
+  void writeNotification(size_t concurrencyIndex, size_t i, size_t slot, size_t generation) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
     auto offset = group->getSharedOffset(&inNotification(concurrencyIndex, rank, slot));
-    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, 0),
-        outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
+    writeControl(concurrencyIndex, dev, i, (void*)&generationValue(concurrencyIndex, generation, 0),
+        generationValuesMr->mrs[di]->lkey, (void*)(remoteComms[i].address + offset), remoteComms[i].keys[di],
         sizeof(uint32_t));
   }
 
@@ -1403,24 +1418,22 @@ struct CpuThreadImpl {
   // order. So a signal is a write through each NIC that carried some of the data, after that NIC has placed it (the
   // completion of this rank's reads, or of its writes into the other rank), into a registration without relaxed
   // ordering (rdmaSignalMr) on the same path as the data's (both registered through Data Direct or both not): a word
-  // per NIC, and the kernel waits until all words of the signal have the step value (see signalWords). Elsewhere (or
-  // with MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
+  // per NIC, and the kernel waits until all words of the signal have the value (see signalWords). Elsewhere (or with
+  // MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
   // writeRdmaSignal writes words [first, end) of signal `signal` of rank i (of this rank: a loopback write), through
-  // dev.
-  void writeRdmaSignal(size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end) {
+  // dev: the step value + generation (see compile_op::Graph::Signal). Signals without data to follow (credits, see
+  // CustomOpDescriptor::IbRead) take any path.
+  void writeRdmaSignal(
+      size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end, size_t generation) {
     CHECK(i < size && first < end && end <= maxDevices);
     CHECK(signal < group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes);
     size_t di = &dev - devices.data();
     auto offset = group->rdmaSignalBuffer.itembytes * concurrencyIndex + Group::rdmaSignalBytes * signal +
                   sizeof(uint32_t) * first;
-    // (from 4 copies of the step value, which the slot's next work changes only once this write has completed, see
-    // WAIT_CONTROL)
-    writeControl(concurrencyIndex, dev, i, (void*)&outStepValue(concurrencyIndex, signalStepValues + first),
-        outStepValuesStorageMr->mrs[di]->lkey, (void*)(remoteRdmaSignals[i].address + offset),
+    writeControl(concurrencyIndex, dev, i, (void*)&generationValue(concurrencyIndex, generation, first),
+        generationValuesMr->mrs[di]->lkey, (void*)(remoteRdmaSignals[i].address + offset),
         remoteRdmaSignals[i].keys[di], sizeof(uint32_t) * (end - first));
   }
-  // (outStepValue slots [signalStepValues, signalStepValues + maxDevices) hold the step value, see WorkCustom)
-  static constexpr size_t signalStepValues = 4;
 
   // The words of a signal that NIC di writes when the NICs in `used` (a bit each) carried its data: from the one after
   // the previous used NIC's up to its own, the last used NIC's up to the last word, so that every word is written
@@ -5853,7 +5866,6 @@ struct CpuThreadImpl {
     QueueEntryCustom& params;
     size_t i;
     size_t o;
-    size_t readIndex;
 
     CustomOpDescriptor* op = &*params.op;
     TemporaryBufferHandle listBuffer;
@@ -5894,14 +5906,37 @@ struct CpuThreadImpl {
     // Per rank: its Header::flags
     Vector<uint32_t> remoteFlags;
 
-    Vector<CustomOpDescriptor::IbRead> reads;
-    // Per signal index: parts of the read that are not done yet
-    Vector<size_t> signalPartsLeft;
+    // The op's reads (op->ibReads), those with a signal index first. Those go in order, a part at a time, a read that
+    // cannot be issued yet letting the ones after it go first (see tryRead): the reads with parts not issued yet form
+    // a list in that order (firstPending, nextPending), and readIssued has the bytes of each read issued so far. The
+    // others go as the parts that prepareReads orders (unsignaledParts: the read, and the part's offset in it and
+    // size).
+    static constexpr uint32_t noRead = ~(uint32_t)0;
+    uint32_t firstPending = noRead;
+    Vector<uint32_t> nextPending;
+    Vector<size_t> readIssued;
+    struct ReadPart {
+      uint32_t read;
+      size_t offset;
+      size_t bytes;
+    };
+    Vector<ReadPart> unsignaledParts;
+    size_t unsignaledIndex = 0;
+    // Per read: the size of its parts (the last may be smaller), and its parts not completed yet
+    Vector<size_t> readPartBytes;
+    Vector<uint32_t> readPartsLeft;
+    // The most waiting entries (reads, notifications) that a pass looks past for one that is ready: with rings (see
+    // crossDomainReductions in compile_op.cc), most reads and notifications of an op wait for most of the op (for the
+    // slots of the parts before them), and passes over all of them took longer than the transfers (reduce-scatter of
+    // 256 MiB across 16 domains of 4 GPUs: 1920 reads and as many notifications per rank, 67 ms instead of 60). They
+    // wait only for entries before them (and for other ranks), so the ones further on can wait.
+    static constexpr size_t scanWindow = 64;
+    bool readsPending() const {
+      return firstPending != noRead || unsignaledIndex != unsignaledParts.size();
+    }
 
-    // Notifications (see CustomOpDescriptor::Notification): whether the kernel has written each one's flag, and per
-    // rank and slot, the flags not written yet
+    // Notifications (see CustomOpDescriptor::Notification): whether the kernel has set each one's flag
     Vector<uint8_t> flagSeen;
-    HashMap<uint32_t, uint32_t> slotFlagsLeft;
     size_t notificationsLeft = 0;
     size_t firstUnseen = 0;
 
@@ -5916,14 +5951,13 @@ struct CpuThreadImpl {
     static constexpr size_t minPartBytes = 64 << 10;
     const size_t numDevices = self.devices.size();
 
-    // The signals of reads into CUDA tensors (see writeRdmaSignal): per signal index, the NICs that carried parts of
-    // its read (a bit each) and a destination of the read (address and output index). The paths that carried parts of
-    // reads without a signal index into CUDA tensors, and a destination of such a read for each, flushed at the end
-    // (see flushRead): a bit per NIC and kind of registration of the destination on it (index 2 * NIC + Data Direct),
-    // since a flush read only orders the writes that took its own path (a NIC that failed to register memory through
-    // Data Direct registers the later tensors without it, see RdmaMr::dataDirect).
-    Vector<uint8_t> signalDevices;
-    Vector<std::pair<uintptr_t, uint32_t>> signalDestination;
+    // The signals of reads into CUDA tensors (see writeRdmaSignal): per read with a signal index, the NICs that
+    // carried parts of it (a bit each). The paths that carried parts of reads without a signal index into CUDA
+    // tensors, and a destination of such a read for each, flushed at the end (see flushRead): a bit per NIC and kind
+    // of registration of the destination on it (index 2 * NIC + Data Direct), since a flush read only orders the
+    // writes that took its own path (a NIC that failed to register memory through Data Direct registers the later
+    // tensors without it, see RdmaMr::dataDirect).
+    Vector<uint8_t> readDevices;
     uint8_t unsignaledPaths = 0;
     std::array<std::pair<uintptr_t, uint32_t>, 2 * maxDevices> unsignaledDestination{};
     static_assert(2 * maxDevices <= 8);
@@ -5962,100 +5996,108 @@ struct CpuThreadImpl {
 
     WorkCustom(CpuThreadImpl& self, QueueEntryCustom& params) : Work(self, params), params(params) {}
 
-    // Whether a read can be issued: its source's input list has arrived, and the source has notified that the data
-    // is there, if the read waits for that
+    // Whether a read can be issued: its source's input list has arrived, the source has notified that the data is
+    // there (if the read waits for that), and the destination is free (if it is a slot of a ring of the scratch
+    // tensor that the kernel has used before: the kernel has set the done flag of that use)
     bool readReady(const CustomOpDescriptor::IbRead& read) {
       if (!remoteInputListReady[read.rank]) {
         return false;
       }
-      return read.waitSlot < 0 || self.inNotification(concurrencyIndex, read.rank, read.waitSlot) >= stepValue;
+      if (read.waitSlot >= 0 &&
+          self.inNotification(concurrencyIndex, read.rank, read.waitSlot) < stepValue + read.waitGeneration) {
+        return false;
+      }
+      return read.freeFlag < 0 || cpuIn[16 + read.freeFlag] >= stepValue + read.freeGeneration;
     }
 
-    // Write the notifications whose flags the kernel has written (all flags of their rank and slot)
+    // Write the notifications whose flags the kernel has set (they are in the order in which the kernel computes
+    // their items; looking past at most scanWindow whose flags are not set)
     void forwardNotifications() {
       const auto& notifications = op->notifications;
-      for (size_t i = firstUnseen; i != notifications.size(); ++i) {
-        if (flagSeen[i] || cpuIn[16 + notifications[i].flag] < stepValue) {
+      size_t waiting = 0;
+      for (size_t i = firstUnseen; i != notifications.size() && waiting != scanWindow; ++i) {
+        const auto& n = notifications[i];
+        if (flagSeen[i]) {
+          continue;
+        }
+        if (cpuIn[16 + n.flag] < stepValue + n.generation) {
+          ++waiting;
           continue;
         }
         flagSeen[i] = 1;
         --notificationsLeft;
-        const auto& n = notifications[i];
-        if (--slotFlagsLeft[n.rank * CustomOpDescriptor::numNotificationSlots + n.slot] == 0) {
-          self.trace(concurrencyIndex, 0, "%#x notify %d", stepValue, n.rank);
-          self.writeNotification(concurrencyIndex, n.rank, n.slot);
-        }
+        self.trace(concurrencyIndex, 0, "%#x notify %d", stepValue, n.rank);
+        self.writeNotification(concurrencyIndex, n.rank, n.slot, n.generation);
       }
       while (firstUnseen != notifications.size() && flagSeen[firstUnseen]) {
         ++firstUnseen;
       }
     }
 
+    // Issues the next part of a read that is ready, on NIC di. Of the reads with a signal index, the first one that
+    // is ready: a read that waits for a notification or for its destination to be free lets the reads after it go
+    // first, until it can be issued, which keeps the order (moving all parts of the ready read ahead instead made
+    // all-reduce of 16 MiB across 16 domains 10% slower: the order of the reads is what keeps one reader on each
+    // partial rank at a time), looking past at most scanWindow reads that wait. Else the next part of the others, if
+    // it is ready.
     void tryRead(size_t di) {
-      CHECK(readIndex < reads.size());
-
-      // A read that waits for a notification may let reads after it go first, until it can be issued: the first part
-      // that is ready goes next, so that a read before it goes on as soon as it is ready (moving all parts of the
-      // ready read ahead instead made all-reduce of 16 MiB across 16 domains 10% slower: the order of the reads is
-      // what keeps one reader on each partial rank at a time). Whether a read is ready depends only on its rank and
-      // wait slot, which the parts of a read share, and they are consecutive (see prepareReads): the scan checks a
-      // run of such parts once (a reduce-scatter of 256 MiB across 16 domains has about 30000 parts of reads that
-      // wait for notifications).
-      if (!readReady(reads[readIndex])) {
-        if (reads[readIndex].waitSlot < 0) {
-          return;
-        }
-        auto runEnd = [&](size_t first) {
-          size_t end = first + 1;
-          while (end != reads.size() && reads[end].rank == reads[first].rank &&
-                 reads[end].waitSlot == reads[first].waitSlot) {
-            ++end;
+      const auto& ibReads = op->ibReads;
+      size_t waiting = 0;
+      for (uint32_t r = firstPending, previous = noRead; r != noRead && waiting != scanWindow;
+          previous = r, r = nextPending[r]) {
+        const auto& read = ibReads[r];
+        if (!readReady(read)) {
+          // (a read that waits only for its source's tensor list holds the ones after it: those of a proxied transfer
+          // go in signal order)
+          if (read.waitSlot < 0 && read.freeFlag < 0) {
+            return;
           }
-          return end;
-        };
-        size_t j = runEnd(readIndex);
-        while (j != reads.size() && !readReady(reads[j])) {
-          j = runEnd(j);
+          ++waiting;
+          continue;
         }
-        if (j == reads.size()) {
-          return;
+        const size_t offset = readIssued[r];
+        const size_t bytes = std::min(readPartBytes[r], read.bytes - offset);
+        readIssued[r] += bytes;
+        if (readIssued[r] == read.bytes) {
+          (previous == noRead ? firstPending : nextPending[previous]) = nextPending[r];
         }
-        std::rotate(reads.begin() + readIndex, reads.begin() + j, reads.begin() + j + 1);
+        issueRead(di, r, offset, bytes);
+        return;
       }
+      if (unsignaledIndex != unsignaledParts.size() && readReady(ibReads[unsignaledParts[unsignaledIndex].read])) {
+        const ReadPart part = unsignaledParts[unsignaledIndex++];
+        issueRead(di, part.read, part.offset, part.bytes);
+      }
+    }
 
-      auto& read = reads[readIndex];
+    // Issues the part of read r at `offset`, of `bytes` bytes, on NIC di
+    void issueRead(size_t di, uint32_t r, size_t offset, size_t bytes) {
+      const auto& read = op->ibReads[r];
       uint32_t source = read.rank;
-      ++readIndex;
-
-      // log.info(
-      //     "read from rank %d, input %d, offset %d, bytes %d, output %d, offset %d\n", source, read.inputIndex,
-      //     read.inputOffset, read.bytes, read.outputIndex, read.outputOffset);
 
       CHECK(source < size);
       InputTensor* arr = (InputTensor*)remoteInputList[source]->cpuPointer;
       CHECK(arr != nullptr);
       CHECK(remoteInputList[source]->bytes >= sizeof(InputTensor) * (read.inputIndex + 1));
       auto& it = arr[read.inputIndex];
-      uintptr_t sourceAddress = it.address + read.inputOffset;
       CHECK(read.inputOffset + read.bytes <= it.bytes);
+      uintptr_t sourceAddress = it.address + read.inputOffset + offset;
 
       CHECK(params.outputs.size() > read.outputIndex);
       auto& ot = params.outputs[read.outputIndex];
       CHECK(ot->bytes() >= read.outputOffset + read.bytes);
 
-      uintptr_t localAddress = ot->data() + read.outputOffset;
+      uintptr_t localAddress = ot->data() + read.outputOffset + offset;
 
-      int32_t signal = read.signalIndex;
-      if (read.bytes == 0) {
-        partDone(signal);
+      if (bytes == 0) {
+        partDone(r);
         return;
       }
 
       // (data in CPU tensors needs no flush: the completion, written to host memory too, does not pass it)
       if (ot->isCuda) {
-        if (signal >= 0) {
-          signalDevices.at(signal) |= 1 << di;
-          signalDestination.at(signal) = {localAddress, read.outputIndex};
+        if (read.signalIndex >= 0) {
+          readDevices[r] |= 1 << di;
         } else {
           const size_t path = 2 * di + outputMrs[read.outputIndex]->mrs[di]->dataDirect;
           unsignaledPaths |= 1 << path;
@@ -6070,41 +6112,57 @@ struct CpuThreadImpl {
       auto key = it.rkey;
       auto& dev = self.devices[di];
       self.readData(dev, source, (void*)localAddress, outputMrs[read.outputIndex]->mrs[di]->lkey, (void*)sourceAddress,
-          key[di], read.bytes, self.makeCallback([this, di, signal]() {
+          key[di], bytes, self.makeCallback([this, di, r]() {
             self.trace(concurrencyIndex, 1 + di, "");
             --liveReads;
             --deviceLive[di];
-            partDone(signal);
+            partDone(r);
           }));
     }
 
     // A part of a read is done: once all parts of a read with a signal index are, signal the kernel, which waits for
-    // the data (see writeRdmaSignal): through every NIC that carried a part (loopback writes), or after flushes
-    // through them.
-    void partDone(int32_t signal) {
-      if (signal < 0 || --signalPartsLeft.at(signal) != 0) {
+    // the data (see writeRdmaSignal): through every NIC that carried a part (loopback writes), or after flushes through
+    // them; and if the read's source is a slot of a ring of the source rank's scratch tensor, tell that rank that the
+    // slot is free (a credit, after the signal: any path will do, the data has left)
+    void partDone(uint32_t r) {
+      if (--readPartsLeft.at(r) != 0) {
         return;
       }
-      const uint8_t used = signalDevices.at(signal);
+      const auto& read = op->ibReads[r];
+      signalRead(read, readDevices[r]);
+      if (read.creditSignal >= 0) {
+        self.writeRdmaSignal(concurrencyIndex, self.devices[(rank + read.rank) % numDevices], read.rank,
+            read.creditSignal, 0, maxDevices, read.creditGeneration);
+      }
+    }
+
+    // Sets the signal of a read whose parts have all completed (if it has one); `used`: the NICs that carried parts
+    void signalRead(const CustomOpDescriptor::IbRead& read, uint8_t used) {
+      const int32_t signal = read.signalIndex;
+      if (signal < 0) {
+        return;
+      }
+      const size_t generation = read.signalGeneration;
       if (used == 0) {
-        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices);
+        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices, generation);
         return;
       }
-      auto [address, outputIndex] = signalDestination[signal];
+      const uint32_t outputIndex = read.outputIndex;
       if (self.signalFollows(outputMrs[outputIndex], used)) {
         for (size_t di : range(numDevices)) {
           if (used & (1 << di)) {
             auto [first, end] = signalWords(used, di);
-            self.writeRdmaSignal(concurrencyIndex, self.devices[di], rank, signal, first, end);
+            self.writeRdmaSignal(concurrencyIndex, self.devices[di], rank, signal, first, end, generation);
           }
         }
         return;
       }
       ++liveFlushes;
-      auto callback = self.makeCallback([this, signal]() {
+      auto callback = self.makeCallback([this, signal, generation]() {
         --liveFlushes;
-        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices);
+        self.writeRdmaSignal(concurrencyIndex, self.devices[0], rank, signal, 0, maxDevices, generation);
       });
+      const uintptr_t address = params.outputs[outputIndex]->data() + read.outputOffset;
       for (size_t di : range(numDevices)) {
         if (used & (1 << di)) {
           self.flushRead(self.devices[di], rank, address, outputMrs[outputIndex]->mrs[di]->rkey, callback);
@@ -6162,7 +6220,7 @@ struct CpuThreadImpl {
         writeDevices[w] = used;
         writeFlushes[w] = (remoteFlags[write.rank] & flagSignalsNeedFlush) != 0;
         if (used == 0) {
-          self.writeRdmaSignal(concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices);
+          self.writeRdmaSignal(concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices, 0);
           --writesLeft;
           continue;
         }
@@ -6205,7 +6263,7 @@ struct CpuThreadImpl {
                   if (--writePending[w] == 0) {
                     const auto& write = op->ibWrites[w];
                     self.writeRdmaSignal(
-                        concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices);
+                        concurrencyIndex, self.devices[0], write.rank, write.signalIndex, 0, maxDevices, 0);
                     --writesLeft;
                   }
                 }));
@@ -6227,7 +6285,8 @@ struct CpuThreadImpl {
                   if (--writePartsLeft[w][di] == 0 && !writeFlushes[w]) {
                     const auto& write = op->ibWrites[w];
                     auto [first, end] = signalWords(writeDevices[w], di);
-                    self.writeRdmaSignal(concurrencyIndex, self.devices[di], write.rank, write.signalIndex, first, end);
+                    self.writeRdmaSignal(
+                        concurrencyIndex, self.devices[di], write.rank, write.signalIndex, first, end, 0);
                     if (--writePending[w] == 0) {
                       --writesLeft;
                     }
@@ -6278,69 +6337,69 @@ struct CpuThreadImpl {
     }
 
     // Splits the op's reads into parts of about partBytes (reads), in the order in which they are issued, each on the
-    // NIC with the fewest in flight (up to numParallel). Reads that signal the kernel come first, in signal order
-    // (the chunks of a transfer in order): copies on this and other ranks wait for them. The others follow in the
-    // order compile_op gave them (by source, rotated per rank so that every source has one reader per step),
-    // op->readSources at a time. With 1, a rank reads from one or two sources at a time, which keeps the ranks in
-    // step when they all read equal amounts. Larger parts let the ranks drift apart, until some sources have
+    // NIC with the fewest in flight (up to numParallel). Reads that signal the kernel come first, in the order of the
+    // descriptor (proxy reads in signal order, the chunks of a transfer in order: copies on this and other ranks wait
+    // for them; reads of reductions across NVLink domains in the order of their edges, see crossDomainReductions). The
+    // others follow in the order compile_op gave them (by source, rotated per rank so that every source has one reader
+    // per step), op->readSources at a time. With 1, a rank reads from one or two sources at a time, which keeps the
+    // ranks in step when they all read equal amounts. Larger parts let the ranks drift apart, until some sources have
     // several readers and others none: with one part per NIC and two in flight, a source port of an all-to-all
     // (1 GiB per rank, 32 GB300 over RoCE) had no reader 13% of the time and three or more 30%, and the op took
     // 14.8 ms instead of 10.2 ms. One part in flight per NIC keeps the ranks in step, but then each part costs a
     // round trip (about 13 us from post to completion besides the transfer). With more than 1 (unequal amounts),
     // the parts of that many reads go round robin, and a read whose parts have all been issued makes room for the
     // next one. With fewer reads than NICs, smaller reads are split as well, into parts of at least minPartBytes,
-    // so that every NIC gets some. The parts of a read with a signal index share its signal: it is written when
-    // the last part has completed.
+    // so that every NIC gets some. The parts of a read share its signal: it is written when the last part has
+    // completed.
     void prepareReads() {
-      const bool fewReads = op->ibReads.size() < numDevices;
+      const auto& ibReads = op->ibReads;
+      const bool fewReads = ibReads.size() < numDevices;
+      nextPending.resize(ibReads.size());
+      std::ranges::fill(nextPending, noRead);
+      readIssued.resize(ibReads.size());
+      readPartBytes.resize(ibReads.size());
+      readPartsLeft.resize(ibReads.size());
+      readDevices.resize(ibReads.size());
       // The number of parts of each read without a signal index, in order
       Vector<size_t> runs;
-      for (const auto& r : op->ibReads) {
+      uint32_t lastPending = noRead;
+      for (size_t i : indices(ibReads)) {
+        const auto& r = ibReads[i];
+        // (the values of its signal and credit are in the op's generations, see step())
+        CHECK(
+            r.signalGeneration < op->numGenerations && (r.creditSignal < 0 || r.creditGeneration < op->numGenerations));
         size_t parts = std::max<size_t>((r.bytes + partBytes / 2) / partBytes, 1);
         if (fewReads) {
           parts = std::max(parts, std::clamp(r.bytes / minPartBytes, (size_t)1, numDevices));
         }
-        size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
-        if (r.signalIndex >= 0 && signalPartsLeft.size() <= (size_t)r.signalIndex) {
-          signalPartsLeft.resize(r.signalIndex + 1);
-          signalDevices.resize(r.signalIndex + 1);
-          signalDestination.resize(r.signalIndex + 1);
+        const size_t bytesPerPart = std::max(((r.bytes + parts - 1) / parts + 4095) & ~(size_t)4095, (size_t)4096);
+        // (as many parts as tryRead issues: of bytesPerPart, the last one with the rest, at least one)
+        parts = std::max<size_t>((r.bytes + bytesPerPart - 1) / bytesPerPart, 1);
+        readPartBytes[i] = bytesPerPart;
+        readPartsLeft[i] = parts;
+        if (r.signalIndex >= 0) {
+          // (the reads with a signal index come first)
+          CHECK(unsignaledParts.empty());
+          (lastPending == noRead ? firstPending : nextPending[lastPending]) = i;
+          lastPending = i;
+          continue;
         }
-        size_t offset = 0;
-        size_t n = 0;
-        do {
-          auto part = r;
-          part.inputOffset += offset;
-          part.outputOffset += offset;
-          part.bytes = std::min(bytesPerPart, r.bytes - offset);
-          reads.push_back(part);
-          if (r.signalIndex >= 0) {
-            ++signalPartsLeft[r.signalIndex];
-          }
-          offset += part.bytes;
-          ++n;
-        } while (offset < r.bytes);
-        if (r.signalIndex < 0) {
-          runs.push_back(n);
+        for (size_t p : range(parts)) {
+          const size_t offset = bytesPerPart * p;
+          unsignaledParts.push_back({(uint32_t)i, offset, std::min(bytesPerPart, r.bytes - offset)});
         }
+        runs.push_back(parts);
       }
-      std::ranges::stable_sort(reads, {}, [](const CustomOpDescriptor::IbRead& r) {
-        return r.signalIndex < 0 ? std::numeric_limits<int32_t>::max() : r.signalIndex;
-      });
       if (op->readSources <= 1) {
         return;
       }
-      // The parts of the reads without a signal index are the last ones, one run per read
-      size_t first = reads.size();
-      for (size_t n : runs) {
-        first -= n;
-      }
-      Vector<CustomOpDescriptor::IbRead> order;
-      order.reserve(reads.size() - first);
+      // One run of parts per read, in order
+      Vector<ReadPart> order;
+      order.reserve(unsignaledParts.size());
       // [next part, end) of the reads being read
       Vector<std::pair<size_t, size_t>> active;
       size_t nextRun = 0;
-      size_t nextPart = first;
+      size_t nextPart = 0;
       auto take = [&]() {
         std::pair<size_t, size_t> run(nextPart, nextPart + runs[nextRun]);
         nextPart = run.second;
@@ -6353,7 +6412,7 @@ struct CpuThreadImpl {
       size_t i = 0;
       while (!active.empty()) {
         auto& run = active[i];
-        order.push_back(reads[run.first++]);
+        order.push_back(unsignaledParts[run.first++]);
         if (run.first != run.second) {
           ++i;
         } else if (nextRun != runs.size()) {
@@ -6366,8 +6425,8 @@ struct CpuThreadImpl {
           i = 0;
         }
       }
-      CHECK(first + order.size() == reads.size());
-      std::ranges::move(order, reads.begin() + first);
+      CHECK(order.size() == unsignaledParts.size());
+      unsignaledParts = std::move(order);
     }
 
     void step() {
@@ -6388,11 +6447,15 @@ struct CpuThreadImpl {
 
       self.outStepValue(concurrencyIndex, 0) = stepValue;
       self.outStepValue(concurrencyIndex, 1) = stepValue + 1;
-      for (size_t d : range(maxDevices)) {
-        self.outStepValue(concurrencyIndex, signalStepValues + d) = stepValue;
-      }
       self.outStepValue(concurrencyIndex, arrivalWords) = stepValue;
       self.outStepValue(concurrencyIndex, arrivalWords + 1) = op->id;
+      // The values of the signals and notifications that the CPU thread writes (see CustomOpDescriptor::IbRead)
+      CHECK(op->numGenerations >= 1 && op->numGenerations <= compile_op::maxGenerations);
+      for (size_t g : range(op->numGenerations)) {
+        for (size_t d : range(maxDevices)) {
+          self.generationValue(concurrencyIndex, g, d) = stepValue + g;
+        }
+      }
 
       // log.info("CUSTOM %#x/%d enter\n", stepValue, concurrencyIndex);
       {
@@ -6523,10 +6586,10 @@ struct CpuThreadImpl {
       prepareReads();
 
       flagSeen.resize(op->notifications.size());
-      for (const auto& n : op->notifications) {
-        ++slotFlagsLeft[n.rank * CustomOpDescriptor::numNotificationSlots + n.slot];
-      }
       notificationsLeft = op->notifications.size();
+      for (const auto& n : op->notifications) {
+        CHECK(n.generation < op->numGenerations);
+      }
 
       writeQueued.resize(op->ibWrites.size());
       writeDevices.resize(op->ibWrites.size());
@@ -6562,11 +6625,10 @@ struct CpuThreadImpl {
       }
 
       self.trace(concurrencyIndex, 0, "%#x reads", stepValue);
-      readIndex = 0;
 
       // Reads, the notifications of partial results this rank's kernel computes for other ranks, and the writes of
       // those that it writes to them (the writes go first: the kernels of other ranks wait for them)
-      while (readIndex != reads.size() || notificationsLeft != 0 || writesLeft != 0) {
+      while (readsPending() || notificationsLeft != 0 || writesLeft != 0) {
         if (notificationsLeft != 0) {
           forwardNotifications();
         }
@@ -6574,7 +6636,7 @@ struct CpuThreadImpl {
           queueWrites();
         }
         issueWrites();
-        if (readIndex != reads.size()) {
+        if (readsPending()) {
           size_t bestDevice = 0;
           size_t bestLive = numParallel;
           for (size_t di = 0; di != numDevices; ++di) {
