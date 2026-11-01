@@ -335,13 +335,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
   Vector<uint32_t> ranks;
   Vector<uint64_t> localNodes;
+  HashMap<uint64_t, uint32_t> localNodeIndices; // (the index of each in localNodes)
   for (auto& v : graph.cudaEdges) {
     for (auto& l : {&v.sources, &v.destinations}) {
       for (auto& x : *l) {
         if (std::ranges::find(ranks, x.rank) == ranks.end()) {
           ranks.push_back(x.rank);
         }
-        if (std::ranges::find(localNodes, x.id) == localNodes.end()) {
+        if (localNodeIndices.try_emplace(x.id, (uint32_t)localNodes.size()).second) {
           localNodes.push_back(x.id);
         }
       }
@@ -889,9 +890,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       return s;
     };
     auto localNodeIndex = [&](uint64_t id) {
-      auto it = std::ranges::find(localNodes, id);
-      CHECK(it != localNodes.end());
-      return (uint32_t)(it - localNodes.begin());
+      auto it = localNodeIndices.find(id);
+      CHECK(it != localNodeIndices.end());
+      return it->second;
     };
     // The depFilled slots to write once e's destination nodes are filled (per block): on this rank, on the
     // destination ranks, and on the destination ranks of edges that read e's destinations.

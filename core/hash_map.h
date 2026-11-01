@@ -171,6 +171,35 @@ public:
     return *this;
   }
 
+  // (rehash moves the values: a map of maps copied all the inner maps at every rehash without these)
+  HashMap(HashMap&& n) noexcept {
+    ksize = n.ksize;
+    msize = n.msize;
+    primary = n.primary;
+    secondary = n.secondary;
+    n.ksize = 0;
+    n.msize = 0;
+    n.primary = nullptr;
+    n.secondary = nullptr;
+  }
+
+  HashMap& operator=(HashMap&& n) noexcept {
+    if (this != &n) {
+      clear();
+      deallocate(primary, ksize);
+      deallocate(secondary, ksize);
+      ksize = n.ksize;
+      msize = n.msize;
+      primary = n.primary;
+      secondary = n.secondary;
+      n.ksize = 0;
+      n.msize = 0;
+      n.primary = nullptr;
+      n.secondary = nullptr;
+    }
+    return *this;
+  }
+
   bool empty() const noexcept {
     return msize == 0;
   }
