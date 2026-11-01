@@ -14,6 +14,11 @@ namespace {
 constexpr size_t maxWr = IbCommon::maxWr;
 constexpr size_t maxCqEntries = IbCommon::maxCqEntries;
 constexpr size_t maxSrqEntries = IbCommon::maxSrqEntries;
+constexpr size_t maxControlWr = IbCommon::maxControlWr;
+
+// (a work request's id is its callback, with the low bit set for control writes)
+static_assert(alignof(RdmaCallback) >= 2);
+constexpr uint64_t controlBit = 1;
 
 struct QueuedWr {
   size_t i;
@@ -43,6 +48,12 @@ struct RdmaIb : Rdma {
 
   IVector<Function<void()>> queuedWrs;
 
+  // Control writes (postWriteControl) posted and not completed, at most maxControlWr (the send queue of a control
+  // queue pair), and those waiting for one of them to complete, in order. (Counted in currentCqEntries too, from when
+  // they are past queuedWrs.)
+  size_t liveControlWrs = 0;
+  IVector<Function<void()>> queuedControlWrs;
+
   size_t numCqEvents = 0;
   bool receivesRunning = false;
 
@@ -57,7 +68,7 @@ struct RdmaIb : Rdma {
   }
 
   void postWriteImpl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
-      RdmaCallback* callback, bool allowInline) {
+      RdmaCallback* callback, bool allowInline, bool control = false) {
     CHECK(i >= 0 && i < group->size);
 
     // bytesWritten += bytes;
@@ -69,12 +80,12 @@ struct RdmaIb : Rdma {
 
     bool efa = qp != nullptr;
     if (!efa) {
-      qp = ib->qpexs[i];
+      qp = control ? ib->controlQpexs[i] : ib->qpexs[i];
       CHECK(qp != nullptr);
     }
 
     ibv_wr_start(qp);
-    qp->wr_id = (uint64_t)(void*)callback;
+    qp->wr_id = (uint64_t)(void*)callback | (control ? controlBit : 0);
     qp->wr_flags = IBV_SEND_SIGNALED;
     ibv_wr_rdma_write(qp, rkey, (uintptr_t)remoteAddress);
     if (allowInline && bytes <= ib->inlineBytes) {
@@ -112,6 +123,39 @@ struct RdmaIb : Rdma {
       cpuThreadApi.setActive();
     }
     postWriteImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, allowInline);
+  }
+
+  void postWriteControl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
+      RdmaCallback* callback) override {
+    CHECK(i >= 0 && i < group->size);
+    // (EFA, and this rank: no control queue pair)
+    if (ib->qpex != nullptr || ib->controlQpexs[i] == nullptr) {
+      postWrite(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+      return;
+    }
+
+    callback->i = i;
+    ++callback->refcount;
+
+    auto post = [this, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
+      if (liveControlWrs == maxControlWr) [[unlikely]] {
+        queuedControlWrs.push_back([this, i, localAddress, lkey, remoteAddress, rkey, bytes, callback] {
+          postWriteImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true, true);
+        });
+        return;
+      }
+      ++liveControlWrs;
+      postWriteImpl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true, true);
+    };
+    if (currentCqEntries == maxCqEntries) [[unlikely]] {
+      queuedWrs.push_back(std::move(post));
+      return;
+    }
+    ++currentCqEntries;
+    if (currentCqEntries == 1) {
+      cpuThreadApi.setActive();
+    }
+    post();
   }
 
   void postReadImpl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
@@ -315,7 +359,7 @@ struct RdmaIb : Rdma {
     for (auto& wc : std::views::take(wcs, n)) {
       if (wc.status) [[unlikely]] {
         NOINLINE_COLD({
-          RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
+          RdmaCallback* callback = (RdmaCallback*)(void*)(wc.wr_id & ~controlBit);
           if (!cpuThreadApi.suppressErrors()) {
             log.error("%s: Error communicating with %s: Work completion with status %d (%s).%s\n",
                 cpuThreadApi.groupName(), cpuThreadApi.rankName(callback->i), wc.status, ibv_wc_status_str(wc.status),
@@ -328,6 +372,16 @@ struct RdmaIb : Rdma {
         });
       } else {
         CHECK(currentCqEntries != 0);
+        if (wc.wr_id & controlBit) {
+          // (the next control write that waits takes its place: it is counted in currentCqEntries already)
+          if (!queuedControlWrs.empty()) [[unlikely]] {
+            CHECK(liveControlWrs == maxControlWr);
+            queuedControlWrs.pop_front_value()();
+          } else {
+            CHECK(liveControlWrs != 0);
+            --liveControlWrs;
+          }
+        }
         if (!queuedWrs.empty()) [[unlikely]] {
           CHECK(currentCqEntries == maxCqEntries);
           queuedWrs.pop_front_value()();
@@ -338,8 +392,8 @@ struct RdmaIb : Rdma {
             cpuThreadApi.setInactive();
           }
         }
-        CHECK(wc.wr_id != 0);
-        RdmaCallback* callback = (RdmaCallback*)(void*)wc.wr_id;
+        RdmaCallback* callback = (RdmaCallback*)(void*)(wc.wr_id & ~controlBit);
+        CHECK(callback != nullptr);
         callback->decref();
       }
     }

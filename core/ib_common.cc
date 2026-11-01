@@ -425,64 +425,70 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
 
   inlineBytes = 64;
 
-  for (size_t i = 0; i != size; ++i) {
-    if (i == rank && false) {
-      qps.emplace_back();
-      qpexs.emplace_back();
-    } else {
-      ibv_qp_init_attr_ex initAttributes;
-      std::memset(&initAttributes, 0, sizeof(initAttributes));
-      initAttributes.qp_type = IBV_QPT_RC;
-      initAttributes.send_cq = cq;
-      initAttributes.recv_cq = recvCq;
-      initAttributes.cap.max_send_wr = maxWr;
-      initAttributes.cap.max_send_sge = 1;
-      initAttributes.cap.max_recv_wr = 1;
-      initAttributes.cap.max_recv_sge = 1;
-      initAttributes.srq = sharedReceiveQueue;
-      initAttributes.sq_sig_all = 0;
-      initAttributes.cap.max_inline_data = inlineBytes;
-      initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
-      initAttributes.pd = protectionDomain;
-      initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ | IBV_QP_EX_WITH_SEND;
+  // A queue pair for peer rank i (this rank: a loopback), in state INIT, and its address
+  auto createQp = [&](size_t i, size_t maxSendWr) {
+    ibv_qp_init_attr_ex initAttributes;
+    std::memset(&initAttributes, 0, sizeof(initAttributes));
+    initAttributes.qp_type = IBV_QPT_RC;
+    initAttributes.send_cq = cq;
+    initAttributes.recv_cq = recvCq;
+    initAttributes.cap.max_send_wr = maxSendWr;
+    initAttributes.cap.max_send_sge = 1;
+    initAttributes.cap.max_recv_wr = 1;
+    initAttributes.cap.max_recv_sge = 1;
+    initAttributes.srq = sharedReceiveQueue;
+    initAttributes.sq_sig_all = 0;
+    initAttributes.cap.max_inline_data = inlineBytes;
+    initAttributes.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+    initAttributes.pd = protectionDomain;
+    initAttributes.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ | IBV_QP_EX_WITH_SEND;
 
-      IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
-      if (!qp) {
-        throwErrno(errno, "ibv_create_qp_ex");
-      }
-      ibv_qp_attr attr;
-      memset(&attr, 0, sizeof(attr));
-      attr.qp_state = IBV_QPS_RESET;
-      int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-      if (error) {
-        throwErrno(error, fmt::sprintf("ibv_modify_qp ->RESET (peer rank %zu, port %d)", i, portNum).c_str());
-      }
-
-      memset(&attr, 0, sizeof(attr));
-      attr.qp_state = IBV_QPS_INIT;
-      attr.pkey_index = 0;
-      attr.port_num = portNum;
-      attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-      error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-      if (error) {
-        throwErrno(error, fmt::sprintf("ibv_modify_qp ->INIT (peer rank %zu, port %d)", i, portNum).c_str());
-      }
-
-      IbAddress address;
-      address.lid = portAttributes.lid;
-      address.qpNum = qp->qp_num;
-      address.mtuIndex = portAttributes.active_mtu;
-      address.gid = gid;
-
-      if (i != rank) {
-        group->setupComms->sendTo(i, address);
-      } else {
-        loopbackAddress = address;
-      }
-
-      qpexs.push_back(ibv_qp_to_qp_ex(qp));
-      qps.push_back(std::move(qp));
+    IbvQp qp = ibv_create_qp_ex(context, &initAttributes);
+    if (!qp) {
+      throwErrno(errno, "ibv_create_qp_ex");
     }
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RESET;
+    int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    if (error) {
+      throwErrno(error, fmt::sprintf("ibv_modify_qp ->RESET (peer rank %zu, port %d)", i, portNum).c_str());
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_INIT;
+    attr.pkey_index = 0;
+    attr.port_num = portNum;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    if (error) {
+      throwErrno(error, fmt::sprintf("ibv_modify_qp ->INIT (peer rank %zu, port %d)", i, portNum).c_str());
+    }
+
+    IbAddress address;
+    address.lid = portAttributes.lid;
+    address.qpNum = qp->qp_num;
+    address.mtuIndex = portAttributes.active_mtu;
+    address.gid = gid;
+    return std::make_pair(std::move(qp), address);
+  };
+
+  // Per rank: a queue pair (this rank's: a loopback), and for each peer a control queue pair (see controlQps). A peer
+  // gets the addresses of both of its.
+  for (size_t i = 0; i != size; ++i) {
+    auto [qp, address] = createQp(i, maxWr);
+    if (i == rank) {
+      loopbackAddress = address;
+      controlQpexs.push_back(nullptr);
+      controlQps.emplace_back();
+    } else {
+      auto [controlQp, controlAddress] = createQp(i, maxControlWr);
+      group->setupComms->sendTo(i, std::make_pair(address, controlAddress));
+      controlQpexs.push_back(ibv_qp_to_qp_ex(controlQp));
+      controlQps.push_back(std::move(controlQp));
+    }
+    qpexs.push_back(ibv_qp_to_qp_ex(qp));
+    qps.push_back(std::move(qp));
   }
 
   // RTR triggers RoCE neighbor-discovery (GID -> L2 address) for each peer. Under a synchronized
@@ -493,16 +499,8 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
   const int rtrMask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                       IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
-  // Stagger the connection order per rank: at step j, rank r connects to peer (r+1+j), so every
-  // peer is targeted by exactly one rank at a time instead of all ranks resolving peer 0 (then
-  // 1, ...) simultaneously. This spreads the ND load and avoids a thundering herd on the
-  // low-numbered ranks during QP bring-up at scale.
-  for (size_t j = 0; j != size; ++j) {
-    const size_t i = (rank + 1 + j) % size;
-    auto& qp = qps.at(i);
-
-    auto remoteAddress = i == rank ? loopbackAddress : group->setupComms->recvFrom<IbAddress>(i);
-
+  // Connects queue pair qp of peer rank i to the peer's at remoteAddress (RTR, then RTS)
+  auto connect = [&](IbvQp& qp, const IbAddress& remoteAddress, size_t i) {
     ibv_qp_attr attr;
     ibv_qp_init_attr initAttr;
     int error = ibv_query_qp(qp, &attr, IBV_QP_STATE, &initAttr);
@@ -558,6 +556,21 @@ void IbCommon::init2Ib(int portNum, ibv_port_attr portAttributes) {
             IBV_QP_ACCESS_FLAGS);
     if (error) {
       throwErrno(error, fmt::sprintf("ibv_modify_qp ->RTS (peer rank %zu, port %d)", i, portNum).c_str());
+    }
+  };
+
+  // Stagger the connection order per rank: at step j, rank r connects to peer (r+1+j), so every
+  // peer is targeted by exactly one rank at a time instead of all ranks resolving peer 0 (then
+  // 1, ...) simultaneously. This spreads the ND load and avoids a thundering herd on the
+  // low-numbered ranks during QP bring-up at scale.
+  for (size_t j = 0; j != size; ++j) {
+    const size_t i = (rank + 1 + j) % size;
+    if (i == rank) {
+      connect(qps.at(i), loopbackAddress, i);
+    } else {
+      auto [remoteAddress, remoteControlAddress] = group->setupComms->recvFrom<std::pair<IbAddress, IbAddress>>(i);
+      connect(qps.at(i), remoteAddress, i);
+      connect(controlQps.at(i), remoteControlAddress, i);
     }
   }
 }

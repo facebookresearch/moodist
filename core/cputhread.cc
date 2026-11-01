@@ -600,16 +600,21 @@ struct CpuThreadImpl {
   }
 
   // A small write whose completion is counted in the concurrency slot's live control transfers (which the next work on
-  // the slot waits for, see ENTER), or in *counter instead
+  // the slot waits for, see ENTER), or in *counter instead. With controlQp, through the peer's control queue pair (see
+  // Rdma::postWriteControl): ordered only with the other such writes to rank i through dev.
   void writeControl(size_t concurrencyIndex, Device& dev, size_t i, void* localAddress, uint32_t lkey,
-      void* remoteAddress, uint32_t rkey, size_t bytes, size_t* counter = nullptr) {
+      void* remoteAddress, uint32_t rkey, size_t bytes, size_t* counter = nullptr, bool controlQp = false) {
     CHECK(i >= 0 && i < size);
 
     auto callbackobj = makeCallback(nullptr);
     Callback* callback = callbackobj;
     callback->counter = counter ? counter : &concurrencyLiveControlTransfers[concurrencyIndex];
     ++*callback->counter;
-    postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+    if (controlQp) {
+      dev.rdma->postWriteControl(i, localAddress, lkey, remoteAddress, rkey, bytes, callback);
+    } else {
+      postWrite(dev, i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+    }
   }
 
   void postSend(Device& dev, size_t i, void* localAddress, uint32_t lkey, size_t bytes, Callback* callback) {
@@ -1365,6 +1370,9 @@ struct CpuThreadImpl {
 
   // Writes the op's step value + generation into notification slot `slot` of this rank's in the memory of rank i (see
   // Group::customNotifications and WorkCustom)
+  // (through the queue pair of the reads, unlike the credits, see WorkCustom::partDone: through the control queue pair,
+  // they made no difference at large sizes, and the times of small ops varied more: reduce-scatter of 1 MiB across 2
+  // domains of 32 GPUs, 167 us at the median instead of 159, the fastest 10% 140 us instead of 156)
   void writeNotification(size_t concurrencyIndex, size_t i, size_t slot, size_t generation) {
     size_t di = (rank + i) % devices.size();
     auto& dev = devices[di];
@@ -1421,10 +1429,10 @@ struct CpuThreadImpl {
   // per NIC, and the kernel waits until all words of the signal have the value (see signalWords). Elsewhere (or with
   // MOODIST_RDMA_FLUSH=1) the data is flushed first (see flushRead), then one write sets all words.
   // writeRdmaSignal writes words [first, end) of signal `signal` of rank i (of this rank: a loopback write), through
-  // dev: the step value + generation (see compile_op::Graph::Signal). Signals without data to follow (credits, see
-  // CustomOpDescriptor::IbRead) take any path.
-  void writeRdmaSignal(
-      size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end, size_t generation) {
+  // dev (with controlQp, through its control queue pair to rank i, see writeControl): the step value + generation (see
+  // compile_op::Graph::Signal). Signals without data to follow (credits, see CustomOpDescriptor::IbRead) take any path.
+  void writeRdmaSignal(size_t concurrencyIndex, Device& dev, size_t i, size_t signal, size_t first, size_t end,
+      size_t generation, bool controlQp = false) {
     CHECK(i < size && first < end && end <= maxDevices);
     CHECK(signal < group->rdmaSignalBuffer.itembytes / Group::rdmaSignalBytes);
     size_t di = &dev - devices.data();
@@ -1432,7 +1440,7 @@ struct CpuThreadImpl {
                   sizeof(uint32_t) * first;
     writeControl(concurrencyIndex, dev, i, (void*)&generationValue(concurrencyIndex, generation, first),
         generationValuesMr->mrs[di]->lkey, (void*)(remoteRdmaSignals[i].address + offset),
-        remoteRdmaSignals[i].keys[di], sizeof(uint32_t) * (end - first));
+        remoteRdmaSignals[i].keys[di], sizeof(uint32_t) * (end - first), nullptr, controlQp);
   }
 
   // The words of a signal that NIC di writes when the NICs in `used` (a bit each) carried its data: from the one after
@@ -6123,7 +6131,9 @@ struct CpuThreadImpl {
     // A part of a read is done: once all parts of a read with a signal index are, signal the kernel, which waits for
     // the data (see writeRdmaSignal): through every NIC that carried a part (loopback writes), or after flushes through
     // them; and if the read's source is a slot of a ring of the source rank's scratch tensor, tell that rank that the
-    // slot is free (a credit, after the signal: any path will do, the data has left)
+    // slot is free (a credit, after the signal: any path will do, the data has left). Credits go through the control
+    // queue pair, not the one of the reads from that rank (see IbCommon::controlQps); all credits to a signal go that
+    // way, so they arrive in order.
     void partDone(uint32_t r) {
       if (--readPartsLeft.at(r) != 0) {
         return;
@@ -6132,7 +6142,7 @@ struct CpuThreadImpl {
       signalRead(read, readDevices[r]);
       if (read.creditSignal >= 0) {
         self.writeRdmaSignal(concurrencyIndex, self.devices[(rank + read.rank) % numDevices], read.rank,
-            read.creditSignal, 0, maxDevices, read.creditGeneration);
+            read.creditSignal, 0, maxDevices, read.creditGeneration, true);
       }
     }
 

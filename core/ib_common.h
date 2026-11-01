@@ -127,6 +127,9 @@ struct IbCommon {
   static constexpr size_t maxWr = 2048;
   static constexpr size_t maxCqEntries = 2048;
   static constexpr size_t maxSrqEntries = 256;
+  // The send queue of a control queue pair (see controlQps): RdmaIb keeps at most this many control writes in flight
+  // per device
+  static constexpr size_t maxControlWr = 256;
 
   IbvSharedPtr<ibv_context, ibv_close_device> context;
   IbvSharedPtr<ibv_pd, ibv_dealloc_pd> protectionDomain;
@@ -143,6 +146,12 @@ struct IbCommon {
 
   std::vector<IbvQp> qps;
   std::vector<ibv_qp_ex*> qpexs;
+  // A second queue pair per peer (null for this rank), for small writes to a peer that this rank reads from (see
+  // Rdma::postWriteControl): through the queue pair of the reads, they slow the reads down (a GPU reading 3.75 GiB
+  // from the GPU of the same position in the previous NVLink domain, 16 domains of 4 GPUs: 95 GB/s; with a write of 4
+  // bytes to that GPU per part of the reads, 128 KiB, 29 GB/s; with one per 16 parts, 78 GB/s)
+  std::vector<IbvQp> controlQps;
+  std::vector<ibv_qp_ex*> controlQpexs;
 
   size_t inlineBytes = 0;
 

@@ -191,6 +191,13 @@ struct Rdma {
       RdmaCallback* callback, bool allowInline) = 0;
   virtual void postRead(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey, size_t bytes,
       RdmaCallback* callback) = 0;
+  // A small write to peer i, through a queue pair of its own where there is one (see IbCommon::controlQps), not the
+  // one of the reads from rank i: it is ordered only with the other writes of this function to rank i through this
+  // device (if inOrder)
+  virtual void postWriteControl(size_t i, void* localAddress, uint32_t lkey, void* remoteAddress, uint32_t rkey,
+      size_t bytes, RdmaCallback* callback) {
+    postWrite(i, localAddress, lkey, remoteAddress, rkey, bytes, callback, true);
+  }
   virtual void postSend(size_t i, void* localAddress, uint32_t lkey, size_t bytes, RdmaCallback* callback) = 0;
   virtual void postRecv(void* localAddress, uint32_t lkey, size_t bytes, RdmaCallback* callback) = 0;
   virtual void stopReceives() = 0;

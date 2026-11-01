@@ -491,15 +491,23 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   slot there. The CPU thread of a partial rank meanwhile watches its kernel's done flags: once an item's flag has the
   value of the slot's use (step value + generation), it writes that value into the item's notification slot of the
   executor (`writeNotification`; an item that the executors of several domains read has a slot and a notification for
-  each). The values that the CPU thread writes come from a table per concurrency slot (`generationValue`), which an
-  op fills when it starts (the slot's previous op has finished its writes from it), for the generations of the uses
-  of its rank's slots and those of its credits, the partial ranks' (`CustomOpDescriptor::numGenerations`). The
-  notifications have words of their own: in the `inStepValueDeviceChunk` words, where they were before, the process
-  group's all-gather and reduce-scatter rings write step values under the indices of other ranks into their send
-  neighbor's memory without waiting for it to reach the op (the broadcast rings only into ranks that have reached
-  it), so a ring 16 ops later on another stream could tell a rank still in the op that a partial result was ready
-  before it was (the all-gather ring, the only one of the two in use, writes a rank's index only once that rank is in
-  the ring op: that rank has then finished the compile_op, which it does only once the reads from it are over).
+  each). The credits go through a second queue pair per peer and NIC (`IbCommon::controlQps`, `Rdma::postWriteControl`),
+  not the one of the reads from that rank: small writes to a rank through the queue pair of reads from it slow the reads
+  down (a GPU reading 3.75 GiB from one rank: 95 GB/s; with a write of 4 bytes to it per part of 128 KiB, 29 GB/s; with
+  one per 16 parts, 78 GB/s). All credits to a signal go through the same queue pair, so they arrive in order. The
+  control queue pairs have send queues of 256 work requests (the others 2048), and `RdmaIb` keeps at most 256 control
+  writes in flight per NIC. The notifications stay on the queue pair of the reads: through the control queue pair, they
+  made no difference at large sizes, and the times of small ops varied more (reduce-scatter of 1 MiB across 2 domains of
+  32 GPUs: 167 us at the median instead of 159, the fastest 10% 140 us instead of 156). The values that the CPU thread
+  writes come from a table per concurrency slot (`generationValue`), which an op fills when it starts (the slot's
+  previous op has finished its writes from it), for the generations of the uses of its rank's slots and those of its
+  credits, the partial ranks' (`CustomOpDescriptor::numGenerations`). The notifications have words of their own: in the
+  `inStepValueDeviceChunk` words, where they were before, the process group's all-gather and reduce-scatter rings write
+  step values under the indices of other ranks into their send neighbor's memory without waiting for it to reach the op
+  (the broadcast rings only into ranks that have reached it), so a ring 16 ops later on another stream could tell a rank
+  still in the op that a partial result was ready before it was (the all-gather ring, the only one of the two in use,
+  writes a rank's index only once that rank is in the ring op: that rank has then finished the compile_op, which it does
+  only once the reads from it are over).
   With writes (`MOODIST_COMPILE_OP_TRANSFER=write`), the CPU thread of a partial rank watches the flags of its
   `IbWrite`s instead: once one is set (and the destination's input list has arrived), it splits the write into parts
   like a read (about 128 KiB, round robin over the NICs from one that rotates per write) and queues them on their
