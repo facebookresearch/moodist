@@ -6859,6 +6859,9 @@ struct CpuThreadImpl {
 
     size_t nRange = std::min(size - 1, (size_t)16);
 
+    // (registered at the start, see entry)
+    auto* mr = regMr((uintptr_t)&localHeartbeatValue, sizeof(localHeartbeatValue));
+
     for (size_t i : range(size)) {
       if (i == rank) {
         continue;
@@ -6899,7 +6902,6 @@ struct CpuThreadImpl {
         }
         continue;
       }
-      auto* mr = regMr((uintptr_t)&localHeartbeatValue, sizeof(localHeartbeatValue));
       state.activeWrite = now;
       size_t di = (localHeartbeatValue + rank + i) % devices.size();
       auto& dev = devices[di];
@@ -6997,6 +6999,11 @@ struct CpuThreadImpl {
   void entry() {
 
     sendRankInfo();
+
+    // The heartbeats' source word, registered now: registered at the first heartbeat, 30 s in, it held this thread up
+    // for 1.3-1.6 ms (4 ConnectX-8 NICs), and an iteration of a reduce-scatter of 8 MiB per rank across 16 nodes of 4
+    // GPUs took 4-5.5 ms instead of 1.5
+    regMr((uintptr_t)&localHeartbeatValue, sizeof(localHeartbeatValue));
 
     runTests();
 
