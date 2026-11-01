@@ -917,7 +917,8 @@ Graph buildRing(InternalContext& ictx, const Graph& baseGraph, bool writeMode) {
   return builder.graph;
 }
 
-void logGraph(const Graph& graph) {
+// Logs rank's graph, an edge per line (log level verbose)
+void logGraph(size_t rank, const Graph& graph) {
   auto f = [&](auto& l) {
     std::string s;
     for (const auto& n : l) {
@@ -953,15 +954,16 @@ void logGraph(const Graph& graph) {
     }
     return s;
   };
+  log.verbose("Rank %zu graph:\n", rank);
   for (size_t i : indices(graph.rdmaEdges)) {
     const auto& e = graph.rdmaEdges[i];
-    log.info("  rdmaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
-        e.cellIndex, signal(e), f(e.sources), f(e.destinations));
+    log.verbose("  rank %zu rdmaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", rank, i, e.id, e.bytes,
+        e.executorRank, e.cellIndex, signal(e), f(e.sources), f(e.destinations));
   }
   for (size_t i : indices(graph.cudaEdges)) {
     const auto& e = graph.cudaEdges[i];
-    log.info("  cudaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", i, e.id, e.bytes, e.executorRank,
-        e.cellIndex, signal(e), f(e.sources), f(e.destinations));
+    log.verbose("  rank %zu cudaEdge[%zu]: %#x %zu bytes executor=%d cell=%u%s [%s] -> [%s]\n", rank, i, e.id, e.bytes,
+        e.executorRank, e.cellIndex, signal(e), f(e.sources), f(e.destinations));
   }
 }
 
@@ -2567,8 +2569,8 @@ struct CompileOpConstructor {
     });
     for (const auto& x : readList) {
       const auto& r = std::get<2>(x);
-      log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d.%u, wait slot %d.%u, free "
-               "flag %d.%u, credit %d.%u\n",
+      log.verbose("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d.%u, wait slot %d.%u, free "
+                  "flag %d.%u, credit %d.%u\n",
           r.rank, r.inputIndex, r.inputOffset, r.outputIndex, r.outputOffset, r.bytes, r.signalIndex,
           r.signalGeneration, r.waitSlot, r.waitGeneration, r.freeFlag, r.freeGeneration, r.creditSignal,
           r.creditGeneration);
@@ -2621,7 +2623,7 @@ struct CompileOpConstructor {
     });
     for (const auto& x : writeList) {
       const auto& w = x.second;
-      log.info("  ibWrite: flag %d, output[%u]+%zu -> rank %u tensor %u + %zu, %zu bytes, signal %d\n", w.flag,
+      log.verbose("  ibWrite: flag %d, output[%u]+%zu -> rank %u tensor %u + %zu, %zu bytes, signal %d\n", w.flag,
           scratchOutputIndex, w.sourceOffset, w.rank, w.destinationIndex, w.destinationOffset, w.bytes, w.signalIndex);
       op.ibWrites.push_back(w);
     }
@@ -4321,7 +4323,7 @@ struct CompileOpConstructor {
             read.bytes = edge.bytes;
             read.signalIndex = edge.rdmaSignal;
             op->ibReads.push_back(read);
-            log.info("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d\n", read.rank,
+            log.verbose("  ibRead: rank %u input[%u]+%zu -> output[%u]+%zu, %zu bytes, signal %d\n", read.rank,
                 read.inputIndex, read.inputOffset, read.outputIndex, read.outputOffset, read.bytes, read.signalIndex);
           }
         }
@@ -4559,13 +4561,10 @@ struct CompileOpConstructor {
           baseGraph.numInputs + baseGraph.numInputCopies + baseGraph.numOutputs + baseGraph.numOutputCopies;
       op->scratchBytes = setting.graph.tensors.size() > numTensors ? setting.graph.tensors.back().bytes : 0;
 
-      for (size_t i : range(size)) {
-        ctx.barrier();
-        if (i == rank) {
-          log.info("Rank %d graph:\n", rank);
-          logGraph(setting.graph);
-        }
-        ctx.barrier();
+      // (every rank its own, unordered: at log level info, the graphs of all ranks in turn, with two barriers each,
+      // took 0.8 s of an all-reduce's compile across 256 GPUs and logged 0.25 MB per rank)
+      if (currentLogLevel >= LOG_VERBOSE) {
+        logGraph(rank, setting.graph);
       }
 
       // A rank that no kernel edge touches runs no kernel. Errors are raised on every rank, as in tuneKernels: this
