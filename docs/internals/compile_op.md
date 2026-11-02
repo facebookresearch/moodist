@@ -262,7 +262,9 @@ Every step is collective: all ranks of the group take part (through per-rank que
    from the same ones first. The proxy's RDMA edge gets a signal index (`rdmaSignal`), and the proxy gets a relay edge: no
    sources, the proxy's node as destination, the same signal index. The relay edge makes the proxy's kernel wait
    until the CPU thread signals that the read has completed, and then mark the node as filled; the copies from the
-   node are ordinary dependent edges. Transfers of 8 MiB or more are split into chunks of at least 4 MiB (at most
+   node are ordinary dependent edges (in the `multicast` graph, where the proxy executes them, they wait for the
+   signal themselves, in the kernel's item sequence; see the kernel's Scheduling). Transfers of 8 MiB or more are
+   split into chunks of at least 4 MiB (at most
    32): each chunk has its own read, signal, relay edge and copies (`chunkIndex`; the chunk nodes get ids that
    their owner never assigns, numbered in the same order by every member of the domain), so that the copies of a
    chunk start as soon as it has arrived.
@@ -384,7 +386,16 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   that in an all-to-all, the ranks do not all write to the same rank at once), or for edges that read another
   rank's node into the executing rank (the `read` graphs), of the rank they read from (all-gather on 32 GPUs, 64 MiB
   per rank, 16 blocks: 74 GB/s per GPU in destination order, where every rank read rank 0 first, 631 GB/s rotated
-  by source). If some edge waits, in rounds: warp 0 scans the
+  by source). A proxy's copies of what it reads (compile phase step 8; in the `multicast` graph, the proxy executes
+  the copies from its node) go through the sequence too, if every edge of the rank that waits, waits for a relay edge
+  of the rank, and no other edge reads the relays' nodes or waits for the copies (`relayItems`): the relay edges are
+  left out, the copies that wait come after the others, in the order of their relays' signals (the order in which the
+  CPU thread issues the reads), and a pipeline loads an item of such a copy once the relay's signal has arrived (see
+  Relay edges; then `fence.acquire.sys` and `fence.proxy.async.global`). Until then, it stores the items that it has
+  loaded, and waits for the signal only when it has none left; the first claims share the items that do not wait.
+  (In the rounds below, all-gather on 64 GPUs in two NVL72 domains, 256 MiB per rank: 30.2 ms, 560 GB/s per GPU, the
+  blocks' static split of each edge leaving the slowest SMs last; in the sequence 25.3 ms, 668 GB/s; see Performance
+  notes.) Otherwise, if some edge waits, in rounds: warp 0 scans the
   edges that are not done, 32 at a time (one per lane, `vote.ballot`); a source is ready when its `depFilled` slot
   for this block has reached stepValue. Relay edges whose signal has arrived are finished on the spot by the lane
   that saw it. The first ready copy edge is handed to the block through shared memory (one `bar.sync` per round);
@@ -401,7 +412,8 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   `fence.acquire.sys` before the selection barrier; before copying from a peer's tensor, every thread does.
 - **Relay edges** (proxied transfers): ready once the words of signal `rdmaSignal` in `Group::rdmaSignalBuffer` for
   the concurrency index (one per NIC, see Runtime, Signals) have all reached stepValue (always ready when tuning);
-  nothing to copy.
+  nothing to copy. In the item sequence (`relayItems`, see Scheduling), the copies from the relay's node wait for the
+  signal themselves (`edgeRelayWait`, the signal in `PipeEdge::waits`), and nothing marks the node filled.
 - **Reductions** (`reduceLoop`): a rank that executes a reduction (an edge with several sources, or a part of one
   across NVLink domains, see compile phase step 7) runs this loop instead of the copy pipelines. The blocks (of 256
   threads) take items one at a time from the sequence (an item: a chunk of an edge, with all its destinations).
@@ -794,7 +806,24 @@ what unicast stores bring it, 3.2% more on 32 ranks and 6.7% more on 16, where N
 Unicast stores are faster when the ranks' outputs are at different offsets: on 32 GPUs, 256 MiB took 12.22 ms with
 the outputs at offsets 64-192 KiB apart (NVLS needs them at the same offset: 12.38 ms in the same run), and 16 MiB
 814 us. Without the step counter, multicast stores from 32 ranks took 17-19 ms at 256 MiB (see the kernel). On 4
-GPUs, and on 64 GPUs in two NVL72 domains (29.4 ms at 256 MiB), ops do not use NVLS and take what they took before.
+GPUs, and on 64 GPUs in two NVL72 domains (29.4 ms at 256 MiB then; 25.3 ms with the proxies' copies in the item
+sequence, see Scheduling), ops do not use NVLS and take what they took before.
+
+All-gather on 64 GPUs in two NVL72 domains of 32 (`bfloat16`, per-rank size, median; a GPU receives 63 pieces, the 32
+from the other domain through the proxies of compile phase step 8), with the proxies' copies in rounds and in the
+item sequence (see the kernel's Scheduling; November 2026, the same 16 nodes):
+
+| | 64 KiB | 256 KiB | 1 MiB | 4 MiB | 16 MiB | 64 MiB | 256 MiB |
+|---|---|---|---|---|---|---|---|
+| rounds | 68 us | 79 us | 139 us | 479 us | 1.87 ms | 7.59 ms | 30.2 ms (560 GB/s) |
+| item sequence | 51 us | 69 us | 141 us | 440 us | 1.61 ms | 6.28 ms | 25.3 ms (668 GB/s) |
+
+(GB/s: what a GPU receives, per second.) On 128 GPUs in four domains of 32, 16 MiB took 3.71 ms in rounds and 3.20 ms
+in the sequence, 64 MiB 14.8 and 12.7 ms, 256 MiB 58.7 and 49.6 ms (581 and 687 GB/s). A first version, in which a
+pipeline waited for the relay's signal as soon as it took an item of the relay's copies (the stores of the items that
+it had loaded waiting too), and the first claims took enough items to fill the rings as without waits, took 152 us at
+1 MiB: of the 64 items, the first claims of half the 16 pipelines took the 32 of the rank's own input, those of the
+other half the 32 of the chunk from the other domain, which they then waited for.
 
 Reductions (`reduce="sum"`, `bfloat16`) on 32 GPUs in one NVL72 domain, against NCCL and moodist's process group
 collectives (which reach the other nodes over RDMA). Reduce-scatter: the size is each rank's output (its input is 32
@@ -1017,7 +1046,8 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   skipped, without an error; GB300, October 2026), so one object per sender, bound by every rank but the sender,
   would skip it, the local copy then done by the idle blocks. Further: groups that span several NVLink domains (one
   multicast object per domain, for the edges within a domain, including the proxies' stores of what they read: 64
-  GPUs in two domains take 29.4 ms at 256 MiB, where the GPUs' NVLink ingress allows about 25), destination sets
+  GPUs in two domains take 25.3 ms at 256 MiB with unicast stores, about what the GPUs' NVLink ingress allows, so
+  there NVLS would mostly save SMs), destination sets
   smaller than the group (which ranks bind a range decides who receives it), ranks that store different numbers of
   chunks (the window assumes the same), and multicast reductions (`multimem.ld_reduce`, which needs every member
   bound: with one unbound, the reader's context fails with CUDA_ERROR_CONTAINED; `multimem.red`) for reduce-scatter
@@ -1027,9 +1057,10 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   same address bits; not investigated.
 - Compile time is mostly the JIT of the tuning candidates (4 per graph variant). JIT on several threads would cut
   it (the PTX differs per rank, so the work cannot be split across ranks).
-- With waits (relay edges, ring graphs), the block copies one edge at a time and drains its pipelines at the end
-  of each edge, and a dependency is per block and edge. Per-chunk ready flags would let the pipelines take chunks
-  across edges as without waits.
+- With waits for other edges (the ring graphs, and in the `read` graph the copies from a proxy's node), the block
+  copies one edge at a time and drains its pipelines at the end of each edge, and a dependency is per block and
+  edge. Per-chunk ready flags would let the pipelines take chunks across edges as without waits (as the copies that
+  wait only for relay edges do, see Scheduling).
 - The fixed cost of a launch is about 6 us on 4 GPUs (64 KiB shift): of it, `fence.release.sys` before the exit
   step value exchange takes 2-3 us (any system-scope fence takes about 1.8 us on GB300 even with nothing
   outstanding, a GPU-scope one 0.3 us; under load it waits for the copies of the other blocks), the address
@@ -1103,7 +1134,6 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   multi-millisecond wake-ups (moodist's all-gather in such a loop: 300-700 us instead of 58 us on 16 GPUs). Spinning
   for about 200 us before sleeping removed them in that test.
 - Pieces that are not contiguous go through separate copies before and after the op.
-- After tuning, the ranks log their graphs one after the other, with two barriers per rank.
 - Code layout (no longer visible since October 2026): small ops across two NVL72 domains (64 GPUs, all-reduce of
   64 KiB to 4 MiB) depended on the build's code layout while `WorkCustom` exchanged with all ranks. 9c67f3a's build
   took 91 us at 64 KiB (median; p90 100). Every build of it with code shifted took 102-109 us (p90 about 120; the
@@ -1119,6 +1149,20 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   op's time (`perf` is not usable on these nodes, so the code that the layout slowed down is unknown). With the
   exchanges limited to the op's peers (see Runtime), builds that differ by a `nop` take the same time (63 us at
   64 KiB, p90 67).
+- Small reductions across many NVLink domains: on 256 GB300 in 64 domains of 4 (`MOODIST_FABRIC=0`), an all-reduce
+  of 64 KiB takes 316 us and one of 1 MiB 439 us, against NCCL's 161 and 263 us (`NCCL_MNNVL_ENABLE=0`); with 16
+  domains of 4, 79 and 119 us. In one round, every executor reads 63 partial results, every partial rank notifies 63
+  executors, and the step exchange and the barrier at the end of the op go to about 66 peers, all posted one after the
+  other by the CPU thread. In a CPU-thread trace of an op of 64 KiB (393 us per op while traced), the step exchange
+  took 27 us, the wait for the peers' step values 22, the 62 notifications 49, the 63 reads 177 (mostly waiting for
+  their notifications), the completions 34 and the barrier with the peers 21, all of which grow with the number of
+  domains. Rings of the domains do not help small ops: a hop (a kernel stores an item, its CPU thread notifies the
+  reader, whose CPU thread reads it and signals its kernel) takes about 30-40 us (the reduce-scatter rings under
+  Performance notes, at 1 MiB per rank), and an all-reduce along a ring of 64 domains would take 2 x 63 of them in a
+  row. Fewer hops and fewer transfers per rank would: recursive doubling among the executors of a piece (6 rounds with
+  64 domains), or exchanges within groups of 8 domains (2 rounds of 7 transfers per executor), with each hop an RDMA
+  write of the data and its signal rather than a notification and a read. Which to use from which size on is a
+  question for the tuning (see Tuning the RDMA side).
 
 ### Cleanup
 - `docs/api/compile_op.md`: the examples predate `TensorRegion`'s `device` field.
@@ -1184,6 +1228,37 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    of a ring exchanges with its two neighbors (and its own domain) only, and the reductions across domains with the
    ranks of its rail. At large world sizes, connecting only the pairs of ranks that an op needs (when it is compiled)
    would save most of them.
+
+### Tuning the RDMA side
+The tuning (compile phase step 12) times kernels only, without the CPU thread. How the data crosses NVLink domains is
+decided by rules: one round or two (the cost model of `reductionPieces`, 5% off with 8 domains at 2 MiB), rings of the
+domains or reads from every domain (from 6 MiB per rank, with 3 or more domains of the same size), reads or writes
+(`MOODIST_COMPILE_OP_TRANSFER`: reads unless set, though writes are 3-13% faster for all-reduces across 16 domains from
+16 MiB on), one source at a time or 8 (`readSources`), and fixed sizes (the proxies' chunks, the parts, the slots of the
+rings). Each choice has a crossover that depends on the number and the sizes of the domains, the sizes of the op and
+the hardware, and more choices are coming (e.g. small all-reduces across many domains in fewer hops, see Performance).
+A second stage of the tuning could time them instead (discussed in November 2026, not built):
+- Stage 1, as now: the kernel configuration of each graph, NVLink only. The two stages are mostly independent: a plan
+  of the RDMA side has graphs of its own, whose kernels are tuned for it. Plans other than the default could try fewer
+  configurations (the default's grid size and its neighbors).
+- Stage 2: each candidate plan runs as a real op (its kernel, the CPU thread, RDMA) on scratch tensors of the op's
+  shapes, a few calls to warm up (which absorb the skew between the ranks, e.g. 60-140 ms out of a barrier on 256
+  GPUs), then timed calls. The ranks exchange their medians as in the kernel tuning, the slowest rank's time counts, and
+  a plan other than the default has to win by a few percent, so that noise does not decide (stalls of the CPU thread
+  of 0.2-1 ms are common on 256 GPUs).
+- The cost is in compiling the plans (their exchanges and kernel JIT: an op takes 2.6-4.6 s to compile on 256 GPUs),
+  not in timing them (10 calls of an all-gather of 256 MiB per rank take 0.25 s). So rules decide what is tuned: each
+  plan says where it applies (sizes, numbers and sizes of domains), a cost model ranks the plans, and only those within
+  about 25% of the best estimate are compiled and timed; far from a crossover, nothing is. The decisions can be cached
+  per op signature and topology, in the process and possibly in a file.
+- Plans that combine the values in a different order (rings, recursive doubling) give different bits in 16-bit types.
+  That is acceptable: the reductions where precision matters are mostly in `float32`, and the least precise plan is as
+  precise as NCCL's or more.
+- A compiled candidate keeps everything that it allocated (moodist frees nothing): signals, notification slots, kernel
+  modules, and NVLS step counters, of which a group has few. Fine with two or three candidates per op, but candidates
+  should not take NVLS counters.
+- First use: the small all-reduces across many domains in fewer hops, against one round near their crossover; then
+  reads against writes, rings against reads, one round against two.
 
 ### Other features
 - Unaligned copies (align down, shift the bytes, handle the unaligned tail; needs `fence.proxy.async.shared::cta`

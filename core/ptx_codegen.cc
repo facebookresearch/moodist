@@ -658,6 +658,47 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       return false;
     };
 
+    // relayItems: the edges wait only for relay edges of this rank (the copies of a proxy's chunks in the multicast
+    // graph, see proxyRemoteEdges in compile_op.cc), and no other edge waits for one of them. They then go through the
+    // item sequence like edges without waits (see PipeEdge), where a pipeline loads an item of an edge whose source a
+    // relay edge fills once the relay's signal has arrived (relaySignal), instead of the rounds below, in which each
+    // block copies its own chunks of an edge (chunk c, block c % grid size): the copy rates of the SMs vary under load,
+    // and with that static split, an all-gather of 256 MiB per rank across two NVLink domains of 32 GB300 took 30.2 ms
+    // (560 GB/s per GPU), in the item sequence 25.3 ms (668 GB/s). The copies wait for their relays' signals in the
+    // item sequence, in signal order: the order in which the CPU thread issues the reads. No relay node may be read by
+    // an edge of another rank (which would wait for its depFilled slot).
+    HashMap<uint64_t, int32_t> relaySignal; // relay node id -> its signal
+    bool relayItems = !nowaits && !reduceKernel;
+    for (const Edge& e : localCopies) {
+      if (e.sources.empty()) {
+        relaySignal[e.destinations.at(0).id] = e.rdmaSignal;
+      }
+    }
+    for (const Edge& e : localCopies) {
+      if (!e.sources.empty()) {
+        const Node& s = e.sources[0];
+        relayItems &= e.sources.size() == 1 && (s.filled || relaySignal.contains(s.id)) && !hasDependents(e);
+      }
+    }
+    for (const Edge& e : graph.cudaEdges) {
+      if (e.executorRank != rank) {
+        for (const Node& n : e.sources) {
+          relayItems &= !relaySignal.contains(n.id);
+        }
+      }
+    }
+    if (relayItems) {
+      // The relay edges (nothing to copy), then the edges without waits, then those with, in signal order
+      auto key = [&](const Edge& e) {
+        if (e.sources.empty()) {
+          return std::make_pair(0, (int32_t)0);
+        }
+        auto it = relaySignal.find(e.sources[0].id);
+        return it == relaySignal.end() ? std::make_pair(1, (int32_t)0) : std::make_pair(2, it->second);
+      };
+      std::ranges::stable_sort(localCopies, {}, key);
+    }
+
     // ---- Tables ----
     // The kernel reads its edges from tables at runtime, so its code size does not depend on the number of
     // edges. All tables are in one initialized global array.
@@ -716,6 +757,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeDoneFlags = 64;   // reduce loop: sets done flags once stored (see Edge::doneFlags)
     static constexpr uint32_t edgeDestinationWaits = 128; // reduce loop: waits before it stores (PipeEdge::destWaits)
     static constexpr uint32_t edgeDoneWhenLoaded = 256;   // reduce loop: sets its done flags once loaded (not stored)
+    static constexpr uint32_t edgeRelayWait = 512; // relayItems: loaded once relay signal PipeEdge::waits has arrived
     // A word of the wait table (a Signal that the kernel waits for, see Edge::sourceWaits): the generation in the low
     // waitGenerationBits bits, the index + 1 in the bits above them (0 if the source does not wait), and waitDoneFlag
     // for a done flag of this kernel's (in cpuInBuffer), else the signal of an RDMA transfer (in rdmaSignalBuffer). A
@@ -1005,17 +1047,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       addrTable.push_back(s);
     }
 
-    // Without waits, the items of all edges form one sequence, which the pipelines of all blocks take items from
-    // (see the copy loop below). An item is a chunk of an edge and a group of its destinations: an edge's
-    // destinations are split into groups when the op has few chunks, so that the stores of an all-gather of a few
-    // chunks to many ranks spread over the SMs too (a load per group: more local reads, which are cheap). Per edge:
-    // the index of its first item in the sequence, the destination groups (item i of the edge covers chunk
-    // i / groups and destination group i % groups), and the slots of its addresses in the address table that every
-    // block resolves at the start (its sources (one, except in reductions), then its destinations, then with NVLS the
-    // NVLS slot: the multicast address of the local destination, or 0 if the launch stores to each destination). A
-    // last record (firstItem = the number of items) ends the sequence. With NVLS, the chunks of all edges also form one
-    // sequence (nvlsFirst: the index of an edge's first chunk), which a launch that uses NVLS stores instead. The
-    // reduce loop takes whole chunks (one destination group).
+    // Without waits (and with relayItems, but for the relay edges), the items of all edges form one sequence, which the
+    // pipelines of all blocks take items from (see the copy loop below). An item is a chunk of an edge and a group of
+    // its destinations: an edge's destinations are split into groups when the op has few chunks, so that the stores of
+    // an all-gather of a few chunks to many ranks spread over the SMs too (a load per group: more local reads, which
+    // are cheap). Per edge: the index of its first item in the sequence, the destination groups (item i of the edge
+    // covers chunk i / groups and destination group i % groups), and the slots of its addresses in the address table
+    // that every block resolves at the start (its sources (one, except in reductions), then its destinations, then with
+    // NVLS the NVLS slot: the multicast address of the local destination, or 0 if the launch stores to each
+    // destination). A last record (firstItem = the number of items) ends the sequence. With NVLS, the chunks of all
+    // edges also form one sequence (nvlsFirst: the index of an edge's first chunk), which a launch that uses NVLS
+    // stores instead. The reduce loop takes whole chunks (one destination group).
     const uint32_t chunkSize = config.chunkSize;
     const uint32_t numPipelines = config.pipelines;
     const uint32_t numClaimers = numBlocks * numPipelines;
@@ -1037,7 +1079,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       // source's word in the wait table (a word per source, see waitWord); with edgeDestinationWaits, the index of the
       // first word in the wait table that the edge waits for before it stores (Edge::destinationWaits) and their
       // number; with edgeDoneFlags, the index of the first word in the done flag table and their number
-      // (Edge::doneFlags)
+      // (Edge::doneFlags). With edgeRelayWait, waits is the signal of the relay edge that fills the source.
       uint32_t inputSources;
       uint32_t divisor;
       uint32_t waits;
@@ -1054,15 +1096,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     std::vector<uint32_t> pipeWaits;
     std::vector<uint32_t> pipeDoneFlags;
     uint32_t pipeNumItems = 0;
+    uint32_t pipeNoWaitItems = 0; // (with relayItems: the items of the edges that wait for no relay, which come first)
     // The NVLS edges' address slots and destination counts (for the check of every launch, see below)
     std::vector<std::array<uint32_t, 2>> nvlsEdgeTable;
     uint32_t nvlsChunksTotal = 0;
     CHECK(chunkSize >= 16 && chunkSize % 16 == 0);
     CHECK(numPipelines >= 1 && numPipelines * 32 <= blockSize);
-    if (nowaits) {
+    // The item sequence (see the copy loop): without waits, or with relayItems
+    const bool itemPath = nowaits || relayItems;
+    if (itemPath) {
       uint64_t numChunksTotal = 0;
       for (const Edge& e : localCopies) {
-        numChunksTotal += (e.bytes + chunkSize - 1) / chunkSize;
+        if (!e.sources.empty()) {
+          numChunksTotal += (e.bytes + chunkSize - 1) / chunkSize;
+        }
       }
       // Destination groups for about 4 items per pipeline: items are taken whole (in batches), so with few items,
       // some pipelines get one more than others, e.g. with 32 chunks to 31 destinations each (an all-gather of
@@ -1071,6 +1118,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           std::max<uint64_t>((4 * numClaimers + numChunksTotal - 1) / std::max<uint64_t>(numChunksTotal, 1), 1);
       for (size_t i : indices(localCopies)) {
         const Edge& e = localCopies[i];
+        if (e.sources.empty()) {
+          // A relay edge (relayItems): the items of the copies from its node wait for its signal
+          continue;
+        }
         EdgeSetup s;
         std::memcpy(&s, edgeTable.data() + edgeStride * i, sizeof(s));
         CHECK(e.bytes > 0 && !e.destinations.empty());
@@ -1095,6 +1146,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         CHECK(e.partialSources <= e.sources.size());
         p.inputSources = e.sources.size() - e.partialSources;
         p.divisor = e.divisor != 0 ? e.divisor : e.sources.size();
+        if (auto it = relaySignal.find(e.sources[0].id); relayItems && it != relaySignal.end()) {
+          CHECK(it->second >= 0);
+          p.flags |= edgeRelayWait;
+          p.waits = it->second;
+        }
         // (the tuning launches run without the CPU thread: they do not wait for its RDMA signals, but for the done
         // flags of their own edges, which they set as the op's launches do; each launch has a step value of its own)
         CHECK(e.sourceWaits.empty() || e.sourceWaits.size() == e.sources.size());
@@ -1141,6 +1197,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         pipeEdges.push_back(p);
         CHECK((uint64_t)pipeNumItems + p.numItems < (1ull << 30));
         pipeNumItems += p.numItems;
+        if (!(p.flags & edgeRelayWait)) {
+          pipeNoWaitItems += p.numItems;
+        }
       }
       PipeEdge end = {};
       end.firstItem = pipeNumItems;
@@ -1174,7 +1233,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // global memory if it does not fit in pipeTableSharedLimit). The stage rings take the rest.
     const uint32_t numEdges = localCopies.size();
     const uint32_t numDoneWords = (numEdges + 31) / 32;
-    const uint32_t scanShared = nowaits ? 0 : (4 * numDoneWords + 8 + 15) / 16 * 16;
+    const uint32_t scanShared = itemPath ? 0 : (4 * numDoneWords + 8 + 15) / 16 * 16;
     static constexpr size_t pipeTableSharedLimit = 32 * 1024;
     const size_t pipeTableBytes = 8 * pipeAddrSetups.size();
     bool pipeTableInShared = false;
@@ -1200,9 +1259,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     } else {
       const size_t perStage = chunkSize + 8 + PipeRing::recordSize;
       // 256: alignment padding; with NVLS, the check's flag and the NVLS rings' barriers and records
-      size_t fixed = 256 + scanShared + (nowaits ? 0 : 8 * maxDestinations) +
+      size_t fixed = 256 + scanShared + (itemPath ? 0 : 8 * maxDestinations) +
                      (nvlsLocal ? 32 + numPipelines * nvlsMaxStages * (8 + PipeRing::recordSize) : 0);
-      if (nowaits && pipeTableBytes <= pipeTableSharedLimit &&
+      if (itemPath && pipeTableBytes <= pipeTableSharedLimit &&
           config.sharedMemory >= fixed + pipeTableBytes + 4 * numPipelines * perStage) {
         pipeTableInShared = true;
         fixed += pipeTableBytes;
@@ -1212,7 +1271,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           config.sharedMemory, chunkSize);
       numStages = std::min<size_t>((config.sharedMemory - fixed) / (numPipelines * perStage), 16);
       mod.topLevelComments.push_back(fmt::sprintf("chunk size %d, %d pipelines of %d stages per block%s", chunkSize,
-          numPipelines, numStages, nowaits && !pipeTableInShared ? ", address table in global memory" : ""));
+          numPipelines, numStages, itemPath && !pipeTableInShared ? ", address table in global memory" : ""));
     }
 
     // Each pipeline's stage ring (the warps beyond the pipelines alias the first ring, and never use it); with the
@@ -1456,7 +1515,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     // With waits: the destination addresses of the edge being copied, for the pipelines
     std::optional<u32> pipeDestinations;
-    if (!nowaits) {
+    if (!itemPath) {
       pipeDestinations = addShared32(8, 8 * std::max(maxDestinations, (size_t)1), "destinations");
     }
     // With waits: copy this block's chunks of an edge, pipelined within the edge. Chunk c of an edge belongs to
@@ -1517,7 +1576,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     };
 
     if (numEdges == 0) {
-    } else if (nowaits) {
+    } else if (itemPath) {
       // The pipelines of all blocks take the items of the sequence (see PipeEdge) from a counter: the first claim
       // of a pipeline takes enough to fill its ring (if there are enough items for all pipelines), the later ones
       // one item (two were slower: the last pipelines to finish had more left). A pipeline claims its next item when
@@ -1526,8 +1585,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       // after the others).
       // Each concurrency slot has two counters, used by alternate launches (by the launch parity): block 0 resets
       // the other one, which the previous launch used and the next one will use.
-      // (the reduce loop claims one item at a time, see below)
-      const uint32_t firstBatch = reduceKernel ? 1 : std::clamp<uint32_t>(pipeNumItems / numClaimers, 1, numStages);
+      // (the reduce loop claims one item at a time, see below; with relayItems, the first claims share the items
+      // without waits, which come first: with the first claims for all items, in an all-gather of 1 MiB per rank
+      // across two domains of 32 GPUs, half the pipelines copied the rank's own input, and the other half waited for
+      // the chunk from the other domain)
+      const uint32_t firstBatch =
+          reduceKernel
+              ? 1
+              : std::clamp<uint32_t>((relayItems ? pipeNoWaitItems : pipeNumItems) / numClaimers, 1, numStages);
       static constexpr uint32_t pipeBatch = 1;
       u64 claimCounters = addGlobalVar(8, 8 * maxConcurrency, "claims");
       IF_D(isThreadZero & (blockIndex == 0)) {
@@ -1687,6 +1752,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           if (nvlsLocal) {
             nvlsLoaded = 0;
           }
+          // With relayItems: whether the edge of the item taken last waits for a relay signal that this pipeline has
+          // not seen arrive yet (its items, and edges, only increase)
+          const bool relayWaits = relayItems && !tuning;
+          Value waitPending(ValType::Pred);
+          auto edgeWaits = [&]() {
+            u32 flags = ld_global_nc_u32(pipeEdgeTable + widen(edge * sizeof(PipeEdge)) + offsetof(PipeEdge, flags));
+            return (flags & edgeRelayWait) != 0;
+          };
+          if (relayWaits) {
+            waitPending = edgeWaits();
+          }
 
           // Take the next item; false if there are none left
           auto take = [&]() {
@@ -1701,12 +1777,58 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
             return item < batchEnd;
           };
-          auto loadItem = [&]() {
-            // Items only increase: advance to the item's edge
+          // Items only increase: advance to the edge of `item`
+          auto advance = [&]() {
             WHILE(item >= nextFirst) {
               edge += 1;
               nextFirst = ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)));
+              if (relayWaits) {
+                waitPending = edgeWaits();
+              }
             }
+          };
+          // With relayItems: whether `item` (taken, not loaded) can be loaded: unless its edge's source is filled by a
+          // relay edge's RDMA read, whose signal has not arrived yet (a word per NIC, all of which get the step value,
+          // see writeRdmaSignal in cputhread.cc). Blocking: wait for it. (The tuning launches run without the CPU
+          // thread, and do not wait.)
+          auto ready = [&](bool blocking) {
+            Value r(ValType::Pred);
+            r = 1;
+            if (relayWaits) {
+              advance();
+              IF(waitPending) {
+                u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
+                u32 signal = ld_global_nc_u32(record + offsetof(PipeEdge, waits));
+                u64 flag = concurrency(group->rdmaSignalBuffer) + widen(signal * Group::rdmaSignalBytes);
+                static_assert(Group::rdmaSignalBytes == 16 && maxDevices == 4);
+                auto load = [&]() {
+                  std::array<Value, 4> words;
+                  ld_global_relaxed_sys_v4_u32(words, flag);
+                  return min_u32(min_u32(words[0], words[1]), min_u32(words[2], words[3]));
+                };
+                u32 value = load();
+                if (blocking) {
+                  IF(value < stepValue) {
+                    profiling.enter("relay wait");
+                    WHILE(value < stepValue) {
+                      value = load();
+                    }
+                    profiling.leave();
+                  }
+                }
+                r = value >= stepValue;
+                IF(r) {
+                  // The data arrived before the signal; the loads are bulk copies
+                  fence_acquire_sys();
+                  fence_proxy_async_global();
+                  waitPending = 0;
+                }
+              }
+            }
+            return r;
+          };
+          auto loadItem = [&]() {
+            advance();
             u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
             u32 edgeFirst = ld_global_nc_u32(record);
             u32 edgeBytes = ld_global_nc_u32(record + 8);
@@ -1736,58 +1858,111 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
           };
 
-          // Fill the ring, then store items in order, loading the next one into the stage of the item before (free
-          // once its stores have read it)
-          WHILE(!exhausted & (loaded < numStages)) {
-            IF(take()) {
-              loadItem();
+          if (relayItems) {
+            // As below, but an item whose relay signal has not arrived is not loaded yet: the pipeline stores the
+            // items it has loaded meanwhile, and waits for the signal only once it has none left. It loads an item
+            // into a stage that no item has used, or, once the stores of all but the last storeLag items stored have
+            // read their stages, while fewer than numStages - storeLag loads are ahead of the stores: one per store
+            // as below, more after a wait.
+            CHECK(!anySignals && !nvlsLocal);
+            WHILE(!exhausted & (loaded < numStages)) {
+              IF(take()) {
+                IF(!ready(false)) {
+                  BREAK;
+                }
+                loadItem();
+              }
+              ELSE {
+                exhausted = 1;
+              }
             }
-            ELSE {
-              exhausted = 1;
-            }
-          }
-          WHILE(stored < loaded) {
-            u32 tag = ring->store();
-            stored += 1;
-            if (anySignals) {
-              // An item of an edge that other edges (on other ranks) wait for. Its items went to any block, while the
-              // waiting kernels wait for per-block slots: the last item to finish signals the slots of all blocks.
-              // Per launch, every item counts once, so the counter wraps back to 0.
-              IF((tag >> 31) != 0) {
-                u32 e = tag & 0x7fffffff;
-                u64 record = pipeEdgeTable + widen(e * sizeof(PipeEdge));
-                u32 numItems = ld_global_nc_u32(record + 4);
-                cp_async_bulk_wait_group(0);
-                fence_release_gpu();
-                u32 old =
-                    atom_global_relaxed_inc_u32(*edgeDone + widen((concurrencyIndex * numEdges + e) * 4), numItems - 1);
-                IF(old == numItems - 1) {
-                  fence_acquire_gpu();
-                  fence_release_sys();
-                  u32 i = ld_global_nc_u32(record + 32);
-                  u32 end = i + ld_global_nc_u32(record + 36);
-                  WHILE(i < end) {
-                    u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
-                    u64 base = ld_global_nc_u64(s);
-                    u32 itembytes = ld_global_nc_u32(s + 8);
-                    u32 index = ld_global_nc_u32(s + 12);
-                    u32 stride = ld_global_nc_u32(s + 16);
-                    u64 slot = base + widen(itembytes * concurrencyIndex + 4 * index);
-                    FOR(u32 b = 0, b < numBlocks, b += 1) {
-                      st_global_relaxed_sys_u32(slot + widen(4 * stride * b), stepValue);
+            WHILE(true) {
+              IF(stored < loaded) {
+                ring->store();
+                stored += 1;
+                IF(!exhausted & (stored >= storeLag + 1)) {
+                  cp_async_bulk_wait_group_read(storeLag);
+                  WHILE(!exhausted & (loaded - stored < numStages - storeLag)) {
+                    IF(take()) {
+                      IF(!ready(false)) {
+                        BREAK;
+                      }
+                      loadItem();
                     }
-                    i += 1;
+                    ELSE {
+                      exhausted = 1;
+                    }
                   }
                 }
               }
+              ELSE {
+                IF(exhausted) {
+                  BREAK;
+                }
+                IF(take()) {
+                  cp_async_bulk_wait_group_read(storeLag);
+                  ready(true);
+                  loadItem();
+                }
+                ELSE {
+                  exhausted = 1;
+                }
+              }
             }
-            IF(!exhausted & (stored >= storeLag + 1)) {
-              cp_async_bulk_wait_group_read(storeLag);
+          } else {
+            // Fill the ring, then store items in order, loading the next one into the stage of the item before (free
+            // once its stores have read it)
+            WHILE(!exhausted & (loaded < numStages)) {
               IF(take()) {
                 loadItem();
               }
               ELSE {
                 exhausted = 1;
+              }
+            }
+            WHILE(stored < loaded) {
+              u32 tag = ring->store();
+              stored += 1;
+              if (anySignals) {
+                // An item of an edge that other edges (on other ranks) wait for. Its items went to any block, while the
+                // waiting kernels wait for per-block slots: the last item to finish signals the slots of all blocks.
+                // Per launch, every item counts once, so the counter wraps back to 0.
+                IF((tag >> 31) != 0) {
+                  u32 e = tag & 0x7fffffff;
+                  u64 record = pipeEdgeTable + widen(e * sizeof(PipeEdge));
+                  u32 numItems = ld_global_nc_u32(record + 4);
+                  cp_async_bulk_wait_group(0);
+                  fence_release_gpu();
+                  u32 old = atom_global_relaxed_inc_u32(
+                      *edgeDone + widen((concurrencyIndex * numEdges + e) * 4), numItems - 1);
+                  IF(old == numItems - 1) {
+                    fence_acquire_gpu();
+                    fence_release_sys();
+                    u32 i = ld_global_nc_u32(record + 32);
+                    u32 end = i + ld_global_nc_u32(record + 36);
+                    WHILE(i < end) {
+                      u64 s = signalTableAddr + widen(i * sizeof(SignalSetup));
+                      u64 base = ld_global_nc_u64(s);
+                      u32 itembytes = ld_global_nc_u32(s + 8);
+                      u32 index = ld_global_nc_u32(s + 12);
+                      u32 stride = ld_global_nc_u32(s + 16);
+                      u64 slot = base + widen(itembytes * concurrencyIndex + 4 * index);
+                      FOR(u32 b = 0, b < numBlocks, b += 1) {
+                        st_global_relaxed_sys_u32(slot + widen(4 * stride * b), stepValue);
+                      }
+                      i += 1;
+                    }
+                  }
+                }
+              }
+              IF(!exhausted & (stored >= storeLag + 1)) {
+                cp_async_bulk_wait_group_read(storeLag);
+                IF(take()) {
+                  loadItem();
+                }
+                ELSE {
+                  exhausted = 1;
+                }
               }
             }
           }
