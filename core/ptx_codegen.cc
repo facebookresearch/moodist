@@ -38,15 +38,15 @@ static constexpr uint32_t paramFillWords = 3968;
 static constexpr uint32_t paramFillBlockSize = 256;
 
 // The reduce loop's shared memory (see generateKernel): 2 to reduceMaxStages stages of chunkSize bytes with an mbarrier
-// each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), and 256 bytes
-// of alignment padding
+// each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), 16 bytes for
+// the flag of the NVLS check (kernels with NVLS reductions), and 256 bytes of alignment padding
 static constexpr uint32_t reduceResults = 2;
 static constexpr uint32_t reduceMaxStages = 16;
 static size_t reduceStageBytes(const KernelConfig& config) {
   return config.chunkSize + 8;
 }
 static size_t reduceFixedBytes(const KernelConfig& config) {
-  return 256 + reduceResults * config.chunkSize + 8 * (reduceMaxStages + 2);
+  return 256 + reduceResults * config.chunkSize + 8 * (reduceMaxStages + 2) + 16;
 }
 
 std::string reduceConfigError(const KernelConfig& config) {
@@ -87,8 +87,12 @@ static constexpr size_t nvlsReduceLocalMinRanks = 12;
 // The multimem.ld_reduce of a 16-byte vector of a dtype for a reduce op: perVector instructions of op (the forms of the
 // integers and of float64 have no vectors: 4 or 8 bytes each, into 64-bit registers if wide), or none. No min / max of
 // floating point types: multimem.ld_reduce has none for float32 and float64, and those of float16 and bfloat16 return
-// the other value where one is NaN (GB300), where the reduce loop propagates NaN. (Sums of float types in the switches
-// start from +0: a sum of -0 only is +0, where the reduce loop's is -0.)
+// the other value where one is NaN (GB300), where the reduce loop propagates NaN. No average of float16: the switches
+// round the sum to float16, which overflows where the average does not (from 65504 / N), where the reduce loop
+// divides the float32 sum. (Sums of float types in the switches start from +0: a sum of -0 only is +0, where the
+// reduce loop's is -0. Their sums of 16-bit floats are within 1 ulp of the exact sum, but not always the nearest
+// value: on 8 GB300, 24-26% of the elements of sums of random values were 1 ulp off, with no bias measurable, where the
+// reduce loop rounds to nearest. Integer sums wrap, as the reduce loop's.)
 struct NvlsReduceInst {
   const char* op;
   uint32_t perVector;
@@ -107,7 +111,7 @@ std::optional<NvlsReduceInst> nvlsReduceInst(DType dtype, compile_op::ReduceOp r
   case DType::BFloat16:
     return sum ? std::optional<NvlsReduceInst>({"add.acc::f32.v4.bf16x2", 1, false}) : std::nullopt;
   case DType::Float16:
-    return sum ? std::optional<NvlsReduceInst>({"add.acc::f32.v4.f16x2", 1, false}) : std::nullopt;
+    return reduce == ReduceOp::Sum ? std::optional<NvlsReduceInst>({"add.acc::f32.v4.f16x2", 1, false}) : std::nullopt;
   case DType::Float64:
     return sum ? std::optional<NvlsReduceInst>({"add.f64", 2, true}) : std::nullopt;
   case DType::Int32:
@@ -153,9 +157,9 @@ bool compile_op::nvlsReductionsPossible(const Group* group, DType dtype, ReduceO
 }
 
 uint64_t compile_op::nvlsReductionMaxBytes(DType dtype) {
-  // int32 takes four 4-byte multimem.ld_reduce per vector, at a quarter of the rate of the vector forms: all-reduce on
-  // 32 GB300, NVLS against the reduce loop: 1 MiB 29 / 46 us, 4 MiB 45 / 50 us, 8 MiB 69 / 53 us, 256 MiB 1554 / 894
-  // us (float64 and int64, two 8-byte ones, were faster at every size: 256 MiB 818 / 859-894 us)
+  // int32 takes four 4-byte multimem.ld_reduce per vector, where the vector forms take one: all-reduce on 32 GB300,
+  // NVLS against the reduce loop: 1 MiB 29 / 46 us, 4 MiB 45 / 50 us, 8 MiB 69 / 53 us, 256 MiB 1554 / 894 us (bfloat16
+  // with NVLS: 551 us; float64 and int64, two 8-byte ones, were faster at every size: 256 MiB 818 / 859-894 us)
   return dtype == DType::Int32 ? (4 << 20) : std::numeric_limits<uint64_t>::max();
 }
 
@@ -936,23 +940,25 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     };
 
     // NVLS reductions: a reduction with a source on every rank of the group, at the same tensor and offset on each (see
-    // nvlsReductionShape), can load each 16-byte vector of its result with one multimem.ld_reduce from the multicast
-    // address of its local source (the switches combine the values of every member of the multicast object), and
-    // store it with one multimem.st to the multicast address of its local destination if it has a destination on every
-    // rank too (an all-reduce's: each GPU then sends its input once and receives the result once, (1 + 1/N) times the
-    // data instead of 2 (N - 1) / N with unicast pieces), else to its one destination, on this rank (a
-    // reduce-scatter's, a reduce to one rank's). A rank does so if every edge it executes is such an edge, in groups of
-    // at least nvlsReduceMinRanks ranks (nvlsReduceLocalMinRanks with one destination), for the dtypes and reduce ops
-    // that multimem.ld_reduce has (see nvlsReduceInst) and up to nvlsReductionMaxBytes. Every launch checks the sources
-    // too (a multimem.ld_reduce at an offset where a member has no memory bound makes the context fail with
-    // CUDA_ERROR_CONTAINED); a launch that cannot use NVLS runs the reduce loop. On 32 GB300 (bfloat16): all-reduce of
-    // 64 KiB in 18 us, 256 MiB in 551 us, against 31 and 842 us with the reduce loop.
+    // nvlsReductionShape), can load each 16-byte vector of its result with multimem.ld_reduce (one, or two or four for
+    // float64 and the integers, see nvlsReduceInst) from the multicast address of its local source (the switches
+    // combine the values of every member of the multicast object), and store it with one multimem.st to the multicast
+    // address of its local destination if it has a destination on every rank too (an all-reduce's: each GPU then sends
+    // its input once and receives the result once, (1 + 1/N) times the data instead of 2 (N - 1) / N with unicast
+    // pieces), else to its one destination, on this rank (a reduce-scatter's, a reduce to one rank's). A rank does so
+    // if every edge it executes is such an edge, in groups of at least nvlsReduceMinRanks ranks
+    // (nvlsReduceLocalMinRanks with one destination), for the dtypes and reduce ops that multimem.ld_reduce has (see
+    // nvlsReduceInst) and up to nvlsReductionMaxBytes. Every launch checks the sources too (a multimem.ld_reduce at an
+    // offset where a member has no memory bound makes the context fail with CUDA_ERROR_CONTAINED); a launch that cannot
+    // use NVLS runs the reduce loop. On 32 GB300 (bfloat16): all-reduce of 64 KiB in 18 us, 256 MiB in 551 us, against
+    // 31 and 842 us with the reduce loop.
     // The bytes of the vectors that a thread has in flight (nvlsReduceVectors of 16 bytes, an item of a warp), and the
     // bytes that the GPUs of an op have in flight together: in the probe, the fewest blocks that were fastest held
     // 128 KiB per GPU with 32 GPUs, 256 KiB with 16 and 1 MiB with 4 (there limited by the SMs: each GPU combines a
     // quarter of the tensor), about 4 MiB in all; more were slower with 32 (16 blocks of 512 threads with 8 vectors of
     // each: 573 us at 256 MiB). A rank's blocks take its share of that (its bytes of the op's NVLS reductions: the
-    // root of a reduce to one rank takes them all).
+    // root of a reduce to one rank takes them all, but at most the grid, tuned for the reduce loop, which can limit
+    // it: on 16 GB300, 256 MiB took 1.82 ms with the tuned grid, 3.46 ms with 8 blocks, 1.30 with 32, 1.29 with 64).
     static constexpr uint32_t nvlsReduceVectors = 8;
     static constexpr uint32_t nvlsReduceItemBytes = 32 * 16 * nvlsReduceVectors;
     static constexpr uint64_t nvlsReduceInFlightBytes = 4 << 20;
@@ -1443,8 +1449,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       std::string error = reduceConfigError(config);
       REQUIRE(error.empty(), "compile_op: %s", error);
       const size_t perStage = reduceStageBytes(config);
-      // (with NVLS reductions, the check's flag)
-      size_t fixed = reduceFixedBytes(config) + (nvlsReduceLocal ? 16 : 0);
+      // (including, with NVLS reductions, the check's flag)
+      size_t fixed = reduceFixedBytes(config);
       if (pipeTableBytes <= pipeTableSharedLimit && config.sharedMemory >= fixed + pipeTableBytes + 2 * perStage) {
         pipeTableInShared = true;
         fixed += pipeTableBytes;
@@ -2691,13 +2697,23 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       // four or two instructions for the integers and float64, whose forms have no vectors), divides them for an
       // average, and stores them with multimem.st to the multicast address of the local destination (an all-reduce's:
       // every rank receives the result), or to the local destination. The switches combine 16-bit floats in f32
-      // (.acc::f32) and round once; an average divides the rounded sum (exact with a power of 2 ranks).
+      // (.acc::f32) and return their sums within 1 ulp (see nvlsReduceInst); an average (of bfloat16: not of float16,
+      // see there) divides that sum (exactly with a power of 2 ranks).
       auto nvlsReduceLoop = [&]() {
         profiling.enter("nvls reduce");
         using compile_op::ReduceOp;
         const DType dtype = graph.tensors.at(0).dtype;
         const NvlsReduceInst inst = nvlsReduceInst(dtype, graph.reduce).value();
         const bool avg = graph.reduce == ReduceOp::Avg;
+        CHECK(!avg || dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::BFloat16);
+        // The stores the edges need: multicast stores (edgeNvlsStore), stores to the local destination, or both
+        bool anyMulticast = false;
+        bool anyLocalStore = false;
+        for (const PipeEdge& p : pipeEdges) {
+          if (p.flags & edgeNvls) {
+            ((p.flags & edgeNvlsStore) ? anyMulticast : anyLocalStore) = true;
+          }
+        }
         u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
         IF(blockIndex < nvlsReduceBlocks) {
           Value isLaneZero = laneIndex == 0;
@@ -2773,22 +2789,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                     arith("div.rn.f32", w, w, divisor);
                     continue;
                   }
-                  // A pair of 16-bit floats (cvt.rn.bf16x2.f32 d, a, b puts a in the upper half)
+                  // A pair of bfloat16 (cvt.rn.bf16x2.f32 d, a, b puts a in the upper half)
                   Value lo(ValType::U32);
                   Value hi(ValType::U32);
-                  if (dtype == DType::BFloat16) {
-                    lo = w << 16;
-                    hi = w & 0xffff0000ll;
-                  } else {
-                    Value lo16(ValType::U16);
-                    Value hi16(ValType::U16);
-                    unpack_b32(lo16, hi16, w);
-                    arith("cvt.f32.f16", lo, lo16);
-                    arith("cvt.f32.f16", hi, hi16);
-                  }
+                  lo = w << 16;
+                  hi = w & 0xffff0000ll;
                   arith("div.rn.f32", lo, lo, divisor);
                   arith("div.rn.f32", hi, hi, divisor);
-                  arith(dtype == DType::BFloat16 ? "cvt.rn.bf16x2.f32" : "cvt.rn.f16x2.f32", w, hi, lo);
+                  arith("cvt.rn.bf16x2.f32", w, hi, lo);
                 }
               }
               if (inst.wide) {
@@ -2800,14 +2808,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             // of a multimem.st (and multimem.red) under a PTX predicate, storing every vector (past the end of an
             // edge too: an all-reduce of 64 KiB on 32 GB300 overwrote other pieces on every rank, a reduce-scatter
             // wrote past its outputs); a branch, which it turns into a predicated store itself, works (ptxas of
-            // CUDA 13.2 keeps both)
+            // CUDA 13.2 keeps both). (Only the stores that some edge needs: no multimem.st without multicast stores.)
             for (uint32_t v : range(nvlsReduceVectors)) {
               u64 address = destination + offsets[v];
-              IF_D(valid[v] & multicast) {
-                multimem_st_relaxed_sys_v4(address, x[v]);
+              if (anyMulticast) {
+                IF_D(valid[v] & multicast) {
+                  multimem_st_relaxed_sys_v4(address, x[v]);
+                }
               }
-              Value toLocal = valid[v] & !multicast;
-              PRED(toLocal) st_global_v4_b32(address, x[v]);
+              if (anyLocalStore) {
+                Value toLocal = valid[v] & !multicast;
+                PRED(toLocal) st_global_v4_b32(address, x[v]);
+              }
             }
             item = shfl_sync_idx_b32(claim, 0, 0x1f);
           }

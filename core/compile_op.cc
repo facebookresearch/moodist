@@ -4498,9 +4498,11 @@ struct CompileOpConstructor {
     // tuneKernels generates and times (bfloat16 all-reduce on 32 GB300 in one domain, one pass / two phases: 64 MiB,
     // i.e. pieces of 2 MiB, 223 / 232 us; 128 MiB 470 / 437 us; 256 MiB 937 / 894 us; 512 MiB 1.86 / 1.65 ms; on 16:
     // 64 MiB 226 / 227 us, 256 MiB 881 / 825 us).
-    // Reductions that can use NVLS (multimem.ld_reduce, see generateKernel) only do in one pass, faster than either
-    // (all-reduce on 32 GB300: 256 MiB in 551 us, in one pass 892, in two phases 894): no two phases where some rank
-    // has such a reduction (unless forced), though a launch whose tensors are not where NVLS needs them runs one pass.
+    // Reductions that use NVLS (multimem.ld_reduce, see generateKernel) only do in one pass, faster than either
+    // (all-reduce of 256 MiB on 32 GB300: 551 us, against 842-892 us in one pass and 894 us in two phases): no two
+    // phases (unless forced) if generateKernel will use NVLS, as far as compile can tell, i.e. every rank can (the
+    // group, dtype and reduce op allow it), and the ranks whose edges all have the shape for it have some reductions
+    // and at most nvlsReductionMaxBytes. (A launch whose tensors are not where NVLS needs them then runs one pass.)
     static constexpr size_t twoPhaseMinBytes = 2 << 20;
     Vector<std::string> graphNames = agreedEnvList("MOODIST_COMPILE_OP_GRAPHS", "multicast");
     if (isReduction(reduce)) {
@@ -4508,28 +4510,38 @@ struct CompileOpConstructor {
       Graph twoPhase = baseGraph;
       const bool mine =
           phases != "1" && twoPhaseReductions(ictx, twoPhase, dtype, phases == "2" ? 0 : twoPhaseMinBytes);
-      // (the bytes of this rank's reductions that have the shape for NVLS)
+      // Whether this rank can use NVLS, and the bytes of its reductions if every edge it executes has the shape for it
+      // (a rank's kernel uses NVLS for all its edges or for none)
+      const bool nvlsPossible = nvlsReductionsPossible(group, dtype, reduce, ctx.collectiveOp);
       uint64_t nvlsBytes = 0;
-      if (nvlsReductionsPossible(group, dtype, reduce, ctx.collectiveOp)) {
+      if (nvlsPossible) {
+        bool all = true;
         for (const Edge& e : baseGraph.edges) {
-          if (e.executorRank == rank && e.sources.size() > 1 && nvlsReductionShape(e, size)) {
+          if (e.executorRank == rank) {
+            all &= nvlsReductionShape(e, size);
             nvlsBytes += e.bytes;
           }
         }
+        if (!all) {
+          nvlsBytes = 0;
+        }
       }
       for (size_t i : range(size)) {
-        ctx.send(i, mine, nvlsBytes);
+        ctx.send(i, mine, nvlsPossible, nvlsBytes);
       }
       bool anyTwoPhase = false;
+      bool nvlsEverywhere = true;
       uint64_t nvlsBytesTotal = 0;
       for (size_t i : range(size)) {
         bool v;
+        bool p;
         uint64_t b;
-        ctx.receive(i, v, b);
+        ctx.receive(i, v, p, b);
         anyTwoPhase |= v;
+        nvlsEverywhere &= p;
         nvlsBytesTotal += b;
       }
-      if (nvlsBytesTotal > 0 && nvlsBytesTotal <= nvlsReductionMaxBytes(dtype) && phases != "2") {
+      if (nvlsEverywhere && nvlsBytesTotal > 0 && nvlsBytesTotal <= nvlsReductionMaxBytes(dtype) && phases != "2") {
         anyTwoPhase = false;
       }
       if (phases != "2" || !anyTwoPhase) {
