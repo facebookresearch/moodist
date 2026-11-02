@@ -160,6 +160,17 @@ inline bool isReduction(ReduceOp reduce) {
   return reduce == ReduceOp::Sum || reduce == ReduceOp::Avg || reduce == ReduceOp::Min || reduce == ReduceOp::Max;
 }
 
+// NVLS reductions (multimem.ld_reduce, see generateKernel in ptx_codegen.cc). Whether a reduction edge has their
+// shape: a source on every rank of the group (of groupSize ranks), at the same tensor and offset on each, and a
+// destination on every rank (likewise; stored with multicast stores) or one, on the edge's executor. And whether an
+// op's reductions in the group could use them: the group (one NVLink domain, enough ranks, multicast support), the
+// dtype and the reduce op (what multimem.ld_reduce combines), not the edges.
+bool nvlsReductionShape(const Graph::Edge& e, size_t groupSize);
+bool nvlsReductionsPossible(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp);
+// The most bytes that an op's NVLS reductions (all its ranks' together) may combine to use them (larger ones use the
+// reduce loop)
+uint64_t nvlsReductionMaxBytes(DType dtype);
+
 // The name of a reduce op, as compile_op takes it
 inline const char* reduceName(ReduceOp reduce) {
   switch (reduce) {

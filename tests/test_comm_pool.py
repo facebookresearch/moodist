@@ -4,7 +4,8 @@ same offset in the group's pool on every rank when all ranks allocate and free i
 allocate; compile_op ops store to such buffers with NVLink multicast (NVLS) where the group supports it (at least 16
 ranks in one NVLink domain), and to each rank otherwise.
 
-Set MOODIST_TEST_EXPECT_NVLS=1 when the group supports NVLS, to also check that the launches use it.
+Set MOODIST_TEST_EXPECT_NVLS=1 when the group is in one NVLink domain that supports NVLS, to also check that the
+launches use it (copies with 16 ranks or more).
 """
 
 import os
@@ -17,6 +18,11 @@ from framework import TestContext, test, create_process_group
 moodist.enable_cuda_allocator()
 
 EXPECT_NVLS = os.environ.get("MOODIST_TEST_EXPECT_NVLS") == "1"
+
+
+def expect_nvls(ctx):
+    """Whether the all-gathers must use NVLS (copies use it from 16 ranks on)."""
+    return EXPECT_NVLS and ctx.world_size >= 16
 
 
 def gather_ints(pg, ctx, values):
@@ -132,7 +138,7 @@ def test_comm_pool_allgather(ctx: TestContext):
             del out
         torch.cuda.synchronize()
         used = pg._get_option("nvls_launches") - launches0
-        if EXPECT_NVLS:
+        if expect_nvls(ctx):
             ctx.assert_true(used == iterations, f"numel {numel}: {used} of {iterations} launches used NVLS")
 
 
@@ -168,7 +174,7 @@ def test_comm_pool_allgather_mismatch(ctx: TestContext):
         ctx.assert_true(bool((out == expected_allgather(ctx, numel, 10 + it)).all()), f"iteration {it}")
         del out
     torch.cuda.synchronize()
-    if EXPECT_NVLS:
+    if expect_nvls(ctx):
         used = pg._get_option("nvls_launches") - launches0
         ctx.assert_true(used == 4, f"{used} of 4 launches used NVLS")
 

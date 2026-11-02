@@ -596,8 +596,20 @@ void fence_release_sys();
 void fence_acquire_gpu();
 void fence_release_gpu();
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
+// The multimem instructions below: never under PRED. The ptxas of CUDA 13.0 (the JIT of driver 580) drops the
+// predicate of a predicated multimem.st or multimem.red (the instruction then always executes); under a branch (IF_D),
+// which it turns into a predicated instruction itself, they work.
 // addr is a multicast address: the add reaches every member's memory
 void multimem_red_relaxed_sys_add_u32(const Value& addr, const Value& val);
+// multimem.ld_reduce.relaxed.sys.global.<opType> at a multicast address: the values of every member's memory there,
+// combined by the NVLink switches (opType e.g. "add.acc::f32.v4.bf16x2" into four 32-bit registers, or "add.f64" into
+// one 64-bit register). Every member must have memory bound at the address.
+void multimem_ld_reduce_relaxed_sys_v4(const char* opType, const std::array<Value, 4>& d, const Value& addr);
+void multimem_ld_reduce_relaxed_sys(const char* opType, const Value& d, const Value& addr);
+// multimem.st.relaxed.sys.global.v4.f32: 16 bytes (any type) to every member's memory at a multicast address
+void multimem_st_relaxed_sys_v4(const Value& addr, const std::array<Value, 4>& v);
+// st.global.v4.b32
+void st_global_v4_b32(const Value& addr, const std::array<Value, 4>& v);
 void st_global_relaxed_sys_u64(const Value& addr, const Value& val);
 void st_global_release_sys_u32(const Value& addr, const Value& val);
 void ld_global_cv_v4_u32(const Value& d0, const Value& d1, const Value& d2, const Value& d3, const Value& addr);

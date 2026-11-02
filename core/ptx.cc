@@ -699,6 +699,21 @@ void st_global_relaxed_sys_u32(const Value& addr, const Value& val) {
 void multimem_red_relaxed_sys_add_u32(const Value& addr, const Value& val) {
   emitInst("multimem.red.relaxed.sys.global.add.u32 [" + addr.str() + "], " + val.str());
 }
+void multimem_ld_reduce_relaxed_sys_v4(const char* opType, const std::array<Value, 4>& d, const Value& addr) {
+  emitInst(std::string("multimem.ld_reduce.relaxed.sys.global.") + opType + " {" + d[0].str() + ", " + d[1].str() +
+           ", " + d[2].str() + ", " + d[3].str() + "}, [" + addr.str() + "]");
+}
+void multimem_ld_reduce_relaxed_sys(const char* opType, const Value& d, const Value& addr) {
+  emitInst(std::string("multimem.ld_reduce.relaxed.sys.global.") + opType + " " + d.str() + ", [" + addr.str() + "]");
+}
+void multimem_st_relaxed_sys_v4(const Value& addr, const std::array<Value, 4>& v) {
+  emitInst("multimem.st.relaxed.sys.global.v4.f32 [" + addr.str() + "], {" + v[0].str() + ", " + v[1].str() + ", " +
+           v[2].str() + ", " + v[3].str() + "}");
+}
+void st_global_v4_b32(const Value& addr, const std::array<Value, 4>& v) {
+  emitInst("st.global.v4.b32 [" + addr.str() + "], {" + v[0].str() + ", " + v[1].str() + ", " + v[2].str() + ", " +
+           v[3].str() + "}");
+}
 void st_global_relaxed_sys_u64(const Value& addr, const Value& val) {
   emitInst("st.relaxed.sys.global.u64 [" + addr.str() + "], " + val.str());
 }
