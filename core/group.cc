@@ -1690,28 +1690,36 @@ bool Group::setupNvls() {
   access.location.id = deviceIndex;
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-  // The multicast objects (see Nvls): the pool's (the pool, then the counter area) and the communication pool's. Rank
-  // 0 creates them, the others import them, and every device must be added before any rank binds memory to them.
+  // The multicast objects (see Nvls) of this rank's NVLink domain (the ranks of the group in it, fabricDomainRanks):
+  // the pool's (the pool, then the counter area) and the communication pool's. The domain's first rank creates them,
+  // the others import them, and every device must be added before any rank binds memory to them. A rank alone in its
+  // domain (or without a fabric) has none, and takes part in the exchanges only.
+  const bool member = fabricDomainRanks.size() >= 2;
+  const size_t creator = member ? fabricDomainRanks[0] : rank;
   constexpr size_t numObjects = 2;
   const std::array<size_t, numObjects> objectBytes = {Nvls::poolBytes + countersBytes, commPoolLogicalSize};
   std::array<CUmemGenericAllocationHandle, numObjects> objects = {};
   CUmulticastObjectProp prop;
   std::memset(&prop, 0, sizeof(prop));
-  prop.numDevices = size;
+  prop.numDevices = fabricDomainRanks.size();
   prop.size = objectBytes[0];
   prop.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   size_t granularity = 0;
-  check(cuMulticastGetGranularity(&granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM), "cuMulticastGetGranularity");
-  if (error.empty() && (granularity == 0 || objectBytes[0] % granularity != 0 || objectBytes[1] % granularity != 0 ||
-                           allocatorGetReservedBase() == 0)) {
-    error =
-        fmt::sprintf("multicast granularity %d, allocator reservation at %#x", granularity, allocatorGetReservedBase());
+  if (member) {
+    check(
+        cuMulticastGetGranularity(&granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM), "cuMulticastGetGranularity");
+    if (error.empty() && (granularity == 0 || objectBytes[0] % granularity != 0 || objectBytes[1] % granularity != 0 ||
+                             allocatorGetReservedBase() == 0)) {
+      error = fmt::sprintf(
+          "multicast granularity %d, allocator reservation at %#x", granularity, allocatorGetReservedBase());
+    }
   }
   std::array<CUmemFabricHandle, numObjects> fabricHandles;
   std::memset(&fabricHandles, 0, sizeof(fabricHandles));
   for (size_t i : range(numObjects)) {
     prop.size = objectBytes[i];
-    if (rank == 0 && error.empty() && check(cuMulticastCreate(&objects[i], &prop), "cuMulticastCreate")) {
+    if (member && rank == creator && error.empty() &&
+        check(cuMulticastCreate(&objects[i], &prop), "cuMulticastCreate")) {
       check(cuMemExportToShareableHandle(&fabricHandles[i], objects[i], CU_MEM_HANDLE_TYPE_FABRIC, 0),
           "cuMemExportToShareableHandle");
     }
@@ -1721,8 +1729,9 @@ bool Group::setupNvls() {
     return false;
   }
   for (size_t i : range(numObjects)) {
-    if (rank == 0 || check(cuMemImportFromShareableHandle(&objects[i], &handles.at(0)[i], CU_MEM_HANDLE_TYPE_FABRIC),
-                         "cuMemImportFromShareableHandle")) {
+    if (member && (rank == creator || check(cuMemImportFromShareableHandle(
+                                                &objects[i], &handles.at(creator)[i], CU_MEM_HANDLE_TYPE_FABRIC),
+                                          "cuMemImportFromShareableHandle"))) {
       check(cuMulticastAddDevice(objects[i], cuDevice), "cuMulticastAddDevice");
     }
   }
@@ -1740,7 +1749,7 @@ bool Group::setupNvls() {
   counterProp.location.id = deviceIndex;
   CUmemGenericAllocationHandle counters = 0;
   CUdeviceptr countersLocal = 0;
-  if (check(cuMemCreate(&counters, countersBytes, &counterProp, 0), "cuMemCreate (counters)") &&
+  if (member && check(cuMemCreate(&counters, countersBytes, &counterProp, 0), "cuMemCreate (counters)") &&
       check(cuMemAddressReserve(&countersLocal, countersBytes, granularity, 0, 0), "cuMemAddressReserve (counters)") &&
       check(cuMemMap(countersLocal, countersBytes, 0, counters, 0), "cuMemMap (counters)") &&
       check(cuMemSetAccess(countersLocal, countersBytes, &access, 1), "cuMemSetAccess (counters)") &&
@@ -1752,20 +1761,24 @@ bool Group::setupNvls() {
 
   // Every chunk of the pool at its offset, and every slab of the communication pool at its logical offset: the
   // existing ones now, new ones when the allocator adds them (binding does not wait for the GPU)
-  if (error.empty()) {
+  if (member && error.empty()) {
     allocatorAddChunkListener(nvlsBindChunk, internalNew<NvlsBinder>(objects[0], Nvls::poolBytes));
     allocatorCommPoolAddSlabListener(getCommPool(), nvlsBindSlab, internalNew<NvlsBinder>(objects[1], objectBytes[1]));
   }
 
   std::array<CUdeviceptr, numObjects> mcBases = {};
   for (size_t i : range(numObjects)) {
-    if (error.empty() &&
+    if (member && error.empty() &&
         check(cuMemAddressReserve(&mcBases[i], objectBytes[i], granularity, 0, 0), "cuMemAddressReserve") &&
         check(cuMemMap(mcBases[i], objectBytes[i], 0, objects[i], 0), "cuMemMap")) {
       check(cuMemSetAccess(mcBases[i], objectBytes[i], &access, 1), "cuMemSetAccess");
     }
   }
   if (!agree()) {
+    return false;
+  }
+  if (!member) {
+    nvls.state = -1;
     return false;
   }
   nvls.mcBase = mcBases[0];
@@ -1775,9 +1788,9 @@ bool Group::setupNvls() {
   nvls.launches = countersLocal;
   nvls.nextCounters = 64;
   nvls.state = 1;
-  if (rank == 0) {
-    log.info("NVLS (multicast) set up for group %s (%d ranks) in %g ms\n", name, size,
-        seconds(std::chrono::steady_clock::now() - start) * 1000);
+  if (rank == fabricDomainRanks[0]) {
+    log.info("NVLS (multicast) set up for group %s: the %d ranks of the NVLink domain of rank %d, in %g ms\n", name,
+        fabricDomainRanks.size(), rank, seconds(std::chrono::steady_clock::now() - start) * 1000);
   }
   return true;
 }

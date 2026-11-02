@@ -69,11 +69,28 @@ bool nvlsEnabled() {
   return !env || std::string_view(env) != "0";
 }
 // What NVLS needs of the group and the op, besides its edges and tensors: an op not behind a process group collective,
-// in a group of at least minRanks ranks, all in one NVLink domain, that supports multicast (and has not failed to set
-// up its multicast objects), with moodist's allocator pool
-bool nvlsGroupCapable(const Group* g, bool collectiveOp, size_t minRanks) {
-  return nvlsEnabled() && !collectiveOp && g->size >= minRanks && g->supportsMulticast &&
-         g->fabricDomainRanks.size() == g->size && g->nvls.state != -1 && allocatorGetReservedBase() != 0;
+// this rank in an NVLink domain of at least minRanks ranks of the group (its multicast objects are the domain's, see
+// Group::Nvls) that supports multicast (and has not failed to set up its multicast objects), moodist's allocator pool
+bool nvlsDomainCapable(const Group* g, bool collectiveOp, size_t minRanks) {
+  return nvlsEnabled() && !collectiveOp && g->fabricDomainRanks.size() >= minRanks && g->supportsMulticast &&
+         g->nvls.state != -1 && allocatorGetReservedBase() != 0;
+}
+// Whether nodes are one per rank of an NVLink domain (its ranks sorted), at the same tensor and offset on each, of CUDA
+// tensors
+bool nvlsDomainNodes(std::span<const compile_op::Graph::Node> nodes, std::span<const size_t> domain) {
+  if (nodes.size() != domain.size() || nodes.empty()) {
+    return false;
+  }
+  Vector<uint8_t> seen(domain.size());
+  for (const compile_op::Graph::Node& n : nodes) {
+    auto it = std::ranges::lower_bound(domain, (size_t)n.rank);
+    if (it == domain.end() || *it != n.rank || seen[it - domain.begin()] || n.tensorIndex != nodes[0].tensorIndex ||
+        n.offset != nodes[0].offset || n.device != DeviceType::CUDA) {
+      return false;
+    }
+    seen[it - domain.begin()] = 1;
+  }
+  return true;
 }
 // NVLS reductions (see generateKernel) from this many ranks, those with a destination on every rank (multicast stores,
 // an all-reduce's) from nvlsReduceMinRanks, those with one destination (a reduce-scatter's, a reduce to one rank's)
@@ -84,6 +101,11 @@ bool nvlsGroupCapable(const Group* g, bool collectiveOp, size_t minRanks) {
 // was as fast as the reduce loop, 601 / 599 us at 256 MiB)
 static constexpr size_t nvlsReduceMinRanks = 8;
 static constexpr size_t nvlsReduceLocalMinRanks = 12;
+// NVLS runs of destinations alone (see nvlsReductionRuns: the multicast stores of an edge whose sources are not a run,
+// e.g. an all-reduce's results across NVLink domains) from this many ranks, as copies with multicast stores (see
+// nvlsMinRanks in generateKernel): across 2 domains of 8 GB300, an all-reduce of 256 MiB took 874 us with them, 772
+// us without (the switches also send each chunk back to its sender, 1/8 of a GPU's ingress)
+static constexpr size_t nvlsStoreMinRanks = 16;
 // The multimem.ld_reduce of a 16-byte vector of a dtype for a reduce op: perVector instructions of op (the forms of the
 // integers and of float64 have no vectors: 4 or 8 bytes each, into 64-bit registers if wide), or none. No min / max of
 // floating point types: multimem.ld_reduce has none for float32 and float64, and those of float16 and bfloat16 return
@@ -125,35 +147,53 @@ std::optional<NvlsReduceInst> nvlsReduceInst(DType dtype, compile_op::ReduceOp r
 }
 } // namespace
 
-bool compile_op::nvlsReductionShape(const Graph::Edge& e, size_t groupSize) {
-  // A node on every rank of the group, at the same tensor and offset on each
-  auto everyRank = [&](const Vector<Graph::Node>& nodes) {
-    if (nodes.size() != groupSize) {
-      return false;
-    }
-    Vector<uint8_t> seen(groupSize);
-    for (const Graph::Node& n : nodes) {
-      if (n.rank >= groupSize || seen[n.rank] || n.tensorIndex != nodes[0].tensorIndex || n.offset != nodes[0].offset ||
-          n.device != DeviceType::CUDA) {
-        return false;
-      }
-      seen[n.rank] = 1;
-    }
-    return true;
-  };
-  if (groupSize < 2 || e.hasSignals() || e.partialSources != 0 || !everyRank(e.sources) ||
+namespace {
+// The first n nodes
+std::span<const compile_op::Graph::Node> firstNodes(const Vector<compile_op::Graph::Node>& nodes, size_t n) {
+  return std::span<const compile_op::Graph::Node>(nodes.data(), std::min(n, nodes.size()));
+}
+} // namespace
+
+bool compile_op::nvlsReductionShape(const Graph::Edge& e, std::span<const size_t> domain) {
+  if (domain.size() < 2 || e.hasSignals() || e.partialSources != 0 ||
+      !nvlsDomainNodes(firstNodes(e.sources, e.sources.size()), domain) ||
       !std::ranges::all_of(e.sources, &Graph::Node::filled)) {
     return false;
   }
   if (e.destinations.size() == 1) {
-    return groupSize >= nvlsReduceLocalMinRanks && e.destinations[0].rank == e.executorRank &&
+    return domain.size() >= nvlsReduceLocalMinRanks && e.destinations[0].rank == e.executorRank &&
            e.destinations[0].device == DeviceType::CUDA;
   }
-  return everyRank(e.destinations);
+  return nvlsDomainNodes(firstNodes(e.destinations, e.destinations.size()), domain);
+}
+
+compile_op::NvlsRuns compile_op::nvlsReductionRuns(const Graph::Edge& e, std::span<const size_t> domain) {
+  NvlsRuns r;
+  const size_t k = domain.size();
+  if (k < nvlsReduceMinRanks) {
+    return r;
+  }
+  // The sources (those of the executor's domain come first, then those of other domains and the partial results, see
+  // crossDomainReductions in compile_op.cc): inputs, there at the start (no waits)
+  bool sources = e.sources.size() >= k + e.partialSources && nvlsDomainNodes(firstNodes(e.sources, k), domain);
+  for (size_t i : range(sources ? k : 0)) {
+    sources &= e.sources[i].filled && (i >= e.sourceWaits.size() || e.sourceWaits[i].index < 0);
+  }
+  const bool destinations = e.destinations.size() >= k && nvlsDomainNodes(firstNodes(e.destinations, k), domain);
+  // Both, from nvlsReduceMinRanks (as an all-reduce of nvlsReduceLoop); sources alone (one destination) from
+  // nvlsReduceLocalMinRanks; destinations alone from nvlsStoreMinRanks
+  r.sources = sources && (destinations || k >= nvlsReduceLocalMinRanks);
+  r.destinations = destinations && (sources || k >= nvlsStoreMinRanks);
+  return r;
+}
+
+bool compile_op::nvlsMulticastRuns(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp) {
+  return nvlsReductionsPossible(group, dtype, reduce, collectiveOp) &&
+         group->fabricDomainRanks.size() >= nvlsStoreMinRanks;
 }
 
 bool compile_op::nvlsReductionsPossible(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp) {
-  return nvlsGroupCapable(group, collectiveOp, nvlsReduceMinRanks) && nvlsReduceInst(dtype, reduce).has_value();
+  return nvlsDomainCapable(group, collectiveOp, nvlsReduceMinRanks) && nvlsReduceInst(dtype, reduce).has_value();
 }
 
 uint64_t compile_op::nvlsReductionMaxBytes(DType dtype) {
@@ -868,6 +908,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // NVLS reductions (with edgeNvls: the NVLS slot of the local source follows the destinations): the result goes to
     // every rank with multicast stores (the NVLS slot of the local destination follows the source's)
     static constexpr uint32_t edgeNvlsStore = 1024;
+    // NVLS runs in the reduce loop (see nvlsReductionRuns): the first domain.size() sources are one, loaded with
+    // multimem.ld_reduce (the NVLS slot of the local source follows the destinations), or the first domain.size()
+    // destinations, stored with one multicast store (the NVLS slot of the local destination follows, after the
+    // source's if any)
+    static constexpr uint32_t edgeNvlsSources = 2048;
+    static constexpr uint32_t edgeNvlsDestinations = 4096;
     // A word of the wait table (a Signal that the kernel waits for, see Edge::sourceWaits): the generation in the low
     // waitGenerationBits bits, the index + 1 in the bits above them (0 if the source does not wait), and waitDoneFlag
     // for a done flag of this kernel's (in cpuInBuffer), else the signal of an RDMA transfer (in rdmaSignalBuffer). A
@@ -939,34 +985,42 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       return local;
     };
 
-    // NVLS reductions: a reduction with a source on every rank of the group, at the same tensor and offset on each (see
+    // NVLS reductions: a reduction with a source on every rank of the executor's NVLink domain (the group's ranks in
+    // it; the multicast objects are per domain, see Group::Nvls), at the same tensor and offset on each (see
     // nvlsReductionShape), can load each 16-byte vector of its result with multimem.ld_reduce (one, or two or four for
     // float64 and the integers, see nvlsReduceInst) from the multicast address of its local source (the switches
     // combine the values of every member of the multicast object), and store it with one multimem.st to the multicast
-    // address of its local destination if it has a destination on every rank too (an all-reduce's: each GPU then sends
-    // its input once and receives the result once, (1 + 1/N) times the data instead of 2 (N - 1) / N with unicast
-    // pieces), else to its one destination, on this rank (a reduce-scatter's, a reduce to one rank's). A rank does so
-    // if every edge it executes is such an edge, in groups of at least nvlsReduceMinRanks ranks
-    // (nvlsReduceLocalMinRanks with one destination), for the dtypes and reduce ops that multimem.ld_reduce has (see
-    // nvlsReduceInst) and up to nvlsReductionMaxBytes. Every launch checks the sources too (a multimem.ld_reduce at an
-    // offset where a member has no memory bound makes the context fail with CUDA_ERROR_CONTAINED); a launch that cannot
-    // use NVLS runs the reduce loop. On 32 GB300 (bfloat16): all-reduce of 64 KiB in 18 us, 256 MiB in 551 us, against
-    // 31 and 842 us with the reduce loop.
-    // The bytes of the vectors that a thread has in flight (nvlsReduceVectors of 16 bytes, an item of a warp), and the
-    // bytes that the GPUs of an op have in flight together: in the probe, the fewest blocks that were fastest held
-    // 128 KiB per GPU with 32 GPUs, 256 KiB with 16 and 1 MiB with 4 (there limited by the SMs: each GPU combines a
-    // quarter of the tensor), about 4 MiB in all; more were slower with 32 (16 blocks of 512 threads with 8 vectors of
-    // each: 573 us at 256 MiB). A rank's blocks take its share of that (its bytes of the op's NVLS reductions: the
-    // root of a reduce to one rank takes them all, but at most the grid, tuned for the reduce loop, which can limit
-    // it: on 16 GB300, 256 MiB took 1.82 ms with the tuned grid, 3.46 ms with 8 blocks, 1.30 with 32, 1.29 with 64).
+    // address of its local destination if it has a destination on every rank of the domain too (an all-reduce's: each
+    // GPU then sends its input once and receives the result once, (1 + 1/N) times the data instead of 2 (N - 1) / N
+    // with unicast pieces), else to its one destination, on this rank (a reduce-scatter's, a reduce to one rank's). A
+    // rank does so (nvlsReduceLoop) if every edge it executes is such an edge, in domains of at least
+    // nvlsReduceMinRanks ranks (nvlsReduceLocalMinRanks with one destination), for the dtypes and reduce ops that
+    // multimem.ld_reduce has (see nvlsReduceInst) and up to nvlsReductionMaxBytes. Every launch checks the sources too
+    // (a multimem.ld_reduce at an offset where a member has no memory bound makes the context fail with
+    // CUDA_ERROR_CONTAINED); a launch that cannot use NVLS runs the reduce loop. On 32 GB300 (bfloat16): all-reduce of
+    // 64 KiB in 18 us, 256 MiB in 551 us, against 31 and 842 us with the reduce loop. NVLS runs: other ranks' edges,
+    // such as those of reductions across NVLink domains (see crossDomainReductions in compile_op.cc), stay in the
+    // reduce loop, which loads the first sources of an edge with multimem.ld_reduce, as one source, if they are a
+    // source on every rank of the domain at the same place (the inputs of the domain; a partial result that it computes
+    // for other domains), and stores to the first destinations with one multicast store if they are a destination on
+    // every rank of the domain at the same place (an all-reduce's result in the domain), see nvlsReductionRuns; the
+    // same ranks, dtypes, reduce ops and checks (an entry per run). The bytes of the vectors that a thread has in
+    // flight (nvlsReduceVectors of 16 bytes, an item of a warp), and the bytes that the GPUs of an op have in flight
+    // together: in the probe, the fewest blocks that were fastest held 128 KiB per GPU with 32 GPUs, 256 KiB with 16
+    // and 1 MiB with 4 (there limited by the SMs: each GPU combines a quarter of the tensor), about 4 MiB in all; more
+    // were slower with 32 (16 blocks of 512 threads with 8 vectors of each: 573 us at 256 MiB). A rank's blocks take
+    // its share of that (its bytes of the op's NVLS reductions: the root of a reduce to one rank takes them all, but at
+    // most the grid, tuned for the reduce loop, which can limit it: on 16 GB300, 256 MiB took 1.82 ms with the tuned
+    // grid, 3.46 ms with 8 blocks, 1.30 with 32, 1.29 with 64).
     static constexpr uint32_t nvlsReduceVectors = 8;
     static constexpr uint32_t nvlsReduceItemBytes = 32 * 16 * nvlsReduceVectors;
     static constexpr uint64_t nvlsReduceInFlightBytes = 4 << 20;
 
-    // Whether the op uses NVLS (decided by all ranks together; the same on every rank), and if so, the chunks this
-    // rank stores with it per launch (0 if none), the ranks that store any (all the same number), the window and
-    // the offset of the op's counters in the group's counter area; with reductions, whether this rank's kernel
-    // reduces with NVLS (when the launch can) and the blocks that do
+    // Whether the op uses NVLS (decided by all ranks of this rank's NVLink domain together, the same on each), and if
+    // so, the chunks this rank stores with it per launch (0 if none), the ranks that store any (all the same number),
+    // the window and the offset of the op's counters in the group's counter area; with reductions, whether this rank's
+    // kernel reduces with NVLS in nvlsReduceLoop (when the launch can) and the blocks that do, or has NVLS runs in the
+    // reduce loop
     bool nvlsOp = false;
     uint32_t nvlsChunks = 0;  // stored by this rank
     uint32_t nvlsSenders = 0; // the ranks that store any
@@ -974,14 +1028,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t nvlsCountersOffset = 0;
     bool nvlsReduceLocal = false;
     uint32_t nvlsReduceBlocks = 0;
+    bool nvlsRunsLocal = false;
+    const std::span<const size_t> domain(ctx.group->fabricDomainRanks.data(), ctx.group->fabricDomainRanks.size());
     if (!tuning) {
       Group* g = ctx.group;
       const bool reduction = compile_op::isReduction(graph.reduce);
+      // The ranks of an op's kernels that exchange with each other decide together (see the exchange below): those of
+      // one domain, if each has exactly the domain's ranks as its peers (ranks), as it does in reductions where a run
+      // (or a reduction of nvlsReduceLoop) touches every rank of the domain. Copies use NVLS only in a group that is
+      // one domain.
+      const bool peersAreDomain = std::ranges::equal(ranks, domain);
       const bool capable =
+          peersAreDomain &&
           (reduction ? !graph.tensors.empty() &&
                            compile_op::nvlsReductionsPossible(g, graph.tensors[0].dtype, graph.reduce, ctx.collectiveOp)
-                     : nvlsGroupCapable(g, ctx.collectiveOp, nvlsMinRanks)) &&
-          ranks.size() == g->size;
+                     : nvlsDomainCapable(g, ctx.collectiveOp, nvlsMinRanks) && domain.size() == g->size);
       uint64_t chunks = 0;
       bool all = capable && !reduction && nowaits && !localCopies.empty();
       for (const Edge& e : localCopies) {
@@ -989,26 +1050,35 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         chunks += (e.bytes + nvlsChunkSize - 1) / nvlsChunkSize;
       }
       uint32_t myChunks = all && chunks < (1u << 30) ? (uint32_t)chunks : 0;
-      // Reductions: the bytes that this rank combines with NVLS (0 if it does not)
+      // Reductions: the bytes that this rank combines with NVLS in nvlsReduceLoop (0 if it does not), else the bytes
+      // of its edges with NVLS runs
       uint64_t reduceBytes = 0;
+      uint64_t runBytes = 0;
       bool reduceAll = capable && reduction && reduceKernel;
       for (const Edge& e : localCopies) {
-        reduceAll &= compile_op::nvlsReductionShape(e, g->size);
+        reduceAll &= compile_op::nvlsReductionShape(e, domain);
         reduceBytes += e.bytes;
+        if (capable && reduction) {
+          const compile_op::NvlsRuns runs = compile_op::nvlsReductionRuns(e, domain);
+          runBytes += runs.sources || runs.destinations ? e.bytes : 0;
+        }
       }
       const uint64_t myReduceBytes = reduceAll ? reduceBytes : 0;
+      const uint64_t myRunBytes = !reduceAll && capable && reduction && reduceKernel ? runBytes : 0;
       for (uint32_t r : ranks) {
-        ctx.send(r, capable, myChunks, myReduceBytes);
+        ctx.send(r, capable, myChunks, myReduceBytes, myRunBytes);
       }
       bool allCapable = true;
       bool uniform = true;
       uint32_t sendersChunks = 0;
       uint64_t reduceBytesTotal = 0;
+      uint64_t runBytesTotal = 0;
       for (uint32_t r : ranks) {
         bool c;
         uint32_t n;
         uint64_t b;
-        ctx.receive(r, c, n, b);
+        uint64_t rb;
+        ctx.receive(r, c, n, b, rb);
         allCapable &= c;
         if (n) {
           uniform &= nvlsSenders == 0 || n == sendersChunks;
@@ -1016,26 +1086,38 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           ++nvlsSenders;
         }
         reduceBytesTotal += b;
+        runBytesTotal += rb;
       }
       // (copies and reductions do not mix: an op with a reduce op has no NVLS copies)
       const bool copies = uniform && nvlsSenders > 0;
-      // (every rank has the same total; a rank without tensors is not capable)
-      if (reduction &&
-          (graph.tensors.empty() || reduceBytesTotal > compile_op::nvlsReductionMaxBytes(graph.tensors[0].dtype))) {
+      // (every rank of the domain has the same totals; a rank without tensors is not capable)
+      if (reduction && (graph.tensors.empty() || reduceBytesTotal + runBytesTotal >
+                                                     compile_op::nvlsReductionMaxBytes(graph.tensors[0].dtype))) {
         reduceBytesTotal = 0;
+        runBytesTotal = 0;
       }
-      // A rank that does not have every rank among its peers says so (capable is false): every rank that does
-      // hears it (the peers of a rank have it among theirs), so they all agree. setupNvls is collective over the
-      // group, which is then all of ranks.
-      nvlsOp = allCapable && (copies || reduceBytesTotal > 0) && g->setupNvls();
+      // A rank whose peers are not its domain's ranks says so (capable is false): every rank that has it among its
+      // peers hears it, and so does every other rank of the domain (whose peers are the domain's ranks, if capable),
+      // so they all agree. setupNvls is collective over the group: copies call it here (the group is one domain, all
+      // of ranks), reductions in compile (compile_op.cc, where every rank takes part), and use its result here.
+      nvlsOp = allCapable && (copies || reduceBytesTotal > 0 || runBytesTotal > 0) &&
+               (reduction ? g->nvls.state == 1 : g->setupNvls());
       if (nvlsOp && copies && g->nvls.nextCounters + nvlsCountersStride * maxConcurrency > Group::Nvls::countersBytes) {
         if (rank == 0) {
           log.error("moodist: compile_op: no NVLS step counters left for more ops; this op does not use NVLS\n");
         }
         nvlsOp = false;
       }
+      rv->nvls = nvlsOp;
+      if (nvlsOp && runBytesTotal > 0) {
+        nvlsRunsLocal = myRunBytes != 0;
+        if (rank == domain[0]) {
+          log.info("compile_op: NVLS: the reduce loop's edges of %d bytes in the NVLink domain of rank %d with "
+                   "multimem.ld_reduce or multicast stores\n",
+              runBytesTotal, rank);
+        }
+      }
       if (nvlsOp && reduceBytesTotal > 0) {
-        rv->nvls = true;
         nvlsReduceLocal = myReduceBytes != 0;
         const uint64_t perBlock = (uint64_t)blockSize * nvlsReduceVectors * 16;
         const uint64_t blocks = (nvlsReduceInFlightBytes * myReduceBytes / reduceBytesTotal + perBlock - 1) / perBlock;
@@ -1044,8 +1126,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         if (const char* env = std::getenv("MOODIST_COMPILE_OP_NVLS_BLOCKS"); env && std::atoi(env) > 0) {
           nvlsReduceBlocks = std::min<uint32_t>(std::atoi(env), numBlocks);
         }
-        if (rank == 0) {
-          log.info("compile_op: NVLS: reductions of %d bytes with multimem.ld_reduce\n", reduceBytesTotal);
+        if (rank == domain[0]) {
+          log.info("compile_op: NVLS: reductions of %d bytes with multimem.ld_reduce in the NVLink domain of rank %d\n",
+              reduceBytesTotal, rank);
         }
       }
       if (nvlsOp && copies) {
@@ -1055,7 +1138,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         // A pipeline holds up to nvlsSignalLag stored but unsignaled chunks while it waits for the counter, so the
         // window must be larger than all of them (8: see the results above)
         nvlsWindow = std::max<uint32_t>(8, config.pipelines * nvlsSignalLag + 1);
-        rv->nvls = true;
         rv->nvlsIncrement = nvlsSenders * sendersChunks;
         if (rank == 0) {
           log.info("compile_op: NVLS: %d ranks store %d chunks of %d bytes each with multicast stores\n", nvlsSenders,
@@ -1066,7 +1148,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // Whether this rank's kernel stores with NVLS (copies), and whether its launches check NVLS identities (copies or
     // reductions)
     const bool nvlsLocal = nvlsChunks != 0;
-    const bool nvlsChecks = nvlsLocal || nvlsReduceLocal;
+    const bool nvlsChecks = nvlsLocal || nvlsReduceLocal || nvlsRunsLocal;
     // In NVLS ops, every rank publishes, besides the address at which a peer maps one of its tensors (the address
     // exchange below), where the tensor is in the group's multicast objects (its "NVLS identity", see nvlsIdentity
     // in processgroup.cc), into a table of the peer's with the layout of the address table. customOp passes the
@@ -1372,9 +1454,32 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           nvlsEdgeTable.push_back({p.addrSlot + 1, numDestinations, p.addrSlot + 1 + numDestinations, 0});
           nvlsChunksTotal += (e.bytes + nvlsChunkSize - 1) / nvlsChunkSize;
         }
+        if (nvlsRunsLocal) {
+          // The NVLS slots of the runs (the local node of each)
+          const compile_op::NvlsRuns runs = compile_op::nvlsReductionRuns(e, domain);
+          const uint32_t k = domain.size();
+          auto local = [&](const Vector<Node>& nodes) {
+            auto it = std::find_if(nodes.begin(), nodes.begin() + k, [&](const Node& n) {
+              return n.rank == rank;
+            });
+            CHECK(it != nodes.begin() + k);
+            NodeSetup m = nodeSetup(*it);
+            m.slot |= 2;
+            pipeAddrSetups.push_back(m);
+            return (uint32_t)pipeAddrSetups.size() - 1;
+          };
+          if (runs.sources) {
+            nvlsEdgeTable.push_back({p.addrSlot, k, local(e.sources), 0});
+            p.flags |= edgeNvlsSources;
+          }
+          if (runs.destinations) {
+            nvlsEdgeTable.push_back({p.addrSlot + (uint32_t)e.sources.size(), k, local(e.destinations), 0});
+            p.flags |= edgeNvlsDestinations;
+          }
+        }
         if (nvlsReduceLocal) {
           // The NVLS slots of the local source and, with a destination on every rank, of the local destination
-          CHECK(compile_op::nvlsReductionShape(e, group->size));
+          CHECK(compile_op::nvlsReductionShape(e, domain));
           const uint32_t numSources = e.sources.size();
           const uint32_t sourceSlot = pipeAddrSetups.size();
           auto local = [&](const Vector<Node>& nodes) {
@@ -2392,11 +2497,46 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           partialDone = addGlobalVar(4, 4 * maxConcurrency * numEdges, "partialdone");
         }
 
+        // NVLS runs (see nvlsReductionRuns): an edge whose first nvlsRunNodes sources are a run loads them, if the
+        // launch can (the run's NVLS slot holds the multicast address of the local source, see the NVLS check), with
+        // multimem.ld_reduce, as one source: thread 0 loads nothing for it, its stage only completes a phase, and the
+        // threads load their vectors of it from the multicast address when they get to it. An edge whose first
+        // nvlsRunNodes destinations are a run stores to them with one bulk store to the multicast address of the local
+        // destination (its NVLS slot, after the source's if the edge has both runs), if the launch can.
+        bool anyNvlsSources = false;
+        bool anyNvlsDestinations = false;
+        for (const PipeEdge& p : pipeEdges) {
+          anyNvlsSources |= (p.flags & edgeNvlsSources) != 0;
+          anyNvlsDestinations |= (p.flags & edgeNvlsDestinations) != 0;
+        }
+        const uint32_t nvlsRunNodes = domain.size();
+        std::optional<NvlsReduceInst> runInst;
+        if (anyNvlsSources) {
+          runInst = nvlsReduceInst(dtype, op);
+          CHECK(runInst.has_value());
+        }
+        // The multicast address of the run of the edge at record (whose address slot and numbers of nodes are given) in
+        // the address table, and the nodes that the run replaces (0 if none, or the launch cannot use NVLS for it)
+        auto runSlotAddress = [&](const u64& record, uint32_t flag, const u32& addrSlot, const u32& numSources,
+                                  const u32& numDestinations) {
+          u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
+          Value has = (flags & flag) != 0;
+          u32 slot = addrSlot + numSources + numDestinations;
+          if (flag == edgeNvlsDestinations) {
+            slot = slot + selp_u32(1, 0, (flags & edgeNvlsSources) != 0);
+          }
+          u64 mc = predicated(has, [&](const u64& a) {
+            return ld_u64(a);
+          })(table + widen(slot * 8));
+          Value use = has & (mc != 0);
+          return std::make_pair(selp_u64(mc, 0, use), selp_u32(nvlsRunNodes, 0, use));
+        };
+
         // Thread 0's loads: the stage of the next load, the item being loaded (its edge, the first item of the edge
         // after it, its next source, its number of sources, its address slot, its offset in the edge and its size,
         // and with waits, its first source wait word or ~0 if none, and its destination wait words not passed yet
-        // [ldDestWait, ldDestWaitEnd)), and its slot in the item ring; ldDone once no items are left; the loads issued
-        // so far
+        // [ldDestWait, ldDestWaitEnd)), its slot in the item ring, and with NVLS runs, the sources that its run of
+        // sources replaces (0 if none); ldDone once no items are left; the loads issued so far
         u32 ldStage = 0;
         u32 ldEdge = 0;
         u32 ldNextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
@@ -2409,6 +2549,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u32 ldDestWait = 0;
         u32 ldDestWaitEnd = 0;
         u32 ldSlot = 0;
+        u32 ldRun = 0;
         Value ldDone(ValType::Pred);
         ldDone = 0;
         u32 ldIssued = 0;
@@ -2431,6 +2572,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             ldOffset = widen(chunk) * chunkSize;
             ldBytes = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(ldOffset), chunkSize);
             ldSource = 0;
+            if (anyNvlsSources) {
+              ldRun = runSlotAddress(record, edgeNvlsSources, ldAddrSlot, ldNumSources,
+                  ld_global_nc_u32(record + offsetof(PipeEdge, numDestinations)))
+                          .second;
+            }
             if (anyWaits) {
               u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
               ldWaits = selp_u32(
@@ -2454,14 +2600,29 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         // Load the next source chunk of the item being loaded into the next stage (which the threads have combined
         // into their accumulators), and after the item's last source, take the next item
         auto issueLoad = [&]() {
-          u64 src = ld_u64(table + widen((ldAddrSlot + ldSource) * 8)) + ldOffset;
           u32 barrier = reduceBarriers + ldStage * 8;
-          mbarrier_arrive_expect_tx(barrier, ldBytes);
-          cp_async_bulk_shared_global(reduceStages + ldStage * chunkSize, src, ldBytes, barrier);
+          auto bulkLoad = [&]() {
+            u64 src = ld_u64(table + widen((ldAddrSlot + ldSource) * 8)) + ldOffset;
+            mbarrier_arrive_expect_tx(barrier, ldBytes);
+            cp_async_bulk_shared_global(reduceStages + ldStage * chunkSize, src, ldBytes, barrier);
+          };
+          if (anyNvlsSources) {
+            // A run of sources: no data, the phase only (see runSlotAddress above)
+            Value run = (ldSource == 0) & (ldRun != 0);
+            IF(run) {
+              mbarrier_arrive(barrier);
+            }
+            ELSE {
+              bulkLoad();
+            }
+            ldSource = selp_u32(ldRun, ldSource + 1, run);
+          } else {
+            bulkLoad();
+            ldSource += 1;
+          }
           u32 next = ldStage + 1;
           ldStage = selp_u32(0, next, next == numStages);
           ldIssued += 1;
-          ldSource += 1;
           IF(ldSource == ldNumSources) {
             u32 nextSlot = ldSlot + 1;
             ldSlot = selp_u32(0, nextSlot, nextSlot == reduceItemSlots);
@@ -2567,6 +2728,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             BREAK;
           }
           u32 chunk = ld_shared_u32(entry + 4);
+          profiling.enter("item");
           u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
           u32 numSources = ld_global_nc_u32(record + offsetof(PipeEdge, numSources));
           u32 numDestinations = ld_global_nc_u32(record + offsetof(PipeEdge, numDestinations));
@@ -2587,7 +2749,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               v = identity;
             }
           }
-          FOR(u32 s = 0, s < numSources, s += 1) {
+          // With an NVLS run of sources: the multicast address of the chunk of the local source, and the sources that
+          // the run replaces (0 if none, see runSlotAddress)
+          u64 runAddress;
+          u32 run;
+          if (anyNvlsSources) {
+            auto [mc, nodes] = runSlotAddress(record, edgeNvlsSources, addrSlot, numSources, numDestinations);
+            runAddress = mc + offset;
+            run = nodes;
+          }
+          u32 s = 0;
+          WHILE(s < numSources) {
             if (anyWaits) {
               // The load of this stage has not been issued: it waits for a source from another domain
               IF_D(isThreadZero & (ldIssued == consumed)) {
@@ -2596,16 +2768,65 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
             mbarrier_wait_parity_spin(reduceBarriers + consStage * 8, consParity);
             u32 stage = reduceStages + consStage * chunkSize;
+            auto loadStage = [&]() {
+              for (uint32_t v : range(numVectors)) {
+                u32 off = threadIndex * 16 + 16 * blockSize * v;
+                PRED(off < n) ld_shared_v4_u32_into(raw[v], stage + off);
+              }
+            };
+            // The sources that this stage covers
+            u32 step = 1;
+            if (anyNvlsSources) {
+              Value isRun = (s == 0) & (run != 0);
+              IF(isRun) {
+                profiling.enter("nvls ld");
+                // The run's vectors, with multimem.ld_reduce from the multicast address (never under a PTX predicate,
+                // see ptx.h: a vector past the chunk's end loads the chunk's last vector again, which is not stored).
+                // The switches combine the domain's values (see nvlsReduceInst), which the threads then combine as one
+                // source.
+                for (uint32_t v : range(numVectors)) {
+                  u32 off = threadIndex * 16 + 16 * blockSize * v;
+                  u64 address = runAddress + widen(selp_u32(off, n - 16, off < n));
+                  if (runInst->perVector == 1) {
+                    std::array<Value, 4> x;
+                    for (Value& w : x) {
+                      w = Value(ValType::U32);
+                    }
+                    multimem_ld_reduce_relaxed_sys_v4(runInst->op, x, address);
+                    for (size_t j : range(4)) {
+                      raw[v][j] = x[j];
+                    }
+                  } else {
+                    const uint32_t width = 16 / runInst->perVector;
+                    for (uint32_t j : range(runInst->perVector)) {
+                      u64 a = address + j * width;
+                      if (runInst->wide) {
+                        Value w(ValType::U64);
+                        multimem_ld_reduce_relaxed_sys(runInst->op, w, a);
+                        unpack_b64(raw[v][2 * j], raw[v][2 * j + 1], w);
+                      } else {
+                        multimem_ld_reduce_relaxed_sys(runInst->op, raw[v][j], a);
+                      }
+                    }
+                  }
+                }
+              }
+              ELSE {
+                profiling.enter("stage");
+                loadStage();
+              }
+              step = selp_u32(run, 1, isRun);
+            } else {
+              loadStage();
+            }
             for (uint32_t v : range(numVectors)) {
-              u32 off = threadIndex * 16 + 16 * blockSize * v;
-              PRED(off < n) ld_shared_v4_u32_into(raw[v], stage + off);
               Vector<Value> x = unpack(raw[v]);
               for (size_t j : range(accPerVector)) {
                 combine(acc[v][j], x[j]);
               }
             }
             if (op == ReduceOp::Avg) {
-              IF(s + 1 == inputSources) {
+              IF(s + step == inputSources) {
                 for (auto& a : acc) {
                   for (Value& v : a) {
                     arith(acc64 ? "div.rn.f64" : "div.rn.f32", v, v, divisor);
@@ -2613,6 +2834,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                 }
               }
             }
+            s += step;
             u32 next = consStage + 1;
             Value wrap = next == numStages;
             consStage = selp_u32(0, next, wrap);
@@ -2625,6 +2847,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
           }
           // The result buffer is free once the stores of the item before the previous one have read it
+          profiling.enter("result");
           IF_D(isThreadZero) {
             cp_async_bulk_wait_group_read(reduceResults - 1);
           }
@@ -2643,7 +2866,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           fence_proxy_async_shared_cta();
           barrier_sync();
           IF_D(isThreadZero) {
-            FOR(u32 d = 0, d < numDestinations, d += 1) {
+            // An NVLS run of destinations: one bulk store to the multicast address, then the destinations after it
+            u32 firstDestination = 0;
+            if (anyNvlsDestinations) {
+              auto [mc, nodes] = runSlotAddress(record, edgeNvlsDestinations, addrSlot, numSources, numDestinations);
+              IF(nodes != 0) {
+                profiling.enter("mc store");
+                cp_async_bulk_global_shared(mc + offset, buffer, n);
+              }
+              firstDestination = nodes;
+            }
+            FOR(u32 d = firstDestination, d < numDestinations, d += 1) {
               u64 dst = ld_u64(table + widen((addrSlot + numSources + d) * 8)) + offset;
               cp_async_bulk_global_shared(dst, buffer, n);
             }
@@ -2679,6 +2912,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               }
             }
           }
+          // Warp 0 together again before the next item's block barriers: the ptxas of CUDA 13.0 (the JIT of driver
+          // 580) can fail to reconverge a warp after a branch of one thread (fixed in CUDA 13.2.2), and a bar.sync
+          // of a diverged warp is undefined (a variant of this loop whose thread 0 alone counted the items after the
+          // last barrier hung in every all-reduce of 64 MiB across 2 domains of 32 GB300; with this, never)
+          warp_sync();
           result = result ^ 1;
           u32 nextSlot = consSlot + 1;
           consSlot = selp_u32(0, nextSlot, nextSlot == reduceItemSlots);

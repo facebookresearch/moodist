@@ -27,8 +27,8 @@ def comm_empty(*size, dtype=None, group=None):
     are such buffers can then store to all ranks at once with NVLink multicast (NVLS) where the group supports it: an
     all-gather, for example, then needs one SM instead of a dozen. Reductions whose inputs (and for an all-reduce,
     outputs) are such buffers can have the NVLink switches combine them (an all-reduce then moves about half the
-    data). A launch whose buffers are not at the same offset on every rank stores to each rank as usual, so a mismatch
-    only costs speed.
+    data), within each NVLink domain of the group. A launch whose buffers are not at the same offset on every rank
+    stores to each rank as usual, so a mismatch only costs speed.
 
     The memory comes from moodist's CUDA allocator (in large slabs the pool keeps), and is usable on the current
     stream, like torch.empty's. The process group's allocate_tensor (which FSDP2 uses after

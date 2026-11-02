@@ -2870,6 +2870,18 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
     CHECK_CU(cuMemcpyAsync((CUdeviceptr)&value, nvls.launches, sizeof(value), nullptr));
     CHECK_CU(cuStreamSynchronize(nullptr));
     return value;
+  } else if (key == "nvlink_domain") {
+    // Read-only: this rank's NVLink domain in the group, as its first rank (the ranks of a multi-node NVLink fabric
+    // that are in the group, else of this rank's node; see compile_op's cudaRanks), e.g. for tests
+    const Group& g = *impl->group;
+    if (!g.fabricDomainRanks.empty()) {
+      return (int64_t)g.fabricDomainRanks[0];
+    }
+    size_t first = g.rank;
+    for (size_t r : g.ipcRanks) {
+      first = std::min(first, r);
+    }
+    return (int64_t)first;
   }
   throw std::runtime_error(std::string("Unknown option: ") + name);
 }
@@ -3587,6 +3599,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   if (anyCuda) {
     slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream);
   }
+  // Whether this launch writes the kernel's profile (MOODIST_COMPILE_OP_PROFILE, see generateKernel)
+  bool dumpProfile = false;
 
   if (anyCuda && anyRdma) {
     memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
@@ -3658,12 +3672,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     launchCompileOpKernel(
         *op->kernelHandle, *op->kernel, op->config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
 
-    if (op->kernelHandle->profilingBytesPerThread != 0) {
-      if (op->kernelHandle->profilingCountdown-- == 0) {
-        CHECK_CU(cuCtxSynchronize());
-        dumpProfiling(&*group, op);
-      }
-    }
+    // (the profile is written below, once the CPU thread has the op's RDMA part: the kernel may wait for it)
+    dumpProfile = op->kernelHandle->profilingBytesPerThread != 0 && op->kernelHandle->profilingCountdown-- == 0;
   }
 
   if (anyCuda && anyRdma) {
@@ -3694,6 +3704,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     e->enqueueTime = getProfilingEnabled() ? std::chrono::system_clock::now() : std::chrono::system_clock::time_point{};
     e->enqueueCpu = e->enqueueTime.time_since_epoch().count() != 0 ? sched_getcpu() : -1;
     group->cpuThread->enqueue(e);
+  }
+  if (dumpProfile) {
+    CHECK_CU(cuCtxSynchronize());
+    dumpProfiling(&*group, op);
   }
 
   result->impl = std::move(future);

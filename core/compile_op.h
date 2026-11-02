@@ -160,14 +160,26 @@ inline bool isReduction(ReduceOp reduce) {
   return reduce == ReduceOp::Sum || reduce == ReduceOp::Avg || reduce == ReduceOp::Min || reduce == ReduceOp::Max;
 }
 
-// NVLS reductions (multimem.ld_reduce, see generateKernel in ptx_codegen.cc). Whether a reduction edge has their
-// shape: a source on every rank of the group (of groupSize ranks), at the same tensor and offset on each, and a
-// destination on every rank (likewise; stored with multicast stores) or, in groups of at least nvlsReduceLocalMinRanks
-// (see ptx_codegen.cc), one, on the edge's executor. And whether an op's reductions in the group could use them: the
-// group (one NVLink domain, enough ranks, multicast support), the dtype and the reduce op (what multimem.ld_reduce
+// NVLS reductions (multimem.ld_reduce, see generateKernel in ptx_codegen.cc), within the NVLink domain of the edge's
+// executor (domain: the group's ranks in it, sorted; the multicast objects are per domain, see Group::Nvls). Whether
+// a reduction edge has their shape: a source on every rank of the domain, at the same tensor and offset on each, and a
+// destination on every rank of the domain (likewise; stored with multicast stores) or, in domains of at least
+// nvlsReduceLocalMinRanks (see ptx_codegen.cc), one, on the edge's executor (nvlsReduceLoop takes such edges). Whether
+// an edge of the reduce loop has NVLS runs (it loads its first domain.size() sources with multimem.ld_reduce, as one,
+// if they are such sources, and stores to its first domain.size() destinations with one multicast store if they are
+// such destinations; e.g. the edges of reductions across domains). And whether an op's reductions could use them on
+// this rank: its domain (enough ranks, multicast support), the dtype and the reduce op (what multimem.ld_reduce
 // combines), not the edges.
-bool nvlsReductionShape(const Graph::Edge& e, size_t groupSize);
+bool nvlsReductionShape(const Graph::Edge& e, std::span<const size_t> domain);
+struct NvlsRuns {
+  bool sources = false;
+  bool destinations = false;
+};
+NvlsRuns nvlsReductionRuns(const Graph::Edge& e, std::span<const size_t> domain);
 bool nvlsReductionsPossible(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp);
+// Whether this rank's domain can also have NVLS runs of destinations alone (multicast stores of results computed from
+// other sources, e.g. an all-reduce's across domains), see nvlsReductionRuns
+bool nvlsMulticastRuns(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp);
 // The most bytes that an op's NVLS reductions (all its ranks' together) may combine to use them (larger ones use the
 // reduce loop)
 uint64_t nvlsReductionMaxBytes(DType dtype);

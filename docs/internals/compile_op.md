@@ -126,6 +126,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    all-reduce in one round moves (k - 1) / n of the tensor per GPU over RDMA each way (1/32 with 2 domains of 32 GPUs,
    but 15/4 with 16 domains of 4).
 
+   Within each domain, these edges use NVLS where the domain can (see NVLS runs under the kernel): a partial result
+   computed from the domain's inputs, and an executor's own domain's inputs in a reduce-scatter or a reduce to one
+   rank, load with `multimem.ld_reduce` (the switches combine the domain's values), and an all-reduce's executor
+   stores its result to its domain's ranks with one multicast store per chunk. The switches' partial results are
+   rounded within 1 ulp (see NVLS reductions), and every executor combines the same rounded values, as before.
+
    In two rounds, the executors of a part split it into k shares (byte ranges of whole 16-byte units, whole pages
    from 64 KiB per share on; `shareRange`), and the executor of the j-th domain with destinations owns share j
    (`AllReducePiece::shareOwners`): a reduce-scatter among the executors, then an all-gather. The contributions of
@@ -201,8 +207,12 @@ Every step is collective: all ranks of the group take part (through per-rank que
    all-reduce) go in bursts of n instead: uses bn to bn + n - 1 after the edges of use bn - 1, so that the kernel mostly
    loads, then stores, as when every item had a region of its own (all-reduce of 256 MiB across 2 domains of 32 GPUs:
    0.88 ms, 0.91 with the items two uses ahead; but reduce-scatter of 256 MiB across 16 domains of 4 GPUs in bursts: 56
-   ms). Within a chunk, a partial rank computes the items of pieces with one executor for its own executor first, then
-   for those of the domain after its own, starting at its own position (where their keys tie), and an executor issues
+   ms); but not where the rank's domain can use NVLS for both, from 16 ranks (see NVLS runs in the kernel): its kernel
+   loads the items with `multimem.ld_reduce`, which the GPUs' NVLink egress limits, and stores the edges' results with
+   multicast stores, which their ingress limits, so that interleaved, both directions work at once (all-reduce of 256
+   MiB across 2 domains of 32 GB300: 705 us two uses ahead, 780 us in bursts of 8). Within a chunk, a partial rank
+   computes the items of pieces with one executor for its own executor first, then for those of the domain after its
+   own, starting at its own position (where their keys tie), and an executor issues
    its reads per part from the domain before its own on, the order in which they are computed: at any time, every
    partial rank then has one reader, and every executor one source (reduce-scatter with 16 domains of 4 GPUs: 47.5 ms at
    256 MiB, 68.7 ms with the partial ranks serving the executors in rank order and the executors reading in domain
@@ -323,7 +333,10 @@ Every step is collective: all ranks of the group take part (through per-rank que
    reduce op allow it), and the ranks all of whose edges have the shape for it have some reductions, up to
    `nvlsReductionMaxBytes`. Those run in one pass, faster than either (an all-reduce of 256 MiB on 32 GPUs: 551 us,
    against 842-892 us in one pass and 894 us in two phases without NVLS), and an op whose launches cannot use NVLS
-   (its tensors not in place) then runs the reduce loop in one pass.
+   (its tensors not in place) then runs the reduce loop in one pass. In the same exchange, the ranks learn whether
+   any rank's edges could use NVLS (NVLS reductions or runs, see the kernel), and if so set up the multicast objects
+   of the group's domains (`Group::setupNvls`, collective: here, where every rank takes part, and not in
+   `generateKernel`, where the ranks of a domain decide among themselves).
 
    `finalize` then sends every edge to every rank that appears in it, sorts the edges into `cudaEdges` and
    `rdmaEdges` (always empty at the moment, because of the split above), and builds the tensor mappings: which of
@@ -434,8 +447,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   them, already divided). The threads write the result into one of two result buffers (rounding 16-bit floats once,
   to nearest even), and thread 0 stores it to every destination with bulk stores (the stores of the item before may
   still be reading the other buffer). An item with one source (a cell that one input covers) is stored as loaded.
-  Sums start from -0 (x + -0 = x for every x), floating point min and max propagate NaN. (In one NVLink domain, a
-  launch may combine the sources in the switches instead, see NVLS reductions below.)
+  Sums start from -0 (x + -0 = x for every x), floating point min and max propagate NaN. (Within an NVLink domain,
+  a launch may combine the sources in the switches instead, see NVLS reductions and NVLS runs below.) After thread 0's
+  stores, warp 0 synchronizes (`bar.warp.sync`) before the next item's block barriers: the ptxas of CUDA 13.0 can fail
+  to reconverge a warp after a branch of one thread (see Known issues).
 
   The blocks take the edges in the order of the graph: across domains, the key order of compile phase step 7, in
   which the items that other ranks wait for come ahead of the edges that use them, and in two phases the pieces
@@ -460,15 +475,17 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   step 7), so the blocks of all ranks make progress.
 - **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
   peers may still read or write its tensors.
-- **NVLS** (NVLink SHARP multicast; groups of at least 16 ranks in one NVLink domain, ops not behind a process group
-  collective): an edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can
-  store each chunk once to the group's multicast mapping, which the switches copy to every GPU. The group has two
-  multicast objects (`Group::setupNvls`, collective, at the first op that can use them). One covers moodist's whole
-  allocator pool: every allocator chunk is bound at its offset in the pool when it is mapped
-  (`allocatorAddChunkListener`), so offset o of every rank's pool is at the mapping's base + o; a counter area
-  follows. The other covers the group's communication pool (`allocatorCommPoolCreate`; `moodist.comm_empty`): every
-  slab of the pool is bound at its logical offset when the pool adds it, so a buffer that every rank allocates in the
-  same order is at the same place of that object on every rank. A rank uses NVLS if every edge it executes is such
+- **NVLS** (NVLink SHARP multicast; copies in groups of at least 16 ranks that are one NVLink domain, ops not behind
+  a process group collective): an edge to every rank of the group, at the same tensor and offset on each (an
+  all-gather's), can store each chunk once to the group's multicast mapping, which the switches copy to every GPU.
+  Each NVLink domain of the group has two multicast objects of its ranks (`Group::setupNvls`, collective over the
+  group, at the first op that can use them; a multicast object cannot span domains: the domain's first rank creates
+  them, the others import them, and a rank alone in its domain has none). One covers moodist's whole allocator pool:
+  every allocator chunk is bound at its offset in the pool when it is mapped (`allocatorAddChunkListener`), so offset
+  o of the pool of every rank of the domain is at the mapping's base + o; a counter area follows. The other covers
+  the group's communication pool (`allocatorCommPoolCreate`; `moodist.comm_empty`): every slab of the pool is bound
+  at its logical offset when the pool adds it, so a buffer that every rank allocates in the same order is at the same
+  place of that object on every rank of the domain. A rank uses NVLS for copies if every edge it executes is such
   an edge (no waits) and every rank that does stores the same number of chunks (agreed in `generateKernel`). Each
   launch checks the destinations: with the addresses, the ranks publish their tensors' NVLS identities (the object
   and the offset in it: `nvlsIdentity` in processgroup.cc) into a table of each peer's with the layout of the
@@ -483,19 +500,22 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   release waits for all outstanding stores), and it stores chunk c once its local copy of the counter shows every
   rank's chunks up to c - 8 complete. The counter only grows; `customOp` passes its value before the launch (launches
   of the slot times the chunks of all ranks); a launch that does not use NVLS adds its chunks at the end.
-- **NVLS reductions** (in one NVLink domain, all-reduces in groups of at least 8 ranks, reductions with one
+- **NVLS reductions** (within an NVLink domain: all-reduces in domains of at least 8 ranks, reductions with one
   destination of at least 12; sums of every floating point type, averages of `float32`, `float64` and `bfloat16`,
   sums, min and max of integers, `int32` only up to 4 MiB per op): a reduction with a source on every rank of the
-  group, at the same tensor and offset on each (`nvlsReductionShape`: a piece of an all-reduce, a cell of a
-  reduce-scatter or of a reduce to one rank), loads each 16-byte vector of its result with `multimem.ld_reduce` from
-  the multicast address of its local source: the switches read the values of every member of the multicast object
-  and combine them (16-bit floats in `float32`, `.acc::f32`, rounded as described below; one instruction per vector,
-  two or four for `float64`, `int32` and `int64`, whose forms have no vectors). With a destination on every rank (an
-  all-reduce's), the result goes to all of them
-  with one `multimem.st` to the multicast address of the local destination: each GPU then sends its input once and
-  receives the result once, (1 + 1/N) times the data instead of 2 (N - 1) / N with unicast pieces; otherwise it goes
-  to the local destination. A rank does so if every edge it executes is such an edge (`nvlsReduceLocal`, agreed with
-  the copies' decision; no step counters). Every launch checks the identities of every source and every multicast
+  executor's domain, at the same tensor and offset on each (`nvlsReductionShape`: a piece of an all-reduce, a cell of
+  a reduce-scatter or of a reduce to one rank, in a group that is one domain or within each domain), loads each
+  16-byte vector of its result with `multimem.ld_reduce` from the multicast address of its local source: the switches
+  read the values of every member of the multicast object and combine them (16-bit floats in `float32`,
+  `.acc::f32`, rounded as described below; one instruction per vector, two or four for `float64`, `int32` and
+  `int64`, whose forms have no vectors). With a destination on every rank of the domain (an all-reduce's), the result
+  goes to all of them with one `multimem.st` to the multicast address of the local destination: each GPU then sends
+  its input once and receives the result once, (1 + 1/N) times the data instead of 2 (N - 1) / N with unicast pieces;
+  otherwise it goes to the local destination. A rank does so (`nvlsReduceLoop`) if every edge it executes is such an
+  edge (`nvlsReduceLocal`; no step counters). The ranks of a domain decide together, with the copies' decision: a
+  rank whose kernel peers are not its domain's ranks says so, which they all hear. `Group::setupNvls` is collective
+  over the group, so `compile` calls it, where every rank takes part, if some rank's edges could use NVLS (the
+  kernels then only use its result). Every launch checks the identities of every source and every multicast
   destination first (the NVLS edge table has an entry per node list and NVLS slot): a `multimem.ld_reduce` at an
   offset where a member has no memory bound makes the reader's context fail with CUDA_ERROR_CONTAINED. A launch that
   cannot use NVLS runs the reduce loop. The warps of the first blocks claim items of 4 KiB (8 vectors per lane) of the
@@ -517,6 +537,29 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   in place gets the reduce loop's). The tuning launches do not use NVLS (their scratch tensors are not in the pools
   at the same offsets), so it is decided by rule; reductions that will use it have no two-phase variant (compile
   phase step 11).
+- **NVLS runs** (the reduce loop's edges, e.g. those of reductions across NVLink domains, compile phase step 7: the
+  same domains, dtypes, reduce ops and limits as NVLS reductions): the first N sources of an edge (N: the ranks of
+  the executor's domain) can be a run, a source on every rank of the domain at the same tensor and offset, filled
+  and without waits (the domain's inputs, which come first: an executor's own domain's in a reduce-scatter or a
+  reduce to one rank, those of a partial result that a rank computes for other domains), and its first N
+  destinations, a destination on every rank of the domain at the same place (the result of an all-reduce in the
+  domain); `nvlsReductionRuns`: both from 8 ranks (as an all-reduce of `nvlsReduceLoop`), sources alone from 12 (as
+  with one destination), destinations alone from 16 (as copies with multicast stores: across 2 domains of 8 GB300, an
+  all-reduce of 256 MiB took 874 us with multicast stores of its results, 772 us without). A rank
+  whose kernel uses the reduce loop has runs if any of its edges has one (`nvlsRunsLocal`, decided with the
+  others, see NVLS reductions; its edges otherwise as before). A run has an NVLS slot (after the destinations: the
+  sources' run, then the destinations') and an entry in the NVLS edge table, and the launch checks it like the
+  others; a run whose check fails gets 0 in its slot, and the edge takes it as N sources (or destinations) as usual,
+  each run on its own. Thread 0 loads a run of sources as one stage without data (an arrive on the stage's
+  mbarrier, no bulk load), and the threads load their vectors of the chunk with `multimem.ld_reduce` from the
+  multicast address when they get to it, as one source (vectors past the chunk's end load its last vector again);
+  thread 0 stores to a run of destinations with one bulk store to the multicast address of the local destination,
+  then to the destinations after it. On 32 GB300 in one domain, all-reduce through the reduce loop with runs:
+  16 MiB 62 us, 64 MiB 180 us, 256 MiB 571 us (`nvlsReduceLoop`: 51, 151, 549 us). Across 2 domains of 32 GB300,
+  an executor's partial result of its own domain and those it computes for the other domain's executors load with
+  `multimem.ld_reduce`, and the all-reduce's results go to its domain with multicast stores: see Performance notes.
+  (Partial results with done flags wait for the completion of their block's bulk stores, earlier multicast stores
+  included; storing them from the threads' registers instead changed nothing measurable, 709 / 708 us at 256 MiB.)
 
 ## Runtime (`customOp`, `WorkCustom`)
 
@@ -650,8 +693,13 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 
 - NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
   communication pool, at logical offset o: (2 << 60) | o; else in moodist's pool, at offset o: (1 << 60) | o) and the
-  op's step counter value (0 for reductions, which have none). Block 0 of a launch that used NVLS (copies or
-  reductions) counts it in the group's counter area (the process group option `nvls_launches`).
+  op's step counter value (0 for reductions, which have none); an identity refers to the rank's NVLink domain's
+  objects, which the launches compare within the domain. Block 0 of a launch that used NVLS (copies or reductions;
+  with NVLS runs, a launch whose every run could) counts it in the group's counter area (the process group option
+  `nvls_launches`; the read-only option `nvlink_domain` gives the first rank of the rank's domain, for tests). With
+  `MOODIST_COMPILE_OP_PROFILE`, the launch that writes the kernel's profile does so once the CPU thread has the op's
+  RDMA part (its kernel may wait for the transfers: writing it right after the launch deadlocked reductions across
+  domains).
 - Communication pools (`allocatorCommPoolCreate`; per group, `Group::getCommPool`; `moodist.comm_empty` and the
   process group's `allocate_tensor`): allocations get logical offsets that depend only on the sequence of
   allocations and frees of the pool, so that ranks that allocate the same buffers in the same order get the same
@@ -660,8 +708,8 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   event per stream, and an allocation of it on another stream waits for those events on the GPU, not on the host
   (which would make the placement depend on timing). The memory comes from the allocator's pool in slabs of at least
   256 MiB (one 2 MiB aligned allocation each, at any address, never freed), each at its own logical range with a 2
-  MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new slab into the
-  group's multicast object when it adds it (before handing out memory in it), and the kernel's address exchange
+  MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new slab into its
+  domain's multicast object when it adds it (before handing out memory in it), and the kernel's address exchange
   orders that before any peer's multicast stores to it.
 
 ## Environment variables
@@ -985,6 +1033,29 @@ faster than one round; the second round costs about 35 us at small sizes. With t
 every size (two rounds, forced: 125 us, 135 us, 163 us, 310 us and 988 us): both read as much, and the second round
 adds a notification and a read.
 
+With NVLS within each domain (November 2026, NVLS runs, see the kernel; buffers from the communication pool, so that
+every rank's tensors are in place; `bfloat16`, median, one session), on the same 64 GPUs in two domains of 32:
+
+| two domains of 32, NVLS / without (`MOODIST_COMPILE_OP_NVLS=0`) | 64 KiB | 1 MiB | 16 MiB | 64 MiB | 256 MiB | 1 GiB |
+|---|---|---|---|---|---|---|
+| all-reduce | 58 / 68 us | 62 / 85 us | 109 / 117 us | 266 / 284 us | 710 / 851 us | 2.39 / 3.28 ms |
+| reduce-scatter (per rank) | 65 / 70 us | 159 / 158 us | 1.47 / 1.66 ms | 5.81 / 6.50 ms | | |
+| reduce to one rank | | 79 / 104 us | 261 / 736 us | 1.01 / 2.80 ms | 3.95 / 10.83 ms | |
+
+An all-reduce's executor computes its domain's partial result of its piece with `multimem.ld_reduce` (each GPU's
+input goes into the switches once) and stores the results with multicast stores (each GPU receives them once): the
+NVLink traffic of an NVLS all-reduce in one domain, which takes 551 us at 256 MiB there; across the domains, the
+partial results go over RDMA in between (see Known issues, Performance, for what the rest costs). With the partial
+results of the executor's own domain in bursts of 8, as without NVLS, 256 MiB took 780 us (all loads, then all
+stores); interleaved (two uses ahead, compile phase step 7), 705-710 us. A reduce-scatter's executor combines its
+domain's inputs with `multimem.ld_reduce` (and the partial results for the other domain's executors are computed the
+same way): its egress, its whole input for every executor, was the limit before too. A reduce to one rank takes its
+domain's sources with `multimem.ld_reduce` instead of reading them all, and is then bound by its RDMA read of the
+other domain's partial result (64 MiB in 1.01 ms, about 66 GB/s through the root's NIC). Across two domains of 8 GPUs
+(2 nodes each), reductions use no NVLS (partial results with `multimem.ld_reduce` from 12 ranks per domain on, results
+with multicast stores alone from 16, see NVLS runs; the multicast stores of an all-reduce's results took 874 us at
+256 MiB, 772 us without).
+
 Since `WorkCustom` exchanges input lists and waits for reads with the op's peers only (see Runtime; before, with all
 ranks: each op posted about 190 small RDMA writes per rank on 64 GPUs, which kept the CPU thread busy for most of a
 small op), small ops across domains are faster (`bfloat16`, median, the previous build in the same session in
@@ -1131,8 +1202,12 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   into a predicated instruction itself, they work: the kernel has no multimem instruction under a PTX predicate (see
   the helpers in ptx.h). CUDA 13.2 Update 2 also fixes a compiler bug present since 12.8 (stale registers after
   failed reconvergence in kernels with nested divergence, which the kernels have), which drivers before 595.71 have.
-  Compiling the PTX with a ptxas of moodist's own (the nvPTXCompiler library of a known version) instead of the
-  driver's would make the compiler independent of the driver.
+  Probably that (or the like) hung a variant of the reduce loop (November 2026, not kept) whose thread 0 alone
+  counted an item's done flags after the item's last block barrier: every all-reduce of 64 MiB across 2 domains of
+  32 GB300 hung in the tuning launches of its 24-block setting, and with a `bar.warp.sync` after thread 0's code
+  never; the reduce loop now has one there (see Reductions in the kernel). Compiling the PTX with a ptxas of moodist's
+  own (the nvPTXCompiler library of a known version) instead of the driver's would make the compiler independent of
+  the driver.
 
 ### Performance
 - NVLS (see the kernel and the all-gather table under Performance notes). Open: the rank threshold (16; one node of
@@ -1157,10 +1232,21 @@ the 12 tuning candidates. The kernel that generated the copy code of each edge i
   (deferred: reductions to one rank are not a common collective). The blocks (by rule, from the probe; tuning them
   needs tuning buffers from the communication pool, as above), the overlap of loads and stores (an all-reduce of
   256 MiB on 32 GPUs, in the probe: loads alone 381 us, stores alone 391 us, both 551 us; a warp loads an item, then
-  stores it), and reductions across NVLink domains (one multicast object per domain: each domain's partial result
-  with `multimem.ld_reduce`). The thresholds (8 ranks, 12 with one destination; `int32` up to 4 MiB) were measured
-  on GB300 only, the 12 on reduce-scatters, where NVLS sends each GPU's whole input into the switches: reductions to
-  one rank on 8 to 11 ranks, where it saves the root's ingress, were not measured.
+  stores it). The thresholds (8 ranks, 12 with one destination; `int32` up to 4 MiB) were measured on GB300 only, the
+  12 on reduce-scatters, where NVLS sends each GPU's whole input into the switches: reductions to one rank on 8 to 11
+  ranks, where it saves the root's ingress, were not measured, nor reductions across domains of 8 to 31 GPUs.
+- NVLS across NVLink domains (NVLS runs, see the kernel and Performance notes). Open: an all-reduce across 2 domains
+  of 32 GB300 takes about 705 us at 256 MiB, against 551 us in one domain with the same NVLink traffic per GPU (each
+  GPU's input into the switches once, the results out once). A kernel profile (`MOODIST_COMPILE_OP_PROFILE`, rank 0,
+  24 blocks) had the blocks wait for sources about 256 us each (the other domain's partial results, which the RDMA
+  read brings 1 MiB at a time once the other domain's kernel has stored all of a part, and the last parts' at the
+  end), load with `multimem.ld_reduce` for about 210 us (3 to 65 us per 32 KiB item, the GPUs' egress shared by every
+  rank's loads), and wait for stores for about 130 us. More blocks did not help (16: 684 us, 32: 680, 48: 728, 64:
+  720), smaller parts a little (256 KiB parts with the items 6 uses ahead: 672 us; 64 MiB unchanged). To try: blocks
+  of their own for the items without source waits (the partial results, which then never wait behind an edge that
+  waits for the other domain), or items interleaved finer than whole parts. Reductions to one rank across domains are
+  now bound by the root's RDMA read of the other domain's partial result (64 MiB in 1.02 ms: one NIC); a ring of
+  NICs, or every GPU of the domain reading a piece, would use more.
 - Unicast stores to outputs at the same offset on every rank are 2-4% slower at large sizes than to outputs at
   different offsets (all-gather on 32 GPUs, see the NVLS table), maybe because all copies of a chunk then have the
   same address bits; not investigated.
@@ -1310,9 +1396,9 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    copies of a piece wait for all of it, and the kernel computes every piece before it copies any. In parts (as
    across domains, Phase 2), the copies of the first parts could overlap the computation of the last ones (across
    two domains, with 1 MiB parts, 846 us at 256 MiB on 64 GPUs; in two phases in one domain of 32, 888 us).
-4. NVLS in one domain: done (November 2026, see NVLS reductions in the kernel; open items under Known issues,
-   Performance). Across domains: one multicast object per domain, each domain's partial result with
-   `multimem.ld_reduce` (and the final stores of an all-reduce with `multimem.st`), the RDMA part as it is.
+4. NVLS: done in one domain (November 2026, see NVLS reductions in the kernel) and within the domains of
+   reductions across domains (one multicast object per domain; see NVLS runs in the kernel; open items under Known
+   issues, Performance).
 5. Reduce to one rank: the root reads every input itself (pieces only split cells with several destination
    ranks). Splitting such cells among the sources (each computing a piece and writing it to the root) would bring
    the root's NVLink ingress from (N - 1) times to about twice the data. With NVLS, the root's ingress is the result

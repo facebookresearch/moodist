@@ -173,11 +173,12 @@ struct Group {
   Vector<size_t> fabricDomainRanks;
 
   // NVLS (NVLink SHARP multicast) for compile_op (see generateKernel), set up by setupNvls when the first op that
-  // can use it is compiled: two multicast objects of all ranks of the group. One over moodist's whole allocator pool,
-  // every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank is at mcBase + o),
-  // followed by an area for the ops' step counters; one over the group's communication pool (see commPool), every
-  // slab bound at its logical offset (so logical offset o of every rank is at commMcBase + o). The objects, and what
-  // is bound to them, outlive the group.
+  // can use it is compiled: two multicast objects per NVLink domain (of the group's ranks in it, fabricDomainRanks;
+  // a multicast object cannot span domains), of which a rank has its domain's. One over moodist's whole allocator
+  // pool, every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank of the domain is
+  // at mcBase + o), followed by an area for the ops' step counters; one over the group's communication pool (see
+  // commPool), every slab bound at its logical offset (so logical offset o of every rank of the domain is at
+  // commMcBase + o). The objects, and what is bound to them, outlive the group.
   struct Nvls {
     // The pool object's size is the pool's (multicast objects of more than 1 TiB fail to bind): the counter area takes
     // its last 2 MiB, so only pool offsets below poolBytes are bound (the allocator never maps that much)
@@ -194,7 +195,8 @@ struct Group {
     uintptr_t launches = 0;
   };
   Nvls nvls;
-  // Collective over all ranks of the group (setupComms). Returns whether NVLS is available.
+  // Collective over all ranks of the group (setupComms). Returns whether NVLS is available to this rank: whether its
+  // domain's objects are set up (a rank alone in its domain has none; if any rank fails, no rank has them).
   bool setupNvls();
 
   // The group's communication pool (see allocatorCommPoolCreate): buffers that every rank allocates (and frees) in the

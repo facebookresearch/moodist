@@ -2223,13 +2223,19 @@ struct CompileOpConstructor {
         // ring that this rank's own plans use in one round (an all-reduce's partial results of its own domain) go in
         // bursts of the ring's slots instead: uses b * slots to b * slots + slots - 1 after the plans of use b * slots
         // - 1, so that the kernel mostly loads, then stores, as when every item had a region of its own (all-reduce of
-        // 256 MiB across 2 domains of 32 GPUs, 4 slots: 0.88 ms, 0.91 with the items 2 uses ahead). (Every wait is
-        // still for an edge with a smaller key: the plans of the previous use of its slot, the reads of it, which wait
-        // for its item and for the plans that used their slots before, and the items before it in its ring.)
+        // 256 MiB across 2 domains of 32 GPUs, 4 slots: 0.88 ms, 0.91 with the items 2 uses ahead) - unless this rank's
+        // domain can use NVLS for both (the kernel then loads such an item with multimem.ld_reduce, which the GPUs'
+        // NVLink egress limits, and stores the plans' results with multicast stores, which their ingress limits:
+        // interleaved, both directions work at once; 256 MiB across 2 domains of 32 GB300: 705 us, 780 us in bursts of
+        // 8 slots, 849 without NVLS). (Every wait is still for an edge with a smaller key: the plans of the previous
+        // use of its slot, the reads of it, which wait for its item and for the plans that used their slots before, and
+        // the items before it in its ring.)
         Vector<Key> keys(items.size());
         for (size_t i : indices(items)) {
           keys[i] = items[i].key;
         }
+        const bool nvlsPossible = !graph.tensors.empty() &&
+                                  nvlsMulticastRuns(ctx.group, graph.tensors[0].dtype, graph.reduce, ctx.collectiveOp);
         for (size_t ri : indices(itemRings)) {
           const Ring& r = itemRings[ri];
           // (the items of rings' steps keep their keys, see above)
@@ -2242,7 +2248,7 @@ struct CompileOpConstructor {
             Item& item = items[ringItems[ri][j]];
             auto piece = allReducePieces.find(((uint64_t)item.cellIndex << 32) | item.chunkIndex);
             const bool twoRounds = piece != allReducePieces.end() && !piece->second.shareOwners.empty();
-            const bool bursts = r.flagsPerSlot >= 2 && !twoRounds;
+            const bool bursts = r.flagsPerSlot >= 2 && !twoRounds && !nvlsPossible;
             // (the use whose plans the item goes after, if any)
             const int64_t after = bursts ? (int64_t)(j / r.slots * r.slots) - 1 : (int64_t)j - 1 - (int64_t)lookahead;
             if (after < 0) {
@@ -4511,15 +4517,21 @@ struct CompileOpConstructor {
       const bool mine =
           phases != "1" && twoPhaseReductions(ictx, twoPhase, dtype, phases == "2" ? 0 : twoPhaseMinBytes);
       // Whether this rank can use NVLS, and the bytes of its reductions if every edge it executes has the shape for it
-      // (a rank's kernel uses NVLS for all its edges or for none)
+      // (a rank's kernel uses nvlsReduceLoop for all its edges or for none), and whether any edge of its could use
+      // NVLS (in nvlsReduceLoop, or with NVLS runs in the reduce loop)
       const bool nvlsPossible = nvlsReductionsPossible(group, dtype, reduce, ctx.collectiveOp);
+      const std::span<const size_t> domain(group->fabricDomainRanks.data(), group->fabricDomainRanks.size());
       uint64_t nvlsBytes = 0;
+      bool nvlsAny = false;
       if (nvlsPossible) {
         bool all = true;
         for (const Edge& e : baseGraph.edges) {
           if (e.executorRank == rank) {
-            all &= nvlsReductionShape(e, size);
+            const bool shape = nvlsReductionShape(e, domain);
+            const NvlsRuns runs = nvlsReductionRuns(e, domain);
+            all &= shape;
             nvlsBytes += e.bytes;
+            nvlsAny |= shape || runs.sources || runs.destinations;
           }
         }
         if (!all) {
@@ -4527,22 +4539,31 @@ struct CompileOpConstructor {
         }
       }
       for (size_t i : range(size)) {
-        ctx.send(i, mine, nvlsPossible, nvlsBytes);
+        ctx.send(i, mine, nvlsPossible, nvlsBytes, nvlsAny);
       }
       bool anyTwoPhase = false;
       bool nvlsEverywhere = true;
       uint64_t nvlsBytesTotal = 0;
+      bool nvlsAnywhere = false;
       for (size_t i : range(size)) {
         bool v;
         bool p;
         uint64_t b;
-        ctx.receive(i, v, p, b);
+        bool a;
+        ctx.receive(i, v, p, b, a);
         anyTwoPhase |= v;
         nvlsEverywhere &= p;
         nvlsBytesTotal += b;
+        nvlsAnywhere |= a;
       }
       if (nvlsEverywhere && nvlsBytesTotal > 0 && nvlsBytesTotal <= nvlsReductionMaxBytes(dtype) && phases != "2") {
         anyTwoPhase = false;
+      }
+      // The multicast objects of every NVLink domain (Group::setupNvls, collective over the group: here, where every
+      // rank takes part; the kernels' NVLS decisions, in generateKernel, are among the ranks of a domain only), if some
+      // rank could use them
+      if (nvlsAnywhere) {
+        ctx.group->setupNvls();
       }
       if (phases != "2" || !anyTwoPhase) {
         graphs.push_back(buildMulticast(ictx, baseGraph));
