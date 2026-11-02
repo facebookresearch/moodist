@@ -13,6 +13,7 @@ moodist's CPU allocator), and CUDA transfers between NVLink peers use sizes and 
 
 import contextlib
 import os
+import time
 
 import torch
 import moodist
@@ -442,6 +443,51 @@ def test_compile_op_reuse(ctx: TestContext, device: str):
             torch.equal(output_tensor, expected),
             f"iteration {i}: got {output_tensor}, expected {expected}"
         )
+
+
+@test_devices("cuda")
+def test_compile_op_relaunch_after_compile(ctx: TestContext, device: str):
+    """An op launched again after another op was compiled, with one rank late: every compile resets the step values,
+    which clears the address tables of all ops, those in use too, while their launch parity goes on. A cleared entry
+    must not pass for a peer's (it did with parity 0: an address of 0, an illegal address on the ranks that read the
+    entry before the late rank's kernel wrote it)."""
+    if ctx.world_size < 2:
+        return
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 1 << 16
+    dtype = torch.float32
+
+    def allgather():
+        return moodist.compile_op(
+            pg,
+            dtype=dtype,
+            inputs=[TensorRegion(offset=[ctx.rank * numel], shape=[numel], device=device)],
+            outputs=[TensorRegion(offset=[0], shape=[n * numel], device=device)],
+        )
+
+    op = allgather()
+    inp = torch.full((numel,), float(ctx.rank), dtype=dtype, device=device)
+    out = torch.empty(n * numel, dtype=dtype, device=device)
+    expected = torch.arange(n, dtype=dtype, device=device).repeat_interleave(numel)
+    # One launch on each of the 16 concurrency slots (back to back: the process group's collectives take slots too),
+    # so that the op's next launch on any slot has parity 0
+    for _ in range(16):
+        op([inp], [out]).wait()
+    torch.cuda.synchronize()
+    ok = torch.equal(out, expected)
+    allgather()  # (compiling resets the step values)
+    sync = torch.empty(n, dtype=torch.int32, device=device)
+    for _ in range(4):
+        out.fill_(-1)
+        pg._allgather_base(sync, torch.zeros(1, dtype=torch.int32, device=device)).wait()
+        torch.cuda.synchronize()
+        if ctx.rank == n - 1:
+            time.sleep(0.1)
+        op([inp], [out]).wait()
+        torch.cuda.synchronize()
+        ok = ok and torch.equal(out, expected)
+    all_ranks_ok(ctx, pg, ok, "an all-gather launched again after another compile: wrong output")
 
 
 @test_cpu_cuda

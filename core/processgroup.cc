@@ -3356,21 +3356,23 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
 
 namespace {
 // The NVLS identity of this rank's CUDA tensor at ptr (see generateKernel): where it is in the group's multicast
-// objects, and its multicast address there. In the group's communication pool, at logical offset o: (2 << 61) | o;
-// else in moodist's pool, at offset o: (1 << 61) | o; else 0 (and no multicast address). The same identity on two
-// ranks means the same offset of the same multicast object.
+// objects, and its multicast address there. In the group's communication pool, at logical offset o: (2 << 60) | o;
+// else in moodist's pool, at offset o: (1 << 60) | o; else 0 (and no multicast address). The same identity on two
+// ranks means the same offset of the same multicast object. (Bits 62 and 63 stay clear: the kernel tags the words it
+// publishes there.)
 std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t bytes) {
+  static_assert(commPoolLogicalSize <= (1ull << 60) && Group::Nvls::poolBytes <= (1ull << 60));
   const Group::Nvls& nvls = group->nvls;
   if (nvls.state != 1) {
     return {0, 0};
   }
   int64_t logical = allocatorCommPoolOffset(group->getCommPool(), ptr, bytes);
   if (logical >= 0) {
-    return {(2ull << 61) | (uint64_t)logical, nvls.commMcBase + logical};
+    return {(2ull << 60) | (uint64_t)logical, nvls.commMcBase + logical};
   }
   const uintptr_t reserved = allocatorGetReservedBase();
   if (reserved && ptr >= reserved && ptr - reserved + bytes <= Group::Nvls::poolBytes) {
-    return {(1ull << 61) | (ptr - reserved), nvls.mcBase + (ptr - reserved)};
+    return {(1ull << 60) | (ptr - reserved), nvls.mcBase + (ptr - reserved)};
   }
   return {0, 0};
 }
@@ -3621,6 +3623,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
     }
     ipcMapper->wait();
+    // (the kernel publishes these to the peers tagged in bits 62 and 63, see generateKernel)
+    for (uintptr_t a : mappedAddrs) {
+      CHECK(a >> 62 == 0);
+    }
 
     if (tensorAddrs.empty()) {
       tensorAddrs.push_back(0);

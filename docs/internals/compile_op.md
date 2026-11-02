@@ -359,8 +359,12 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 - **Buffers** (device memory, one slot per concurrency index, mapped by all kernel peers; cached per group and
   reused by later ops): `addresses` (peer tensor addresses, per block), `syncs` (exit sync, one row per block),
   `depFilled` (per node and block).
-- **Parity**: every (concurrency index, block) keeps a bit that flips at each launch. Exchanged addresses carry it
-  in bit 63, so a reader can tell the current launch's entries from the previous one's.
+- **Parity**: every (concurrency index, block) keeps a bit that flips at each launch. Exchanged words (addresses,
+  and in NVLS ops identities) carry it as a tag, bit 63 with parity 1 and bit 62 with parity 0, so a reader can tell
+  the current launch's entries from the previous one's, and never takes a word of 0 for an entry: the step value
+  reset (`resetStepValue`, at every compile and when the step values wrap) clears these tables, also those of ops in
+  use, whose parity goes on (with parity 0 as a tag of 0, a launch after a reset could read a cleared entry as an
+  address of 0 when a peer was late).
 - **Address exchange**: on entry, each rank writes the addresses at which its peers have mapped its tensors (from
   the IPC mapper, per call) into the peers' `addresses` tables. A rank that needs a remote node's address spins
   until the entry carries the current parity.
@@ -636,7 +640,7 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   slots 16 + index).
 
 - NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
-  communication pool, at logical offset o: (2 << 61) | o; else in moodist's pool, at offset o: (1 << 61) | o) and the
+  communication pool, at logical offset o: (2 << 60) | o; else in moodist's pool, at offset o: (1 << 60) | o) and the
   op's step counter value (0 for reductions, which have none). Block 0 of a launch that used NVLS (copies or
   reductions) counts it in the group's counter area (the process group option `nvls_launches`).
 - Communication pools (`allocatorCommPoolCreate`; per group, `Group::getCommPool`; `moodist.comm_empty` and the

@@ -616,7 +616,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     predicated(isThreadZero, st_global_u32)(parityAddr, parityBit);
     parityBit = selp_u32(1, 0, parityPred);
 
-    u64 parityTag = widen(parityBit) << 63;
+    // The tag of the words that this launch publishes (the addresses of the address exchange below, and in NVLS ops the
+    // identities): bit 63 with parity 1, bit 62 with parity 0, so that a word of 0 never passes for a published one.
+    // The step value reset (resetStepValue: at every compile, and when the step values wrap) clears these tables, also
+    // those of ops that are still in use, whose parity goes on: with a tag of 0 for parity 0, a launch would take a
+    // cleared word for its peer's (an address of 0).
+    static constexpr uint64_t parityTagMask = 3ull << 62;
+    u64 parityTag = (widen(parityBit) << 63) | (widen(parityBit ^ 1) << 62);
 
     profiling.leave();
 
@@ -1581,11 +1587,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       ELSE {
         u64 gaddr = addrAddrsLocalBase + widen(slot);
         r = ld_global_relaxed_sys_u64(gaddr);
-        WHILE((r & (1ull << 63)) != parityTag) {
+        WHILE((r & parityTagMask) != parityTag) {
           nanosleep(10);
           r = ld_global_relaxed_sys_u64(gaddr);
         }
-        r &= ~(1ull << 63);
+        r &= ~parityTagMask;
       }
       r += widen(offsetlo) | (widen(offsethi) << 32);
       return r;
@@ -1603,16 +1609,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       done |= isParam;
       u64 gaddr = addrAddrsLocalBase + widen(slot);
       r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
-      done |= (r & (1ull << 63)) == parityTag;
+      done |= (r & parityTagMask) == parityTag;
       profiling.enter("nodeaddr loop");
       WHILE(vote_sync_any(!done)) {
         nanosleep(10);
         fence_acquire_sys();
         r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
-        done |= (r & (1ull << 63)) == parityTag;
+        done |= (r & parityTagMask) == parityTag;
       }
       profiling.enter("nodeaddr post");
-      r &= ~(1ull << 63);
+      r &= ~parityTagMask;
 
       r += widen(offsetlo) | (widen(offsethi) << 32);
       profiling.leave();
@@ -1891,13 +1897,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             Value remote = valid & ((dslot & 1) == 0);
             u64 idAddr = idLocalBase + widen(dslot);
             u64 published = predicated(remote, ld_global_relaxed_sys_u64)(idAddr);
-            Value done = !remote | ((published & (1ull << 63)) == parityTag);
+            Value done = !remote | ((published & parityTagMask) == parityTag);
             WHILE(vote_sync_any(!done)) {
               nanosleep(10);
               published = selp(published, predicated(!done, ld_global_relaxed_sys_u64)(idAddr), done);
-              done |= (published & (1ull << 63)) == parityTag;
+              done |= (published & parityTagMask) == parityTag;
             }
-            Value bad = remote & ((published & ~(1ull << 63)) != identity);
+            Value bad = remote & ((published & ~parityTagMask) != identity);
             ok = ok & !vote_sync_any(bad);
           }
           IF_D(!ok & (laneIndex == 0)) {
