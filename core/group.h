@@ -173,30 +173,35 @@ struct Group {
   Vector<size_t> fabricDomainRanks;
 
   // NVLS (NVLink SHARP multicast) for compile_op (see generateKernel), set up by setupNvls when the first op that
-  // can use it is compiled: two multicast objects per NVLink domain (of the group's ranks in it, fabricDomainRanks;
-  // a multicast object cannot span domains), of which a rank has its domain's. One over moodist's whole allocator
-  // pool, every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank of the domain is
-  // at mcBase + o), followed by an area for the ops' step counters; one over the group's communication pool (see
-  // commPool), every slab bound at its logical offset (so logical offset o of every rank of the domain is at
-  // commMcBase + o). The objects, and what is bound to them, outlive the group.
+  // can use it is compiled: two multicast objects per NVLink domain that can use them (of the group's ranks in it,
+  // fabricDomainRanks; a multicast object cannot span domains), of which a rank has its domain's. One over moodist's
+  // whole allocator pool, every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank
+  // of the domain is at mcBase + o), followed by an area for the ops' step counters; one over the group's
+  // communication pool (see commPool), every slab bound at its logical offset (so logical offset o of every rank of
+  // the domain is at commMcBase + o). The objects, and what is bound to them, outlive the group.
   struct Nvls {
     // The pool object's size is the pool's (multicast objects of more than 1 TiB fail to bind): the counter area takes
     // its last 2 MiB, so only pool offsets below poolBytes are bound (the allocator never maps that much)
     static constexpr size_t countersBytes = (size_t)2 << 20;
     static constexpr size_t poolBytes = allocatorReserveSize - countersBytes;
-    int state = 0; // 0: not set up yet, 1: available, -1: unavailable
+    // The fewest ranks of a domain that any use of NVLS needs (see nvlsReduceMinRanks in ptx_codegen.cc, which checks
+    // the thresholds against it): smaller domains get no multicast objects
+    static constexpr size_t minDomainRanks = 8;
+    int state = 0; // 0: not set up yet, 1: available, -1: unavailable (to this rank, i.e. to its domain)
     uintptr_t mcBase = 0;
     uintptr_t commMcBase = 0;
     uintptr_t countersLocal = 0; // the counter area, through the local mapping
     uintptr_t countersMc = 0;    // the counter area, through the multicast mapping
     size_t nextCounters = 0;     // the offset in the counter area of the next op's counters (the same on all ranks)
-    // How many launches of this rank stored with NVLS (a 32-bit counter in the first 64 bytes of the counter area;
-    // see the process group option "nvls_launches")
+    // How many launches of this rank used NVLS (a 32-bit counter in the first 64 bytes of the counter area; see the
+    // process group option "nvls_launches")
     uintptr_t launches = 0;
   };
   Nvls nvls;
   // Collective over all ranks of the group (setupComms). Returns whether NVLS is available to this rank: whether its
-  // domain's objects are set up (a rank alone in its domain has none; if any rank fails, no rank has them).
+  // domain's objects are set up. A domain has none if it has fewer than Nvls::minDomainRanks ranks (a rank alone in
+  // its domain, or without a fabric, is in none), if one of its ranks does not support multicast or has no allocator
+  // pool, or if the setup fails on one of its ranks; the other domains are not affected.
   bool setupNvls();
 
   // The group's communication pool (see allocatorCommPoolCreate): buffers that every rank allocates (and frees) in the

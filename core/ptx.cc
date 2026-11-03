@@ -928,6 +928,9 @@ void barrier_sync(int n) {
 void barrier_sync(u32 a, u32 b) {
   emitInst("barrier.cta.sync.aligned " + a.str() + ", " + b.str());
 }
+void barrier_sync_unaligned(int n) {
+  emitInst("barrier.cta.sync " + std::to_string(n));
+}
 void membar_sys() {
   emitInst("membar.sys");
 }

@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""Communication pools: CUDA buffers at the same place of a process group's multicast object on every rank."""
+"""Communication pools: CUDA buffers at the same place of a process group's multicast objects (one per NVLink domain)
+on every rank."""
 
 import math
 
@@ -28,7 +29,7 @@ def comm_empty(*size, dtype=None, group=None):
     all-gather, for example, then needs one SM instead of a dozen. Reductions whose inputs (and for an all-reduce,
     outputs) are such buffers can have the NVLink switches combine them (an all-reduce then moves about half the
     data), within each NVLink domain of the group. A launch whose buffers are not at the same offset on every rank
-    stores to each rank as usual, so a mismatch only costs speed.
+    stores to each rank as usual (and reads each input), so a mismatch only costs speed.
 
     The memory comes from moodist's CUDA allocator (in large slabs the pool keeps), and is usable on the current
     stream, like torch.empty's. The process group's allocate_tensor (which FSDP2 uses after

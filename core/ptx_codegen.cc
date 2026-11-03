@@ -39,7 +39,7 @@ static constexpr uint32_t paramFillBlockSize = 256;
 
 // The reduce loop's shared memory (see generateKernel): 2 to reduceMaxStages stages of chunkSize bytes with an mbarrier
 // each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), 16 bytes for
-// the flag of the NVLS check (kernels with NVLS reductions), and 256 bytes of alignment padding
+// the flag of the NVLS check (kernels with NVLS reductions or NVLS runs), and 256 bytes of alignment padding
 static constexpr uint32_t reduceResults = 2;
 static constexpr uint32_t reduceMaxStages = 16;
 static size_t reduceStageBytes(const KernelConfig& config) {
@@ -92,13 +92,13 @@ bool nvlsDomainNodes(std::span<const compile_op::Graph::Node> nodes, std::span<c
   }
   return true;
 }
-// NVLS reductions (see generateKernel) from this many ranks, those with a destination on every rank (multicast stores,
-// an all-reduce's) from nvlsReduceMinRanks, those with one destination (a reduce-scatter's, a reduce to one rank's)
-// from nvlsReduceLocalMinRanks: with one destination, each GPU sends its whole input into the switches, N / (N - 1)
-// times what the other ranks read with the reduce loop (bfloat16 on GB300, NVLS / reduce loop: all-reduce of 256 MiB
-// on 8 GPUs 568 / 714 us, on 12 606 / 801 us, on 32 551 / 842 us; reduce-scatter of 64 MiB per rank on 8 GPUs 753 /
-// 723 us, on 12 1113 / 1131 us, on 32 2917 / 3270 us; within one node (4 GPUs), an all-reduce kernel of the probe's
-// was as fast as the reduce loop, 601 / 599 us at 256 MiB)
+// NVLS reductions (see generateKernel) from this many ranks of a domain, those with a destination on every rank of it
+// (multicast stores, an all-reduce's) from nvlsReduceMinRanks, those with one destination (a reduce-scatter's, a
+// reduce to one rank's) from nvlsReduceLocalMinRanks: with one destination, each GPU sends its whole input into the
+// switches, N / (N - 1) times what the other ranks read with the reduce loop (bfloat16 on GB300, NVLS / reduce loop:
+// all-reduce of 256 MiB on 8 GPUs 568 / 714 us, on 12 606 / 801 us, on 32 551 / 842 us; reduce-scatter of 64 MiB per
+// rank on 8 GPUs 753 / 723 us, on 12 1113 / 1131 us, on 32 2917 / 3270 us; within one node (4 GPUs), an all-reduce
+// kernel of the probe's was as fast as the reduce loop, 601 / 599 us at 256 MiB)
 static constexpr size_t nvlsReduceMinRanks = 8;
 static constexpr size_t nvlsReduceLocalMinRanks = 12;
 // NVLS runs of destinations alone (see nvlsReductionRuns: the multicast stores of an edge whose sources are not a run,
@@ -106,6 +106,9 @@ static constexpr size_t nvlsReduceLocalMinRanks = 12;
 // nvlsMinRanks in generateKernel): across 2 domains of 8 GB300, an all-reduce of 256 MiB took 874 us with them, 772
 // us without (the switches also send each chunk back to its sender, 1/8 of a GPU's ingress)
 static constexpr size_t nvlsStoreMinRanks = 16;
+// (smaller domains get no multicast objects, see Group::setupNvls)
+static_assert(nvlsReduceMinRanks >= Group::Nvls::minDomainRanks && nvlsReduceLocalMinRanks >= nvlsReduceMinRanks &&
+              nvlsStoreMinRanks >= nvlsReduceMinRanks);
 // The multimem.ld_reduce of a 16-byte vector of a dtype for a reduce op: perVector instructions of op (the forms of the
 // integers and of float64 have no vectors: 4 or 8 bytes each, into 64-bit registers if wide), or none. No min / max of
 // floating point types: multimem.ld_reduce has none for float32 and float64, and those of float16 and bfloat16 return
@@ -215,6 +218,9 @@ struct Profiling {
   std::optional<u32> dataOffset;
 
   static constexpr size_t maxBytesPerThread = 1024 * 128;
+  // A thread's area: the number of its entries that it kept, the number it recorded, then the entries (16 bytes
+  // each, of which the first 8 are written); entries that do not fit are dropped (dumpProfiling says so)
+  static constexpr uint32_t maxEntries = (maxBytesPerThread - 8) / 16;
 
   size_t dataSize(const KernelConfig& config) {
     return maxBytesPerThread * config.blockSize * config.gridSize;
@@ -235,9 +241,8 @@ struct Profiling {
     if (!enabled) {
       return;
     }
-    u32 o = 8 + 16 * *nextEntryIndex;
-    PRED(o + 16 > maxBytesPerThread) trap();
-    st_global_u32(*addrData + widen(*dataOffset), *nextEntryIndex);
+    st_global_u32(*addrData + widen(*dataOffset), min_u32(*nextEntryIndex, maxEntries));
+    st_global_u32(*addrData + widen(*dataOffset + 4), *nextEntryIndex);
   }
   void enter(std::string name, std::optional<u32> arg = {}) {
     if (!enabled) {
@@ -248,7 +253,9 @@ struct Profiling {
     }
     u32 o = 8 + 16 * *nextEntryIndex;
     u32 a = *dataOffset + o;
-    st_global_u64(*addrData + widen(a), clock64() + *clockOffset + (nameToIndex[name] << 48));
+    PRED(*nextEntryIndex < maxEntries) {
+      st_global_u64(*addrData + widen(a), clock64() + *clockOffset + (nameToIndex[name] << 48));
+    }
     *nextEntryIndex = *nextEntryIndex + 1;
   }
   void leave() {
@@ -952,6 +959,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // by time worked too, but needs the rate). The counter of each concurrency slot only grows: customOp passes its
     // value before the launch (launches times nvlsIncrement).
     static constexpr size_t nvlsMinRanks = 16;
+    static_assert(nvlsMinRanks >= Group::Nvls::minDomainRanks);
     static constexpr uint32_t nvlsSignalLag = 1; // a chunk is signaled once the stores of the one after it are issued
     static constexpr size_t nvlsCountersStride = 64; // bytes per counter (one per concurrency slot)
     // With NVLS, a pipeline stores chunks of nvlsChunkSize through its own ring over the same stage memory (up to
@@ -1004,12 +1012,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // source on every rank of the domain at the same place (the inputs of the domain; a partial result that it computes
     // for other domains), and stores to the first destinations with one multicast store if they are a destination on
     // every rank of the domain at the same place (an all-reduce's result in the domain), see nvlsReductionRuns; the
-    // same ranks, dtypes, reduce ops and checks (an entry per run). The bytes of the vectors that a thread has in
-    // flight (nvlsReduceVectors of 16 bytes, an item of a warp), and the bytes that the GPUs of an op have in flight
-    // together: in the probe, the fewest blocks that were fastest held 128 KiB per GPU with 32 GPUs, 256 KiB with 16
-    // and 1 MiB with 4 (there limited by the SMs: each GPU combines a quarter of the tensor), about 4 MiB in all; more
-    // were slower with 32 (16 blocks of 512 threads with 8 vectors of each: 573 us at 256 MiB). A rank's blocks take
-    // its share of that (its bytes of the op's NVLS reductions: the root of a reduce to one rank takes them all, but at
+    // same dtypes, reduce ops and checks (an entry per run, each falling back on its own), the same numbers of ranks
+    // but nvlsStoreMinRanks for destinations alone. The bytes of the vectors that a thread has in flight
+    // (nvlsReduceVectors of 16 bytes, an item of a warp), and the bytes that the GPUs of an op have in flight together:
+    // in the probe, the fewest blocks that were fastest held 128 KiB per GPU with 32 GPUs, 256 KiB with 16 and 1 MiB
+    // with 4 (there limited by the SMs: each GPU combines a quarter of the tensor), about 4 MiB in all; more were
+    // slower with 32 (16 blocks of 512 threads with 8 vectors of each: 573 us at 256 MiB). A rank's blocks take its
+    // share of that (its bytes of the op's NVLS reductions: the root of a reduce to one rank takes them all, but at
     // most the grid, tuned for the reduce loop, which can limit it: on 16 GB300, 256 MiB took 1.82 ms with the tuned
     // grid, 3.46 ms with 8 blocks, 1.30 with 32, 1.29 with 64).
     static constexpr uint32_t nvlsReduceVectors = 8;
@@ -1051,9 +1060,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       uint32_t myChunks = all && chunks < (1u << 30) ? (uint32_t)chunks : 0;
       // Reductions: the bytes that this rank combines with NVLS in nvlsReduceLoop (0 if it does not), else the bytes
-      // of its edges with NVLS runs
+      // of its edges with NVLS runs, and of those among them with a run of sources (which the switches combine)
       uint64_t reduceBytes = 0;
       uint64_t runBytes = 0;
+      uint64_t runLoadBytes = 0;
       bool reduceAll = capable && reduction && reduceKernel;
       for (const Edge& e : localCopies) {
         reduceAll &= compile_op::nvlsReductionShape(e, domain);
@@ -1061,24 +1071,29 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         if (capable && reduction) {
           const compile_op::NvlsRuns runs = compile_op::nvlsReductionRuns(e, domain);
           runBytes += runs.sources || runs.destinations ? e.bytes : 0;
+          runLoadBytes += runs.sources ? e.bytes : 0;
         }
       }
+      const bool runsPossible = !reduceAll && capable && reduction && reduceKernel;
       const uint64_t myReduceBytes = reduceAll ? reduceBytes : 0;
-      const uint64_t myRunBytes = !reduceAll && capable && reduction && reduceKernel ? runBytes : 0;
+      const uint64_t myRunBytes = runsPossible ? runBytes : 0;
+      const uint64_t myRunLoadBytes = runsPossible ? runLoadBytes : 0;
       for (uint32_t r : ranks) {
-        ctx.send(r, capable, myChunks, myReduceBytes, myRunBytes);
+        ctx.send(r, capable, myChunks, myReduceBytes, myRunBytes, myRunLoadBytes);
       }
       bool allCapable = true;
       bool uniform = true;
       uint32_t sendersChunks = 0;
       uint64_t reduceBytesTotal = 0;
       uint64_t runBytesTotal = 0;
+      uint64_t runLoadBytesTotal = 0;
       for (uint32_t r : ranks) {
         bool c;
         uint32_t n;
         uint64_t b;
         uint64_t rb;
-        ctx.receive(r, c, n, b, rb);
+        uint64_t rlb;
+        ctx.receive(r, c, n, b, rb, rlb);
         allCapable &= c;
         if (n) {
           uniform &= nvlsSenders == 0 || n == sendersChunks;
@@ -1087,11 +1102,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         }
         reduceBytesTotal += b;
         runBytesTotal += rb;
+        runLoadBytesTotal += rlb;
       }
       // (copies and reductions do not mix: an op with a reduce op has no NVLS copies)
       const bool copies = uniform && nvlsSenders > 0;
-      // (every rank of the domain has the same totals; a rank without tensors is not capable)
-      if (reduction && (graph.tensors.empty() || reduceBytesTotal + runBytesTotal >
+      // (every rank of the domain has the same totals; a rank without tensors is not capable; nvlsReductionMaxBytes
+      // bounds what the switches combine, not the multicast stores of runs of destinations alone)
+      if (reduction && (graph.tensors.empty() || reduceBytesTotal + runLoadBytesTotal >
                                                      compile_op::nvlsReductionMaxBytes(graph.tensors[0].dtype))) {
         reduceBytesTotal = 0;
         runBytesTotal = 0;
@@ -1933,8 +1950,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 base = (int64_t)rv->scratch.cudaPointer;
         table = base + widen(concurrencyIndex) * (blockBytes * numBlocks) + widen(blockIndex) * blockBytes;
       }
-      // NVLS: the flag the check below sets if this launch cannot use NVLS (thread 0 clears it before the resolve
-      // barrier)
+      // NVLS: the flag the check below sets if an entry fails (thread 0 clears it before the resolve barrier)
       const Group::Nvls& groupNvls = ctx.group->nvls;
       u32 nvlsFailedAddr;
       if (nvlsChecks) {
@@ -1975,16 +1991,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         fence_acquire_sys();
       }
       profiling.enter("resolve addresses barrier");
-      barrier_sync();
+      // (unaligned: after thread 0's branch above, see the reduce loop)
+      barrier_sync_unaligned();
       profiling.leave();
 
-      // NVLS check: this launch uses NVLS if every node of every entry of the NVLS edge table (the destinations of
-      // copies; the sources of reductions, and their destinations with multicast stores) has the identity of the local
-      // node of the entry's NVLS slot (the same tensor at the same place of the same multicast object; the node offset
-      // is the same on every rank): from the identities the peers publish (with the launch's parity, like the
-      // addresses). All of them before any multimem.ld_reduce, which fails (the context, with CUDA_ERROR_CONTAINED) at
-      // an offset where a member has no memory bound. Warp w checks the entries w, w + numWarps, ...; an entry that
-      // fails gets 0 in its NVLS slot and sets the flag. Every block decides the same: from the same identities.
+      // NVLS check: an entry of the NVLS edge table (the destinations of copies; the sources of reductions, and their
+      // destinations with multicast stores; a run of the reduce loop) passes if every node of it has the identity of
+      // the local node of the entry's NVLS slot (the same tensor at the same place of the same multicast object; the
+      // node offset is the same on every rank): from the identities the peers publish (with the launch's parity, like
+      // the addresses). All of them before any multimem.ld_reduce, which fails (the context, with
+      // CUDA_ERROR_CONTAINED) at an offset where a member has no memory bound. Warp w checks the entries w, w +
+      // numWarps, ...; an entry that fails gets 0 in its NVLS slot and sets the flag. Copies and nvlsReduceLoop use
+      // NVLS only if no entry fails (nvlsMode), a run of the reduce loop if its own entry passes (see runSlotAddress).
+      // Every block decides the same: from the same identities.
       Value nvlsMode(ValType::Pred);
       if (nvlsChecks) {
         profiling.enter("nvls check");
@@ -2022,9 +2041,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             st_shared_u32(nvlsFailedAddr, 1);
           }
         }
-        barrier_sync();
+        // (unaligned: after lane 0's branch above, see the reduce loop)
+        barrier_sync_unaligned();
         nvlsMode = ld_shared_u32(nvlsFailedAddr) == 0;
-        // Count the launch (see Group::Nvls::launches)
+        // Count the launch, if every entry passed (see Group::Nvls::launches)
         IF_D(nvlsMode & isThreadZero & (blockIndex == 0)) {
           u64 launches = (int64_t)groupNvls.launches;
           u32 old;
@@ -2701,14 +2721,15 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
         };
 
-        // Fill the ring
+        // Fill the ring. (The block barriers of the loop are unaligned: they follow branches of thread 0, after which
+        // the ptxas of CUDA 13.0 can fail to reconverge warp 0, see the warp sync at the end of an item.)
         IF_D(isThreadZero) {
           // The loads below may read data whose readiness generic loads have observed
           fence_proxy_async_global();
           startItem();
           fill(false);
         }
-        barrier_sync();
+        barrier_sync_unaligned();
 
         u32 consStage = 0;
         u32 consParity = 0;
@@ -2841,7 +2862,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             consParity = consParity ^ selp_u32(1, 0, wrap);
             consumed += 1;
             // Every thread has combined the stage: load the next chunk into it
-            barrier_sync();
+            barrier_sync_unaligned();
             IF_D(isThreadZero) {
               fill(false);
             }
@@ -2851,7 +2872,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           IF_D(isThreadZero) {
             cp_async_bulk_wait_group_read(reduceResults - 1);
           }
-          barrier_sync();
+          barrier_sync_unaligned();
           u32 buffer = reduceResultBuffers + result * chunkSize;
           Value copy = numSources == 1;
           for (uint32_t v : range(numVectors)) {
@@ -2864,7 +2885,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           }
           // The bulk stores below read what the threads have written
           fence_proxy_async_shared_cta();
-          barrier_sync();
+          barrier_sync_unaligned();
           IF_D(isThreadZero) {
             // An NVLS run of destinations: one bulk store to the multicast address, then the destinations after it
             u32 firstDestination = 0;
@@ -2912,10 +2933,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               }
             }
           }
-          // Warp 0 together again before the next item's block barriers: the ptxas of CUDA 13.0 (the JIT of driver
-          // 580) can fail to reconverge a warp after a branch of one thread (fixed in CUDA 13.2.2), and a bar.sync
-          // of a diverged warp is undefined (a variant of this loop whose thread 0 alone counted the items after the
-          // last barrier hung in every all-reduce of 64 MiB across 2 domains of 32 GB300; with this, never)
+          // Warp 0 together again before the next item: the ptxas of CUDA 13.0 (the JIT of driver 580) can fail to
+          // reconverge a warp after a branch of one thread (fixed in CUDA 13.2.2), and an aligned block barrier
+          // (bar.sync) of a diverged warp is undefined (a variant of this loop whose thread 0 alone counted the items
+          // after the last barrier, with aligned barriers, hung in every all-reduce of 64 MiB across 2 domains of 32
+          // GB300; with this, never). The loop's barriers are unaligned now too, which a diverged warp may reach.
           warp_sync();
           result = result ^ 1;
           u32 nextSlot = consSlot + 1;
@@ -3089,9 +3111,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       } else {
         unicastCopy();
       }
-      // All copies done before the exit's release fence
+      // All copies done before the exit's release fence (unaligned: after the branches of thread 0 or of the pipelines'
+      // lanes, see the reduce loop)
       profiling.enter("copy end barrier");
-      barrier_sync();
+      barrier_sync_unaligned();
       profiling.leave();
     } else {
       // Rounds: warp 0 scans the edges that are not done, 32 at a time (one per lane). Relay edges whose signal
@@ -3213,7 +3236,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       u32 targetValue = stepValue + stepOffset;
       profiling.enter("exit sync barrier");
-      barrier_sync();
+      // (unaligned: after thread 0's release fence, see the reduce loop)
+      barrier_sync_unaligned();
       profiling.enter("exit sync barrier wait");
       for (size_t i : indices(staddrs)) {
         profiling.enter("sync st");

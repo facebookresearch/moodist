@@ -711,6 +711,10 @@ Value atom_shared_acq_rel_cta_add_u32(const Value& addr, const Value& b);
 // Synchronization
 void barrier_sync(int n = 0);
 void barrier_sync(u32 a, u32 b);
+// barrier.cta.sync without .aligned (barrier_sync's): also defined when the threads of a warp arrive diverged, each
+// thread on its own, e.g. after a branch of one thread if the compiler does not reconverge the warp (see the reduce
+// loop in ptx_codegen.cc)
+void barrier_sync_unaligned(int n = 0);
 void membar_sys();
 void warp_sync(uint32_t membermask = 0xFFFFFFFF);
 

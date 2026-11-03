@@ -1661,6 +1661,25 @@ bool Group::setupNvls() {
   auto start = std::chrono::steady_clock::now();
   CHECK_CU(cuCtxSetCurrent(cuContext));
   constexpr size_t countersBytes = Nvls::countersBytes;
+
+  // The multicast objects (see Nvls) of this rank's NVLink domain (the ranks of the group in it, fabricDomainRanks):
+  // the pool's (the pool, then the counter area) and the communication pool's. The domain's first rank creates them,
+  // the others import them, and every device must be added before any rank binds memory to them. Only a domain that
+  // can use them has them (its ranks are the members): one of at least Nvls::minDomainRanks ranks, every one of which
+  // supports multicast (supportsMulticast covers the ranks of a node) and has moodist's allocator pool. Every rank of
+  // the group takes part in every exchange (the ranks of the other domains in the exchanges only), and the ranks of a
+  // domain agree among themselves: a domain whose setup fails on one of its ranks has no NVLS, the others still do.
+  auto capable = setupComms->allgather((uint8_t)(supportsMulticast && allocatorGetReservedBase() != 0));
+  bool member = fabricDomainRanks.size() >= Nvls::minDomainRanks;
+  for (size_t i : fabricDomainRanks) {
+    member &= capable.at(i);
+  }
+  if (!member && fabricDomainRanks.size() >= Nvls::minDomainRanks && rank == fabricDomainRanks[0]) {
+    log.info("NVLS (multicast) is not available in the NVLink domain of rank %d of group %s: not every rank of it "
+             "supports multicast and has moodist's allocator pool\n",
+        rank, name);
+  }
+  const size_t creator = member ? fabricDomainRanks[0] : rank;
   std::string error; // this rank's first error
   auto check = [&](CUresult r, const char* what) {
     if (r != CUDA_SUCCESS && error.empty()) {
@@ -1670,19 +1689,24 @@ bool Group::setupNvls() {
     }
     return error.empty();
   };
-  // Whether no rank has failed so far (all ranks get the same answer)
+  // Whether this rank's domain is a member and none of its ranks has failed so far (the same on every rank of the
+  // domain)
+  bool ok = member;
   auto agree = [&]() {
     auto errors = setupComms->allgather(error);
-    for (size_t i : indices(errors)) {
-      if (!errors[i].empty()) {
-        if (rank == 0) {
-          log.error("moodist: NVLS (multicast) is not available for group %s (rank %d: %s)\n", name, i, errors[i]);
+    if (ok) {
+      for (size_t i : fabricDomainRanks) {
+        if (!errors.at(i).empty()) {
+          if (rank == fabricDomainRanks[0]) {
+            log.error("NVLS (multicast) is not available in the NVLink domain of rank %d of group %s "
+                      "(rank %d: %s)\n",
+                rank, name, i, errors[i]);
+          }
+          ok = false;
+          break;
         }
-        nvls.state = -1;
-        return false;
       }
     }
-    return true;
   };
   CUmemAccessDesc access;
   std::memset(&access, 0, sizeof(access));
@@ -1690,12 +1714,6 @@ bool Group::setupNvls() {
   access.location.id = deviceIndex;
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-  // The multicast objects (see Nvls) of this rank's NVLink domain (the ranks of the group in it, fabricDomainRanks):
-  // the pool's (the pool, then the counter area) and the communication pool's. The domain's first rank creates them,
-  // the others import them, and every device must be added before any rank binds memory to them. A rank alone in its
-  // domain (or without a fabric) has none, and takes part in the exchanges only.
-  const bool member = fabricDomainRanks.size() >= 2;
-  const size_t creator = member ? fabricDomainRanks[0] : rank;
   constexpr size_t numObjects = 2;
   const std::array<size_t, numObjects> objectBytes = {Nvls::poolBytes + countersBytes, commPoolLogicalSize};
   std::array<CUmemGenericAllocationHandle, numObjects> objects = {};
@@ -1705,39 +1723,32 @@ bool Group::setupNvls() {
   prop.size = objectBytes[0];
   prop.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   size_t granularity = 0;
-  if (member) {
+  if (ok) {
     check(
         cuMulticastGetGranularity(&granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM), "cuMulticastGetGranularity");
-    if (error.empty() && (granularity == 0 || objectBytes[0] % granularity != 0 || objectBytes[1] % granularity != 0 ||
-                             allocatorGetReservedBase() == 0)) {
-      error = fmt::sprintf(
-          "multicast granularity %d, allocator reservation at %#x", granularity, allocatorGetReservedBase());
+    if (error.empty() && (granularity == 0 || objectBytes[0] % granularity != 0 || objectBytes[1] % granularity != 0)) {
+      error = fmt::sprintf("multicast granularity %d", granularity);
     }
   }
   std::array<CUmemFabricHandle, numObjects> fabricHandles;
   std::memset(&fabricHandles, 0, sizeof(fabricHandles));
   for (size_t i : range(numObjects)) {
     prop.size = objectBytes[i];
-    if (member && rank == creator && error.empty() &&
-        check(cuMulticastCreate(&objects[i], &prop), "cuMulticastCreate")) {
+    if (ok && rank == creator && error.empty() && check(cuMulticastCreate(&objects[i], &prop), "cuMulticastCreate")) {
       check(cuMemExportToShareableHandle(&fabricHandles[i], objects[i], CU_MEM_HANDLE_TYPE_FABRIC, 0),
           "cuMemExportToShareableHandle");
     }
   }
   auto handles = setupComms->allgather(fabricHandles);
-  if (!agree()) {
-    return false;
-  }
+  agree();
   for (size_t i : range(numObjects)) {
-    if (member && (rank == creator || check(cuMemImportFromShareableHandle(
-                                                &objects[i], &handles.at(creator)[i], CU_MEM_HANDLE_TYPE_FABRIC),
-                                          "cuMemImportFromShareableHandle"))) {
+    if (ok && (rank == creator ||
+                  check(cuMemImportFromShareableHandle(&objects[i], &handles.at(creator)[i], CU_MEM_HANDLE_TYPE_FABRIC),
+                      "cuMemImportFromShareableHandle"))) {
       check(cuMulticastAddDevice(objects[i], cuDevice), "cuMulticastAddDevice");
     }
   }
-  if (!agree()) {
-    return false;
-  }
+  agree();
 
   // The counter area: zeroed before any rank can add to it (once every rank has returned from here)
   CUmemAllocationProp counterProp;
@@ -1749,7 +1760,7 @@ bool Group::setupNvls() {
   counterProp.location.id = deviceIndex;
   CUmemGenericAllocationHandle counters = 0;
   CUdeviceptr countersLocal = 0;
-  if (member && check(cuMemCreate(&counters, countersBytes, &counterProp, 0), "cuMemCreate (counters)") &&
+  if (ok && check(cuMemCreate(&counters, countersBytes, &counterProp, 0), "cuMemCreate (counters)") &&
       check(cuMemAddressReserve(&countersLocal, countersBytes, granularity, 0, 0), "cuMemAddressReserve (counters)") &&
       check(cuMemMap(countersLocal, countersBytes, 0, counters, 0), "cuMemMap (counters)") &&
       check(cuMemSetAccess(countersLocal, countersBytes, &access, 1), "cuMemSetAccess (counters)") &&
@@ -1759,28 +1770,26 @@ bool Group::setupNvls() {
         "cuMulticastBindMem (counters)");
   }
 
-  // Every chunk of the pool at its offset, and every slab of the communication pool at its logical offset: the
-  // existing ones now, new ones when the allocator adds them (binding does not wait for the GPU)
-  if (member && error.empty()) {
-    allocatorAddChunkListener(nvlsBindChunk, internalNew<NvlsBinder>(objects[0], Nvls::poolBytes));
-    allocatorCommPoolAddSlabListener(getCommPool(), nvlsBindSlab, internalNew<NvlsBinder>(objects[1], objectBytes[1]));
-  }
-
   std::array<CUdeviceptr, numObjects> mcBases = {};
   for (size_t i : range(numObjects)) {
-    if (member && error.empty() &&
+    if (ok && error.empty() &&
         check(cuMemAddressReserve(&mcBases[i], objectBytes[i], granularity, 0, 0), "cuMemAddressReserve") &&
         check(cuMemMap(mcBases[i], objectBytes[i], 0, objects[i], 0), "cuMemMap")) {
       check(cuMemSetAccess(mcBases[i], objectBytes[i], &access, 1), "cuMemSetAccess");
     }
   }
-  if (!agree()) {
-    return false;
-  }
-  if (!member) {
+  agree();
+  if (!ok) {
     nvls.state = -1;
     return false;
   }
+
+  // Every chunk of the pool at its offset, and every slab of the communication pool at its logical offset: the
+  // existing ones now, new ones when the allocator adds them (binding does not wait for the GPU). Only once the whole
+  // domain has its objects, so that a domain whose setup fails binds nothing (a failed bind of a chunk is fatal).
+  allocatorAddChunkListener(nvlsBindChunk, internalNew<NvlsBinder>(objects[0], Nvls::poolBytes));
+  allocatorCommPoolAddSlabListener(getCommPool(), nvlsBindSlab, internalNew<NvlsBinder>(objects[1], objectBytes[1]));
+
   nvls.mcBase = mcBases[0];
   nvls.commMcBase = mcBases[1];
   nvls.countersLocal = countersLocal;

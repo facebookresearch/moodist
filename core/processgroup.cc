@@ -2859,8 +2859,9 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
     // Read-only: the process group's timeout (see Group::timeout)
     return std::chrono::duration_cast<std::chrono::milliseconds>(impl->group->timeout).count();
   } else if (key == "nvls_launches") {
-    // Read-only: how many compile_op launches of this rank in this group stored with NVLS (see generateKernel); as
-    // of the launches that have completed
+    // Read-only: how many compile_op launches of this rank in this group used NVLS (copies, reductions; with the NVLS
+    // runs of the reduce loop, a launch every run of which could; see generateKernel); as of the launches that have
+    // completed
     const Group::Nvls& nvls = impl->group->nvls;
     if (nvls.state != 1) {
       return 0;
@@ -3272,12 +3273,17 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
                   "\n");
 
   bool first = true;
+  size_t truncated = 0; // threads that recorded more entries than their area holds (the kernel drops the others)
   for (size_t blockIndex : range(gridSize)) {
     for (size_t threadIndex : range(blockSize)) {
       size_t dataOffset = op->kernelHandle->profilingBytesPerThread * ((blockSize * blockIndex) + threadIndex);
 
       uint32_t numEntries;
       std::memcpy(&numEntries, data.data() + dataOffset, sizeof(uint32_t));
+      uint32_t recorded;
+      std::memcpy(&recorded, data.data() + dataOffset + 4, sizeof(uint32_t));
+      truncated += recorded > numEntries;
+      CHECK(8 + 16 * (size_t)numEntries <= op->kernelHandle->profilingBytesPerThread);
 
       // log.info("Block %d thread %d has %d entries\n", blockIndex, threadIndex, numEntries);
 
@@ -3312,6 +3318,11 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
   fmt::fprintf(f, "]}\n");
   fclose(f);
   log.info("Chrome trace dumped to %s\n", fn);
+  if (truncated) {
+    log.error("the trace of compile_op op %u is incomplete: %d threads recorded more entries than fit in %d "
+              "bytes each (the later ones are missing)\n",
+        op->id, truncated, op->kernelHandle->profilingBytesPerThread);
+  }
 }
 
 } // namespace
@@ -3706,6 +3717,8 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     group->cpuThread->enqueue(e);
   }
   if (dumpProfile) {
+    // (on the group's device, as the launch was)
+    StreamGuard sg(stream, group->deviceIndex);
     CHECK_CU(cuCtxSynchronize());
     dumpProfiling(&*group, op);
   }
