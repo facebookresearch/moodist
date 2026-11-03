@@ -134,33 +134,31 @@ struct GenericHash {
   }
 };
 
-// Cache key for scatter collective (used with compile_op)
+// Cache key of the scatter of CPU tensors (a collectiveOp compile_op op; CUDA tensors: see runCollective)
 struct ScatterCacheKey {
   size_t numel;
   DType dtype;
   int sourceRank;
-  bool isCuda;
 
   bool operator==(const ScatterCacheKey&) const = default;
 
   template<typename X>
   void hash(X& x) const {
-    x(numel, dtype, sourceRank, isCuda);
+    x(numel, dtype, sourceRank);
   }
 };
 
-// Cache key for gather collective (used with compile_op)
+// Cache key of the gather of CPU tensors (likewise)
 struct GatherCacheKey {
   size_t numel;
   DType dtype;
   int destRank;
-  bool isCuda;
 
   bool operator==(const GatherCacheKey&) const = default;
 
   template<typename X>
   void hash(X& x) const {
-    x(numel, dtype, destRank, isCuda);
+    x(numel, dtype, destRank);
   }
 };
 
@@ -425,8 +423,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
   Reusable<IpcEvent> ipcEvents;
   Reusable<IpcEvent> pendingIpcEvents;
 
-  int streamPriority = -1;
-
   // Memory operations batching for CUDA stream memory ops
   std::vector<CUstreamBatchMemOpParams> memops;
 
@@ -463,10 +459,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
     for (auto& v : concurrencyEvents) {
       v = Event::create();
-    }
-
-    if (size - 1 == group->peerIndices.size()) {
-      streamPriority = -10;
     }
 
     {
@@ -1173,7 +1165,7 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
   }
 
   // CPU tensors: a compile_op op over RDMA
-  ScatterCacheKey key{numel, dtype, sourceRank, isCuda};
+  ScatterCacheKey key{numel, dtype, sourceRank};
 
   auto it = scatterCache.find(key);
   if (it == scatterCache.end()) {
@@ -1281,7 +1273,7 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
   }
 
   // CPU tensors: a compile_op op over RDMA
-  GatherCacheKey key{numel, dtype, destRank, isCuda};
+  GatherCacheKey key{numel, dtype, destRank};
 
   auto it = gatherCache.find(key);
   if (it == gatherCache.end()) {
@@ -2042,7 +2034,8 @@ namespace {
 // all-reduce; in an all-gather, the output has one per rank, and in a reduce-scatter the input; in an all-to-all,
 // both (what the rank sends to each rank, what it receives from each); every rank has an output in a broadcast, and
 // the root an input (in place: then the op's destinations are on every rank, at the same offset of the pool where the
-// tensors are there, which multicast stores need); every rank has an input in a reduce, and the root an output; in a
+// tensors are there, as multicast stores need, which the kernel does not use for it yet: see docs/internals/
+// compile_op.md, Known issues); every rank has an input in a reduce, and the root an output; in a
 // scatter every rank has an output, and the root an input of one part per rank; in a gather the other way around.
 std::pair<size_t, size_t> collectiveParts(CollectiveKind kind, size_t r, size_t root, size_t size) {
   switch (kind) {
@@ -2285,6 +2278,9 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     auto overlaps = [&]() {
       if (kind != CollectiveKind::allToAll) {
         return false;
+      }
+      if (in.contiguous && out.contiguous) {
+        return in.address() < out.address() + out.rows * width && out.address() < in.address() + in.rows * width;
       }
       for (uintptr_t a : in.addresses) {
         for (uintptr_t b : out.addresses) {

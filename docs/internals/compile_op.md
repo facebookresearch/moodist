@@ -743,23 +743,23 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   goes through a buffer of the group's communication pool, copied in before the op and out after it on the stream (2-D
   copies where the buffer's parts are padded to 16 bytes; one buffer for both where the input is the output: an
   all-reduce, a broadcast or a reduce on its root); so does an all-to-all's input that shares memory with its output (in
-  place, a rank's part for rank j is where rank j's part for it goes). A broadcast's root has an output too, its input
-  (so that the op has a destination on every rank, at the same offset of the pool where the tensors are there: the root
-  stores to all of them with multicast stores, instead of once per rank). When every rank does the same (e.g. all use
-  PyTorch's allocator), the buffers are at the same offset of the pool on every rank, and the op still uses NVLS.
-  Tensors from the pool (`comm_empty`, or the process group's `allocate_tensor`, i.e. FSDP2's with
+  place, a rank's part for rank j is where rank j's part for it goes). A broadcast's root has an output too, its input,
+  so that the op has a destination on every rank (at the same offset of the pool where the tensors are there), as
+  multicast stores need (the kernel does not use them for it yet, see Known issues, Performance). When every rank does
+  the same (e.g. all use PyTorch's allocator), the buffers are at the same offset of the pool on every rank, and the op
+  still uses NVLS. Tensors from the pool (`comm_empty`, or the process group's `allocate_tensor`, i.e. FSDP2's with
   `set_allocate_memory_from_process_group_for_comm(True)`) whose parts are multiples of 16 bytes need no copies.
   PREMUL_SUM's factor is a launch parameter (see Reductions in the kernel), so one op serves every factor; a group of
   one rank compiles nothing (a copy, and PREMUL_SUM's factor applied after). `all_to_all_single` with uneven splits is
-  an error (an op per pattern of splits would compile at nearly every call; see Reductions: next steps). The forms with
-  lists of `reduce_scatter` (whose inputs the wrapper copies into one tensor) and `all_gather_coalesced` (an all-gather
-  per input) use the same ops. CPU tensors take the CPU thread's implementations (all-gather, reduce-scatter, whose avg
-  sums and divides, all-reduce, which is a reduce-scatter and an all-gather, broadcast), or compile_op ops over RDMA
-  (scatter, gather: `collectiveOp`); reduce and all-to-all of CPU tensors are errors. The process group's own
-  implementations for CUDA tensors (ring and direct reads in the CPU thread, RDMA trees, NVRTC kernels) are gone
-  (November 2026). The tuning's tensors and the scratch tensor come from moodist's allocator (`allocateCudaBuffer`),
-  which ranks across a fabric can map (before, from the caller's allocator: PyTorch's, unless
-  `moodist.enable_cuda_allocator()`).
+  an error (an op per pattern of splits would compile at nearly every call; see Reductions: next steps), raised by the
+  ranks whose splits are uneven (the others wait for them, until the timeout). The forms with lists of `reduce_scatter`
+  (whose inputs the wrapper copies into one tensor) and `all_gather_coalesced` (an all-gather per input) use the same
+  ops. CPU tensors take the CPU thread's implementations (all-gather, reduce-scatter, whose avg sums and divides,
+  all-reduce, which is a reduce-scatter and an all-gather, broadcast), or compile_op ops over RDMA (scatter, gather:
+  `collectiveOp`); reduce and all-to-all of CPU tensors are errors. The process group's own implementations for CUDA
+  tensors (ring and direct reads in the CPU thread, RDMA trees, NVRTC kernels) are gone (November 2026). The tuning's
+  tensors and the scratch tensor come from moodist's allocator (`allocateCudaBuffer`), which ranks across a fabric can
+  map (before, from the caller's allocator: PyTorch's, unless `moodist.enable_cuda_allocator()`).
 
 ## Environment variables
 
@@ -1346,13 +1346,26 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
 
 ### Performance
 - The process group's broadcast and reduce of large tensors are bound by the root (see the table under Performance
-  notes): a broadcast's root stores the tensor to every other rank (copies use multicast stores only where every
-  rank's kernel exchanges with its whole domain, as in an all-gather; a broadcast's receivers exchange with the root
-  alone), and a reduce's root combines every input (with NVLS too, at about 100 GB/s). They could run as two ops
-  above some size (a scatter and an all-gather; a reduce-scatter and a gather to the root), or compile_op could store
-  from one sender to its domain with multicast stores (and the proxies' copies across domains) and split a reduce to
-  one rank among the GPUs of its domain (Reductions: next steps, item 5). Not critical for the workloads known so far
-  (November 2026).
+  notes): a broadcast's root stores the tensor to every other rank, and a reduce's root combines every input (with
+  NVLS too, at about 100 GB/s). A broadcast's destinations are on every rank, at the same offset of the pool where the
+  tensors are there, but `nvlsLocalDestination` (ptx_codegen.cc) takes only an edge whose destinations have the same
+  tensor index on every rank, and the root's output is its second tensor (after its input), the other ranks' their
+  first: going by the destinations' NVLS identities, which every launch checks anyway, would let a broadcast in one
+  domain use multicast stores (not tried; copies across domains use none). Or the two could run as two ops above some
+  size (a scatter and an all-gather; a reduce-scatter and a gather to the root), and compile_op could split a reduce
+  to one rank among the GPUs of its domain (Reductions: next steps, item 5). Not critical for the workloads known so
+  far (November 2026).
+- The ops of the process group's broadcast, reduce, scatter and gather allocate different tuning tensors on different
+  ranks (`tuneKernels`, from moodist's allocator: the root has more tensors), after which the ranks' tensors from
+  moodist's allocator are no longer at the same offsets, and later ops on such tensors lose NVLS (on 32 GPUs, a reduce
+  of 64 MiB took 2.76 ms instead of 669 us). The communication pool is not affected, nor PyTorch's allocator, whose
+  tensors the process group copies through the pool. Tuning tensors of the same total size on every rank (the
+  largest rank's) would keep the allocators in step.
+- Every new shape of a process group collective compiles an op (1-2 s, collective), kept for the group's lifetime:
+  one per collective, size and root (e.g. a broadcast of every parameter of a model compiles one per parameter shape,
+  as bwrl's `allreduce_backend="hierarchical"` does), and a group's NVLS step counters last for 2047 ops with NVLS
+  copies (later ones store to each rank, with an error in the log). Ops parameterized by size would bound both
+  (Reductions: next steps, item 6).
 - NVLS (see the kernel and the all-gather table under Performance notes). Open: the rank threshold (16; one node of
   4 GPUs lost from 4M on, 8 and 12 are not measured; 16 ranks lose 1-2% from 64 MiB on) could become a tuning
   candidate instead (one block, against the unicast grids with their block penalty), which needs tuning buffers from

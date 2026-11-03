@@ -154,9 +154,13 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter(std::vector<at::Tensor>& o
   TORCH_CHECK(outputs.size() == 1 && inputs.size() == 1, "moodist: reduce_scatter takes one output and one input list");
   TORCH_CHECK((int64_t)inputs[0].size() == getSize(), "moodist: reduce_scatter: expected ", getSize(), " inputs, got ",
       inputs[0].size());
-  // The inputs one after the other in one tensor (copies, on the current stream)
+  // The inputs one after the other in one tensor (copies, on the current stream): each the output's size and dtype
+  // (uneven inputs are not supported, as all_to_all_single's uneven splits)
   std::vector<at::Tensor> flat;
   for (auto& t : inputs[0]) {
+    TORCH_CHECK(t.numel() == outputs[0].numel() && t.scalar_type() == outputs[0].scalar_type() &&
+                    t.device() == outputs[0].device(),
+        "moodist: reduce_scatter: every input must have the output's size, dtype and device");
     flat.push_back(t.reshape(-1));
   }
   at::Tensor input = at::cat(flat);

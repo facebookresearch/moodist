@@ -548,6 +548,10 @@ def test_pg_list_collectives(ctx: TestContext):
     opts.reduceOp = dist.ReduceOp.SUM
     pg.reduce_scatter([out], [inputs], opts).wait()
     check(ctx, pg, "reduce_scatter (list)", out, reference("sum", n, ctx.rank * numel, numel, 2), "sum", torch.float32)
+    if n > 1:
+        # (inputs of other sizes than the output's, even if they add up: an error, on every rank here)
+        uneven = [torch.zeros(numel + (1 if j == 0 else -1 if j == 1 else 0), device="cuda") for j in range(n)]
+        ctx.assert_raises(RuntimeError, lambda: pg.reduce_scatter([out], [uneven], opts).wait())
     a = rank_values(ctx.rank, 0, 100, torch.float32, 3)
     b = rank_values(ctx.rank, 0, 37, torch.int64, 4)
     outputs = [[torch.empty_like(a), torch.empty_like(b)] for _ in range(n)]

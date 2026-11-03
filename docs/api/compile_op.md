@@ -71,7 +71,7 @@ This is useful for tensor redistribution operations where you want to change the
 
 ## NVLink multicast and communication buffers
 
-In groups of at least 16 ranks in one NVLink domain (with NVLink SHARP, e.g. GB200/GB300 NVL72), an op that sends the same data to every rank of the group (all-gather, broadcast) can store it once, with NVLink multicast: one SM then does the work of a dozen, and the op is faster up to large sizes. A launch uses multicast only if every rank's output is at the same place of the group's multicast memory, which buffers from the group's communication pool are when every rank allocates and frees them in the same order:
+In groups of at least 16 ranks in one NVLink domain (with NVLink SHARP, e.g. GB200/GB300 NVL72), an op that sends the same data to every rank of the group, at the same tensor and offset on each (an all-gather), can store it once, with NVLink multicast: one SM then does the work of a dozen, and the op is faster up to large sizes. A launch uses multicast only if every rank's output is at the same place of the group's multicast memory, which buffers from the group's communication pool are when every rank allocates and frees them in the same order:
 
 ```python
 op = moodist.compile_op(group, dtype=torch.float32, inputs=..., outputs=...)  # an all-gather
