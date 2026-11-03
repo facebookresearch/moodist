@@ -20,14 +20,12 @@ namespace moodist {
 
 constexpr uint8_t taskShutdown = 0;
 constexpr uint8_t taskBarrier = 1;
-// (2, 3, 20, 21 and 23 were the all-gathers and reduce-scatters of CUDA tensors, now compile_op ops)
-constexpr uint8_t taskBroadcast = 4;
+// (2, 3, 4, 10, 20, 21 and 23 were the all-gathers, reduce-scatters, broadcasts and reduces of CUDA tensors, now
+// compile_op ops; 7, a gather of CPU tensors, was unused)
 constexpr uint8_t taskAllGatherCpu = 5;
 constexpr uint8_t taskReduceScatterCpu = 6;
-constexpr uint8_t taskGatherCpu = 7;
 constexpr uint8_t taskBroadcastCpu = 8;
 constexpr uint8_t taskInternalBarrier = 9;
-constexpr uint8_t taskReduce = 10;
 constexpr uint8_t taskCreateQueue = 11;
 constexpr uint8_t taskQueuePut = 12;
 constexpr uint8_t taskQueueRead = 13;
@@ -65,26 +63,8 @@ OPTYPE(InternalBarrier);
 OPTYPE(AllGatherCpu);
 OPTYPE(ReduceScatterCpu);
 OPTYPE(BroadcastRingCpu);
-OPTYPE(GatherCpu);
 
-OPTYPE(AllGatherKernelLessCuda);
-OPTYPE(AllGatherLocalCuda);
-OPTYPE(AllGatherRingCuda);
-OPTYPE(AllGatherBroadcastCuda);
-OPTYPE(AllGatherDirectCuda);
-OPTYPE(ReduceScatterKernelLessCuda);
-OPTYPE(ReduceScatterRingCuda);
-OPTYPE(ReduceScatterDirectCuda);
-OPTYPE(BroadcastCuda);
-OPTYPE(ReduceCuda);
-OPTYPE(AllToAllCuda);
-OPTYPE(AllToAllCuda2);
-OPTYPE(LocalSmallAllReduceCuda);
-OPTYPE(ShareCuda);
 OPTYPE(BarrierCuda);
-
-OPTYPE(BroadcastRingCuda);
-OPTYPE(ReduceTreeCuda);
 
 OPTYPE(CreateQueue);
 OPTYPE(QueuePut);
@@ -135,28 +115,6 @@ struct QueueEntryBarrier : QueueEntry {
   std::atomic_uint32_t* cpuDone = nullptr;
 };
 
-struct QueueEntryBroadcast : QueueEntry {
-  uintptr_t tensorAddress = 0;
-  size_t bytes = 0;
-  size_t sourceRank = 0;
-
-  size_t numDevices = 0;
-  size_t numChunks = 0;
-  size_t numParallel = 0;
-};
-
-struct QueueEntryReduce : QueueEntry {
-  uintptr_t tensorAddress = 0;
-  size_t bytes = 0;
-  size_t destinationRank = 0;
-
-  uintptr_t recvBuffer = 0;
-
-  size_t numDevices = 0;
-  size_t numChunks = 0;
-  size_t numParallel = 0;
-};
-
 struct QueueEntryAllGatherCpu : QueueEntry {
   uintptr_t inputAddress = 0;
   uintptr_t outputAddress = 0;
@@ -173,14 +131,6 @@ struct QueueEntryReduceScatterCpu : QueueEntry {
   std::atomic_uint32_t* cpuDone = nullptr;
   Dtype dindex;
   Reduction opindex;
-};
-
-struct QueueEntryGatherCpu : QueueEntry {
-  uintptr_t inputAddress = 0;
-  SimpleVector<DataRef> outputList;
-  size_t bytes = 0;
-  uint32_t destinationRank = -1;
-  std::atomic_uint32_t* cpuDone = nullptr;
 };
 
 struct QueueEntryBroadcastCpu : QueueEntry {
@@ -411,8 +361,8 @@ struct CustomOpDescriptor {
   bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
   bool anyRankNeedsRdma = false;
-  // CUDA tensors must come from the moodist CUDA allocator (checked in customOp). Off for process group
-  // collectives built on compile_op (scatter, gather), which take tensors from any allocator.
+  // CUDA tensors must come from the moodist CUDA allocator (checked in customOp). Off for the process group's
+  // collectives (see runCollective in processgroup.cc), which take tensors from any allocator.
   bool requireMoodistMemory = true;
 
   compile_op::Graph graph;
@@ -484,12 +434,9 @@ struct CpuThread {
 
   QueueEntryFreeList<QueueEntry> freelistShutdown;
   QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
-  QueueEntryFreeList<QueueEntryBroadcast> freelistBroadcast;
   QueueEntryFreeList<QueueEntryAllGatherCpu> freelistAllGatherCpu;
   QueueEntryFreeList<QueueEntryReduceScatterCpu> freelistReduceScatterCpu;
-  QueueEntryFreeList<QueueEntryGatherCpu> freelistGatherCpu;
   QueueEntryFreeList<QueueEntryBroadcastCpu> freelistBroadcastCpu;
-  QueueEntryFreeList<QueueEntryReduce> freelistReduce;
   QueueEntryFreeList<QueueEntryCreateQueue> freelistCreateQueue;
   QueueEntryFreeList<QueueEntryQueuePut> freelistQueuePut;
   QueueEntryFreeList<QueueEntryQueueRead> freelistQueueRead;

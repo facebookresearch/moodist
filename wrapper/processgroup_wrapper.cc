@@ -149,6 +149,46 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather_into_tensor_coalesced(
   return c10::make_intrusive<WorkImpl>(outputs);
 }
 
+c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter(std::vector<at::Tensor>& outputs,
+    std::vector<std::vector<at::Tensor>>& inputs, const c10d::ReduceScatterOptions& opts) {
+  TORCH_CHECK(outputs.size() == 1 && inputs.size() == 1, "moodist: reduce_scatter takes one output and one input list");
+  TORCH_CHECK((int64_t)inputs[0].size() == getSize(), "moodist: reduce_scatter: expected ", getSize(), " inputs, got ",
+      inputs[0].size());
+  // The inputs one after the other in one tensor (copies, on the current stream)
+  std::vector<at::Tensor> flat;
+  for (auto& t : inputs[0]) {
+    flat.push_back(t.reshape(-1));
+  }
+  at::Tensor input = at::cat(flat);
+  TensorPtr inPtr = wrapTensor(input);
+  TensorPtr outPtr = wrapTensor(outputs[0]);
+  coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, toReduceOp(opts.reduceOp), getStream(input),
+      extractPremulValue(opts.reduceOp, input.scalar_type()));
+  return c10::make_intrusive<WorkImpl>(outputs);
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::allgather_coalesced(std::vector<std::vector<at::Tensor>>& outputLists,
+    std::vector<at::Tensor>& inputs, const c10d::AllgatherOptions& opts) {
+  // outputLists[r][i]: rank r's input i; one all-gather per input
+  TORCH_CHECK((int64_t)outputLists.size() == getSize(), "moodist: allgather_coalesced: expected ", getSize(),
+      " output lists, got ", outputLists.size());
+  std::vector<at::Tensor> results;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    std::vector<std::vector<at::Tensor>> gathered(1);
+    for (auto& list : outputLists) {
+      TORCH_CHECK(list.size() == inputs.size(), "moodist: allgather_coalesced: an output list has ", list.size(),
+          " tensors, expected ", inputs.size());
+      gathered[0].push_back(list[i]);
+    }
+    std::vector<at::Tensor> input = {inputs[i]};
+    allgather(gathered, input, opts);
+  }
+  for (auto& list : outputLists) {
+    results.insert(results.end(), list.begin(), list.end());
+  }
+  return c10::make_intrusive<WorkImpl>(results);
+}
+
 c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
     at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
   TensorPtr inPtr = wrapTensor(input);
@@ -203,7 +243,8 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
   TORCH_CHECK(!tensors.empty());
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
-  coreApi.processGroupReduce(handle.get(), tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t));
+  coreApi.processGroupReduce(handle.get(), tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t),
+      extractPremulValue(opts.reduceOp, t.scalar_type()));
   return c10::make_intrusive<WorkImpl>(t);
 }
 
@@ -264,11 +305,30 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
   return c10::make_intrusive<WorkImpl>(outputs);
 }
 
-c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(
-    at::Tensor& output, at::Tensor& input, std::vector<int64_t>&, std::vector<int64_t>&, const c10d::AllToAllOptions&) {
-  // Split into per-rank tensors
-  auto outs = output.tensor_split(getSize());
-  auto ins = input.tensor_split(getSize());
+c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(at::Tensor& output, at::Tensor& input,
+    std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions&) {
+  // Equal splits along dim 0 (none given, or all the same): an op per pattern of uneven splits would compile for
+  // nearly every call
+  const int64_t n = getSize();
+  auto checkSplits = [&](const std::vector<int64_t>& splits, const at::Tensor& t, const char* what) {
+    TORCH_CHECK(t.dim() > 0 && t.size(0) % n == 0, "moodist: all_to_all_single: the ", what,
+        "'s first dimension must be a multiple of the group size (", n, ")");
+    if (splits.empty()) {
+      return;
+    }
+    TORCH_CHECK((int64_t)splits.size() == n, "moodist: all_to_all_single: expected ", n, " ", what,
+        " split sizes, got ", splits.size());
+    for (int64_t v : splits) {
+      TORCH_CHECK(
+          v == t.size(0) / n, "moodist: all_to_all_single with uneven splits is not supported (only equal splits are)");
+    }
+  };
+  checkSplits(inputSplitSizes, input, "input");
+  checkSplits(outputSplitSizes, output, "output");
+
+  // Split into per-rank tensors (views of the two)
+  auto outs = output.tensor_split(n);
+  auto ins = input.tensor_split(n);
 
   std::vector<TensorPtr> outPtrs;
   std::vector<TensorPtr> inPtrs;

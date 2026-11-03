@@ -233,8 +233,9 @@ struct CompileContext {
   // For generating unique op IDs
   uint32_t* nextOpId;
 
-  // An op behind a process group collective (scatter, gather), whose tensors may come from any allocator
-  // and have any size (set per compile). Such ops use no multi-node NVLink fabric peers (e.g. NVL72; they
+  // An op behind a process group collective (the scatter and gather of CPU tensors; the collectives of CUDA tensors
+  // are user ops, see runCollective in processgroup.cc), whose tensors may come from any allocator and have any size
+  // (set per compile). Such ops use no multi-node NVLink fabric peers (e.g. NVL72; they
   // can only map memory from the moodist CUDA allocator), so edges to other nodes go over RDMA, and edges
   // the copy kernel cannot move (sizes or offsets not multiples of 16 bytes) also go over RDMA instead of
   // raising.

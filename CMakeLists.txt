@@ -180,7 +180,6 @@ set(core_sources
   core/ib_common.cc
   core/internal_allocator.cc
   core/ipc_mapper.cc
-  core/kernels.cc
   core/moodist_api.cc
   core/numa.cc
   core/cuda_loader.cc

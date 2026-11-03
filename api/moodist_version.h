@@ -12,7 +12,8 @@ namespace moodist {
 // 3: RDMA direct-read functions appended to CoreApi (rdmaRegister, rdmaRead, rdmaWorkDestroy, rdmaWorkWait)
 // 4: communication pool functions appended to CoreApi (processGroupCommPoolAllocate, commPoolOffset)
 // 5: createProcessGroup takes the process group's timeout
-// 6: the PREMUL_SUM factors of processGroupReduceScatter and processGroupAllreduce are doubles
+// 6: the PREMUL_SUM factors of processGroupReduceScatter and processGroupAllreduce are doubles, and
+//    processGroupReduce takes one
 //
 // Besides the _C.so <-> libmoodist.so handshake (moodistGetApi), this is what separately built C++
 // extensions check: they pass the version they were compiled against to get_core_api_ptr(version).

@@ -59,7 +59,8 @@ void processGroupAllreduce(
 
 void processGroupBroadcast(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream);
 
-void processGroupReduce(api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+void processGroupReduce(
+    api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream, double premulValue);
 
 void processGroupBarrier(api::ProcessGroup* pg);
 

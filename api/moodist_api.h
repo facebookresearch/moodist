@@ -203,7 +203,7 @@ struct CoreApi {
       api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue);
   void (*processGroupBroadcast)(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream);
   void (*processGroupReduce)(
-      api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+      api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream, double premulValue);
   void (*processGroupBarrier)(api::ProcessGroup* pg);
   void (*processGroupScatter)(
       api::ProcessGroup* pg, std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);

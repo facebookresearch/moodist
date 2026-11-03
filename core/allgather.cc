@@ -4,7 +4,6 @@
 #include "common.h"
 #include "group.h"
 #include "ipc_mapper.h"
-#include "kernels.h"
 #include "setup_comms.h"
 
 #include <vector>

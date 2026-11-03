@@ -1,9 +1,10 @@
 """
-Tests for the process group's all-gather, reduce-scatter and all-reduce of CUDA tensors, which run as compile_op ops
-(one per collective and shape, compiled at its first call): every dtype and reduce op, sizes from 16 bytes to several
-MiB per rank, in place and not, tensors from PyTorch's allocator, from the communication pool (comm_empty) and at
-addresses the kernel cannot take and sizes that are not a multiple of 16 bytes (which go through buffers of the pool),
-on several streams, PREMUL_SUM; and avg of CPU tensors.
+Tests for the process group's collectives of CUDA tensors, which run as compile_op ops (one per collective and shape,
+compiled at its first call): all-gather, reduce-scatter and all-reduce with every dtype and reduce op, sizes from 16
+bytes to several MiB per rank, in place and not, tensors from PyTorch's allocator, from the communication pool
+(comm_empty) and at addresses the kernel cannot take and sizes that are not a multiple of 16 bytes (which go through
+buffers of the pool), on several streams, PREMUL_SUM; broadcast, reduce, scatter, gather and all-to-all (from and to
+several roots, lists of tensors); and avg of CPU tensors.
 """
 
 import torch
@@ -148,8 +149,126 @@ def all_reduce(ctx, pg, numel, dtype, op, salt, alloc=None):
     check(ctx, pg, f"all-reduce {op} {dtype} {numel}", t, expected, op, dtype)
 
 
+def broadcast(ctx, pg, numel, dtype, root, salt, alloc=None):
+    """A broadcast of numel elements from root."""
+    alloc = alloc or cuda_empty
+    t = alloc(numel, dtype=dtype)
+    if ctx.rank == root:
+        t.copy_(rank_values(root, 0, numel, dtype, salt))
+    else:
+        t.fill_(99)
+    pg.broadcast(t, root).wait()
+    expected = rank_values(root, 0, numel, torch.float64, salt)
+    check(ctx, pg, f"broadcast {dtype} {numel} from {root}", t, expected, "sum", dtype)
+
+
+def reduce(ctx, pg, numel, dtype, op, root, salt, alloc=None):
+    """A reduce of numel elements to root (in place there); the other ranks' tensors stay as they were."""
+    alloc = alloc or cuda_empty
+    t = alloc(numel, dtype=dtype)
+    t.copy_(rank_values(ctx.rank, 0, numel, dtype, salt))
+    opts = dist.ReduceOptions()
+    opts.reduceOp = reduce_op(op)
+    opts.rootRank = root
+    pg.reduce([t], opts).wait()
+    if ctx.rank == root:
+        check(ctx, pg, f"reduce {op} {dtype} {numel} to {root}", t, reference(op, ctx.world_size, 0, numel, salt), op,
+              dtype)
+    else:
+        check(ctx, pg, f"reduce {op} {dtype} {numel} to {root}: rank {ctx.rank}'s input", t,
+              rank_values(ctx.rank, 0, numel, torch.float64, salt), "sum", dtype)
+
+
+def part_inputs(ctx, numel, dtype, rank, salt, alloc, contiguous):
+    """rank's parts for every rank (part j: the elements j * numel..), as a list of tensors: views of one tensor if
+    contiguous, else separate tensors."""
+    n = ctx.world_size
+    if contiguous:
+        whole = alloc(n * numel, dtype=dtype)
+        whole.copy_(rank_values(rank, 0, n * numel, dtype, salt))
+        return list(whole.split(numel)) if numel else [whole[:0] for _ in range(n)]
+    parts = [alloc(numel, dtype=dtype) for _ in range(n)]
+    for j, p in enumerate(parts):
+        p.copy_(rank_values(rank, j * numel, numel, dtype, salt))
+    return parts
+
+
+def empty_parts(ctx, numel, dtype, alloc, contiguous):
+    n = ctx.world_size
+    if contiguous:
+        whole = alloc(n * numel, dtype=dtype)
+        whole.fill_(99)
+        return list(whole.split(numel)) if numel else [whole[:0] for _ in range(n)]
+    parts = [alloc(numel, dtype=dtype) for _ in range(n)]
+    for p in parts:
+        p.fill_(99)
+    return parts
+
+
+def scatter(ctx, pg, numel, dtype, root, salt, alloc=None, contiguous=False):
+    """A scatter of numel elements per rank from root's list."""
+    alloc = alloc or cuda_empty
+    out = alloc(numel, dtype=dtype)
+    out.fill_(99)
+    inputs = [part_inputs(ctx, numel, dtype, root, salt, alloc, contiguous)] if ctx.rank == root else []
+    opts = dist.ScatterOptions()
+    opts.rootRank = root
+    pg.scatter([out], inputs, opts).wait()
+    expected = rank_values(root, ctx.rank * numel, numel, torch.float64, salt)
+    check(ctx, pg, f"scatter {dtype} {numel} per rank from {root}", out, expected, "sum", dtype)
+
+
+def gather(ctx, pg, numel, dtype, root, salt, alloc=None, contiguous=False):
+    """A gather of numel elements per rank into root's list."""
+    alloc = alloc or cuda_empty
+    inp = alloc(numel, dtype=dtype)
+    inp.copy_(rank_values(ctx.rank, ctx.rank * numel, numel, dtype, salt))
+    outputs = [empty_parts(ctx, numel, dtype, alloc, contiguous)] if ctx.rank == root else []
+    opts = dist.GatherOptions()
+    opts.rootRank = root
+    pg.gather(outputs, [inp], opts).wait()
+    if ctx.rank == root:
+        got = torch.cat(outputs[0])
+        expected = torch.cat([rank_values(r, r * numel, numel, torch.float64, salt) for r in range(ctx.world_size)])
+    else:
+        got = inp
+        expected = rank_values(ctx.rank, ctx.rank * numel, numel, torch.float64, salt)
+    check(ctx, pg, f"gather {dtype} {numel} per rank to {root}", got, expected, "sum", dtype)
+
+
+def all_to_all(ctx, pg, numel, dtype, salt, alloc=None, lists=False):
+    """An all-to-all of numel elements per pair of ranks: all_to_all_single's (one tensor each), or all_to_all's
+    (lists of separate tensors)."""
+    alloc = alloc or cuda_empty
+    n = ctx.world_size
+    if lists:
+        inputs = part_inputs(ctx, numel, dtype, ctx.rank, salt, alloc, contiguous=False)
+        outputs = empty_parts(ctx, numel, dtype, alloc, contiguous=False)
+        pg.alltoall(outputs, inputs).wait()
+        out = torch.cat(outputs)
+    else:
+        inp = alloc(n * numel, dtype=dtype)
+        inp.copy_(rank_values(ctx.rank, 0, n * numel, dtype, salt))
+        out = alloc(n * numel, dtype=dtype)
+        out.fill_(99)
+        pg.alltoall_base(out, inp, [], []).wait()
+    # (rank i's part for this rank: its elements rank * numel..)
+    expected = torch.cat([rank_values(i, ctx.rank * numel, numel, torch.float64, salt) for i in range(n)])
+    check(ctx, pg, f"all-to-all{' (lists)' if lists else ''} {dtype} {numel} per pair", out, expected, "sum", dtype)
+
+
+def roots(ctx):
+    """Root ranks to test: the first, the last, and one in the middle."""
+    return sorted({0, ctx.world_size - 1, ctx.world_size // 2})
+
+
 def cuda_empty(numel, dtype):
     return torch.empty(numel, dtype=dtype, device="cuda")
+
+
+def misaligned_empty(numel, dtype):
+    """A tensor at an address that is not 16-byte aligned (a view at an offset of one element)."""
+    return torch.empty(numel + 4, dtype=dtype, device="cuda")[1 : numel + 1]
 
 
 @test
@@ -322,23 +441,135 @@ def test_pg_avg_int_error(ctx: TestContext):
 
 
 @test
-def test_pg_alltoall_local(ctx: TestContext):
-    """The process group's all-to-all of CUDA tensors (within a node only; its kernel comes from the same NVRTC module
-    as the all-gather's and reduce-scatter's did)."""
+def test_pg_broadcast_reduce(ctx: TestContext):
+    """Broadcast and reduce from and to several roots: every reduce op, several dtypes and sizes (unaligned too), from
+    PyTorch's allocator, misaligned and from the communication pool."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+
+    def pool(numel, dtype):
+        return moodist.comm_empty(numel, dtype=dtype, group=pg)
+
+    for i, root in enumerate(roots(ctx)):
+        for numel in [64, 1001, 1 << 18]:
+            broadcast(ctx, pg, numel, torch.float32, root, salt=i)
+            broadcast(ctx, pg, numel, torch.bfloat16, root, salt=i + 1, alloc=misaligned_empty)
+            reduce(ctx, pg, numel, torch.float32, "sum", root, salt=i)
+            reduce(ctx, pg, numel, torch.bfloat16, "avg", root, salt=i)
+        broadcast(ctx, pg, 1 << 16, torch.bfloat16, root, salt=i, alloc=pool)
+        reduce(ctx, pg, 1 << 16, torch.bfloat16, "sum", root, salt=i, alloc=pool)
+        reduce(ctx, pg, 1 << 16, torch.float32, "max", root, salt=i, alloc=pool)
+        reduce(ctx, pg, 4096, torch.int32, "min", root, salt=i, alloc=misaligned_empty)
+        reduce(ctx, pg, 4096, torch.float16, "premul_0.25", root, salt=i)
+
+
+@test
+def test_pg_reduce_dtypes(ctx: TestContext):
+    """Reduce of every dtype and reduce op, to the last rank."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    for i, (dtype, op) in enumerate(combinations()):
+        reduce(ctx, pg, 256, dtype, op, ctx.world_size - 1, salt=i)
+    reduce(ctx, pg, 256, torch.bfloat16, f"premul_{1 / 3}", 0, salt=1)
+
+
+@test
+def test_pg_scatter_gather(ctx: TestContext):
+    """Scatter and gather from and to several roots, with lists of separate tensors and of views of one, several sizes
+    (unaligned too)."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    for i, root in enumerate(roots(ctx)):
+        for numel in [1, 64, 1001, 1 << 17]:
+            for contiguous in [False, True]:
+                scatter(ctx, pg, numel, torch.float32, root, salt=i, contiguous=contiguous)
+                gather(ctx, pg, numel, torch.float32, root, salt=i, contiguous=contiguous)
+        scatter(ctx, pg, 1000, torch.bfloat16, root, salt=i, alloc=misaligned_empty)
+        gather(ctx, pg, 1000, torch.bfloat16, root, salt=i, alloc=misaligned_empty)
+
+
+@test
+def test_pg_all_to_all(ctx: TestContext):
+    """All-to-all: all_to_all_single's (one tensor each) and all_to_all's (lists of separate tensors), several sizes
+    (unaligned too), from the communication pool and misaligned."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+
+    def pool(numel, dtype):
+        return moodist.comm_empty(numel, dtype=dtype, group=pg)
+
+    # (1 MiB parts: PyTorch's allocator puts separate tensors one after the other in separate allocations)
+    for numel in [1, 64, 1001, 1 << 17, 1 << 18]:
+        for salt in range(2):
+            all_to_all(ctx, pg, numel, torch.float32, salt)
+            all_to_all(ctx, pg, numel, torch.float32, salt, lists=True)
+    all_to_all(ctx, pg, 1 << 16, torch.bfloat16, 3, alloc=pool)
+    all_to_all(ctx, pg, 1000, torch.int64, 4, alloc=misaligned_empty)
+
+
+@test
+def test_pg_all_to_all_in_place(ctx: TestContext):
+    """all_to_all_single with the same tensor as input and output (the input goes through a buffer)."""
     torch.cuda.set_device(ctx.local_rank)
     pg = create_process_group(ctx)
     n = ctx.world_size
     numel = 1000
-    inputs = [torch.full((numel,), float(ctx.rank * 100 + j), device="cuda") for j in range(n)]
-    outputs = [torch.empty(numel, device="cuda") for _ in range(n)]
-    try:
-        pg.alltoall(outputs, inputs).wait()
-    except RuntimeError as e:
-        if "only local alltoall" in str(e):
-            return
-        raise
-    bad = [j for j, out in enumerate(outputs) if not bool((out == float(j * 100 + ctx.rank)).all())]
-    raise_on_all_ranks(ctx, pg, f"all-to-all: wrong parts from ranks {bad[:8]}" if bad else "")
+    t = rank_values(ctx.rank, 0, n * numel, torch.float32, 7)
+    pg.alltoall_base(t, t, [], []).wait()
+    expected = torch.cat([rank_values(i, ctx.rank * numel, numel, torch.float64, 7) for i in range(n)])
+    check(ctx, pg, "all-to-all in place", t, expected, "sum", torch.float32)
+
+
+@test
+def test_pg_all_to_all_uneven_error(ctx: TestContext):
+    """all_to_all_single with uneven splits: an error (on every rank, as every rank's splits are uneven here)."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    if n == 1:
+        return
+    splits = [2] * n
+    splits[0], splits[1] = 1, 3
+    inp = torch.zeros(2 * n, device="cuda")
+    out = torch.zeros(2 * n, device="cuda")
+    ctx.assert_raises(RuntimeError, lambda: pg.alltoall_base(out, inp, splits, splits).wait())
+
+
+@test
+def test_pg_list_collectives(ctx: TestContext):
+    """The forms with lists of tensors: reduce_scatter's inputs, all_gather_coalesced."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 1000
+    inputs = part_inputs(ctx, numel, torch.float32, ctx.rank, 2, cuda_empty, contiguous=False)
+    out = torch.empty(numel, device="cuda")
+    opts = dist.ReduceScatterOptions()
+    opts.reduceOp = dist.ReduceOp.SUM
+    pg.reduce_scatter([out], [inputs], opts).wait()
+    check(ctx, pg, "reduce_scatter (list)", out, reference("sum", n, ctx.rank * numel, numel, 2), "sum", torch.float32)
+    a = rank_values(ctx.rank, 0, 100, torch.float32, 3)
+    b = rank_values(ctx.rank, 0, 37, torch.int64, 4)
+    outputs = [[torch.empty_like(a), torch.empty_like(b)] for _ in range(n)]
+    pg.allgather_coalesced(outputs, [a, b]).wait()
+    got = torch.cat([torch.cat([o[0].to(torch.float64), o[1].to(torch.float64)]) for o in outputs])
+    expected = torch.cat([torch.cat([rank_values(r, 0, 100, torch.float64, 3), rank_values(r, 0, 37, torch.float64, 4)])
+                          for r in range(n)])
+    check(ctx, pg, "allgather_coalesced", got, expected, "sum", torch.float32)
+
+
+@test
+def test_pg_cpu_errors(ctx: TestContext):
+    """Reduce and all-to-all of CPU tensors: errors (on every rank)."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    t = torch.ones(16)
+    opts = dist.ReduceOptions()
+    opts.rootRank = 0
+    ctx.assert_raises(RuntimeError, lambda: pg.reduce([t], opts).wait())
+    inputs = [torch.ones(4) for _ in range(n)]
+    outputs = [torch.zeros(4) for _ in range(n)]
+    ctx.assert_raises(RuntimeError, lambda: pg.alltoall(outputs, inputs).wait())
 
 
 @test

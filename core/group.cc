@@ -10,7 +10,6 @@
 #include "ib_common.h"
 #include "infiniband/mlx5dv.h"
 #include "ipc_mapper.h"
-#include "kernels.h"
 #include "queue.h"
 #include "rdma.h"
 #include "reduce_scatter.h"
@@ -429,7 +428,6 @@ static std::vector<int> detectRailPartition(
 Group::Group(size_t rank, size_t size) : rank(rank), size(size) {
   setupComms = createSetupComms(rank, size);
   ipcMapper = createIpcMapper(this);
-  kernels = std::make_unique<Kernels>(this);
   allGather = std::make_unique<AllGather>(this);
   reduceScatter = std::make_unique<ReduceScatter>(this);
 }
@@ -1919,38 +1917,6 @@ AllocatedArray Group::allocateArrayDeviceMapped(size_t itembytes, size_t numel) 
   r.buffer = allocateDeviceMapped(itembytes * numel);
   r.itembytes = itembytes;
   r.numel = numel;
-  return r;
-}
-
-TreeSendsRecvs Group::generateTree(size_t nary, size_t rootRank) {
-  log.info("Generating new tree, %d-ary, root %d\n", nary, rootRank);
-  size_t rootLocalRank = rankLocalRank.at(rootRank);
-  size_t nNodes = nodeRanks.size();
-  CHECK(nNodes > 1);
-  size_t rootNode = rankToNodeIndex.at(rootRank);
-  size_t nodeIndex = rankToNodeIndex.at(rank);
-  size_t rotatedNodeIndex = (nodeIndex + nNodes - rootNode) % nNodes;
-  auto& node = nodeRanks.at(nodeIndex);
-  CHECK(node.at(rootLocalRank % node.size()) == rank);
-
-  size_t parent = (rotatedNodeIndex - 1) / nary;
-  size_t childBegin = rotatedNodeIndex * nary + 1;
-
-  TreeSendsRecvs r;
-
-  if (rotatedNodeIndex != 0) {
-    CHECK(parent < nNodes);
-    auto& parentNode = nodeRanks.at((parent + rootNode) % nNodes);
-    r.sends.push_back(parentNode.at(rootLocalRank % parentNode.size()));
-  }
-  for (size_t i = childBegin; i != childBegin + nary; ++i) {
-    if (i >= nNodes) {
-      break;
-    }
-    auto& childNode = nodeRanks.at((i + rootNode) % nNodes);
-    r.recvs.push_back(childNode.at(rootLocalRank % childNode.size()));
-  }
-
   return r;
 }
 

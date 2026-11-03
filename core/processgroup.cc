@@ -16,7 +16,6 @@
 #include "cuda_loader.h"
 #include "group.h"
 #include "ipc_mapper.h"
-#include "kernels.h"
 #include "queue.h"
 #include "reduce_scatter.h"
 #include "serialization.h"
@@ -166,23 +165,32 @@ struct GatherCacheKey {
 };
 
 // The process group collectives that run as compile_op ops (see ProcessGroupImpl::runCollective)
-enum class CollectiveKind : uint8_t { allGather, reduceScatter, allReduce };
+enum class CollectiveKind : uint8_t {
+  allGather,
+  reduceScatter,
+  allReduce,
+  broadcast,
+  reduce,
+  scatter,
+  gather,
+  allToAll
+};
 
 // Cache key of a collective's compiled op: from the call's arguments only, which are the same on every rank, so that
 // every rank compiles an op at the same call
 struct CollectiveKey {
   CollectiveKind kind;
-  DType dtype;          // UInt8 for all-gathers, which copy bytes whatever the tensors' dtype
-  api::ReduceOp reduce; // None for all-gathers
-  // All-gather: the bytes of each rank's input; reduce-scatter: the elements of each rank's output; all-reduce: the
-  // elements of the tensor
+  DType dtype;          // UInt8 for the collectives that only copy, which move bytes whatever the tensors' dtype
+  api::ReduceOp reduce; // None for those
+  // The elements of a part (see runCollective), rounded up to 16 bytes
   size_t numel;
+  uint32_t root; // the root's rank: of a broadcast, a reduce, a scatter or a gather (else 0)
 
   bool operator==(const CollectiveKey&) const = default;
 
   template<typename X>
   void hash(X& x) const {
-    x(kind, dtype, reduce, numel);
+    x(kind, dtype, reduce, numel, root);
   }
 };
 
@@ -195,46 +203,6 @@ struct EventSerializer {
   ~EventSerializer() {
     event.record(stream);
   }
-};
-
-// Work objects can outlive ProcessGroupImpl and hold a pointer to WorkStream.
-// A proper solution would be to hold a SharedPtr to WorkStreams in Work.
-// Instead, we intentionally leak WorkStreams objects through a circular SharedPtr.
-struct WorkStreams;
-struct WorkStream {
-  IntrusiveListLink<WorkStream> link;
-  CUstream stream = nullptr;
-  CUevent event = nullptr;
-  std::atomic<CUstream> joinedStream = nullptr;
-  SharedPtr<WorkStreams> owner;
-  WorkStream() = default;
-  WorkStream(const WorkStream&) = delete;
-  WorkStream& operator=(const WorkStream&) = delete;
-  WorkStream(WorkStream&& n) noexcept {
-    *this = std::move(n);
-  }
-  WorkStream& operator=(WorkStream&& n) noexcept {
-    std::swap(stream, n.stream);
-    std::swap(event, n.event);
-    std::swap(owner, n.owner);
-    // Note: link and joinedStream intentionally not swapped
-    return *this;
-  }
-  ~WorkStream() {
-    if (event) {
-      cuEventDestroy(event);
-    }
-    if (stream) {
-      cuStreamDestroy(stream);
-    }
-  }
-};
-
-struct WorkStreams {
-  SpinMutex mutex;
-  Vector<std::unique_ptr<WorkStream>> all;
-  IntrusiveList<WorkStream, &WorkStream::link> free;
-  std::atomic_size_t refcount = 1;
 };
 
 struct ThreadUnsafe {
@@ -420,13 +388,13 @@ static std::chrono::steady_clock::duration timeoutFromEnv(std::chrono::steady_cl
   return std::min<std::chrono::steady_clock::duration>(timeout, std::chrono::seconds(1000000000));
 }
 
-// A process group collective's compiled op (see ProcessGroupImpl::runCollective), and for each of this rank's tensors
-// in it (its input, then its output) how the other ranks reach it: whether a rank maps it across a multi-node NVLink
+// A process group collective's compiled op (see ProcessGroupImpl::runCollective), and for this rank's input and its
+// output in it (where it has them) how the other ranks reach them: whether a rank maps it across a multi-node NVLink
 // fabric (which maps moodist's memory only), and whether any rank maps it or the op moves data over RDMA (whose
 // registrations, like the mappings within a node, take whole allocations: of moodist's allocator, or of cudaMalloc)
 struct CollectiveOp {
   std::shared_ptr<CustomOpDescriptor> op;
-  std::array<bool, 2> fabricMapped{};
+  std::array<bool, 2> fabricMapped{}; // the input, the output
   std::array<bool, 2> shared{};
 };
 
@@ -441,20 +409,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
   uint32_t nextStepValue = 0x1000;
   uint32_t nextConcurrencyIndex = 0;
 
-  HashMap<CUstream, SharedPtr<WorkStreams>> workStreams;
-
   std::array<Event, maxConcurrency> concurrencyEvents;
-
-  Event localEvent;
-  std::optional<Stream> peerMemcpyStream;
-  std::optional<Stream> peerIncomingMemcpyStream;
-
-  HashMap<CUstream, Stream> copyStream;
-
-  std::array<std::optional<Stream>, maxChunks> peerMemcpyStreamPerChunk;
-
-  std::array<std::optional<Stream>, 4> reduceStreamArr;
-  size_t reduceCounter = 0;
 
   std::vector<SharedPtr<Queue>> queues;
 
@@ -509,8 +464,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
     for (auto& v : concurrencyEvents) {
       v = Event::create();
     }
-
-    localEvent = Event::create();
 
     if (size - 1 == group->peerIndices.size()) {
       streamPriority = -10;
@@ -576,60 +529,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
     return r;
   }
 
-  Stream getCopyStream(CUstream stream) {
-    auto& ref = copyStream[stream];
-    if (!ref) {
-      ref = Stream::create(streamPriority);
-    }
-    return Stream::reference(ref);
-  }
-
-  WorkStreams* getWorkStreams(CUstream stream) {
-    auto& ptr = workStreams[stream];
-    if (!ptr) {
-      ptr = makeShared<WorkStreams>();
-    }
-    return ptr.get();
-  }
-
-  WorkStream* getWorkStream(CUstream stream) {
-    WorkStreams* ws = getWorkStreams(stream);
-    std::unique_lock l(ws->mutex);
-    WorkStream* w = nullptr;
-    int n = 0;
-    for (auto& v : ws->free) {
-      if (v.joinedStream.load(std::memory_order_relaxed) == stream) {
-        w = &v;
-        ws->free.erase(v);
-        break;
-      }
-      if (cuEventQuery(v.event) == CUDA_SUCCESS) {
-        w = &v;
-        ws->free.erase(v);
-        break;
-      }
-      ++n;
-    }
-    if (!w && n >= static_cast<int>(maxConcurrency)) {
-      w = &ws->free.front();
-      ws->free.pop_front();
-    }
-    if (!w) {
-      auto ptr = std::make_unique<WorkStream>();
-      w = &*ptr;
-      ws->all.push_back(std::move(ptr));
-
-      w->owner = workStreams[stream];
-      CHECK(&*w->owner == ws);
-      CHECK_CU(cuStreamCreateWithPriority(&w->stream, CU_STREAM_NON_BLOCKING, streamPriority));
-      CHECK_CU(cuEventCreate(&w->event, CU_EVENT_DISABLE_TIMING));
-      log.info("New work stream %#x created for stream %#x\n", (uintptr_t)w->stream, (uintptr_t)stream);
-    }
-    w->joinedStream.store(w->stream, std::memory_order_relaxed);
-    l.unlock();
-    return w;
-  }
-
   void internalBarrier() {
     uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
     std::atomic_uint32_t cpuDone = 0;
@@ -683,27 +582,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
     }
     resetStepValue();
     return 1;
-  }
-
-  AllocatedBuffer alloccuda(size_t size, CUstream stream) {
-    if (size == 0) {
-      return {};
-    }
-    if (size < 16) {
-      size = 16;
-    }
-    StreamGuard sg(stream, group->deviceIndex);
-    AllocatedBuffer buffer;
-    void* cleanupCtx = nullptr;
-    void* ptr = wrapperApi.cudaCachingAllocatorAlloc(size, &cleanupCtx);
-    buffer.cudaPointer = (uintptr_t)ptr;
-    buffer.bytes = size;
-    // Capture cleanupCtx in the cleanup function
-    buffer.externalAlloc = DeferredCleanup(Function<void()>([cleanupCtx]() {
-      wrapperApi.cudaCachingAllocatorFree(cleanupCtx);
-    }));
-    CHECK(buffer.cudaPointer != 0);
-    return buffer;
   }
 
   void sync(uint32_t stepValue) {
@@ -802,7 +680,7 @@ struct ProcessGroupImpl : api::ProcessGroup {
       TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, double premulValue);
   void allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue);
   void broadcast(TensorPtr& tensor, int sourceRank, CUstream stream);
-  void reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
+  void reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream, double premulValue);
   void barrier();
   void scatter(std::span<TensorPtr> inputs, TensorPtr& output, int sourceRank, CUstream stream);
   void gather(std::span<TensorPtr> outputs, const TensorPtr& input, int destRank, CUstream stream);
@@ -810,8 +688,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
   void cudaBarrier(CUstream stream);
 
   // compileOpFull - compile a distributed tensor operation. collectiveOp: an op behind a process group
-  // collective (scatter, gather), whose tensors may come from any allocator and have any size: no
-  // moodist-memory requirement, and edges the copy kernel cannot take go over RDMA (see
+  // collective (the scatter and gather of CPU tensors), whose tensors may come from any allocator and have any
+  // size: no moodist-memory requirement, and edges the copy kernel cannot take go over RDMA (see
   // CompileContext::collectiveOp).
   SharedPtr<CustomOpImpl> compileOpFull(DType dtype, std::span<const api::TensorRegion> inputs,
       std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync = false,
@@ -820,12 +698,17 @@ struct ProcessGroupImpl : api::ProcessGroup {
   std::shared_ptr<CustomOpDescriptor> compileOp(DType dtype, std::span<const api::TensorRegion> inputs,
       std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync, bool collectiveOp);
 
-  // Runs a collective as a compiled op (see CollectiveKey), compiled at its first call. input and output: this rank's
-  // contiguous CUDA tensors, on the group's device (the same tensor for an all-reduce in place); numel: the elements
-  // of a rank's part (the all-gather's input, the reduce-scatter's output), or of the all-reduce's tensor (bytes for
-  // all-gathers, whose dtype is UInt8); scale: PremulSum's factor.
-  void runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t numel, const TensorPtr& input,
-      const TensorPtr& output, CUstream stream, double scale = 1.0);
+  // Runs a collective as a compiled op (see CollectiveKey), compiled at its first call. Its tensors are made of parts
+  // of numel elements of dtype (bytes, with UInt8, for the collectives that only copy): a rank's share of an
+  // all-gather's output, of a reduce-scatter's input, of a scatter's input or of a gather's output (whose root has
+  // one part per rank), what a rank sends to or receives from another in an all-to-all, or the whole tensor of an
+  // all-reduce, a broadcast or a reduce. inputs and outputs: this rank's input and output (none where it has none:
+  // only the root has an input in a broadcast or a scatter, and an output in a reduce or a gather), each one tensor of
+  // all of its parts or a list of tensors of one part each (e.g. a scatter's inputs); CUDA tensors on the group's
+  // device, contiguous; the same tensor as input and output in place (an all-reduce, a broadcast or a reduce on its
+  // root). root: the root's rank of a broadcast, a reduce, a scatter or a gather; scale: PremulSum's factor.
+  void runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t root, size_t numel,
+      std::span<const TensorPtr> inputs, std::span<const TensorPtr> outputs, CUstream stream, double scale = 1.0);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -1003,7 +886,8 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
     CHECK(input.device_index() == group->deviceIndex);
     CHECK(output.is_cuda());
     CHECK(output.device_index() == group->deviceIndex);
-    runCollective(CollectiveKind::allGather, DType::UInt8, api::ReduceOp::None, bytes, input, output, stream);
+    runCollective(
+        CollectiveKind::allGather, DType::UInt8, api::ReduceOp::None, 0, bytes, {&input, 1}, {&output, 1}, stream);
     return;
   }
 
@@ -1053,8 +937,8 @@ void ProcessGroupImpl::reduce_scatter(
     CHECK(input.device_index() == group->deviceIndex);
     CHECK(output.is_cuda());
     CHECK(output.device_index() == group->deviceIndex);
-    runCollective(
-        CollectiveKind::reduceScatter, dtype, cudaReduce(reduceOp), numel, input, output, stream, premulValue);
+    runCollective(CollectiveKind::reduceScatter, dtype, cudaReduce(reduceOp), 0, numel, {&input, 1}, {&output, 1},
+        stream, premulValue);
     return;
   }
 
@@ -1110,8 +994,8 @@ void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream 
   // CUDA tensors: a compile_op op in place (see runCollective)
   if (tensor.is_cuda()) {
     CHECK(tensor.is_contiguous() && tensor.device_index() == group->deviceIndex);
-    runCollective(CollectiveKind::allReduce, tensor.dtype(), cudaReduce(reduceOp), tensor.numel(), tensor, tensor,
-        stream, premulValue);
+    runCollective(CollectiveKind::allReduce, tensor.dtype(), cudaReduce(reduceOp), 0, tensor.numel(), {&tensor, 1},
+        {&tensor, 1}, stream, premulValue);
     return;
   }
 
@@ -1151,435 +1035,64 @@ void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream 
 // ============================================================================
 
 void ProcessGroupImpl::broadcast(TensorPtr& tensor, int sourceRank, CUstream stream) {
+  REQUIRE(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size, "broadcast: root rank %d out of range [0, %d)",
+      sourceRank, size);
+  REQUIRE(tensor.is_contiguous(), "broadcast: the tensor must be contiguous");
+
+  size_t numel = static_cast<size_t>(tensor.numel());
+  size_t bytes = numel * static_cast<size_t>(tensor.itemsize());
+
+  // CUDA tensors: a compile_op op (see runCollective), from the root's tensor to every rank's (in place on the root)
+  if (tensor.is_cuda()) {
+    const std::span<const TensorPtr> root =
+        static_cast<size_t>(sourceRank) == rank ? std::span<const TensorPtr>(&tensor, 1) : std::span<const TensorPtr>();
+    runCollective(CollectiveKind::broadcast, DType::UInt8, api::ReduceOp::None, static_cast<size_t>(sourceRank), bytes,
+        root, {&tensor, 1}, stream);
+    return;
+  }
+
+  // CPU tensors: the CPU thread
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
   CHECK(stepValue < 0x80000000);
 
-  bool isCuda = tensor.is_cuda();
-
-  CHECK(tensor.is_contiguous());
-  CHECK(sourceRank >= 0 && static_cast<size_t>(sourceRank) < size);
-
-  if (isCuda) {
-    CHECK(tensor.device_index() == group->deviceIndex);
-  }
-
-  size_t numel = static_cast<size_t>(tensor.numel());
-  size_t bytes = numel * static_cast<size_t>(tensor.itemsize());
-
   uintptr_t tensorAddress = (uintptr_t)tensor.data_ptr();
 
-  if (!isCuda) {
-    StreamData& sd = group->getStreamData(nullptr);
-    std::atomic_uint32_t cpuDone = 0;
-    QueueEntryBroadcastCpu* e = group->cpuThread->freelistBroadcastCpu.pop();
-    e->task = taskBroadcastCpu;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->tensorAddress = tensorAddress;
-    e->bytes = bytes;
-    e->sourceRank = static_cast<uint32_t>(sourceRank);
-    e->cpuDone = &cpuDone;
-    group->cpuThread->enqueue(e);
-    l.unlock();
-    group->waitForCpuThread(cpuDone, "a broadcast of CPU tensors");
-    return;
-  }
-
-  StreamData& sd = group->getStreamData(stream);
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  Group* group = &*this->group;
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  const auto& ipcRanks = group->ipcRanks;
-  const auto& peerIndices = group->peerIndices;
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  CHECK(memops.empty());
-
-  if (!peerMemcpyStream) {
-    peerMemcpyStream = Stream::create(streamPriority);
-  }
-
-  size_t sourceLocalRank = group->rankLocalRank.at(static_cast<size_t>(sourceRank));
-  size_t localSourceRank = static_cast<size_t>(sourceRank);
-  {
-    auto& node = group->nodeRanks.at(group->rankToNodeIndex.at(rank));
-    localSourceRank = node[sourceLocalRank % node.size()];
-  }
-
-  size_t numDevices = std::min(bytes / 262144, std::max((size_t)4, group->numTrueIbDevs));
-  size_t numChunks = std::min(bytes / 131072, (size_t)4);
-  if (peerIndices.empty()) {
-    numDevices = std::min(bytes / 65536, std::max((size_t)4, group->numTrueIbDevs));
-    numChunks = std::min(bytes / 65536, (size_t)4);
-  }
-  numDevices = std::min(numDevices, group->rdmaDevs.size());
-  numDevices = std::max(numDevices, (size_t)1);
-  numChunks = std::max(numChunks, (size_t)1);
-  size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
-
-  bool networked = group->nodeRanks.size() != 1 && localSourceRank == rank;
-
-  if (networked) {
-    QueueEntryBroadcast* e = group->cpuThread->freelistBroadcast.pop();
-    e->task = taskBroadcast;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->tensorAddress = tensorAddress;
-    e->bytes = bytes;
-    e->sourceRank = static_cast<uint32_t>(sourceRank);
-
-    e->numDevices = numDevices;
-    e->numChunks = numChunks;
-    e->numParallel = 1;
-
-    group->cpuThread->enqueue(e);
-  }
-
-  bool anyLocalPeers = !peerIndices.empty();
-
-  if (!anyLocalPeers) {
-    CHECK(rank == localSourceRank);
-  }
-
-  size_t next = 0;
-  size_t prev = peerIndices.size() - 1;
-
-  uintptr_t peerAddress = 0;
-  if (anyLocalPeers && ipcRanks[next] != localSourceRank) {
-    ipcMapper->requestAddress(
-        next, tensorAddress, bytes,
-        [ptr = &peerAddress](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-
-    ipcMapper->wait();
-  }
-
-  if (anyLocalPeers) {
-    peerWriteDyn(concurrencyIndex, next, opTypeBroadcastCuda, stepValue, peerAddress, bytes);
-
-    peerAddress = peerWaitDyn(concurrencyIndex, prev, opTypeBroadcastCuda, stepValue, bytes);
-  }
-
-  if (networked) {
-    memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
-    memFlush(stream);
-  }
-
-  size_t offset = 0;
-  for (size_t chunkIndex = 0; offset != bytes; ++chunkIndex) {
-    size_t currentChunkSize = std::min(chunkSize, bytes - offset);
-    if (localSourceRank == rank) {
-      CHECK(peerAddress == 0);
-      if (static_cast<size_t>(sourceRank) != rank) {
-        CHECK(networked);
-        memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) +
-                       sizeof(uint32_t) * (16 + size * chunkIndex + static_cast<size_t>(sourceRank)),
-            stepValue);
-        memFlush(stream);
-      }
-      if (anyLocalPeers) {
-        ipcMapper->streamRecord(next, stream);
-      }
-    } else {
-      CHECK(peerAddress != 0);
-
-      ipcMapper->streamWait(prev, stream);
-
-      auto& copyStream = peerMemcpyStreamPerChunk[chunkIndex];
-      if (!copyStream) {
-        copyStream = Stream::create(streamPriority);
-      }
-
-      localEvent.record(stream);
-      localEvent.wait(*copyStream);
-      CHECK_CU(cuMemcpyDtoDAsync(tensorAddress + offset, peerAddress + offset, currentChunkSize, *copyStream));
-      localEvent.record(*copyStream);
-      localEvent.wait(stream);
-
-      if (ipcRanks[next] != localSourceRank) {
-        ipcMapper->streamRecord(next, stream);
-      }
-    }
-    offset += currentChunkSize;
-  }
-
-  if (localSourceRank != rank) {
-    ipcMapper->streamRecord(prev, stream);
-  }
-  if (anyLocalPeers && ipcRanks[next] != localSourceRank) {
-    ipcMapper->streamWait(next, stream);
-  }
-
-  if (networked) {
-    memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-    memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-    memFlush(stream);
-  }
-
-  CHECK(memops.empty());
+  StreamData& sd = group->getStreamData(nullptr);
+  std::atomic_uint32_t cpuDone = 0;
+  QueueEntryBroadcastCpu* e = group->cpuThread->freelistBroadcastCpu.pop();
+  e->task = taskBroadcastCpu;
+  e->stepValue = stepValue;
+  e->concurrencyIndex = concurrencyIndex;
+  e->sd = &sd;
+  e->tensorAddress = tensorAddress;
+  e->bytes = bytes;
+  e->sourceRank = static_cast<uint32_t>(sourceRank);
+  e->cpuDone = &cpuDone;
+  group->cpuThread->enqueue(e);
+  l.unlock();
+  group->waitForCpuThread(cpuDone, "a broadcast of CPU tensors");
 }
 
 // ============================================================================
 // ProcessGroupImpl::reduce() - Reduce collective
 // ============================================================================
 
-void ProcessGroupImpl::reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream) {
-  std::unique_lock l(threadUnsafe);
-
-  uint32_t stepValue = getNextStepValue();
-  uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-  CHECK(stepValue < 0x80000000);
-
-  bool isCuda = tensor.is_cuda();
-
-  CHECK(tensor.is_contiguous());
-  CHECK(destRank >= 0 && static_cast<size_t>(destRank) < size);
-
-  if (isCuda) {
-    CHECK(tensor.device_index() == group->deviceIndex);
+void ProcessGroupImpl::reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream, double premulValue) {
+  REQUIRE(destRank >= 0 && static_cast<size_t>(destRank) < size, "reduce: root rank %d out of range [0, %d)", destRank,
+      size);
+  REQUIRE(tensor.is_contiguous(), "reduce: the tensor must be contiguous");
+  if (!tensor.is_cuda()) {
+    throw std::runtime_error("moodist: reduce of CPU tensors is not supported");
   }
 
-  size_t numel = static_cast<size_t>(tensor.numel());
-  size_t bytes = numel * static_cast<size_t>(tensor.itemsize());
-
-  uintptr_t tensorAddress = (uintptr_t)tensor.data_ptr();
-
-  if (!isCuda) {
-    throw std::runtime_error("CPU reduce currently not supported :(");
-  }
-
-  StreamData& sd = group->getStreamData(stream);
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  Group* group = &*this->group;
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  const auto& ipcRanks = group->ipcRanks;
-  const auto& peerIndices = group->peerIndices;
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  // Only SUM supported for now (other ops need sum_out variant)
-  CHECK(reduceOp == ReduceOp::SUM);
-
-  CHECK(memops.empty());
-
-  if (!peerMemcpyStream) {
-    peerMemcpyStream = Stream::create(streamPriority);
-  }
-  if (!peerIncomingMemcpyStream) {
-    peerIncomingMemcpyStream = Stream::create(streamPriority);
-  }
-
-  size_t destinationLocalRank = group->rankLocalRank.at(static_cast<size_t>(destRank));
-  size_t localDestinationRank = static_cast<size_t>(destRank);
-  {
-    auto& node = group->nodeRanks.at(group->rankToNodeIndex.at(rank));
-    localDestinationRank = node[destinationLocalRank % node.size()];
-  }
-
-  size_t numDevices = std::min(bytes / 262144, std::max((size_t)4, group->numTrueIbDevs));
-  size_t numChunks = std::min(bytes / 131072, (size_t)4);
-  if (peerIndices.empty()) {
-    numDevices = std::min(bytes / 65536, std::max((size_t)4, group->numTrueIbDevs));
-    numChunks = std::min(bytes / 65536, (size_t)4);
-  }
-  numDevices = std::min(numDevices, group->rdmaDevs.size());
-  numDevices = std::max(numDevices, (size_t)1);
-  numChunks = std::max(numChunks, (size_t)1);
-  size_t chunkSize = ((bytes + numChunks - 1) / numChunks + 4095u) / 4096u * 4096u;
-
-  bool networked = group->nodeRanks.size() != 1 && localDestinationRank == rank;
-
-  TreeSendsRecvs* tree = nullptr;
-  size_t bufferSize = 0;
-  size_t recvOffset = 0;
-
-  AllocatedBuffer reduceBuffer;
-  auto& reduceStream = reduceStreamArr[reduceCounter];
-  if (localDestinationRank == rank) {
-    reduceCounter = (reduceCounter + 1) % reduceStreamArr.size();
-  }
-
-  if (!reduceStream) {
-    reduceStream = Stream::create(streamPriority);
-  }
-
-  if (networked) {
-    tree = group->getTree(4, static_cast<size_t>(destRank));
-
-    recvOffset = 1 + peerIndices.size();
-    bufferSize = recvOffset + tree->recvs.size();
-
-    reduceBuffer = alloccuda(bytes * bufferSize, stream);
-
-    QueueEntryReduce* e = group->cpuThread->freelistReduce.pop();
-    e->task = taskReduce;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->tensorAddress = tensorAddress;
-    e->bytes = bytes;
-    e->destinationRank = static_cast<uint32_t>(destRank);
-
-    e->recvBuffer = tree->recvs.empty() ? 0 : reduceBuffer.cudaPointer + bytes * recvOffset;
-
-    e->numDevices = numDevices;
-    e->numChunks = numChunks;
-    e->numParallel = 1;
-
-    group->cpuThread->enqueue(e);
-  }
-
-  bool anyLocalPeers = !peerIndices.empty();
-
-  if (!anyLocalPeers) {
-    CHECK(rank == localDestinationRank);
-  }
-
-  if (localDestinationRank != rank) {
-    CHECK(anyLocalPeers);
-    CHECK(!networked);
-    size_t peerIndex = group->getPeerIndex(localDestinationRank);
-
-    uintptr_t peerAddress = 0;
-    ipcMapper->requestAddress(
-        peerIndex, tensorAddress, bytes,
-        [ptr = &peerAddress](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-    ipcMapper->wait();
-
-    peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceCuda, stepValue, peerAddress, bytes);
-
-    CHECK(peerWaitDyn(concurrencyIndex, peerIndex, opTypeReduceCuda, stepValue, bytes) == 0);
-
-    localEvent.record(*peerIncomingMemcpyStream);
-    localEvent.wait(stream);
-    ipcMapper->streamRecord(peerIndex, stream);
-
-    ipcMapper->streamWait(peerIndex, stream);
-    localEvent.record(stream);
-    localEvent.wait(*peerIncomingMemcpyStream);
-
-  } else {
-
-    std::array<uintptr_t, 8> peerAddresses;
-    peerAddresses.fill(0);
-
-    for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceCuda, stepValue, 0, bytes);
-    }
-    for (size_t peerIndex : peerIndices) {
-      peerAddresses[peerIndex] = peerWaitDyn(concurrencyIndex, peerIndex, opTypeReduceCuda, stepValue, bytes);
-    }
-
-    if (networked) {
-      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
-      memFlush(stream);
-    } else {
-      CHECK(bufferSize == 0);
-      bufferSize = 1 + peerIndices.size();
-      reduceBuffer = alloccuda(bytes * bufferSize, stream);
-    }
-
-    localEvent.record(*reduceStream);
-    localEvent.wait(*peerMemcpyStream);
-
-    localEvent.record(stream);
-    localEvent.wait(*reduceStream);
-
-    for (size_t peerIndex : peerIndices) {
-      ipcMapper->streamWait(peerIndex, *peerMemcpyStream);
-      CHECK(reduceBuffer.cudaPointer != 0);
-      CHECK(peerAddresses[peerIndex] != 0);
-      CHECK_CU(cuMemcpyDtoDAsync(
-          reduceBuffer.cudaPointer + bytes * peerIndex, peerAddresses[peerIndex], bytes, *peerMemcpyStream));
-
-      ipcMapper->streamRecord(peerIndex, *peerMemcpyStream);
-    }
-
-    CHECK_CU(
-        cuMemcpyDtoDAsync(reduceBuffer.cudaPointer + bytes * peerIndices.size(), tensorAddress, bytes, *reduceStream));
-
-    localEvent.record(*peerMemcpyStream);
-    localEvent.wait(*reduceStream);
-
-    // Create TensorPtr for buffer and use sum_out
-    std::array<int64_t, 2> bufferShape = {static_cast<int64_t>(bufferSize), static_cast<int64_t>(numel)};
-    TensorPtr buffer =
-        TensorPtr::from_blob((void*)reduceBuffer.cudaPointer, bufferShape, tensor.dtype(), tensor.device_index());
-
-    CHECK(static_cast<size_t>(buffer.numel() * buffer.itemsize()) == bytes * bufferSize);
-
-    if (networked) {
-      size_t offset = 0;
-      for (size_t chunkIndex = 0; offset != bytes; ++chunkIndex) {
-        size_t currentChunkSize = std::min(chunkSize, bytes - offset);
-
-        for (size_t index = 0; index != tree->recvs.size(); ++index) {
-          memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
-              stepValue);
-        }
-
-        offset += currentChunkSize;
-      }
-      memFlush(*reduceStream);
-    }
-
-    {
-      StreamGuard sg2(*reduceStream, group->deviceIndex);
-      sum_out(tensor, buffer, 0);
-    }
-
-    localEvent.record(*reduceStream);
-    localEvent.wait(stream);
-
-    if (networked) {
-      size_t offset = 0;
-      for (size_t chunkIndex = 0; offset != bytes; ++chunkIndex) {
-        size_t currentChunkSize = std::min(chunkSize, bytes - offset);
-
-        CHECK(tree->sends.size() <= 1);
-        for (size_t index = 0; index != tree->sends.size(); ++index) {
-          memWrite(group->cpuInBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + size * chunkIndex + index),
-              stepValue);
-        }
-
-        offset += currentChunkSize;
-      }
-      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-      memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-      memFlush(stream);
-    }
-  }
-
-  // sync note at end of broadcast
-  for (size_t peerIndex : peerIndices) {
-    ipcMapper->push(peerIndex, stepValue + 1);
-  }
-  for (size_t peerIndex : peerIndices) {
-    CHECK(ipcMapper->pop<uint32_t>(peerIndex) == stepValue + 1);
-  }
-
-  CHECK(memops.empty());
+  // A compile_op op (see runCollective): every rank's tensor is an input, and the root's the output too (in place)
+  const std::span<const TensorPtr> root =
+      static_cast<size_t>(destRank) == rank ? std::span<const TensorPtr>(&tensor, 1) : std::span<const TensorPtr>();
+  runCollective(CollectiveKind::reduce, tensor.dtype(), cudaReduce(reduceOp), static_cast<size_t>(destRank),
+      static_cast<size_t>(tensor.numel()), {&tensor, 1}, root, stream, premulValue);
 }
 
 // ============================================================================
@@ -1651,6 +1164,15 @@ void ProcessGroupImpl::scatter(std::span<TensorPtr> inputs, TensorPtr& output, i
     }
   }
 
+  // CUDA tensors: a compile_op op (see runCollective), from the root's inputs, one per rank
+  if (isCuda) {
+    runCollective(CollectiveKind::scatter, DType::UInt8, api::ReduceOp::None, static_cast<size_t>(sourceRank),
+        numel * static_cast<size_t>(output.itemsize()), std::span<const TensorPtr>(inputs.data(), inputs.size()),
+        {&output, 1}, stream);
+    return;
+  }
+
+  // CPU tensors: a compile_op op over RDMA
   ScatterCacheKey key{numel, dtype, sourceRank, isCuda};
 
   auto it = scatterCache.find(key);
@@ -1750,6 +1272,15 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
     }
   }
 
+  // CUDA tensors: a compile_op op (see runCollective), into the root's outputs, one per rank
+  if (isCuda) {
+    runCollective(CollectiveKind::gather, DType::UInt8, api::ReduceOp::None, static_cast<size_t>(destRank),
+        numel * static_cast<size_t>(input.itemsize()), {&input, 1},
+        std::span<const TensorPtr>(outputs.data(), outputs.size()), stream);
+    return;
+  }
+
+  // CPU tensors: a compile_op op over RDMA
   GatherCacheKey key{numel, dtype, destRank, isCuda};
 
   auto it = gatherCache.find(key);
@@ -1806,135 +1337,22 @@ void ProcessGroupImpl::gather(std::span<TensorPtr> outputs, const TensorPtr& inp
 // ============================================================================
 
 void ProcessGroupImpl::alltoall(std::span<TensorPtr> outputs, std::span<TensorPtr> inputs, CUstream stream) {
-  std::unique_lock l(threadUnsafe);
-
-  uint32_t stepValue = getNextStepValue();
-  uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
-  CHECK(stepValue < 0x80000000);
-
-  CHECK(inputs.size() == size);
-  CHECK(outputs.size() == size);
-
-  for (auto& v : inputs) {
-    CHECK(v.is_contiguous());
-  }
-  for (auto& v : outputs) {
-    CHECK(v.is_contiguous());
-  }
-
-  if (size - 1 != group->peerIndices.size()) {
-    throw std::runtime_error("only local alltoall is supported at the moment, sorry :(");
-  }
-
-  size_t numel = static_cast<size_t>(inputs[0].numel());
-  size_t bytes = numel * static_cast<size_t>(inputs[0].itemsize());
-
-  for (auto& v : inputs) {
-    CHECK(v.is_cuda());
-    CHECK(static_cast<size_t>(v.numel() * v.itemsize()) == bytes);
-  }
-  for (auto& v : outputs) {
-    CHECK(v.is_cuda());
-    CHECK(static_cast<size_t>(v.numel() * v.itemsize()) == bytes);
-  }
-
-  StreamData& sd = group->getStreamData(stream);
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  Group* group = &*this->group;
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  const auto& ipcRanks = group->ipcRanks;
-  const auto& peerIndices = group->peerIndices;
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  std::vector<AllocatedBuffer> temporaryBuffers;
-
-  std::array<uintptr_t, 8> peerMappedAddresses;
-  for (size_t i : peerIndices) {
-    uintptr_t ptr = (uintptr_t)inputs[ipcRanks[i]].data_ptr();
-    if (ptr % 16 != 0) {
-      auto buf = alloccuda(bytes, stream);
-      CHECK_CU(cuMemcpyDtoDAsync(buf.cudaPointer, ptr, bytes, stream));
-      ptr = buf.cudaPointer;
-      temporaryBuffers.push_back(std::move(buf));
-    }
-    ipcMapper->requestAddress(
-        i, ptr, bytes,
-        [addr = &peerMappedAddresses[i]](uintptr_t address) {
-          *addr = address;
-        },
-        true);
-  }
-  ipcMapper->wait();
-
-  std::array<uintptr_t, 8> peerAddresses;
-  for (size_t peerIndex : peerIndices) {
-    peerWriteDyn(concurrencyIndex, peerIndex, opTypeAllToAllCuda2, stepValue, peerMappedAddresses[peerIndex], bytes);
-  }
-  for (size_t peerIndex : peerIndices) {
-    peerAddresses[peerIndex] = peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllToAllCuda2, stepValue, bytes);
-  }
-
-  freePendingIpcEvents();
-
-  localEvent.record(stream);
-
-  syncPeers(stream);
-
-  // AllToAll kernel parameters
-  struct AllToAllParameters {
-    size_t bytes;
-    uintptr_t outputAddress[8];
-    uintptr_t peerInputAddresses[8];
-  };
-
-  AllToAllParameters parameters;
-  parameters.bytes = bytes;
-  for (size_t peerIndex : peerIndices) {
-    parameters.outputAddress[peerIndex] = (uintptr_t)outputs[ipcRanks[peerIndex]].data_ptr();
-    if (parameters.outputAddress[peerIndex] % 16 != 0) {
-      auto buf = alloccuda(bytes, stream);
-      parameters.outputAddress[peerIndex] = buf.cudaPointer;
-      temporaryBuffers.push_back(std::move(buf));
-    }
-    parameters.peerInputAddresses[peerIndex] = peerAddresses[peerIndex];
-  }
-
-  if (!group->kernels->cuAllToAll) {
-    group->kernels->compile(CompileAllToAll);
-    CHECK(group->kernels->cuAllToAll != nullptr);
-  }
-
-  size_t gridSize = group->kernels->gridSize;
-  size_t blockSize = group->kernels->blockSize;
-
-  std::array<void*, 1> params = {&parameters};
-
-  CHECK_CU(
-      cuLaunchKernel(group->kernels->cuAllToAll, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
-
-  for (size_t peerIndex : peerIndices) {
-    if (parameters.outputAddress[peerIndex] != (uintptr_t)outputs[ipcRanks[peerIndex]].data_ptr()) {
-      CHECK_CU(cuMemcpyDtoDAsync(
-          (uintptr_t)outputs[ipcRanks[peerIndex]].data_ptr(), parameters.outputAddress[peerIndex], bytes, stream));
+  REQUIRE(inputs.size() == size && outputs.size() == size, "all-to-all: expected %d inputs and outputs, got %d and %d",
+      size, inputs.size(), outputs.size());
+  for (auto* list : {&inputs, &outputs}) {
+    for (const TensorPtr& t : *list) {
+      if (!t.is_cuda()) {
+        throw std::runtime_error("moodist: all-to-all of CPU tensors is not supported");
+      }
     }
   }
+  const size_t bytes = static_cast<size_t>(inputs[0].numel() * inputs[0].itemsize());
 
-  syncPeers(stream);
-
-  if (outputs[rank].data_ptr() != inputs[rank].data_ptr()) {
-    auto copyStream = getCopyStream(stream);
-    localEvent.wait(copyStream);
-    CHECK_CU(
-        cuMemcpyDtoDAsync((uintptr_t)outputs[rank].data_ptr(), (uintptr_t)inputs[rank].data_ptr(), bytes, copyStream));
-    localEvent.record(copyStream);
-    localEvent.wait(stream);
-  }
+  // A compile_op op (see runCollective): input j goes to rank j, output i comes from rank i (one tensor each if the
+  // lists are views of one, as all_to_all_single's)
+  runCollective(CollectiveKind::allToAll, DType::UInt8, api::ReduceOp::None, 0, bytes,
+      std::span<const TensorPtr>(inputs.data(), inputs.size()),
+      std::span<const TensorPtr>(outputs.data(), outputs.size()), stream);
 }
 
 // ============================================================================
@@ -2162,8 +1580,9 @@ void processGroupBroadcast(api::ProcessGroup* pg, TensorPtr& tensor, int sourceR
   static_cast<ProcessGroupImpl*>(pg)->broadcast(tensor, sourceRank, stream);
 }
 
-void processGroupReduce(api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream) {
-  static_cast<ProcessGroupImpl*>(pg)->reduce(tensor, destRank, reduceOp, stream);
+void processGroupReduce(
+    api::ProcessGroup* pg, TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream, double premulValue) {
+  static_cast<ProcessGroupImpl*>(pg)->reduce(tensor, destRank, reduceOp, stream, premulValue);
 }
 
 void processGroupBarrier(api::ProcessGroup* pg) {
@@ -2618,21 +2037,93 @@ bool legacyIpcCapable(uintptr_t ptr) {
 }
 } // namespace
 
-void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t numel,
-    const TensorPtr& input, const TensorPtr& output, CUstream stream, double scale) {
+namespace {
+// The parts (see runCollective) of rank r's input and output in a collective, 0 where it has none: one each in an
+// all-reduce; in an all-gather, the output has one per rank, and in a reduce-scatter the input; in an all-to-all,
+// both (what the rank sends to each rank, what it receives from each); every rank has an output in a broadcast, and
+// the root an input (in place: then the op's destinations are on every rank, at the same offset of the pool where the
+// tensors are there, which multicast stores need); every rank has an input in a reduce, and the root an output; in a
+// scatter every rank has an output, and the root an input of one part per rank; in a gather the other way around.
+std::pair<size_t, size_t> collectiveParts(CollectiveKind kind, size_t r, size_t root, size_t size) {
+  switch (kind) {
+  case CollectiveKind::allGather:
+    return {1, size};
+  case CollectiveKind::reduceScatter:
+    return {size, 1};
+  case CollectiveKind::allReduce:
+    return {1, 1};
+  case CollectiveKind::broadcast:
+    return {r == root ? 1 : 0, 1};
+  case CollectiveKind::reduce:
+    return {1, r == root ? 1 : 0};
+  case CollectiveKind::scatter:
+    return {r == root ? size : 0, 1};
+  case CollectiveKind::gather:
+    return {1, r == root ? size : 0};
+  case CollectiveKind::allToAll:
+    return {size, size};
+  }
+  CHECK(false);
+  return {};
+}
+
+// Whether [address, address + bytes) is in one allocation of CUDA memory (one cudaMalloc, one mapping), which copies
+// and mappings take as a whole: a list of tensors that are one after the other, but in separate allocations (as
+// PyTorch's allocator may hand out), is not one tensor
+bool oneAllocation(uintptr_t address, size_t bytes) {
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  return cuMemGetAddressRange(&base, &size, address) == CUDA_SUCCESS && address + bytes <= base + size;
+}
+
+// A rank's input or output in a collective, as the caller has it: `rows` parts of `width` bytes (none if rows is 0),
+// at addresses[i], one after the other in one allocation if contiguous (one tensor, or a list of views of one, e.g.
+// all_to_all_single's; moodist's memory is one allocation)
+struct CollectiveSide {
+  size_t rows = 0;
+  Vector<uintptr_t> addresses;
+  bool contiguous = true;
+
+  CollectiveSide(std::span<const TensorPtr> tensors, size_t rows, size_t width, int device, const char* what) {
+    REQUIRE(rows == 0 ? tensors.empty() : tensors.size() == 1 || tensors.size() == rows,
+        "moodist: got %d %s tensors for %d parts", tensors.size(), what, rows);
+    for (const TensorPtr& t : tensors) {
+      REQUIRE(t.is_cuda() && t.device_index() == device, "moodist: an %s tensor is not on the process group's device",
+          what);
+      REQUIRE(t.is_contiguous(), "moodist: an %s tensor is not contiguous", what);
+      const size_t parts = tensors.size() == 1 ? rows : 1;
+      REQUIRE((size_t)(t.numel() * t.itemsize()) == parts * width,
+          "moodist: an %s tensor has %d bytes, expected %d (%d parts of %d)", what, t.numel() * t.itemsize(),
+          parts * width, parts, width);
+    }
+    this->rows = rows;
+    addresses.resize(rows);
+    for (size_t i : range(rows)) {
+      addresses[i] =
+          tensors.size() == 1 ? (uintptr_t)tensors[0].data_ptr() + i * width : (uintptr_t)tensors[i].data_ptr();
+      contiguous &= addresses[i] == addresses[0] + i * width;
+    }
+    if (contiguous && tensors.size() > 1 && width != 0 && !allocator::owns(addresses[0])) {
+      contiguous = oneAllocation(addresses[0], rows * width);
+    }
+  }
+  uintptr_t address() const {
+    return addresses[0];
+  }
+};
+} // namespace
+
+void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t root, size_t numel,
+    std::span<const TensorPtr> inputs, std::span<const TensorPtr> outputs, CUstream stream, double scale) {
   const int device = group->deviceIndex;
   StreamGuard sg(stream, device);
-  const uintptr_t inputAddress = (uintptr_t)input.data_ptr();
-  const uintptr_t outputAddress = (uintptr_t)output.data_ptr();
   const size_t itemsize = wrapperApi.dtypeSize(dtype);
   CHECK(itemsize != 0 && 16 % itemsize == 0);
-  // The caller's tensors are rows of numel elements: the parts of the ranks in an all-gather's output and a
-  // reduce-scatter's input, else one
+  CHECK(root < size);
   const size_t width = numel * itemsize;
-  const size_t inputRows = kind == CollectiveKind::reduceScatter ? size : 1;
-  const size_t outputRows = kind == CollectiveKind::allGather ? size : 1;
-  CHECK((size_t)(input.numel() * input.itemsize()) == inputRows * width);
-  CHECK((size_t)(output.numel() * output.itemsize()) == outputRows * width);
+  const auto [inputParts, outputParts] = collectiveParts(kind, rank, root, size);
+  const CollectiveSide in(inputs, inputParts, width, device, "input");
+  const CollectiveSide out(outputs, outputParts, width, device, "output");
   if (std::string error = compile_op::reduceDtypeError(dtype, reduce); !error.empty()) {
     throw std::runtime_error(error);
   }
@@ -2640,56 +2131,77 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     return;
   }
   if (size == 1) {
-    // Nothing to combine (an op of one rank would only copy, see the factor below)
-    if (outputAddress != inputAddress) {
-      CHECK_CU(cuMemcpyDtoDAsync(outputAddress, inputAddress, width, stream));
+    // Nothing to combine or send (an op of one rank would only copy): the input to the output, scaled by PremulSum's
+    // factor
+    if (in.rows != 0 && out.rows != 0) {
+      CHECK(in.rows == 1 && out.rows == 1);
+      if (in.address() != out.address()) {
+        CHECK_CU(cuMemcpyDtoDAsync(out.address(), in.address(), width, stream));
+      }
     }
     if (reduce == api::ReduceOp::PremulSum) {
-      TensorPtr(output).mul_(scale);
+      CHECK(outputs.size() == 1);
+      TensorPtr(outputs[0]).mul_(scale);
     }
     return;
   }
 
-  // The op: of rows of numel rounded up to 16 bytes (the copy kernel's unit). A call of another size uses it through
-  // buffers whose rows have the padding (below).
+  // The op: of parts of numel rounded up to 16 bytes (the copy kernel's unit). A call of another size uses it through
+  // buffers whose parts have the padding (below).
   const size_t unit = 16 / itemsize;
   const size_t n = (numel + unit - 1) / unit * unit;
   const size_t pitch = n * itemsize;
-  const CollectiveKey key{kind, dtype, reduce, n};
+  const bool rooted = kind == CollectiveKind::broadcast || kind == CollectiveKind::reduce ||
+                      kind == CollectiveKind::scatter || kind == CollectiveKind::gather;
+  const CollectiveKey key{kind, dtype, reduce, n, rooted ? (uint32_t)root : 0};
   auto it = collectiveOps.find(key);
   if (it == collectiveOps.end()) {
-    // The op of every rank, the same on all (compile takes them all): each rank's input and output as regions of one
-    // tensor of size * n elements, or n for an all-reduce
-    const int64_t whole = kind == CollectiveKind::allReduce ? (int64_t)n : (int64_t)(size * n);
-    std::vector<api::TensorRegion> inputs;
-    std::vector<api::TensorRegion> outputs;
-    for (size_t i : range(size)) {
-      const int32_t r = (int32_t)i;
-      const int64_t piece = (int64_t)(i * n);
-      switch (kind) {
-      case CollectiveKind::allGather:
-        inputs.push_back({.rank = r, .offset = {piece}, .shape = {(int64_t)n}, .tensorId = "0", .device = "cuda"});
-        outputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
-        break;
-      case CollectiveKind::reduceScatter:
-        inputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
-        outputs.push_back({.rank = r, .offset = {piece}, .shape = {(int64_t)n}, .tensorId = "0", .device = "cuda"});
-        break;
-      case CollectiveKind::allReduce:
-        inputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
-        outputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
-        break;
+    // The regions of every rank, in the group's tensor (compile takes them all): a vector of size parts (one for an
+    // all-reduce, a broadcast and a reduce), or for an all-to-all a matrix of size x size parts, whose row r is what
+    // rank r sends (part j to rank j) and column r what it receives
+    std::vector<api::TensorRegion> inputRegions;
+    std::vector<api::TensorRegion> outputRegions;
+    const int64_t part = (int64_t)n;
+    const int64_t all = (int64_t)(size * n);
+    for (size_t r : range(size)) {
+      auto region = [&](std::vector<int64_t> offset, std::vector<int64_t> shape) {
+        return api::TensorRegion{.rank = (int32_t)r,
+            .offset = std::move(offset),
+            .shape = std::move(shape),
+            .tensorId = "0",
+            .device = "cuda"};
+      };
+      const int64_t at = (int64_t)(r * n);
+      const auto [rInputs, rOutputs] = collectiveParts(kind, r, root, size);
+      if (kind == CollectiveKind::allToAll) {
+        inputRegions.push_back(region({(int64_t)r, 0}, {1, all}));
+        outputRegions.push_back(region({0, at}, {(int64_t)size, part}));
+        continue;
+      }
+      // Otherwise a rank's tensor of one part is its own part of the vector (the whole vector if it has one part),
+      // and one of size parts is the whole vector
+      const bool onePart =
+          kind == CollectiveKind::allReduce || kind == CollectiveKind::broadcast || kind == CollectiveKind::reduce;
+      if (rInputs != 0) {
+        inputRegions.push_back(rInputs == size && !onePart ? region({0}, {all}) : region({onePart ? 0 : at}, {part}));
+      }
+      if (rOutputs != 0) {
+        outputRegions.push_back(rOutputs == size && !onePart ? region({0}, {all}) : region({onePart ? 0 : at}, {part}));
       }
     }
     CollectiveOp c;
-    c.op = compileOp(dtype, inputs, outputs, reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
+    c.op = compileOp(dtype, inputRegions, outputRegions, reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
     // The tensors come from any allocator: below, each rank puts those that its peers cannot reach where they can
     c.op->requireMoodistMemory = false;
-    CHECK(c.op->inputs.size() == 1 && c.op->outputs.size() == 1);
+    CHECK(c.op->inputs.size() == (inputParts != 0 ? 1 : 0) && c.op->outputs.size() == (outputParts != 0 ? 1 : 0));
+    CHECK(c.op->inputCopies.empty() && c.op->outputCopies.empty());
+    // (the tensors of a rank: its inputs, its outputs, then a scratch tensor)
+    const size_t numInputs = c.op->inputs.size();
     for (const auto& m : c.op->graph.remoteCudaTensorMappings) {
-      if (m.tensorIndex < 2) {
-        c.shared[m.tensorIndex] = true;
-        c.fabricMapped[m.tensorIndex] |= !group->ipcAccess.at(m.rank);
+      if (m.tensorIndex < numInputs + c.op->outputs.size()) {
+        const size_t which = m.tensorIndex < numInputs ? 0 : 1;
+        c.shared[which] = true;
+        c.fabricMapped[which] |= !group->ipcAccess.at(m.rank);
       }
     }
     if (c.op->anyRankNeedsRdma) {
@@ -2699,24 +2211,27 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
   }
   const CollectiveOp& c = it->second;
   const std::shared_ptr<CustomOpDescriptor>& op = c.op;
-  CHECK(op->inputs[0].bytes == inputRows * pitch && op->outputs[0].bytes == outputRows * pitch);
+  CHECK(in.rows == 0 || op->inputs.at(0).bytes == in.rows * pitch);
+  CHECK(out.rows == 0 || op->outputs.at(0).bytes == out.rows * pitch);
 
-  // This rank's tensors where they are, unless their rows need padding, some rank cannot reach them there (moodist's
-  // memory and cudaMalloc's within a node, moodist's only across a multi-node NVLink fabric), or the kernel cannot
-  // take their address (16 bytes aligned): then through a buffer of the group's communication pool, which, when every
-  // rank does the same, is at the same offset on every rank, so that the op can still use NVLS
+  // This rank's tensors where they are, unless their parts need padding or are not one after the other, some rank
+  // cannot reach them there (moodist's memory and cudaMalloc's within a node, moodist's only across a multi-node
+  // NVLink fabric), or the kernel cannot take their address (16 bytes aligned): then through a buffer of the group's
+  // communication pool, which, when every rank does the same, is at the same offset on every rank, so that the op can
+  // still use NVLS. An all-to-all's input that overlaps its output goes through one too (in place, a rank's part for
+  // rank j would be where rank j's part for it goes).
   const bool padded = n != numel;
-  auto elsewhere = [&](size_t index, uintptr_t address) {
-    if (padded || (op->kernel && address % 16 != 0)) {
+  auto elsewhere = [&](size_t which, const CollectiveSide& s) {
+    if (padded || !s.contiguous || (op->kernel && s.address() % 16 != 0)) {
       return true;
     }
-    if (allocator::owns(address)) {
+    if (allocator::owns(s.address())) {
       return false;
     }
-    return c.fabricMapped[index] || (c.shared[index] && !legacyIpcCapable(address));
+    return c.fabricMapped[which] || (c.shared[which] && !legacyIpcCapable(s.address()));
   };
-  // Copies rows of width bytes
-  auto copyRows = [&](uintptr_t dst, size_t dstPitch, uintptr_t src, size_t srcPitch, size_t rows) {
+  // Copies a side's parts into a buffer, or back
+  auto copyParts = [&](uintptr_t dst, size_t dstPitch, uintptr_t src, size_t srcPitch, size_t rows) {
     if (rows == 1 || (dstPitch == width && srcPitch == width)) {
       CHECK_CU(cuMemcpyDtoDAsync(dst, src, width * rows, stream));
       return;
@@ -2732,41 +2247,87 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     copy.Height = rows;
     CHECK_CU(cuMemcpy2DAsync(&copy, stream));
   };
-  uintptr_t in = inputAddress;
-  uintptr_t out = outputAddress;
+  auto copyIn = [&](uintptr_t buffer, const CollectiveSide& s) {
+    if (s.contiguous) {
+      copyParts(buffer, pitch, s.address(), width, s.rows);
+    } else {
+      for (size_t i : range(s.rows)) {
+        CHECK_CU(cuMemcpyDtoDAsync(buffer + i * pitch, s.addresses[i], width, stream));
+      }
+    }
+  };
+  auto copyOut = [&](const CollectiveSide& s, uintptr_t buffer) {
+    if (s.contiguous) {
+      copyParts(s.address(), width, buffer, pitch, s.rows);
+    } else {
+      for (size_t i : range(s.rows)) {
+        CHECK_CU(cuMemcpyDtoDAsync(s.addresses[i], buffer + i * pitch, width, stream));
+      }
+    }
+  };
+  uintptr_t inAddress = in.rows != 0 ? in.address() : 0;
+  uintptr_t outAddress = out.rows != 0 ? out.address() : 0;
   AllocatedBuffer inputBuffer;
   AllocatedBuffer outputBuffer;
-  if (inputAddress == outputAddress && inputRows == outputRows) {
-    // In place (an all-reduce): one buffer for both
-    if (elsewhere(0, inputAddress) || elsewhere(1, outputAddress)) {
-      outputBuffer = allocateCudaBuffer(outputRows * pitch, stream, device, group->getCommPool());
-      copyRows(outputBuffer.cudaPointer, pitch, inputAddress, width, inputRows);
-      in = out = outputBuffer.cudaPointer;
+  const bool inPlace =
+      in.rows != 0 && out.rows != 0 && in.contiguous && out.contiguous && in.address() == out.address() &&
+      in.rows == out.rows &&
+      (kind == CollectiveKind::allReduce || kind == CollectiveKind::reduce || kind == CollectiveKind::broadcast);
+  if (inPlace) {
+    // (an all-reduce, a reduce or a broadcast on its root): one buffer for both
+    if (elsewhere(0, in) || elsewhere(1, out)) {
+      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, group->getCommPool());
+      copyIn(outputBuffer.cudaPointer, in);
+      inAddress = outAddress = outputBuffer.cudaPointer;
     }
   } else {
-    if (elsewhere(0, inputAddress)) {
-      inputBuffer = allocateCudaBuffer(inputRows * pitch, stream, device, group->getCommPool());
-      copyRows(inputBuffer.cudaPointer, pitch, inputAddress, width, inputRows);
-      in = inputBuffer.cudaPointer;
+    // (whether some part of an all-to-all's input and some part of its output share memory)
+    auto overlaps = [&]() {
+      if (kind != CollectiveKind::allToAll) {
+        return false;
+      }
+      for (uintptr_t a : in.addresses) {
+        for (uintptr_t b : out.addresses) {
+          if (a < b + width && b < a + width) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    if (in.rows != 0 && (elsewhere(0, in) || overlaps())) {
+      inputBuffer = allocateCudaBuffer(in.rows * pitch, stream, device, group->getCommPool());
+      copyIn(inputBuffer.cudaPointer, in);
+      inAddress = inputBuffer.cudaPointer;
     }
-    if (elsewhere(1, outputAddress)) {
-      outputBuffer = allocateCudaBuffer(outputRows * pitch, stream, device, group->getCommPool());
-      out = outputBuffer.cudaPointer;
+    if (out.rows != 0 && elsewhere(1, out)) {
+      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, group->getCommPool());
+      outAddress = outputBuffer.cudaPointer;
     }
   }
 
-  std::array<TensorPtr, 2> tensors = {
-      TensorPtr::from_blob((void*)in, {(int64_t)(inputRows * n)}, dtype, device),
-      TensorPtr::from_blob((void*)out, {(int64_t)(outputRows * n)}, dtype, device),
-  };
-  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], 1, &tensors[1], 1, stream, scale);
+  // The op's tensors, of its shapes (an all-to-all's are matrices)
+  std::array<TensorPtr, 2> tensors;
+  size_t numInputs = 0;
+  size_t numOutputs = 0;
+  if (in.rows != 0) {
+    const auto& shape = op->inputs[0].shape;
+    tensors[numInputs++] =
+        TensorPtr::from_blob((void*)inAddress, std::span<const int64_t>(shape.data(), shape.size()), dtype, device);
+  }
+  if (out.rows != 0) {
+    const auto& shape = op->outputs[0].shape;
+    tensors[numInputs + numOutputs++] =
+        TensorPtr::from_blob((void*)outAddress, std::span<const int64_t>(shape.data(), shape.size()), dtype, device);
+  }
+  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], numInputs, &tensors[numInputs], numOutputs, stream, scale);
   // (CUDA tensors only: the op is done for the caller once queued on the stream, see customOp)
   futureWait(future.get());
 
-  if (out != outputAddress) {
-    copyRows(outputAddress, width, out, pitch, outputRows);
+  if (out.rows != 0 && outAddress != out.address()) {
+    copyOut(out, outAddress);
   }
-  // (the buffers are freed here, for reuse by work after the op and the copy on the stream)
+  // (the buffers are freed here, for reuse by work after the op and the copies on the stream)
 }
 
 namespace {

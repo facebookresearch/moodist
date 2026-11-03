@@ -19,7 +19,6 @@ struct SetupComms;
 struct IpcMapper;
 struct CpuThread;
 struct IbCommon;
-struct Kernels;
 struct AllGather;
 struct ReduceScatter;
 
@@ -74,11 +73,6 @@ struct StreamData {
   ~StreamData();
 };
 
-struct TreeSendsRecvs {
-  Vector<size_t> sends;
-  Vector<size_t> recvs;
-};
-
 struct Group {
   size_t rank;
   size_t size;
@@ -109,7 +103,6 @@ struct Group {
   std::vector<std::unique_ptr<Rdma>> rdmaDevs;
   size_t numTrueIbDevs = 0;
   bool rdmaSupportsCuda = false;
-  std::unique_ptr<Kernels> kernels;
   std::unique_ptr<AllGather> allGather;
   std::unique_ptr<ReduceScatter> reduceScatter;
   CpuThread* cpuThread = nullptr;
@@ -332,20 +325,6 @@ struct Group {
     double div = 1024 * 1042 * 1024;
     log.verbose(
         "Bytes managed: %d (%gG)\nBytes device: %d (%gG)\nBytes host: %d (%gG)\n", m, m / div, d, d / div, h, h / div);
-  }
-
-  TreeSendsRecvs generateTree(size_t nary, size_t rootRank);
-  HashMap<size_t, std::unique_ptr<TreeSendsRecvs>> cachedTrees;
-  TreeSendsRecvs* getTree(size_t nary, size_t rootRank) {
-    size_t index = size * nary + rootRank;
-    auto it = cachedTrees.find(index);
-    if (it != cachedTrees.end()) {
-      return &*it->second;
-    }
-    auto p = std::make_unique<TreeSendsRecvs>(generateTree(nary, rootRank));
-    auto* r = &*p;
-    cachedTrees[index] = std::move(p);
-    return r;
   }
 
   uintptr_t getNextCudaUint32();

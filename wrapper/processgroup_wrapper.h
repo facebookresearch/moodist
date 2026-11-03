@@ -144,18 +144,14 @@ public:
       const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
 
   c10::intrusive_ptr<Work> allgather_coalesced(std::vector<std::vector<at::Tensor>>& outputTensorLists,
-      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
-    throw std::runtime_error("allgather_coalesced not supported");
-  }
+      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
 
   c10::intrusive_ptr<Work> allgather_into_tensor_coalesced(std::vector<at::Tensor>& outputTensors,
       std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
 
   c10::intrusive_ptr<Work> reduce_scatter(std::vector<at::Tensor>& outputTensors,
       std::vector<std::vector<at::Tensor>>& inputTensors,
-      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override {
-    throw std::runtime_error("reduce_scatter not supported");
-  }
+      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
 
   c10::intrusive_ptr<Work> _reduce_scatter_base(at::Tensor& outputTensor, at::Tensor& inputTensor,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
