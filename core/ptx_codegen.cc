@@ -112,12 +112,12 @@ static_assert(nvlsReduceMinRanks >= Group::Nvls::minDomainRanks && nvlsReduceLoc
 // The multimem.ld_reduce of a 16-byte vector of a dtype for a reduce op: perVector instructions of op (the forms of the
 // integers and of float64 have no vectors: 4 or 8 bytes each, into 64-bit registers if wide), or none. No min / max of
 // floating point types: multimem.ld_reduce has none for float32 and float64, and those of float16 and bfloat16 return
-// the other value where one is NaN (GB300), where the reduce loop propagates NaN. No average of float16: the switches
-// round the sum to float16, which overflows where the average does not (from 65504 / N), where the reduce loop
-// divides the float32 sum. (Sums of float types in the switches start from +0: a sum of -0 only is +0, where the
-// reduce loop's is -0. Their sums of 16-bit floats are within 1 ulp of the exact sum, but not always the nearest
-// value: on 8 GB300, 24-26% of the elements of sums of random values were 1 ulp off, with no bias measurable, where the
-// reduce loop rounds to nearest. Integer sums wrap, as the reduce loop's.)
+// the other value where one is NaN (GB300), where the reduce loop propagates NaN. No average (nor PremulSum) of
+// float16: the switches round the sum to float16, which overflows where the average does not (from 65504 / N), where
+// the reduce loop scales the float32 sum. (Sums of float types in the switches start from +0: a sum of -0 only is +0,
+// where the reduce loop's is -0. Their sums of 16-bit floats are within 1 ulp of the exact sum, but not always the
+// nearest value: on 8 GB300, 24-26% of the elements of sums of random values were 1 ulp off, with no bias measurable,
+// where the reduce loop rounds to nearest. Integer sums wrap, as the reduce loop's.)
 struct NvlsReduceInst {
   const char* op;
   uint32_t perVector;
@@ -125,7 +125,7 @@ struct NvlsReduceInst {
 };
 std::optional<NvlsReduceInst> nvlsReduceInst(DType dtype, compile_op::ReduceOp reduce) {
   using compile_op::ReduceOp;
-  const bool sum = reduce == ReduceOp::Sum || reduce == ReduceOp::Avg;
+  const bool sum = reduce == ReduceOp::Sum || compile_op::isScaledSum(reduce);
   const bool isMin = reduce == ReduceOp::Min;
   if (!compile_op::isReduction(reduce)) {
     return {};
@@ -619,6 +619,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 stepValue = loadParamField(params, 0, ValType::U32);
     u32 concurrencyIndex = loadParamField(params, 4, ValType::U32);
     static_assert(offsetof(CompileOpCopyParameters, nvlsCounterBase) == 8);
+    // PremulSum's factor (CompileOpCopyParameters::scale), as a float64, or converted to float32
+    static_assert(offsetof(CompileOpCopyParameters, scale) == 16);
+    auto launchScale = [&](bool f64) {
+      Value bits = loadParamField(params, 16, ValType::U64);
+      if (f64) {
+        return bits;
+      }
+      Value r(ValType::U32);
+      arith("cvt.rn.f32.f64", r, bits);
+      return r;
+    };
 
     u32 threadIndex = threadIdx_x();
     u32 blockIndex = blockIdx_x();
@@ -2417,9 +2428,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         const bool accFloat = dtype != DType::Int32 && dtype != DType::Int64;
         const bool half = dtype == DType::Float16 || dtype == DType::BFloat16;
         const uint32_t accPerVector = half ? 8 : acc64 ? 2 : 4;
-        const bool sum = op == ReduceOp::Sum || op == ReduceOp::Avg;
+        const bool sum = op == ReduceOp::Sum || compile_op::isScaledSum(op);
         const bool isMin = op == ReduceOp::Min;
-        CHECK(compile_op::isReduction(op) && (accFloat || op != ReduceOp::Avg));
+        CHECK(compile_op::isReduction(op) && (accFloat || !compile_op::isScaledSum(op)));
         // The identity: -0 for sums (x + -0 = x for every x, -0 included), +-inf or the integer extremes for min / max
         int64_t identity;
         if (sum) {
@@ -2756,14 +2767,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 addrSlot = ld_global_nc_u32(record + offsetof(PipeEdge, addrSlot));
           u64 offset = widen(chunk) * chunkSize;
           u32 n = min_u32(ld_global_nc_u32(record + offsetof(PipeEdge, bytes)) - narrow(offset), chunkSize);
-          // An average divides once it has combined the inputs among the sources (the partial results of other
-          // domains after them are divided already)
+          // An average divides, PremulSum multiplies by the launch's factor, once it has combined the inputs among
+          // the sources (the partial results of other domains after them are scaled already)
           u32 inputSources;
           Value divisor(acc64 ? ValType::U64 : ValType::U32);
+          Value factor(acc64 ? ValType::U64 : ValType::U32);
           if (op == ReduceOp::Avg) {
             inputSources = ld_global_nc_u32(record + offsetof(PipeEdge, inputSources));
             arith(acc64 ? "cvt.rn.f64.u32" : "cvt.rn.f32.u32", divisor,
                 ld_global_nc_u32(record + offsetof(PipeEdge, divisor)));
+          } else if (op == ReduceOp::PremulSum) {
+            inputSources = ld_global_nc_u32(record + offsetof(PipeEdge, inputSources));
+            factor = launchScale(acc64);
           }
           for (auto& a : acc) {
             for (Value& v : a) {
@@ -2846,11 +2861,15 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                 combine(acc[v][j], x[j]);
               }
             }
-            if (op == ReduceOp::Avg) {
+            if (compile_op::isScaledSum(op)) {
               IF(s + step == inputSources) {
                 for (auto& a : acc) {
                   for (Value& v : a) {
-                    arith(acc64 ? "div.rn.f64" : "div.rn.f32", v, v, divisor);
+                    if (op == ReduceOp::Avg) {
+                      arith(acc64 ? "div.rn.f64" : "div.rn.f32", v, v, divisor);
+                    } else {
+                      arith(acc64 ? "mul.rn.f64" : "mul.rn.f32", v, v, factor);
+                    }
                   }
                 }
               }
@@ -2964,8 +2983,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         using compile_op::ReduceOp;
         const DType dtype = graph.tensors.at(0).dtype;
         const NvlsReduceInst inst = nvlsReduceInst(dtype, graph.reduce).value();
+        // Avg divides the switches' sums, PremulSum multiplies them by the launch's factor
         const bool avg = graph.reduce == ReduceOp::Avg;
-        CHECK(!avg || dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::BFloat16);
+        const bool scaled = compile_op::isScaledSum(graph.reduce);
+        CHECK(!scaled || dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::BFloat16);
         // The stores the edges need: multicast stores (edgeNvlsStore), stores to the local destination, or both
         bool anyMulticast = false;
         bool anyLocalStore = false;
@@ -3037,16 +3058,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               divisor = Value(dtype == DType::Float64 ? ValType::U64 : ValType::U32);
               arith(dtype == DType::Float64 ? "cvt.rn.f64.u32" : "cvt.rn.f32.u32", divisor,
                   ld_global_nc_u32(record + offsetof(PipeEdge, divisor)));
+            } else if (scaled) {
+              divisor = launchScale(dtype == DType::Float64);
             }
+            // (divisor: the factor for PremulSum)
+            const char* const scale32 = avg ? "div.rn.f32" : "mul.rn.f32";
             for (uint32_t v : range(nvlsReduceVectors)) {
-              if (avg && dtype == DType::Float64) {
+              if (scaled && dtype == DType::Float64) {
                 for (Value& w : wide[v]) {
-                  arith("div.rn.f64", w, w, divisor);
+                  arith(avg ? "div.rn.f64" : "mul.rn.f64", w, w, divisor);
                 }
-              } else if (avg) {
+              } else if (scaled) {
                 for (Value& w : x[v]) {
                   if (dtype == DType::Float32) {
-                    arith("div.rn.f32", w, w, divisor);
+                    arith(scale32, w, w, divisor);
                     continue;
                   }
                   // A pair of bfloat16 (cvt.rn.bf16x2.f32 d, a, b puts a in the upper half)
@@ -3054,8 +3079,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                   Value hi(ValType::U32);
                   lo = w << 16;
                   hi = w & 0xffff0000ll;
-                  arith("div.rn.f32", lo, lo, divisor);
-                  arith("div.rn.f32", hi, hi, divisor);
+                  arith(scale32, lo, lo, divisor);
+                  arith(scale32, hi, hi, divisor);
                   arith("cvt.rn.bf16x2.f32", w, hi, lo);
                 }
               }

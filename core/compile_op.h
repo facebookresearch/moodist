@@ -113,8 +113,8 @@ struct Graph {
     // The done flags only say that the edge has loaded its sources (it has used regions of rings, which are then free
     // again): the kernel sets them once all of the edge has been loaded, without waiting for its stores to complete
     bool doneWhenLoaded = false;
-    // The number of sources, at the end, that are partial results of NVLink domains: an average has divided those
-    // by the divisor already, the others it divides after combining them
+    // The number of sources, at the end, that are partial results of NVLink domains: an average (PremulSum) has
+    // divided those by the divisor (multiplied them by the factor) already, the others it scales after combining them
     uint32_t partialSources = 0;
     // Avg: the number of inputs the result is the average of (0: the number of sources)
     uint32_t divisor = 0;
@@ -157,13 +157,24 @@ struct Graph {
   size_t numOutputCopies;
   Vector<TensorDescr> tensors;
 
-  // Sum, Avg, Min or Max: edges with several sources reduce them (see compile_op.cc)
+  // Sum, Avg, Min, Max or PremulSum: edges with several sources reduce them (see compile_op.cc)
   ReduceOp reduce = ReduceOp::None;
 };
 
-// Whether reduce is an operation on the values (Sum, Avg, Min, Max), as opposed to None and Any
+// Whether reduce is an operation on the values (Sum, Avg, Min, Max, PremulSum), as opposed to None and Any
 inline bool isReduction(ReduceOp reduce) {
-  return reduce == ReduceOp::Sum || reduce == ReduceOp::Avg || reduce == ReduceOp::Min || reduce == ReduceOp::Max;
+  return reduce == ReduceOp::Sum || reduce == ReduceOp::Avg || reduce == ReduceOp::Min || reduce == ReduceOp::Max ||
+         reduce == ReduceOp::PremulSum;
+}
+
+// Whether reduce scales the sum of an edge's inputs before it is rounded to the dtype: Avg divides it by the number of
+// the inputs that cover each element, PremulSum multiplies it by the launch's factor (CompileOpCopyParameters::scale),
+// as if each input had been multiplied by it first (the process group's PREMUL_SUM; in float32, so that no value is
+// rounded to a 16-bit type before: multiplying the inputs first keeps float16 sums in range). Both apply to the inputs
+// that an edge combines, before the partial results of other NVLink domains, which carry it already (see
+// crossDomainReductions in compile_op.cc); floating point types only.
+inline bool isScaledSum(ReduceOp reduce) {
+  return reduce == ReduceOp::Avg || reduce == ReduceOp::PremulSum;
 }
 
 // NVLS reductions (multimem.ld_reduce, see generateKernel in ptx_codegen.cc), within the NVLink domain of the edge's
@@ -206,6 +217,8 @@ inline const char* reduceName(ReduceOp reduce) {
     return "min";
   case ReduceOp::Max:
     return "max";
+  case ReduceOp::PremulSum:
+    return "premul_sum";
   }
   return "unknown";
 }
@@ -282,6 +295,10 @@ struct CompileContext {
     }
   }
 };
+
+// Why reduce cannot combine values of dtype, or empty if it can (reductions: floating point types and 32- and 64-bit
+// integers; avg and PremulSum floating point types only)
+std::string reduceDtypeError(DType dtype, ReduceOp reduce);
 
 // Main compile function
 // Returns a compiled CustomOpDescriptor ready for execution

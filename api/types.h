@@ -61,6 +61,9 @@ enum class ReduceOp : int {
   Avg = 3,
   Min = 4,
   Max = 5,
+  // The sum times a factor given per launch, applied before the result is rounded to the dtype (the process group's
+  // PREMUL_SUM, see compile_op.h)
+  PremulSum = 6,
 };
 
 // Input/output specification for compile_op

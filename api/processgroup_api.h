@@ -52,10 +52,10 @@ void processGroupCommPoolAllocate(
 void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, CUstream stream);
 
 void processGroupReduceScatter(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
-    CUstream stream, float premulValue);
+    CUstream stream, double premulValue);
 
 void processGroupAllreduce(
-    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
+    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue);
 
 void processGroupBroadcast(api::ProcessGroup* pg, TensorPtr& tensor, int sourceRank, CUstream stream);
 

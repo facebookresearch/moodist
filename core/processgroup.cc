@@ -114,14 +114,6 @@ bool profilingEnabled = false;
 // Helper types
 // ============================================================================
 
-// 2D copy descriptor for kernelless allgather optimization
-struct Copy2d {
-  size_t offset;
-  size_t length;
-  size_t pitch;
-  size_t num;
-};
-
 // Generic hashing utilities for cache keys
 constexpr size_t kHashMultiplier = 0x9e3779b97f4a7c15; // 64-bit golden ratio
 
@@ -354,9 +346,9 @@ Dtype toInternalDtype(DType dt) {
   }
 }
 
-// The compile_op reduce op of a process group reduce op, for the collectives that run on compile_op (see
-// ProcessGroupImpl::runCollective), or none
-std::optional<api::ReduceOp> collectiveReduce(ReduceOp op) {
+// The compile_op reduce op of a process group reduce op, for the reductions of CUDA tensors (which run on compile_op,
+// see ProcessGroupImpl::runCollective)
+api::ReduceOp cudaReduce(ReduceOp op) {
   switch (op) {
   case ReduceOp::SUM:
     return api::ReduceOp::Sum;
@@ -366,8 +358,12 @@ std::optional<api::ReduceOp> collectiveReduce(ReduceOp op) {
     return api::ReduceOp::Min;
   case ReduceOp::MAX:
     return api::ReduceOp::Max;
+  case ReduceOp::PREMUL_SUM:
+    return api::ReduceOp::PremulSum;
   default:
-    return std::nullopt;
+    throw std::runtime_error(fmt::sprintf("moodist: reduce op %d is not supported for CUDA tensors (SUM, AVG, MIN, MAX "
+                                          "and PREMUL_SUM are)",
+        (int)op));
   }
 }
 
@@ -470,9 +466,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
     int64_t chunkSize = -1;       // -1 = auto
     int64_t method = -1;          // -1 = auto, 0 = kernel, 1 = copy, 2 = direct
   } options;
-
-  // Cached 2D copy patterns for kernelless allgather
-  std::optional<std::array<Vector<Copy2d>, 8>> allGather2dCopies;
 
   Reusable<IpcEvent> ipcEvents;
   Reusable<IpcEvent> pendingIpcEvents;
@@ -750,15 +743,6 @@ struct ProcessGroupImpl : api::ProcessGroup {
     }
   }
 
-  void memWaitEq(uintptr_t address, uint32_t value) {
-    CUstreamBatchMemOpParams op;
-    std::memset(&op, 0, sizeof(op));
-    op.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
-    op.waitValue.address = address;
-    op.waitValue.value = value;
-    memops.push_back(op);
-  }
-
   void memWaitGeq(uintptr_t address, uint32_t value) {
     CUstreamBatchMemOpParams op;
     std::memset(&op, 0, sizeof(op));
@@ -813,330 +797,10 @@ struct ProcessGroupImpl : api::ProcessGroup {
     return dyn.gatherAddress;
   }
 
-  void calculateAllGather2dCopies() {
-    const auto& peerIndices = group->peerIndices;
-    AllGather& allGather = *group->allGather;
-
-    std::array<Vector<size_t>, 8> recvsPerPeer;
-
-    for (auto& v : allGather.proxyDestinationInfo) {
-      recvsPerPeer.at(v.proxyPeerIndex).push_back(v.source);
-    }
-
-    for (size_t peerIndex : peerIndices) {
-      recvsPerPeer[peerIndex].push_back(group->ipcRanks[peerIndex]);
-    }
-
-    for (auto& v : recvsPerPeer) {
-      std::sort(v.begin(), v.end());
-    }
-
-    allGather2dCopies.emplace();
-
-    for (size_t peerIndex : peerIndices) {
-      size_t i = 0;
-      auto& recvs = recvsPerPeer[peerIndex];
-      auto nextseq = [&]() {
-        CHECK(i != recvs.size());
-        size_t beginSource = recvs[i];
-        size_t len = 0;
-        size_t prevSource = -1;
-        for (; i != recvs.size(); ++i) {
-          size_t source = recvs[i];
-          if (prevSource == -1 || source == prevSource + 1) {
-            ++len;
-            prevSource = source;
-          } else {
-            break;
-          }
-        }
-        CHECK(len >= 1);
-        size_t endSource = beginSource + len;
-        CHECK(endSource >= beginSource);
-        return std::make_pair(beginSource, endSource);
-      };
-      while (i != recvs.size()) {
-        auto firstSeq = nextseq();
-        size_t seqLen = firstSeq.second - firstSeq.first;
-        size_t pitch = 0;
-        size_t numSeqs = 1;
-        auto prevSeq = firstSeq;
-        while (i != recvs.size()) {
-          size_t oi = i;
-          auto seq = nextseq();
-          if (seq.second - seq.first != seqLen) {
-            i = oi;
-            break;
-          }
-          size_t thisPitch = seq.first - prevSeq.first;
-          if (pitch == 0) {
-            pitch = thisPitch;
-          } else {
-            if (thisPitch != pitch) {
-              i = oi;
-              break;
-            }
-          }
-          ++numSeqs;
-          prevSeq = seq;
-        }
-
-        if (pitch == 0) {
-          pitch = seqLen;
-          CHECK(numSeqs == 1);
-        }
-
-        Copy2d c;
-        c.offset = firstSeq.first;
-        c.length = seqLen;
-        c.pitch = pitch;
-        c.num = numSeqs;
-
-        (*allGather2dCopies)[peerIndex].push_back(c);
-
-        CHECK(numSeqs >= 1 && numSeqs < size);
-        CHECK(seqLen >= 1 && seqLen < size);
-        CHECK(pitch >= seqLen && pitch < size);
-      }
-    }
-  }
-
-  void kernelLess_all_gather_impl(uint32_t concurrencyIndex, uint32_t stepValue, uintptr_t inputAddress,
-      size_t inputBytes, uintptr_t outputAddress, size_t outputBytes, CUstream stream,
-      const std::array<uintptr_t, 8>& peerMappedInputAddresses,
-      const std::array<uintptr_t, 8>& peerMappedOutputAddresses, bool direct, size_t numChunks, size_t chunkSize,
-      bool isLocalOnly) {
-
-    if (!allGather2dCopies) {
-      calculateAllGather2dCopies();
-    }
-
-    const auto& peerIndices = group->peerIndices;
-
-    // Signal CPU thread (only if not local-only, since CPU thread task isn't launched for local-only)
-    if (!isLocalOnly) {
-      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-      memFlush(stream);
-    }
-
-    // Copy local rank's data to output
-    {
-      size_t offset = inputBytes * rank;
-      size_t nbytes = inputBytes;
-      CHECK(inputBytes == nbytes);
-
-      if (outputAddress + offset != inputAddress) {
-        CHECK_CU(cuMemcpyDtoDAsync(outputAddress + offset, inputAddress, nbytes, stream));
-      }
-    }
-
-    // Wait for CPU thread (only if not local-only and not direct mode)
-    if (!isLocalOnly && !direct) {
-      memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-      memFlush(stream);
-    }
-
-    std::array<uintptr_t, 8> peerAddresses;
-
-    for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue,
-          peerMappedOutputAddresses[peerIndex], outputBytes);
-    }
-    for (size_t peerIndex : peerIndices) {
-      peerAddresses[peerIndex] =
-          peerWaitDyn(concurrencyIndex, peerIndex, opTypeAllGatherKernelLessCuda, stepValue, outputBytes);
-    }
-
-    freePendingIpcEvents();
-
-    if (direct) {
-      CUstream curStream = stream;
-
-      size_t flushIndex = 0;
-      size_t nQueuedChunks = 0;
-
-      auto flushCopies = [&]() {
-        if (nQueuedChunks == 0) {
-          return;
-        }
-        size_t chunkOffset = chunkSize * flushIndex;
-        size_t currentChunkSize = std::min(chunkSize * nQueuedChunks, inputBytes - chunkSize * flushIndex);
-
-        auto copy = [&](size_t peerIndex) {
-          CHECK(allGather2dCopies.has_value());
-          for (auto& c : (*allGather2dCopies)[peerIndex]) {
-            CHECK(c.length == 1);
-            CUDA_MEMCPY2D copyArgs = {0};
-            copyArgs.srcDevice = peerAddresses[peerIndex] + inputBytes * c.offset + chunkOffset;
-            copyArgs.srcPitch = inputBytes * c.pitch;
-            copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            copyArgs.dstDevice = outputAddress + inputBytes * c.offset + chunkOffset;
-            copyArgs.dstPitch = inputBytes * c.pitch;
-            copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            copyArgs.WidthInBytes = currentChunkSize;
-            copyArgs.Height = c.num;
-            CHECK_CU(cuMemcpy2DAsync(&copyArgs, curStream));
-          }
-        };
-
-        for (size_t peerIndex : peerIndices) {
-          copy(peerIndex);
-        }
-
-        flushIndex += nQueuedChunks;
-        nQueuedChunks = 0;
-      };
-
-      for (size_t chunkIndex = 0; chunkIndex != numChunks; ++chunkIndex) {
-        memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + chunkIndex), stepValue);
-        memFlush(curStream);
-
-        syncPeers(curStream);
-        ++nQueuedChunks;
-        if (nQueuedChunks >= 1) {
-          flushCopies();
-        }
-      }
-      flushCopies();
-      syncPeers(stream);
-
-    } else {
-      auto copy = [&](size_t peerIndex) {
-        CHECK(allGather2dCopies.has_value());
-        for (auto& c : (*allGather2dCopies)[peerIndex]) {
-          CUDA_MEMCPY2D copyArgs = {0};
-          copyArgs.srcDevice = peerAddresses[peerIndex] + inputBytes * c.offset;
-          copyArgs.srcPitch = inputBytes * c.pitch;
-          copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-          copyArgs.dstDevice = outputAddress + inputBytes * c.offset;
-          copyArgs.dstPitch = inputBytes * c.pitch;
-          copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-          copyArgs.WidthInBytes = inputBytes * c.length;
-          copyArgs.Height = c.num;
-          CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-        }
-      };
-
-      syncPeers(stream);
-      for (size_t peerIndex : peerIndices) {
-        copy(peerIndex);
-      }
-      syncPeers(stream);
-    }
-
-    if (direct) {
-      memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex) + 4, stepValue + 1);
-      memFlush(stream);
-    }
-  }
-
-  void reduce_scatter_copy_prepare_sends(uint32_t concurrencyIndex, uint32_t stepValue,
-      const std::array<uintptr_t, 8>& peerInputAddresses, uintptr_t inputAddress, uintptr_t bufferAddress,
-      uintptr_t sendAddress, size_t bytes, DType dtype, int device, size_t numel, Reduction opindex, CUstream stream,
-      size_t copyBatchSize) {
-    ReduceScatter& reduceScatter = *group->reduceScatter;
-    const auto& peerIndices = group->peerIndices;
-    const auto& sendRanks = reduceScatter.sendRanks;
-    const size_t numSends = sendRanks.size();
-
-    std::array<uintptr_t, 8> peerAddresses;
-
-    for (size_t peerIndex : peerIndices) {
-      peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceScatterKernelLessCuda, stepValue,
-          peerInputAddresses[peerIndex], bytes);
-    }
-    for (size_t peerIndex : peerIndices) {
-      peerAddresses[peerIndex] =
-          peerWaitDyn(concurrencyIndex, peerIndex, opTypeReduceScatterKernelLessCuda, stepValue, bytes);
-    }
-    freePendingIpcEvents();
-
-    syncPeers(stream);
-
-    StreamGuard sg(stream, device);
-
-    TensorPtr bufferTensor = TensorPtr::from_blob(
-        (void*)bufferAddress, {(int64_t)((1 + peerIndices.size()) * copyBatchSize), (int64_t)numel}, dtype, device);
-
-    if (sendRanks.size()) {
-      CHECK(copyBatchSize >= 1);
-      TensorPtr outTensor =
-          TensorPtr::from_blob((void*)sendAddress, {(int64_t)sendRanks.size(), (int64_t)numel}, dtype, device);
-
-      TensorPtr buft = bufferTensor.view({(int64_t)copyBatchSize, (int64_t)(1 + peerIndices.size()), (int64_t)numel});
-
-      size_t begin = 0;
-      size_t pitch = 0;
-      size_t prev = 0;
-      size_t n = 1;
-      auto flush = [&]() {
-        size_t srcOffsetBytes = bytes * sendRanks[begin];
-        size_t srcPitchBytes = bytes * pitch;
-        size_t dstOffsetBytes = 0;
-        size_t dstPitchBytes = bytes * (1 + peerIndices.size());
-
-        CUDA_MEMCPY2D copyArgs = {0};
-        copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        copyArgs.srcPitch = srcPitchBytes;
-        copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-        copyArgs.dstPitch = dstPitchBytes;
-        copyArgs.WidthInBytes = bytes;
-        copyArgs.Height = n;
-
-        for (size_t peerIndex : peerIndices) {
-          copyArgs.srcDevice = peerAddresses[peerIndex] + srcOffsetBytes;
-          copyArgs.dstDevice = bufferAddress + dstOffsetBytes;
-          CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-
-          dstOffsetBytes += bytes;
-        }
-
-        copyArgs.srcDevice = inputAddress + srcOffsetBytes;
-        copyArgs.dstDevice = bufferAddress + dstOffsetBytes;
-        CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-
-        TensorPtr src = buft.narrow(0, 0, n);
-        TensorPtr dst = outTensor.narrow(0, begin, n);
-        if (opindex == Reduction::sum) {
-          sum_out(dst, src, 1);
-        } else if (opindex == Reduction::max) {
-          amax_out(dst, src, 1);
-        } else if (opindex == Reduction::min) {
-          amin_out(dst, src, 1);
-        } else {
-          CHECK(false);
-        }
-
-        for (size_t z = 0; z < n; ++z) {
-          memWrite(group->cpuInBuffer.cuda(concurrencyIndex) + sizeof(uint32_t) * (16 + begin + z), stepValue);
-        }
-        memFlush(stream);
-      };
-      for (size_t i = 1; i < numSends; ++i) {
-        size_t thisPitch = sendRanks[i] - sendRanks[prev];
-        if ((pitch == 0 || thisPitch == pitch) && n < copyBatchSize) {
-          pitch = thisPitch;
-          ++n;
-          prev = i;
-        } else {
-          flush();
-          begin = i;
-          prev = i;
-          pitch = 0;
-          n = 1;
-        }
-      }
-      flush();
-    }
-
-    for (size_t peerIndex : peerIndices) {
-      cudaCopy(bufferAddress + bytes * (1 + peerIndex), peerAddresses[peerIndex] + bytes * rank, bytes, stream);
-    }
-  }
-
   void all_gather(TensorPtr& output, const TensorPtr& input, CUstream stream);
-  void reduce_scatter(TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, float premulValue);
-  void allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue);
+  void reduce_scatter(
+      TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, double premulValue);
+  void allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue);
   void broadcast(TensorPtr& tensor, int sourceRank, CUstream stream);
   void reduce(TensorPtr& tensor, int destRank, ReduceOp reduceOp, CUstream stream);
   void barrier();
@@ -1156,9 +820,12 @@ struct ProcessGroupImpl : api::ProcessGroup {
   std::shared_ptr<CustomOpDescriptor> compileOp(DType dtype, std::span<const api::TensorRegion> inputs,
       std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync, bool collectiveOp);
 
-  // Runs a collective as its compiled op (see CollectiveKey), compiled at its first call. input and output: this
-  // rank's contiguous CUDA tensors, on the group's device (the same tensor for an all-reduce in place).
-  void runCollective(const CollectiveKey& key, const TensorPtr& input, const TensorPtr& output, CUstream stream);
+  // Runs a collective as a compiled op (see CollectiveKey), compiled at its first call. input and output: this rank's
+  // contiguous CUDA tensors, on the group's device (the same tensor for an all-reduce in place); numel: the elements
+  // of a rank's part (the all-gather's input, the reduce-scatter's output), or of the all-reduce's tensor (bytes for
+  // all-gathers, whose dtype is UInt8); scale: PremulSum's factor.
+  void runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t numel, const TensorPtr& input,
+      const TensorPtr& output, CUstream stream, double scale = 1.0);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -1167,9 +834,9 @@ struct ProcessGroupImpl : api::ProcessGroup {
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> inputs_arg,
       std::span<const std::tuple<int, std::vector<int64_t>, std::vector<int64_t>>> outputs_arg);
 
-  // customOp - execute a compiled custom operation
+  // customOp - execute a compiled custom operation (scale: the factor of a PremulSum, see compile_op::isScaledSum)
   SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
-      TensorPtr* outputs, size_t nOutputs, CUstream stream);
+      TensorPtr* outputs, size_t nOutputs, CUstream stream, double scale = 1.0);
 
   // executeLocalOnly - fast path for all-local custom ops (no CPU thread)
   SharedPtr<ApiFuture> executeLocalOnly(const CustomOpDescriptor& op, std::vector<TensorDataPtr>& inputs,
@@ -1328,29 +995,19 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
   CHECK(input.is_contiguous());
   CHECK(output.is_contiguous());
 
-  bool isCuda = input.is_cuda();
+  const size_t bytes = input.numel() * input.itemsize();
+  CHECK(static_cast<size_t>(output.numel() * output.itemsize()) == bytes * size);
 
-  if (isCuda) {
-    CHECK(input.is_cuda());
+  // CUDA tensors: a compile_op op (see runCollective)
+  if (input.is_cuda()) {
     CHECK(input.device_index() == group->deviceIndex);
     CHECK(output.is_cuda());
     CHECK(output.device_index() == group->deviceIndex);
-  }
-
-  size_t bytes = input.numel() * input.itemsize();
-  size_t outputBytes = bytes * size;
-  size_t pitch = bytes;
-
-  CHECK(static_cast<size_t>(output.numel() * output.itemsize()) == outputBytes);
-
-  // CUDA tensors: a compile_op op (see runCollective), for now where each rank's part is a multiple of 16 bytes
-  if (isCuda && bytes % 16 == 0) {
-    if (bytes != 0) {
-      runCollective({CollectiveKind::allGather, DType::UInt8, api::ReduceOp::None, bytes}, input, output, stream);
-    }
+    runCollective(CollectiveKind::allGather, DType::UInt8, api::ReduceOp::None, bytes, input, output, stream);
     return;
   }
 
+  // CPU tensors: the CPU thread
   std::unique_lock l(threadUnsafe);
 
   CHECK(bytes > 0);
@@ -1359,203 +1016,22 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
   CHECK(stepValue < 0x80000000);
 
-  uintptr_t inputAddress = (uintptr_t)input.data_ptr();
-  uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+  StreamData& sd = group->getStreamData(nullptr);
+  std::atomic_uint32_t cpuDone = 0;
 
-  if (!isCuda) {
-    StreamData& sd = group->getStreamData(nullptr);
-    std::atomic_uint32_t cpuDone = 0;
-
-    QueueEntryAllGatherCpu* e = group->cpuThread->freelistAllGatherCpu.pop();
-    e->task = taskAllGatherCpu;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->inputAddress = inputAddress;
-    e->outputAddress = outputAddress;
-    e->bytes = bytes;
-    e->pitch = pitch;
-    e->cpuDone = &cpuDone;
-    group->cpuThread->enqueue(e);
-    l.unlock();
-    group->waitForCpuThread(cpuDone, "an all-gather of CPU tensors");
-    return;
-  }
-
-  StreamData& sd = group->getStreamData(stream);
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  Group* group = &*this->group;
-
-  AllGather& allGather = *group->allGather;
-
-  const auto& ipcRanks = group->ipcRanks;
-  const auto& peerIndices = group->peerIndices;
-
-  bool isLocalOnly = allGather.recvRanks.empty();
-  bool isNoLocal = !isLocalOnly && peerIndices.empty();
-
-  AllocatedBuffer alignedBuffer;
-  AllocatedBuffer alignedBuffer2;
-
-  // forceKernelLess bypasses the isLocalOnly check (for testing)
-  bool kernelLess = options.forceKernelLess || (!isLocalOnly && (isNoLocal || options.preferKernelLess));
-
-  if (!isNoLocal && !kernelLess) {
-    if (bytes % 16 != 0 || outputAddress % 16 != 0) {
-      pitch = (bytes + 127u) / 128u * 128u;
-      alignedBuffer = alloccuda(pitch * size, stream);
-      outputAddress = alignedBuffer.cudaPointer;
-      outputBytes = pitch * size;
-    }
-
-    if (inputAddress % 16 != 0) {
-      alignedBuffer2 = alloccuda(bytes, stream);
-      CHECK_CU(cuMemcpyDtoDAsync(alignedBuffer2.cudaPointer, inputAddress, bytes, stream));
-      inputAddress = alignedBuffer2.cudaPointer;
-    }
-  }
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::array<uintptr_t, 8> peerOutputAddresses;
-
-  for (size_t i : peerIndices) {
-    ipcMapper->requestAddress(
-        i, inputAddress, bytes,
-        [ptr = &peerInputAddresses[i]](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-
-    ipcMapper->requestAddress(
-        i, outputAddress, outputBytes,
-        [ptr = &peerOutputAddresses[i]](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-  }
-
-  ipcMapper->wait();
-
-  size_t numChunks = 0;
-  size_t chunkSize = 0;
-
-  bool kernelLess_ring = kernelLess && false;
-
-  bool direct = !isLocalOnly && kernelLess && !kernelLess_ring;
-
-  if (!isLocalOnly) {
-    QueueEntryAllGather* e = group->cpuThread->freelistAllGather.pop();
-    e->task = direct ? taskAllGatherDirect : taskAllGather;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->inputAddress = inputAddress;
-    e->outputAddress = outputAddress;
-    e->bytes = bytes;
-    e->pitch = pitch;
-
-    e->numDevices = bytes < 262144 ? 1 : std::max((size_t)2, group->numTrueIbDevs);
-    e->numChunks = std::min(bytes / 131072, (size_t)maxChunks);
-    if (direct) {
-      e->numDevices = 4;
-    }
-    e->numParallel = 1;
-    e->numDevices = std::min(e->numDevices, group->rdmaDevs.size());
-    e->numDevices = std::max(e->numDevices, (size_t)1);
-    e->numChunks = std::max(e->numChunks, (size_t)1);
-    chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
-    e->numChunks = (bytes + chunkSize - 1) / chunkSize;
-    numChunks = e->numChunks;
-    group->cpuThread->enqueue(e);
-  }
-
-  if (kernelLess_ring) {
-    // kernelLess_all_gather_ring_copies not yet ported
-    throw std::runtime_error("kernelLess_ring all_gather path not yet implemented");
-  }
-
-  if (kernelLess && (!isNoLocal || direct)) {
-    CHECK(pitch == bytes);
-    kernelLess_all_gather_impl(concurrencyIndex, stepValue, inputAddress, bytes, outputAddress, outputBytes, stream,
-        peerInputAddresses, peerOutputAddresses, direct, numChunks, chunkSize, isLocalOnly);
-    return;
-  }
-  CHECK(!direct);
-
-  if (!group->kernels->cuAllGather) {
-    group->kernels->compile(CompileAllGather);
-    CHECK(group->kernels->cuAllGather != nullptr);
-    CHECK(group->kernels->cuAllGatherLocal != nullptr);
-    CHECK(group->kernels->cuAllGatherNoLocal != nullptr);
-  }
-
-  AllGatherParameters parameters;
-  parameters.stepValue = stepValue;
-  parameters.concurrencyIndex = concurrencyIndex;
-  parameters.bytes = bytes;
-  parameters.pitch = pitch;
-  parameters.chunkSize = chunkSize;
-  parameters.inputAddress = inputAddress;
-  parameters.outputAddress = outputAddress;
-  parameters.peerInputAddresses = peerInputAddresses;
-  parameters.peerOutputAddresses = peerOutputAddresses;
-
-  std::array<void*, 1> params = {&parameters};
-
-  size_t gridSize = group->kernels->gridSize;
-  size_t blockSize = group->kernels->blockSize;
-
-  if (isLocalOnly) {
-    CHECK_CU(cuLaunchKernel(
-        group->kernels->cuAllGatherLocal, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
-  } else if (isNoLocal) {
-
-    bool copyOutput = outputAddress + pitch * rank != inputAddress;
-
-    if (copyOutput) {
-      localEvent.record(stream);
-    }
-
-    if (kernelLess) {
-      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-      memWaitEq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-      memFlush(stream);
-    } else {
-      CHECK_CU(cuLaunchKernel(group->kernels->cuAllGatherNoLocal, 1, 1, 1, 1, 1, 1, 0, stream, params.data(), nullptr));
-    }
-
-    if (copyOutput) {
-      auto copyStream = getCopyStream(stream);
-      localEvent.wait(copyStream);
-      CHECK_CU(cuMemcpyAsync(outputAddress + pitch * rank, inputAddress, bytes, copyStream));
-      localEvent.record(copyStream);
-      localEvent.wait(stream);
-    }
-
-  } else {
-    CHECK(chunkSize != 0);
-    CHECK_CU(cuLaunchKernel(
-        group->kernels->cuAllGather, gridSize, 1, 1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
-  }
-
-  if (!isNoLocal && outputAddress != (uintptr_t)output.data_ptr()) {
-    CUDA_MEMCPY2D copyArgs = {0};
-    copyArgs.srcDevice = alignedBuffer.cudaPointer;
-    copyArgs.srcPitch = pitch;
-    copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-    copyArgs.dstDevice = (uintptr_t)output.data_ptr();
-    copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    copyArgs.WidthInBytes = bytes;
-    copyArgs.Height = size;
-    CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-  }
+  QueueEntryAllGatherCpu* e = group->cpuThread->freelistAllGatherCpu.pop();
+  e->task = taskAllGatherCpu;
+  e->stepValue = stepValue;
+  e->concurrencyIndex = concurrencyIndex;
+  e->sd = &sd;
+  e->inputAddress = (uintptr_t)input.data_ptr();
+  e->outputAddress = (uintptr_t)output.data_ptr();
+  e->bytes = bytes;
+  e->pitch = bytes;
+  e->cpuDone = &cpuDone;
+  group->cpuThread->enqueue(e);
+  l.unlock();
+  group->waitForCpuThread(cpuDone, "an all-gather of CPU tensors");
 }
 
 // ============================================================================
@@ -1563,396 +1039,65 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
 // ============================================================================
 
 void ProcessGroupImpl::reduce_scatter(
-    TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, float premulValue) {
-  // CUDA tensors: a compile_op op (see runCollective), for now for sum, avg, min and max where each rank's output is a
-  // multiple of 16 bytes
-  if (std::optional<api::ReduceOp> reduce = collectiveReduce(reduceOp); reduce && input.is_cuda()) {
-    CHECK(input.is_contiguous() && output.is_contiguous() && output.is_cuda());
-    CHECK(input.device_index() == group->deviceIndex && output.device_index() == group->deviceIndex);
-    CHECK(input.dtype() == output.dtype());
-    const size_t numel = output.numel();
-    CHECK(static_cast<size_t>(input.numel()) == numel * size);
-    if (numel * output.itemsize() % 16 == 0) {
-      if (numel != 0) {
-        runCollective({CollectiveKind::reduceScatter, output.dtype(), *reduce, numel}, input, output, stream);
-      }
-      return;
-    }
+    TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, double premulValue) {
+  CHECK(input.is_contiguous());
+  CHECK(output.is_contiguous());
+
+  const DType dtype = output.dtype();
+  CHECK(input.dtype() == dtype);
+  const size_t numel = output.numel();
+  CHECK(static_cast<size_t>(input.numel()) == numel * size);
+
+  // CUDA tensors: a compile_op op (see runCollective)
+  if (input.is_cuda()) {
+    CHECK(input.device_index() == group->deviceIndex);
+    CHECK(output.is_cuda());
+    CHECK(output.device_index() == group->deviceIndex);
+    runCollective(
+        CollectiveKind::reduceScatter, dtype, cudaReduce(reduceOp), numel, input, output, stream, premulValue);
+    return;
   }
 
+  // CPU tensors: the CPU thread
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
   CHECK(stepValue < 0x80000000);
 
-  CHECK(input.is_contiguous());
-  CHECK(output.is_contiguous());
-
-  bool isCuda = input.is_cuda();
-
-  if (isCuda) {
-    CHECK(input.is_cuda());
-    CHECK(input.device_index() == group->deviceIndex);
-    CHECK(output.is_cuda());
-    CHECK(output.device_index() == group->deviceIndex);
-  }
-
-  DType dtype = output.dtype();
-  CHECK(input.dtype() == dtype);
-
   Dtype dindex = toInternalDtype(dtype);
-  // avg: the sum, divided by the group size below (the kernels and the CPU reduction have no avg)
+  // avg: the sum, divided by the group size below (the CPU reduction has no avg)
   bool workaroundMean = (reduceOp == ReduceOp::AVG);
   Reduction opindex = workaroundMean ? Reduction::sum : toInternalReduction(reduceOp);
-  bool premul = (reduceOp == ReduceOp::PREMUL_SUM);
 
-  size_t numel = output.numel();
-  size_t itemsize = output.itemsize();
-  size_t bytes = numel * itemsize;
-  size_t inputBytes = bytes * size;
-  size_t pitch = bytes;
-
+  const size_t bytes = numel * output.itemsize();
   CHECK(bytes > 0);
-  CHECK(static_cast<size_t>(input.numel() * input.itemsize()) == inputBytes);
 
   uintptr_t inputAddress = (uintptr_t)input.data_ptr();
-  uintptr_t outputAddress = (uintptr_t)output.data_ptr();
-
   TensorPtr premulTensor;
-
-  Group* group = &*this->group;
-
-  ReduceScatter& reduceScatter = *group->reduceScatter;
-
-  auto& sendRanks = reduceScatter.sendRanks;
-  auto& recvRanks = reduceScatter.recvRanks;
-
-  if (!isCuda) {
-    if (premul) {
-      premulTensor = input * premulValue;
-      inputAddress = (uintptr_t)premulTensor.data_ptr();
-      CHECK(static_cast<size_t>(premulTensor.numel() * premulTensor.itemsize()) == inputBytes);
-    }
-    StreamData& sd = group->getStreamData(nullptr);
-    std::atomic_uint32_t cpuDone = 0;
-    QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();
-    e->task = taskReduceScatterCpu;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->inputAddress = inputAddress;
-    e->outputAddress = outputAddress;
-    e->bytes = bytes;
-    e->pitch = pitch;
-    e->cpuDone = &cpuDone;
-    e->dindex = dindex;
-    e->opindex = opindex;
-    group->cpuThread->enqueue(e);
-    l.unlock();
-    group->waitForCpuThread(cpuDone, "a reduce-scatter of CPU tensors");
-    if (workaroundMean) {
-      output.mul_(1.0f / size);
-    }
-    return;
-  }
-
-  StreamData& sd = group->getStreamData(stream);
-  EventSerializer es(concurrencyEvents[concurrencyIndex], stream);
-  StreamGuard sg(stream, group->deviceIndex);
-
-  if (premul) {
+  if (reduceOp == ReduceOp::PREMUL_SUM) {
     premulTensor = input * premulValue;
     inputAddress = (uintptr_t)premulTensor.data_ptr();
-    CHECK(static_cast<size_t>(premulTensor.numel() * premulTensor.itemsize()) == inputBytes);
+    CHECK(static_cast<size_t>(premulTensor.numel() * premulTensor.itemsize()) == bytes * size);
   }
-
-  IpcMapper* ipcMapper = &*group->ipcMapper;
-
-  const auto& ipcRanks = group->ipcRanks;
-  const auto& peerIndices = group->peerIndices;
-
-  AllocatedBuffer alignedBuffer;
-  AllocatedBuffer alignedBuffer2;
-
-  bool isLocalOnly = reduceScatter.recvRanks.empty();
-  bool isNoLocal = peerIndices.empty();
-
-  // Method selection (same as old code):
-  // - methodKernel for local-only
-  // - methodDirect for multi-node
-  enum { methodKernel, methodCopy, methodDirect };
-  int method = methodKernel;
-  if (!isLocalOnly) {
-    method = methodDirect;
-  }
-
-  bool direct = method == methodDirect;
-  bool copy = method == methodCopy;
-
-  size_t copyBatchSize = 0;
-  if (copy) {
-    copyBatchSize = (reduceScatter.sendRanks.size() + 7) / 8;
-    copyBatchSize = std::max(copyBatchSize, (size_t)1);
-  }
-
-  if (!copy) {
-    if (bytes % 16 != 0 || inputAddress % 16 != 0) {
-      pitch = (bytes + 127u) / 128u * 128u;
-      alignedBuffer = alloccuda(pitch * size, stream);
-      CUDA_MEMCPY2D copyArgs = {0};
-      copyArgs.srcDevice = inputAddress;
-      copyArgs.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-      copyArgs.dstDevice = alignedBuffer.cudaPointer;
-      copyArgs.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-      copyArgs.dstPitch = pitch;
-      copyArgs.WidthInBytes = bytes;
-      copyArgs.Height = size;
-      CHECK_CU(cuMemcpy2DAsync(&copyArgs, stream));
-      inputAddress = alignedBuffer.cudaPointer;
-      inputBytes = pitch * size;
-    }
-
-    if (!direct && outputAddress % 16 != 0) {
-      alignedBuffer2 = alloccuda(pitch, stream);
-      CHECK_CU(cuMemcpyDtoDAsync(alignedBuffer2.cudaPointer, outputAddress, bytes, stream));
-      outputAddress = alignedBuffer2.cudaPointer;
-    }
-  }
-
-  AllocatedBuffer sendBuffer;
-  if (!copy || !isNoLocal) {
-    if (!isLocalOnly) {
-      sendBuffer = alloccuda(pitch * sendRanks.size(), stream);
-    }
-  }
-  AllocatedBuffer recvBuffer;
-  if (copy) {
-    recvBuffer = alloccuda(pitch * (recvRanks.size() + (1 + peerIndices.size()) * copyBatchSize), stream);
-  } else if (direct) {
-    recvBuffer = alloccuda(pitch * (1 + recvRanks.size() + peerIndices.size()), stream);
-  } else if (!isLocalOnly) {
-    recvBuffer = alloccuda(pitch * recvRanks.size(), stream);
-  }
-
-  std::shared_lock unmapLock(unmapMemoryMutex);
-  sync(stepValue);
-
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::array<uintptr_t, 8> peerOutputAddresses;
-
-  for (size_t i : peerIndices) {
-    ipcMapper->requestAddress(
-        i, inputAddress, inputBytes,
-        [ptr = &peerInputAddresses[i]](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-
-    ipcMapper->requestAddress(
-        i, outputAddress, bytes,
-        [ptr = &peerOutputAddresses[i]](uintptr_t address) {
-          *ptr = address;
-        },
-        true);
-  }
-
-  ipcMapper->wait();
-
-  size_t chunkSize = 0;
-
-  uintptr_t sendAddress = sendBuffer.cudaPointer;
-  uintptr_t recvAddress = recvBuffer.cudaPointer;
-
-  if (!isLocalOnly) {
-    QueueEntryReduceScatter* e = group->cpuThread->freelistReduceScatter.pop();
-    e->task = taskReduceScatter;
-    if (copy || direct) {
-      e->task = taskReduceScatterDirect;
-    }
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->inputAddress = inputAddress;
-    e->outputAddress = outputAddress;
-    e->bytes = bytes;
-    e->pitch = pitch;
-
-    e->sendAddress = sendAddress;
-    e->recvAddress = recvAddress;
-
-    e->isCopy = copy;
-
-    e->numDevices = bytes < 262144 ? 1 : std::max((size_t)4, group->numTrueIbDevs);
-    e->numChunks = std::min(bytes / 131072, (size_t)4);
-    e->numDevices = std::min(e->numDevices, group->rdmaDevs.size());
-    e->numDevices = std::max(e->numDevices, (size_t)1);
-    e->numChunks = std::max(e->numChunks, (size_t)1);
-    e->numParallel = 1;
-    chunkSize = ((bytes + e->numChunks - 1) / e->numChunks + 4095u) / 4096u * 4096u;
-    e->numChunks = (bytes + chunkSize - 1) / chunkSize;
-    group->cpuThread->enqueue(e);
-  }
-
-  if (copy || direct) {
-
-    if (direct) {
-      CHECK(!isLocalOnly);
-
-      if (!group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex]) {
-        group->kernels->compile(CompileReduceScatterDirect, group->kernels->supportedTypes[(size_t)dindex],
-            group->kernels->supportedReductions[(size_t)opindex]);
-        CHECK(group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex] != nullptr);
-      }
-
-      std::array<uintptr_t, 8> peerAddresses;
-
-      for (size_t peerIndex : peerIndices) {
-        peerWriteDyn(concurrencyIndex, peerIndex, opTypeReduceScatterDirectCuda, stepValue,
-            peerInputAddresses[peerIndex], bytes);
-      }
-      for (size_t peerIndex : peerIndices) {
-        peerAddresses[peerIndex] =
-            peerWaitDyn(concurrencyIndex, peerIndex, opTypeReduceScatterDirectCuda, stepValue, bytes);
-      }
-
-      freePendingIpcEvents();
-
-      memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-      memFlush(stream);
-
-      syncPeers(stream);
-
-      CHECK(sendAddress != 0);
-
-      ReduceScatterParameters parameters;
-      parameters.stepValue = stepValue;
-      parameters.concurrencyIndex = concurrencyIndex;
-      parameters.bytes = bytes;
-      parameters.pitch = pitch;
-      parameters.chunkSize = chunkSize;
-      parameters.inputAddress = inputAddress;
-      parameters.outputAddress = 0;
-      parameters.peerInputAddresses = peerAddresses;
-      parameters.peerOutputAddresses.fill(0);
-      parameters.sendAddress = sendAddress;
-      parameters.recvAddress = 0;
-
-      std::array<void*, 1> params = {&parameters};
-
-      size_t gridSize = group->kernels->gridSize;
-      size_t blockSize = group->kernels->blockSize;
-
-      CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatterDirect[(size_t)dindex][(size_t)opindex], gridSize * 4, 1,
-          1, blockSize, 1, 1, 0, stream, params.data(), nullptr));
-
-      for (size_t peerIndex : peerIndices) {
-        cudaCopy(recvAddress + pitch * recvRanks.size() + pitch * (1 + peerIndex),
-            peerAddresses[peerIndex] + pitch * rank, bytes, stream);
-      }
-
-    } else {
-      // copy path
-      CHECK(pitch == bytes);
-
-      if (!isLocalOnly) {
-        memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue + 1);
-        memFlush(stream);
-      }
-
-      if (!isNoLocal) {
-        CHECK(sendAddress != 0);
-        reduce_scatter_copy_prepare_sends(concurrencyIndex, stepValue, peerInputAddresses, inputAddress,
-            recvAddress + bytes * recvRanks.size(), sendAddress, bytes, dtype, group->deviceIndex, numel, opindex,
-            stream, copyBatchSize);
-      }
-    }
-
-    {
-      auto ipcEvent = getIpcEvent();
-      ipcEvent->record(stream);
-      for (size_t peerIndex : peerIndices) {
-        ipcMapper->pushEvent(peerIndex, *ipcEvent);
-      }
-      cudaCopy(recvAddress + pitch * recvRanks.size(), inputAddress + pitch * rank, bytes, stream);
-
-      for (size_t peerIndex : peerIndices) {
-        Event::reference(ipcMapper->popEvent(peerIndex)).wait(stream);
-      }
-
-      if (!isLocalOnly) {
-        memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-        memFlush(stream);
-      }
-    }
-
-    {
-      int device = group->deviceIndex;
-      TensorPtr outputTensor = TensorPtr::from_blob((void*)outputAddress, {(int64_t)numel}, dtype, device);
-      TensorPtr buffer = TensorPtr::from_blob((void*)recvAddress,
-          {(int64_t)(1 + recvRanks.size() + peerIndices.size()), (int64_t)(pitch / itemsize)}, dtype, device);
-      if (buffer.size(1) != static_cast<int64_t>(numel)) {
-        buffer = buffer.narrow(1, 0, numel);
-      }
-      if (opindex == Reduction::sum) {
-        sum_out(outputTensor, buffer, 0);
-      } else if (opindex == Reduction::max) {
-        amax_out(outputTensor, buffer, 0);
-      } else if (opindex == Reduction::min) {
-        amin_out(outputTensor, buffer, 0);
-      } else {
-        CHECK(false);
-      }
-    }
-
-    if (!isLocalOnly) {
-      memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue + 1);
-      memFlush(stream);
-    }
-
-  } else {
-    // Kernel path
-
-    if (!group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex]) {
-      group->kernels->compile(CompileReduceScatter, group->kernels->supportedTypes[(size_t)dindex],
-          group->kernels->supportedReductions[(size_t)opindex]);
-      CHECK(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex] != nullptr);
-      CHECK(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex] != nullptr);
-    }
-
-    ReduceScatterParameters parameters;
-    parameters.stepValue = stepValue;
-    parameters.concurrencyIndex = concurrencyIndex;
-    parameters.bytes = bytes;
-    parameters.pitch = pitch;
-    parameters.chunkSize = chunkSize;
-    parameters.inputAddress = inputAddress;
-    parameters.outputAddress = outputAddress;
-    parameters.peerInputAddresses = peerInputAddresses;
-    parameters.peerOutputAddresses = peerOutputAddresses;
-    parameters.sendAddress = sendAddress;
-    parameters.recvAddress = recvAddress;
-
-    std::array<void*, 1> params = {&parameters};
-
-    size_t gridSize = group->kernels->gridSize;
-    size_t blockSize = group->kernels->blockSize;
-
-    if (isLocalOnly) {
-      CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatterLocal[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
-          blockSize, 1, 1, 0, stream, params.data(), nullptr));
-    } else {
-      CHECK_CU(cuLaunchKernel(group->kernels->cuReduceScatter[(size_t)dindex][(size_t)opindex], gridSize, 1, 1,
-          blockSize, 1, 1, 0, stream, params.data(), nullptr));
-    }
-
-    if (outputAddress != (uintptr_t)output.data_ptr()) {
-      CHECK_CU(cuMemcpyDtoDAsync((uintptr_t)output.data_ptr(), outputAddress, bytes, stream));
-    }
-  }
-
+  StreamData& sd = group->getStreamData(nullptr);
+  std::atomic_uint32_t cpuDone = 0;
+  QueueEntryReduceScatterCpu* e = group->cpuThread->freelistReduceScatterCpu.pop();
+  e->task = taskReduceScatterCpu;
+  e->stepValue = stepValue;
+  e->concurrencyIndex = concurrencyIndex;
+  e->sd = &sd;
+  e->inputAddress = inputAddress;
+  e->outputAddress = (uintptr_t)output.data_ptr();
+  e->bytes = bytes;
+  e->pitch = bytes;
+  e->cpuDone = &cpuDone;
+  e->dindex = dindex;
+  e->opindex = opindex;
+  group->cpuThread->enqueue(e);
+  l.unlock();
+  group->waitForCpuThread(cpuDone, "a reduce-scatter of CPU tensors");
   if (workaroundMean) {
-    StreamGuard sg2(stream, group->deviceIndex);
     output.mul_(1.0f / size);
   }
 }
@@ -1961,30 +1106,18 @@ void ProcessGroupImpl::reduce_scatter(
 // ProcessGroupImpl::allreduce() - Allreduce collective
 // ============================================================================
 
-void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
-  // CUDA tensors: a compile_op op in place (see runCollective), for now for sum, avg, min and max of tensors of a
-  // multiple of 16 bytes
-  if (std::optional<api::ReduceOp> reduce = collectiveReduce(reduceOp); reduce && tensor.is_cuda()) {
+void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue) {
+  // CUDA tensors: a compile_op op in place (see runCollective)
+  if (tensor.is_cuda()) {
     CHECK(tensor.is_contiguous() && tensor.device_index() == group->deviceIndex);
-    const size_t elements = tensor.numel();
-    if (elements * tensor.itemsize() % 16 == 0) {
-      if (elements != 0) {
-        runCollective({CollectiveKind::allReduce, tensor.dtype(), *reduce, elements}, tensor, tensor, stream);
-      }
-      return;
-    }
+    runCollective(CollectiveKind::allReduce, tensor.dtype(), cudaReduce(reduceOp), tensor.numel(), tensor, tensor,
+        stream, premulValue);
+    return;
   }
 
-  // Otherwise as reduce_scatter + all_gather
-
+  // CPU tensors: a reduce-scatter and an all-gather (in a temporary tensor whose size the group size divides)
   int64_t numel = tensor.numel();
   CHECK(numel > 0);
-
-  bool isCuda = tensor.is_cuda();
-
-  if (isCuda) {
-    StreamGuard sg(stream, group->deviceIndex);
-  }
 
   if (numel % static_cast<int64_t>(size) == 0) {
     // Tensor is evenly divisible by size - use in-place view
@@ -1995,19 +1128,12 @@ void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream 
     reduce_scatter(o, t, reduceOp, stream, premulValue);
     all_gather(t, o, stream);
   } else {
-    // Tensor not evenly divisible - need temporary
     int64_t newsize =
         (numel + static_cast<int64_t>(size) - 1) / static_cast<int64_t>(size) * static_cast<int64_t>(size);
     size_t bytes = static_cast<size_t>(numel) * static_cast<size_t>(tensor.itemsize());
 
-    int device = isCuda ? tensor.device_index() : -1;
-    TensorPtr temporary = TensorPtr::empty({newsize}, tensor.dtype(), device);
-
-    if (isCuda) {
-      CHECK_CU(cuMemcpyAsync((uintptr_t)temporary.data_ptr(), (uintptr_t)tensor.data_ptr(), bytes, stream));
-    } else {
-      std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
-    }
+    TensorPtr temporary = TensorPtr::empty({newsize}, tensor.dtype(), -1);
+    std::memcpy(temporary.data_ptr(), tensor.data_ptr(), bytes);
 
     std::array<int64_t, 2> viewShape = {static_cast<int64_t>(size), newsize / static_cast<int64_t>(size)};
     TensorPtr t = temporary.view(viewShape);
@@ -2016,11 +1142,7 @@ void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream 
     reduce_scatter(o, t, reduceOp, stream, premulValue);
     all_gather(t, o, stream);
 
-    if (isCuda) {
-      CHECK_CU(cuMemcpyAsync((uintptr_t)tensor.data_ptr(), (uintptr_t)temporary.data_ptr(), bytes, stream));
-    } else {
-      std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
-    }
+    std::memcpy(tensor.data_ptr(), temporary.data_ptr(), bytes);
   }
 }
 
@@ -3027,12 +2149,12 @@ void processGroupAllGather(api::ProcessGroup* pg, TensorPtr& output, const Tenso
 }
 
 void processGroupReduceScatter(api::ProcessGroup* pg, TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp,
-    CUstream stream, float premulValue) {
+    CUstream stream, double premulValue) {
   static_cast<ProcessGroupImpl*>(pg)->reduce_scatter(output, input, reduceOp, stream, premulValue);
 }
 
 void processGroupAllreduce(
-    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
+    api::ProcessGroup* pg, TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, double premulValue) {
   static_cast<ProcessGroupImpl*>(pg)->allreduce(tensor, reduceOp, stream, premulValue);
 }
 
@@ -3496,20 +2618,55 @@ bool legacyIpcCapable(uintptr_t ptr) {
 }
 } // namespace
 
-void ProcessGroupImpl::runCollective(
-    const CollectiveKey& key, const TensorPtr& input, const TensorPtr& output, CUstream stream) {
+void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t numel,
+    const TensorPtr& input, const TensorPtr& output, CUstream stream, double scale) {
+  const int device = group->deviceIndex;
+  StreamGuard sg(stream, device);
+  const uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+  const uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+  const size_t itemsize = wrapperApi.dtypeSize(dtype);
+  CHECK(itemsize != 0 && 16 % itemsize == 0);
+  // The caller's tensors are rows of numel elements: the parts of the ranks in an all-gather's output and a
+  // reduce-scatter's input, else one
+  const size_t width = numel * itemsize;
+  const size_t inputRows = kind == CollectiveKind::reduceScatter ? size : 1;
+  const size_t outputRows = kind == CollectiveKind::allGather ? size : 1;
+  CHECK((size_t)(input.numel() * input.itemsize()) == inputRows * width);
+  CHECK((size_t)(output.numel() * output.itemsize()) == outputRows * width);
+  if (std::string error = compile_op::reduceDtypeError(dtype, reduce); !error.empty()) {
+    throw std::runtime_error(error);
+  }
+  if (numel == 0) {
+    return;
+  }
+  if (size == 1) {
+    // Nothing to combine (an op of one rank would only copy, see the factor below)
+    if (outputAddress != inputAddress) {
+      CHECK_CU(cuMemcpyDtoDAsync(outputAddress, inputAddress, width, stream));
+    }
+    if (reduce == api::ReduceOp::PremulSum) {
+      TensorPtr(output).mul_(scale);
+    }
+    return;
+  }
+
+  // The op: of rows of numel rounded up to 16 bytes (the copy kernel's unit). A call of another size uses it through
+  // buffers whose rows have the padding (below).
+  const size_t unit = 16 / itemsize;
+  const size_t n = (numel + unit - 1) / unit * unit;
+  const size_t pitch = n * itemsize;
+  const CollectiveKey key{kind, dtype, reduce, n};
   auto it = collectiveOps.find(key);
   if (it == collectiveOps.end()) {
     // The op of every rank, the same on all (compile takes them all): each rank's input and output as regions of one
     // tensor of size * n elements, or n for an all-reduce
-    const size_t n = key.numel;
-    const int64_t whole = key.kind == CollectiveKind::allReduce ? (int64_t)n : (int64_t)(size * n);
+    const int64_t whole = kind == CollectiveKind::allReduce ? (int64_t)n : (int64_t)(size * n);
     std::vector<api::TensorRegion> inputs;
     std::vector<api::TensorRegion> outputs;
     for (size_t i : range(size)) {
       const int32_t r = (int32_t)i;
       const int64_t piece = (int64_t)(i * n);
-      switch (key.kind) {
+      switch (kind) {
       case CollectiveKind::allGather:
         inputs.push_back({.rank = r, .offset = {piece}, .shape = {(int64_t)n}, .tensorId = "0", .device = "cuda"});
         outputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
@@ -3525,7 +2682,7 @@ void ProcessGroupImpl::runCollective(
       }
     }
     CollectiveOp c;
-    c.op = compileOp(key.dtype, inputs, outputs, key.reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
+    c.op = compileOp(dtype, inputs, outputs, reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
     // The tensors come from any allocator: below, each rank puts those that its peers cannot reach where they can
     c.op->requireMoodistMemory = false;
     CHECK(c.op->inputs.size() == 1 && c.op->outputs.size() == 1);
@@ -3542,21 +2699,15 @@ void ProcessGroupImpl::runCollective(
   }
   const CollectiveOp& c = it->second;
   const std::shared_ptr<CustomOpDescriptor>& op = c.op;
-  const int device = group->deviceIndex;
-  StreamGuard sg(stream, device);
+  CHECK(op->inputs[0].bytes == inputRows * pitch && op->outputs[0].bytes == outputRows * pitch);
 
-  // This rank's tensors where they are, unless some rank cannot reach them there (moodist's memory and cudaMalloc's
-  // within a node, moodist's only across a multi-node NVLink fabric) or the kernel cannot take their address (16
-  // bytes aligned): then through a buffer of the group's communication pool, which, when every rank does the same, is
-  // at the same offset on every rank, so that the op can still use NVLS
-  const uintptr_t inputAddress = (uintptr_t)input.data_ptr();
-  const uintptr_t outputAddress = (uintptr_t)output.data_ptr();
-  const size_t inputBytes = op->inputs[0].bytes;
-  const size_t outputBytes = op->outputs[0].bytes;
-  CHECK((size_t)(input.numel() * input.itemsize()) == inputBytes);
-  CHECK((size_t)(output.numel() * output.itemsize()) == outputBytes);
+  // This rank's tensors where they are, unless their rows need padding, some rank cannot reach them there (moodist's
+  // memory and cudaMalloc's within a node, moodist's only across a multi-node NVLink fabric), or the kernel cannot
+  // take their address (16 bytes aligned): then through a buffer of the group's communication pool, which, when every
+  // rank does the same, is at the same offset on every rank, so that the op can still use NVLS
+  const bool padded = n != numel;
   auto elsewhere = [&](size_t index, uintptr_t address) {
-    if (op->kernel && address % 16 != 0) {
+    if (padded || (op->kernel && address % 16 != 0)) {
       return true;
     }
     if (allocator::owns(address)) {
@@ -3564,40 +2715,56 @@ void ProcessGroupImpl::runCollective(
     }
     return c.fabricMapped[index] || (c.shared[index] && !legacyIpcCapable(address));
   };
+  // Copies rows of width bytes
+  auto copyRows = [&](uintptr_t dst, size_t dstPitch, uintptr_t src, size_t srcPitch, size_t rows) {
+    if (rows == 1 || (dstPitch == width && srcPitch == width)) {
+      CHECK_CU(cuMemcpyDtoDAsync(dst, src, width * rows, stream));
+      return;
+    }
+    CUDA_MEMCPY2D copy = {};
+    copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = src;
+    copy.srcPitch = srcPitch;
+    copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = dst;
+    copy.dstPitch = dstPitch;
+    copy.WidthInBytes = width;
+    copy.Height = rows;
+    CHECK_CU(cuMemcpy2DAsync(&copy, stream));
+  };
   uintptr_t in = inputAddress;
   uintptr_t out = outputAddress;
   AllocatedBuffer inputBuffer;
   AllocatedBuffer outputBuffer;
-  if (inputAddress == outputAddress && inputBytes == outputBytes) {
+  if (inputAddress == outputAddress && inputRows == outputRows) {
     // In place (an all-reduce): one buffer for both
     if (elsewhere(0, inputAddress) || elsewhere(1, outputAddress)) {
-      outputBuffer = allocateCudaBuffer(outputBytes, stream, device, group->getCommPool());
-      CHECK_CU(cuMemcpyDtoDAsync(outputBuffer.cudaPointer, inputAddress, inputBytes, stream));
+      outputBuffer = allocateCudaBuffer(outputRows * pitch, stream, device, group->getCommPool());
+      copyRows(outputBuffer.cudaPointer, pitch, inputAddress, width, inputRows);
       in = out = outputBuffer.cudaPointer;
     }
   } else {
     if (elsewhere(0, inputAddress)) {
-      inputBuffer = allocateCudaBuffer(inputBytes, stream, device, group->getCommPool());
-      CHECK_CU(cuMemcpyDtoDAsync(inputBuffer.cudaPointer, inputAddress, inputBytes, stream));
+      inputBuffer = allocateCudaBuffer(inputRows * pitch, stream, device, group->getCommPool());
+      copyRows(inputBuffer.cudaPointer, pitch, inputAddress, width, inputRows);
       in = inputBuffer.cudaPointer;
     }
     if (elsewhere(1, outputAddress)) {
-      outputBuffer = allocateCudaBuffer(outputBytes, stream, device, group->getCommPool());
+      outputBuffer = allocateCudaBuffer(outputRows * pitch, stream, device, group->getCommPool());
       out = outputBuffer.cudaPointer;
     }
   }
 
-  const size_t itemsize = wrapperApi.dtypeSize(op->dtype);
   std::array<TensorPtr, 2> tensors = {
-      TensorPtr::from_blob((void*)in, {(int64_t)(inputBytes / itemsize)}, op->dtype, device),
-      TensorPtr::from_blob((void*)out, {(int64_t)(outputBytes / itemsize)}, op->dtype, device),
+      TensorPtr::from_blob((void*)in, {(int64_t)(inputRows * n)}, dtype, device),
+      TensorPtr::from_blob((void*)out, {(int64_t)(outputRows * n)}, dtype, device),
   };
-  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], 1, &tensors[1], 1, stream);
+  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], 1, &tensors[1], 1, stream, scale);
   // (CUDA tensors only: the op is done for the caller once queued on the stream, see customOp)
   futureWait(future.get());
 
   if (out != outputAddress) {
-    CHECK_CU(cuMemcpyDtoDAsync(outputAddress, out, outputBytes, stream));
+    copyRows(outputAddress, width, out, pitch, outputRows);
   }
   // (the buffers are freed here, for reuse by work after the op and the copy on the stream)
 }
@@ -3631,7 +2798,7 @@ std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t b
 // ============================================================================
 
 SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs,
-    size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream) {
+    size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream, double scale) {
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
@@ -3903,8 +3070,10 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
       nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
     }
 
-    CompileOpCopyParameters params{
-        .stepValue = stepValue, .concurrencyIndex = concurrencyIndex, .nvlsCounterBase = nvlsCounterBase};
+    CompileOpCopyParameters params{.stepValue = stepValue,
+        .concurrencyIndex = concurrencyIndex,
+        .nvlsCounterBase = nvlsCounterBase,
+        .scale = scale};
     // (with the parameter buffer, the slot's copy is filled first: the slot's previous op, whose kernel read it, is
     // done on the GPU before this one starts, see slotSerializer)
     launchCompileOpKernel(

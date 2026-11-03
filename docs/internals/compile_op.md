@@ -446,7 +446,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   accumulators (16 bytes per thread and step), in the order of the edge's sources: in `float32` for `float32`,
   `float16` and `bfloat16`, in `float64`, `int32` and `int64` for those; `avg` divides once the inputs among the
   sources are combined (by the number of inputs of the result; the partial results of other domains come after
-  them, already divided). The threads write the result into one of two result buffers (rounding 16-bit floats once,
+  them, already divided), and `PremulSum` (the process group's PREMUL_SUM) multiplies them there by its factor
+  (`CompileOpCopyParameters::scale`, in `float32` for 16-bit types), before any rounding to the dtype, as if the inputs
+  had been multiplied. The threads write the result into one of two result buffers (rounding 16-bit floats once,
   to nearest even), and thread 0 stores it to every destination with bulk stores (the stores of the item before may
   still be reading the other buffer). An item with one source (a cell that one input covers) is stored as loaded.
   Sums start from -0 (x + -0 = x for every x), floating point min and max propagate NaN. (Within an NVLink domain,
@@ -543,7 +545,7 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   multicast store per vector), and its NVLS launches the same bits in every run (random values, 32 GB300; a launch whose
   tensors are not in place gets the reduce loop's). The tuning launches do not use NVLS (their scratch tensors are not
   in the pools at the same offsets), so it is decided by rule; reductions that will use it have no two-phase variant
-  (compile phase step 11).
+  (compile phase step 11). `PremulSum` uses NVLS where an average does (it multiplies where an average divides).
 - **NVLS runs** (the reduce loop's edges, e.g. those of reductions across NVLink domains, compile phase step 7: the same
   dtypes and reduce ops as NVLS reductions, and the `int32` limit on what the switches combine in a domain, to which
   runs of destinations alone do not count): the first N sources of an edge (N: the ranks of the executor's domain) can
@@ -720,25 +722,30 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   domain's multicast object when it adds it (before handing out memory in it), and the kernel's address exchange
   orders that before any peer's multicast stores to it.
 - Process group collectives (`ProcessGroupImpl::runCollective` in processgroup.cc): the all-gather, reduce-scatter
-  and all-reduce (in place) of CUDA tensors, with sum, avg, min or max, run as compile_op ops, one per collective
-  and shape (`CollectiveKey`: the collective, the dtype, the reduce op, the elements per rank; all-gathers copy bytes,
-  whatever the dtype), compiled at the first call. The key comes from the call's arguments, which are the same on
-  every rank, so every rank compiles at the same call (compiling is collective: 0.6-1.2 s on 4 GPUs, mostly the JIT
-  of the tuning candidates). They are compiled like user ops (NVLink across the nodes of a fabric, NVLS), but take
-  tensors from any allocator. The op's mappings (`remoteCudaTensorMappings`) say, per tensor of the rank, whether a
-  rank across a multi-node NVLink fabric maps it (such a rank maps only memory of moodist's allocator), and whether
-  any rank maps it or the op moves data over RDMA (which, like the mappings within a node, take whole allocations:
-  moodist's or cudaMalloc's, `CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE`; not, e.g., PyTorch's expandable
-  segments). A tensor that some rank cannot reach where it is, or whose address the kernel cannot take (16 bytes
-  aligned), goes through a buffer of the group's communication pool, copied in before the op and out after it on
-  the stream (one buffer for an all-reduce in place): when every rank does the same (e.g. all use PyTorch's
-  allocator), the buffers are at the same offset of the pool on every rank, and the op still uses NVLS. Tensors from
-  the pool (`comm_empty`, or the process group's `allocate_tensor`, i.e. FSDP2's with
-  `set_allocate_memory_from_process_group_for_comm(True)`) need no copies. Sizes that are not a multiple of 16 bytes
-  (per rank for all-gathers and reduce-scatters), PREMUL_SUM and CPU tensors still take the process group's own
-  implementations (whose avg now sums and divides; it was a fatal error). The tuning's tensors and the scratch
-  tensor come from moodist's allocator (`allocateCudaBuffer`), which ranks across a fabric can map (before, from the
-  caller's allocator: PyTorch's, unless `moodist.enable_cuda_allocator()`).
+  and all-reduce (in place) of CUDA tensors, with sum, avg, min, max or PREMUL_SUM, run as compile_op ops, one per
+  collective and shape (`CollectiveKey`: the collective, the dtype, the reduce op, the elements per rank, rounded up
+  to 16 bytes; all-gathers copy bytes, whatever the dtype), compiled at the first call. The key comes from the call's
+  arguments, which are the same on every rank, so every rank compiles at the same call (compiling is collective:
+  0.6-1.2 s on 4 GPUs, about 2 s on 64, mostly the JIT of the tuning candidates). They are compiled like user ops
+  (NVLink across the nodes of a fabric, NVLS), but take tensors from any allocator. The op's mappings
+  (`remoteCudaTensorMappings`) say, per tensor of the rank, whether a rank across a multi-node NVLink fabric maps it
+  (such a rank maps only memory of moodist's allocator), and whether any rank maps it or the op moves data over RDMA
+  (which, like the mappings within a node, take whole allocations: moodist's or cudaMalloc's,
+  `CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE`; not, e.g., PyTorch's expandable segments). A tensor that some
+  rank cannot reach where it is, whose address the kernel cannot take (16 bytes aligned), or whose parts (a rank's
+  part of an all-gather's output or a reduce-scatter's input, or an all-reduce's tensor) are not a multiple of 16
+  bytes, goes through a buffer of the group's communication pool, copied in before the op and out after it on the
+  stream (2-D copies where the buffer's parts are padded to 16 bytes; one buffer for an all-reduce in place): when
+  every rank does the same (e.g. all use PyTorch's allocator), the buffers are at the same offset of the pool on every
+  rank, and the op still uses NVLS. Tensors from the pool (`comm_empty`, or the process group's `allocate_tensor`, i.e.
+  FSDP2's with `set_allocate_memory_from_process_group_for_comm(True)`) whose parts are multiples of 16 bytes need no
+  copies. PREMUL_SUM's factor is a launch parameter (see Reductions in the kernel), so one op serves every factor; a
+  group of one rank compiles nothing (a copy, and PREMUL_SUM's factor applied after). CPU tensors take the CPU thread's
+  implementations (`WorkAllGatherCpu`, `WorkReduceScatterCpu`; an all-reduce is a reduce-scatter and an all-gather;
+  avg sums and divides); the process group's own implementations for CUDA tensors (ring and direct reads in the CPU
+  thread, NVRTC kernels) are gone (November 2026). The tuning's tensors and the scratch tensor come from moodist's
+  allocator (`allocateCudaBuffer`), which ranks across a fabric can map (before, from the caller's allocator:
+  PyTorch's, unless `moodist.enable_cuda_allocator()`).
 
 ## Environment variables
 
@@ -1261,7 +1268,7 @@ Python layer takes about 11 us of CPU time per call (back to back, a reduce-scat
   the tuning launches, they end the process instead (as after running out of memory for the scratch tensors: the
   others wait in the tuning's barrier). The errors that step 1 lists are raised on all ranks. The failing rank could
   tell the others through the queues, so that they fail at once.
-- The process group's own collectives (all-gather, reduce-scatter, broadcast and reduce in cputhread.cc) signal their
+- The process group's own collectives of CUDA tensors (broadcast and reduce in cputhread.cc) signal their
   kernels as soon as the completions of their RDMA reads arrive (`writeCpuOut`), through the first NIC into memory
   registered with relaxed ordering, so the signal may land before data that another NIC wrote, or that the same NIC
   wrote before it (a write with relaxed ordering may pass earlier ones; compile_op's signals follow their data, see
@@ -1446,7 +1453,7 @@ in chunks for large transfers. (Before the edge-based model, `computeNvlinkPlan`
 c57c8f4, computed a similar plan with gateway reads and local copies, but it was never executed.) Next:
 1. The write variant: the source writes the data and the signal into the proxy's memory (as reductions across
    domains can, see compile phase step 7).
-2. A ring for the RDMA part where the op allows it, as the process group's all-gather does (each rank reads from one
+2. A ring for the RDMA part where the op allows it, as the process group's all-gather did (each rank reads from one
    fixed neighbor, which relays the data of the ranks before it): one source per rank, and its two neighbors as its
    only peers in `WorkCustom` (see Runtime). It needs a heuristic for when it applies, and measurements against the
    proxy pass. Reductions across domains have rings for cells with one executor (compile phase step 7: reduce-scatters
@@ -1482,12 +1489,10 @@ c57c8f4, computed a similar plan with gateway reads and local copies, but it was
    the root's NVLink ingress from (N - 1) times to about twice the data. With NVLS, the root's ingress is the result
    only, but it combines all of it alone, limited by its loads in flight (see Known issues, Performance): split, every
    GPU would combine a piece.
-6. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: done for
-   sizes that are multiples of 16 bytes, with sum, avg, min and max (November 2026, see Runtime; one op per shape,
-   compiled at the first call). Next: other sizes (through padded buffers of the communication pool), PREMUL_SUM
-   (the factor applied in the reduce loop, in float32, where avg divides, so that no value is rounded to a 16-bit
-   type before it: multiplying the inputs first keeps a float16 sum in range), then the process group's own
-   implementations of these collectives go. Ops parameterized by size would save the compiles of new sizes.
+6. The process group's reduce-scatter and all-reduce on compile_op (and its all-gather), e.g. for FSDP2: done
+   (November 2026, see Runtime; one op per shape, compiled at the first call). Ops parameterized by size (one op for
+   a pattern of shapes) would save the compiles of new sizes. The process group's broadcast, reduce, all-to-all,
+   scatter and gather could go the same way (scatter and gather are compile_op ops already, without the fabric).
 7. Rings of the domains (compile phase step 7) where there are none yet: a reduce to one rank uses only the GPUs at
    the executor's position (one ring of k - 1 steps; a ring per position, each for a part of the cell that a rank of
    the executor's domain then writes to it over NVLink, would use every NIC); ranks with several cells with one

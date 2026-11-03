@@ -20,8 +20,7 @@ namespace moodist {
 
 constexpr uint8_t taskShutdown = 0;
 constexpr uint8_t taskBarrier = 1;
-constexpr uint8_t taskAllGather = 2;
-constexpr uint8_t taskReduceScatter = 3;
+// (2, 3, 20, 21 and 23 were the all-gathers and reduce-scatters of CUDA tensors, now compile_op ops)
 constexpr uint8_t taskBroadcast = 4;
 constexpr uint8_t taskAllGatherCpu = 5;
 constexpr uint8_t taskReduceScatterCpu = 6;
@@ -38,10 +37,7 @@ constexpr uint8_t taskQueueTransaction = 16;
 constexpr uint8_t taskCat = 17;
 constexpr uint8_t taskCopy = 18;
 constexpr uint8_t taskCached = 19;
-constexpr uint8_t taskReduceScatterDirect = 20;
-constexpr uint8_t taskAllGatherBroadcast = 21;
 constexpr uint8_t taskCallback = 22;
-constexpr uint8_t taskAllGatherDirect = 23;
 constexpr uint8_t taskCreateQueueNamed = 24;
 constexpr uint8_t taskCustom = 25;
 constexpr uint8_t taskFabricMap = 26;
@@ -137,33 +133,6 @@ struct QueueEntry {
 
 struct QueueEntryBarrier : QueueEntry {
   std::atomic_uint32_t* cpuDone = nullptr;
-};
-
-struct QueueEntryAllGather : QueueEntry {
-  uintptr_t inputAddress = 0;
-  uintptr_t outputAddress = 0;
-  size_t bytes = 0;
-  size_t pitch = 0;
-
-  size_t numDevices = 0;
-  size_t numChunks = 0;
-  size_t numParallel = 0;
-};
-
-struct QueueEntryReduceScatter : QueueEntry {
-  uintptr_t inputAddress = 0;
-  uintptr_t outputAddress = 0;
-  size_t bytes = 0;
-  size_t pitch = 0;
-
-  size_t numDevices = 0;
-  size_t numChunks = 0;
-  size_t numParallel = 0;
-
-  uintptr_t recvAddress = 0;
-  uintptr_t sendAddress = 0;
-
-  bool isCopy = false;
 };
 
 struct QueueEntryBroadcast : QueueEntry {
@@ -515,8 +484,6 @@ struct CpuThread {
 
   QueueEntryFreeList<QueueEntry> freelistShutdown;
   QueueEntryFreeList<QueueEntryBarrier> freelistBarrier;
-  QueueEntryFreeList<QueueEntryAllGather> freelistAllGather;
-  QueueEntryFreeList<QueueEntryReduceScatter> freelistReduceScatter;
   QueueEntryFreeList<QueueEntryBroadcast> freelistBroadcast;
   QueueEntryFreeList<QueueEntryAllGatherCpu> freelistAllGatherCpu;
   QueueEntryFreeList<QueueEntryReduceScatterCpu> freelistReduceScatterCpu;

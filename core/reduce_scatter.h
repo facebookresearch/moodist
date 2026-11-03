@@ -11,20 +11,6 @@
 
 namespace moodist {
 
-struct ReduceScatterParameters {
-  uint32_t stepValue;
-  uint32_t concurrencyIndex;
-  size_t bytes;
-  size_t pitch;
-  size_t chunkSize;
-  uintptr_t inputAddress;
-  uintptr_t outputAddress;
-  std::array<uintptr_t, 8> peerInputAddresses;
-  std::array<uintptr_t, 8> peerOutputAddresses;
-  uintptr_t sendAddress;
-  uintptr_t recvAddress;
-};
-
 struct ReduceScatter : CollectiveBase {
 
   IVector<size_t> sendRanks;
@@ -37,7 +23,6 @@ struct ReduceScatter : CollectiveBase {
   ReduceScatter(Group* group);
   ~ReduceScatter();
   void init();
-  std::string generate(std::vector<std::string> generateTypes, std::vector<std::string> generateReductions);
 };
 
 } // namespace moodist

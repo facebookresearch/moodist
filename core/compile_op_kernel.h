@@ -13,6 +13,8 @@ struct CompileOpCopyParameters {
   uint32_t concurrencyIndex;
   // NVLS: the value of the op's step counter (of this concurrency slot) before this launch (see generateKernel)
   uint32_t nvlsCounterBase = 0;
+  // PremulSum: the factor (see compile_op::isScaledSum)
+  double scale = 1.0;
 };
 
 struct KernelConfig {

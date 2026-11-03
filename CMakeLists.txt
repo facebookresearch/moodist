@@ -188,7 +188,6 @@ set(core_sources
   core/rdma_ib.cc
   core/rdma_tcp.cc
   core/reduce_scatter.cc
-  core/reduce_scatter_direct.cc
   core/setup_comms.cc
   core/socket.cc
   core/store.cc

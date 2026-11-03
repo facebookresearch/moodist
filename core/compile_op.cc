@@ -3229,16 +3229,8 @@ struct CompileOpConstructor {
           value);
     }
 
-    // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at
-    // least 32 bits) and 32- and 64-bit integers
-    if (isReduction(reduce)) {
-      const bool floating =
-          dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
-      const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
-      REQUIRE(floating || (integer && reduce != ReduceOp::Avg),
-          "moodist.compile_op: reduce='%s' does not support dtype %s (supported: float32, float64, float16, "
-          "bfloat16%s)",
-          reduceName(reduce), dtypeName(dtype), reduce == ReduceOp::Avg ? "" : ", int32, int64");
+    if (std::string error = reduceDtypeError(dtype, reduce); !error.empty()) {
+      throw std::runtime_error(error);
     }
 
     // Parse inputs and outputs into TensorDescr structs
@@ -4667,6 +4659,23 @@ struct CompileOpConstructor {
 };
 
 } // namespace
+
+std::string reduceDtypeError(DType dtype, ReduceOp reduce) {
+  // Reductions combine the values in the kernel (see generateKernel): floating point types (accumulated in at least
+  // 32 bits) and 32- and 64-bit integers
+  if (!isReduction(reduce)) {
+    return {};
+  }
+  const bool floating =
+      dtype == DType::Float32 || dtype == DType::Float64 || dtype == DType::Float16 || dtype == DType::BFloat16;
+  const bool integer = dtype == DType::Int32 || dtype == DType::Int64;
+  if (floating || (integer && !isScaledSum(reduce))) {
+    return {};
+  }
+  return fmt::sprintf("moodist.compile_op: reduce='%s' does not support dtype %s (supported: float32, float64, "
+                      "float16, bfloat16%s)",
+      reduceName(reduce), dtypeName(dtype), isScaledSum(reduce) ? "" : ", int32, int64");
+}
 
 std::shared_ptr<CustomOpDescriptor> compile(CompileContext& ctx, DType dtype, std::span<const api::TensorRegion> inputs,
     std::span<const api::TensorRegion> outputs, ReduceOp reduce, bool cpuSync) {

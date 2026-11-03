@@ -38,18 +38,19 @@ static ReduceOp toReduceOp(c10d::ReduceOp op) {
   }
 }
 
-static float extractPremulValue(c10d::ReduceOp reduceOp, at::ScalarType dtype) {
+// PREMUL_SUM's factor (0 for other reduce ops); floating point types only, as NCCL's
+static double extractPremulValue(c10d::ReduceOp reduceOp, at::ScalarType dtype) {
   if (static_cast<int>(reduceOp) != static_cast<int>(c10d::ReduceOp::PREMUL_SUM)) {
-    return 0.0f;
+    return 0.0;
   }
-  if (dtype != at::ScalarType::Float) {
-    throw std::runtime_error("PREMUL_SUM only supported for float32");
+  if (!at::isFloatingType(dtype)) {
+    throw std::runtime_error("PREMUL_SUM is only supported for floating point types");
   }
   auto* supplement = reinterpret_cast<c10d::NCCLPreMulSumSupplement*>(reduceOp.supplement_.get());
   if (supplement->tensor_factor.defined()) {
-    return supplement->tensor_factor.item<float>();
+    return supplement->tensor_factor.item<double>();
   }
-  return static_cast<float>(supplement->double_factor);
+  return supplement->double_factor;
 }
 
 static CUstream getStream(const at::Tensor& t) {
