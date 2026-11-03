@@ -59,9 +59,11 @@ std::chrono::steady_clock::duration ibTransportTimeout() {
 }
 
 // Select the best GID index for the given port.
-// Preference order: IB > RoCE v2 > RoCE v1. Among GIDs of the best type, the last one is
-// preferred (tuned for IPv6-only RoCE fabrics). Can be overridden with MOODIST_IB_GID_INDEX.
-// Returns the GID index and the resolved GID value.
+// Preference order: IB > RoCE v2 > RoCE v1, and of a RoCE type, GIDs outside fe80::/10 before link-local ones
+// (those only reach the local L2 segment, so on routed fabrics they can't connect to other nodes; a port's table is
+// not always in address order: after its addresses are re-added, its link-local GIDs can come last). Among GIDs of
+// the best kind, the last one is preferred (tuned for IPv6-only RoCE fabrics). Can be overridden with
+// MOODIST_IB_GID_INDEX. Returns the GID index and the resolved GID value.
 std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool quiet) {
   auto gidTypeName = [](uint32_t gid_type) -> const char* {
     switch (gid_type) {
@@ -107,10 +109,14 @@ std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool q
     }
   };
 
+  auto isLinkLocal = [](const ibv_gid& gid) {
+    return gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80;
+  };
+
   uint32_t bestIndex = 0;
   ibv_gid bestGid{};
   uint32_t bestGidType = 0;
-  int bestPriority = 4; // worse than any valid type
+  int bestPriority = 8; // worse than any valid kind
   bool found = false;
   for (uint32_t i = 0; i < 256; ++i) {
     ibv_gid_entry entry;
@@ -125,7 +131,8 @@ std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool q
     }
     log.debug("gid %d is %s of type %d    -- %d %d %d\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
         entry.port_num, entry.ndev_ifindex);
-    int priority = gidTypePriority(entry.gid_type);
+    int priority =
+        2 * gidTypePriority(entry.gid_type) + (entry.gid_type != IBV_GID_TYPE_IB && isLinkLocal(entry.gid) ? 1 : 0);
     // Prefer the last GID of the best priority (tuned for IPv6-only RoCE fabrics).
     if (priority <= bestPriority) {
       bestPriority = priority;
