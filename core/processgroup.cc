@@ -173,6 +173,27 @@ struct GatherCacheKey {
   }
 };
 
+// The process group collectives that run as compile_op ops (see ProcessGroupImpl::runCollective)
+enum class CollectiveKind : uint8_t { allGather, reduceScatter, allReduce };
+
+// Cache key of a collective's compiled op: from the call's arguments only, which are the same on every rank, so that
+// every rank compiles an op at the same call
+struct CollectiveKey {
+  CollectiveKind kind;
+  DType dtype;          // UInt8 for all-gathers, which copy bytes whatever the tensors' dtype
+  api::ReduceOp reduce; // None for all-gathers
+  // All-gather: the bytes of each rank's input; reduce-scatter: the elements of each rank's output; all-reduce: the
+  // elements of the tensor
+  size_t numel;
+
+  bool operator==(const CollectiveKey&) const = default;
+
+  template<typename X>
+  void hash(X& x) const {
+    x(kind, dtype, reduce, numel);
+  }
+};
+
 struct EventSerializer {
   Event event;
   CUstream stream;
@@ -333,6 +354,23 @@ Dtype toInternalDtype(DType dt) {
   }
 }
 
+// The compile_op reduce op of a process group reduce op, for the collectives that run on compile_op (see
+// ProcessGroupImpl::runCollective), or none
+std::optional<api::ReduceOp> collectiveReduce(ReduceOp op) {
+  switch (op) {
+  case ReduceOp::SUM:
+    return api::ReduceOp::Sum;
+  case ReduceOp::AVG:
+    return api::ReduceOp::Avg;
+  case ReduceOp::MIN:
+    return api::ReduceOp::Min;
+  case ReduceOp::MAX:
+    return api::ReduceOp::Max;
+  default:
+    return std::nullopt;
+  }
+}
+
 // Convert API ReduceOp to internal Reduction (for kernel dispatch)
 Reduction toInternalReduction(ReduceOp op) {
   switch (op) {
@@ -385,6 +423,16 @@ static std::chrono::steady_clock::duration timeoutFromEnv(std::chrono::steady_cl
   }
   return std::min<std::chrono::steady_clock::duration>(timeout, std::chrono::seconds(1000000000));
 }
+
+// A process group collective's compiled op (see ProcessGroupImpl::runCollective), and for each of this rank's tensors
+// in it (its input, then its output) how the other ranks reach it: whether a rank maps it across a multi-node NVLink
+// fabric (which maps moodist's memory only), and whether any rank maps it or the op moves data over RDMA (whose
+// registrations, like the mappings within a node, take whole allocations: of moodist's allocator, or of cudaMalloc)
+struct CollectiveOp {
+  std::shared_ptr<CustomOpDescriptor> op;
+  std::array<bool, 2> fabricMapped{};
+  std::array<bool, 2> shared{};
+};
 
 struct ProcessGroupImpl : api::ProcessGroup {
   size_t rank = 0;
@@ -443,6 +491,9 @@ struct ProcessGroupImpl : api::ProcessGroup {
 
   // Cache for gather collective compiled ops
   HashMap<GatherCacheKey, SharedPtr<CustomOpImpl>, GenericHash<GatherCacheKey>> gatherCache;
+
+  // The compiled ops of the collectives that run on compile_op, each compiled at its first call (see runCollective)
+  HashMap<CollectiveKey, CollectiveOp, GenericHash<CollectiveKey>> collectiveOps;
 
   void* c10dStore_ = nullptr; // Opaque pointer to c10d::Store for init
 
@@ -1101,6 +1152,13 @@ struct ProcessGroupImpl : api::ProcessGroup {
   SharedPtr<CustomOpImpl> compileOpFull(DType dtype, std::span<const api::TensorRegion> inputs,
       std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync = false,
       bool collectiveOp = false);
+  // The op itself (compileOpFull wraps it for the API)
+  std::shared_ptr<CustomOpDescriptor> compileOp(DType dtype, std::span<const api::TensorRegion> inputs,
+      std::span<const api::TensorRegion> outputs, api::ReduceOp reduce, bool cpuSync, bool collectiveOp);
+
+  // Runs a collective as its compiled op (see CollectiveKey), compiled at its first call. input and output: this
+  // rank's contiguous CUDA tensors, on the group's device (the same tensor for an all-reduce in place).
+  void runCollective(const CollectiveKey& key, const TensorPtr& input, const TensorPtr& output, CUstream stream);
 
   // Template implementation for compileOpFull - parameterized by ndim
   // OLD: Kept for reference during refactoring. Will be deleted once new impl is working.
@@ -1267,8 +1325,6 @@ void ProcessGroupImpl::init() {
 // ============================================================================
 
 void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUstream stream) {
-  std::unique_lock l(threadUnsafe);
-
   CHECK(input.is_contiguous());
   CHECK(output.is_contiguous());
 
@@ -1285,8 +1341,19 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
   size_t outputBytes = bytes * size;
   size_t pitch = bytes;
 
-  CHECK(bytes > 0);
   CHECK(static_cast<size_t>(output.numel() * output.itemsize()) == outputBytes);
+
+  // CUDA tensors: a compile_op op (see runCollective), for now where each rank's part is a multiple of 16 bytes
+  if (isCuda && bytes % 16 == 0) {
+    if (bytes != 0) {
+      runCollective({CollectiveKind::allGather, DType::UInt8, api::ReduceOp::None, bytes}, input, output, stream);
+    }
+    return;
+  }
+
+  std::unique_lock l(threadUnsafe);
+
+  CHECK(bytes > 0);
 
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -1497,6 +1564,22 @@ void ProcessGroupImpl::all_gather(TensorPtr& output, const TensorPtr& input, CUs
 
 void ProcessGroupImpl::reduce_scatter(
     TensorPtr& output, const TensorPtr& input, ReduceOp reduceOp, CUstream stream, float premulValue) {
+  // CUDA tensors: a compile_op op (see runCollective), for now for sum, avg, min and max where each rank's output is a
+  // multiple of 16 bytes
+  if (std::optional<api::ReduceOp> reduce = collectiveReduce(reduceOp); reduce && input.is_cuda()) {
+    CHECK(input.is_contiguous() && output.is_contiguous() && output.is_cuda());
+    CHECK(input.device_index() == group->deviceIndex && output.device_index() == group->deviceIndex);
+    CHECK(input.dtype() == output.dtype());
+    const size_t numel = output.numel();
+    CHECK(static_cast<size_t>(input.numel()) == numel * size);
+    if (numel * output.itemsize() % 16 == 0) {
+      if (numel != 0) {
+        runCollective({CollectiveKind::reduceScatter, output.dtype(), *reduce, numel}, input, output, stream);
+      }
+      return;
+    }
+  }
+
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
@@ -1519,8 +1602,9 @@ void ProcessGroupImpl::reduce_scatter(
   CHECK(input.dtype() == dtype);
 
   Dtype dindex = toInternalDtype(dtype);
-  Reduction opindex = toInternalReduction(reduceOp);
+  // avg: the sum, divided by the group size below (the kernels and the CPU reduction have no avg)
   bool workaroundMean = (reduceOp == ReduceOp::AVG);
+  Reduction opindex = workaroundMean ? Reduction::sum : toInternalReduction(reduceOp);
   bool premul = (reduceOp == ReduceOp::PREMUL_SUM);
 
   size_t numel = output.numel();
@@ -1878,7 +1962,20 @@ void ProcessGroupImpl::reduce_scatter(
 // ============================================================================
 
 void ProcessGroupImpl::allreduce(TensorPtr& tensor, ReduceOp reduceOp, CUstream stream, float premulValue) {
-  // Allreduce is implemented as reduce_scatter + all_gather
+  // CUDA tensors: a compile_op op in place (see runCollective), for now for sum, avg, min and max of tensors of a
+  // multiple of 16 bytes
+  if (std::optional<api::ReduceOp> reduce = collectiveReduce(reduceOp); reduce && tensor.is_cuda()) {
+    CHECK(tensor.is_contiguous() && tensor.device_index() == group->deviceIndex);
+    const size_t elements = tensor.numel();
+    if (elements * tensor.itemsize() % 16 == 0) {
+      if (elements != 0) {
+        runCollective({CollectiveKind::allReduce, tensor.dtype(), *reduce, elements}, tensor, tensor, stream);
+      }
+      return;
+    }
+  }
+
+  // Otherwise as reduce_scatter + all_gather
 
   int64_t numel = tensor.numel();
   CHECK(numel > 0);
@@ -3333,6 +3430,22 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
 
 SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<const api::TensorRegion> inputsVec,
     std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce, bool cpuSync, bool collectiveOp) {
+  std::shared_ptr<CustomOpDescriptor> op = compileOp(dtype, inputsVec, outputsVec, reduce, cpuSync, collectiveOp);
+
+  // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
+  auto result = makeShared<CustomOpImpl>();
+  auto selfPtr = share(this);
+  result->call = [op, selfPtr](TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs,
+                     CUstream stream) -> SharedPtr<ApiFuture> {
+    return selfPtr->customOp(op, inputs, nInputs, outputs, nOutputs, stream);
+  };
+
+  return result;
+}
+
+std::shared_ptr<CustomOpDescriptor> ProcessGroupImpl::compileOp(DType dtype,
+    std::span<const api::TensorRegion> inputsVec, std::span<const api::TensorRegion> outputsVec, api::ReduceOp reduce,
+    bool cpuSync, bool collectiveOp) {
 
   // Ensure queues exist for compile_op communication
   if (queues.empty()) {
@@ -3365,16 +3478,128 @@ SharedPtr<CustomOpImpl> ProcessGroupImpl::compileOpFull(DType dtype, std::span<c
   // Call compile_op
   auto op = compile_op::compile(ctx, dtype, inputsVec, outputsVec, reduce, cpuSync);
   op->requireMoodistMemory = !collectiveOp;
+  return op;
+}
 
-  // Wrap CustomOpDescriptor in CustomOpImpl with execution closure
-  auto result = makeShared<CustomOpImpl>();
-  auto selfPtr = share(this);
-  result->call = [op, selfPtr](TensorPtr* inputs, size_t nInputs, TensorPtr* outputs, size_t nOutputs,
-                     CUstream stream) -> SharedPtr<ApiFuture> {
-    return selfPtr->customOp(op, inputs, nInputs, outputs, nOutputs, stream);
+// ============================================================================
+// ProcessGroupImpl::runCollective - process group collectives on compile_op
+// ============================================================================
+
+namespace {
+// Whether the CUDA memory at ptr is from cudaMalloc (or the like: memory that cuIpcGetMemHandle can share). The peers
+// of a node map such memory, and RDMA registers it, as whole allocations; other allocators' memory (e.g. PyTorch's
+// expandable segments, of many cuMemCreate allocations) is not.
+bool legacyIpcCapable(uintptr_t ptr) {
+  int value = 0;
+  return cuPointerGetAttribute(&value, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE, ptr) == CUDA_SUCCESS &&
+         value != 0;
+}
+} // namespace
+
+void ProcessGroupImpl::runCollective(
+    const CollectiveKey& key, const TensorPtr& input, const TensorPtr& output, CUstream stream) {
+  auto it = collectiveOps.find(key);
+  if (it == collectiveOps.end()) {
+    // The op of every rank, the same on all (compile takes them all): each rank's input and output as regions of one
+    // tensor of size * n elements, or n for an all-reduce
+    const size_t n = key.numel;
+    const int64_t whole = key.kind == CollectiveKind::allReduce ? (int64_t)n : (int64_t)(size * n);
+    std::vector<api::TensorRegion> inputs;
+    std::vector<api::TensorRegion> outputs;
+    for (size_t i : range(size)) {
+      const int32_t r = (int32_t)i;
+      const int64_t piece = (int64_t)(i * n);
+      switch (key.kind) {
+      case CollectiveKind::allGather:
+        inputs.push_back({.rank = r, .offset = {piece}, .shape = {(int64_t)n}, .tensorId = "0", .device = "cuda"});
+        outputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
+        break;
+      case CollectiveKind::reduceScatter:
+        inputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
+        outputs.push_back({.rank = r, .offset = {piece}, .shape = {(int64_t)n}, .tensorId = "0", .device = "cuda"});
+        break;
+      case CollectiveKind::allReduce:
+        inputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
+        outputs.push_back({.rank = r, .offset = {0}, .shape = {whole}, .tensorId = "0", .device = "cuda"});
+        break;
+      }
+    }
+    CollectiveOp c;
+    c.op = compileOp(key.dtype, inputs, outputs, key.reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
+    // The tensors come from any allocator: below, each rank puts those that its peers cannot reach where they can
+    c.op->requireMoodistMemory = false;
+    CHECK(c.op->inputs.size() == 1 && c.op->outputs.size() == 1);
+    for (const auto& m : c.op->graph.remoteCudaTensorMappings) {
+      if (m.tensorIndex < 2) {
+        c.shared[m.tensorIndex] = true;
+        c.fabricMapped[m.tensorIndex] |= !group->ipcAccess.at(m.rank);
+      }
+    }
+    if (c.op->anyRankNeedsRdma) {
+      c.shared = {true, true};
+    }
+    it = collectiveOps.emplace(key, std::move(c)).first;
+  }
+  const CollectiveOp& c = it->second;
+  const std::shared_ptr<CustomOpDescriptor>& op = c.op;
+  const int device = group->deviceIndex;
+  StreamGuard sg(stream, device);
+
+  // This rank's tensors where they are, unless some rank cannot reach them there (moodist's memory and cudaMalloc's
+  // within a node, moodist's only across a multi-node NVLink fabric) or the kernel cannot take their address (16
+  // bytes aligned): then through a buffer of the group's communication pool, which, when every rank does the same, is
+  // at the same offset on every rank, so that the op can still use NVLS
+  const uintptr_t inputAddress = (uintptr_t)input.data_ptr();
+  const uintptr_t outputAddress = (uintptr_t)output.data_ptr();
+  const size_t inputBytes = op->inputs[0].bytes;
+  const size_t outputBytes = op->outputs[0].bytes;
+  CHECK((size_t)(input.numel() * input.itemsize()) == inputBytes);
+  CHECK((size_t)(output.numel() * output.itemsize()) == outputBytes);
+  auto elsewhere = [&](size_t index, uintptr_t address) {
+    if (op->kernel && address % 16 != 0) {
+      return true;
+    }
+    if (allocator::owns(address)) {
+      return false;
+    }
+    return c.fabricMapped[index] || (c.shared[index] && !legacyIpcCapable(address));
   };
+  uintptr_t in = inputAddress;
+  uintptr_t out = outputAddress;
+  AllocatedBuffer inputBuffer;
+  AllocatedBuffer outputBuffer;
+  if (inputAddress == outputAddress && inputBytes == outputBytes) {
+    // In place (an all-reduce): one buffer for both
+    if (elsewhere(0, inputAddress) || elsewhere(1, outputAddress)) {
+      outputBuffer = allocateCudaBuffer(outputBytes, stream, device, group->getCommPool());
+      CHECK_CU(cuMemcpyDtoDAsync(outputBuffer.cudaPointer, inputAddress, inputBytes, stream));
+      in = out = outputBuffer.cudaPointer;
+    }
+  } else {
+    if (elsewhere(0, inputAddress)) {
+      inputBuffer = allocateCudaBuffer(inputBytes, stream, device, group->getCommPool());
+      CHECK_CU(cuMemcpyDtoDAsync(inputBuffer.cudaPointer, inputAddress, inputBytes, stream));
+      in = inputBuffer.cudaPointer;
+    }
+    if (elsewhere(1, outputAddress)) {
+      outputBuffer = allocateCudaBuffer(outputBytes, stream, device, group->getCommPool());
+      out = outputBuffer.cudaPointer;
+    }
+  }
 
-  return result;
+  const size_t itemsize = wrapperApi.dtypeSize(op->dtype);
+  std::array<TensorPtr, 2> tensors = {
+      TensorPtr::from_blob((void*)in, {(int64_t)(inputBytes / itemsize)}, op->dtype, device),
+      TensorPtr::from_blob((void*)out, {(int64_t)(outputBytes / itemsize)}, op->dtype, device),
+  };
+  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], 1, &tensors[1], 1, stream);
+  // (CUDA tensors only: the op is done for the caller once queued on the stream, see customOp)
+  futureWait(future.get());
+
+  if (out != outputAddress) {
+    CHECK_CU(cuMemcpyDtoDAsync(outputAddress, out, outputBytes, stream));
+  }
+  // (the buffers are freed here, for reuse by work after the op and the copy on the stream)
 }
 
 namespace {
@@ -3577,23 +3802,25 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   }
 
   // Reductions across NVLink domains or in two phases: the scratch tensor (see CustomOpDescriptor::scratchBytes), the
-  // last tensor. Allocated on the op's stream: once freed, it is reused only by work after the op on that stream,
-  // which comes after the RDMA transfers into and from it (the stream waits for the CPU thread, see below). It is a
-  // CUDA tensor of the op like the others: a rank can have one without any tensors of its own (one that computes a
-  // partial result of its domain's inputs for another domain, see crossDomainReductions), and its stream must still
-  // wait for the CPU thread, or the scratch tensor could be reused while other ranks still read or write it.
+  // last tensor. From moodist's CUDA allocator (the ranks of a multi-node NVLink fabric can map no other memory), on
+  // the op's stream, and freed at the end of this call: it is then reused only by work after the op on that stream,
+  // which comes after the RDMA transfers into and from it (the stream waits for the CPU thread, see below, which
+  // starts once the stream has reached the op). It is a CUDA tensor of the op like the others: a rank can have one
+  // without any tensors of its own (one that computes a partial result of its domain's inputs for another domain, see
+  // crossDomainReductions), and its stream must still wait for the CPU thread, or the scratch tensor could be reused
+  // while other ranks still read or write it.
+  AllocatedBuffer scratch;
   if (op->scratchBytes != 0) {
-    StreamGuard sg(stream, group->deviceIndex);
-    TensorPtr t = TensorPtr::empty(
-        {(int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype))}, op->dtype, group->deviceIndex);
-    auto td = getTensorDataFromPtr(t, group.get());
-    CHECK(td->isCuda && td->bytes() == op->scratchBytes && td->data() % 16 == 0);
-    REQUIRE(!op->requireMoodistMemory || allocator::owns(td->data()),
-        "moodist: this custom op (a reduction) needs a scratch tensor on this rank, which must "
-        "come from the moodist CUDA allocator (call moodist.enable_cuda_allocator() on every rank)");
+    scratch = allocateCudaBuffer(op->scratchBytes, stream, group->deviceIndex);
+    TensorDataPtr td = TensorDataPtr::make();
+    td->dtype = static_cast<int>(op->dtype);
+    td->shape.resize(1);
+    td->shape[0] = (int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype));
+    td->dataPtr = scratch.cudaPointer;
+    td->dataBytes = op->scratchBytes;
+    td->isCuda = true;
     anyCuda = true;
     outputTDs.push_back(std::move(td));
-    result->holdTensors.push_back(std::move(t));
   }
 
   bool anyRdma = op->anyRankNeedsRdma;

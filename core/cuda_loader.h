@@ -202,6 +202,7 @@ using CUpointer_attribute = int;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_SYNC_MEMOPS = 6;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_BUFFER_ID = 7;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9;
+constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 10;
 
 // Function attributes
 using CUfunction_attribute = int;
@@ -379,6 +380,7 @@ using cuMemHostRegister_t = CUresult (*)(void* p, size_t bytesize, unsigned int 
 using cuMemHostUnregister_t = CUresult (*)(void* p);
 using cuMemHostGetDevicePointer_t = CUresult (*)(CUdeviceptr* pdptr, void* p, unsigned int flags);
 using cuMemsetD8_t = CUresult (*)(CUdeviceptr dstDevice, unsigned char uc, size_t N);
+using cuMemsetD8Async_t = CUresult (*)(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream);
 
 // Memory copy
 using cuMemcpyAsync_t = CUresult (*)(CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream);
@@ -500,6 +502,7 @@ struct CudaApi {
   cuMemHostUnregister_t memHostUnregister = nullptr;
   cuMemHostGetDevicePointer_t memHostGetDevicePointer = nullptr;
   cuMemsetD8_t memsetD8 = nullptr;
+  cuMemsetD8Async_t memsetD8Async = nullptr;
 
   // Memory copy
   cuMemcpyAsync_t memcpyAsync = nullptr;
@@ -673,6 +676,9 @@ inline CUresult cuMemHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned 
 }
 inline CUresult cuMemsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
   return cudaApi.memsetD8(dstDevice, uc, N);
+}
+inline CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream) {
+  return cudaApi.memsetD8Async(dstDevice, uc, N, hStream);
 }
 inline CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
   return cudaApi.memcpyAsync(dst, src, byteCount, hStream);

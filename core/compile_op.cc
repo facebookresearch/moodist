@@ -2921,24 +2921,25 @@ struct CompileOpConstructor {
         continue;
       }
 
-      Vector<TensorPtr> tensors;
+      // The tuning launches' tensors: zeroed, from moodist's CUDA allocator (the ranks of a multi-node NVLink fabric
+      // can map no other memory, and the caller's allocator may be another, e.g. for process group collectives), and
+      // freed once the setting is timed
+      Vector<AllocatedBuffer> tensors;
       Vector<uintptr_t> tensorAddrs;
 
       for (size_t ti = 0; ti < graph.tensors.size(); ti++) {
         auto& t = graph.tensors[ti];
-        if (t.device != DeviceType::CUDA) {
+        if (t.device != DeviceType::CUDA || t.bytes == 0) {
           // (kernel edges have CUDA nodes only)
           tensorAddrs.push_back(0);
           continue;
         }
-        auto x = TensorPtr::empty(t.shape, t.dtype, group->deviceIndex);
-        log.debug("  tensor %d: shape=[%s] dtype=%d deviceIndex=%d data_ptr=%p\n", ti,
-            fmt::to_string(fmt::join(t.shape, ",")), (int)t.dtype, group->deviceIndex,
-            x.defined() ? x.data_ptr() : nullptr);
-        CHECK(x.defined());
-        x.zero_();
-        tensors.push_back(x);
-        tensorAddrs.push_back((uintptr_t)x.data_ptr());
+        tensors.push_back(allocateCudaBuffer(t.bytes, stream, group->deviceIndex));
+        const AllocatedBuffer& x = tensors.back();
+        log.debug("  tensor %d: shape=[%s] dtype=%d deviceIndex=%d data_ptr=%#x\n", ti,
+            fmt::to_string(fmt::join(t.shape, ",")), (int)t.dtype, group->deviceIndex, x.cudaPointer);
+        CHECK_CU(cuMemsetD8Async(x.cudaPointer, 0, t.bytes, stream));
+        tensorAddrs.push_back(x.cudaPointer);
       }
 
       IpcMapper* ipcMapper = &*group->ipcMapper;
@@ -4674,4 +4675,18 @@ std::shared_ptr<CustomOpDescriptor> compile(CompileContext& ctx, DType dtype, st
 }
 
 } // namespace compile_op
+
+AllocatedBuffer allocateCudaBuffer(size_t bytes, CUstream stream, int deviceIndex, CommPool* pool) {
+  CudaAllocation a = pool ? allocatorCommPoolAllocate(pool, bytes, stream, deviceIndex)
+                          : cudaAllocatorImplAllocate(nullptr, bytes, stream, deviceIndex);
+  CHECK(a.ptr != 0 && a.ptr % 16 == 0);
+  AllocatedBuffer r;
+  r.cudaPointer = a.ptr;
+  r.bytes = bytes;
+  r.externalAlloc = DeferredCleanup(Function<void()>([ctx = a.cleanupCtx, stream] {
+    cudaAllocatorImplFree(ctx, stream);
+  }));
+  return r;
+}
+
 } // namespace moodist

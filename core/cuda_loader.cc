@@ -127,6 +127,7 @@ bool loadCuda() {
     cudaApi.memHostGetDevicePointer =
         (cuMemHostGetDevicePointer_t)loadSym(lib, "cuMemHostGetDevicePointer_v2", name, ok, failed);
     cudaApi.memsetD8 = (cuMemsetD8_t)loadSym(lib, "cuMemsetD8_v2", name, ok, failed);
+    cudaApi.memsetD8Async = (cuMemsetD8Async_t)loadSym(lib, "cuMemsetD8Async", name, ok, failed);
 
     // Memory copy
     cudaApi.memcpyAsync = (cuMemcpyAsync_t)loadSym(lib, "cuMemcpyAsync", name, ok, failed);

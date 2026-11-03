@@ -31,6 +31,12 @@ enum class DeviceType : int8_t {
   CUDA = 1,
 };
 
+// A CUDA buffer of moodist's CUDA allocator (whose memory the ranks of a multi-node NVLink fabric can map, unlike other
+// allocators'), or of the communication pool `pool` if given (see allocatorCommPoolAllocate), for use on stream. It is
+// freed when the AllocatedBuffer is destroyed (cudaAllocatorImplFree): its memory is then reused only by work that
+// comes after the work queued on stream by then.
+AllocatedBuffer allocateCudaBuffer(size_t bytes, CUstream stream, int deviceIndex, CommPool* pool = nullptr);
+
 namespace compile_op {
 
 // Use the ReduceOp enum from the API
