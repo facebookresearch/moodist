@@ -15,8 +15,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 
 extern "C" bool is_efa_dev(ibv_device* device);
@@ -58,11 +60,29 @@ std::chrono::steady_clock::duration ibTransportTimeout() {
   return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(s));
 }
 
+// Whether a GID of a port belongs to a network device in another network namespace, as far as sysfs (as this
+// process sees it) can tell: the port's gid_attrs/ndevs entry of such a GID reads as an error (EINVAL), while the
+// verbs queries list it like the others. False if the entry reads, or if there is none (nothing to tell).
+static bool gidOfOtherNamespace(ibv_context* context, int portNum, uint32_t index) {
+  const std::string fn = fmt::sprintf(
+      "/sys/class/infiniband/%s/ports/%d/gid_attrs/ndevs/%d", ibv_get_device_name(context->device), portNum, index);
+  FILE* f = std::fopen(fn.c_str(), "rb");
+  if (!f) {
+    return false;
+  }
+  char buf[64];
+  const bool failed = std::fread(buf, 1, sizeof(buf), f) == 0 && std::ferror(f);
+  std::fclose(f);
+  return failed;
+}
+
 // Select the best GID index for the given port.
-// Preference order: IB > RoCE v2 > RoCE v1, and of a RoCE type, GIDs outside fe80::/10 before link-local ones
-// (those only reach the local L2 segment, so on routed fabrics they can't connect to other nodes; a port's table is
-// not always in address order: after its addresses are re-added, its link-local GIDs can come last). Among GIDs of
-// the best kind, the last one is preferred (tuned for IPv6-only RoCE fabrics). Can be overridden with
+// Preference order: GIDs of network devices in this process's network namespace (in a container, a port's table can
+// also list the GIDs of the host's own device of the port; peers can't connect to those, "No such device"), then
+// IB > RoCE v2 > RoCE v1, and of a RoCE type, GIDs outside fe80::/10 before link-local ones (those only reach the
+// local L2 segment, so on routed fabrics they can't connect to other nodes). Among GIDs of the best kind, the last one
+// is preferred (tuned for IPv6-only RoCE fabrics), although a port's table is not always in address order: after
+// addresses are re-added, the host's GIDs or link-local ones can come last. Can be overridden with
 // MOODIST_IB_GID_INDEX. Returns the GID index and the resolved GID value.
 std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool quiet) {
   auto gidTypeName = [](uint32_t gid_type) -> const char* {
@@ -116,7 +136,8 @@ std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool q
   uint32_t bestIndex = 0;
   ibv_gid bestGid{};
   uint32_t bestGidType = 0;
-  int bestPriority = 8; // worse than any valid kind
+  constexpr int otherNamespacePriority = 8;      // added for GIDs of devices in another namespace: last resort only
+  int bestPriority = 2 * otherNamespacePriority; // worse than any valid kind
   bool found = false;
   for (uint32_t i = 0; i < 256; ++i) {
     ibv_gid_entry entry;
@@ -129,10 +150,12 @@ std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool q
     if (std::memcmp(&entry.gid, &zero, sizeof(zero)) == 0) {
       continue;
     }
-    log.debug("gid %d is %s of type %d    -- %d %d %d\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
-        entry.port_num, entry.ndev_ifindex);
-    int priority =
-        2 * gidTypePriority(entry.gid_type) + (entry.gid_type != IBV_GID_TYPE_IB && isLinkLocal(entry.gid) ? 1 : 0);
+    const bool nonIb = entry.gid_type != IBV_GID_TYPE_IB;
+    const bool otherNamespace = nonIb && gidOfOtherNamespace(context, portNum, i);
+    log.debug("gid %d is %s of type %d    -- %d %d %d%s\n", i, hexstr(&entry.gid, 16), entry.gid_type, entry.gid_index,
+        entry.port_num, entry.ndev_ifindex, otherNamespace ? " (a device in another network namespace)" : "");
+    int priority = 2 * gidTypePriority(entry.gid_type) + (nonIb && isLinkLocal(entry.gid) ? 1 : 0) +
+                   (otherNamespace ? otherNamespacePriority : 0);
     // Prefer the last GID of the best priority (tuned for IPv6-only RoCE fabrics).
     if (priority <= bestPriority) {
       bestPriority = priority;
@@ -152,6 +175,11 @@ std::pair<uint32_t, ibv_gid> selectGid(ibv_context* context, int portNum, bool q
     }
   } else if (!quiet) {
     log.info("selectGid: using GID index %d (%s)\n", bestIndex, gidTypeName(bestGidType));
+    if (bestPriority >= otherNamespacePriority) {
+      log.error("selectGid: port %d of %s has no GID of a network device in this network namespace; using GID index "
+                "%d anyway\n",
+          portNum, ibv_get_device_name(context->device), bestIndex);
+    }
   }
 
   return {bestIndex, bestGid};
