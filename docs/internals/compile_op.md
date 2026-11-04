@@ -734,16 +734,19 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   one after the other in one allocation (`all_to_all_single`'s views of one tensor). The key comes from the call's
   arguments, which are the same on every rank, so every rank compiles at the same call (compiling is collective: 0.6-1.2
   s on 4 GPUs, about 2 s on 64, mostly the JIT of the tuning candidates). They are compiled like user ops (NVLink across
-  the nodes of a fabric, NVLS), but take tensors from any allocator. The op's mappings (`remoteCudaTensorMappings`) say,
-  for the rank's input and its output, whether a rank across a multi-node NVLink fabric maps it (such a rank maps only
-  memory of moodist's allocator), and whether any rank maps it or the op moves data over RDMA (which, like the mappings
-  within a node, take whole allocations: moodist's or cudaMalloc's, `CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE`;
-  not, e.g., PyTorch's expandable segments). A tensor that some rank cannot reach where it is, whose address the kernel
-  cannot take (16 bytes aligned), whose parts are not a multiple of 16 bytes, or a list whose parts are not one tensor,
-  goes through a buffer of the group's communication pool, copied in before the op and out after it on the stream (2-D
-  copies where the buffer's parts are padded to 16 bytes; one buffer for both where the input is the output: an
-  all-reduce, a broadcast or a reduce on its root); so does an all-to-all's input that shares memory with its output (in
-  place, a rank's part for rank j is where rank j's part for it goes). A broadcast's root has an output too, its input,
+  the nodes of a fabric, NVLS), but take tensors from any allocator. Other ranks reach moodist's memory only: peers map
+  it and the NICs register it once, and it stays moodist's, while another allocator's memory (e.g. PyTorch's) can be
+  freed and reused under the peers' mappings (a CUDA IPC mapping open past the `cudaFree` is undefined behavior) and
+  the NICs' registrations (a dma-buf registration keeps the freed pages), which moodist would not notice. So a tensor
+  of another allocator that other ranks reach (the op's `remoteCudaTensorMappings` map it, or the op moves data over
+  RDMA), a tensor whose address the kernel cannot take (16 bytes aligned), one whose parts are not a multiple of 16
+  bytes, or a list whose parts are not one tensor, goes through a buffer of the group's communication pool, copied in
+  before the op and out after it on the stream (2-D copies where the buffer's parts are padded to 16 bytes; one buffer
+  for both where the input is the output: an all-reduce, a broadcast or a reduce on its root); so does an all-to-all's
+  input that shares memory with its output (in place, a rank's part for rank j is where rank j's part for it goes).
+  In a group of more than one rank, other ranks reach every input and output (a rank maps every tensor of another that
+  is in one of its edges), so every tensor of another allocator is copied, and the pool keeps the most memory that such
+  buffers took at once (it never frees its slabs). A broadcast's root has an output too, its input,
   so that the op has a destination on every rank (at the same offset of the pool where the tensors are there), as
   multicast stores need (the kernel does not use them for it yet, see Known issues, Performance). When every rank does
   the same (e.g. all use PyTorch's allocator), the buffers are at the same offset of the pool on every rank, and the op

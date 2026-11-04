@@ -202,7 +202,6 @@ using CUpointer_attribute = int;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_SYNC_MEMOPS = 6;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_BUFFER_ID = 7;
 constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9;
-constexpr CUpointer_attribute CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 10;
 
 // Function attributes
 using CUfunction_attribute = int;

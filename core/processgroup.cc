@@ -387,13 +387,11 @@ static std::chrono::steady_clock::duration timeoutFromEnv(std::chrono::steady_cl
 }
 
 // A process group collective's compiled op (see ProcessGroupImpl::runCollective), and for this rank's input and its
-// output in it (where it has them) how the other ranks reach them: whether a rank maps it across a multi-node NVLink
-// fabric (which maps moodist's memory only), and whether any rank maps it or the op moves data over RDMA (whose
-// registrations, like the mappings within a node, take whole allocations: of moodist's allocator, or of cudaMalloc)
+// output in it (where it has them) whether other ranks reach them: whether another rank maps it or the op moves data
+// over RDMA. Such tensors must be moodist's memory (see runCollective)
 struct CollectiveOp {
   std::shared_ptr<CustomOpDescriptor> op;
-  std::array<bool, 2> fabricMapped{}; // the input, the output
-  std::array<bool, 2> shared{};
+  std::array<bool, 2> shared{}; // the input, the output
 };
 
 struct ProcessGroupImpl : api::ProcessGroup {
@@ -2019,17 +2017,6 @@ std::shared_ptr<CustomOpDescriptor> ProcessGroupImpl::compileOp(DType dtype,
 // ============================================================================
 
 namespace {
-// Whether the CUDA memory at ptr is from cudaMalloc (or the like: memory that cuIpcGetMemHandle can share). The peers
-// of a node map such memory, and RDMA registers it, as whole allocations; other allocators' memory (e.g. PyTorch's
-// expandable segments, of many cuMemCreate allocations) is not.
-bool legacyIpcCapable(uintptr_t ptr) {
-  int value = 0;
-  return cuPointerGetAttribute(&value, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE, ptr) == CUDA_SUCCESS &&
-         value != 0;
-}
-} // namespace
-
-namespace {
 // The parts (see runCollective) of rank r's input and output in a collective, 0 where it has none: one each in an
 // all-reduce; in an all-gather, the output has one per rank, and in a reduce-scatter the input; in an all-to-all,
 // both (what the rank sends to each rank, what it receives from each); every rank has an output in a broadcast, and
@@ -2184,7 +2171,9 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     }
     CollectiveOp c;
     c.op = compileOp(dtype, inputRegions, outputRegions, reduce, /*cpuSync=*/false, /*collectiveOp=*/false);
-    // The tensors come from any allocator: below, each rank puts those that its peers cannot reach where they can
+    // The tensors come from any allocator: below, each rank puts those that other ranks reach into moodist's memory.
+    // A rank maps every tensor of another that is in one of its edges (whichever rank executes it), so in a group of
+    // more than one rank, every input and output counts
     c.op->requireMoodistMemory = false;
     CHECK(c.op->inputs.size() == (inputParts != 0 ? 1 : 0) && c.op->outputs.size() == (outputParts != 0 ? 1 : 0));
     CHECK(c.op->inputCopies.empty() && c.op->outputCopies.empty());
@@ -2192,9 +2181,7 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     const size_t numInputs = c.op->inputs.size();
     for (const auto& m : c.op->graph.remoteCudaTensorMappings) {
       if (m.tensorIndex < numInputs + c.op->outputs.size()) {
-        const size_t which = m.tensorIndex < numInputs ? 0 : 1;
-        c.shared[which] = true;
-        c.fabricMapped[which] |= !group->ipcAccess.at(m.rank);
+        c.shared[m.tensorIndex < numInputs ? 0 : 1] = true;
       }
     }
     if (c.op->anyRankNeedsRdma) {
@@ -2207,21 +2194,22 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
   CHECK(in.rows == 0 || op->inputs.at(0).bytes == in.rows * pitch);
   CHECK(out.rows == 0 || op->outputs.at(0).bytes == out.rows * pitch);
 
-  // This rank's tensors where they are, unless their parts need padding or are not one after the other, some rank
-  // cannot reach them there (moodist's memory and cudaMalloc's within a node, moodist's only across a multi-node
-  // NVLink fabric), or the kernel cannot take their address (16 bytes aligned): then through a buffer of the group's
-  // communication pool, which, when every rank does the same, is at the same offset on every rank, so that the op can
-  // still use NVLS. An all-to-all's input that overlaps its output goes through one too (in place, a rank's part for
-  // rank j would be where rank j's part for it goes).
+  // This rank's tensors where they are, unless their parts need padding or are not one after the other, other ranks
+  // reach them and they are not moodist's memory, or the kernel cannot take their address (16 bytes aligned): then
+  // through a buffer of the group's communication pool, which, when every rank does the same, is at the same offset on
+  // every rank, so that the op can still use NVLS. Other ranks reach moodist's memory only: its mappings and RDMA
+  // registrations are of memory that stays moodist's, while another allocator's (e.g. PyTorch's) could be freed and
+  // reused with the mappings of peers still open (undefined behavior for CUDA IPC) and its registrations holding the
+  // freed pages. In a group of more than one rank, other ranks reach every input and output (see above): every tensor
+  // of another allocator is copied, and the pool keeps the most memory that such buffers took at once (it never frees
+  // its slabs). An all-to-all's input that overlaps its output goes through one too (in place, a rank's part for rank
+  // j would be where rank j's part for it goes).
   const bool padded = n != numel;
   auto elsewhere = [&](size_t which, const CollectiveSide& s) {
     if (padded || !s.contiguous || (op->kernel && s.address() % 16 != 0)) {
       return true;
     }
-    if (allocator::owns(s.address())) {
-      return false;
-    }
-    return c.fabricMapped[which] || (c.shared[which] && !legacyIpcCapable(s.address()));
+    return c.shared[which] && !allocator::owns(s.address());
   };
   // Copies a side's parts into a buffer, or back
   auto copyParts = [&](uintptr_t dst, size_t dstPitch, uintptr_t src, size_t srcPitch, size_t rows) {
@@ -2301,6 +2289,10 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
       outAddress = outputBuffer.cudaPointer;
     }
   }
+
+  // (what other ranks reach is moodist's memory, see elsewhere; customOp does not check, requireMoodistMemory is off)
+  CHECK(in.rows == 0 || !c.shared[0] || allocator::owns(inAddress));
+  CHECK(out.rows == 0 || !c.shared[1] || allocator::owns(outAddress));
 
   // The op's tensors, of its shapes (an all-to-all's are matrices)
   std::array<TensorPtr, 2> tensors;

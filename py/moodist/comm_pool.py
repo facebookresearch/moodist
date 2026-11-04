@@ -34,8 +34,9 @@ def comm_empty(*size, dtype=None, group=None):
     The memory comes from moodist's CUDA allocator (in large slabs the pool keeps), and is usable on the current
     stream, like torch.empty's. The process group's allocate_tensor (which FSDP2 uses after
     set_allocate_memory_from_process_group_for_comm(True)) allocates from the same pool. The process group's own
-    collectives of CUDA tensors run as compile_op ops, so they use NVLS on such buffers too (and need no copies of them
-    across the nodes of an NVLink fabric, whose ranks can map no other memory).
+    collectives of CUDA tensors run as compile_op ops, so they use NVLS on such buffers too, and need no copies of them
+    (other ranks reach moodist's memory only: the collectives copy every tensor of another allocator, e.g. PyTorch's,
+    through such buffers, which the pool keeps the memory of).
 
     Args:
         size: The shape (ints, or one tuple / list / torch.Size).

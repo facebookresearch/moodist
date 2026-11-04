@@ -3,8 +3,9 @@ Tests for the process group's collectives of CUDA tensors, which run as compile_
 compiled at its first call): all-gather, reduce-scatter and all-reduce with every dtype and reduce op, sizes from 16
 bytes to several MiB per rank, in place and not, tensors from PyTorch's allocator, from the communication pool
 (comm_empty) and at addresses the kernel cannot take and sizes that are not a multiple of 16 bytes (which go through
-buffers of the pool), on several streams, PREMUL_SUM; broadcast, reduce, scatter, gather and all-to-all (from and to
-several roots, lists of tensors); and avg of CPU tensors.
+buffers of the pool), PyTorch's tensors freed after their calls (their memory comes back), on several streams,
+PREMUL_SUM; broadcast, reduce, scatter, gather and all-to-all (from and to several roots, lists of tensors); and avg
+of CPU tensors.
 """
 
 import torch
@@ -342,6 +343,41 @@ def test_pg_collectives_misaligned(ctx: TestContext):
         all_gather(ctx, pg, numel, torch.float32, 1, alloc=alloc, in_place=True)
         reduce_scatter(ctx, pg, numel, torch.float32, "sum", 2, alloc=alloc)
         all_reduce(ctx, pg, numel, torch.float32, "max", 3, alloc=alloc)
+
+
+@test
+def test_pg_freed_tensors_memory(ctx: TestContext):
+    """Collectives of tensors from PyTorch's allocator, which are freed after their calls and their memory returned to
+    the driver (torch.cuda.empty_cache: cudaFree), round after round: the GPU memory comes back. Other ranks reach
+    moodist's memory only (such tensors go through buffers of the communication pool), so no peer's mapping and no
+    RDMA registration holds memory that PyTorch freed."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    # (with moodist's allocator enabled in this process, e.g. by another test module loaded into it, every tensor would
+    # be moodist's, and the test would pass whatever the process group did)
+    ctx.assert_true(
+        torch.cuda.get_allocator_backend() != "moodist", "needs PyTorch's allocator, but moodist's is enabled"
+    )
+    numel = 16 << 20  # 64 MiB of float32
+    part = numel // ctx.world_size
+
+    def collectives(salt):
+        all_reduce(ctx, pg, numel, torch.float32, "sum", salt)
+        reduce_scatter(ctx, pg, part, torch.float32, "sum", salt)
+        all_gather(ctx, pg, part, torch.float32, salt)
+        broadcast(ctx, pg, numel, torch.float32, 0, salt)
+        reduce(ctx, pg, numel, torch.float32, "sum", ctx.world_size - 1, salt)
+        all_to_all(ctx, pg, part, torch.float32, salt)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    collectives(0)  # (compiles the ops: their tuning, scratch and communication buffers are moodist's, which it keeps)
+    free = torch.cuda.mem_get_info()[0]
+    for salt in range(1, 9):
+        collectives(salt)
+    lost = free - torch.cuda.mem_get_info()[0]
+    # (what peers' mappings or the NICs' registrations of the freed tensors held would be gigabytes)
+    raise_on_all_ranks(ctx, pg, f"{lost >> 20} MiB of GPU memory did not come back" if lost > (256 << 20) else "")
 
 
 @test
