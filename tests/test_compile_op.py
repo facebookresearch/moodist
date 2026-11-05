@@ -410,6 +410,33 @@ def test_compile_op_wait_other_stream(ctx: TestContext, device: str):
 
 
 @test_cpu_cuda
+def test_compile_op_alternating_tensors(ctx: TestContext, device: str):
+    """An op launched with two sets of tensors, in the order A A B B A B. A launch takes the peers' addresses of its
+    tensors from the op's last launch if its tensors are at the same addresses, else from the IPC mapper: a launch that
+    took the previous launch's would have the peers write into the other set."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+    n = 4096
+    inputs = [TensorRegion(offset=[ctx.rank * n], shape=[n], device=device)]
+    outputs = [TensorRegion(offset=[0], shape=[n * ctx.world_size], device=device)]
+    op = moodist.compile_op(pg, dtype=torch.float32, inputs=inputs, outputs=outputs)
+    sets = [(torch.empty(n, device=device), torch.empty(n * ctx.world_size, device=device)) for _ in range(2)]
+    expected_rows = torch.arange(ctx.world_size, dtype=torch.float32, device=device).unsqueeze(1)
+    for i, k in enumerate([0, 0, 1, 1, 0, 1]):
+        inp, out = sets[k]
+        other = sets[1 - k][1]
+        inp.fill_(float(i * 100 + ctx.rank))
+        out.zero_()
+        other.fill_(-1.0)
+        op([inp], [out]).wait()
+        got = out.view(ctx.world_size, n)
+        ok = torch.equal(got, (expected_rows + i * 100).expand_as(got)) and bool((other == -1.0).all())
+        all_ranks_ok(ctx, pg, ok, f"launch {i} (set {k}): wrong output, or the other set's output written")
+
+
+@test_cpu_cuda
 def test_compile_op_reuse(ctx: TestContext, device: str):
     """Test that compiled op can be reused multiple times."""
     if ctx.world_size < 2:

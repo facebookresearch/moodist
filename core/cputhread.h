@@ -365,6 +365,16 @@ struct CustomOpDescriptor {
   // collectives (see runCollective in processgroup.cc), which take tensors from any allocator.
   bool requireMoodistMemory = true;
 
+  // The tensor addresses of the op's last launch, the addresses at which the peers map them and their NVLS words: the
+  // next launch with the same tensor addresses takes these (see launchCustomOp in processgroup.cc)
+  struct LaunchCache {
+    bool valid = false;
+    std::vector<uintptr_t> tensorAddrs;
+    std::vector<uintptr_t> mappedAddrs;
+    std::vector<uint64_t> nvlsTensors;
+  };
+  LaunchCache launchCache;
+
   compile_op::Graph graph;
   std::shared_ptr<KernelHandle> kernelHandle;
   std::unique_ptr<CompiledKernel> kernel;

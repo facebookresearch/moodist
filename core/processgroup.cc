@@ -2477,17 +2477,32 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
       tensorAddrs.push_back(v->data());
     }
 
+    // The addresses at which the peers map this rank's tensors (which the kernel publishes to them, see
+    // generateKernel), and in NVLS ops the tensors' NVLS identities and multicast addresses: those of the op's last
+    // launch if its tensors are at the same addresses (moodist never unmaps memory it has shared, an address stays in
+    // its pool slab, and the op's tensor sizes are fixed), else from the IPC mapper and the allocator (a lookup per
+    // peer and tensor: about 1.5 us per launch with 31 peers on GB300)
+    CustomOpDescriptor::LaunchCache& cache = op->launchCache;
+    const bool cached = cache.valid && cache.tensorAddrs.size() == tensorAddrs.size() &&
+                        std::equal(tensorAddrs.begin(), tensorAddrs.end(), cache.tensorAddrs.begin());
     Vector<uintptr_t> mappedAddrs(op->graph.remoteCudaTensorMappings.size());
-    for (size_t i : indices(mappedAddrs)) {
-      auto& m = op->graph.remoteCudaTensorMappings[i];
-      auto& tensor =
-          m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
-      ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
-    }
-    ipcMapper->wait();
-    // (the kernel publishes these to the peers tagged in bits 62 and 63, see generateKernel)
-    for (uintptr_t a : mappedAddrs) {
-      CHECK(a >> 62 == 0);
+    if (cached) {
+      std::copy(cache.mappedAddrs.begin(), cache.mappedAddrs.end(), mappedAddrs.begin());
+    } else {
+      cache.valid = false;
+      for (size_t i : indices(mappedAddrs)) {
+        auto& m = op->graph.remoteCudaTensorMappings[i];
+        auto& tensor = m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size())
+                                                        : inputTDs.at(m.tensorIndex);
+        ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
+      }
+      ipcMapper->wait();
+      // (the kernel publishes these to the peers tagged in bits 62 and 63, see generateKernel)
+      for (uintptr_t a : mappedAddrs) {
+        CHECK(a >> 62 == 0);
+      }
+      cache.tensorAddrs.assign(tensorAddrs.begin(), tensorAddrs.end());
+      cache.mappedAddrs.assign(mappedAddrs.begin(), mappedAddrs.end());
     }
 
     if (tensorAddrs.empty()) {
@@ -2503,15 +2518,22 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
     if (op->kernelHandle->nvls) {
       KernelHandle& kh = *op->kernelHandle;
       nvlsTensors.resize(2 * std::max(inputTDs.size() + outputTDs.size(), (size_t)1));
-      size_t n = 0;
-      for (auto* list : {&inputTDs, &outputTDs}) {
-        for (auto& v : *list) {
-          std::tie(nvlsTensors[n], nvlsTensors[n + 1]) = nvlsIdentity(&*group, v->data(), v->bytes());
-          n += 2;
+      if (cached) {
+        CHECK(cache.nvlsTensors.size() == nvlsTensors.size());
+        std::copy(cache.nvlsTensors.begin(), cache.nvlsTensors.end(), nvlsTensors.begin());
+      } else {
+        size_t n = 0;
+        for (auto* list : {&inputTDs, &outputTDs}) {
+          for (auto& v : *list) {
+            std::tie(nvlsTensors[n], nvlsTensors[n + 1]) = nvlsIdentity(&*group, v->data(), v->bytes());
+            n += 2;
+          }
         }
+        cache.nvlsTensors.assign(nvlsTensors.begin(), nvlsTensors.end());
       }
       nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
     }
+    cache.valid = true;
 
     CompileOpCopyParameters params{.stepValue = stepValue,
         .concurrencyIndex = concurrencyIndex,

@@ -384,8 +384,9 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   use, whose parity goes on (with parity 0 as a tag of 0, a launch after a reset could read a cleared entry as an
   address of 0 when a peer was late).
 - **Address exchange**: on entry, each rank writes the addresses at which its peers have mapped its tensors (from
-  the IPC mapper, per call) into the peers' `addresses` tables. A rank that needs a remote node's address spins
-  until the entry carries the current parity.
+  the IPC mapper, per call, unless the op's last launch had its tensors at the same addresses: then that launch's,
+  `CustomOpDescriptor::launchCache`) into the peers' `addresses` tables. A rank that needs a remote node's address
+  spins until the entry carries the current parity.
 - **Copy engine** (`PipeRing`): each block runs pipelines (the first lane of each of its first warps; one by
   default), each with a ring of stages of 32 KiB in shared memory. A chunk is copied by a TMA bulk load into a
   stage (completion via mbarrier), then one TMA bulk store of the stage per destination, so a multicast edge is
