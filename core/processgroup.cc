@@ -195,8 +195,10 @@ struct CollectiveKey {
 struct EventSerializer {
   Event event;
   CUstream stream;
-  EventSerializer(CUevent event, CUstream stream) : event(Event::reference(event)), stream(stream) {
-    this->event.wait(stream);
+  EventSerializer(CUevent event, CUstream stream, bool wait = true) : event(Event::reference(event)), stream(stream) {
+    if (wait) {
+      this->event.wait(stream);
+    }
   }
   ~EventSerializer() {
     event.record(stream);
@@ -406,6 +408,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
   uint32_t nextConcurrencyIndex = 0;
 
   std::array<Event, maxConcurrency> concurrencyEvents;
+  // The stream (its id, see cuStreamGetId) of each concurrency slot's last op with CUDA tensors (see launchCustomOp)
+  std::array<std::optional<unsigned long long>, maxConcurrency> concurrencyStreams;
 
   std::vector<SharedPtr<Queue>> queues;
 
@@ -2432,10 +2436,17 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
 
   // On the stream, the whole op (cpuIn write, kernel, cpuOut wait) comes after the previous op of its concurrency
   // slot, whose cpuIn and cpuOut it reuses (otherwise an op on another stream could satisfy this op's cpuIn wait
-  // before this stream gets here), and records the slot's event when done, which wait() uses (see customOp).
+  // before this stream gets here), and records the slot's event when done, which wait() uses (see customOp). If the
+  // slot's previous op ran on this stream, stream order already puts this op after it: no wait (about 0.3 us of host
+  // time and 0.25 us of the GPU's per op on GB300). Streams by id: a destroyed stream's handle can come back, with
+  // its last ops still to run; its id does not. (Only these ops wait for and record the slot's event.)
   std::optional<EventSerializer> slotSerializer;
   if (anyCuda) {
-    slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream);
+    unsigned long long streamId = 0;
+    const bool known = cudaApi.streamGetId && cudaApi.streamGetId(stream, &streamId) == CUDA_SUCCESS;
+    const bool wait = !known || concurrencyStreams[concurrencyIndex] != streamId;
+    slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream, wait);
+    concurrencyStreams[concurrencyIndex] = known ? std::optional(streamId) : std::nullopt;
   }
   // Whether this launch writes the kernel's profile (MOODIST_COMPILE_OP_PROFILE, see generateKernel)
   bool dumpProfile = false;

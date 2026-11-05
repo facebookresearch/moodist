@@ -591,7 +591,8 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   sees the complete op, RDMA part included, so ops without CPU tensors are done for the caller when the call
   returns. Each op uses one of 16 concurrency slots (its own `cpuIn`, `cpuOut` and step value exchange areas): on
   the stream, the whole op waits for the slot's event, which the slot's previous op (possibly on another stream)
-  recorded when it was done, and records it when done itself. `wait()` (or dropping the future) makes the current
+  recorded when it was done (not if that op ran on the same stream, by its stream id: stream order already puts this
+  op after it), and records it when done itself. `wait()` (or dropping the future) makes the current
   stream wait for that event if it is not the op's stream (if the slot has been reused since, for the later op,
   which only waits longer), then makes the output copies. Ops with CPU tensors, or compiled with `cpu_sync=True`,
   block in `wait()` until the CPU thread is done. (moodist's process group collectives also run on the current

@@ -424,6 +424,7 @@ using cuStreamCreateWithPriority_t = CUresult (*)(CUstream* phStream, unsigned i
 using cuStreamDestroy_t = CUresult (*)(CUstream hStream);
 using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
 using cuStreamWaitEvent_t = CUresult (*)(CUstream hStream, CUevent hEvent, unsigned int flags);
+using cuStreamGetId_t = CUresult (*)(CUstream hStream, unsigned long long* streamId);
 using cuStreamWaitValue32_t = CUresult (*)(CUstream stream, CUdeviceptr addr, cuuint32_t value, unsigned int flags);
 using cuStreamBatchMemOp_t = CUresult (*)(
     CUstream stream, unsigned int count, CUstreamBatchMemOpParams* paramArray, unsigned int flags);
@@ -538,6 +539,7 @@ struct CudaApi {
   cuStreamDestroy_t streamDestroy = nullptr;
   cuStreamSynchronize_t streamSynchronize = nullptr;
   cuStreamWaitEvent_t streamWaitEvent = nullptr;
+  cuStreamGetId_t streamGetId = nullptr; // optional (CUDA 12.0 and later): null if the driver has none
   cuStreamWaitValue32_t streamWaitValue32 = nullptr;
   cuStreamBatchMemOp_t streamBatchMemOp = nullptr;
 
