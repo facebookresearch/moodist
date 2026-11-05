@@ -409,6 +409,49 @@ def test_pg_collectives_streams(ctx: TestContext):
 
 
 @test
+def test_pg_synchronous_calls(ctx: TestContext):
+    """Synchronous calls (asyncOp false: torch.distributed's async_op=False) return no Work, as ProcessGroupNCCL's do,
+    asynchronous ones (the default) a Work; the results are on the stream either way."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    numel = 1000
+    c10d = torch._C._distributed_c10d
+    for async_op in (False, True):
+        salt = 20 + int(async_op)
+
+        def call(what, fn, options, **fields):
+            opts = options()
+            for k, v in fields.items():
+                setattr(opts, k, v)
+            opts.asyncOp = async_op
+            work = fn(opts)
+            ok = (work is not None) == async_op
+            raise_on_all_ranks(ctx, pg, "" if ok else f"{what} with asyncOp {async_op} returned {work!r}")
+            if work is not None:
+                work.wait()
+
+        t = rank_values(ctx.rank, 0, numel, torch.float32, salt)
+        call("allreduce", lambda o: pg.allreduce([t], o), c10d.AllreduceOptions, reduceOp=dist.ReduceOp.SUM)
+        check(ctx, pg, f"all-reduce, asyncOp {async_op}", t, reference("sum", n, 0, numel, salt), "sum", torch.float32)
+        out = torch.empty(n * numel, device="cuda")
+        inp = rank_values(ctx.rank, ctx.rank * numel, numel, torch.float32, salt)
+        call("_allgather_base", lambda o: pg._allgather_base(out, inp, o), c10d.AllgatherOptions)
+        expected = torch.cat([rank_values(r, r * numel, numel, torch.float64, salt) for r in range(n)])
+        check(ctx, pg, f"all-gather, asyncOp {async_op}", out, expected, "sum", torch.float32)
+        inp = rank_values(ctx.rank, 0, n * numel, torch.float32, salt)
+        out = torch.empty(numel, device="cuda")
+        call("_reduce_scatter_base", lambda o: pg._reduce_scatter_base(out, inp, o), c10d.ReduceScatterOptions,
+             reduceOp=dist.ReduceOp.SUM)
+        check(ctx, pg, f"reduce-scatter, asyncOp {async_op}", out, reference("sum", n, ctx.rank * numel, numel, salt),
+              "sum", torch.float32)
+        t = rank_values(ctx.rank, 0, numel, torch.float32, salt)
+        call("broadcast", lambda o: pg.broadcast([t], o), c10d.BroadcastOptions, rootRank=0)
+        check(ctx, pg, f"broadcast, asyncOp {async_op}", t, rank_values(0, 0, numel, torch.float64, salt), "sum",
+              torch.float32)
+
+
+@test
 def test_pg_collectives_unaligned_sizes(ctx: TestContext):
     """Sizes that are not a multiple of 16 bytes (the ops of the next multiple, through buffers whose rows are padded),
     in place too, and at addresses that are not aligned either."""

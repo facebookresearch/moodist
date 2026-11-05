@@ -85,6 +85,18 @@ struct WorkImpl : c10d::Work {
   }
 };
 
+// The Work a collective returns: none for a synchronous call (asyncOp false, i.e. torch.distributed's
+// async_op=False), as ProcessGroupNCCL does. moodist's collectives run on the caller's current stream (those of CPU
+// tensors are done when the call returns), so the caller has nothing to wait for, and the Work, its Python object and
+// torch.distributed's call of its wait() would only cost host time (about 2.7 us per call on GB300).
+template<typename Options, typename... Tensors>
+static c10::intrusive_ptr<Work> makeWork(const Options& opts, Tensors&&... tensors) {
+  if (!opts.asyncOp) {
+    return {};
+  }
+  return c10::make_intrusive<WorkImpl>(std::forward<Tensors>(tensors)...);
+}
+
 // ============================================================================
 // Construction
 // ============================================================================
@@ -112,7 +124,7 @@ namespace wrapper {
 // ============================================================================
 
 c10::intrusive_ptr<Work> ProcessGroup::allgather(std::vector<std::vector<at::Tensor>>& outputTensors,
-    std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions&) {
+    std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts) {
   TORCH_CHECK(outputTensors.size() == 1 && inputTensors.size() == 1);
   // Flatten output list to contiguous buffer for core
   auto& input = inputTensors[0];
@@ -127,26 +139,26 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather(std::vector<std::vector<at::Ten
     outputTensors[0][i].copy_(output[i]);
   }
 
-  return c10::make_intrusive<WorkImpl>(outputTensors[0]);
+  return makeWork(opts, outputTensors[0]);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::_allgather_base(
-    at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions&) {
+    at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
   TensorPtr inPtr = wrapTensor(input);
   TensorPtr outPtr = wrapTensor(output);
   coreApi.processGroupAllGather(handle.get(), outPtr, inPtr, getStream(input));
-  return c10::make_intrusive<WorkImpl>(output);
+  return makeWork(opts, output);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allgather_into_tensor_coalesced(
-    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllgatherOptions&) {
+    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllgatherOptions& opts) {
   TORCH_CHECK(outputs.size() == inputs.size());
   for (size_t i = 0; i < inputs.size(); ++i) {
     TensorPtr inPtr = wrapTensor(inputs[i]);
     TensorPtr outPtr = wrapTensor(outputs[i]);
     coreApi.processGroupAllGather(handle.get(), outPtr, inPtr, getStream(inputs[i]));
   }
-  return c10::make_intrusive<WorkImpl>(outputs);
+  return makeWork(opts, outputs);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter(std::vector<at::Tensor>& outputs,
@@ -168,7 +180,7 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter(std::vector<at::Tensor>& o
   TensorPtr outPtr = wrapTensor(outputs[0]);
   coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, toReduceOp(opts.reduceOp), getStream(input),
       extractPremulValue(opts.reduceOp, input.scalar_type()));
-  return c10::make_intrusive<WorkImpl>(outputs);
+  return makeWork(opts, outputs);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allgather_coalesced(std::vector<std::vector<at::Tensor>>& outputLists,
@@ -190,7 +202,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allgather_coalesced(std::vector<std::vect
   for (auto& list : outputLists) {
     results.insert(results.end(), list.begin(), list.end());
   }
-  return c10::make_intrusive<WorkImpl>(results);
+  return makeWork(opts, results);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
@@ -199,7 +211,7 @@ c10::intrusive_ptr<Work> ProcessGroup::_reduce_scatter_base(
   TensorPtr outPtr = wrapTensor(output);
   coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, toReduceOp(opts.reduceOp), getStream(input),
       extractPremulValue(opts.reduceOp, input.scalar_type()));
-  return c10::make_intrusive<WorkImpl>(output);
+  return makeWork(opts, output);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
@@ -212,7 +224,7 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_tensor_coalesced(
     coreApi.processGroupReduceScatter(handle.get(), outPtr, inPtr, op, getStream(inputs[i]),
         extractPremulValue(opts.reduceOp, inputs[i].scalar_type()));
   }
-  return c10::make_intrusive<WorkImpl>(outputs);
+  return makeWork(opts, outputs);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
@@ -221,7 +233,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce(std::vector<at::Tensor>& tensor
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupAllreduce(
       handle.get(), tPtr, toReduceOp(opts.reduceOp), getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
-  return c10::make_intrusive<WorkImpl>(t);
+  return makeWork(opts, t);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::allreduce_coalesced(
@@ -232,7 +244,7 @@ c10::intrusive_ptr<Work> ProcessGroup::allreduce_coalesced(
     coreApi.processGroupAllreduce(
         handle.get(), tPtr, op, getStream(t), extractPremulValue(opts.reduceOp, t.scalar_type()));
   }
-  return c10::make_intrusive<WorkImpl>(tensors);
+  return makeWork(opts, tensors);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
@@ -240,7 +252,7 @@ c10::intrusive_ptr<Work> ProcessGroup::broadcast(std::vector<at::Tensor>& tensor
   auto& t = tensors[0];
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupBroadcast(handle.get(), tPtr, opts.rootRank, getStream(t));
-  return c10::make_intrusive<WorkImpl>(t);
+  return makeWork(opts, t);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
@@ -249,7 +261,7 @@ c10::intrusive_ptr<Work> ProcessGroup::reduce(std::vector<at::Tensor>& tensors, 
   TensorPtr tPtr = wrapTensor(t);
   coreApi.processGroupReduce(handle.get(), tPtr, opts.rootRank, toReduceOp(opts.reduceOp), getStream(t),
       extractPremulValue(opts.reduceOp, t.scalar_type()));
-  return c10::make_intrusive<WorkImpl>(t);
+  return makeWork(opts, t);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::barrier(const c10d::BarrierOptions&) {
@@ -272,7 +284,7 @@ c10::intrusive_ptr<Work> ProcessGroup::scatter(
   TensorPtr outPtr = wrapTensor(output);
   coreApi.processGroupScatter(handle.get(), inPtrs, outPtr, opts.rootRank, getStream(output));
 
-  return c10::make_intrusive<WorkImpl>(output);
+  return makeWork(opts, output);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::gather(
@@ -290,11 +302,11 @@ c10::intrusive_ptr<Work> ProcessGroup::gather(
   TensorPtr inPtr = wrapTensor(input);
   coreApi.processGroupGather(handle.get(), outPtrs, inPtr, opts.rootRank, getStream(input));
 
-  return c10::make_intrusive<WorkImpl>(outputs.empty() ? std::vector<torch::Tensor>{} : outputs[0]);
+  return makeWork(opts, outputs.empty() ? std::vector<torch::Tensor>{} : outputs[0]);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::alltoall(
-    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllToAllOptions&) {
+    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllToAllOptions& opts) {
   std::vector<TensorPtr> outPtrs;
   std::vector<TensorPtr> inPtrs;
   for (auto& t : outputs) {
@@ -306,11 +318,11 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall(
 
   coreApi.processGroupAllToAll(handle.get(), outPtrs, inPtrs, getStream(inputs[0]));
 
-  return c10::make_intrusive<WorkImpl>(outputs);
+  return makeWork(opts, outputs);
 }
 
 c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(at::Tensor& output, at::Tensor& input,
-    std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions&) {
+    std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts) {
   // Equal splits along dim 0 (none given, or all the same): an op per pattern of uneven splits would compile for
   // nearly every call
   const int64_t n = getSize();
@@ -345,7 +357,7 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(at::Tensor& output, at::Ten
 
   coreApi.processGroupAllToAll(handle.get(), outPtrs, inPtrs, getStream(input));
 
-  return c10::make_intrusive<WorkImpl>(output);
+  return makeWork(opts, output);
 }
 
 // ============================================================================
