@@ -576,16 +576,17 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 
 - `customOp` checks the tensors (shape, dtype, device; for user ops also that CUDA tensors come from the moodist
   CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies (`narrow().contiguous()`)
-  and allocates the output copies (copied into the outputs when the op is waited on), then calls `launchCustomOp` for
-  the rest of this section. The process group's collectives call `launchCustomOp` directly, with the tensor data of
-  the addresses they have checked (no temporary tensors, no future: their tensors are CUDA tensors, so the op is done
-  for the caller once queued). `launchCustomOp` allocates the scratch tensor of reductions across NVLink domains or in
-  two phases (from moodist's allocator, on the op's stream, freed at the end of the call: its memory is reused only by
-  work after the op on that stream, which comes after the op's RDMA transfers into and from it, as the CPU thread
-  starts once the stream has reached the op). A rank with a scratch tensor counts as one with CUDA tensors, also if it
-  has no tensors of its own in the op (a partial rank need not have any): its stream must wait for the CPU thread too,
-  or a new tensor on the stream could take the scratch tensor's memory while other ranks still read from it or write
-  into it.
+  and allocates the output copies (copied into the outputs when the op is waited on), both from PyTorch's current
+  CUDA allocator, which for user ops must therefore be moodist's (checked like the tensors, see Known issues), then
+  calls `launchCustomOp` for the rest of this section. The process group's collectives call `launchCustomOp`
+  directly, with the tensor data of the addresses they have checked (no temporary tensors, no future: their tensors
+  are CUDA tensors, so the op is done for the caller once queued). `launchCustomOp` allocates the scratch tensor of
+  reductions across NVLink domains or in two phases (from moodist's allocator, on the op's stream, freed at the end
+  of the call: its memory is reused only by work after the op on that stream, which comes after the op's RDMA
+  transfers into and from it, as the CPU thread starts once the stream has reached the op). A rank with a scratch
+  tensor counts as one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need not have
+  any): its stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch tensor's
+  memory while other ranks still read from it or write into it.
 - Stream order (a rank with CUDA tensors, when any rank needs RDMA): write `cpuIn` = stepValue (the CPU thread may
   start), then the kernel, then wait until `cpuOut` >= stepValue.
 - The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream
@@ -1352,6 +1353,17 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   `barrier.cta.sync.aligned`), see Reductions in the kernel; the copy loops' barriers are still aligned. Compiling the
   PTX with a ptxas of moodist's own (the nvPTXCompiler library of a known version) instead of the driver's would make
   the compiler independent of the driver.
+- The input and output copies of user ops (of pieces that are not contiguous in a tensor, see Runtime) come from
+  PyTorch's current CUDA allocator, and other ranks map them (or RDMA registers them) like the tensors, so `customOp`
+  requires them to be moodist's memory: an op that needs copies raises unless `moodist.enable_cuda_allocator()` has
+  made moodist's allocator PyTorch's (tensors from `comm_empty` alone are not enough). Before that check, other
+  allocators' copies were mapped with CUDA IPC within a node, mappings that outlive PyTorch's frees (and that the
+  launch cache, see Address exchange, would reuse for a new allocation at the same address), registered over RDMA
+  (keeping freed pages), and could not be mapped by fabric peers at all. TODO: allocate the copies from moodist's
+  allocator, on the op's stream. Their free must then also wait for the stream that copies the output copies back in
+  `wait()`: today a `wait()` on a stream other than the op's copies back from memory that its allocator (PyTorch's,
+  or moodist's through PyTorch's) has already handed back to the op's stream, where later allocations can take it
+  before that copy runs.
 
 ### Performance
 - The process group's broadcast and reduce of large tensors are bound by the root (see the table under Performance

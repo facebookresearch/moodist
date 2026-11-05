@@ -132,6 +132,10 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
     Requirements for CUDA tensors:
         - They must be allocated by the moodist CUDA allocator (call
           moodist.enable_cuda_allocator() before allocating them). Checked when the op runs.
+        - Pieces that are not contiguous in a tensor go through contiguous copies from
+          PyTorch's current CUDA allocator: ops with such pieces need
+          moodist.enable_cuda_allocator() even if their tensors come from moodist.comm_empty
+          (RuntimeError when the op runs otherwise).
         - CUDA transfers between NVLink peers (including multi-node NVLink fabrics such as
           NVL72) must use sizes and offsets that are multiples of 16 bytes, and 16-byte aligned
           tensors. Sizes and offsets are checked here (RuntimeError on all ranks), tensor

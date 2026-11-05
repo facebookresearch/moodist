@@ -2728,6 +2728,24 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     result->holdTensors.push_back(std::move(t));
   }
 
+  // The copies come from PyTorch's current CUDA allocator, and other ranks map them (or RDMA registers them) like the
+  // tensors themselves, so in user ops they must be moodist's memory too (see checkTensors): they are once
+  // moodist.enable_cuda_allocator() has made moodist's allocator PyTorch's, but not when only the tensors are moodist's
+  // (e.g. from moodist.comm_empty). Checked before the launch takes the op's step value. TODO: take the copies from
+  // moodist's allocator (see docs/internals/compile_op.md, Known issues).
+  auto checkCopies = [&](const char* what, std::span<const TensorDataPtr> copies, const auto& of) {
+    for (size_t i : indices(copies)) {
+      const auto& t = copies[i];
+      REQUIRE(!op->requireMoodistMemory || !t->isCuda || t->bytes() == 0 || allocator::owns(t->data()),
+          "moodist: custom op %s[%d] has a piece that is not contiguous in it, which the op copies through a "
+          "contiguous tensor from PyTorch's CUDA allocator; such ops need that to be the moodist CUDA allocator "
+          "(call moodist.enable_cuda_allocator(); tensors from moodist.comm_empty alone are not enough)",
+          what, of[i].index);
+    }
+  };
+  checkCopies("input", std::span<const TensorDataPtr>(inputTDs).subspan(nInputs), op->inputCopies);
+  checkCopies("output", std::span<const TensorDataPtr>(outputTDs).subspan(nOutputs), op->outputCopies);
+
   // The op (with the op's stream current on the group's device for the kernel's launch, see launchCustomOp)
   CustomOpLaunch launch;
   {
