@@ -69,6 +69,9 @@ if(MOODIST_BUILD_WRAPPER)
     message(FATAL_ERROR "Failed to detect PyTorch version")
   endif()
   message(STATUS "PyTorch version: ${TORCH_VERSION}")
+  if (TORCH_VERSION VERSION_LESS 2.10)
+    message(FATAL_ERROR "moodist requires PyTorch 2.10 or later (found ${TORCH_VERSION})")
+  endif()
 
   # Detect _GLIBCXX_USE_CXX11_ABI from PyTorch (affects std::string layout)
   set(USE_CXX1_ABI "auto" CACHE STRING "_GLIBCXX_USE_CXX11_ABI option that pytorch was built with")
@@ -272,7 +275,6 @@ target_include_directories(_C PRIVATE
 target_compile_definitions(_C PRIVATE
   _GLIBCXX_USE_CXX11_ABI=${USE_CXX1_ABI}
   MOODIST_WRAPPER  # Enable direct wrapper function calls in _C.so
-  $<$<VERSION_LESS:${TORCH_VERSION},2.10>:MOODIST_THPVARIABLE_MAYBEOWNED>
 )
 
 set_property(TARGET _C PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)

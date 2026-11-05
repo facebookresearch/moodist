@@ -78,11 +78,9 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
     return 1.0;
   }
   virtual void setMemoryFraction(double fraction, c10::DeviceIndex device) override {}
-#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 10)
   virtual std::vector<c10::cuda::CUDACachingAllocator::StreamSegmentSize> getExpandableSegmentSizes(c10::DeviceIndex) {
     return {};
   }
-#endif
   virtual void enable(bool) {}
   virtual bool isEnabled() const {
     return true;

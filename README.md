@@ -12,7 +12,7 @@ Moodist also supports some additional communication primitives and collectives, 
 
 ## Requirements
 
-Moodist requires Linux, CUDA>=12.4, PyTorch>=2.6, and an InfiniBand or similar supported RDMA device.
+Moodist requires Linux, CUDA>=12.4, PyTorch>=2.10, and an InfiniBand or similar supported RDMA device.
 
 CUDA and the RDMA drivers must be installed separately. Building from source requires the CUDA toolkit to be installed.
 
