@@ -12,7 +12,8 @@ work. For the user-facing API, see [api/compile_op.md](../api/compile_op.md).
 - `core/ptx_codegen.cc` - `generateKernel`: the copy kernel of one rank, as PTX
 - `core/ptx.h`, `core/ptx.cc` - the PTX DSL (typed registers and operators, scope macros for control flow)
 - `core/compile_op_kernel.cc` - PTX JIT (`cuModuleLoadDataEx`)
-- `core/processgroup.cc` - `compileOpFull` (sets up the compile context), `customOp` (runs a compiled op)
+- `core/processgroup.cc` - `compileOpFull` (sets up the compile context), `customOp` (checks a compiled op's
+  tensors and runs it), `launchCustomOp` (its launch, which the process group's collectives call directly)
 - `core/cputhread.cc` - `WorkCustom`: the RDMA part of an op, run by the CPU thread
 
 ## Data model
@@ -573,14 +574,17 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 ## Runtime (`customOp`, `WorkCustom`)
 
 - `customOp` checks the tensors (shape, dtype, device; for user ops also that CUDA tensors come from the moodist
-  CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies
-  (`narrow().contiguous()`), allocates the output copies (copied into the outputs when the op is waited on) and the
-  scratch tensor of reductions across NVLink domains or in two phases (from moodist's allocator, on the op's stream,
-  freed at the end of the call: its memory is reused only by work after the op on that stream, which comes after the
-  op's RDMA transfers into and from it, as the CPU thread starts once the stream has reached the op). A rank with a
-  scratch tensor counts as one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need
-  not have any): its stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch
-  tensor's memory while other ranks still read from it or write into it.
+  CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies (`narrow().contiguous()`)
+  and allocates the output copies (copied into the outputs when the op is waited on), then calls `launchCustomOp` for
+  the rest of this section. The process group's collectives call `launchCustomOp` directly, with the tensor data of
+  the addresses they have checked (no temporary tensors, no future: their tensors are CUDA tensors, so the op is done
+  for the caller once queued). `launchCustomOp` allocates the scratch tensor of reductions across NVLink domains or in
+  two phases (from moodist's allocator, on the op's stream, freed at the end of the call: its memory is reused only by
+  work after the op on that stream, which comes after the op's RDMA transfers into and from it, as the CPU thread
+  starts once the stream has reached the op). A rank with a scratch tensor counts as one with CUDA tensors, also if it
+  has no tensors of its own in the op (a partial rank need not have any): its stream must wait for the CPU thread too,
+  or a new tensor on the stream could take the scratch tensor's memory while other ranks still read from it or write
+  into it.
 - Stream order (a rank with CUDA tensors, when any rank needs RDMA): write `cpuIn` = stepValue (the CPU thread may
   start), then the kernel, then wait until `cpuOut` >= stepValue.
 - The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream

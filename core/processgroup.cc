@@ -711,6 +711,20 @@ struct ProcessGroupImpl : api::ProcessGroup {
   SharedPtr<ApiFuture> customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs, size_t nInputs,
       TensorPtr* outputs, size_t nOutputs, CUstream stream, double scale = 1.0);
 
+  // launchCustomOp - the launch of a compiled custom operation: customOp's after its checks of the tensors and its
+  // copies, and the process group's collectives' (see runCollective). inputTDs: the inputs, then the input copies;
+  // outputTDs: the outputs, then the output copies. If the op has a kernel, the caller makes the op's stream current
+  // on the group's device (the kernel's launch takes the current context). Returns the op's future (done once queued
+  // on the stream if no tensor is a CPU tensor), its concurrency slot and whether it has CUDA tensors (a scratch
+  // tensor counts: see launchCustomOp).
+  struct CustomOpLaunch {
+    FutureImplSharedPtr future;
+    uint32_t concurrencyIndex = 0;
+    bool anyCuda = false;
+  };
+  CustomOpLaunch launchCustomOp(const std::shared_ptr<CustomOpDescriptor>& op, std::vector<TensorDataPtr> inputTDs,
+      std::vector<TensorDataPtr> outputTDs, CUstream stream, double scale);
+
   // executeLocalOnly - fast path for all-local custom ops (no CPU thread)
   SharedPtr<ApiFuture> executeLocalOnly(const CustomOpDescriptor& op, std::vector<TensorDataPtr>& inputs,
       std::vector<TensorDataPtr>& outputs, TensorPtr* inputPtrs, size_t nInputs, TensorPtr* outputPtrs, size_t nOutputs,
@@ -2294,23 +2308,32 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
   CHECK(in.rows == 0 || !c.shared[0] || allocator::owns(inAddress));
   CHECK(out.rows == 0 || !c.shared[1] || allocator::owns(outAddress));
 
-  // The op's tensors, of its shapes (an all-to-all's are matrices)
-  std::array<TensorPtr, 2> tensors;
-  size_t numInputs = 0;
-  size_t numOutputs = 0;
+  // The op's tensor data, of its shapes (an all-to-all's are matrices), from the addresses, to launchCustomOp directly:
+  // without customOp's checks, which the tensors pass (CUDA tensors on the group's device, see CollectiveSide; the op's
+  // dtype, shapes and sizes; moodist's memory where other ranks reach it, aligned for the kernel, see elsewhere), and
+  // without a future to wait for (CUDA tensors only: the op is done for the caller once queued on the stream, which sg
+  // makes current). Temporary tensors and the future took ~2-3 us per call on GB300.
+  auto tensorData = [&](uintptr_t address, const compile_op::Graph::TensorDescr& d) {
+    TensorDataPtr t = TensorDataPtr::make();
+    t->dtype = static_cast<int>(dtype);
+    t->shape.resize(d.shape.size());
+    for (size_t i : indices(d.shape)) {
+      t->shape[i] = d.shape[i];
+    }
+    t->dataPtr = address;
+    t->dataBytes = d.bytes;
+    t->isCuda = true;
+    return t;
+  };
+  std::vector<TensorDataPtr> inputTDs;
+  std::vector<TensorDataPtr> outputTDs;
   if (in.rows != 0) {
-    const auto& shape = op->inputs[0].shape;
-    tensors[numInputs++] =
-        TensorPtr::from_blob((void*)inAddress, std::span<const int64_t>(shape.data(), shape.size()), dtype, device);
+    inputTDs.push_back(tensorData(inAddress, op->inputs[0]));
   }
   if (out.rows != 0) {
-    const auto& shape = op->outputs[0].shape;
-    tensors[numInputs + numOutputs++] =
-        TensorPtr::from_blob((void*)outAddress, std::span<const int64_t>(shape.data(), shape.size()), dtype, device);
+    outputTDs.push_back(tensorData(outAddress, op->outputs[0]));
   }
-  SharedPtr<ApiFuture> future = customOp(op, &tensors[0], numInputs, &tensors[numInputs], numOutputs, stream, scale);
-  // (CUDA tensors only: the op is done for the caller once queued on the stream, see customOp)
-  futureWait(future.get());
+  launchCustomOp(op, std::move(inputTDs), std::move(outputTDs), stream, scale);
 
   if (out.rows != 0 && outAddress != out.address()) {
     copyOut(out, outAddress);
@@ -2343,17 +2366,200 @@ std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t b
 } // namespace
 
 // ============================================================================
-// ProcessGroupImpl::customOp - execute a compiled custom operation
+// ProcessGroupImpl::launchCustomOp - launch a compiled custom operation
 // ============================================================================
 
-SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs,
-    size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream, double scale) {
+ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::shared_ptr<CustomOpDescriptor>& op,
+    std::vector<TensorDataPtr> inputTDs, std::vector<TensorDataPtr> outputTDs, CUstream stream, double scale) {
   std::unique_lock l(threadUnsafe);
 
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
   CHECK(stepValue < 0x80000000);
 
+  sync(stepValue);
+
+  // for (size_t peerIndex : group->peerIndices) {
+  //   peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
+  // }
+  // for (size_t peerIndex : group->peerIndices) {
+  //   peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
+  // }
+  // freePendingIpcEvents();
+
+  auto future = FutureImplSharedPtr::make();
+
+  bool anyCuda = false;
+  bool anyCpu = false;
+
+  for (auto& t : inputTDs) {
+    anyCuda |= t->isCuda;
+    anyCpu |= !t->isCuda;
+  }
+  for (auto& t : outputTDs) {
+    anyCuda |= t->isCuda;
+    anyCpu |= !t->isCuda;
+  }
+
+  // Reductions across NVLink domains or in two phases: the scratch tensor (see CustomOpDescriptor::scratchBytes), the
+  // last tensor. From moodist's CUDA allocator (the ranks of a multi-node NVLink fabric can map no other memory), on
+  // the op's stream, and freed at the end of this call: it is then reused only by work after the op on that stream,
+  // which comes after the RDMA transfers into and from it (the stream waits for the CPU thread, see below, which
+  // starts once the stream has reached the op). It is a CUDA tensor of the op like the others: a rank can have one
+  // without any tensors of its own (one that computes a partial result of its domain's inputs for another domain, see
+  // crossDomainReductions), and its stream must still wait for the CPU thread, or the scratch tensor could be reused
+  // while other ranks still read or write it.
+  AllocatedBuffer scratch;
+  if (op->scratchBytes != 0) {
+    scratch = allocateCudaBuffer(op->scratchBytes, stream, group->deviceIndex);
+    TensorDataPtr td = TensorDataPtr::make();
+    td->dtype = static_cast<int>(op->dtype);
+    td->shape.resize(1);
+    td->shape[0] = (int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype));
+    td->dataPtr = scratch.cudaPointer;
+    td->dataBytes = op->scratchBytes;
+    td->isCuda = true;
+    anyCuda = true;
+    outputTDs.push_back(std::move(td));
+  }
+
+  bool anyRdma = op->anyRankNeedsRdma;
+
+  if (op->cpuSync) {
+    anyCpu = true;
+    CHECK(anyRdma);
+  }
+
+  // On the stream, the whole op (cpuIn write, kernel, cpuOut wait) comes after the previous op of its concurrency
+  // slot, whose cpuIn and cpuOut it reuses (otherwise an op on another stream could satisfy this op's cpuIn wait
+  // before this stream gets here), and records the slot's event when done, which wait() uses (see customOp).
+  std::optional<EventSerializer> slotSerializer;
+  if (anyCuda) {
+    slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream);
+  }
+  // Whether this launch writes the kernel's profile (MOODIST_COMPILE_OP_PROFILE, see generateKernel)
+  bool dumpProfile = false;
+
+  if (anyCuda && anyRdma) {
+    memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
+    memFlush(stream);
+  }
+
+  // Without CPU tensors the op is stream-ordered, RDMA part included: the stream waits for cpuOut below, and wait()
+  // only joins another current stream to it (see customOp). Blocking the caller until the CPU thread is done would
+  // make every op synchronous: the CPU thread then runs dry and sleeps after each op, and every op pays for waking
+  // it up again on every rank (occasionally milliseconds).
+  if (!anyCpu) {
+    future->done = 1;
+  }
+
+  if (op->kernel) {
+    IpcMapper* ipcMapper = &*group->ipcMapper;
+    std::shared_lock unmapLock(unmapMemoryMutex);
+
+    Vector<uintptr_t> tensorAddrs;
+    tensorAddrs.reserve(inputTDs.size() + outputTDs.size());
+    for (auto& v : inputTDs) {
+      tensorAddrs.push_back(v->data());
+    }
+    for (auto& v : outputTDs) {
+      tensorAddrs.push_back(v->data());
+    }
+
+    Vector<uintptr_t> mappedAddrs(op->graph.remoteCudaTensorMappings.size());
+    for (size_t i : indices(mappedAddrs)) {
+      auto& m = op->graph.remoteCudaTensorMappings[i];
+      auto& tensor =
+          m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
+      ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
+    }
+    ipcMapper->wait();
+    // (the kernel publishes these to the peers tagged in bits 62 and 63, see generateKernel)
+    for (uintptr_t a : mappedAddrs) {
+      CHECK(a >> 62 == 0);
+    }
+
+    if (tensorAddrs.empty()) {
+      tensorAddrs.push_back(0);
+    }
+    if (mappedAddrs.empty()) {
+      mappedAddrs.push_back(0);
+    }
+    // NVLS (see generateKernel): the tensors' NVLS identities and multicast addresses, and the op's step counter
+    // before this launch
+    uint32_t nvlsCounterBase = 0;
+    Vector<uint64_t> nvlsTensors;
+    if (op->kernelHandle->nvls) {
+      KernelHandle& kh = *op->kernelHandle;
+      nvlsTensors.resize(2 * std::max(inputTDs.size() + outputTDs.size(), (size_t)1));
+      size_t n = 0;
+      for (auto* list : {&inputTDs, &outputTDs}) {
+        for (auto& v : *list) {
+          std::tie(nvlsTensors[n], nvlsTensors[n + 1]) = nvlsIdentity(&*group, v->data(), v->bytes());
+          n += 2;
+        }
+      }
+      nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
+    }
+
+    CompileOpCopyParameters params{.stepValue = stepValue,
+        .concurrencyIndex = concurrencyIndex,
+        .nvlsCounterBase = nvlsCounterBase,
+        .scale = scale};
+    // (with the parameter buffer, the slot's copy is filled first: the slot's previous op, whose kernel read it, is
+    // done on the GPU before this one starts, see slotSerializer)
+    launchCompileOpKernel(
+        *op->kernelHandle, *op->kernel, op->config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
+
+    // (the profile is written below, once the CPU thread has the op's RDMA part: the kernel may wait for it)
+    dumpProfile = op->kernelHandle->profilingBytesPerThread != 0 && op->kernelHandle->profilingCountdown-- == 0;
+  }
+
+  if (anyCuda && anyRdma) {
+    memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
+    memFlush(stream);
+  }
+  slotSerializer.reset();
+
+  if (anyRdma) {
+    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
+    QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
+    e->task = taskCustom;
+    e->stepValue = stepValue;
+    e->concurrencyIndex = concurrencyIndex;
+    e->sd = &sd;
+    e->op = op;
+    e->future = future;
+    e->anyCuda = anyCuda;
+    e->anyCpu = anyCpu;
+
+    CHECK(e->inputs.empty());
+    CHECK(e->outputs.empty());
+
+    e->inputs = std::move(inputTDs);
+    e->outputs = std::move(outputTDs);
+
+    // For the trace (entries are reused, so always set)
+    e->enqueueTime = getProfilingEnabled() ? std::chrono::system_clock::now() : std::chrono::system_clock::time_point{};
+    e->enqueueCpu = e->enqueueTime.time_since_epoch().count() != 0 ? sched_getcpu() : -1;
+    group->cpuThread->enqueue(e);
+  }
+  if (dumpProfile) {
+    // (on the group's device, as the launch was)
+    StreamGuard sg(stream, group->deviceIndex);
+    CHECK_CU(cuCtxSynchronize());
+    dumpProfiling(&*group, op);
+  }
+
+  return {std::move(future), concurrencyIndex, anyCuda};
+}
+
+// ============================================================================
+// ProcessGroupImpl::customOp - execute a compiled custom operation
+// ============================================================================
+
+SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescriptor> op, TensorPtr* inputs,
+    size_t nInputs, TensorPtr* outputs, size_t nOutputs, CUstream stream, double scale) {
   if (nInputs != op->inputs.size()) {
     throw std::runtime_error(
         fmt::sprintf("moodist: custom op expected %d inputs, but got %d", op->inputs.size(), nInputs));
@@ -2457,30 +2663,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   //       *op, inputTDs, outputTDs, inputs, nInputs, outputs, nOutputs, concurrencyIndex, stepValue, stream);
   // }
 
-  sync(stepValue);
-
-  // for (size_t peerIndex : group->peerIndices) {
-  //   peerWriteDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0, 0);
-  // }
-  // for (size_t peerIndex : group->peerIndices) {
-  //   peerWaitDyn(concurrencyIndex, peerIndex, opTypeCompileOpLocal, stepValue, 0);
-  // }
-  // freePendingIpcEvents();
-
-  auto future = FutureImplSharedPtr::make();
-
-  bool anyCuda = false;
-  bool anyCpu = false;
-
-  for (auto& t : inputTDs) {
-    anyCuda |= t->isCuda;
-    anyCpu |= !t->isCuda;
-  }
-  for (auto& t : outputTDs) {
-    anyCuda |= t->isCuda;
-    anyCpu |= !t->isCuda;
-  }
-
   // Create and return ApiFuture early so we can store tensors in it
   auto result = makeShared<ApiFuture>();
 
@@ -2494,8 +2676,6 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     }
     t = t.contiguous();
     auto td = getTensorDataFromPtr(t, group.get());
-    anyCuda |= td->isCuda;
-    anyCpu |= !td->isCuda;
     inputTDs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
@@ -2510,165 +2690,24 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     TensorPtr t = TensorPtr::empty(shape64, op->dtype, outputs[x.index].device_index());
     outputCopyTensors.emplace_back(t, x.index);
     auto td = getTensorDataFromPtr(t, group.get());
-    anyCuda |= td->isCuda;
-    anyCpu |= !td->isCuda;
     outputTDs.push_back(std::move(td));
     // Keep tensor alive
     result->holdTensors.push_back(std::move(t));
   }
 
-  // Reductions across NVLink domains or in two phases: the scratch tensor (see CustomOpDescriptor::scratchBytes), the
-  // last tensor. From moodist's CUDA allocator (the ranks of a multi-node NVLink fabric can map no other memory), on
-  // the op's stream, and freed at the end of this call: it is then reused only by work after the op on that stream,
-  // which comes after the RDMA transfers into and from it (the stream waits for the CPU thread, see below, which
-  // starts once the stream has reached the op). It is a CUDA tensor of the op like the others: a rank can have one
-  // without any tensors of its own (one that computes a partial result of its domain's inputs for another domain, see
-  // crossDomainReductions), and its stream must still wait for the CPU thread, or the scratch tensor could be reused
-  // while other ranks still read or write it.
-  AllocatedBuffer scratch;
-  if (op->scratchBytes != 0) {
-    scratch = allocateCudaBuffer(op->scratchBytes, stream, group->deviceIndex);
-    TensorDataPtr td = TensorDataPtr::make();
-    td->dtype = static_cast<int>(op->dtype);
-    td->shape.resize(1);
-    td->shape[0] = (int64_t)(op->scratchBytes / wrapperApi.dtypeSize(op->dtype));
-    td->dataPtr = scratch.cudaPointer;
-    td->dataBytes = op->scratchBytes;
-    td->isCuda = true;
-    anyCuda = true;
-    outputTDs.push_back(std::move(td));
-  }
-
-  bool anyRdma = op->anyRankNeedsRdma;
-
-  if (op->cpuSync) {
-    anyCpu = true;
-    CHECK(anyRdma);
-  }
-
-  // On the stream, the whole op (cpuIn write, kernel, cpuOut wait) comes after the previous op of its concurrency
-  // slot, whose cpuIn and cpuOut it reuses (otherwise an op on another stream could satisfy this op's cpuIn wait
-  // before this stream gets here), and records the slot's event when done, which wait() uses (see below).
-  std::optional<EventSerializer> slotSerializer;
-  if (anyCuda) {
-    slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream);
-  }
-  // Whether this launch writes the kernel's profile (MOODIST_COMPILE_OP_PROFILE, see generateKernel)
-  bool dumpProfile = false;
-
-  if (anyCuda && anyRdma) {
-    memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
-    memFlush(stream);
-  }
-
-  // Without CPU tensors the op is stream-ordered, RDMA part included: the stream waits for cpuOut below, and wait()
-  // only joins another current stream to it (see below). Blocking the caller until the CPU thread is done would
-  // make every op synchronous: the CPU thread then runs dry and sleeps after each op, and every op pays for waking
-  // it up again on every rank (occasionally milliseconds).
-  if (!anyCpu) {
-    future->done = 1;
-  }
-
-  if (op->kernel) {
-    StreamGuard sg(stream, group->deviceIndex);
-    IpcMapper* ipcMapper = &*group->ipcMapper;
-    std::shared_lock unmapLock(unmapMemoryMutex);
-
-    Vector<uintptr_t> tensorAddrs;
-    tensorAddrs.reserve(inputTDs.size() + outputTDs.size());
-    for (auto& v : inputTDs) {
-      tensorAddrs.push_back(v->data());
+  // The op (with the op's stream current on the group's device for the kernel's launch, see launchCustomOp)
+  CustomOpLaunch launch;
+  {
+    std::optional<StreamGuard> sg;
+    if (op->kernel) {
+      sg.emplace(stream, group->deviceIndex);
     }
-    for (auto& v : outputTDs) {
-      tensorAddrs.push_back(v->data());
-    }
-
-    Vector<uintptr_t> mappedAddrs(op->graph.remoteCudaTensorMappings.size());
-    for (size_t i : indices(mappedAddrs)) {
-      auto& m = op->graph.remoteCudaTensorMappings[i];
-      auto& tensor =
-          m.tensorIndex >= inputTDs.size() ? outputTDs.at(m.tensorIndex - inputTDs.size()) : inputTDs.at(m.tensorIndex);
-      ipcMapper->requestAddressRank(m.rank, tensor->data(), tensor->bytes(), &mappedAddrs[i]);
-    }
-    ipcMapper->wait();
-    // (the kernel publishes these to the peers tagged in bits 62 and 63, see generateKernel)
-    for (uintptr_t a : mappedAddrs) {
-      CHECK(a >> 62 == 0);
-    }
-
-    if (tensorAddrs.empty()) {
-      tensorAddrs.push_back(0);
-    }
-    if (mappedAddrs.empty()) {
-      mappedAddrs.push_back(0);
-    }
-    // NVLS (see generateKernel): the tensors' NVLS identities and multicast addresses, and the op's step counter
-    // before this launch
-    uint32_t nvlsCounterBase = 0;
-    Vector<uint64_t> nvlsTensors;
-    if (op->kernelHandle->nvls) {
-      KernelHandle& kh = *op->kernelHandle;
-      nvlsTensors.resize(2 * std::max(inputTDs.size() + outputTDs.size(), (size_t)1));
-      size_t n = 0;
-      for (auto* list : {&inputTDs, &outputTDs}) {
-        for (auto& v : *list) {
-          std::tie(nvlsTensors[n], nvlsTensors[n + 1]) = nvlsIdentity(&*group, v->data(), v->bytes());
-          n += 2;
-        }
-      }
-      nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
-    }
-
-    CompileOpCopyParameters params{.stepValue = stepValue,
-        .concurrencyIndex = concurrencyIndex,
-        .nvlsCounterBase = nvlsCounterBase,
-        .scale = scale};
-    // (with the parameter buffer, the slot's copy is filled first: the slot's previous op, whose kernel read it, is
-    // done on the GPU before this one starts, see slotSerializer)
-    launchCompileOpKernel(
-        *op->kernelHandle, *op->kernel, op->config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
-
-    // (the profile is written below, once the CPU thread has the op's RDMA part: the kernel may wait for it)
-    dumpProfile = op->kernelHandle->profilingBytesPerThread != 0 && op->kernelHandle->profilingCountdown-- == 0;
+    launch = launchCustomOp(op, std::move(inputTDs), std::move(outputTDs), stream, scale);
   }
+  const uint32_t concurrencyIndex = launch.concurrencyIndex;
+  const bool anyCuda = launch.anyCuda;
 
-  if (anyCuda && anyRdma) {
-    memWaitGeq(group->cpuOutBuffer.cuda(concurrencyIndex), stepValue);
-    memFlush(stream);
-  }
-  slotSerializer.reset();
-
-  if (anyRdma) {
-    StreamData& sd = group->getCpuStreamData(concurrencyIndex);
-    QueueEntryCustom* e = group->cpuThread->freelistCustom.pop();
-    e->task = taskCustom;
-    e->stepValue = stepValue;
-    e->concurrencyIndex = concurrencyIndex;
-    e->sd = &sd;
-    e->op = op;
-    e->future = future;
-    e->anyCuda = anyCuda;
-    e->anyCpu = anyCpu;
-
-    CHECK(e->inputs.empty());
-    CHECK(e->outputs.empty());
-
-    e->inputs = std::move(inputTDs);
-    e->outputs = std::move(outputTDs);
-
-    // For the trace (entries are reused, so always set)
-    e->enqueueTime = getProfilingEnabled() ? std::chrono::system_clock::now() : std::chrono::system_clock::time_point{};
-    e->enqueueCpu = e->enqueueTime.time_since_epoch().count() != 0 ? sched_getcpu() : -1;
-    group->cpuThread->enqueue(e);
-  }
-  if (dumpProfile) {
-    // (on the group's device, as the launch was)
-    StreamGuard sg(stream, group->deviceIndex);
-    CHECK_CU(cuCtxSynchronize());
-    dumpProfiling(&*group, op);
-  }
-
-  result->impl = std::move(future);
+  result->impl = std::move(launch.future);
   // Hold original tensors alive
   for (size_t i = 0; i < nInputs; ++i) {
     result->holdTensors.push_back(inputs[i]);
