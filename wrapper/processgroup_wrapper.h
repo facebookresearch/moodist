@@ -9,6 +9,8 @@
 #include "api/types.h"
 #include "torch_includes.h"
 
+#include <torch/version.h>
+
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -167,6 +169,29 @@ public:
 
   c10::intrusive_ptr<Work> alltoall(std::vector<at::Tensor>& outputTensors, std::vector<at::Tensor>& inputTensors,
       const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
+
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 13)
+  // torch 2.13's names of _allgather_base, _reduce_scatter_base, alltoall_base, allgather_into_tensor_coalesced and
+  // reduce_scatter_tensor_coalesced, which torch.distributed calls (all_gather_into_tensor, reduce_scatter_tensor,
+  // all_to_all_single and the coalescing manager). c10d's defaults go through its dispatcher to the backend (4-5 us per
+  // call on GB300); these call the methods above directly.
+  c10::intrusive_ptr<Work> all_gather_single(at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
+
+  c10::intrusive_ptr<Work> reduce_scatter_single(at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
+
+  c10::intrusive_ptr<Work> all_to_all_single(at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes,
+      const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
+
+  c10::intrusive_ptr<Work> all_gather_single_coalesced(std::vector<at::Tensor>& outputTensors,
+      std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override;
+
+  c10::intrusive_ptr<Work> reduce_scatter_single_coalesced(std::vector<at::Tensor>& outputTensors,
+      std::vector<at::Tensor>& inputTensors,
+      const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
+#endif
 
   c10::intrusive_ptr<Work> send(std::vector<at::Tensor>& tensors, int dstRank, int tag) override {
     throw std::runtime_error("send not supported");

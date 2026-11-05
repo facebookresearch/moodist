@@ -452,6 +452,48 @@ def test_pg_synchronous_calls(ctx: TestContext):
 
 
 @test
+def test_pg_single_names(ctx: TestContext):
+    """torch 2.13's names, which torch.distributed calls (all_gather_single, reduce_scatter_single, all_to_all_single and
+    the coalesced forms): moodist overrides them (its methods directly, not through c10d's dispatcher)."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    if not hasattr(pg, "all_gather_single"):
+        return  # (torch before 2.13)
+    n = ctx.world_size
+    numel = 1000
+    rs = torch._C._distributed_c10d.ReduceScatterOptions()
+    rs.reduceOp = dist.ReduceOp.SUM
+
+    def gathered(start, count, salt):
+        return torch.cat([rank_values(r, r * start, count, torch.float64, salt) for r in range(n)])
+
+    out = torch.empty(n * numel, device="cuda")
+    pg.all_gather_single(out, rank_values(ctx.rank, ctx.rank * numel, numel, torch.float32, 30)).wait()
+    check(ctx, pg, "all_gather_single", out, gathered(numel, numel, 30), "sum", torch.float32)
+    out = torch.empty(numel, device="cuda")
+    pg.reduce_scatter_single(out, rank_values(ctx.rank, 0, n * numel, torch.float32, 31), rs).wait()
+    check(ctx, pg, "reduce_scatter_single", out, reference("sum", n, ctx.rank * numel, numel, 31), "sum",
+          torch.float32)
+    out = torch.empty(n * numel, device="cuda")
+    pg.all_to_all_single(out, rank_values(ctx.rank, 0, n * numel, torch.float32, 32), [], []).wait()
+    expected = torch.cat([rank_values(r, ctx.rank * numel, numel, torch.float64, 32) for r in range(n)])
+    check(ctx, pg, "all_to_all_single", out, expected, "sum", torch.float32)
+    outs = [torch.empty(n * numel, device="cuda"), torch.empty(n * 64, device="cuda")]
+    ins = [rank_values(ctx.rank, ctx.rank * numel, numel, torch.float32, 33),
+           rank_values(ctx.rank, ctx.rank * 64, 64, torch.float32, 34)]
+    pg.all_gather_single_coalesced(outs, ins).wait()
+    check(ctx, pg, "all_gather_single_coalesced 0", outs[0], gathered(numel, numel, 33), "sum", torch.float32)
+    check(ctx, pg, "all_gather_single_coalesced 1", outs[1], gathered(64, 64, 34), "sum", torch.float32)
+    outs = [torch.empty(numel, device="cuda"), torch.empty(64, device="cuda")]
+    ins = [rank_values(ctx.rank, 0, n * numel, torch.float32, 35), rank_values(ctx.rank, 0, n * 64, torch.float32, 36)]
+    pg.reduce_scatter_single_coalesced(outs, ins, rs).wait()
+    check(ctx, pg, "reduce_scatter_single_coalesced 0", outs[0], reference("sum", n, ctx.rank * numel, numel, 35),
+          "sum", torch.float32)
+    check(ctx, pg, "reduce_scatter_single_coalesced 1", outs[1], reference("sum", n, ctx.rank * 64, 64, 36), "sum",
+          torch.float32)
+
+
+@test
 def test_pg_collectives_unaligned_sizes(ctx: TestContext):
     """Sizes that are not a multiple of 16 bytes (the ops of the next multiple, through buffers whose rows are padded),
     in place too, and at addresses that are not aligned either."""

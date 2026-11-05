@@ -360,6 +360,33 @@ c10::intrusive_ptr<Work> ProcessGroup::alltoall_base(at::Tensor& output, at::Ten
   return makeWork(opts, output);
 }
 
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 13)
+c10::intrusive_ptr<Work> ProcessGroup::all_gather_single(
+    at::Tensor& output, at::Tensor& input, const c10d::AllgatherOptions& opts) {
+  return _allgather_base(output, input, opts);
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_single(
+    at::Tensor& output, at::Tensor& input, const c10d::ReduceScatterOptions& opts) {
+  return _reduce_scatter_base(output, input, opts);
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::all_to_all_single(at::Tensor& output, at::Tensor& input,
+    std::vector<int64_t>& outputSplitSizes, std::vector<int64_t>& inputSplitSizes, const c10d::AllToAllOptions& opts) {
+  return alltoall_base(output, input, outputSplitSizes, inputSplitSizes, opts);
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::all_gather_single_coalesced(
+    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::AllgatherOptions& opts) {
+  return allgather_into_tensor_coalesced(outputs, inputs, opts);
+}
+
+c10::intrusive_ptr<Work> ProcessGroup::reduce_scatter_single_coalesced(
+    std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs, const c10d::ReduceScatterOptions& opts) {
+  return reduce_scatter_tensor_coalesced(outputs, inputs, opts);
+}
+#endif
+
 // ============================================================================
 // Other methods
 // ============================================================================
