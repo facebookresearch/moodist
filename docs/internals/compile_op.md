@@ -720,14 +720,17 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
 - Communication pools (`allocatorCommPoolCreate`; per group, `Group::getCommPool`; `moodist.comm_empty` and the
   process group's `allocate_tensor`): allocations get logical offsets that depend only on the sequence of
   allocations and frees of the pool, so that ranks that allocate the same buffers in the same order get the same
-  offsets. The pool places them with the allocator's region machinery (best fit, lowest offset first) in logical
-  coordinates; memory freed while streams other than the allocation's still used it (record_stream) carries an
-  event per stream, and an allocation of it on another stream waits for those events on the GPU, not on the host
-  (which would make the placement depend on timing). The memory comes from the allocator's pool in slabs of at least
-  256 MiB (one 2 MiB aligned allocation each, at any address, never freed), each at its own logical range with a 2
-  MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new slab into its
-  domain's multicast object when it adds it (before handing out memory in it), and the kernel's address exchange
-  orders that before any peer's multicast stores to it.
+  offsets. The pool places them like the allocator's other pools (see the top of allocator.cc), in logical
+  coordinates: freed memory goes to a free list of the stream it was allocated on, an allocation takes the best fit
+  (lowest offset first) from its stream's list, else from memory no stream has used, else from a new slab, so streams
+  never wait for each other's memory and nothing depends on timing (only once the device is out of memory does the
+  pool share freed memory between streams, preferring memory whose GPU work has completed: offsets can then differ
+  between ranks, which only costs NVLS). Memory freed while other streams still used it (record_stream) carries an
+  event per stream, which an allocation of it waits for on the GPU. The memory comes from the allocator's pool in
+  slabs of at least 256 MiB (one 2 MiB aligned allocation each, at any address, never freed), each at its own logical
+  range with a 2 MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new
+  slab into its domain's multicast object when it adds it (before handing out memory in it), and the kernel's address
+  exchange orders that before any peer's multicast stores to it.
 - Process group collectives (`ProcessGroupImpl::runCollective` in processgroup.cc): the all-gather, reduce-scatter,
   all-reduce (in place), broadcast, reduce (in place on the root), scatter, gather and all-to-all of CUDA tensors run as
   compile_op ops, one per collective and shape (`CollectiveKey`: the collective, the dtype, the reduce op (sum, avg,

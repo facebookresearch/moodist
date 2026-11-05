@@ -172,6 +172,16 @@ static CoreApi coreApi = {
     // Communication pool
     .processGroupCommPoolAllocate = processGroupCommPoolAllocate,
     .commPoolOffset = allocatorAnyCommPoolOffset,
+
+    // CUDA allocator statistics and private pools
+    .cudaAllocatorGetStats = cudaAllocatorGetStats,
+    .cudaAllocatorSetMemoryLimit = cudaAllocatorSetMemoryLimit,
+    .cudaAllocatorResetStats = cudaAllocatorResetStats,
+    .cudaAllocatorBeginAllocateToPool = cudaAllocatorBeginAllocateToPool,
+    .cudaAllocatorEndAllocateToPool = cudaAllocatorEndAllocateToPool,
+    .cudaAllocatorReleasePool = cudaAllocatorReleasePool,
+    .cudaAllocatorCreateOrIncrefPool = cudaAllocatorCreateOrIncrefPool,
+    .cudaAllocatorGetPoolUseCount = cudaAllocatorGetPoolUseCount,
 };
 
 } // namespace moodist

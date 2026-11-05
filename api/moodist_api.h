@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "allocator_api.h" // CudaAllocatorStats, CudaAllocatorPoolFilter
 #include "moodist_version.h"
 #include "types.h" // For ApiHandle, api::Queue, etc.
 
@@ -277,6 +278,17 @@ struct CoreApi {
   void (*processGroupCommPoolAllocate)(api::ProcessGroup* pg, size_t bytes, CUstream stream, uintptr_t* outPtr,
       void** outCleanupCtx, int* outDeviceIndex);
   int64_t (*commPoolOffset)(uintptr_t address, size_t bytes);
+
+  // CUDA allocator statistics and private pools (see allocator_api.h)
+  void (*cudaAllocatorGetStats)(CudaAllocatorStats* out);
+  void (*cudaAllocatorSetMemoryLimit)(size_t bytes);
+  void (*cudaAllocatorResetStats)(bool peaks, bool accumulated);
+  void (*cudaAllocatorBeginAllocateToPool)(
+      uint64_t id0, uint64_t id1, CudaAllocatorPoolFilter filter, void* filterCtx, void (*destroyFilterCtx)(void*));
+  void (*cudaAllocatorEndAllocateToPool)(uint64_t id0, uint64_t id1);
+  void (*cudaAllocatorReleasePool)(uint64_t id0, uint64_t id1);
+  void (*cudaAllocatorCreateOrIncrefPool)(uint64_t id0, uint64_t id1);
+  int (*cudaAllocatorGetPoolUseCount)(uint64_t id0, uint64_t id1);
 };
 
 } // namespace moodist

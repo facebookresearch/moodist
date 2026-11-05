@@ -9,7 +9,7 @@ import moodist
 from framework import TestContext, test
 
 # Must equal moodist::kMoodistApiVersion in api/moodist_version.h.
-CORE_API_VERSION = 6
+CORE_API_VERSION = 7
 
 
 @test

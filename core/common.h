@@ -363,6 +363,10 @@ struct Event {
   }
 };
 
+// (allocator.cc: the CUDA allocator's free memory of a stream that is about to be destroyed goes to memory any stream
+// can use)
+void allocatorStreamDestroyed(CUstream stream);
+
 struct Stream {
   CUstream stream = nullptr;
   bool owning = false;
@@ -373,6 +377,7 @@ struct Stream {
   }
   ~Stream() {
     if (owning && stream) {
+      allocatorStreamDestroyed(stream);
       cuStreamDestroy(stream);
     }
   }

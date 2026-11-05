@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 // Forward declare CUstream in global namespace for cuda.h compatibility
@@ -31,29 +32,83 @@ struct CudaAllocation {
   int deviceIndex;  // Device index (may differ from input if auto-detected)
 };
 
+// Thrown by the allocation functions when the allocator cannot get enough memory from the device (other errors throw
+// std::runtime_error). The wrapper turns it into PyTorch's OutOfMemoryError.
+struct CudaOutOfMemoryError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 // CoreApi functions for CUDA allocator
 
-// Create a new CudaAllocatorImpl
+// The allocator is global: the CudaAllocatorImpl* arguments below are ignored (pass nullptr). These two remain for
+// the CoreApi layout: createCudaAllocatorImpl returns nullptr, setCudaAllocatorImpl does nothing.
 CudaAllocatorImpl* createCudaAllocatorImpl();
-
-// Set the global allocator impl pointer (for allocator::owns/mappedRegion)
 void setCudaAllocatorImpl(CudaAllocatorImpl* impl);
 
-// Allocate memory
+// Allocate memory for use on stream (see the top of allocator.cc): from the private pool that allocations on stream
+// are routed to (see cudaAllocatorBeginAllocateToPool), if any, else from the main pool
 // - bytes: number of bytes to allocate (will be aligned internally)
 // - stream: CUDA stream for allocation
 // - deviceIndex: CUDA device index (-1 to auto-detect from current context)
-// Returns: CudaAllocation with ptr, cleanupCtx, and actual deviceIndex
+// Returns: CudaAllocation with ptr, cleanupCtx, and actual deviceIndex. Throws CudaOutOfMemoryError if out of memory.
 CudaAllocation cudaAllocatorImplAllocate(CudaAllocatorImpl* impl, size_t bytes, CUstream stream, int deviceIndex);
 
-// Free memory using cleanup context (the main deallocation path)
-// - cleanupCtx: context returned from cudaAllocatorImplAllocate
-// - stream: the stream that was active when the allocation was last used
+// Free memory using cleanup context (the main deallocation path). The memory is reused only by work that comes after
+// the work queued by then on the stream it was allocated on and on the streams recorded for it
+// (cudaAllocatorImplRecordStream).
+// - cleanupCtx: context returned from cudaAllocatorImplAllocate (or allocatorCommPoolAllocate)
+// - stream: unused
 void cudaAllocatorImplFree(void* cleanupCtx, CUstream stream);
 
 // Record that a stream has used an allocation (for recordStream)
 // This must be called when torch's recordStream is invoked
 void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstream stream);
+
+// A statistic of the allocator, like PyTorch's c10::CachingAllocator::Stat: its current value, its peak, and the sums
+// of its increases and decreases (peak and sums since the last reset, see cudaAllocatorResetStats)
+struct CudaAllocatorStat {
+  int64_t current = 0;
+  int64_t peak = 0;
+  int64_t allocated = 0;
+  int64_t freed = 0;
+};
+
+// The allocator's statistics, for PyTorch's DeviceStats (torch.cuda.memory_stats). The arrays of 3 are for all
+// allocations, those of at most 1 MiB, and larger ones (PyTorch's aggregate, small pool and large pool).
+struct CudaAllocatorStats {
+  CudaAllocatorStat allocations[3];    // allocations of the main pool and of private pools, not freed yet
+  CudaAllocatorStat allocatedBytes[3]; // their sizes as allocated (rounded up, with alignment padding)
+  CudaAllocatorStat requestedBytes[3]; // their sizes as requested
+  CudaAllocatorStat reservedBytes;     // memory mapped (never unmapped)
+  CudaAllocatorStat segments;          // chunks mapped
+  int64_t numOoms = 0;                 // allocations that failed for lack of memory
+  int64_t numMaps = 0;                 // chunks mapped
+  size_t largestFreeBlock = 0;         // the largest free region (main pool and private pools)
+};
+
+void cudaAllocatorGetStats(CudaAllocatorStats* out);
+// The most memory the allocator maps (0: no limit, the default): once that much is mapped, allocations reuse free
+// memory (see pressure mode in allocator.cc) or fail. Memory mapped already stays mapped.
+void cudaAllocatorSetMemoryLimit(size_t bytes);
+// Resets the peaks to the current values, and/or the sums (and numOoms, numMaps) to zero
+void cudaAllocatorResetStats(bool peaks, bool accumulated);
+
+// Private pools: PyTorch's memory pools (MempoolId_t {id0, id1}), e.g. those of CUDA graphs. A pool exists from its
+// first cudaAllocatorCreateOrIncrefPool or cudaAllocatorBeginAllocateToPool (which count a use each) until
+// cudaAllocatorReleasePool has released all uses; its memory then goes back to the main pool once the graphs captured
+// into it are destroyed and their launches have completed, and memory still allocated from it goes back when freed.
+// Between cudaAllocatorBeginAllocateToPool and cudaAllocatorEndAllocateToPool, allocations on the streams that
+// filter(filterCtx, stream) returns true for come from the pool (PyTorch's beginAllocateToPool); the allocator calls
+// destroyFilterCtx(filterCtx) at the end. filter is called with the allocator's lock held. See allocator.cc ("CUDA
+// graphs") for allocations during stream capture.
+using CudaAllocatorPoolFilter = bool (*)(void* filterCtx, CUstream stream);
+void cudaAllocatorBeginAllocateToPool(
+    uint64_t id0, uint64_t id1, CudaAllocatorPoolFilter filter, void* filterCtx, void (*destroyFilterCtx)(void*));
+void cudaAllocatorEndAllocateToPool(uint64_t id0, uint64_t id1);
+void cudaAllocatorReleasePool(uint64_t id0, uint64_t id1);
+void cudaAllocatorCreateOrIncrefPool(uint64_t id0, uint64_t id1);
+// The pool's uses (0 if there is no such pool)
+int cudaAllocatorGetPoolUseCount(uint64_t id0, uint64_t id1);
 
 // Query if an address is owned by the allocator
 bool allocatorOwns(uintptr_t address);
@@ -94,12 +149,13 @@ bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outO
 bool allocatorSupportsFabric();
 
 // Communication pools. A communication pool places its allocations in a logical address space of its own,
-// deterministically: the same sequence of allocations and frees (sizes and order) gives the same logical offsets in
-// every process, whatever else the processes allocate and whenever their GPUs finish with freed memory. (An allocation
-// that reuses freed memory makes its stream wait on the GPU for the streams that used the memory, instead of the host
-// checking whether they have, which depends on timing.) The memory comes from the allocator's pool, in slabs: one
-// contiguous allocation per slab, at any address, each at its own range of logical offsets (never adjacent, so that no
-// allocation spans two slabs). A process group binds every slab at its logical offset into a multicast object of its
+// deterministically: the same sequence of allocations and frees (sizes, streams and order) gives the same logical
+// offsets in every process, whatever else the processes allocate and whenever their GPUs finish with freed memory.
+// (Freed memory is reused by allocations on the stream it was allocated on, else the pool takes new memory; see the
+// top of allocator.cc. Only once the device is out of memory does the pool reuse memory of other streams, preferring
+// memory whose GPU work has completed, which depends on timing.) The memory comes from the allocator's pool, in slabs:
+// one contiguous allocation per slab, at any address, each at its own range of logical offsets (never adjacent, so that
+// no allocation spans two slabs). A process group binds every slab at its logical offset into a multicast object of its
 // own (see allocatorCommPoolAddSlabListener), so that a buffer that all ranks of the group allocate in the same order
 // is at the same offset of that object on every rank. Slabs are never returned to the pool.
 struct CommPool;
