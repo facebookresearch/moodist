@@ -17,8 +17,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -1120,6 +1122,18 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
       };
       FabricId localFabricId;
       localFabricId.clique = localFabricInfo.cliqueId;
+      // MOODIST_FABRIC_CLIQUE=N replaces this GPU's NVLink clique id, which splits an NVLink domain into smaller ones
+      // (for tests across NVLink domains within one: set per node, the same on all its GPUs, e.g. domains of 16 GPUs
+      // in a domain of 32)
+      if (const char* e = std::getenv("MOODIST_FABRIC_CLIQUE"); e && *e) {
+        char* end = nullptr;
+        const unsigned long long clique = std::strtoull(e, &end, 10);
+        if (*end != 0 || *e == '-' || clique > std::numeric_limits<unsigned int>::max()) {
+          throw std::runtime_error(fmt::sprintf("MOODIST_FABRIC_CLIQUE=%s is not a clique id (a number)", e));
+        }
+        localFabricId.clique = (unsigned int)clique;
+        log.info("fabric clique %u from MOODIST_FABRIC_CLIQUE\n", localFabricId.clique);
+      }
       std::ranges::copy(localFabricInfo.clusterUuid, localFabricId.cluster.begin());
 
       CUmemFabricHandle fabricHandle;

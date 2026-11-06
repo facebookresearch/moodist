@@ -783,6 +783,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   itself. Same on all ranks.
 - `MOODIST_FABRIC=0` - ignore a multi-node NVLink fabric: compile_op reaches other nodes over RDMA, as between
   separate NVLink domains. Same on all ranks.
+- `MOODIST_FABRIC_CLIQUE=N` - this GPU's NVLink clique id instead of the fabric's: the GPUs with the same N in a domain
+  (and the same cluster) form a smaller domain, for tests across NVLink domains within one (not specific to
+  compile_op). Set per node, the same on all its GPUs; e.g. `$((NODE_RANK / 4 + 1))` makes domains of 4 nodes. Read
+  when a process group is created.
 - `MOODIST_IB_DATA_DIRECT=0` - ignore the Data Direct DMA functions of ConnectX-8 NICs (not specific to compile_op;
   see the RDMA bandwidth note under Performance).
 - `MOODIST_DUMP_KERNELS` - write each op's final PTX to `moodist-compile-op-kernels-rank<rank>-op<id>.ptx`.
