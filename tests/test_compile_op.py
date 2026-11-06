@@ -410,6 +410,50 @@ def test_compile_op_wait_other_stream(ctx: TestContext, device: str):
 
 
 @test_devices("cuda")
+def test_compile_op_wait_other_stream_output_copies(ctx: TestContext, device: str):
+    """An op with output copies (an all-gather of columns: each rank's piece is a block of the output's columns),
+    waited on another stream: wait() copies them into the output on that stream. The copies were allocated on the
+    op's stream and are freed with the future, so their memory must not go to new tensors on the op's stream before
+    that copy has read it. The waiting stream is held back (a sleep) while the op's stream fills new tensors of the
+    copies' size."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    rows, c = 64, 64
+    dtype = torch.float32
+    op = moodist.compile_op(
+        pg,
+        dtype=dtype,
+        inputs=[TensorRegion(offset=[0, ctx.rank * c], shape=[rows, c], device=device)],
+        outputs=[TensorRegion(offset=[0, 0], shape=[rows, n * c], device=device)],
+    )
+    x = torch.empty(rows, c, dtype=dtype, device=device)
+    out = torch.empty(rows, n * c, dtype=dtype, device=device)
+    main = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    wrong = 0
+    for i in range(5):
+        x.fill_(float(i * 100 + ctx.rank))
+        out.fill_(-1)
+        side.wait_stream(main)
+        future = op([x], [out])
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(20_000_000)
+            future.wait()
+        del future
+        junk = [torch.full((rows, c), -2.0, dtype=dtype, device=device) for _ in range(2 * n)]
+        main.wait_stream(side)
+        expected = torch.cat(
+            [torch.full((rows, c), float(i * 100 + r), dtype=dtype, device=device) for r in range(n)], dim=1
+        )
+        wrong += int((out != expected).sum().item())
+        del junk
+    all_ranks_ok(ctx, pg, wrong == 0, f"{wrong} wrong elements in the outputs")
+
+
+@test_devices("cuda")
 def test_compile_op_capture_error(ctx: TestContext, device: str):
     """An op with CUDA tensors cannot be captured in a CUDA graph yet: called while the stream captures (in
     torch.cuda.graph's default mode, global), it raises moodist's error before queuing anything, so the capture stays

@@ -2823,9 +2823,9 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   // wait() (and dropping the future without it): if the current stream is not the one the op ran on, it waits for
   // the slot's event, which the op recorded when done on its stream (kernel and RDMA part). If the slot has been
   // reused since, the event is a later op's, which only waits longer. On the op's own stream nothing is needed.
-  // Not while it captures a CUDA graph: the wait for an event recorded outside the capture would fail and invalidate
-  // the capture, and the copies back into the outputs (below) would be captured instead of run. It raises then,
-  // before any of it (futureDestroy logs the error of a future dropped meanwhile).
+  // Returns the current stream. Not while it captures a CUDA graph: the wait for an event recorded outside the
+  // capture would fail and invalidate the capture, and the copies back into the outputs (below) would be captured
+  // instead of run. It raises then, before any of it (futureDestroy logs the error of a future dropped meanwhile).
   auto selfPtr = share(this);
   auto joinCurrentStream = [selfPtr, concurrencyIndex, stream]() {
     CUstream current = wrapperApi.cudaGetCurrentStream();
@@ -2837,17 +2837,21 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
     if (current != stream) {
       selfPtr->concurrencyEvents[concurrencyIndex].wait(current);
     }
+    return current;
   };
   if (!outputCopyTensors.empty()) {
     // Need to copy temporary outputs back to original output tensors after completion
     // Capture copies of the output TensorPtrs since the outputs pointer may be invalid later
     std::vector<TensorPtr> outputsCopy(outputs, outputs + nOutputs);
-    result->waitDoneCallback = [joinCurrentStream, anyCuda, copyTensors = std::move(outputCopyTensors), op,
+    result->waitDoneCallback = [joinCurrentStream, anyCuda, stream, copyTensors = std::move(outputCopyTensors), op,
                                    outputsCopy = std::move(outputsCopy)]() {
+      CUstream current = stream;
       if (anyCuda) {
-        joinCurrentStream();
+        current = joinCurrentStream();
       }
-      // Copy temporary tensors back to the appropriate slices of original outputs
+      // Copy temporary tensors back to the appropriate slices of original outputs, on the current stream. The copies
+      // were allocated on the op's stream and are freed with the future: on another stream, the allocator must not
+      // hand a copy's memory out again (to work on the op's stream) before this reads it (record_stream)
       CHECK(copyTensors.size() == op->outputCopies.size());
       for (size_t i = 0; i < op->outputCopies.size(); ++i) {
         const auto& [src, outputIdx] = copyTensors[i];
@@ -2858,10 +2862,15 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
           dst = dst.narrow(j, x.offset[j], x.shape[j]);
         }
         dst.copy_(src);
+        if (current != stream && src.is_cuda()) {
+          TensorPtr(src).record_stream(current);
+        }
       }
     };
   } else if (anyCuda) {
-    result->waitDoneCallback = std::move(joinCurrentStream);
+    result->waitDoneCallback = [joinCurrentStream]() {
+      joinCurrentStream();
+    };
   }
 
   return result;

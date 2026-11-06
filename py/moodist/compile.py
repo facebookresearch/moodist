@@ -160,9 +160,10 @@ def compile_op(group, dtype=None, inputs=None, outputs=None, reduce=None, cpu_sy
                   all-reduce. CUDA tensors; float32, float64, float16, bfloat16, int32 and
                   int64 ("avg": the floating point types). All ranks must pass the same
                   value.
-        cpu_sync: If True, force CPU-side synchronization before CUDA operations.
-                  This avoids potential deadlocks when CUDA has device-wide syncs pending.
-                  Default is False.
+        cpu_sync: If True, the future's wait() blocks until moodist's CPU thread has
+                  finished the op's RDMA part (the transfers between NVLink domains), as
+                  for ops with CPU tensors. Only for ops with an RDMA part (one without
+                  currently fails when it runs). Default is False.
 
     Returns:
         A compiled custom operation object that can be used to efficiently execute the

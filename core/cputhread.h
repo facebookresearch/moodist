@@ -340,7 +340,7 @@ struct CustomOpDescriptor {
   Vector<uint8_t> isPeer;
   bool dynSelf = false;
   // Reductions across NVLink domains or in two phases: the bytes of the scratch tensor (a CUDA tensor of the op's
-  // dtype that customOp allocates per launch, after the output copies: the last tensor), which holds the rings of
+  // dtype that launchCustomOp allocates per launch, after the output copies: the last tensor), which holds the rings of
   // regions for the partial results that this rank computes (for other domains, and in an all-reduce for itself) and
   // the ones that it reads from them (with writes, a region for each of those), and the pieces that it computes in two
   // phases before it copies them to their destinations (see twoPhaseReductions in compile_op.cc); 0 if none
@@ -358,7 +358,7 @@ struct CustomOpDescriptor {
   // Vector<DeviceType> inputDevices;
   // Vector<DeviceType> outputDevices;
   DType dtype;
-  bool cpuSync = false;  // Force CPU-side wait in customOp before CUDA operations
+  bool cpuSync = false;  // wait() blocks until the CPU thread is done, as with CPU tensors (see launchCustomOp)
   bool allLocal = false; // All ranks local + all CUDA: skip CPU thread entirely
   bool anyRankNeedsRdma = false;
   // CUDA tensors must come from the moodist CUDA allocator (checked in customOp). Off for the process group's

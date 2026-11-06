@@ -155,7 +155,7 @@ Every step is collective: all ranks of the group take part (through per-rank que
    wherever every share gets at least one unit, with two domains too).
 
    Rings: the items (partial results, copies, shares) and the data that the CPU threads read go through slots of the
-   scratch tensors (a CUDA tensor of the op's dtype that `customOp` allocates per call, the last tensor;
+   scratch tensors (a CUDA tensor of the op's dtype that `launchCustomOp` allocates per call, the last tensor;
    `tuneKernels` allocates it too). A rank's kernel stores the items that it computes to rings of slots, one per kind
    (partial results and copies, shares) and set of ranks that read them (itself among them for the items that it uses
    itself): an item that several ranks read is stored once. A rank's CPU thread reads into rings of slots, one per
@@ -372,7 +372,7 @@ peer) mappings fill (e.g. an all-gather of 1400 tensors on 2 ranks): an op whose
 bytes (counting NVLS's) has them in a global array of its module instead, with a copy per concurrency slot, and the
 module's second kernel, `compile_op_params`, copies them there from its own parameters (31 KiB per launch) before
 every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot run one after the other on the GPU
-(customOp), so the copy stays until the kernel has read it; tuning fills every slot's copy once per candidate.
+(`launchCustomOp`), so the copy stays until the kernel has read it; tuning fills every slot's copy once per candidate.
 
 - **Buffers** (device memory, one slot per concurrency index, mapped by all kernel peers; cached per group and
   reused by later ops): `addresses` (peer tensor addresses, per block), `syncs` (exit sync, one row per block),
@@ -501,16 +501,16 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   addresses, the ranks publish their tensors' NVLS identities (the object and the offset in it: `nvlsIdentity` in
   processgroup.cc) into a table of each peer's with the layout of the address table. If every destination has the local
   destination's identity, block 0 stores the chunks with one multicast store each (to the multicast address of the local
-  destination's tensor, which `customOp` passes with the identities in a fourth kernel parameter, or through the
+  destination's tensor, which `launchCustomOp` passes with the identities in a fourth kernel parameter, or through the
   parameter buffer; chunks of 64 KiB, through a ring of its own over the stage memory: per chunk, the window and the
   counter cost time) and the other blocks only take part in the address exchange and the exit sync; otherwise the launch
   stores to each destination as usual. Multicast stores at full speed from all ranks overload the switches' links to the
   GPUs, which then deliver about 2/3 of their bandwidth, so the ranks advance in step: an op has a step counter per
   concurrency slot in the counter area; once the stores of a chunk have completed, a rank adds 1 to it through the
   multicast mapping (`multimem.red`, relaxed: a release waits for all outstanding stores), and it stores chunk c once
-  its local copy of the counter shows every rank's chunks up to c - 8 complete. The counter only grows; `customOp`
-  passes its value before the launch (launches of the slot times the chunks of all ranks); a launch that does not use
-  NVLS adds its chunks at the end.
+  its local copy of the counter shows every rank's chunks up to c - 8 complete. The counter only grows;
+  `launchCustomOp` passes its value before the launch (launches of the slot times the chunks of all ranks); a launch
+  that does not use NVLS adds its chunks at the end.
 - **NVLS reductions** (within an NVLink domain: all-reduces in domains of at least 8 ranks, reductions with one
   destination of at least 12; sums of every floating point type, averages of `float32`, `float64` and `bfloat16`, sums,
   min and max of integers, `int32` only up to 4 MiB per op and domain that the switches combine, NVLS runs included): a
@@ -602,7 +602,7 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   us; 8: 222, 713 and 2595 us; 24: 262, 666 and 2430 us; across 4 domains of 16, in two rounds, which RDMA limits, the
   same with any); reduce to one rank 16 MiB 251 / 260 us, 64 MiB 775 / 956 us.
 
-## Runtime (`customOp`, `WorkCustom`)
+## Runtime (`customOp`, `launchCustomOp`, `WorkCustom`)
 
 - `customOp` checks the tensors (shape, dtype, device; for user ops also that CUDA tensors come from the moodist
   CUDA allocator and are 16-byte aligned when the op has a kernel), makes the input copies (`narrow().contiguous()`)
@@ -628,11 +628,13 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   recorded when it was done (not if that op ran on the same stream, by its stream id: stream order already puts this
   op after it), and records it when done itself. `wait()` (or dropping the future) makes the current stream wait for
   that event if it is not the op's stream (if the slot has been reused since, for the later op, which only waits
-  longer), then makes the output copies; not while the current stream captures a CUDA graph (see Known issues). Ops
-  with CPU tensors, or compiled with `cpu_sync=True`, block in `wait()` until the CPU thread is done. (moodist's
-  process group collectives also run on the current stream, but their `Work.wait()` does nothing, so they do not join
-  another stream.) Between April and October 2026 (95a48ec) `wait()` blocked for every op with an RDMA part; see the
-  latency noise note under Known issues.
+  longer), then copies the output copies into the outputs on it (on another stream than the op's, their memory is
+  recorded for that stream, `record_stream`: they were allocated on the op's stream and are freed with the future, and
+  their allocator must not hand them out again before these copies have read them); not while the current stream
+  captures a CUDA graph (see Known issues). Ops with CPU tensors, or compiled with `cpu_sync=True`, block in `wait()`
+  until the CPU thread is done. (moodist's process group collectives also run on the current stream, but their
+  `Work.wait()` does nothing, so they do not join another stream.) Between April and October 2026 (95a48ec) `wait()`
+  blocked for every op with an RDMA part; see the latency noise note under Known issues.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads or ibWrites) works with the rank's peers in the op
   (`CustomOpDescriptor::peers`: the ranks it reads from, writes to or notifies, and those that read from it, write to
   it or notify it; the compile phase finds them in an exchange it already has). It publishes the rank's input list
@@ -1405,10 +1407,12 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   allocators' copies were mapped with CUDA IPC within a node, mappings that outlive PyTorch's frees (and that the
   launch cache, see Address exchange, would reuse for a new allocation at the same address), registered over RDMA
   (keeping freed pages), and could not be mapped by fabric peers at all. TODO: allocate the copies from moodist's
-  allocator, on the op's stream. Their free must then also wait for the stream that copies the output copies back in
-  `wait()`: today a `wait()` on a stream other than the op's copies back from memory that its allocator (PyTorch's,
-  or moodist's through PyTorch's) has already handed back to the op's stream, where later allocations can take it
-  before that copy runs.
+  allocator, on the op's stream (an output copy that `wait()` copies back on another stream must then still wait for
+  that stream before its memory is reused, as `record_stream` does now, see Runtime).
+- The checks of a user op's tensors and copies when it runs (their number, dtype, shape and device, moodist's memory,
+  alignment) are each rank's of its own: a rank whose tensors fail them raises before its launch, while the other
+  ranks launch the op and wait in it for that rank (the kernel's waits have no timeout). `compile_op` raises its
+  errors on all ranks (see Compile phase, step 1).
 - Ops are not capturable in CUDA graphs: a collective of CUDA tensors, a compile_op op with CUDA tensors and
   `cuda_barrier` raise if the stream is capturing (see Runtime). Each launch takes its step value and concurrency
   slot from the host, waits for and records the slot's event, can allocate staging buffers and a scratch tensor, and
@@ -1417,6 +1421,9 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   fails and invalidates the capture, and its copies back into the outputs would be captured instead of run): `wait()`
   raises, and a future dropped meanwhile logs the error (`futureDestroy`; a destructor cannot raise) and does neither.
   moodist.Queue's CUDA operations (queue.cc) are not checked.
+- `cpu_sync=True` on an op without an RDMA part (e.g. all ranks in one NVLink domain) fails at its first launch
+  (`CHECK(anyRdma)` in `launchCustomOp`, on every rank, after the launch took its step value). It could do nothing
+  there (the stream already orders the whole op), or `compile_op` could raise.
 
 ### Performance
 - The process group's broadcast and reduce of large tensors are bound by the root (see the table under Performance
