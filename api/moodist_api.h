@@ -289,6 +289,10 @@ struct CoreApi {
   void (*cudaAllocatorReleasePool)(uint64_t id0, uint64_t id1);
   void (*cudaAllocatorCreateOrIncrefPool)(uint64_t id0, uint64_t id1);
   int (*cudaAllocatorGetPoolUseCount)(uint64_t id0, uint64_t id1);
+  void (*cudaAllocatorEmptyCache)();
+  void (*cudaAllocatorSetCaptureMarks)(bool enabled);
+  void (*cudaAllocatorMarkCaptureBegin)();
+  void (*cudaAllocatorMarkCaptureEnd)();
 };
 
 } // namespace moodist

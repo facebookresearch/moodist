@@ -15,7 +15,7 @@ namespace moodist {
 // 6: the PREMUL_SUM factors of processGroupReduceScatter and processGroupAllreduce are doubles, and
 //    processGroupReduce takes one
 // 7: CUDA allocator statistics, memory limit and private pools appended to CoreApi (cudaAllocatorGetStats ...
-//    cudaAllocatorGetPoolUseCount); the allocation functions throw CudaOutOfMemoryError when out of memory
+//    cudaAllocatorMarkCaptureEnd); the allocation functions throw CudaOutOfMemoryError when out of memory
 //
 // Besides the _C.so <-> libmoodist.so handshake (moodistGetApi), this is what separately built C++
 // extensions check: they pass the version they were compiled against to get_core_api_ptr(version).

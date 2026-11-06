@@ -172,12 +172,6 @@ bool loadCuda() {
     cudaApi.threadExchangeStreamCaptureMode =
         (cuThreadExchangeStreamCaptureMode_t)loadSym(lib, "cuThreadExchangeStreamCaptureMode", name, ok, failed);
 
-    // User objects
-    cudaApi.userObjectCreate = (cuUserObjectCreate_t)loadSym(lib, "cuUserObjectCreate", name, ok, failed);
-    cudaApi.userObjectRelease = (cuUserObjectRelease_t)loadSym(lib, "cuUserObjectRelease", name, ok, failed);
-    cudaApi.graphRetainUserObject =
-        (cuGraphRetainUserObject_t)loadSym(lib, "cuGraphRetainUserObject", name, ok, failed);
-
     // Event management
     cudaApi.eventCreate = (cuEventCreate_t)loadSym(lib, "cuEventCreate", name, ok, failed);
     cudaApi.eventDestroy = (cuEventDestroy_t)loadSym(lib, "cuEventDestroy_v2", name, ok, failed);

@@ -7,6 +7,8 @@
 #include "moodist_loader.h"
 #include "torch_includes.h"
 
+#include <torch/version.h>
+
 #include <mutex>
 
 namespace moodist {
@@ -127,9 +129,14 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   virtual bool isEnabled() const {
     return true;
   }
-  // (moodist never unmaps memory)
-  virtual void emptyCache() {}
-  virtual void emptyCache(at::cuda::MempoolId_t) {}
+  // Memory of released pools (CUDA graphs and MemPools destroyed) goes back to moodist's main pool, after a device sync
+  // (see cudaAllocatorEmptyCache); moodist never unmaps memory
+  virtual void emptyCache() {
+    coreApi.cudaAllocatorEmptyCache();
+  }
+  virtual void emptyCache(at::cuda::MempoolId_t) {
+    coreApi.cudaAllocatorEmptyCache();
+  }
 
   // The largest allocation that would succeed without mapping more memory, or else the device's free memory (an
   // estimate, as PyTorch's)
@@ -220,9 +227,13 @@ struct CUDAAllocator : c10::cuda::CUDACachingAllocator::CUDAAllocator {
   // (no `override` on the following: not virtuals of every supported PyTorch version)
   virtual void setUseOnOOM(c10::DeviceIndex device, c10::cuda::MempoolId_t mempool_id, bool use_on_oom) {}
   virtual void setNoSplit(c10::DeviceIndex device, c10::cuda::MempoolId_t mempool_id) {}
-  // (PyTorch 2.14: around stream captures; the allocator checks streams' capture status itself)
-  virtual void markCaptureBegin(c10::DeviceIndex device) {}
-  virtual void markCaptureEnd(c10::DeviceIndex device) {}
+  // (PyTorch 2.13+: right after a capture begins and ends; see cudaAllocatorSetCaptureMarks)
+  virtual void markCaptureBegin(c10::DeviceIndex device) {
+    coreApi.cudaAllocatorMarkCaptureBegin();
+  }
+  virtual void markCaptureEnd(c10::DeviceIndex device) {
+    coreApi.cudaAllocatorMarkCaptureEnd();
+  }
 
   virtual c10::cuda::CUDACachingAllocator::ShareableHandle shareIpcHandle(void* ptr) override {
     throw std::runtime_error("moodist CUDAAllocator::shareIpcHandle: not implemented");
@@ -303,6 +314,9 @@ void enableCudaAllocator() {
   std::lock_guard l(assignmentMutex);
   if (!cudaAllocator) {
     cudaAllocator = new CUDAAllocator();
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 13)
+    coreApi.cudaAllocatorSetCaptureMarks(true);
+#endif
   }
   c10::cuda::CUDACachingAllocator::allocator = cudaAllocator;
 }

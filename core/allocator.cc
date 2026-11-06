@@ -33,34 +33,43 @@
 //
 // Streams are identified by their ids, not their handles (see StreamRef): the driver hands a destroyed stream's handle
 // to the next stream created, even while the destroyed stream's work still runs. Memory must be freed before the
-// streams that used it are destroyed.
+// streams that used it outside captures are destroyed.
 //
 // Pressure mode. Once a pool cannot get new memory (the device is out of it), it merges all its lists into its common
 // list, for good, and frees go there too: per-stream lists would keep the free memory split between streams. An
 // allocation then takes the best fit among the regions that need no wait (the events of other streams on them have
 // completed: the host queries events, each stream's in the order recorded, and drops the completed ones; see
-// processEvents), else the best fit (with waits), else new memory, else it fails (CudaOutOfMemoryError).
+// processEvents), else the best fit (with waits), else new memory, else it fails (CudaOutOfMemoryError). Before a pool
+// enters pressure mode, and before an allocation fails, the memory of released private pools goes back to the main pool
+// if it can (see reclaim).
 //
 // CUDA graphs. During a capture, PyTorch routes the capture's allocations to the graph's private pool (see
 // cudaAllocatorBeginAllocateToPool).
 //  - An event recorded during a capture is a node of the capture's graph: work captured in the same capture can wait
 //    for it (an edge of the graph), nothing else can, and the host cannot query it. Such events
-//    (EventRegion::captureId) are dropped when their capture has ended (cudaAllocatorEndAllocateToPool): later captures
-//    into the same pool, and frees after replays, rely on PyTorch's rules (graphs that share a pool are replayed in
-//    the order captured, one at a time).
+//    (EventRegion::captureId) are dropped once no capture is in progress (see refreshCaptures): later captures into the
+//    same pool, and frees after replays, rely on PyTorch's rules (graphs that share a pool are replayed in the order
+//    captured, one at a time).
 //  - A capture cannot wait for an event recorded outside it, so an allocation during a capture takes only memory
 //    without such events (completed events are dropped first: queries of events recorded outside captures are allowed
 //    during captures in relaxed capture mode, see RelaxedCaptureMode).
 //  - Memory of any other pool freed during a capture (a stream that used it is capturing) is freed when the capture
 //    has ended (deferredFrees), when its events can be recorded outside any capture.
-//  - A private pool's memory goes back to the main pool once the pool is released and the graphs that may use it are
-//    gone: each capture that allocates or frees memory of the pool has its graph retain a CUDA user object, which the
-//    driver destroys only after the graph and its executable graphs are destroyed and their last launch has completed
-//    (see attachGraph).
+//  - A stream's use of memory during a capture is the graph's: once the capture has ended, a free records no event on
+//    that stream (see StreamUse). The graph's replays are ordered by PyTorch's rules, and the stream may be gone
+//    (PyTorch destroys the stream of a conditional node's body right after its capture).
+//  - A private pool's memory goes back to the main pool once PyTorch has released the pool (its graphs are destroyed,
+//    its MemPool is gone), at the next device sync of the allocator (see reclaim: torch.cuda.empty_cache, which
+//    torch.cuda.graph calls before every capture, or an allocation that would enter pressure mode or fail): graphs
+//    that never allocated in the pool may still be running and use its memory (a graph that only reads tensors of its
+//    pool, a graph of another pool). PyTorch's allocator returns such memory with cudaFree, at the same points.
+// Captures that PyTorch does not route (cuStreamBeginCapture without beginAllocateToPool) are not supported, as with
+// PyTorch's allocator: an allocation on a stream in one invalidates it with some drivers (see capturingStreamId), and a
+// free during one records an event in its graph, which the allocator drops when it finds out (see processEvents).
 //
 // Debugging: MOODIST_DEBUG_ALLOCATOR=1 checks the allocator's data structures after every call (slow), =2 logs where
-// the free memory is whenever a chunk is mapped, =3 both. MOODIST_DEBUG_ALLOCATOR_TRACE=<path> writes every allocation
-// and free to <path>.<pid> (see trace).
+// the free memory is whenever a chunk is mapped or an allocation fails, =3 both. MOODIST_DEBUG_ALLOCATOR_TRACE=<path>
+// writes every allocation and free to <path>.<pid> (see trace).
 
 #include "api/allocator.h"
 #include "api/allocator_api.h"
@@ -73,6 +82,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
@@ -118,23 +128,41 @@ void add_span(Vector<Span>& spans, uintptr_t begin, uintptr_t end) {
   spans.insert(spans.begin() + a, Span{begin, end});
 }
 
-// A stream: its handle, and its id (cuStreamGetId), which identifies it. Handles do not: the driver hands a destroyed
-// stream's handle to the next stream created, even while the destroyed stream's work still runs. Ids are taken while
-// the stream is in use (allocation, recordStream); the driver may not be called with a destroyed stream's handle, so
-// memory must be freed before the streams that used it are destroyed (the free records an event on each).
+// A stream: its handle, and its id (cuStreamGetId; capturingStreamId while it captures), which identifies it. Handles
+// do not: the driver hands a destroyed stream's handle to the next stream created, even while the destroyed stream's
+// work still runs. Ids are taken while the stream is in use (allocation, recordStream); the driver may not be called
+// with a destroyed stream's handle, so memory must be freed before the streams that used it outside captures are
+// destroyed (the free records an event on each; see StreamUse).
 struct StreamRef {
   CUstream stream = nullptr;
   uint64_t id = 0;
 };
 
+// A stream's id, or its handle (with the top bit set, apart from ids) on drivers without ids (before CUDA 12.0). Not
+// for a capturing stream: see capturingStreamId.
 uint64_t streamId(CUstream stream) {
   unsigned long long id = 0;
   if (cudaApi.streamGetId && cudaApi.streamGetId(stream, &id) == CUDA_SUCCESS) {
     return id;
   }
-  // (drivers before CUDA 12.0 have no stream ids)
-  return (uintptr_t)stream;
+  return (1ull << 63) | (uintptr_t)stream;
 }
+
+// The id the allocator uses for a stream while it captures: its handle, with the top bit set. cuStreamGetId fails on a
+// capturing stream and invalidates the capture with some drivers (580, CUDA 13.0; 610 allows it); a stream exists until
+// its capture ends, so its handle names it meanwhile. (The same stream has another id outside captures: memory freed
+// by its captures, and by tensors its captures allocated, is reused by its later captures, and by its eager
+// allocations only in pressure mode.)
+uint64_t capturingStreamId(CUstream stream) {
+  return (1ull << 63) | (uintptr_t)stream;
+}
+
+// A stream's use of an allocation: the stream it was allocated on, or one recorded for it (recordStream), and the
+// capture the stream was in then (0: none; see the top of the file)
+struct StreamUse {
+  StreamRef stream;
+  unsigned long long captureId = 0;
+};
 
 // Free memory [span) was in use on eventStream until event (recorded when it was freed): an allocation on another
 // stream that takes any of it waits for the event first
@@ -338,9 +366,6 @@ struct RelaxedCaptureMode {
   RelaxedCaptureMode& operator=(const RelaxedCaptureMode&) = delete;
 };
 
-// Set by graphReleased (on a thread of the CUDA driver), cleared by the allocator when it handles it
-std::atomic_bool graphsReleased = false;
-
 } // namespace
 
 // See allocatorCommPoolCreate. Guarded by the allocator's mutex.
@@ -362,7 +387,7 @@ struct CommPool {
   Vector<std::pair<bool (*)(void*, size_t, unsigned long long, size_t, size_t), void*>> listeners;
 };
 
-// A PyTorch memory pool (see cudaAllocatorBeginAllocateToPool). Guarded by the allocator's mutex, except liveGraphs.
+// A PyTorch memory pool (see cudaAllocatorBeginAllocateToPool). Guarded by the allocator's mutex.
 struct PrivatePool {
   MempoolId id;
   Pool pool;
@@ -371,23 +396,10 @@ struct PrivatePool {
   int useCount = 0;
   // Allocations from the pool not freed yet
   size_t liveAllocations = 0;
-  // Graphs that may use the pool's memory: those captured with allocations or frees in the pool, until the driver
-  // destroys their user object (see attachGraph); their capture ids
-  std::atomic_int liveGraphs = 0;
-  Vector<unsigned long long> captureIds;
-  bool released = false; // useCount reached 0
-  bool retired = false;  // its free memory went back to the main pool, as does memory freed since
+  // useCount reached 0: the pool's free memory, and memory freed into it since (without events), waits for a device
+  // sync to go to the main pool (see reclaim); the pool is deleted once it has neither free memory nor allocations
+  bool released = false;
 };
-
-namespace {
-// A user object's destructor (see attachGraph), called by the CUDA driver on a thread of its own once the graph that
-// retained the object, and the executable graphs instantiated from it, are destroyed and their launches have
-// completed. No CUDA calls and no locks here: the allocator retires the pool on its next call (see maintenance).
-void graphReleased(void* ptr) {
-  static_cast<PrivatePool*>(ptr)->liveGraphs.fetch_sub(1);
-  graphsReleased.store(true);
-}
-} // namespace
 
 // CudaAllocatorImpl is defined in moodist namespace so it can be forward-declared
 struct CudaAllocatorImpl {
@@ -413,8 +425,8 @@ struct CudaAllocatorImpl {
   int deviceIndex = -1;
 
   // Stream tracking for recordStream (ptr -> list of streams that have used it)
-  HashMap<uintptr_t, std::unique_ptr<Vector<StreamRef>>, PointerHash> streamUses;
-  Vector<std::unique_ptr<Vector<StreamRef>>> streamListFree;
+  HashMap<uintptr_t, std::unique_ptr<Vector<StreamUse>>, PointerHash> streamUses;
+  Vector<std::unique_ptr<Vector<StreamUse>>> streamListFree;
 
   // Free callbacks (ptr -> linked list of callbacks)
   HashMap<uintptr_t, FunctionPointer, PointerHash> freeCallbacks;
@@ -451,8 +463,8 @@ struct CudaAllocatorImpl {
   // Event regions with captured events
   size_t numCapturedEvents = 0;
 
-  // Private pools (see cudaAllocatorBeginAllocateToPool): the routing scopes, the pools by id (until released), the
-  // released pools that wait for their graphs
+  // Private pools (see cudaAllocatorBeginAllocateToPool): the routing scopes (in the order begun), the pools by id
+  // (until released), the released pools (see reclaim)
   struct Scope {
     PrivatePool* pool = nullptr;
     CudaAllocatorPoolFilter filter = nullptr;
@@ -463,14 +475,36 @@ struct CudaAllocatorImpl {
   Vector<PrivatePool*> privatePools;
   Vector<PrivatePool*> releasedPools;
 
+  // The captures seen in progress (allocations, frees and recordStream during them), each with a stream that was in
+  // it, until seen to have ended (see refreshCaptures)
+  struct ActiveCapture {
+    unsigned long long id;
+    StreamRef stream;
+  };
+  Vector<ActiveCapture> activeCaptures;
+
+  // PyTorch's capture marks (torch 2.13+, see cudaAllocatorSetCaptureMarks): whether PyTorch reports its captures, and
+  // how many are in progress
+  bool captureMarks = false;
+  int markedCaptures = 0;
+
+  // Released pools' free memory during a device sync (see reclaim), whether one is in progress, and its end
+  Regions reclaiming;
+  bool syncing = false;
+  std::condition_variable_any syncDone;
+  // Set during an allocation's first attempt if a device sync can return released pools' memory (or one is in
+  // progress): the allocation fails instead of entering pressure mode, and is retried after the sync (see withReclaim)
+  bool reclaimFirst = false;
+
   // Frees that wait for the end of a capture (see freeIn)
   struct DeferredFree {
     PoolKind kind;
     void* owner;
     Span span;
-    Vector<StreamRef> streams;
+    Vector<StreamUse> uses;
   };
   Vector<DeferredFree> deferredFrees;
+  bool loggedCapturedEvents = false; // (see processEvents)
 
   CudaAllocatorStats stats;
   // The most memory to map (0: no limit; see cudaAllocatorSetMemoryLimit)
@@ -486,7 +520,6 @@ struct CudaAllocatorImpl {
   Vector<unsigned long long> tmpCaptureIds;
   Vector<LocalFreeList<EventRegion>::Handle> tmpEventRegionHandles;
   Vector<EventRegion*> tmpEventRegions;
-  Vector<std::pair<uint64_t, unsigned long long>> tmpStreamCaptures;
 
   // ---------------------------------------------------------------------------------------------------------------
   // Free lists
@@ -642,7 +675,16 @@ struct CudaAllocatorImpl {
         if (r == CUDA_ERROR_NOT_READY) {
           break;
         }
-        CHECK_CU(r);
+        if (r == CUDA_ERROR_INVALID_VALUE || r == CUDA_ERROR_CAPTURED_EVENT) {
+          // Recorded during a capture that PyTorch did not route (not supported, see the top of the file): the query
+          // fails after the capture, and fails and invalidates the capture during it. Dropped like a completed event.
+          if (!std::exchange(loggedCapturedEvents, true)) {
+            log.error("Moodist CUDA allocator: memory was freed during a CUDA graph capture that PyTorch did not route "
+                      "to a memory pool (cuStreamBeginCapture without beginAllocateToPool); this is not supported\n");
+          }
+        } else {
+          CHECK_CU(r);
+        }
         EventList::erase(e);
         releaseEventRegion(e);
       }
@@ -694,69 +736,99 @@ struct CudaAllocatorImpl {
     }
   }
 
-  struct CaptureInfo {
-    unsigned long long id = 0; // 0: not capturing
-    CUgraph graph = nullptr;   // null if the capture has been invalidated
-  };
+  // ---------------------------------------------------------------------------------------------------------------
+  // Captures
+
+  // The capture stream is in: its id, invalidatedCapture if the capture has been invalidated (until it ends), or 0
   static constexpr unsigned long long invalidatedCapture = ~0ull;
-  CaptureInfo captureInfo(CUstream stream) {
-    CaptureInfo r;
+  unsigned long long captureId(CUstream stream) {
     if (stream == nullptr) {
       // The legacy default stream is never captured (and the query can fail while another stream captures)
-      return r;
+      return 0;
     }
     CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
     unsigned long long id = 0;
-    CUgraph graph = nullptr;
-    CUresult err = cuStreamGetCaptureInfo(stream, &status, &id, &graph);
+    CUresult err = cuStreamGetCaptureInfo(stream, &status, &id);
     if (err != CUDA_SUCCESS) {
-      // (e.g. a stream destroyed since: not capturing)
       log.debug("Moodist CUDA allocator: cuStreamGetCaptureInfo failed with error %d\n", err);
-      return r;
+      return 0;
     }
     if (status == CU_STREAM_CAPTURE_STATUS_ACTIVE) {
       CHECK(id != 0);
-      r.id = id;
-      r.graph = graph;
-    } else if (status == CU_STREAM_CAPTURE_STATUS_INVALIDATED) {
-      // (until the capture ends: an id that matches no capture's events, and no graph)
-      r.id = invalidatedCapture;
+      return id;
     }
-    return r;
+    // (until the capture ends: an id that matches no capture's events)
+    return status == CU_STREAM_CAPTURE_STATUS_INVALIDATED ? invalidatedCapture : 0;
   }
 
-  // Drops the captured events of pp whose capture has ended (all: all of them)
-  void dropCapturedEvents(PrivatePool& pp, bool all) {
-    if (numCapturedEvents == 0) {
-      return;
-    }
-    tmpStreamCaptures.clear();
-    auto ended = [&](const EventRegion& e) {
-      if (all) {
+  // Whether a capture may be in progress: PyTorch routes allocations to private pools (it begins routing before a
+  // capture begins, and ends it after the capture ends), it has marked a capture's beginning and not its end, or a
+  // capture seen in progress has not been seen to end. Only then does the allocator query streams' capture status.
+  bool captureMayBeActive() const {
+    return !scopes.empty() || markedCaptures > 0 || !activeCaptures.empty();
+  }
+
+  // Whether no capture can be in progress, for a device sync (which fails, and invalidates the capture, while any
+  // stream captures, in any mode, from any thread): none that PyTorch has marked, none seen in progress, and, if
+  // PyTorch does not mark its captures (before torch 2.13), no routing to private pools (routing without a capture, as
+  // in torch.cuda.use_mem_pool or a capture that failed before torch 2.13, cannot be told apart then). (PyTorch marks a
+  // capture right after cudaStreamBeginCapture: a sync in between can still invalidate it.)
+  bool noCaptureInProgress() const {
+    return markedCaptures == 0 && activeCaptures.empty() && (captureMarks || scopes.empty());
+  }
+
+  bool captureActive(unsigned long long id) const {
+    for (auto& c : activeCaptures) {
+      if (c.id == id) {
         return true;
       }
-      for (auto& [stream, id] : tmpStreamCaptures) {
-        if (stream == e.eventStreamId) {
-          return id != e.captureId;
-        }
+    }
+    return false;
+  }
+
+  // stream is in capture id
+  void noteCapture(unsigned long long id, StreamRef stream) {
+    if (!captureActive(id)) {
+      activeCaptures.push_back(ActiveCapture{id, stream});
+    }
+  }
+
+  // Forgets the captures that have ended (a stream stays in its capture until the capture ends), and once none is left
+  // (nor one PyTorch has marked), drops the captured events (no capture can wait for them anymore). Called right after
+  // a capture ends, while its streams still exist (PyTorch destroys a conditional node's stream after its capture: 2.13
+  // right after cudaAllocatorMarkCaptureEnd, 2.14 after cudaAllocatorEndAllocateToPool), and when PyTorch ends routing.
+  void refreshCaptures() {
+    for (size_t i = 0; i != activeCaptures.size();) {
+      if (captureId(activeCaptures[i].stream.stream) != activeCaptures[i].id) {
+        activeCaptures.erase(activeCaptures.begin() + i);
+      } else {
+        ++i;
       }
-      unsigned long long id = captureInfo(e.eventStream).id;
-      tmpStreamCaptures.emplace_back(e.eventStreamId, id);
-      return id != e.captureId;
-    };
-    pp.pool.forEachList([&](Regions& regions) {
-      for (auto& region : regions.map) {
-        for (auto i = region.events.begin(); i != region.events.end();) {
-          if (i->captureId != 0 && ended(*i)) {
-            EventRegion& e = *i;
-            i = region.events.erase(i);
-            releaseEventRegion(e);
-          } else {
-            ++i;
+    }
+    if (activeCaptures.empty() && markedCaptures == 0 && numCapturedEvents != 0) {
+      auto drop = [&](Regions& regions) {
+        for (auto& region : regions.map) {
+          for (auto i = region.events.begin(); i != region.events.end();) {
+            if (i->captureId != 0) {
+              EventRegion& e = *i;
+              i = region.events.erase(i);
+              releaseEventRegion(e);
+            } else {
+              ++i;
+            }
           }
         }
+      };
+      // (only private pools' frees record captured events)
+      for (PrivatePool* pp : privatePools) {
+        pp->pool.forEachList(drop);
       }
-    });
+      for (PrivatePool* pp : releasedPools) {
+        pp->pool.forEachList(drop);
+      }
+      drop(reclaiming);
+      CHECK(numCapturedEvents == 0);
+    }
   }
 
   // ---------------------------------------------------------------------------------------------------------------
@@ -767,24 +839,27 @@ struct CudaAllocatorImpl {
     CUstream stream = nullptr;
     uint64_t streamId = 0;
     unsigned long long captureId = 0;
-    CUgraph graph = nullptr;
   };
   AllocContext context(CUstream stream) {
     AllocContext ctx;
     ctx.stream = stream;
-    ctx.streamId = moodist::streamId(stream);
-    // (PyTorch routes a capture's allocations to a private pool before the capture begins: no scopes, no captures)
-    if (!scopes.empty()) {
-      CaptureInfo ci = captureInfo(stream);
-      ctx.captureId = ci.id;
-      ctx.graph = ci.graph;
+    if (captureMayBeActive()) {
+      ctx.captureId = captureId(stream);
+      if (ctx.captureId != 0) {
+        ctx.streamId = capturingStreamId(stream);
+        noteCapture(ctx.captureId, StreamRef{stream, ctx.streamId});
+        return ctx;
+      }
     }
+    ctx.streamId = moodist::streamId(stream);
     return ctx;
   }
 
-  // The private pool allocations on stream are routed to (see cudaAllocatorBeginAllocateToPool), if any
+  // The private pool allocations on stream are routed to (see cudaAllocatorBeginAllocateToPool), if any: the most
+  // recent scope that takes the stream, as PyTorch's allocator
   PrivatePool* route(CUstream stream) {
-    for (auto& s : scopes) {
+    for (size_t i = scopes.size(); i != 0; --i) {
+      Scope& s = scopes[i - 1];
       if (s.filter(s.filterCtx, stream)) {
         return s.pool;
       }
@@ -842,7 +917,11 @@ struct CudaAllocatorImpl {
       }
       CHECK(i->captureId == ctx.captureId);
       if (i->eventStreamId != ctx.streamId) {
-        CHECK_CU(cuStreamWaitEvent(ctx.stream, i->event, CU_EVENT_WAIT_DEFAULT));
+        CUresult r = cuStreamWaitEvent(ctx.stream, i->event, CU_EVENT_WAIT_DEFAULT);
+        // (an event recorded during a capture that PyTorch did not route: see processEvents)
+        if (r != CUDA_ERROR_INVALID_VALUE) {
+          CHECK_CU(r);
+        }
       }
       if (i->span.end > ptrEnd) {
         i->span.begin = ptrEnd;
@@ -899,6 +978,10 @@ struct CudaAllocatorImpl {
       }
       if (uintptr_t r = grow(kind, owner, bytes, ctx)) {
         return r;
+      }
+      if (reclaimFirst) {
+        // (released pools' memory first: see allocate)
+        return 0;
       }
       if (freeBytes(pool) < bytes) {
         // (no placement could fit it: not a reason for pressure mode)
@@ -993,7 +1076,7 @@ struct CudaAllocatorImpl {
         if (uintptr_t r = growMain(bytes, ctx)) {
           return r;
         }
-        if (mainPool.pressure || freeBytes(mainPool) < bytes) {
+        if (reclaimFirst || mainPool.pressure || freeBytes(mainPool) < bytes) {
           break;
         }
         enterPressureMode(mainPool);
@@ -1018,7 +1101,7 @@ struct CudaAllocatorImpl {
       return 0;
     }
     noteAllocation(slabBytes + align, slabBytes + align);
-    trace('a', 's', raw, slabBytes + align, ctx.stream);
+    trace('a', 's', raw, slabBytes + align, StreamRef{ctx.stream, ctx.streamId});
     CommPool::Slab slab;
     slab.local = (raw + align - 1) / align * align;
     slab.logical = pool.nextLogical;
@@ -1056,44 +1139,53 @@ struct CudaAllocatorImpl {
   // ---------------------------------------------------------------------------------------------------------------
   // Free
 
-  // Frees [span) of the pool of kind (owner: its CommPool or PrivatePool), memory used on streamList (the allocation's
-  // stream first): records an event on each of these streams, and puts the memory into the pool's free lists (memory
-  // of a retired private pool into the main pool's). Returns false, and does nothing, if the memory cannot be freed
-  // yet: a stream that used it is capturing (unless the memory is of the capture's private pool), or an event could
-  // not be recorded. See deferredFrees.
-  template<typename StreamList>
-  bool freeIn(PoolKind kind, void* owner, Span span, const StreamList& streamList) {
+  // Frees [span) of the pool of kind (owner: its CommPool or PrivatePool), memory with the stream uses useList (the
+  // allocation's stream first): records an event on each of these streams, except those used in a capture that has
+  // ended (see StreamUse), and puts the memory into the pool's free lists (memory of a released private pool without
+  // events: see reclaim). Returns false, and does nothing, if the memory cannot be freed yet: a stream that used it is
+  // capturing (unless the memory is of the capture's private pool), or an event could not be recorded. See
+  // deferredFrees. checkCaptures: query the streams' capture status even if no capture may be active (retries of
+  // deferred frees: see processDeferredFrees).
+  template<typename UseList>
+  bool freeIn(PoolKind kind, void* owner, Span span, const UseList& useList, bool checkCaptures) {
+    PrivatePool* pp = kind == PoolKind::private_ ? static_cast<PrivatePool*>(owner) : nullptr;
+    if (pp && pp->released) {
+      insertRegion(pp->pool.common, span, std::array<EventRegion*, 0>{});
+      CHECK(pp->liveAllocations > 0);
+      --pp->liveAllocations;
+      return true;
+    }
+    CHECK(useList.begin() != useList.end());
+    const StreamRef allocationStream = useList.begin()->stream;
     tmpStreams.clear();
-    for (const StreamRef& s : streamList) {
+    for (const StreamUse& u : useList) {
+      if (u.captureId != 0 && !captureActive(u.captureId)) {
+        continue;
+      }
       bool seen = false;
       for (const StreamRef& t : tmpStreams) {
-        seen |= t.id == s.id;
+        seen |= t.id == u.stream.id;
       }
       if (!seen) {
-        tmpStreams.push_back(s);
+        tmpStreams.push_back(u.stream);
       }
-    }
-    CHECK(!tmpStreams.empty());
-    PrivatePool* pp = kind == PoolKind::private_ ? static_cast<PrivatePool*>(owner) : nullptr;
-    if (pp && pp->retired) {
-      kind = PoolKind::main;
-      owner = nullptr;
     }
     tmpCaptureIds.clear();
     for (size_t i = 0; i != tmpStreams.size(); ++i) {
       tmpCaptureIds.push_back(0);
     }
-    if (!scopes.empty()) {
+    if (checkCaptures || captureMayBeActive()) {
       for (size_t i = 0; i != tmpStreams.size(); ++i) {
-        CaptureInfo ci = captureInfo(tmpStreams[i].stream);
-        if (ci.id == 0) {
+        unsigned long long id = captureId(tmpStreams[i].stream);
+        if (id == 0) {
           continue;
         }
+        noteCapture(id, tmpStreams[i]);
         // Only memory of the capture's own private pool is freed during a capture (with events of the capture)
-        if (kind != PoolKind::private_ || !ci.graph || route(tmpStreams[i].stream) != pp || !attachGraph(*pp, ci)) {
+        if (kind != PoolKind::private_ || route(tmpStreams[i].stream) != pp) {
           return false;
         }
-        tmpCaptureIds[i] = ci.id;
+        tmpCaptureIds[i] = id;
       }
     }
     tmpEventRegionHandles.clear();
@@ -1115,7 +1207,7 @@ struct CudaAllocatorImpl {
       tmpEventRegionHandles.push_back(std::move(h));
     }
     Pool& pool = poolOf(kind, owner);
-    insertRegion(pool.pressure ? pool.common : pool.streamFree(tmpStreams[0]), span, tmpEventRegionHandles);
+    insertRegion(pool.pressure ? pool.common : pool.streamFree(allocationStream), span, tmpEventRegionHandles);
     for (auto& h : tmpEventRegionHandles) {
       EventRegion& e = *h;
       if (e.captureId != 0) {
@@ -1129,28 +1221,27 @@ struct CudaAllocatorImpl {
     if (pp) {
       CHECK(pp->liveAllocations > 0);
       --pp->liveAllocations;
-      if (pp->retired && pp->liveAllocations == 0) {
-        internalDelete(pp);
-      }
     }
     return true;
   }
 
   // freeIn, or later (see processDeferredFrees)
-  template<typename StreamList>
-  void freeOrDefer(PoolKind kind, void* owner, Span span, const StreamList& streamList) {
-    if (!freeIn(kind, owner, span, streamList)) {
+  template<typename UseList>
+  void freeOrDefer(PoolKind kind, void* owner, Span span, const UseList& useList) {
+    if (!freeIn(kind, owner, span, useList, false)) {
       DeferredFree d;
       d.kind = kind;
       d.owner = owner;
       d.span = span;
-      for (const StreamRef& s : streamList) {
-        d.streams.push_back(s);
+      for (const StreamUse& u : useList) {
+        d.uses.push_back(u);
       }
       deferredFrees.push_back(std::move(d));
     }
   }
 
+  // Retries the deferred frees. Their streams' capture status is queried even if no capture seems to be in progress:
+  // PyTorch's conditional nodes end routing for a moment during a capture (torch 2.12+).
   void processDeferredFrees() {
     if (deferredFrees.empty()) {
       return;
@@ -1158,7 +1249,7 @@ struct CudaAllocatorImpl {
     Vector<DeferredFree> list = std::move(deferredFrees);
     deferredFrees.clear();
     for (auto& d : list) {
-      if (!freeIn(d.kind, d.owner, d.span, d.streams)) {
+      if (!freeIn(d.kind, d.owner, d.span, d.uses, true)) {
         deferredFrees.push_back(std::move(d));
       }
     }
@@ -1187,69 +1278,106 @@ struct CudaAllocatorImpl {
     return pp;
   }
 
-  // The graph being captured (ci) may use memory of pp: pp's memory goes back to the main pool only after the driver
-  // has destroyed a user object that the graph retains. Returns false if the graph could not retain it.
-  bool attachGraph(PrivatePool& pp, const CaptureInfo& ci) {
-    if (std::find(pp.captureIds.begin(), pp.captureIds.end(), ci.id) != pp.captureIds.end()) {
+  static bool hasFreeMemory(Pool& pool) {
+    bool any = false;
+    pool.forEachList([&](Regions& regions) {
+      any |= !regions.map.empty();
+    });
+    return any;
+  }
+
+  // Whether a device sync would return memory of released pools now (see reclaim)
+  bool canReclaim() {
+    if (syncing || !noCaptureInProgress()) {
+      return false;
+    }
+    if (!reclaiming.map.empty()) {
       return true;
     }
-    if (!ci.graph) {
-      return false;
+    for (PrivatePool* pp : releasedPools) {
+      if (hasFreeMemory(pp->pool)) {
+        return true;
+      }
     }
-    RelaxedCaptureMode relaxed;
-    CUuserObject object = nullptr;
-    CHECK_CU(cuUserObjectCreate(&object, &pp, graphReleased, 1, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC));
-    pp.liveGraphs.fetch_add(1);
-    CUresult r = cuGraphRetainUserObject(ci.graph, object, 1, CU_GRAPH_USER_OBJECT_MOVE);
-    if (r != CUDA_SUCCESS) {
-      // (destroys the object: graphReleased undoes the count)
-      cuUserObjectRelease(object, 1);
-      log.error("Moodist CUDA allocator: cuGraphRetainUserObject failed with error %d\n", r);
-      return false;
-    }
-    pp.captureIds.push_back(ci.id);
-    return true;
+    return false;
   }
 
-  // Once pp is released and no graph can use its memory anymore, its free memory goes back to the main pool (into the
-  // list of the stream it was freed by, in normal mode), as does memory freed from it later (see freeIn), and the pool
-  // is deleted when its last allocation is freed. Returns whether it did (pp may be deleted then).
-  bool tryRetire(PrivatePool* pp) {
-    CHECK(pp->released && !pp->retired);
-    if (pp->liveGraphs.load() != 0) {
+  // Deletes the released pools that have neither free memory nor allocations
+  void deleteDrainedPools() {
+    for (size_t i = 0; i != releasedPools.size();) {
+      PrivatePool* pp = releasedPools[i];
+      if (pp->liveAllocations == 0 && !hasFreeMemory(pp->pool)) {
+        releasedPools.erase(releasedPools.begin() + i);
+        internalDelete(pp);
+      } else {
+        ++i;
+      }
+    }
+  }
+
+  // The free memory of released pools goes to the main pool's common list once no work queued so far can use it:
+  // after a device sync (cuCtxSynchronize), which the allocator does only if no capture can be in progress (see
+  // noCaptureInProgress). As with PyTorch's allocator, which returns such memory with cudaFree, that is on emptyCache
+  // (torch.cuda.graph calls it, after a synchronize, before every capture) and before an allocation would enter
+  // pressure mode or fail (see withReclaim); not when a pool is released (a graph destroyed mid-step would stall the
+  // host until the device is idle). The allocator is unlocked during the sync (lock holds its mutex): other threads,
+  // moodist's own among them, may need it for the work the sync waits for. Memory freed into released pools meanwhile
+  // waits for the next reclaim, and no capture begins meanwhile (see cudaAllocatorBeginAllocateToPool). Returns whether
+  // memory went to the main pool.
+  bool reclaim(std::unique_lock<SpinMutex>& lock) {
+    deleteDrainedPools();
+    if (!canReclaim()) {
       return false;
     }
-    dropCapturedEvents(*pp, true);
-    Pool& p = pp->pool;
-    if (mainPool.pressure) {
-      p.forEachList([&](Regions& regions) {
-        moveRegions(regions, mainPool.common);
+    for (PrivatePool* pp : releasedPools) {
+      pp->pool.forEachList([&](Regions& regions) {
+        moveRegions(regions, reclaiming);
       });
-    } else {
-      moveRegions(p.common, mainPool.common);
-      for (auto& sf : p.streams) {
-        moveRegions(sf->free, mainPool.streamFree(sf->stream));
+    }
+    deleteDrainedPools();
+    syncing = true;
+    const CUcontext context = cuContext;
+    lock.unlock();
+    // (the allocator's context, on any thread)
+    CUcontext current = nullptr;
+    cuCtxGetCurrent(&current);
+    if (current != context) {
+      cuCtxSetCurrent(context);
+    }
+    CUresult r = cuCtxSynchronize();
+    if (current != context) {
+      cuCtxSetCurrent(current);
+    }
+    lock.lock();
+    syncing = false;
+    syncDone.notify_all();
+    if (r != CUDA_SUCCESS) {
+      // (the memory waits for the next reclaim)
+      log.error("Moodist CUDA allocator: cuCtxSynchronize failed with error %d\n", r);
+      return false;
+    }
+    // (all events have completed; captures that recorded events have ended, see noCaptureInProgress)
+    for (auto& region : reclaiming.map) {
+      while (!region.events.empty()) {
+        EventRegion& e = region.events.front();
+        region.events.pop_front();
+        releaseEventRegion(e);
       }
     }
-    pp->retired = true;
-    if (pp->liveAllocations == 0) {
-      internalDelete(pp);
-    }
+    moveRegions(reclaiming, mainPool.common);
     return true;
   }
 
-  // Work left from earlier calls: released pools whose graphs are gone, frees that waited for captures to end
+  // Waits (unlocked) for the end of a device sync in progress, if any (see reclaim)
+  void waitForSync(std::unique_lock<SpinMutex>& lock) {
+    syncDone.wait(lock, [&] {
+      return !syncing;
+    });
+  }
+
+  // Frees that waited for captures to end
   void maintenance() {
-    if (graphsReleased.load(std::memory_order_relaxed) && graphsReleased.exchange(false)) {
-      for (size_t i = 0; i != releasedPools.size();) {
-        if (tryRetire(releasedPools[i])) {
-          releasedPools.erase(releasedPools.begin() + i);
-        } else {
-          ++i;
-        }
-      }
-    }
-    if (!deferredFrees.empty() && scopes.empty()) {
+    if (!deferredFrees.empty() && noCaptureInProgress()) {
       processDeferredFrees();
     }
   }
@@ -1452,7 +1580,7 @@ struct CudaAllocatorImpl {
     noteAllocation(bytes, requested, -1);
   }
 
-  // The free bytes and the largest free region of the main pool and the private pools
+  // The free bytes of the main pool and the private pools, and the largest free region
   std::pair<size_t, size_t> freeMemory() {
     size_t total = 0;
     size_t largest = 0;
@@ -1471,24 +1599,38 @@ struct CudaAllocatorImpl {
     for (PrivatePool* pp : releasedPools) {
       pp->pool.forEachList(count);
     }
+    count(reclaiming);
     return {total, largest};
   }
 
+  // The largest free region of the main pool
+  size_t largestFree() {
+    size_t largest = 0;
+    mainPool.forEachList([&](Regions& regions) {
+      if (!regions.sizes.empty()) {
+        largest = std::max(largest, std::prev(regions.sizes.end())->bytes);
+      }
+    });
+    return largest;
+  }
+
   // A line of the allocation trace: op (a: allocation, f: free), what (t: PyTorch's, i: moodist's own, c: of a
-  // communication pool, s: a communication pool's slab), address, bytes (as allocated), stream, microseconds
-  void trace(char op, char what, uintptr_t address, size_t bytes, CUstream stream) {
+  // communication pool, s: a communication pool's slab), address, bytes (as allocated), stream (handle and id),
+  // microseconds
+  void trace(char op, char what, uintptr_t address, size_t bytes, StreamRef stream) {
     if (traceFile) {
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - traceStart);
-      std::fprintf(traceFile, "%c %c %#lx %lu %#lx %ld\n", op, what, (unsigned long)address, (unsigned long)bytes,
-          (unsigned long)(uintptr_t)stream, (long)us.count());
+      std::fprintf(traceFile, "%c %c %#lx %lu %#lx %lu %ld\n", op, what, (unsigned long)address, (unsigned long)bytes,
+          (unsigned long)(uintptr_t)stream.stream, (unsigned long)stream.id, (long)us.count());
     }
   }
 
-  // Where the free memory is (MOODIST_DEBUG_ALLOCATOR=2: when a chunk is mapped, for a request of bytes)
+  // Where the free memory is (MOODIST_DEBUG_ALLOCATOR=2: when a chunk is mapped or an allocation fails, for a request
+  // of bytes)
   std::string freeMemoryReport(size_t bytes) {
-    std::string s = fmt::sprintf("Moodist CUDA allocator free memory (map for a request of %d bytes; %d allocated):\n",
+    std::string s = fmt::sprintf("Moodist CUDA allocator free memory (for a request of %d bytes; %d allocated):\n",
         bytes, stats.allocatedBytes[0].current);
-    auto list = [&](const char* what, CUstream stream, Regions& regions) {
+    auto list = [&](const std::string& what, Regions& regions) {
       if (regions.map.empty()) {
         return;
       }
@@ -1496,18 +1638,22 @@ struct CudaAllocatorImpl {
       for (auto& r : regions.map) {
         total += r.span.end - r.span.begin;
       }
-      s += fmt::sprintf("  %s stream %#x: %d bytes in %d regions, the largest %d\n", what, (uintptr_t)stream, total,
-          regions.map.size(), std::prev(regions.sizes.end())->bytes);
+      s += fmt::sprintf("  %s: %d bytes in %d regions, the largest %d\n", what, total, regions.map.size(),
+          std::prev(regions.sizes.end())->bytes);
     };
     auto pool = [&](const char* what, Pool& p) {
-      list(fmt::sprintf("%s%s common list,", what, p.pressure ? " (pressure mode)" : "").c_str(), nullptr, p.common);
+      list(fmt::sprintf("%s%s common list", what, p.pressure ? " (pressure mode)" : ""), p.common);
       for (auto& sf : p.streams) {
-        list(fmt::sprintf("%s list of", what).c_str(), sf->stream.stream, sf->free);
+        list(
+            fmt::sprintf("%s list of stream %#x (id %d)", what, (uintptr_t)sf->stream.stream, sf->stream.id), sf->free);
       }
     };
     pool("main pool", mainPool);
     for (PrivatePool* pp : privatePools) {
       pool("private pool", pp->pool);
+    }
+    for (PrivatePool* pp : releasedPools) {
+      pool("released private pool", pp->pool);
     }
     return s;
   }
@@ -1538,7 +1684,29 @@ struct CudaAllocatorImpl {
   }
 
   // ---------------------------------------------------------------------------------------------------------------
-  // Entry points (with the mutex held)
+  // Entry points (with the mutex held: lock)
+
+  // attempt(), an allocation (0 if it fails); if a device sync can return memory of released pools, or another thread's
+  // is in progress, the allocation fails rather than enter pressure mode (see reclaimFirst), and is attempted again
+  // after the sync (see reclaim)
+  template<typename F>
+  uintptr_t withReclaim(std::unique_lock<SpinMutex>& lock, F&& attempt) {
+    struct Reset {
+      bool& flag;
+      ~Reset() {
+        flag = false;
+      }
+    } reset{reclaimFirst};
+    reclaimFirst = syncing || canReclaim();
+    uintptr_t r = attempt();
+    if (r == 0 && reclaimFirst) {
+      reclaimFirst = false;
+      waitForSync(lock);
+      reclaim(lock);
+      r = attempt();
+    }
+    return r;
+  }
 
   // An allocation of bytes (requested: the size asked for) for use on stream: from the private pool that allocations
   // on stream are routed to, if any, else from the main pool. Throws CudaOutOfMemoryError if out of memory.
@@ -1546,23 +1714,24 @@ struct CudaAllocatorImpl {
     uintptr_t ptr;
     PrivatePool* privatePool;
     uint64_t streamId;
+    unsigned long long captureId;
   };
-  Allocation allocate(size_t bytes, size_t requested, CUstream stream) {
+  Allocation allocate(size_t bytes, size_t requested, CUstream stream, std::unique_lock<SpinMutex>& lock) {
     CHECK(bytes > 0);
     maintenance();
-    AllocContext ctx = context(stream);
-    PrivatePool* pp = scopes.empty() ? nullptr : route(stream);
-    uintptr_t r;
-    if (pp) {
-      if (ctx.captureId != 0 && ctx.graph && !attachGraph(*pp, CaptureInfo{ctx.captureId, ctx.graph})) {
-        throw std::runtime_error("Moodist CUDA allocator: could not attach a private pool to a CUDA graph capture");
-      }
-      r = allocateIn(PoolKind::private_, pp, bytes, ctx);
-    } else {
-      r = allocateIn(PoolKind::main, nullptr, bytes, ctx);
-    }
+    AllocContext ctx;
+    PrivatePool* pp = nullptr;
+    uintptr_t r = withReclaim(lock, [&] {
+      // (anew after a reclaim, which unlocks)
+      ctx = context(stream);
+      pp = scopes.empty() ? nullptr : route(stream);
+      return pp ? allocateIn(PoolKind::private_, pp, bytes, ctx) : allocateIn(PoolKind::main, nullptr, bytes, ctx);
+    });
     if (r == 0) {
       ++stats.numOoms;
+      if (reportOnMap) {
+        log.info("%s", freeMemoryReport(bytes));
+      }
       throw CudaOutOfMemoryError(outOfMemoryMessage(bytes));
     }
     if (pp) {
@@ -1572,7 +1741,7 @@ struct CudaAllocatorImpl {
     if (validateEveryCall) {
       validate();
     }
-    return {r, pp, ctx.streamId};
+    return {r, pp, ctx.streamId, ctx.captureId};
   }
 
   // ---------------------------------------------------------------------------------------------------------------
@@ -1628,10 +1797,12 @@ struct CudaAllocatorImpl {
       });
     }
     for (PrivatePool* pp : releasedPools) {
+      CHECK(pp->released && pp->useCount == 0);
       pp->pool.forEachList([&](Regions& regions) {
         validateRegions(regions, all, eagerCount, capturedCount);
       });
     }
+    validateRegions(reclaiming, all, eagerCount, capturedCount);
     checkDisjoint(all);
     for (CommPool* cp : commPools) {
       all.clear();
@@ -1649,6 +1820,7 @@ struct CudaAllocatorImpl {
     }
     CHECK(fifoCount == eagerCount);
     CHECK(capturedCount == numCapturedEvents);
+    CHECK(numCapturedEvents == 0 || !activeCaptures.empty() || markedCaptures > 0);
     for (auto& sf : mainPool.streams) {
       CHECK(!mainPool.pressure || sf->free.map.empty());
     }
@@ -1663,9 +1835,10 @@ struct CudaAllocCleanupCtx {
   CUstream allocStream;         // Stream used for allocation
   uintptr_t userPtr;            // As returned (see cudaAllocatorImplAllocate): the key of streamUses and freeCallbacks
   CommPool* commPool = nullptr; // The communication pool the memory is from, if any
-  PrivatePool* privatePool = nullptr; // The private pool the memory is from, if any
-  size_t requested = 0;               // The size asked for (for the statistics)
-  uint64_t allocStreamId = 0;         // allocStream's id (see StreamRef)
+  PrivatePool* privatePool = nullptr;    // The private pool the memory is from, if any
+  size_t requested = 0;                  // The size asked for (for the statistics)
+  uint64_t allocStreamId = 0;            // allocStream's id (see StreamRef)
+  unsigned long long allocCaptureId = 0; // The capture allocStream was in (see StreamUse)
 };
 
 // Global allocator impl pointer for allocator::owns/mappedRegion
@@ -1749,7 +1922,7 @@ namespace {
 // (fromWrapper: PyTorch's allocation, for the trace)
 CudaAllocation allocateImpl(size_t bytes, CUstream stream, int deviceIndex, bool fromWrapper) {
   CudaAllocatorImpl* impl = getImpl();
-  std::lock_guard l(impl->mutex);
+  std::unique_lock l(impl->mutex);
   prepareAllocation(impl, deviceIndex);
 
   // Align allocation. Allocations are 256-byte aligned; those of at least 64 KiB start at a 4 KiB boundary (a little
@@ -1763,13 +1936,13 @@ CudaAllocation allocateImpl(size_t bytes, CUstream stream, int deviceIndex, bool
   size_t alignedBytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
   const size_t padding = bytes >= pageAlignedFrom ? pageAlignment - alignment : 0;
 
-  auto [ptr, privatePool, allocStreamId] = impl->allocate(alignedBytes + padding, bytes, stream);
+  auto [ptr, privatePool, allocStreamId, allocCaptureId] = impl->allocate(alignedBytes + padding, bytes, stream, l);
   uintptr_t userPtr = padding ? (ptr + pageAlignment - 1) & ~(uintptr_t)(pageAlignment - 1) : ptr;
   CHECK(userPtr + alignedBytes <= ptr + alignedBytes + padding);
 
   auto* ctx = internalNew<CudaAllocCleanupCtx>(
-      impl, ptr, alignedBytes + padding, stream, userPtr, nullptr, privatePool, bytes, allocStreamId);
-  impl->trace('a', fromWrapper ? 't' : 'i', ptr, alignedBytes + padding, stream);
+      impl, ptr, alignedBytes + padding, stream, userPtr, nullptr, privatePool, bytes, allocStreamId, allocCaptureId);
+  impl->trace('a', fromWrapper ? 't' : 'i', ptr, alignedBytes + padding, StreamRef{stream, allocStreamId});
   return CudaAllocation{userPtr, ctx, impl->deviceIndex};
 }
 } // namespace
@@ -1785,26 +1958,27 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream) {
   std::lock_guard l(impl->mutex);
 
   // The streams that used the memory: the allocation's, then any recorded
-  struct StreamArrayView {
-    StreamRef* data;
+  struct StreamUseArrayView {
+    StreamUse* data;
     size_t count;
-    StreamRef* begin() const {
+    StreamUse* begin() const {
       return data;
     }
-    StreamRef* end() const {
+    StreamUse* end() const {
       return data + count;
     }
   };
-  impl->trace('f', ctx->commPool ? 'c' : '-', ctx->ptr, ctx->bytes, ctx->allocStream);
-  auto deallocate = [&](const auto& streams) {
+  const StreamUse allocationUse{StreamRef{ctx->allocStream, ctx->allocStreamId}, ctx->allocCaptureId};
+  impl->trace('f', ctx->commPool ? 'c' : '-', ctx->ptr, ctx->bytes, allocationUse.stream);
+  auto deallocate = [&](const auto& uses) {
     if (ctx->commPool) {
-      impl->freeOrDefer(PoolKind::comm, ctx->commPool, Span{ctx->ptr, ctx->ptr + ctx->bytes}, streams);
+      impl->freeOrDefer(PoolKind::comm, ctx->commPool, Span{ctx->ptr, ctx->ptr + ctx->bytes}, uses);
     } else {
       impl->noteFree(ctx->bytes, ctx->requested);
       if (ctx->privatePool) {
-        impl->freeOrDefer(PoolKind::private_, ctx->privatePool, Span{ctx->ptr, ctx->ptr + ctx->bytes}, streams);
+        impl->freeOrDefer(PoolKind::private_, ctx->privatePool, Span{ctx->ptr, ctx->ptr + ctx->bytes}, uses);
       } else {
-        impl->freeOrDefer(PoolKind::main, nullptr, Span{ctx->ptr, ctx->ptr + ctx->bytes}, streams);
+        impl->freeOrDefer(PoolKind::main, nullptr, Span{ctx->ptr, ctx->ptr + ctx->bytes}, uses);
       }
     }
   };
@@ -1824,14 +1998,14 @@ void cudaAllocatorImplFree(void* cleanupCtx, CUstream) {
   auto it = impl->streamUses.find(ctx->userPtr);
   if (it != impl->streamUses.end()) {
     auto& list = it->second;
-    list->insert(list->begin(), StreamRef{ctx->allocStream, ctx->allocStreamId});
+    list->insert(list->begin(), allocationUse);
     deallocate(*list);
     list->clear();
     impl->streamListFree.push_back(std::move(list));
     impl->streamUses.erase(it);
   } else {
-    StreamRef streams[1] = {StreamRef{ctx->allocStream, ctx->allocStreamId}};
-    deallocate(StreamArrayView{streams, 1});
+    StreamUse uses[1] = {allocationUse};
+    deallocate(StreamUseArrayView{uses, 1});
   }
 
   internalDelete(ctx);
@@ -1850,17 +2024,20 @@ CommPool* allocatorCommPoolCreate() {
 
 CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream stream, int deviceIndex) {
   CudaAllocatorImpl* impl = getImpl();
-  std::lock_guard l(impl->mutex);
+  std::unique_lock l(impl->mutex);
   prepareAllocation(impl, deviceIndex);
   impl->maintenance();
-  auto ctx = impl->context(stream);
-  if (ctx.captureId != 0) {
-    throw std::runtime_error("Moodist communication pools do not support CUDA graph capture yet: allocation on a "
-                             "capturing stream");
-  }
   constexpr size_t alignment = 0x1000;
   const size_t alignedBytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
-  uintptr_t logical = impl->allocateIn(PoolKind::comm, pool, alignedBytes, ctx);
+  CudaAllocatorImpl::AllocContext ctx;
+  uintptr_t logical = impl->withReclaim(l, [&] {
+    ctx = impl->context(stream);
+    if (ctx.captureId != 0) {
+      throw std::runtime_error("Moodist communication pools do not support CUDA graph capture yet: allocation on a "
+                               "capturing stream");
+    }
+    return impl->allocateIn(PoolKind::comm, pool, alignedBytes, ctx);
+  });
   if (logical == 0) {
     ++impl->stats.numOoms;
     throw CudaOutOfMemoryError(impl->outOfMemoryMessage(alignedBytes));
@@ -1875,7 +2052,7 @@ CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream 
   CHECK(userPtr != 0);
   auto* ctx2 =
       internalNew<CudaAllocCleanupCtx>(impl, logical, alignedBytes, stream, userPtr, pool, nullptr, 0, ctx.streamId);
-  impl->trace('a', 'c', logical, alignedBytes, stream);
+  impl->trace('a', 'c', logical, alignedBytes, StreamRef{stream, ctx.streamId});
   if (impl->validateEveryCall) {
     impl->validate();
   }
@@ -1941,10 +2118,20 @@ void cudaAllocatorImplRecordStream(CudaAllocatorImpl* impl, uintptr_t ptr, CUstr
       list = std::move(impl->streamListFree.back());
       impl->streamListFree.pop_back();
     } else {
-      list = std::make_unique<Vector<StreamRef>>();
+      list = std::make_unique<Vector<StreamUse>>();
     }
   }
-  list->push_back(StreamRef{stream, streamId(stream)});
+  StreamUse use;
+  if (impl->captureMayBeActive()) {
+    use.captureId = impl->captureId(stream);
+  }
+  if (use.captureId != 0) {
+    use.stream = StreamRef{stream, capturingStreamId(stream)};
+    impl->noteCapture(use.captureId, use.stream);
+  } else {
+    use.stream = StreamRef{stream, streamId(stream)};
+  }
+  list->push_back(use);
 }
 
 int cudaAllocatorImplGetDevice(CudaAllocatorImpl* impl) {
@@ -2087,7 +2274,43 @@ void cudaAllocatorGetStats(CudaAllocatorStats* out) {
   CudaAllocatorImpl* impl = getImpl();
   std::lock_guard l(impl->mutex);
   *out = impl->stats;
-  out->largestFreeBlock = impl->freeMemory().second;
+  out->largestFreeBlock = impl->largestFree();
+}
+
+void cudaAllocatorSetCaptureMarks(bool enabled) {
+  CudaAllocatorImpl* impl = getImpl();
+  std::lock_guard l(impl->mutex);
+  impl->captureMarks = enabled;
+}
+
+void cudaAllocatorMarkCaptureBegin() {
+  CudaAllocatorImpl* impl = getImpl();
+  std::lock_guard l(impl->mutex);
+  ++impl->markedCaptures;
+}
+
+void cudaAllocatorMarkCaptureEnd() {
+  CudaAllocatorImpl* impl = getImpl();
+  std::lock_guard l(impl->mutex);
+  if (impl->markedCaptures > 0) {
+    --impl->markedCaptures;
+  }
+  impl->refreshCaptures();
+  if (impl->validateEveryCall) {
+    impl->validate();
+  }
+}
+
+void cudaAllocatorEmptyCache() {
+  CudaAllocatorImpl* impl = getImpl();
+  std::unique_lock l(impl->mutex);
+  // (after another thread's sync, if any: memory freed into released pools meanwhile is returned too)
+  impl->waitForSync(l);
+  impl->maintenance();
+  impl->reclaim(l);
+  if (impl->validateEveryCall) {
+    impl->validate();
+  }
 }
 
 void cudaAllocatorSetMemoryLimit(size_t bytes) {
@@ -2127,7 +2350,9 @@ void cudaAllocatorResetStats(bool peaks, bool accumulated) {
 void cudaAllocatorBeginAllocateToPool(
     uint64_t id0, uint64_t id1, CudaAllocatorPoolFilter filter, void* filterCtx, void (*destroyFilterCtx)(void*)) {
   CudaAllocatorImpl* impl = getImpl();
-  std::lock_guard l(impl->mutex);
+  std::unique_lock l(impl->mutex);
+  // PyTorch begins a capture after this returns: not during a device sync, which would invalidate it (see reclaim)
+  impl->waitForSync(l);
   for (auto& s : impl->scopes) {
     if (s.pool->id == MempoolId{id0, id1}) {
       if (destroyFilterCtx) {
@@ -2155,10 +2380,9 @@ void cudaAllocatorEndAllocateToPool(uint64_t id0, uint64_t id1) {
       if (scope.destroyFilterCtx) {
         scope.destroyFilterCtx(scope.filterCtx);
       }
-      // The events recorded in the pool's capture, if it has ended
-      impl->dropCapturedEvents(*scope.pool, false);
+      // (PyTorch ends routing after a capture has ended)
+      impl->refreshCaptures();
       impl->processDeferredFrees();
-      impl->maintenance();
       if (impl->validateEveryCall) {
         impl->validate();
       }
@@ -2170,7 +2394,7 @@ void cudaAllocatorEndAllocateToPool(uint64_t id0, uint64_t id1) {
 
 void cudaAllocatorReleasePool(uint64_t id0, uint64_t id1) {
   CudaAllocatorImpl* impl = getImpl();
-  std::lock_guard l(impl->mutex);
+  std::unique_lock l(impl->mutex);
   PrivatePool* pp = impl->findPool(MempoolId{id0, id1});
   if (!pp) {
     throw std::runtime_error("Moodist CUDA allocator: releasePool: no such pool");
@@ -2182,9 +2406,9 @@ void cudaAllocatorReleasePool(uint64_t id0, uint64_t id1) {
     }
     impl->privatePools.erase(std::find(impl->privatePools.begin(), impl->privatePools.end(), pp));
     pp->released = true;
-    if (!impl->tryRetire(pp)) {
-      impl->releasedPools.push_back(pp);
-    }
+    impl->releasedPools.push_back(pp);
+    // (its memory goes to the main pool at the next reclaim, without a device sync now: see reclaim)
+    impl->deleteDrainedPools();
   }
   if (impl->validateEveryCall) {
     impl->validate();

@@ -430,7 +430,11 @@ at::Tensor ProcessGroup::allocateCommTensor(int64_t numel, at::TensorOptions opt
   uintptr_t ptr = 0;
   void* cleanupCtx = nullptr;
   int device = -1;
-  coreApi.processGroupCommPoolAllocate(handle.get(), bytes, stream, &ptr, &cleanupCtx, &device);
+  try {
+    coreApi.processGroupCommPoolAllocate(handle.get(), bytes, stream, &ptr, &cleanupCtx, &device);
+  } catch (const CudaOutOfMemoryError& e) {
+    TORCH_CHECK_WITH(OutOfMemoryError, false, e.what());
+  }
   // The same deleter as moodist's CUDA allocator (see allocator_wrapper.cc)
   auto deleter = [](void* ctx) {
     coreApi.cudaAllocatorImplFree(ctx, c10::cuda::getCurrentCUDAStream());

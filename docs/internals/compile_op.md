@@ -722,11 +722,13 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   allocations and frees of the pool, so that ranks that allocate the same buffers in the same order get the same
   offsets. The pool places them like the allocator's other pools (see the top of allocator.cc), in logical
   coordinates: freed memory goes to a free list of the stream it was allocated on, an allocation takes the best fit
-  (lowest offset first) from its stream's list, else from memory no stream has used, else from a new slab, so streams
-  never wait for each other's memory and nothing depends on timing (only once the device is out of memory does the
-  pool share freed memory between streams, preferring memory whose GPU work has completed: offsets can then differ
-  between ranks, which only costs NVLS). Memory freed while other streams still used it (record_stream) carries an
-  event per stream, which an allocation of it waits for on the GPU. The memory comes from the allocator's pool in
+  (lowest offset first) from its stream's list, else from memory no stream has used, else from a new slab, so a
+  stream's allocations do not wait for other streams' work on freed memory, and nothing depends on timing (only once
+  the device is out of memory does the pool share freed memory between streams, preferring memory whose GPU work has
+  completed: offsets can then differ between ranks, which only costs NVLS). Memory freed while other streams still used
+  it (record_stream) carries an event per stream, which an allocation of it waits for on the GPU; so does the rest of a
+  new slab (an event on the stream whose allocation added it), as the slab's main-pool memory may have been in use on
+  that stream. The memory comes from the allocator's pool in
   slabs of at least 256 MiB (one 2 MiB aligned allocation each, at any address, never freed), each at its own logical
   range with a 2 MiB gap before it, so that no free region spans two slabs. Without communication: a rank binds a new
   slab into its domain's multicast object when it adds it (before handing out memory in it), and the kernel's address

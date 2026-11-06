@@ -182,6 +182,10 @@ static CoreApi coreApi = {
     .cudaAllocatorReleasePool = cudaAllocatorReleasePool,
     .cudaAllocatorCreateOrIncrefPool = cudaAllocatorCreateOrIncrefPool,
     .cudaAllocatorGetPoolUseCount = cudaAllocatorGetPoolUseCount,
+    .cudaAllocatorEmptyCache = cudaAllocatorEmptyCache,
+    .cudaAllocatorSetCaptureMarks = cudaAllocatorSetCaptureMarks,
+    .cudaAllocatorMarkCaptureBegin = cudaAllocatorMarkCaptureBegin,
+    .cudaAllocatorMarkCaptureEnd = cudaAllocatorMarkCaptureEnd,
 };
 
 } // namespace moodist

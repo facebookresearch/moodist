@@ -25,6 +25,7 @@ constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY = 2;
 constexpr CUresult CUDA_ERROR_NOT_INITIALIZED = 3;
 constexpr CUresult CUDA_ERROR_DEINITIALIZED = 4;
 constexpr CUresult CUDA_ERROR_NOT_READY = 600;
+constexpr CUresult CUDA_ERROR_CAPTURED_EVENT = 907;
 
 using CUdeviceptr = unsigned long long;
 using CUdevice = int;
@@ -57,9 +58,6 @@ using CUgraph = CUgraph_st*;
 
 struct CUgraphNode_st;
 using CUgraphNode = CUgraphNode_st*;
-
-struct CUuserObject_st;
-using CUuserObject = CUuserObject_st*;
 
 // Integer types
 using cuuint32_t = uint32_t;
@@ -320,10 +318,6 @@ enum CUstreamCaptureMode {
   CU_STREAM_CAPTURE_MODE_RELAXED = 2,
 };
 
-// User objects
-constexpr unsigned int CU_USER_OBJECT_NO_DESTRUCTOR_SYNC = 1;
-constexpr unsigned int CU_GRAPH_USER_OBJECT_MOVE = 1;
-
 using CUlaunchAttributeID = unsigned long;
 
 constexpr CUlaunchAttributeID CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN = 10;
@@ -462,13 +456,6 @@ using cuStreamGetCaptureInfo_v3_t = CUresult (*)(CUstream hStream, CUstreamCaptu
     size_t* numDependencies_out);
 using cuThreadExchangeStreamCaptureMode_t = CUresult (*)(CUstreamCaptureMode* mode);
 
-// User objects (CUDA 11.3)
-using cuUserObjectCreate_t = CUresult (*)(
-    CUuserObject* object_out, void* ptr, CUhostFn destroy, unsigned int initialRefcount, unsigned int flags);
-using cuUserObjectRelease_t = CUresult (*)(CUuserObject object, unsigned int count);
-using cuGraphRetainUserObject_t = CUresult (*)(
-    CUgraph graph, CUuserObject object, unsigned int count, unsigned int flags);
-
 // Event management
 using cuEventCreate_t = CUresult (*)(CUevent* phEvent, unsigned int flags);
 using cuEventDestroy_t = CUresult (*)(CUevent hEvent);
@@ -587,11 +574,6 @@ struct CudaApi {
   cuStreamGetCaptureInfo_v2_t streamGetCaptureInfoV2 = nullptr;
   cuStreamGetCaptureInfo_v3_t streamGetCaptureInfoV3 = nullptr;
   cuThreadExchangeStreamCaptureMode_t threadExchangeStreamCaptureMode = nullptr;
-
-  // User objects
-  cuUserObjectCreate_t userObjectCreate = nullptr;
-  cuUserObjectRelease_t userObjectRelease = nullptr;
-  cuGraphRetainUserObject_t graphRetainUserObject = nullptr;
 
   // Event management
   cuEventCreate_t eventCreate = nullptr;
@@ -818,26 +800,16 @@ inline CUresult cuStreamBatchMemOp(
     CUstream stream, unsigned int count, CUstreamBatchMemOpParams* paramArray, unsigned int flags) {
   return cudaApi.streamBatchMemOp(stream, count, paramArray, flags);
 }
-// (the capture status, id and graph only)
+// (the capture status and id only)
 inline CUresult cuStreamGetCaptureInfo(
-    CUstream hStream, CUstreamCaptureStatus* captureStatus_out, unsigned long long* id_out, CUgraph* graph_out) {
+    CUstream hStream, CUstreamCaptureStatus* captureStatus_out, unsigned long long* id_out) {
   if (cudaApi.streamGetCaptureInfoV3) {
-    return cudaApi.streamGetCaptureInfoV3(hStream, captureStatus_out, id_out, graph_out, nullptr, nullptr, nullptr);
+    return cudaApi.streamGetCaptureInfoV3(hStream, captureStatus_out, id_out, nullptr, nullptr, nullptr, nullptr);
   }
-  return cudaApi.streamGetCaptureInfoV2(hStream, captureStatus_out, id_out, graph_out, nullptr, nullptr);
+  return cudaApi.streamGetCaptureInfoV2(hStream, captureStatus_out, id_out, nullptr, nullptr, nullptr);
 }
 inline CUresult cuThreadExchangeStreamCaptureMode(CUstreamCaptureMode* mode) {
   return cudaApi.threadExchangeStreamCaptureMode(mode);
-}
-inline CUresult cuUserObjectCreate(
-    CUuserObject* object_out, void* ptr, CUhostFn destroy, unsigned int initialRefcount, unsigned int flags) {
-  return cudaApi.userObjectCreate(object_out, ptr, destroy, initialRefcount, flags);
-}
-inline CUresult cuUserObjectRelease(CUuserObject object, unsigned int count) {
-  return cudaApi.userObjectRelease(object, count);
-}
-inline CUresult cuGraphRetainUserObject(CUgraph graph, CUuserObject object, unsigned int count, unsigned int flags) {
-  return cudaApi.graphRetainUserObject(graph, object, count, flags);
 }
 inline CUresult cuEventCreate(CUevent* phEvent, unsigned int flags) {
   return cudaApi.eventCreate(phEvent, flags);

@@ -83,7 +83,7 @@ struct CudaAllocatorStats {
   CudaAllocatorStat segments;          // chunks mapped
   int64_t numOoms = 0;                 // allocations that failed for lack of memory
   int64_t numMaps = 0;                 // chunks mapped
-  size_t largestFreeBlock = 0;         // the largest free region (main pool and private pools)
+  size_t largestFreeBlock = 0;         // the largest free region of the main pool
 };
 
 void cudaAllocatorGetStats(CudaAllocatorStats* out);
@@ -95,12 +95,13 @@ void cudaAllocatorResetStats(bool peaks, bool accumulated);
 
 // Private pools: PyTorch's memory pools (MempoolId_t {id0, id1}), e.g. those of CUDA graphs. A pool exists from its
 // first cudaAllocatorCreateOrIncrefPool or cudaAllocatorBeginAllocateToPool (which count a use each) until
-// cudaAllocatorReleasePool has released all uses; its memory then goes back to the main pool once the graphs captured
-// into it are destroyed and their launches have completed, and memory still allocated from it goes back when freed.
+// cudaAllocatorReleasePool has released all uses; its free memory, and memory still allocated from it once freed, then
+// go back to the main pool after a device sync, which the allocator does on cudaAllocatorEmptyCache and before an
+// allocation would enter pressure mode or fail, if no capture is in progress (as PyTorch's allocator, with cudaFree).
 // Between cudaAllocatorBeginAllocateToPool and cudaAllocatorEndAllocateToPool, allocations on the streams that
-// filter(filterCtx, stream) returns true for come from the pool (PyTorch's beginAllocateToPool); the allocator calls
-// destroyFilterCtx(filterCtx) at the end. filter is called with the allocator's lock held. See allocator.cc ("CUDA
-// graphs") for allocations during stream capture.
+// filter(filterCtx, stream) returns true for come from the pool (PyTorch's beginAllocateToPool; the most recent scope
+// first); the allocator calls destroyFilterCtx(filterCtx) at the end. filter is called with the allocator's lock held.
+// See allocator.cc ("CUDA graphs") for allocations during stream capture.
 using CudaAllocatorPoolFilter = bool (*)(void* filterCtx, CUstream stream);
 void cudaAllocatorBeginAllocateToPool(
     uint64_t id0, uint64_t id1, CudaAllocatorPoolFilter filter, void* filterCtx, void (*destroyFilterCtx)(void*));
@@ -109,6 +110,17 @@ void cudaAllocatorReleasePool(uint64_t id0, uint64_t id1);
 void cudaAllocatorCreateOrIncrefPool(uint64_t id0, uint64_t id1);
 // The pool's uses (0 if there is no such pool)
 int cudaAllocatorGetPoolUseCount(uint64_t id0, uint64_t id1);
+// PyTorch's emptyCache: released pools' memory goes back to the main pool (after a device sync) if no capture is in
+// progress. Memory stays mapped.
+void cudaAllocatorEmptyCache();
+// PyTorch's capture marks (torch 2.13+): markCaptureBegin right after cudaStreamBeginCapture and markCaptureEnd right
+// after cudaStreamEndCapture, for every capture (conditional nodes' bodies too); a capture's streams still exist at its
+// end mark (PyTorch 2.13 destroys a conditional node's stream after it, before endAllocateToPool).
+// cudaAllocatorSetCaptureMarks(true) says that PyTorch makes them: then routing to a pool without a capture
+// (torch.cuda.use_mem_pool, cudagraph trees' warmup) does not keep the allocator from syncing the device.
+void cudaAllocatorSetCaptureMarks(bool enabled);
+void cudaAllocatorMarkCaptureBegin();
+void cudaAllocatorMarkCaptureEnd();
 
 // Query if an address is owned by the allocator
 bool allocatorOwns(uintptr_t address);
