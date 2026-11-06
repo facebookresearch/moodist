@@ -1416,14 +1416,17 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
 - Ops are not capturable in CUDA graphs: a collective of CUDA tensors, a compile_op op with CUDA tensors and
   `cuda_barrier` raise if the stream is capturing (see Runtime). Each launch takes its step value and concurrency
   slot from the host, waits for and records the slot's event, can allocate staging buffers and a scratch tensor, and
-  gives an RDMA part to the CPU thread, all per call; a replay would repeat none of it. The future of such an op
-  cannot be waited for during a capture either (its join would wait for an event recorded outside the capture, which
-  fails and invalidates the capture, and its copies back into the outputs would be captured instead of run): `wait()`
-  raises, and a future dropped meanwhile logs the error (`futureDestroy`; a destructor cannot raise) and does neither.
-  moodist.Queue's CUDA operations (queue.cc) are not checked.
-- `cpu_sync=True` on an op without an RDMA part (e.g. all ranks in one NVLink domain) fails at its first launch
-  (`CHECK(anyRdma)` in `launchCustomOp`, on every rank, after the launch took its step value). It could do nothing
-  there (the stream already orders the whole op), or `compile_op` could raise.
+  gives an RDMA part to the CPU thread, all per call; a replay would repeat none of it. Nor can the future of such an
+  op, launched before a capture, be waited for during it, which makes little sense anyway (its join would wait for an
+  event recorded outside the capture, which fails and invalidates the capture, and its copies back into the outputs
+  would be captured instead of run): `wait()` raises, also where nothing would be queued (the op's own stream, no
+  copies), one rule whatever the op's internals; a future dropped meanwhile logs the error (`futureDestroy`; a
+  destructor cannot raise) and does neither. Once ops can be captured, waiting in a capture for an op launched in it
+  has to work. moodist.Queue's CUDA operations (queue.cc) are not checked.
+- `cpu_sync=True` on an op without an RDMA part (e.g. all ranks in one NVLink domain) fails at every launch, on the
+  ranks that passed it (`CHECK(anyRdma)` in `launchCustomOp`, after the launch took its step value). `cpu_sync` is
+  not compared across ranks: ranks that did not pass it launch the op and wait in it for the others. It could do
+  nothing there (the stream already orders the whole op), or `compile_op` could raise.
 
 ### Performance
 - The process group's broadcast and reduce of large tensors are bound by the root (see the table under Performance

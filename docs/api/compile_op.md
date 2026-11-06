@@ -70,7 +70,7 @@ This is useful for tensor redistribution operations where you want to change the
 - An op whose regions have pieces that are not contiguous in a tensor (e.g. a block of columns of a row-major matrix) moves them through contiguous copies, which come from PyTorch's current CUDA allocator: such an op needs `moodist.enable_cuda_allocator()` even if its tensors come from `moodist.comm_empty` (it raises otherwise, when it runs).
 - Transfers between NVLink peers (GPUs on the same node, or all GPUs of a multi-node NVLink domain such as NVL72) are done by a copy kernel that needs sizes and offsets that are multiples of 16 bytes, and 16-byte aligned tensors. Sizes and offsets are checked by `compile_op` (a `RuntimeError` on all ranks), tensor addresses when the op runs.
 - The checks when the op runs (these, and the tensors' number, dtype, shape and device) are each rank's of its own tensors: only the ranks whose tensors fail them raise, and the other ranks' launches of the op then wait for those ranks (ops have no timeout yet, see the README's Timeouts).
-- Ops with CUDA tensors cannot be captured in CUDA graphs yet: calling one while the current stream is capturing raises a `RuntimeError` (before anything is queued on the stream, so the capture stays valid). So does waiting for the future of such an op while the current stream is capturing (dropping the future then logs the error, and neither joins the stream nor copies outputs back): wait for it before the capture begins.
+- Ops with CUDA tensors cannot be captured in CUDA graphs yet: calling one while the current stream is capturing raises a `RuntimeError` (before anything is queued on the stream, so the capture stays valid). So does waiting for the future of such an op, launched before the capture, while the current stream is capturing (dropping the future then logs the error, and neither joins the stream nor copies outputs back): wait for it before the capture begins.
 
 ## NVLink multicast and communication buffers
 
@@ -183,9 +183,9 @@ The `reduce="any"` option is useful for replicated data patterns (e.g., `Replica
 ### `cpu_sync`
 **Type:** `bool` (default: `False`)
 
-If `True`, the future's `wait()` blocks the caller until moodist's CPU thread has finished the op's RDMA part (the transfers between NVLink domains), as it does for ops with CPU tensors. Without it, an op with only CUDA tensors is done for the caller once it is queued on the stream: everything queued after it on that stream sees its results, RDMA part included. It applies only to ops with an RDMA part: one without (e.g. all ranks in one NVLink domain) currently fails when it runs.
+If `True`, the future's `wait()` blocks the caller until moodist's CPU thread has finished the op's RDMA part (the transfers between NVLink domains), as it does for ops with CPU tensors. Without it, an op with only CUDA tensors is done for the caller once it is queued on the stream: everything queued after it on that stream sees its results, RDMA part included. It applies only to ops with an RDMA part: one without (e.g. all ranks in one NVLink domain) currently fails when it runs, on the ranks that passed `cpu_sync=True` (all ranks should pass the same value: it is not checked).
 
-**Performance note:** `wait()` then waits for the transfers on the host, which costs latency and serializes the host with the GPU work.
+**Performance note:** `wait()` then waits for the transfers on the host, which costs latency and serializes the host with the GPU work. Waiting for every op this way also lets moodist's CPU thread run out of work and sleep between ops: waking it up again for each op occasionally takes milliseconds.
 
 ## Return Value
 

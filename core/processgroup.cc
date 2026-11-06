@@ -2823,16 +2823,18 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   // wait() (and dropping the future without it): if the current stream is not the one the op ran on, it waits for
   // the slot's event, which the op recorded when done on its stream (kernel and RDMA part). If the slot has been
   // reused since, the event is a later op's, which only waits longer. On the op's own stream nothing is needed.
-  // Returns the current stream. Not while it captures a CUDA graph: the wait for an event recorded outside the
-  // capture would fail and invalidate the capture, and the copies back into the outputs (below) would be captured
-  // instead of run. It raises then, before any of it (futureDestroy logs the error of a future dropped meanwhile).
+  // Returns the current stream. Not while it captures a CUDA graph: the op ran before the capture (ops raise during
+  // one, see requireNotCapturing), and waiting for it in the capture makes little sense. The wait for an event
+  // recorded outside the capture would fail and invalidate the capture, and the copies back into the outputs (below)
+  // would be captured instead of run. It raises then, before any of it, and also where there is nothing to queue (the
+  // op's own stream, no copies): one rule, whatever the op's internals (futureDestroy logs the error of a future
+  // dropped meanwhile). Once ops can be captured, waiting in a capture for an op launched in it has to work.
   auto selfPtr = share(this);
   auto joinCurrentStream = [selfPtr, concurrencyIndex, stream]() {
     CUstream current = wrapperApi.cudaGetCurrentStream();
     if (streamCapturing(current)) {
-      throw std::runtime_error("moodist: the future of a compile_op op with CUDA tensors cannot be waited for (or "
-                               "dropped) while the current stream is capturing a CUDA graph: wait for it before the "
-                               "capture begins");
+      throw std::runtime_error("moodist: the future of a compile_op op launched before a CUDA graph capture cannot be "
+                               "waited for (or dropped) during the capture: wait for it before the capture begins");
     }
     if (current != stream) {
       selfPtr->concurrencyEvents[concurrencyIndex].wait(current);
