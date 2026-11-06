@@ -4,8 +4,8 @@ compiled at its first call): all-gather, reduce-scatter and all-reduce with ever
 bytes to several MiB per rank, in place and not, tensors from PyTorch's allocator, from the communication pool
 (comm_empty) and at addresses the kernel cannot take and sizes that are not a multiple of 16 bytes (which go through
 buffers of the pool), PyTorch's tensors freed after their calls (their memory comes back), on several streams,
-PREMUL_SUM; broadcast, reduce, scatter, gather and all-to-all (from and to several roots, lists of tensors); and avg
-of CPU tensors.
+PREMUL_SUM; broadcast, reduce, scatter, gather and all-to-all (from and to several roots, lists of tensors); the error
+during a CUDA graph capture; and avg of CPU tensors.
 """
 
 import torch
@@ -406,6 +406,49 @@ def test_pg_collectives_streams(ctx: TestContext):
               reference("sum", ctx.world_size, 0, numel, it), "sum", torch.float32)
         expected = torch.cat([rank_values(r, r * numel, numel, torch.float64, it) for r in range(ctx.world_size)])
         check(ctx, pg, f"all-gather on stream {it % 2}, iteration {it}", out, expected, "sum", torch.float32)
+
+
+@test
+def test_pg_capture_error(ctx: TestContext):
+    """Collectives of CUDA tensors and cuda_barrier cannot be captured in CUDA graphs yet: called while the stream
+    captures (in torch.cuda.graph's default mode, global), they raise moodist's error before queuing anything, also at
+    a shape's first call (before its compile), so the capture stays valid (the graph of the other work replays).
+    Afterwards collectives still work, in every concurrency slot."""
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    if n == 1:
+        return  # (a group of one rank copies, which can be captured)
+    numel = 1000
+    t = rank_values(ctx.rank, 0, numel, torch.float32, 30)
+    pg.allreduce([t]).wait()  # (compiled before the capture)
+    inp = rank_values(ctx.rank, ctx.rank * 777, 777, torch.float32, 31)
+    out = torch.empty(n * 777, device="cuda")
+    calls = {
+        "all-reduce": lambda: pg.allreduce([t]),
+        "all-gather of a new shape": lambda: pg._allgather_base(out, inp),
+        "cuda_barrier": lambda: pg.cuda_barrier(),
+    }
+    counter = torch.zeros(16, device="cuda")
+    for replays, (what, call) in enumerate(calls.items(), 1):
+        graph = torch.cuda.CUDAGraph()
+        error = ""
+        try:
+            with torch.cuda.graph(graph):
+                counter.add_(1)
+                call()
+        except RuntimeError as e:
+            error = str(e)
+        ok = "cannot be captured in a CUDA graph" in error
+        raise_on_all_ranks(ctx, pg, "" if ok else f"{what} during a capture: expected moodist's error, got {error!r}")
+        graph.replay()
+        ok = bool((counter == replays).all())
+        raise_on_all_ranks(ctx, pg, "" if ok else f"after the capture of {what}: the graph's replay did not run")
+    for it in range(20):
+        t = rank_values(ctx.rank, 0, numel, torch.float32, 40 + it)
+        pg.allreduce([t]).wait()
+        check(ctx, pg, f"all-reduce {it} after the captures", t, reference("sum", n, 0, numel, 40 + it), "sum",
+              torch.float32)
 
 
 @test

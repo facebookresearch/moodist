@@ -61,6 +61,16 @@ seconds, overrides it:
 Collectives of CUDA tensors, scatters and gathers of CPU tensors, and the ops that `compile_op` returns have no
 timeout yet; once a rank's process has ended, the other ranks notice within a few minutes and end theirs.
 
+## CUDA graphs
+
+Collectives of CUDA tensors (in groups of more than one rank), `cuda_barrier` and the ops that `compile_op` returns,
+if they have CUDA tensors, cannot be captured in CUDA graphs yet: called while the current stream is capturing, they
+raise an error, before queuing anything on the stream (the capture stays valid, and the process group usable). Each
+rank checks its own stream: ranks that do not capture run the collective and wait for the others. Waiting for the
+future of such a `compile_op` op while the current stream is capturing raises an error too (dropping it logs one):
+wait for it before the capture. Collectives and ops of CPU tensors run at once during a capture, outside the graph.
+The CUDA operations of `moodist.Queue` are not checked.
+
 ## Documentation
 
 API documentation is available in the [docs/](docs/) directory:

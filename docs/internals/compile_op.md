@@ -610,13 +610,15 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   CUDA allocator, which for user ops must therefore be moodist's (checked like the tensors, see Known issues), then
   calls `launchCustomOp` for the rest of this section. The process group's collectives call `launchCustomOp`
   directly, with the tensor data of the addresses they have checked (no temporary tensors, no future: their tensors
-  are CUDA tensors, so the op is done for the caller once queued). `launchCustomOp` allocates the scratch tensor of
-  reductions across NVLink domains or in two phases (from moodist's allocator, on the op's stream, freed at the end
-  of the call: its memory is reused only by work after the op on that stream, which comes after the op's RDMA
-  transfers into and from it, as the CPU thread starts once the stream has reached the op). A rank with a scratch
-  tensor counts as one with CUDA tensors, also if it has no tensors of its own in the op (a partial rank need not have
-  any): its stream must wait for the CPU thread too, or a new tensor on the stream could take the scratch tensor's
-  memory while other ranks still read from it or write into it.
+  are CUDA tensors, so the op is done for the caller once queued). Both raise if an op with CUDA tensors would run on
+  a stream that is capturing a CUDA graph (`requireNotCapturing`, before the compile of a collective's new shape,
+  its staging buffers or the copies: the capture stays valid, and the group usable; see Known issues).
+  `launchCustomOp` allocates the scratch tensor of reductions across NVLink domains or in two phases (from moodist's
+  allocator, on the op's stream, freed at the end of the call: its memory is reused only by work after the op on that
+  stream, which comes after the op's RDMA transfers into and from it, as the CPU thread starts once the stream has
+  reached the op). A rank with a scratch tensor counts as one with CUDA tensors, also if it has no tensors of its own
+  in the op (a partial rank need not have any): its stream must wait for the CPU thread too, or a new tensor on the
+  stream could take the scratch tensor's memory while other ranks still read from it or write into it.
 - Stream order (a rank with CUDA tensors, when any rank needs RDMA): write `cpuIn` = stepValue (the CPU thread may
   start), then the kernel, then wait until `cpuOut` >= stepValue.
 - The op runs on the caller's current CUDA stream (no internal stream). Everything enqueued after it on that stream
@@ -624,12 +626,13 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   returns. Each op uses one of 16 concurrency slots (its own `cpuIn`, `cpuOut` and step value exchange areas): on
   the stream, the whole op waits for the slot's event, which the slot's previous op (possibly on another stream)
   recorded when it was done (not if that op ran on the same stream, by its stream id: stream order already puts this
-  op after it), and records it when done itself. `wait()` (or dropping the future) makes the current
-  stream wait for that event if it is not the op's stream (if the slot has been reused since, for the later op,
-  which only waits longer), then makes the output copies. Ops with CPU tensors, or compiled with `cpu_sync=True`,
-  block in `wait()` until the CPU thread is done. (moodist's process group collectives also run on the current
-  stream, but their `Work.wait()` does nothing, so they do not join another stream.) Between April and October
-  2026 (95a48ec) `wait()` blocked for every op with an RDMA part; see the latency noise note under Known issues.
+  op after it), and records it when done itself. `wait()` (or dropping the future) makes the current stream wait for
+  that event if it is not the op's stream (if the slot has been reused since, for the later op, which only waits
+  longer), then makes the output copies; not while the current stream captures a CUDA graph (see Known issues). Ops
+  with CPU tensors, or compiled with `cpu_sync=True`, block in `wait()` until the CPU thread is done. (moodist's
+  process group collectives also run on the current stream, but their `Work.wait()` does nothing, so they do not join
+  another stream.) Between April and October 2026 (95a48ec) `wait()` blocked for every op with an RDMA part; see the
+  latency noise note under Known issues.
 - The CPU thread (`WorkCustom`, only if some rank has ibReads or ibWrites) works with the rank's peers in the op
   (`CustomOpDescriptor::peers`: the ranks it reads from, writes to or notifies, and those that read from it, write to
   it or notify it; the compile phase finds them in an exchange it already has). It publishes the rank's input list
@@ -1406,6 +1409,14 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   `wait()`: today a `wait()` on a stream other than the op's copies back from memory that its allocator (PyTorch's,
   or moodist's through PyTorch's) has already handed back to the op's stream, where later allocations can take it
   before that copy runs.
+- Ops are not capturable in CUDA graphs: a collective of CUDA tensors, a compile_op op with CUDA tensors and
+  `cuda_barrier` raise if the stream is capturing (see Runtime). Each launch takes its step value and concurrency
+  slot from the host, waits for and records the slot's event, can allocate staging buffers and a scratch tensor, and
+  gives an RDMA part to the CPU thread, all per call; a replay would repeat none of it. The future of such an op
+  cannot be waited for during a capture either (its join would wait for an event recorded outside the capture, which
+  fails and invalidates the capture, and its copies back into the outputs would be captured instead of run): `wait()`
+  raises, and a future dropped meanwhile logs the error (`futureDestroy`; a destructor cannot raise) and does neither.
+  moodist.Queue's CUDA operations (queue.cc) are not checked.
 
 ### Performance
 - The process group's broadcast and reduce of large tensors are bound by the root (see the table under Performance

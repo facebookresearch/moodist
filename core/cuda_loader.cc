@@ -159,7 +159,7 @@ bool loadCuda() {
     cudaApi.streamDestroy = (cuStreamDestroy_t)loadSym(lib, "cuStreamDestroy_v2", name, ok, failed);
     cudaApi.streamSynchronize = (cuStreamSynchronize_t)loadSym(lib, "cuStreamSynchronize", name, ok, failed);
     cudaApi.streamWaitEvent = (cuStreamWaitEvent_t)loadSym(lib, "cuStreamWaitEvent", name, ok, failed);
-    cudaApi.streamGetId = (cuStreamGetId_t)loadSymOptional(lib, "cuStreamGetId");
+    cudaApi.streamGetId = (cuStreamGetId_t)loadSym(lib, "cuStreamGetId", name, ok, failed);
     cudaApi.streamWaitValue32 = (cuStreamWaitValue32_t)loadSym(lib, "cuStreamWaitValue32_v2", name, ok, failed);
     cudaApi.streamBatchMemOp = (cuStreamBatchMemOp_t)loadSym(lib, "cuStreamBatchMemOp_v2", name, ok, failed);
 

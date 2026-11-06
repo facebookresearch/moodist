@@ -566,7 +566,7 @@ struct CudaApi {
   cuStreamDestroy_t streamDestroy = nullptr;
   cuStreamSynchronize_t streamSynchronize = nullptr;
   cuStreamWaitEvent_t streamWaitEvent = nullptr;
-  cuStreamGetId_t streamGetId = nullptr; // optional (CUDA 12.0 and later): null if the driver has none
+  cuStreamGetId_t streamGetId = nullptr;
   cuStreamWaitValue32_t streamWaitValue32 = nullptr;
   cuStreamBatchMemOp_t streamBatchMemOp = nullptr;
 

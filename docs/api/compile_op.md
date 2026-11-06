@@ -69,6 +69,7 @@ This is useful for tensor redistribution operations where you want to change the
 - CUDA tensors must be allocated by the moodist CUDA allocator: call `moodist.enable_cuda_allocator()` before allocating them. Checked when the op runs.
 - An op whose regions have pieces that are not contiguous in a tensor (e.g. a block of columns of a row-major matrix) moves them through contiguous copies, which come from PyTorch's current CUDA allocator: such an op needs `moodist.enable_cuda_allocator()` even if its tensors come from `moodist.comm_empty` (it raises otherwise, when it runs).
 - Transfers between NVLink peers (GPUs on the same node, or all GPUs of a multi-node NVLink domain such as NVL72) are done by a copy kernel that needs sizes and offsets that are multiples of 16 bytes, and 16-byte aligned tensors. Sizes and offsets are checked by `compile_op` (a `RuntimeError` on all ranks), tensor addresses when the op runs.
+- Ops with CUDA tensors cannot be captured in CUDA graphs yet: calling one while the current stream is capturing raises a `RuntimeError` (before anything is queued on the stream, so the capture stays valid). So does waiting for the future of such an op while the current stream is capturing (dropping the future then logs the error, and neither joins the stream nor copies outputs back): wait for it before the capture begins.
 
 ## NVLink multicast and communication buffers
 

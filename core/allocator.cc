@@ -138,11 +138,11 @@ struct StreamRef {
   uint64_t id = 0;
 };
 
-// A stream's id, or its handle (with the top bit set, apart from ids) on drivers without ids (before CUDA 12.0). Not
-// for a capturing stream: see capturingStreamId.
+// A stream's id, or its handle (with the top bit set, apart from ids) if the driver gives none. Not for a capturing
+// stream: see capturingStreamId.
 uint64_t streamId(CUstream stream) {
   unsigned long long id = 0;
-  if (cudaApi.streamGetId && cudaApi.streamGetId(stream, &id) == CUDA_SUCCESS) {
+  if (cudaApi.streamGetId(stream, &id) == CUDA_SUCCESS) {
     return id;
   }
   return (1ull << 63) | (uintptr_t)stream;

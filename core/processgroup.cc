@@ -205,6 +205,30 @@ struct EventSerializer {
   }
 };
 
+namespace {
+// Whether the stream is capturing a CUDA graph (or is in a capture that has been invalidated)
+bool streamCapturing(CUstream stream) {
+  // (the legacy default stream is never captured, and the query fails for it while another stream captures)
+  if (stream == nullptr) {
+    return false;
+  }
+  CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
+  unsigned long long id = 0;
+  return cuStreamGetCaptureInfo(stream, &status, &id) == CUDA_SUCCESS && status != CU_STREAM_CAPTURE_STATUS_NONE;
+}
+
+// Raises if the stream is capturing a CUDA graph: work that moodist queues on a stream cannot be captured yet (a
+// launch takes its step value and concurrency slot from the host, waits for and records the slot's event, and can
+// allocate buffers and give the CPU thread work, all per call). Called before anything touches the stream or the
+// process group's state, so that the capture stays valid and the process group usable. launchCustomOp counts on it:
+// cuStreamGetId fails on a capturing stream, and with some drivers (580, CUDA 13.0) invalidates the capture.
+void requireNotCapturing(CUstream stream, const char* what) {
+  if (streamCapturing(stream)) {
+    throw std::runtime_error(fmt::sprintf("moodist: %s cannot be captured in a CUDA graph yet", what));
+  }
+}
+} // namespace
+
 struct ThreadUnsafe {
   SpinMutex mutex;
   void lock() {
@@ -718,7 +742,8 @@ struct ProcessGroupImpl : api::ProcessGroup {
   // launchCustomOp - the launch of a compiled custom operation: customOp's after its checks of the tensors and its
   // copies, and the process group's collectives' (see runCollective). inputTDs: the inputs, then the input copies;
   // outputTDs: the outputs, then the output copies. If the op has a kernel, the caller makes the op's stream current
-  // on the group's device (the kernel's launch takes the current context). Returns the op's future (done once queued
+  // on the group's device (the kernel's launch takes the current context); if it has CUDA tensors, the caller has
+  // checked that the stream does not capture (requireNotCapturing). Returns the op's future (done once queued
   // on the stream if no tensor is a CPU tensor), its concurrency slot and whether it has CUDA tensors (a scratch
   // tensor counts: see launchCustomOp).
   struct CustomOpLaunch {
@@ -1368,6 +1393,7 @@ void ProcessGroupImpl::alltoall(std::span<TensorPtr> outputs, std::span<TensorPt
 // ============================================================================
 
 void ProcessGroupImpl::cudaBarrier(CUstream stream) {
+  requireNotCapturing(stream, "cuda_barrier");
   std::unique_lock l(threadUnsafe);
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -1817,7 +1843,20 @@ bool getProfilingEnabled() {
 void futureWait(api::Future* future);
 
 void futureDestroy(api::Future* future) {
-  futureWait(future);
+  // (called from a destructor: an error is logged, as thrown it would end the process; e.g. a compile_op future dropped
+  // while the current stream captures a CUDA graph, which neither joins that stream nor copies the outputs back)
+  try {
+    futureWait(future);
+  } catch (const std::exception& e) {
+    // (the log adds its own "moodist: ")
+    std::string_view what = e.what();
+    if (what.starts_with("moodist: ")) {
+      what.remove_prefix(std::string_view("moodist: ").size());
+    }
+    log.error("%s (while dropping the future: the current stream does not wait for the op, and outputs that it copies "
+              "back are not written)\n",
+        std::string(what));
+  }
   internalDelete(static_cast<ApiFuture*>(future));
 }
 
@@ -2145,6 +2184,8 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
     }
     return;
   }
+  // (before the compile at a shape's first call, the staging buffers and the launch)
+  requireNotCapturing(stream, "process group collectives of CUDA tensors");
 
   // The op: of parts of numel rounded up to 16 bytes (the copy kernel's unit). A call of another size uses it through
   // buffers whose parts have the padding (below).
@@ -2441,11 +2482,12 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
   // before this stream gets here), and records the slot's event when done, which wait() uses (see customOp). If the
   // slot's previous op ran on this stream, stream order already puts this op after it: no wait (about 0.3 us of host
   // time and 0.25 us of the GPU's per op on GB300). Streams by id: a destroyed stream's handle can come back, with
-  // its last ops still to run; its id does not. (Only these ops wait for and record the slot's event.)
+  // its last ops still to run; its id does not. (Only these ops wait for and record the slot's event.) The stream
+  // does not capture (the callers check, see requireNotCapturing); should the query fail anyway, the op waits.
   std::optional<EventSerializer> slotSerializer;
   if (anyCuda) {
     unsigned long long streamId = 0;
-    const bool known = cudaApi.streamGetId && cudaApi.streamGetId(stream, &streamId) == CUDA_SUCCESS;
+    const bool known = cudaApi.streamGetId(stream, &streamId) == CUDA_SUCCESS;
     const bool wait = !known || concurrencyStreams[concurrencyIndex] != streamId;
     slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream, wait);
     concurrencyStreams[concurrencyIndex] = known ? std::optional(streamId) : std::nullopt;
@@ -2691,6 +2733,15 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   checkTensors("input", inputTDs);
   checkTensors("output", outputTDs);
 
+  // An op with CUDA tensors (a scratch tensor counts, see launchCustomOp) runs on the stream: not while it captures,
+  // checked before the copies
+  auto isCuda = [](const TensorDataPtr& t) {
+    return t->isCuda;
+  };
+  if (op->scratchBytes != 0 || std::ranges::any_of(inputTDs, isCuda) || std::ranges::any_of(outputTDs, isCuda)) {
+    requireNotCapturing(stream, "compile_op ops of CUDA tensors");
+  }
+
   // Fast path: all-local, all-CUDA, no copies — skip CPU thread entirely
   // if (op->allLocal) {
   // if (true) {
@@ -2772,9 +2823,17 @@ SharedPtr<ApiFuture> ProcessGroupImpl::customOp(std::shared_ptr<CustomOpDescript
   // wait() (and dropping the future without it): if the current stream is not the one the op ran on, it waits for
   // the slot's event, which the op recorded when done on its stream (kernel and RDMA part). If the slot has been
   // reused since, the event is a later op's, which only waits longer. On the op's own stream nothing is needed.
+  // Not while it captures a CUDA graph: the wait for an event recorded outside the capture would fail and invalidate
+  // the capture, and the copies back into the outputs (below) would be captured instead of run. It raises then,
+  // before any of it (futureDestroy logs the error of a future dropped meanwhile).
   auto selfPtr = share(this);
   auto joinCurrentStream = [selfPtr, concurrencyIndex, stream]() {
     CUstream current = wrapperApi.cudaGetCurrentStream();
+    if (streamCapturing(current)) {
+      throw std::runtime_error("moodist: the future of a compile_op op with CUDA tensors cannot be waited for (or "
+                               "dropped) while the current stream is capturing a CUDA graph: wait for it before the "
+                               "capture begins");
+    }
     if (current != stream) {
       selfPtr->concurrencyEvents[concurrencyIndex].wait(current);
     }

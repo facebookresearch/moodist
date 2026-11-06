@@ -409,6 +409,88 @@ def test_compile_op_wait_other_stream(ctx: TestContext, device: str):
         )
 
 
+@test_devices("cuda")
+def test_compile_op_capture_error(ctx: TestContext, device: str):
+    """An op with CUDA tensors cannot be captured in a CUDA graph yet: called while the stream captures (in
+    torch.cuda.graph's default mode, global), it raises moodist's error before queuing anything, so the capture stays
+    valid (the graph of the other work replays). Nor can the future of an op launched before the capture be waited for
+    during it, on another stream than the op's or on the op's own: wait() raises before anything too, and the future
+    can still be waited for after the capture; dropped during the capture, it logs the error (a destructor: raising
+    would end the process). The op still works afterwards."""
+    if ctx.world_size < 2:
+        return
+
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    c = 256
+    dtype = torch.float32
+    op = moodist.compile_op(
+        pg,
+        dtype=dtype,
+        inputs=[TensorRegion(offset=[ctx.rank * c], shape=[c], device=device)],
+        outputs=[TensorRegion(offset=[0], shape=[n * c], device=device)],
+    )
+    x = torch.full((c,), float(ctx.rank), dtype=dtype, device=device)
+    out = torch.zeros(n * c, dtype=dtype, device=device)
+    expected = torch.arange(n, dtype=dtype, device=device).repeat_interleave(c)
+    counter = torch.zeros(16, device=device)
+    replays = 0
+
+    def capture(what, fn, stream=None):
+        """fn during a capture (on stream; by default torch.cuda.graph's own); checks on every rank that the capture
+        stayed valid (its graph replays), and returns the message of the RuntimeError fn raised, if any."""
+        nonlocal replays
+        graph = torch.cuda.CUDAGraph()
+        error = ""
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                counter.add_(1)
+                fn()
+        except RuntimeError as e:
+            error = str(e)
+        try:
+            graph.replay()
+            torch.cuda.synchronize()
+            replays += 1
+            ok = bool((counter == replays).all())
+        except RuntimeError:
+            ok = False
+        all_ranks_ok(ctx, pg, ok, f"{what}: the capture's graph did not replay (error {error!r})")
+        return error
+
+    error = capture("the op", lambda: op([x], [out]))
+    all_ranks_ok(ctx, pg, "cannot be captured in a CUDA graph" in error,
+                 f"op during a capture: expected moodist's error, got {error!r}")
+
+    future = op([x], [out])
+    error = capture("future.wait() on another stream", future.wait)
+    all_ranks_ok(ctx, pg, "cannot be waited for" in error,
+                 f"future.wait() during a capture: expected moodist's error, got {error!r}")
+    future.wait()
+    all_ranks_ok(ctx, pg, torch.equal(out, expected), "the op waited for after the capture: wrong output")
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        future = op([x], [out])
+    error = capture("future.wait() on the op's stream", future.wait, stream=side)
+    all_ranks_ok(ctx, pg, "cannot be waited for" in error,
+                 f"future.wait() on the op's stream during a capture: expected moodist's error, got {error!r}")
+    future.wait()
+
+    future = op([x], [out])
+
+    def drop():
+        nonlocal future
+        future = None
+
+    capture("dropping a future", drop)
+    torch.cuda.synchronize()
+    out.zero_()
+    op([x], [out]).wait()
+    all_ranks_ok(ctx, pg, torch.equal(out, expected), "the op after the captures: wrong output")
+
+
 @test_cpu_cuda
 def test_compile_op_alternating_tensors(ctx: TestContext, device: str):
     """An op launched with two sets of tensors, in the order A A B B A B. A launch takes the peers' addresses of its
