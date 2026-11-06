@@ -8,7 +8,8 @@ unchanged.
 Inputs are small integers that depend on the rank, the region and the global index, so that every rank can compute
 every rank's inputs, and sums are exact in every dtype: the expected results are exact too (avg: the exact sum divided
 by the number of inputs, rounded once in float32, then to the dtype, as the kernel does; across domains, the partial
-results of the domains are divided and rounded to the dtype first, which is exact with a power of 2 ranks).
+results of the domains are divided and rounded to the dtype first, which is exact with a power of 2 inputs, and
+otherwise within a few ulps of the partial results, which run_reduce allows there).
 """
 
 import contextlib
@@ -81,8 +82,12 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
     output_tensors = []
     aliased = []  # per output: whether it is an input tensor
     expected = []
+    tolerances = []  # per output: how far each element may be from the expected value (None: not at all)
+    # (avg across NVLink domains: every rank's domain, see below)
+    domain_of = nvlink_domains(ctx, pg) if op_name == "avg" else []
+    multi_domain = len(set(domain_of)) > 1
     for tid, (gshape, ins, outs) in spec.items():
-        # The expected values of the whole global tensor, from every rank's inputs
+        # The expected values of the whole global tensor, from every rank's inputs (the ranks of each domain together)
         acc_dtype = torch.float64
         if op_name == "min":
             acc = torch.full(gshape, math.inf, dtype=acc_dtype, device="cuda")
@@ -91,7 +96,15 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
         else:
             acc = torch.zeros(gshape, dtype=acc_dtype, device="cuda")
         count = torch.zeros(gshape, dtype=torch.int64, device="cuda")
-        for r in range(ctx.world_size):
+        if multi_domain:
+            # The magnitudes of the domains' partial sums, added up
+            partial = torch.zeros(gshape, dtype=acc_dtype, device="cuda")
+            magnitude = torch.zeros(gshape, dtype=acc_dtype, device="cuda")
+        ranks = sorted(range(ctx.world_size), key=lambda r: domain_of[r]) if multi_domain else range(ctx.world_size)
+        for j, r in enumerate(ranks):
+            if multi_domain and j != 0 and domain_of[r] != domain_of[ranks[j - 1]]:
+                magnitude += partial.abs()
+                partial.zero_()
             for i, (offset, shape) in enumerate(ins[r]):
                 v = make_input(r, i, gshape, offset, shape, torch.float64, salt)
                 sl = tuple(slice(o, o + s) for o, s in zip(offset, shape))
@@ -101,8 +114,21 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
                     acc[sl] = torch.maximum(acc[sl], v)
                 else:
                     acc[sl] += v
+                    if multi_domain:
+                        partial[sl] += v
                 count[sl] += 1
+        tolerance = None
         if op_name == "avg":
+            # Across NVLink domains, each domain's partial result is divided by the number of inputs and rounded to the
+            # dtype before the domains' are combined (see crossDomainReductions in compile_op.cc): exact where that
+            # number is a power of 2, else off by up to half an ulp of each partial result, and of the result (with a
+            # margin of 2, e.g. for the switches' sums of 16-bit floats, within 1 ulp; exact for these inputs)
+            if multi_domain:
+                magnitude += partial.abs()
+                power_of_2 = (count & (count - 1)) == 0
+                n = count.clamp(min=1).to(acc_dtype)
+                bound = 2 * torch.finfo(dtype).eps * (magnitude / n + (acc / n).abs())
+                tolerance = torch.where(power_of_2, torch.zeros_like(bound), bound)
             if dtype == torch.float64:
                 acc = acc / count
             else:
@@ -118,6 +144,7 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
             outputs.append(TensorRegion(offset=list(offset), shape=list(shape), device="cuda", tensor_id=tid))
             sl = tuple(slice(o, o + s) for o, s in zip(offset, shape))
             expected.append(result[sl])
+            tolerances.append(tolerance[sl] if tolerance is not None else None)
             same = my_inputs.get((tuple(offset), tuple(shape))) if in_place else None
             aliased.append(same is not None)
             output_tensors.append(same if same is not None else torch.empty(shape, dtype=dtype, device="cuda"))
@@ -130,13 +157,15 @@ def run_reduce(ctx, pg, op_name, dtype, spec, salt=0, in_place=False, repeat=1):
             if not a:
                 t.fill_(99)
         op(input_tensors, output_tensors).wait()
-        for i, (out, exp) in enumerate(zip(output_tensors, expected)):
-            if not torch.equal(out, exp):
-                bad = (out != exp).nonzero()
+        for i, (out, exp, tol) in enumerate(zip(output_tensors, expected, tolerances)):
+            wrong = out != exp if tol is None else (out.double() - exp.double()).abs() > tol
+            if bool(wrong.any()):
+                bad = wrong.nonzero()
                 first = tuple(bad[0].tolist())
                 errors.append(
                     f"reduce={op_name} {dtype} output {i}{' (in place)' if aliased[i] else ''}, run {run}: {len(bad)} "
                     f"of {out.numel()} wrong, first at {first}: {out[first].item()} expected {exp[first].item()}"
+                    + (f" (within {tol[first].item():.3g})" if tol is not None else "")
                 )
     raise_on_all_ranks(ctx, pg, errors)
     return output_tensors
