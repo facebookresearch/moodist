@@ -1503,17 +1503,19 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
   } else if (key == "timeout_ms") {
     // Read-only: the process group's timeout (see Group::timeout)
     return std::chrono::duration_cast<std::chrono::milliseconds>(impl->group->timeout).count();
-  } else if (key == "nvls_launches") {
-    // Read-only: how many compile_op launches of this rank in this group used NVLS (copies, reductions; with the NVLS
-    // runs of the reduce loop, a launch every run of which could; see generateKernel); as of the launches that have
-    // completed
+  } else if (key == "nvls_launches" || key == "nvls_loop_launches") {
+    // Read-only: how many compile_op launches of this rank in this group used NVLS (copies, reductions; with NVLS
+    // runs, a launch every run of which could; see generateKernel), or how many of those ran nvlsReduceLoop (NVLS
+    // reductions, or NVLS runs in the warp loop: not with MOODIST_COMPILE_OP_NVLS_LOOP=0), e.g. for tests; as of the
+    // launches that have completed
     const Group::Nvls& nvls = impl->group->nvls;
     if (nvls.state != 1) {
       return 0;
     }
     uint32_t value = 0;
     CHECK_CU(cuCtxSetCurrent(impl->group->cuContext));
-    CHECK_CU(cuMemcpyAsync((CUdeviceptr)&value, nvls.launches, sizeof(value), nullptr));
+    CHECK_CU(cuMemcpyAsync(
+        (CUdeviceptr)&value, key == "nvls_launches" ? nvls.launches : nvls.loopLaunches, sizeof(value), nullptr));
     CHECK_CU(cuStreamSynchronize(nullptr));
     return value;
   } else if (key == "nvlink_domain") {

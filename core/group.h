@@ -187,8 +187,10 @@ struct Group {
     uintptr_t countersMc = 0;    // the counter area, through the multicast mapping
     size_t nextCounters = 0;     // the offset in the counter area of the next op's counters (the same on all ranks)
     // How many launches of this rank used NVLS (a 32-bit counter in the first 64 bytes of the counter area; see the
-    // process group option "nvls_launches")
+    // process group option "nvls_launches"), and how many of those ran nvlsReduceLoop (the next 32 bits;
+    // "nvls_loop_launches")
     uintptr_t launches = 0;
+    uintptr_t loopLaunches = 0;
   };
   Nvls nvls;
   // Collective over all ranks of the group (setupComms). Returns whether NVLS is available to this rank: whether its

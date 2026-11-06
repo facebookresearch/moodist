@@ -572,6 +572,36 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   flags wait for the completion of their block's bulk stores, earlier multicast stores included; storing them from the
   threads' registers instead changed nothing measurable, 709 / 708 us at 256 MiB.)
 
+  A rank whose edges all have their sources and destinations besides the runs on the rank itself (`nvlsRunLoopEdge`:
+  those of reductions across domains, whose other sources are partial results that the CPU thread reads into its scratch
+  tensor and items that the kernel computes for itself) runs its edges in `nvlsReduceLoop` instead (`nvlsRunLoop`), when
+  the launch can use NVLS (every entry passes; otherwise in the reduce loop, each run on its own as above;
+  `MOODIST_COMPILE_OP_NVLS_LOOP=0`: always). Its warps take the items of 4 KiB of every edge, in the order of the edges
+  (the reduce loop's, so that every wait is for an edge earlier in the order or for a transfer of one, and a warp has
+  one item at a time). An item loads the run of sources with `multimem.ld_reduce` first (a run waits for nothing), then
+  passes the edge's waits if the warp has not yet (the reduce loop's: the destination waits, then the sources'; every
+  lane polls the words, then an acquire fence), loads the other sources with plain loads (the first before the run is
+  combined), and combines them as the reduce loop does (from the identity, the run as one source, `avg` and `PremulSum`
+  scaled after the inputs, 16-bit floats in `float32` rounded once; an edge with one source stored as loaded): the same
+  bits as in the reduce loop (`test_nvls_loop_same_bits`). It stores the result with one multicast store to the run of
+  destinations and with plain stores to the other destinations. Done flags: a warp counts its items of an edge, and adds
+  its count to the edge's counter (lane 0, after the warp's barrier and a release fence) when it goes on to another
+  edge, before that edge's waits, and at the end; the warp whose add completes the count sets the flags. The blocks are
+  the rank's share of 4 MiB in flight per domain, by its bytes of edges with runs among the domain's (4 blocks with 32
+  GPUs per domain, 8 with 16; see NVLS reductions), three times that with runs of destinations (an all-reduce's, whose
+  items of partial results and plans with multicast stores each run with every warp, one after the other), where the
+  reduce loop takes the whole tuned grid: its blocks take 32 KiB chunks, for which all threads wait for the block's
+  slowest vector, and thread 0 waits for the completion of its bulk stores before it counts an item with done flags,
+  which the block's next chunk then waits for (across 2 domains of 32 GB300, a reduce-scatter's partial results for the
+  other domain: 7.6-14.8 us per item, a quarter of the kernel). Across 2 domains of 32 GB300 (buffers from the
+  communication pool, the mean of two passes in one session, `nvlsReduceLoop` / the reduce loop): reduce-scatter (per
+  rank) of `float32` 13 MiB 1212 / 1203 us and 31.3 MiB 2866 / 2854 us (4 working blocks instead of the 24 of the tuned
+  grid; 6 blocks: 1201 and 2851 us), of `bfloat16` 64 KiB 60 / 61 us, 256 KiB 77 / 80 us, 1 MiB 160 / 159 us, 16 MiB
+  1474 / 1468 us and 64 MiB 5839 / 5806 us; all-reduce of `bfloat16` (12 blocks; two passes in reverse order) 16 MiB 112
+  / 115 us, 64 MiB 237 / 263 us, 256 MiB 687 / 719 us and 1 GiB 2357 / 2353 us (with 4 blocks: 111, 216, 779 and 3055
+  us; 8: 222, 713 and 2595 us; 24: 262, 666 and 2430 us; across 4 domains of 16, in two rounds, which RDMA limits, the
+  same with any); reduce to one rank 16 MiB 251 / 260 us, 64 MiB 775 / 956 us.
+
 ## Runtime (`customOp`, `WorkCustom`)
 
 - `customOp` checks the tensors (shape, dtype, device; for user ops also that CUDA tensors come from the moodist
@@ -708,14 +738,15 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   kernel signals the CPU thread when it has stored an item or used the contents of a slot (done flags, `cpuInBuffer`
   slots 16 + index).
 
-- NVLS ops (see the kernel): `customOp` passes the NVLS identities and multicast addresses of the tensors (in the
+- NVLS ops (see the kernel): `launchCustomOp` passes the NVLS identities and multicast addresses of the tensors (in the
   communication pool, at logical offset o: (2 << 60) | o; else in moodist's pool, at offset o: (1 << 60) | o) and the
-  op's step counter value (0 for reductions, which have none); an identity refers to the rank's NVLink domain's
-  objects, which the launches compare within the domain. Block 0 of a launch that used NVLS (copies or reductions;
-  with NVLS runs, a launch whose every run could) counts it in the group's counter area (the process group option
-  `nvls_launches`; the read-only option `nvlink_domain` gives the first rank of the rank's domain, for tests). With
-  `MOODIST_COMPILE_OP_PROFILE`, the launch that writes the kernel's profile does so once the CPU thread has the op's
-  RDMA part (its kernel may wait for the transfers: writing it right after the launch deadlocked reductions across
+  op's step counter value (0 for reductions, which have none); an identity refers to the rank's NVLink domain's objects,
+  which the launches compare within the domain. Block 0 of a launch that used NVLS (copies or reductions; with NVLS
+  runs, a launch whose every run could) counts it in the group's counter area (the process group option
+  `nvls_launches`), and if it ran `nvlsReduceLoop` (NVLS reductions, NVLS runs in the warp loop) also in the next word
+  (`nvls_loop_launches`); the read-only option `nvlink_domain` gives the first rank of the rank's domain, for tests.
+  With `MOODIST_COMPILE_OP_PROFILE`, the launch that writes the kernel's profile does so once the CPU thread has the
+  op's RDMA part (its kernel may wait for the transfers: writing it right after the launch deadlocked reductions across
   domains).
 - Communication pools (`allocatorCommPoolCreate`; per group, `Group::getCommPool`; `moodist.comm_empty` and the
   process group's `allocate_tensor`): allocations get logical offsets that depend only on the sequence of
@@ -821,8 +852,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   large for kernel parameters do (see The kernel), for tests.
 - `MOODIST_COMPILE_OP_NVLS=0` - no NVLS (copies and reductions, see The kernel), for tests and comparisons. Read
   when an op is compiled; a rank that says no makes the op use none.
-- `MOODIST_COMPILE_OP_NVLS_BLOCKS=N` - the blocks that do the NVLS reductions of every rank that does any (at most the
-  grid; by default by each rank's share, see The kernel), for measurements.
+- `MOODIST_COMPILE_OP_NVLS_BLOCKS=N` - the blocks of `nvlsReduceLoop` (NVLS reductions, and NVLS runs in it) of every
+  rank that runs it (at most the grid; by default by each rank's share, see The kernel), for measurements.
+- `MOODIST_COMPILE_OP_NVLS_LOOP=0` - NVLS runs stay in the reduce loop instead of `nvlsReduceLoop` (see NVLS runs in
+  The kernel; the same bits), for tests and comparisons. Read when an op is compiled; may differ between ranks.
 - `MOODIST_IB_TIMEOUT` - the RDMA transport's ACK timeout exponent (not specific to compile_op; default 20, as
   NCCL's: on ConnectX-8, about 64 s of an unanswered request before the error that ends the job; see ib_common.cc).
 - `MOODIST_TIMEOUT` - the process group's timeout in seconds (not specific to compile_op; it overrides the one that
@@ -1434,6 +1467,22 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   own for the items without source waits (see Reductions in the kernel). To try: items interleaved finer than whole
   parts. Reductions to one rank across domains are now bound by the root's RDMA read of the other domain's partial
   result (64 MiB in 1.01 ms: one NIC); a ring of NICs, or every GPU of the domain reading a piece, would use more.
+  In `nvlsReduceLoop` (November 2026, see NVLS runs): reduce-scatters take as long as in the reduce loop, on the 4
+  blocks of a rank's share (0.4-0.7% longer at large sizes; 6 blocks: as long). All-reduces across 2 domains get three
+  times the share (12 blocks with 32 GPUs per domain): with 4, both phases (items, then plans) had too little in flight
+  (1 GiB 3055 us, the reduce loop 2353). Running the items and the plans at once (half of the warps each) was not faster
+  than more blocks: the items' multimem.ld_reduce slowed down while the plans' multicast stores ran (the switches share
+  their throughput), so an all-reduce across domains cannot get below one within a domain (256 MiB on 32 GB300: 551 us).
+  Open: why 4 blocks were faster than 12 at 64 MiB (216 / 237 us; 12-block runs varied from 217 to 270 us between
+  processes, and a profiled launch was not longer with 12), and the rule on 16 domains of 16 GPUs. The blocks of the
+  tuned grid beyond the share are still launched: they leave `nvlsReduceLoop` at once, but stay on their SMs in the
+  kernel's entry and exit syncs while peers are behind, so the other kernels do not get the SMs back. torchtitan
+  `llama3_8b` (FSDP2, every rank with the same data, rank 0's backward GEMM time): across 2 domains of 32 GB300, 160 ms
+  with the warp loop, 158 with the reduce loop, 147 when an experiment launched only the 4 working blocks (where every
+  rank of the domain has the same share: the syncs pair the blocks of the same index), NCCL with symmetric memory 142;
+  across 16 domains of 16 GB300 the same with all three (146-154 ms; step 503-512 ms, 596-600 ms with different data on
+  every rank). Open: launching only the working blocks, which needs the same grid on every peer or syncs that allow
+  different ones, and the whole grid for launches that fall back to the reduce loop.
 - Unicast stores to outputs at the same offset on every rank are 2-4% slower at large sizes than to outputs at
   different offsets (all-gather on 32 GPUs, see the NVLS table), maybe because all copies of a chunk then have the
   same address bits; not investigated.

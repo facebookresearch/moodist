@@ -610,6 +610,128 @@ def test_all_reduce_nvls_edges(ctx: TestContext):
 
 
 @test
+def test_nvls_loop_same_bits(ctx: TestContext):
+    """Reductions with NVLS runs (across NVLink domains: their parts within each domain) give the same bits in the NVLS
+    warp loop (nvlsReduceLoop, by default) as in the reduce loop (MOODIST_COMPILE_OP_NVLS_LOOP=0): the same switches'
+    sums of the runs, the same other sources combined in the same order, rounded the same way. Buffers of the
+    communication pool (at the same place on every rank), random values: reduce-scatters, all-reduces (in place too)
+    and reductions to one rank of the dtypes and ops that the switches combine (and float16 averages, which they do
+    not), from one 16-byte vector to 13 MiB per rank (parts), edges of at most 4 KiB (MOODIST_COMPILE_OP_MAX_EDGE_BYTES:
+    many per rank, ending part way through items), one slot of 4 KiB per ring of the scratch tensors (every part waits
+    for its slot's previous use, many times per launch), writes instead of reads (MOODIST_COMPILE_OP_TRANSFER=write);
+    the same bits in every launch, nothing stored past the outputs. With MOODIST_TEST_EXPECT_NVLS=1 and domains of 12
+    ranks or more, every launch of a rank that executes reductions used NVLS (but those of float16 averages, and of
+    int32 inputs of more than 4 MiB), with domains of 16 or more in the warp loop (nvls_loop_launches), and those of
+    the reference never did."""
+    pg = create_process_group(ctx)
+    n = ctx.world_size
+    domains = nvlink_domains(ctx, pg)
+    expect = EXPECT_NVLS and len(set(domains)) > 1 and smallest_domain(domains) >= 12
+    whole = lambda numel: [TensorRegion(offset=[0], shape=[numel], device="cuda")]  # noqa: E731
+    small_slots = [("MOODIST_COMPILE_OP_SLOTS", "1"), ("MOODIST_COMPILE_OP_SLOT_BYTES", "4096")]
+    # (kind, dtype, reduce op, elements of an output, environment)
+    cases = [
+        ("reduce_scatter", torch.float32, "sum", 4, []),
+        ("reduce_scatter", torch.float32, "sum", 1000, []),
+        ("reduce_scatter", torch.float32, "avg", (13 << 20) // 4, []),
+        ("reduce_scatter", torch.bfloat16, "avg", 40000, []),
+        ("reduce_scatter", torch.bfloat16, "sum", 3 << 19, []),
+        ("reduce_scatter", torch.float16, "sum", 3000, []),
+        ("reduce_scatter", torch.float16, "avg", 3000, []),
+        ("reduce_scatter", torch.float64, "avg", 5000, []),
+        ("reduce_scatter", torch.int32, "max", 7000, []),
+        ("reduce_scatter", torch.int64, "sum", 3000, []),
+        ("reduce_scatter", torch.float32, "sum", 30000, [("MOODIST_COMPILE_OP_MAX_EDGE_BYTES", "4096")]),
+        ("reduce_scatter", torch.float32, "avg", 1 << 17, small_slots),
+        ("reduce_scatter", torch.bfloat16, "avg", 1 << 18, [("MOODIST_COMPILE_OP_TRANSFER", "write")]),
+        ("all_reduce", torch.bfloat16, "sum", (1 << 20) + 8 * n, []),
+        ("all_reduce", torch.float32, "avg", 3 << 18, []),
+        ("all_reduce", torch.float32, "sum", 4 << 20, []),
+        ("all_reduce", torch.int64, "min", 8000, []),
+        ("all_reduce", torch.bfloat16, "avg", 1 << 18, small_slots),
+        ("all_reduce", torch.float32, "sum", 1 << 18, [("MOODIST_COMPILE_OP_TRANSFER", "write")]),
+        ("all_reduce_in_place", torch.bfloat16, "sum", 300000, []),
+        ("reduce_one", torch.bfloat16, "sum", 1 << 18, []),
+        ("reduce_one", torch.float32, "avg", 1 << 20, []),
+    ]
+    errors = []
+    for kind, dtype, op_name, numel, env in cases:
+        in_place = kind == "all_reduce_in_place"
+        has_output = kind != "reduce_one" or ctx.rank == n - 1
+        in_numel = n * numel if kind == "reduce_scatter" else numel
+        inputs = whole(in_numel)
+        if kind == "reduce_scatter":
+            outputs = [TensorRegion(offset=[ctx.rank * numel], shape=[numel], device="cuda")]
+        else:
+            outputs = whole(numel) if has_output else []
+        with contextlib.ExitStack() as stack:
+            for name, value in env:
+                stack.enter_context(environment(name, value))
+            op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs, reduce=op_name)
+            with environment("MOODIST_COMPILE_OP_NVLS_LOOP", "0"):
+                reference_op = moodist.compile_op(pg, dtype=dtype, inputs=inputs, outputs=outputs, reduce=op_name)
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(1234 + ctx.rank + numel)
+        if dtype.is_floating_point:
+            values = torch.randn(in_numel, generator=gen, device="cuda").to(dtype)
+        else:
+            values = torch.randint(-1000, 1000, (in_numel,), generator=gen, device="cuda").to(dtype)
+        x = moodist.comm_empty(in_numel, dtype=dtype, group=pg)
+        # Outputs: two launches of op, then one of reference_op (in place: the input is the output)
+        bigs, outs = guarded_outputs(pg, numel, dtype, 3)
+        used = []
+        looped = []  # the launches that ran nvlsReduceLoop
+        for i, (big, out) in enumerate(zip(bigs, outs)):
+            big.fill_(99)
+            launches0 = pg._get_option("nvls_launches")
+            loop_launches0 = pg._get_option("nvls_loop_launches")
+            if in_place:
+                out.copy_(values)
+                (op if i < 2 else reference_op)([out], [out]).wait()
+            else:
+                x.copy_(values)
+                (op if i < 2 else reference_op)([x], [out] if has_output else []).wait()
+            torch.cuda.synchronize()
+            used.append(pg._get_option("nvls_launches") - launches0)
+            looped.append(pg._get_option("nvls_loop_launches") - loop_launches0)
+        what = f"{kind} reduce={op_name} {dtype} numel {numel}{''.join(f' {k}={v}' for k, v in env)}"
+        bits = {2: torch.int16, 4: torch.int32, 8: torch.int64}[outs[0].element_size()]
+        if has_output:
+            if not torch.equal(outs[0].view(bits), outs[1].view(bits)):
+                errors.append(f"{what}: two launches gave different bits")
+            if not torch.equal(outs[0].view(bits), outs[2].view(bits)):
+                different = (outs[0].view(bits) != outs[2].view(bits)).nonzero()
+                errors.append(f"{what}: other bits than the reduce loop's at {different.numel()} elements, first "
+                              f"{different[0].item()}: {outs[0][different[0]].item()} vs {outs[2][different[0]].item()}")
+            if not all(guards_intact(big, numel, 99) for big in bigs):
+                errors.append(f"{what}: stores past the output")
+        if expect:
+            counts = nvls_counts(ctx, pg, sum(used))
+            loop_counts = nvls_counts(ctx, pg, looped[0] + looped[1])
+            reference_loop_counts = nvls_counts(ctx, pg, looped[2])
+            if kind in ("reduce_scatter", "all_reduce", "all_reduce_in_place"):
+                executors = list(range(n)) if numel * x.element_size() >= 16 * n or kind == "reduce_scatter" else []
+            else:
+                executors = [n - 1]
+            # (every domain combines the whole input, at most 4 MiB of it with NVLS for int32: nvlsReductionMaxBytes)
+            if (dtype == torch.float16 and op_name == "avg") or (dtype == torch.int32 and in_numel * 4 > (4 << 20)):
+                if any(counts) or any(loop_counts):
+                    errors.append(f"{what}: launches used NVLS (per rank {counts}), which float16 averages and int32 "
+                                  "inputs of more than 4 MiB must not")
+            elif any(counts[r] != 3 for r in executors):
+                errors.append(f"{what}: launches that used NVLS per rank {counts}")
+            # The executors ran op in the warp loop and reference_op in the reduce loop (with domains of 16 ranks or
+            # more: destinations alone are a run from 16, see nvlsStoreMinRanks)
+            elif smallest_domain(domains) >= 16 and any(loop_counts[r] != 2 for r in executors):
+                errors.append(f"{what}: launches of op in nvlsReduceLoop per rank {loop_counts} (2 expected)")
+            if any(reference_loop_counts[r] for r in executors):
+                errors.append(f"{what}: launches with MOODIST_COMPILE_OP_NVLS_LOOP=0 in nvlsReduceLoop per rank "
+                              f"{reference_loop_counts}")
+        raise_on_all_ranks(ctx, pg, errors)
+        del x, outs, bigs
+
+
+@test
 def test_reduce_nvls_mismatch(ctx: TestContext):
     """NVLS reductions fall back to the reduce loop when a rank's tensor is not where NVLS needs it: the last rank's
     input outside the communication pool, its input at another offset of the pool, its output outside the pool (an

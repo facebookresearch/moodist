@@ -1807,6 +1807,7 @@ bool Group::setupNvls() {
   nvls.countersLocal = countersLocal;
   nvls.countersMc = mcBases[0] + Nvls::poolBytes;
   nvls.launches = countersLocal;
+  nvls.loopLaunches = countersLocal + 4;
   nvls.nextCounters = 64;
   nvls.state = 1;
   if (rank == fabricDomainRanks[0]) {
