@@ -1544,6 +1544,22 @@ int64_t processGroupGetOption(api::ProcessGroup* pg, const char* name) {
         (CUdeviceptr)&value, key == "nvls_launches" ? nvls.launches : nvls.loopLaunches, sizeof(value), nullptr));
     CHECK_CU(cuStreamSynchronize(nullptr));
     return value;
+  } else if (key == "kernel_error") {
+    // Read-only: the code of the error that a compile_op kernel of this rank in this group reported (see
+    // Group::KernelError: 1, a tensor at another place of the communication pool on another rank; 2, a peer launched
+    // the op's other kernel), or 0, e.g. for tests. (Host memory: no CUDA call, which would fail after the kernel's
+    // trap.)
+    const Group& g = *impl->group;
+    if (!g.kernelError.cpuPointer) {
+      return 0;
+    }
+    const volatile Group::KernelError* e = (const volatile Group::KernelError*)g.kernelError.cpuPointer;
+    if (e->ready == 0) {
+      return 0;
+    }
+    // (the kernel wrote the record, then a fence, then ready)
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return e->code;
   } else if (key == "nvlink_domain") {
     // Read-only: this rank's NVLink domain in the group, as its first rank (the ranks of a multi-node NVLink fabric
     // that are in the group, else of this rank's node; see compile_op's cudaRanks), e.g. for tests
@@ -1936,13 +1952,15 @@ struct TInput {
   }
 };
 
-void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
-  size_t blockSize = op->config.blockSize;
-  size_t gridSize = op->config.gridSize;
+// (kh, config: the kernel of the op that recorded the profile, see launchCustomOp)
+void dumpProfiling(
+    const Group* group, std::shared_ptr<CustomOpDescriptor> op, const KernelHandle& kh, const KernelConfig& config) {
+  size_t blockSize = config.blockSize;
+  size_t gridSize = config.gridSize;
   Vector<char> data;
-  data.resize(op->kernelHandle->profilingBytesPerThread * blockSize * gridSize);
+  data.resize(kh.profilingBytesPerThread * blockSize * gridSize);
 
-  cudaCopy((uintptr_t)data.data(), op->kernelHandle->profilingData.cudaPointer, data.size(), 0);
+  cudaCopy((uintptr_t)data.data(), kh.profilingData.cudaPointer, data.size(), 0);
   CHECK_CU(cuCtxSynchronize());
 
   CUdevice cuDevice;
@@ -1953,7 +1971,9 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
   uint64_t clockFreq = (uint64_t)clockRate * 1000;
   uint64_t clockDiv = (clockFreq + 1000000 - 1) / 1000000;
 
-  std::string fn = fmt::sprintf("moodist-trace-cuda-%s-%d-op%u.json", group->name, group->rank, op->id);
+  // (an op's NVLS kernel has a file of its own)
+  const char* variant = &kh == op->nvlsKernelHandle.get() ? "-nvls" : "";
+  std::string fn = fmt::sprintf("moodist-trace-cuda-%s-%d-op%u%s.json", group->name, group->rank, op->id, variant);
   FILE* f = fopen(fn.c_str(), "wb");
   CHECK(f != nullptr);
   fmt::fprintf(f, R"({"traceEvents": [)"
@@ -1963,14 +1983,14 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
   size_t truncated = 0; // threads that recorded more entries than their area holds (the kernel drops the others)
   for (size_t blockIndex : range(gridSize)) {
     for (size_t threadIndex : range(blockSize)) {
-      size_t dataOffset = op->kernelHandle->profilingBytesPerThread * ((blockSize * blockIndex) + threadIndex);
+      size_t dataOffset = kh.profilingBytesPerThread * ((blockSize * blockIndex) + threadIndex);
 
       uint32_t numEntries;
       std::memcpy(&numEntries, data.data() + dataOffset, sizeof(uint32_t));
       uint32_t recorded;
       std::memcpy(&recorded, data.data() + dataOffset + 4, sizeof(uint32_t));
       truncated += recorded > numEntries;
-      CHECK(8 + 16 * (size_t)numEntries <= op->kernelHandle->profilingBytesPerThread);
+      CHECK(8 + 16 * (size_t)numEntries <= kh.profilingBytesPerThread);
 
       // log.info("Block %d thread %d has %d entries\n", blockIndex, threadIndex, numEntries);
 
@@ -1988,8 +2008,8 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
         // std::memcpy(&index, data.data() + dataOffset + 8 + 16 * i + 8, sizeof(uint32_t));
         index = clock >> 48;
         // (an unnamed marker, profiling.leave(), ends the span before it)
-        if (index && !op->kernelHandle->profilingNames.at(index).empty()) {
-          std::string name = op->kernelHandle->profilingNames.at(index);
+        if (index && !kh.profilingNames.at(index).empty()) {
+          std::string name = kh.profilingNames.at(index);
           if (!first) {
             fmt::fprintf(f, ",\n");
           } else {
@@ -2008,7 +2028,7 @@ void dumpProfiling(const Group* group, std::shared_ptr<CustomOpDescriptor> op) {
   if (truncated) {
     log.error("the trace of compile_op op %u is incomplete: %d threads recorded more entries than fit in %d "
               "bytes each (the later ones are missing)\n",
-        op->id, truncated, op->kernelHandle->profilingBytesPerThread);
+        op->id, truncated, kh.profilingBytesPerThread);
   }
 }
 
@@ -2154,6 +2174,10 @@ struct CollectiveSide {
 
 void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::ReduceOp reduce, size_t root, size_t numel,
     std::span<const TensorPtr> inputs, std::span<const TensorPtr> outputs, CUstream stream, double scale) {
+  // A kernel's report (see launchCustomOp): before the copies below, whose CUDA calls would fail first
+  if (std::string error = group->kernelErrorMessage(); !error.empty()) {
+    throw std::runtime_error(error);
+  }
   const int device = group->deviceIndex;
   StreamGuard sg(stream, device);
   const size_t itemsize = wrapperApi.dtypeSize(dtype);
@@ -2257,20 +2281,37 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
 
   // This rank's tensors where they are, unless their parts need padding or are not one after the other, other ranks
   // reach them and they are not moodist's memory, or the kernel cannot take their address (16 bytes aligned): then
-  // through a buffer of the group's communication pool, which, when every rank does the same, is at the same offset on
-  // every rank, so that the op can still use NVLS. Other ranks reach moodist's memory only: its mappings and RDMA
-  // registrations are of memory that stays moodist's, while another allocator's (e.g. PyTorch's) could be freed and
-  // reused with the mappings of peers still open (undefined behavior for CUDA IPC) and its registrations holding the
-  // freed pages. In a group of more than one rank, other ranks reach every input and output (see above): every tensor
-  // of another allocator is copied, and the pool keeps the most memory that such buffers took at once (it never frees
-  // its slabs). An all-to-all's input that overlaps its output goes through one too (in place, a rank's part for rank
-  // j would be where rank j's part for it goes).
+  // through a buffer (see bufferPool). Other ranks reach moodist's memory only: its mappings and RDMA registrations are
+  // of memory that stays moodist's, while another allocator's (e.g. PyTorch's) could be freed and reused with the
+  // mappings of peers still open (undefined behavior for CUDA IPC) and its registrations holding the freed pages. In a
+  // group of more than one rank, other ranks reach every input and output (see above): every tensor of another
+  // allocator is copied. An all-to-all's input that overlaps its output goes through one too (in place, a rank's part
+  // for rank j would be where rank j's part for it goes).
   const bool padded = n != numel;
   auto elsewhere = [&](size_t which, const CollectiveSide& s) {
     if (padded || !s.contiguous || (op->kernel && s.address() % 16 != 0)) {
       return true;
     }
     return c.shared[which] && !allocator::owns(s.address());
+  };
+  // The buffer of a side that goes through one: of the group's communication pool if the op's NVLS kernel uses the
+  // side (see KernelHandle::nvlsTensors) and every rank copies it alike, so that the buffer is at the same offset of
+  // the pool on every rank and the launch can use NVLS: its parts need padding (the same on every rank), it is another
+  // allocator's (every rank's, as it is when every rank allocates alike), or it is in the pool (where it must be at the
+  // same offset on every rank, and so has the same alignment and layout). Otherwise of moodist's general memory: a
+  // buffer that only some ranks take from the pool would shift the offsets of every later buffer of it on those ranks
+  // (e.g. the copy of an all-gather's input that is a view into its output, at an offset that is a multiple of 16
+  // bytes on some ranks only), and the side does not need NVLS.
+  auto bufferPool = [&](size_t which, const CollectiveSide& s) -> CommPool* {
+    const uint32_t tensorIndex = which == 0 ? 0 : op->inputs.size();
+    if (!op->nvlsKernelHandle ||
+        std::ranges::find(op->nvlsKernelHandle->nvlsTensors, tensorIndex) == op->nvlsKernelHandle->nvlsTensors.end()) {
+      return nullptr;
+    }
+    CommPool* pool = group->getCommPool();
+    const bool alike =
+        padded || !allocator::owns(s.address()) || allocatorCommPoolOffset(pool, s.address(), width) >= 0;
+    return alike ? pool : nullptr;
   };
   // Copies a side's parts into a buffer, or back
   auto copyParts = [&](uintptr_t dst, size_t dstPitch, uintptr_t src, size_t srcPitch, size_t rows) {
@@ -2318,7 +2359,8 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
   if (inPlace) {
     // (an all-reduce, a reduce or a broadcast on its root): one buffer for both
     if (elsewhere(0, in) || elsewhere(1, out)) {
-      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, group->getCommPool());
+      CommPool* pool = bufferPool(0, in) ? bufferPool(0, in) : bufferPool(1, out);
+      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, pool);
       copyIn(outputBuffer.cudaPointer, in);
       inAddress = outAddress = outputBuffer.cudaPointer;
     }
@@ -2341,12 +2383,12 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
       return false;
     };
     if (in.rows != 0 && (elsewhere(0, in) || overlaps())) {
-      inputBuffer = allocateCudaBuffer(in.rows * pitch, stream, device, group->getCommPool());
+      inputBuffer = allocateCudaBuffer(in.rows * pitch, stream, device, bufferPool(0, in));
       copyIn(inputBuffer.cudaPointer, in);
       inAddress = inputBuffer.cudaPointer;
     }
     if (out.rows != 0 && elsewhere(1, out)) {
-      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, group->getCommPool());
+      outputBuffer = allocateCudaBuffer(out.rows * pitch, stream, device, bufferPool(1, out));
       outAddress = outputBuffer.cudaPointer;
     }
   }
@@ -2390,12 +2432,11 @@ void ProcessGroupImpl::runCollective(CollectiveKind kind, DType dtype, api::Redu
 
 namespace {
 // The NVLS identity of this rank's CUDA tensor at ptr (see generateKernel): where it is in the group's multicast
-// objects, and its multicast address there. In the group's communication pool, at logical offset o: (2 << 60) | o;
-// else in moodist's pool, at offset o: (1 << 60) | o; else 0 (and no multicast address). The same identity on two
-// ranks means the same offset of the same multicast object. (Bits 62 and 63 stay clear: the kernel tags the words it
-// publishes there.)
+// object over its communication pool, and its multicast address there. In the pool, at logical offset o: (2 << 60) |
+// o; else 0 (and no multicast address). The same identity on two ranks means the same offset of the pool. (Bits 62 and
+// 63 stay clear: the kernel tags the words it publishes there.)
 std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t bytes) {
-  static_assert(commPoolLogicalSize <= (1ull << 60) && Group::Nvls::poolBytes <= (1ull << 60));
+  static_assert(commPoolLogicalSize <= (1ull << 60));
   const Group::Nvls& nvls = group->nvls;
   if (nvls.state != 1) {
     return {0, 0};
@@ -2403,10 +2444,6 @@ std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t b
   int64_t logical = allocatorCommPoolOffset(group->getCommPool(), ptr, bytes);
   if (logical >= 0) {
     return {(2ull << 60) | (uint64_t)logical, nvls.commMcBase + logical};
-  }
-  const uintptr_t reserved = allocatorGetReservedBase();
-  if (reserved && ptr >= reserved && ptr - reserved + bytes <= Group::Nvls::poolBytes) {
-    return {(1ull << 60) | (ptr - reserved), nvls.mcBase + (ptr - reserved)};
   }
   return {0, 0};
 }
@@ -2419,6 +2456,12 @@ std::pair<uint64_t, uint64_t> nvlsIdentity(Group* group, uintptr_t ptr, size_t b
 ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::shared_ptr<CustomOpDescriptor>& op,
     std::vector<TensorDataPtr> inputTDs, std::vector<TensorDataPtr> outputTDs, CUstream stream, double scale) {
   std::unique_lock l(threadUnsafe);
+
+  // A kernel of the group has reported that its launch could not go on, and trapped (the context has failed, see
+  // Group::KernelError): this raises its report
+  if (std::string error = group->kernelErrorMessage(); !error.empty()) {
+    throw std::runtime_error(error);
+  }
 
   uint32_t stepValue = getNextStepValue();
   uint32_t concurrencyIndex = std::exchange(nextConcurrencyIndex, (nextConcurrencyIndex + 1) % Group::maxConcurrency);
@@ -2492,8 +2535,9 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
     slotSerializer.emplace(concurrencyEvents[concurrencyIndex], stream, wait);
     concurrencyStreams[concurrencyIndex] = known ? std::optional(streamId) : std::nullopt;
   }
-  // Whether this launch writes the kernel's profile (MOODIST_COMPILE_OP_PROFILE, see generateKernel)
-  bool dumpProfile = false;
+  // The kernel (and its configuration) whose profile this launch writes, if it does (MOODIST_COMPILE_OP_PROFILE, see
+  // generateKernel)
+  std::optional<std::pair<const KernelHandle*, const KernelConfig*>> profiled;
 
   if (anyCuda && anyRdma) {
     memWrite(group->cpuInBuffer.cuda(concurrencyIndex), stepValue);
@@ -2522,10 +2566,10 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
     }
 
     // The addresses at which the peers map this rank's tensors (which the kernel publishes to them, see
-    // generateKernel), and in NVLS ops the tensors' NVLS identities and multicast addresses: those of the op's last
-    // launch if its tensors are at the same addresses (moodist never unmaps memory it has shared, an address stays in
-    // its pool slab, and the op's tensor sizes are fixed), else from the IPC mapper and the allocator (a lookup per
-    // peer and tensor: about 1.5 us per launch with 31 peers on GB300)
+    // generateKernel), and in ops with an NVLS kernel the tensors' NVLS identities and multicast addresses: those of
+    // the op's last launch if its tensors are at the same addresses (moodist never unmaps memory it has shared, an
+    // address stays in its pool slab, and the op's tensor sizes are fixed), else from the IPC mapper and the allocator
+    // (a lookup per peer and tensor: about 1.5 us per launch with 31 peers on GB300)
     CustomOpDescriptor::LaunchCache& cache = op->launchCache;
     const bool cached = cache.valid && cache.tensorAddrs.size() == tensorAddrs.size() &&
                         std::equal(tensorAddrs.begin(), tensorAddrs.end(), cache.tensorAddrs.begin());
@@ -2555,17 +2599,24 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
     if (mappedAddrs.empty()) {
       mappedAddrs.push_back(0);
     }
-    // NVLS (see generateKernel): the tensors' NVLS identities and multicast addresses, and the op's step counter
-    // before this launch
+    // The kernel of the launch (see KernelVariant): the NVLS kernel if the op has one and every tensor that NVLS uses
+    // (KernelHandle::nvlsTensors) is in the group's communication pool (has an NVLS identity, see nvlsIdentity), else
+    // the unicast kernel. Every rank of the NVLink domain chooses alike as long as the pool holds the same tensors on
+    // every rank, as it must: the kernels report it if not (see Group::KernelError). With NVLS, the tensors' NVLS
+    // identities and multicast addresses (the kernel's fourth parameter), and the op's step counter before this
+    // launch.
+    bool useNvls = false;
     uint32_t nvlsCounterBase = 0;
     Vector<uint64_t> nvlsTensors;
-    if (op->kernelHandle->nvls) {
-      KernelHandle& kh = *op->kernelHandle;
+    if (op->nvlsKernel) {
       nvlsTensors.resize(2 * std::max(inputTDs.size() + outputTDs.size(), (size_t)1));
-      if (cached) {
+      // (a new slab of the pool can be at the address of memory that was outside it, see LaunchCache)
+      const uint64_t slabs = allocatorCommPoolSlabCount(group->getCommPool());
+      if (cached && cache.commPoolSlabs == slabs) {
         CHECK(cache.nvlsTensors.size() == nvlsTensors.size());
         std::copy(cache.nvlsTensors.begin(), cache.nvlsTensors.end(), nvlsTensors.begin());
       } else {
+        cache.commPoolSlabs = slabs;
         size_t n = 0;
         for (auto* list : {&inputTDs, &outputTDs}) {
           for (auto& v : *list) {
@@ -2575,9 +2626,19 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
         }
         cache.nvlsTensors.assign(nvlsTensors.begin(), nvlsTensors.end());
       }
-      nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
+      useNvls = std::ranges::all_of(op->nvlsKernelHandle->nvlsTensors, [&](uint32_t t) {
+        return nvlsTensors.at(2 * t) != 0;
+      });
     }
     cache.valid = true;
+    KernelHandle& kh = useNvls ? *op->nvlsKernelHandle : *op->kernelHandle;
+    const CompiledKernel& kernel = useNvls ? *op->nvlsKernel : *op->kernel;
+    const KernelConfig& config = useNvls ? op->nvlsConfig : op->config;
+    if (useNvls) {
+      nvlsCounterBase = kh.nvlsLaunches.at(concurrencyIndex)++ * kh.nvlsIncrement;
+    } else {
+      nvlsTensors.clear();
+    }
 
     CompileOpCopyParameters params{.stepValue = stepValue,
         .concurrencyIndex = concurrencyIndex,
@@ -2585,11 +2646,12 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
         .scale = scale};
     // (with the parameter buffer, the slot's copy is filled first: the slot's previous op, whose kernel read it, is
     // done on the GPU before this one starts, see slotSerializer)
-    launchCompileOpKernel(
-        *op->kernelHandle, *op->kernel, op->config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
+    launchCompileOpKernel(kh, kernel, config, stream, params, tensorAddrs, mappedAddrs, nvlsTensors);
 
     // (the profile is written below, once the CPU thread has the op's RDMA part: the kernel may wait for it)
-    dumpProfile = op->kernelHandle->profilingBytesPerThread != 0 && op->kernelHandle->profilingCountdown-- == 0;
+    if (kh.profilingBytesPerThread != 0 && kh.profilingCountdown-- == 0) {
+      profiled = {&kh, &config};
+    }
   }
 
   if (anyCuda && anyRdma) {
@@ -2621,11 +2683,11 @@ ProcessGroupImpl::CustomOpLaunch ProcessGroupImpl::launchCustomOp(const std::sha
     e->enqueueCpu = e->enqueueTime.time_since_epoch().count() != 0 ? sched_getcpu() : -1;
     group->cpuThread->enqueue(e);
   }
-  if (dumpProfile) {
+  if (profiled) {
     // (on the group's device, as the launch was)
     StreamGuard sg(stream, group->deviceIndex);
     CHECK_CU(cuCtxSynchronize());
-    dumpProfiling(&*group, op);
+    dumpProfiling(&*group, op, *profiled->first, *profiled->second);
   }
 
   return {std::move(future), concurrencyIndex, anyCuda};

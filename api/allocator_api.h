@@ -148,11 +148,6 @@ constexpr size_t allocatorReserveSize = (size_t)1 << 40;
 // Get number of cuMemCreate chunks
 size_t allocatorGetChunkCount();
 
-// Call fn(ctx, handle, offset, size) for every chunk (cuMemCreate handle, offset within the reserved range, size): the
-// existing ones now, the ones mapped later as they are mapped (before any memory in them is handed out). fn runs with
-// the allocator's lock held, so it must not allocate.
-void allocatorAddChunkListener(void (*fn)(void* ctx, unsigned long long handle, size_t offset, size_t size), void* ctx);
-
 // Get chunk info by index: handle, offset within reserved range, size.
 // Returns true if index is valid, false otherwise.
 bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outOffset, size_t* outSize);
@@ -164,8 +159,8 @@ bool allocatorSupportsFabric();
 // deterministically: the same sequence of allocations and frees (sizes, streams and order) gives the same logical
 // offsets in every process, whatever else the processes allocate and whenever their GPUs finish with freed memory.
 // (Freed memory is reused by allocations on the stream it was allocated on, else the pool takes new memory; see the
-// top of allocator.cc. Only once the device is out of memory does the pool reuse memory of other streams, preferring
-// memory whose GPU work has completed, which depends on timing.) The memory comes from the allocator's pool, in slabs:
+// top of allocator.cc. Out of device memory, an allocation fails rather than take memory freed on other streams, whose
+// choice would depend on timing.) The memory comes from the allocator's pool, in slabs:
 // one contiguous allocation per slab, at any address, each at its own range of logical offsets (never adjacent, so that
 // no allocation spans two slabs). A process group binds every slab at its logical offset into a multicast object of its
 // own (see allocatorCommPoolAddSlabListener), so that a buffer that all ranks of the group allocate in the same order
@@ -192,6 +187,11 @@ void allocatorCommPoolAddSlabListener(CommPool* pool,
 // The logical offset of [address, address + bytes) if it lies in one slab of the pool whose pieces are all bound (see
 // allocatorCommPoolAddSlabListener), else -1
 int64_t allocatorCommPoolOffset(CommPool* pool, uintptr_t address, size_t bytes);
+
+// How many slabs the pool has added so far (without the allocator's lock). An address keeps its slab (slabs are never
+// freed), but memory at an address outside the pool can be in it once a slab has been added: a new slab is taken from
+// the main pool's memory, at any address, also one where memory of the main pool was before.
+uint64_t allocatorCommPoolSlabCount(CommPool* pool);
 
 // The same for whichever communication pool [address, address + bytes) is in (memory is in at most one), or -1
 int64_t allocatorAnyCommPoolOffset(uintptr_t address, size_t bytes);

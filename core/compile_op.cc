@@ -4653,16 +4653,17 @@ struct CompileOpConstructor {
         logGraph(rank, setting.graph);
       }
 
-      // A rank that no kernel edge touches runs no kernel. Errors are raised on every rank, as in tuneKernels: this
-      // kernel is not one of the tuned ones (it waits for the RDMA transfers, and it may record a profile).
+      // A rank that no kernel edge touches runs no kernel. Errors are raised on every rank, as in tuneKernels: these
+      // kernels are not the tuned ones (they wait for the RDMA transfers, and they may record a profile). The op's
+      // kernels: its NVLS kernel, if the ranks of the NVLink domain decide that the op can use NVLS (generated first:
+      // the unicast kernel needs its variant words), with a grid of its own, and its unicast kernel, with the tuned
+      // configuration (see launchCustomOp in processgroup.cc, which chooses between them).
       std::string error;
       if (!setting.graph.cudaEdges.empty()) {
-        try {
-          std::shared_ptr<KernelHandle> kernelHandle =
-              generateKernel(group, setting.config, target, setting.graph, ctx, false);
+        auto compileVariant = [&](const std::shared_ptr<KernelHandle>& kernelHandle, const char* suffix) {
           const std::string& ptx = kernelHandle->ptx;
           if (std::getenv("MOODIST_DUMP_KERNELS")) {
-            std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u.ptx", rank, op->id);
+            std::string fn = fmt::sprintf("moodist-compile-op-kernels-rank%zu-op%u%s.ptx", rank, op->id, suffix);
             FILE* f = fopen(fn.c_str(), "wb");
             if (f) {
               fwrite(ptx.data(), ptx.size(), 1, f);
@@ -4670,7 +4671,21 @@ struct CompileOpConstructor {
               log.info("compile_op PTX dumped to %s\n", fn);
             }
           }
-          op->kernel = std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+          return std::make_unique<CompiledKernel>(compileKernelPtx(ptx, "compile_op_copy"));
+        };
+        try {
+          std::shared_ptr<KernelHandle> nvlsHandle =
+              generateKernel(group, setting.config, target, setting.graph, ctx, false, KernelVariant::nvls);
+          std::shared_ptr<KernelHandle> kernelHandle = generateKernel(
+              group, setting.config, target, setting.graph, ctx, false, KernelVariant::unicast, nvlsHandle.get());
+          if (nvlsHandle) {
+            op->nvlsConfig = setting.config;
+            op->nvlsConfig.gridSize = nvlsHandle->gridSize;
+            op->nvlsKernel = compileVariant(nvlsHandle, "-nvls");
+            op->nvlsKernelHandle = std::move(nvlsHandle);
+          }
+          CHECK(kernelHandle->gridSize == setting.config.gridSize);
+          op->kernel = compileVariant(kernelHandle, "");
           op->kernelHandle = std::move(kernelHandle);
         } catch (const std::exception& e) {
           error = e.what();

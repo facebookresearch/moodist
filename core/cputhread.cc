@@ -4469,6 +4469,25 @@ struct CpuThreadImpl {
 
     std::chrono::steady_clock::time_point prevHeartbeatTime = std::chrono::steady_clock::now();
 
+    // The report of a compile_op kernel that could not go on (see Group::KernelError), looked at every
+    // kernelErrorInterval (also while the loop sleeps): the kernel has trapped, so the process fails at its next CUDA
+    // call, with an error that does not say why
+    std::chrono::steady_clock::time_point prevKernelErrorTime = prevHeartbeatTime;
+    static constexpr auto kernelErrorInterval = std::chrono::milliseconds(100);
+    auto checkKernelError = [&]() {
+      if (!group->kernelErrorReported) {
+        if (std::string error = group->kernelErrorMessage(); !error.empty()) {
+          group->kernelErrorReported = true;
+          // (the log adds its own "moodist: ")
+          std::string_view what = error;
+          if (what.starts_with("moodist: ")) {
+            what.remove_prefix(std::string_view("moodist: ").size());
+          }
+          log.error("%s\n", what);
+        }
+      }
+    };
+
     auto prevRunTime = std::chrono::steady_clock::now();
 
     bool debugCpuTime = false;
@@ -4526,6 +4545,10 @@ struct CpuThreadImpl {
           fatal("Moodist is terminating the process due to the aforementioned errors\n");
         }
       }
+      if (now - prevKernelErrorTime >= kernelErrorInterval) {
+        prevKernelErrorTime = now;
+        checkKernelError();
+      }
       if (debugCpuTime) {
         auto now = std::chrono::steady_clock::now();
         if (now - prevRunTime >= std::chrono::milliseconds(1)) {
@@ -4544,17 +4567,19 @@ struct CpuThreadImpl {
               cpuThread->busy.store(false, std::memory_order_relaxed);
             }
             if (shutdownInProgress) {
+              checkKernelError();
               break;
             }
             ++waitCount;
             traceLoopSlept = true;
-            futexWait(&cpuThread->queueSize, 0, std::chrono::seconds(10));
+            futexWait(&cpuThread->queueSize, 0, kernelErrorInterval);
             if (debugCpuTime) {
               prevRunTime = std::chrono::steady_clock::now();
             }
             continue;
           } else {
             if (shutdownInProgress) {
+              checkKernelError();
               break;
             }
           }

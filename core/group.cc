@@ -1390,6 +1390,8 @@ void Group::init(Function<void()> f, Function<void()> pghandle) {
 
     cpuOutBuffer = allocateArrayDevice(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
     cpuInBuffer = allocateArrayHostMapped(4096 + sizeof(uint32_t) * maxChunks * size, Group::maxConcurrency);
+    kernelError = allocateHostMapped(4096);
+    std::memset(kernelError.cpuPointer, 0, sizeof(KernelError));
     {
       // (as many signals as cpuOutBuffer had for them after its first 16 slots)
       static_assert(rdmaSignalBytes == sizeof(uint32_t) * maxDevices);
@@ -1626,22 +1628,16 @@ AllocatedBuffer Group::allocateWriteCombined(size_t bytes) {
   return r;
 }
 namespace {
-// What the allocator listeners of Group::setupNvls bind memory into: one of the group's multicast objects. Never
-// freed, like the objects: the allocator calls the listeners for as long as the process lives.
+// What the communication pool's slab listener of Group::setupNvls binds memory into: the group's multicast object over
+// the pool. Never freed, like the object: the allocator calls the listener for as long as the process lives.
 struct NvlsBinder {
   CUmemGenericAllocationHandle handle = 0;
   size_t limit = 0; // the object's offsets that may be bound are below this
 };
-// The allocator's chunk listener: binds the chunk at its pool offset. A chunk that is not bound would silently miss
-// the multicast stores to it, so a failure is fatal.
-void nvlsBindChunk(void* ctx, unsigned long long handle, size_t offset, size_t size) {
-  auto* binder = (NvlsBinder*)ctx;
-  CHECK(offset + size <= binder->limit);
-  CHECK_CU(cuMulticastBindMem(binder->handle, offset, handle, 0, size, 0));
-}
-// The communication pool's slab listener: binds a piece of a slab at its logical offset. The pool does not count a
-// slab whose pieces are not all bound as in the pool for NVLS (see allocatorCommPoolOffset), so a failure only costs
-// that.
+// The communication pool's slab listener: binds a piece of a slab at its logical offset. A failure is fatal: a slab
+// that is not bound would silently miss the multicast stores to it, and the ranks launch an op's NVLS kernel when its
+// tensors are in the pool (see launchCustomOp in processgroup.cc), so a slab that some rank did not count as in the
+// pool (see allocatorCommPoolOffset) would have the ranks launch different kernels.
 bool nvlsBindSlab(void* ctx, size_t logicalOffset, unsigned long long handle, size_t memOffset, size_t size) {
   auto* binder = (NvlsBinder*)ctx;
   CUresult r = logicalOffset + size <= binder->limit
@@ -1650,14 +1646,62 @@ bool nvlsBindSlab(void* ctx, size_t logicalOffset, unsigned long long handle, si
   if (r != CUDA_SUCCESS) {
     const char* str = "unknown error";
     cuGetErrorString(r, &str);
-    log.error("moodist: binding %d bytes of a communication pool at logical offset %#x to its multicast object failed: "
-              "%s. Buffers in that part of the pool do not use NVLS.\n",
+    fatal(
+        "moodist: binding %d bytes of a communication pool at logical offset %#x to its multicast object failed: %s\n",
         size, logicalOffset, str);
-    return false;
   }
   return true;
 }
 } // namespace
+
+std::string Group::kernelErrorMessage() const {
+  if (!kernelError.cpuPointer) {
+    return {};
+  }
+  const volatile KernelError* e = (const volatile KernelError*)kernelError.cpuPointer;
+  if (e->ready == 0) {
+    return {};
+  }
+  // (the kernel wrote the record, then a fence, then ready)
+  std::atomic_thread_fence(std::memory_order_acquire);
+  auto offset = [](uint64_t identity) -> std::string {
+    // (see nvlsIdentity in processgroup.cc)
+    if (identity >> 60 != 2) {
+      return "outside the pool";
+    }
+    return fmt::sprintf("at offset %#x of the pool", identity & ((1ull << 60) - 1));
+  };
+  if (e->code == kernelErrorIdentity && e->peer == e->rank) {
+    // (launchCustomOp runs the NVLS kernel only with the tensors in the pool: a bug if this happens)
+    return fmt::sprintf("moodist: rank %d: the NVLS kernel of a compile_op op (launch with step value %#x) found its "
+                        "tensor %d %s",
+        e->rank, e->stepValue, e->tensor, offset(e->local));
+  }
+  if (e->code == kernelErrorIdentity) {
+    return fmt::sprintf(
+        "moodist: rank %d: the NVLS kernel of a compile_op op (launch with step value %#x) found its tensor %d %s, but "
+        "rank %d's %s: the communication pool must hold the tensors that NVLS uses at the same offset on every rank "
+        "(allocate the buffers of the communication pool, moodist.comm_empty or the process group's "
+        "allocate_tensor, in the same order and sizes on every rank)",
+        e->rank, e->stepValue, e->tensor, offset(e->local), e->peer, offset(e->remote));
+  }
+  if (e->code == kernelErrorVariant) {
+    auto variant = [](uint64_t word) {
+      return word & 0x80000000 ? "NVLS" : "unicast";
+    };
+    return fmt::sprintf(
+        "moodist: rank %d launched the %s kernel of a compile_op op (step value %#x), rank %d the %s kernel: the "
+        "tensors that NVLS uses must be in the communication pool (moodist.comm_empty, the process group's "
+        "allocate_tensor) on every rank, or on none",
+        e->rank, variant(e->local), e->stepValue, e->peer, variant(e->remote));
+  }
+  if (e->code == kernelErrorPeerFailed) {
+    return fmt::sprintf("moodist: rank %d: the launch of a compile_op op (step value %#x) on rank %d failed (see its "
+                        "report), so this rank's cannot complete either",
+        e->rank, e->stepValue, e->peer);
+  }
+  return fmt::sprintf("moodist: rank %d: a compile_op kernel reported error %d", e->rank, e->code);
+}
 
 CommPool* Group::getCommPool() {
   std::call_once(commPoolOnce, [&] {
@@ -1675,7 +1719,7 @@ bool Group::setupNvls() {
   constexpr size_t countersBytes = Nvls::countersBytes;
 
   // The multicast objects (see Nvls) of this rank's NVLink domain (the ranks of the group in it, fabricDomainRanks):
-  // the pool's (the pool, then the counter area) and the communication pool's. The domain's first rank creates them,
+  // the counter area's and the communication pool's. The domain's first rank creates them,
   // the others import them, and every device must be added before any rank binds memory to them. Only a domain that
   // can use them has them (its ranks are the members): one of at least Nvls::minDomainRanks ranks, every one of which
   // supports multicast (supportsMulticast covers the ranks of a node) and has moodist's allocator pool. Every rank of
@@ -1727,7 +1771,7 @@ bool Group::setupNvls() {
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
   constexpr size_t numObjects = 2;
-  const std::array<size_t, numObjects> objectBytes = {Nvls::poolBytes + countersBytes, commPoolLogicalSize};
+  const std::array<size_t, numObjects> objectBytes = {countersBytes, commPoolLogicalSize};
   std::array<CUmemGenericAllocationHandle, numObjects> objects = {};
   CUmulticastObjectProp prop;
   std::memset(&prop, 0, sizeof(prop));
@@ -1778,8 +1822,7 @@ bool Group::setupNvls() {
       check(cuMemSetAccess(countersLocal, countersBytes, &access, 1), "cuMemSetAccess (counters)") &&
       check(cuMemsetD8(countersLocal, 0, countersBytes), "cuMemsetD8 (counters)") &&
       check(cuStreamSynchronize(nullptr), "cuStreamSynchronize")) {
-    check(cuMulticastBindMem(objects[0], Nvls::poolBytes, counters, 0, countersBytes, 0),
-        "cuMulticastBindMem (counters)");
+    check(cuMulticastBindMem(objects[0], 0, counters, 0, countersBytes, 0), "cuMulticastBindMem (counters)");
   }
 
   std::array<CUdeviceptr, numObjects> mcBases = {};
@@ -1796,16 +1839,14 @@ bool Group::setupNvls() {
     return false;
   }
 
-  // Every chunk of the pool at its offset, and every slab of the communication pool at its logical offset: the
-  // existing ones now, new ones when the allocator adds them (binding does not wait for the GPU). Only once the whole
-  // domain has its objects, so that a domain whose setup fails binds nothing (a failed bind of a chunk is fatal).
-  allocatorAddChunkListener(nvlsBindChunk, internalNew<NvlsBinder>(objects[0], Nvls::poolBytes));
+  // Every slab of the communication pool at its logical offset: the existing ones now, new ones when the allocator adds
+  // them (binding does not wait for the GPU). Only once the whole domain has its objects, so that a domain whose setup
+  // fails binds nothing (a failed bind is fatal).
   allocatorCommPoolAddSlabListener(getCommPool(), nvlsBindSlab, internalNew<NvlsBinder>(objects[1], objectBytes[1]));
 
-  nvls.mcBase = mcBases[0];
   nvls.commMcBase = mcBases[1];
   nvls.countersLocal = countersLocal;
-  nvls.countersMc = mcBases[0] + Nvls::poolBytes;
+  nvls.countersMc = mcBases[0];
   nvls.launches = countersLocal;
   nvls.loopLaunches = countersLocal + 4;
   nvls.nextCounters = 64;

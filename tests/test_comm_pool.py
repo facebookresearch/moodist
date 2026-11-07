@@ -155,37 +155,28 @@ def test_comm_pool_allgather(ctx: TestContext):
 
 
 @test
-def test_comm_pool_allgather_mismatch(ctx: TestContext):
-    """One rank's output is not in the pool: every rank of its NVLink domain stores to each destination (no NVLS),
-    correctly, while the other domains still use NVLS (where supported); then all ranks in the pool again: NVLS."""
+def test_comm_pool_allgather_outside(ctx: TestContext):
+    """Every rank's output outside the pool: the launches run the op's unicast kernel (no NVLS), correctly; then every
+    rank's in the pool: its NVLS kernel (where supported). (One rank's outside the pool alone is an error: see
+    test_nvls_errors.py.)"""
     if ctx.world_size < 2:
         return
     torch.cuda.set_device(ctx.local_rank)
     pg = create_process_group(ctx)
     domains = nvlink_domains(pg, ctx)
-    # (the ranks that share the NVLink domain of the rank whose output is elsewhere)
-    mismatched = domains[ctx.rank] == domains[ctx.world_size - 1]
     numel = 1 << 18
     op = allgather_op(pg, ctx, numel)
     inp = torch.empty(numel, device="cuda", dtype=torch.float32)
     launches0 = pg._get_option("nvls_launches")
     for it in range(4):
-        # every rank allocates from the pool (so the pools stay alike), but the last rank's output is elsewhere
-        comm = moodist.comm_empty(numel * ctx.world_size, dtype=torch.float32, group=pg)
-        if ctx.rank == ctx.world_size - 1:
-            out = torch.empty(numel * ctx.world_size, device="cuda", dtype=torch.float32)
-        else:
-            out = comm
+        out = torch.empty(numel * ctx.world_size, device="cuda", dtype=torch.float32)
         inp.fill_(ctx.rank * 1000 + it)
         op([inp], [out]).wait()
-        ctx.assert_true(bool((out == expected_allgather(ctx, numel, it)).all()), f"mismatch iteration {it}")
-        del out, comm
+        ctx.assert_true(bool((out == expected_allgather(ctx, numel, it)).all()), f"outside iteration {it}")
+        del out
     torch.cuda.synchronize()
     used = pg._get_option("nvls_launches") - launches0
-    if mismatched:
-        ctx.assert_true(used == 0, f"{used} launches used NVLS with one output of the NVLink domain not in the pool")
-    elif expect_nvls(ctx, pg, domains):
-        ctx.assert_true(used == 4, f"{used} of 4 launches used NVLS in a domain whose outputs are all in the pool")
+    ctx.assert_true(used == 0, f"{used} launches used NVLS with the outputs outside the pool")
     launches0 = pg._get_option("nvls_launches")
     for it in range(4):
         out = moodist.comm_empty(numel * ctx.world_size, dtype=torch.float32, group=pg)

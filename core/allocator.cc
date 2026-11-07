@@ -3,8 +3,8 @@
 // moodist's CUDA allocator.
 //
 // Memory. The allocator reserves allocatorReserveSize bytes of virtual addresses and maps cuMemCreate chunks into them,
-// one after another, as it needs more memory (mapMoreMemory). It never unmaps them. Chunk listeners bind the chunks
-// into process groups' multicast objects and export them to peers.
+// one after another, as it needs more memory (mapMoreMemory). It never unmaps them. Process groups export the chunks to
+// peers (allocatorGetChunk), and bind communication pools' slabs into their multicast objects (see CommPool).
 //
 // Pools. Free memory is kept in pools (Pool): sets of free lists of address-ordered regions that merge with their
 // neighbors (Regions), from which an allocation takes the best fit (the smallest region that fits, the lowest address
@@ -41,7 +41,9 @@
 // completed: the host queries events, each stream's in the order recorded, and drops the completed ones; see
 // processEvents), else the best fit (with waits), else new memory, else it fails (CudaOutOfMemoryError). Before a pool
 // enters pressure mode, and before an allocation fails, the memory of released private pools goes back to the main pool
-// if it can (see reclaim).
+// if it can (see reclaim). Communication pools never enter pressure mode (that would make their offsets depend on the
+// GPU's progress, and on which ranks ran out of memory): an allocation that finds no memory in its lists and gets no
+// new slab fails.
 //
 // CUDA graphs. During a capture, PyTorch routes the capture's allocations to the graph's private pool (see
 // cudaAllocatorBeginAllocateToPool).
@@ -383,6 +385,8 @@ struct CommPool {
   };
   Pool pool; // in logical coordinates
   Vector<Slab> slabs;
+  // How many slabs the pool has added (see allocatorCommPoolSlabCount: read without the lock)
+  std::atomic<uint64_t> slabCount = 0;
   size_t nextLogical = slabGap;
   Vector<std::pair<bool (*)(void*, size_t, unsigned long long, size_t, size_t), void*>> listeners;
 };
@@ -438,8 +442,6 @@ struct CudaAllocatorImpl {
   std::atomic_uintptr_t reservedBase = 0;
   size_t nextMapBase = 0;
   Vector<std::pair<size_t, CUmemGenericAllocationHandle>> cuMemHandles;
-  // See allocatorAddChunkListener
-  Vector<std::pair<void (*)(void*, unsigned long long, size_t, size_t), void*>> chunkListeners;
   size_t allocationGranularity = 0;
   bool fabricSupported = false;
   bool gpuDirectRdmaSupported = false;
@@ -983,8 +985,10 @@ struct CudaAllocatorImpl {
         // (released pools' memory first: see allocate)
         return 0;
       }
-      if (freeBytes(pool) < bytes) {
-        // (no placement could fit it: not a reason for pressure mode)
+      // (no placement could fit it: not a reason for pressure mode). A communication pool never enters it: where its
+      // allocations go would then depend on the GPU's progress, and on whether this rank ran out of memory, so its
+      // offsets would no longer be the same on every rank (see allocatorCommPoolCreate); it fails instead.
+      if (kind == PoolKind::comm || freeBytes(pool) < bytes) {
         return 0;
       }
       enterPressureMode(pool);
@@ -1114,6 +1118,7 @@ struct CudaAllocatorImpl {
           });
     }
     pool.slabs.push_back(slab);
+    pool.slabCount.store(pool.slabs.size(), std::memory_order_release);
     log.verbose("Moodist communication pool: slab of %d bytes at %#x, logical offset %#x\n", slab.bytes, slab.local,
         slab.logical);
 
@@ -1519,9 +1524,6 @@ struct CudaAllocatorImpl {
 
     cuMemHandles.emplace_back(bytes, handle);
     nextMapBase += bytes;
-    for (auto& [fn, ctx] : chunkListeners) {
-      fn(ctx, handle, address - reservedBase, bytes);
-    }
 
     add_span(mappedRegions, address, address + bytes);
     addStat(stats.reservedBytes, (int64_t)bytes);
@@ -2040,7 +2042,11 @@ CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream 
   });
   if (logical == 0) {
     ++impl->stats.numOoms;
-    throw CudaOutOfMemoryError(impl->outOfMemoryMessage(alignedBytes));
+    throw CudaOutOfMemoryError(
+        impl->outOfMemoryMessage(alignedBytes) +
+        " The allocation was from a communication pool (moodist.comm_empty, a moodist process group's buffers), "
+        "which found no room in its free memory and got no new slab: it does not take memory freed on other streams "
+        "(its buffers must be at the same offsets on every rank).");
   }
   uintptr_t userPtr = 0;
   for (auto& s : pool->slabs) {
@@ -2089,6 +2095,10 @@ int64_t allocatorCommPoolOffset(CommPool* pool, uintptr_t address, size_t bytes)
   }
   std::lock_guard l(globalCudaAllocatorImpl->mutex);
   return commPoolOffset(pool, address, bytes);
+}
+
+uint64_t allocatorCommPoolSlabCount(CommPool* pool) {
+  return pool->slabCount.load(std::memory_order_acquire);
 }
 
 int64_t allocatorAnyCommPoolOffset(uintptr_t address, size_t bytes) {
@@ -2237,18 +2247,6 @@ bool allocatorGetChunk(size_t index, unsigned long long* outHandle, size_t* outO
   *outOffset = offset;
   *outSize = handles[index].first;
   return true;
-}
-
-void allocatorAddChunkListener(
-    void (*fn)(void* ctx, unsigned long long handle, size_t offset, size_t size), void* ctx) {
-  CHECK(globalCudaAllocatorImpl);
-  std::lock_guard l(globalCudaAllocatorImpl->mutex);
-  size_t offset = 0;
-  for (auto& [size, handle] : globalCudaAllocatorImpl->cuMemHandles) {
-    fn(ctx, handle, offset, size);
-    offset += size;
-  }
-  globalCudaAllocatorImpl->chunkListeners.emplace_back(fn, ctx);
 }
 
 bool allocatorSupportsFabric() {

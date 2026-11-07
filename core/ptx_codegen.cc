@@ -38,15 +38,15 @@ static constexpr uint32_t paramFillWords = 3968;
 static constexpr uint32_t paramFillBlockSize = 256;
 
 // The reduce loop's shared memory (see generateKernel): 2 to reduceMaxStages stages of chunkSize bytes with an mbarrier
-// each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), 16 bytes for
-// the flag of the NVLS check (kernels with NVLS reductions or NVLS runs), and 256 bytes of alignment padding
+// each, reduceResults result buffers, a ring of up to reduceMaxStages + 2 claimed items (8 bytes each), and 256 bytes
+// of alignment padding
 static constexpr uint32_t reduceResults = 2;
 static constexpr uint32_t reduceMaxStages = 16;
 static size_t reduceStageBytes(const KernelConfig& config) {
   return config.chunkSize + 8;
 }
 static size_t reduceFixedBytes(const KernelConfig& config) {
-  return 256 + reduceResults * config.chunkSize + 8 * (reduceMaxStages + 2) + 16;
+  return 256 + reduceResults * config.chunkSize + 8 * (reduceMaxStages + 2);
 }
 
 std::string reduceConfigError(const KernelConfig& config) {
@@ -615,10 +615,16 @@ KernelMappedBuffers mapn(size_t memoryKey, compile_op::CompileContext& ctx, std:
 // This kernel runs in the remote memory synchronization domain.
 
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,
-    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning) {
+    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning, KernelVariant variant,
+    const KernelHandle* nvlsSibling) {
   using namespace ptx;
 
+  // The NVLS kernel of an op (see the NVLS decision below); every tuning kernel is a unicast kernel
+  const bool nvlsKernel = variant == KernelVariant::nvls;
+  CHECK(!(nvlsKernel && tuning) && !(nvlsKernel && nvlsSibling));
+
   uint32_t blockSize = config.blockSize;
+  // (the NVLS kernel's grid is decided with the NVLS decision below)
   uint32_t numBlocks = config.gridSize;
 
   size_t rank = group->rank;
@@ -628,7 +634,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
   Module mod;
   mod.target = target;
-  mod.topLevelComments.push_back(fmt::sprintf("block size: %d  grid size: %d", config.blockSize, config.gridSize));
   mod.topLevelComments.push_back(fmt::sprintf("shared memory: %d", config.sharedMemory));
   setModule(&mod);
 
@@ -733,10 +738,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     return mapn(rv->memoryKey, ctx, name, ranks, bytes);
   };
 
+  // (the buffers of the exchanges with the peers, per block, are mapped once the grid is known: see the NVLS decision)
   size_t addrAddrsBlockStride = graph.localCudaTensorMappings.size();
-  auto addrAddrs = map("addresses", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks);
-  auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
-  auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
 
   // The address arrays: the tensor addresses (8 bytes per tensor), the addresses at which the peers map this rank's
   // tensors (8 per mapping) and, with NVLS, the tensors' identities and multicast addresses (16 per tensor). Kernel
@@ -790,21 +793,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     u32 warpIndex = threadIndex / 32;
     u32 laneIndex = laneid();
 
-    // Kernel profiling (debugging aid; MOODIST_COMPILE_OP_PROFILE=N): in the kernel of each op (not in the tuning
-    // candidates), every thread records a timestamp at each profiling.enter(), and the op's N-th launch writes them as
-    // a Chrome trace (dumpProfiling in processgroup.cc). Needs Profiling::maxBytesPerThread of device memory per
-    // thread.
+    // (kernel profiling starts once the grid is known: see the NVLS decision)
     profiling = Profiling();
-    if (const char* env = std::getenv("MOODIST_COMPILE_OP_PROFILE"); env && !tuning) {
-      int launch = std::atoi(env);
-      REQUIRE(launch >= 1, "MOODIST_COMPILE_OP_PROFILE must be the number of the launch to trace (1 or more)");
-      auto profilingBuffer = ctx.group->allocateDevice(profiling.dataSize(config));
-      profiling = Profiling();
-      profiling.start(config, profilingBuffer.cudaPointer);
-      rv->profilingData = std::move(profilingBuffer);
-      rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
-      rv->profilingCountdown = launch - 1;
-    }
 
     auto predicated = [&](auto pred, auto f) {
       return [&, pred = std::move(pred), f = std::move(f)](auto&&... args) {
@@ -1052,7 +1042,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t edgeWait = 2;    // waits for its source node (relay edges: for the signal)
     static constexpr uint32_t edgeAcquire = 4; // fence.acquire.sys before the copy (source written by another agent)
     static constexpr uint32_t edgeSignal = 8;  // other edges wait for its destinations: write their depFilled slots
-    static constexpr uint32_t edgeNvls = 16;   // stored with NVLS when the launch can: the NVLS slot follows the dsts
+    static constexpr uint32_t edgeNvls = 16;   // stored with NVLS (NVLS kernel): the NVLS slot follows the dsts
     static constexpr uint32_t edgeSourceWaits = 32; // reduce loop: sources wait for signals (PipeEdge::waits)
     static constexpr uint32_t edgeDoneFlags = 64;   // reduce loop: sets done flags once stored (see Edge::doneFlags)
     static constexpr uint32_t edgeDestinationWaits = 128; // reduce loop: waits before it stores (PipeEdge::destWaits)
@@ -1147,35 +1137,44 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // with unicast pieces), else to its one destination, on this rank (a reduce-scatter's, a reduce to one rank's). A
     // rank does so (nvlsReduceLoop) if every edge it executes is such an edge, in domains of at least
     // nvlsReduceMinRanks ranks (nvlsReduceLocalMinRanks with one destination), for the dtypes and reduce ops that
-    // multimem.ld_reduce has (see nvlsReduceInst) and up to nvlsReductionMaxBytes. Every launch checks the sources too
-    // (a multimem.ld_reduce at an offset where a member has no memory bound makes the context fail with
-    // CUDA_ERROR_CONTAINED); a launch that cannot use NVLS runs the reduce loop. On 32 GB300 (bfloat16): all-reduce of
-    // 64 KiB in 18 us, 256 MiB in 551 us, against 31 and 842 us with the reduce loop. NVLS runs: other ranks' edges,
-    // such as those of reductions across NVLink domains (see crossDomainReductions in compile_op.cc), load the first
-    // sources of an edge with multimem.ld_reduce, as one source, if they are a source on every rank of the domain at
-    // the same place (the inputs of the domain; a partial result that it computes for other domains), and store to the
-    // first destinations with one multicast store if they are a destination on every rank of the domain at the same
-    // place (an all-reduce's result in the domain), see nvlsReductionRuns; the same dtypes, reduce ops and checks, the
-    // same numbers of ranks but nvlsStoreMinRanks for destinations alone. A rank whose edges have all their other
-    // sources and destinations on itself (nvlsRunLoopEdge) runs them in nvlsReduceLoop (nvlsRunLoop) in a launch whose
-    // every entry passes, else in the reduce loop, where each run falls back on its own (an entry per run); other
-    // ranks' edges with runs are always in the reduce loop. The bytes of the vectors that a thread has in flight
-    // (nvlsReduceVectors of 16 bytes, an item of a warp), and the bytes that the GPUs of an op have in flight together:
-    // in the probe, the fewest blocks that were fastest held 128 KiB per GPU with 32 GPUs, 256 KiB with 16 and 1 MiB
-    // with 4 (there limited by the SMs: each GPU combines a quarter of the tensor), about 4 MiB in all; more were
-    // slower with 32 (16 blocks of 512 threads with 8 vectors of each: 573 us at 256 MiB). A rank's blocks take its
-    // share of that (its bytes of the op's NVLS reductions: the root of a reduce to one rank takes them all, but at
-    // most the grid, tuned for the reduce loop, which can limit it: on 16 GB300, 256 MiB took 1.82 ms with the tuned
-    // grid, 3.46 ms with 8 blocks, 1.30 with 32, 1.29 with 64).
+    // multimem.ld_reduce has (see nvlsReduceInst) and up to nvlsReductionMaxBytes. Such ops have an NVLS kernel (see
+    // the NVLS decision below), which checks the sources too (a multimem.ld_reduce at an offset where a member has no
+    // memory bound makes the context fail with CUDA_ERROR_CONTAINED); the launches whose tensors are not in the
+    // communication pool run the op's unicast kernel, with the reduce loop. On 32 GB300 (bfloat16): all-reduce of 64
+    // KiB in 18 us, 256 MiB in 551 us, against 31 and 842 us with the reduce loop. NVLS runs: other ranks' edges, such
+    // as those of reductions across NVLink domains (see crossDomainReductions in compile_op.cc), load the first sources
+    // of an edge with multimem.ld_reduce, as one source, if they are a source on every rank of the domain at the same
+    // place (the inputs of the domain; a partial result that it computes for other domains), and store to the first
+    // destinations with one multicast store if they are a destination on every rank of the domain at the same place (an
+    // all-reduce's result in the domain), see nvlsReductionRuns; the same dtypes, reduce ops and checks, the same
+    // numbers of ranks but nvlsStoreMinRanks for destinations alone. A rank whose edges have all their other sources
+    // and destinations on itself (nvlsRunLoopEdge) runs them in nvlsReduceLoop (nvlsRunLoop) in its NVLS kernel; other
+    // ranks' edges with runs are in the reduce loop. The bytes of the vectors that a thread has in flight
+    // (nvlsReduceVectors of 16 bytes, an item of a warp). The blocks of nvlsReduceLoop (fitted to sweeps of
+    // MOODIST_COMPILE_OP_NVLS_BLOCKS on 16 and 32 GB300 in one NVLink domain and on 2 domains of 32, November 2026): a
+    // rank's share (its bytes of the domain's) of nvlsReduceInFlightBytesPerGpu per GPU of the domain, which
+    // reduce-scatters take as is (8 blocks of 256 threads at 16 and 32 GPUs, where 4 took up to 1.7% longer; across
+    // domains too, where 4 took up to 1.8% longer; the root of a reduce to one rank takes the domain's whole share: on
+    // 16 GB300, 256 MiB took 1.30 ms with 32 blocks, 1.29 with 64, 3.46 with 8), all-reduces across domains one and a
+    // half times (12 blocks at 32 GPUs per domain, see nvlsRunLoop below), and all-reduces in one domain, which store
+    // their results with multicast stores, half (4 blocks at 16 and 32 GPUs: 8 took 7% longer at 1 MiB on 16 GPUs); at
+    // most a block per nvlsItemsPerBlock of the rank's items (4 with multicast stores, 2 without: an all-reduce of 4
+    // KiB to 1 MiB on 32 GPUs, up to 8 items per rank, takes 1 or 2 blocks, up to 0.5 us faster than 4, whose others
+    // would only take part in the syncs); at most nvlsMaxGrid. (A reduce-scatter of 4 KiB per rank, one item, took 9.40
+    // us with 1 block, 8.85 with 8 of which 7 had nothing to do; unexplained.)
     static constexpr uint32_t nvlsReduceVectors = 8;
     static constexpr uint32_t nvlsReduceItemBytes = 32 * 16 * nvlsReduceVectors;
-    static constexpr uint64_t nvlsReduceInFlightBytes = 4 << 20;
+    static constexpr uint64_t nvlsReduceInFlightBytesPerGpu = 256 << 10;
+    static constexpr uint32_t nvlsMaxGrid = 64;
 
-    // Whether the op uses NVLS (decided by all ranks of this rank's NVLink domain together, the same on each), and if
-    // so, the chunks this rank stores with it per launch (0 if none), the ranks that store any (all the same number),
-    // the window and the offset of the op's counters in the group's counter area; with reductions, whether this rank's
-    // kernel reduces with NVLS in nvlsReduceLoop (when the launch can), or has NVLS runs, and whether it runs them in
-    // nvlsReduceLoop (when the launch can) instead of the reduce loop, and the blocks of nvlsReduceLoop
+    // The NVLS kernel: whether the op can use NVLS (decided by all ranks of this rank's NVLink domain together, the
+    // same on each; if not, the op has no NVLS kernel), and if so, the chunks this rank stores with it per launch (0 if
+    // none), the ranks that store any (all the same number), the window and the offset of the op's counters in the
+    // group's counter area; with reductions, whether this rank's kernel reduces with NVLS in nvlsReduceLoop, or has
+    // NVLS runs, and whether it runs them in nvlsReduceLoop instead of the reduce loop, and the blocks of
+    // nvlsReduceLoop; and the kernel's grid. Every launch of the NVLS kernel uses NVLS: the launch chooses the kernel
+    // (see launchCustomOp in processgroup.cc), and the kernel checks that the tensors are where NVLS needs them on
+    // every rank (else it reports the error and traps, see reportError below).
     bool nvlsOp = false;
     uint32_t nvlsChunks = 0;  // stored by this rank
     uint32_t nvlsSenders = 0; // the ranks that store any
@@ -1185,7 +1184,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     uint32_t nvlsReduceBlocks = 0;
     bool nvlsRunsLocal = false;
     bool nvlsRunLoop = false;
-    if (!tuning) {
+    if (nvlsKernel) {
       Group* g = ctx.group;
       const bool reduction = compile_op::isReduction(graph.reduce);
       // The ranks of an op's kernels that exchange with each other decide together (see the exchange below): those of
@@ -1284,16 +1283,26 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         }
         nvlsOp = false;
       }
-      rv->nvls = nvlsOp;
-      // The blocks of nvlsReduceLoop: this rank's share of the bytes in flight (see nvlsReduceVectors), by its bytes
-      // of NVLS reductions, or of edges with NVLS runs, among the domain's
-      auto nvlsBlocks = [&](uint64_t bytes, uint64_t total) {
-        const uint64_t perBlock = (uint64_t)blockSize * nvlsReduceVectors * 16;
-        const uint64_t blocks = (nvlsReduceInFlightBytes * bytes / total + perBlock - 1) / perBlock;
-        uint32_t r = std::clamp<uint64_t>(blocks, 1, numBlocks);
+      if (!nvlsOp) {
+        // (the same on every rank of the domain: the op has no NVLS kernel there)
+        return nullptr;
+      }
+      // The blocks of nvlsReduceLoop (see nvlsReduceVectors): this rank's share of the bytes in flight (times scale),
+      // by its bytes of NVLS reductions, or of edges with NVLS runs, among the domain's, and at most a block per
+      // nvlsItemsPerBlock of its items (at most nvlsMaxGrid: see the grid below)
+      auto nvlsBlocks = [&](uint64_t bytes, uint64_t total, double scale, uint64_t nvlsItemsPerBlock) {
+        const double perBlock = (double)blockSize * nvlsReduceVectors * 16;
+        const double inFlight = (double)nvlsReduceInFlightBytesPerGpu * domain.size() * scale;
+        uint64_t blocks = (uint64_t)std::ceil(inFlight * ((double)bytes / (double)total) / perBlock);
+        uint64_t items = 0;
+        for (const Edge& e : localCopies) {
+          items += (e.bytes + nvlsReduceItemBytes - 1) / nvlsReduceItemBytes;
+        }
+        blocks = std::min(blocks, (items + nvlsItemsPerBlock - 1) / nvlsItemsPerBlock);
+        uint32_t r = std::clamp<uint64_t>(blocks, 1, nvlsMaxGrid);
         // MOODIST_COMPILE_OP_NVLS_BLOCKS: the blocks of every rank that reduces with NVLS (experiments)
         if (const char* env = std::getenv("MOODIST_COMPILE_OP_NVLS_BLOCKS"); env && std::atoi(env) > 0) {
-          r = std::min<uint32_t>(std::atoi(env), numBlocks);
+          r = std::min<uint32_t>(std::atoi(env), nvlsMaxGrid);
         }
         return r;
       };
@@ -1304,11 +1313,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         });
         if (nvlsRunLoop) {
           // With runs of destinations (an all-reduce's: the items of partial results with multimem.ld_reduce, then the
-          // plans with multicast stores, each phase with every warp), three times the share: across 2 domains of 32
-          // GB300 (bfloat16, 64 MiB / 256 MiB / 1 GiB), 4 blocks took 215 / 779 / 3055 us, 8 222 / 713 / 2595, 12 237
-          // / 687 / 2357, 24 262 / 666 / 2430, the reduce loop 263 / 719 / 2353 (across 4 domains of 16, two rounds,
-          // the same with any)
-          nvlsReduceBlocks = nvlsBlocks(destinationRuns ? 3 * myRunBytes : myRunBytes, runBytesTotal);
+          // plans with multicast stores, each phase with every warp), one and a half times the share: across 2 domains
+          // of 32 GB300 (bfloat16, 64 MiB / 256 MiB / 1 GiB), 4 blocks took 215 / 779 / 3055 us, 8 222 / 713 / 2595,
+          // 12 237 / 687 / 2357, 24 262 / 666 / 2430, the reduce loop 263 / 719 / 2353 (across 4 domains of 16, two
+          // rounds, the same with any); in November 2026, at 64 MiB, 8 blocks 196 us, 12 197, and at 1 MiB, 2 to 8
+          // blocks 0.5 us faster than 12 (the items' bound takes those)
+          nvlsReduceBlocks = nvlsBlocks(myRunBytes, runBytesTotal, destinationRuns ? 1.5 : 1, 2);
         }
         if (rank == domain[0]) {
           log.info("compile_op: NVLS: the reduce loop's edges of %d bytes in the NVLink domain of rank %d with "
@@ -1320,7 +1330,11 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         nvlsReduceLocal = myReduceBytes != 0;
         // (the ranks that reduce with NVLS, while others of the domain may have NVLS runs, see above)
         if (nvlsReduceLocal) {
-          nvlsReduceBlocks = nvlsBlocks(myReduceBytes, reduceBytesTotal);
+          // (with multicast stores: an all-reduce's, whose edges have a destination on every rank of the domain)
+          const bool multicast = std::ranges::any_of(localCopies, [](const Edge& e) {
+            return e.destinations.size() > 1;
+          });
+          nvlsReduceBlocks = nvlsBlocks(myReduceBytes, reduceBytesTotal, multicast ? 0.5 : 1, multicast ? 4 : 2);
         }
         if (rank == domain[0]) {
           log.info("compile_op: NVLS: reductions of %d bytes with multimem.ld_reduce in the NVLink domain of rank %d\n",
@@ -1341,22 +1355,95 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
               nvlsSenders, rank, sendersChunks, nvlsChunkSize);
         }
       }
+      // The NVLS kernel's grid (the same on every rank of the domain: the ranks' blocks pair up in the exchanges
+      // below). Copies: one block if every rank stores all its copies with NVLS (in block 0, see nvlsCopy) or has none;
+      // the other blocks would only take part in the exchanges (an all-gather of 4 KiB per rank on 32 GB300: 9.5 us
+      // with 4 blocks, 11.5 with 16). Reductions: the most blocks of nvlsReduceLoop of a rank of the domain if every
+      // rank that executes edges runs nvlsReduceLoop. Otherwise the unicast kernel's grid (tuned), which then bounds
+      // the blocks of nvlsReduceLoop.
+      const bool hasCopies = std::ranges::any_of(localCopies, [](const Edge& e) {
+        return !e.sources.empty();
+      });
+      const bool loopOnly =
+          reduction ? (reduceKernel ? nvlsReduceLocal || nvlsRunLoop : !hasCopies) : nvlsChunks != 0 || !hasCopies;
+      const uint32_t wantedBlocks = nvlsReduceLocal || nvlsRunLoop ? nvlsReduceBlocks : 0;
+      for (uint32_t r : ranks) {
+        ctx.send(r, loopOnly, wantedBlocks);
+      }
+      bool allLoopOnly = true;
+      uint32_t mostBlocks = 1;
+      for (uint32_t r : ranks) {
+        bool l;
+        uint32_t w;
+        ctx.receive(r, l, w);
+        allLoopOnly &= l;
+        mostBlocks = std::max(mostBlocks, w);
+      }
+      if (allLoopOnly) {
+        numBlocks = reduction ? mostBlocks : 1;
+      }
+      nvlsReduceBlocks = std::min(nvlsReduceBlocks, numBlocks);
     }
-    // Whether this rank's kernel stores with NVLS (copies), and whether its launches check NVLS identities (copies or
+    rv->gridSize = numBlocks;
+    mod.topLevelComments.push_back(fmt::sprintf("block size: %d  grid size: %d", blockSize, numBlocks));
+    // Whether this rank's kernel stores with NVLS (copies), and whether it checks NVLS identities (copies or
     // reductions)
     const bool nvlsLocal = nvlsChunks != 0;
     const bool nvlsChecks = nvlsLocal || nvlsReduceLocal || nvlsRunsLocal;
-    // In NVLS ops, every rank publishes, besides the address at which a peer maps one of its tensors (the address
-    // exchange below), where the tensor is in the group's multicast objects (its "NVLS identity", see nvlsIdentity
-    // in processgroup.cc), into a table of the peer's with the layout of the address table. launchCustomOp passes the
-    // identities of the rank's tensors and their multicast addresses in a fourth kernel parameter (or in the parameter
-    // buffer): per tensor, 8 bytes of identity (0 if none), then 8 bytes of multicast address (0 if none).
+
+    // The buffers of the exchanges with the peers (per block)
+    auto addrAddrs = map("addresses", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks);
+    auto syncAddrs = map("syncs", sizeof(uint32_t) * ranks.size() * numBlocks);
+    auto depFilled = map("depFilled", sizeof(uint32_t) * localNodes.size() * numBlocks);
+
+    // In the NVLS kernel, every rank publishes, besides the address at which a peer maps one of its tensors (the
+    // address exchange below), where the tensor is in the group's multicast object over its communication pool (its
+    // "NVLS identity", see nvlsIdentity in processgroup.cc), into a table of the peer's with the layout of the address
+    // table. launchCustomOp passes the identities of the rank's tensors and their multicast addresses in a fourth
+    // kernel parameter (or in the parameter buffer): per tensor, 8 bytes of identity (0 if none), then 8 bytes of
+    // multicast address (0 if none).
     std::optional<KernelMappedBuffers> nvlsIds;
     if (nvlsOp) {
       nvlsIds.emplace(map("nvlsids", sizeof(uint64_t) * addrAddrsBlockStride * numBlocks));
       if (!paramBuffer) {
         fn->addParamBytes(8, 16 * numTensorWords);
       }
+    }
+
+    // An op with an NVLS kernel: the variant words (see KernelHandle::variantWords), which the NVLS kernel maps here
+    // and its unicast kernel takes over (generated after it, see compile in compile_op.cc)
+    std::shared_ptr<KernelHandle::VariantWords> variantWords;
+    if (nvlsOp) {
+      KernelMappedBuffers words = map("variants", sizeof(uint32_t) * ranks.size());
+      variantWords = std::make_shared<KernelHandle::VariantWords>();
+      variantWords->local = words.local.buffer.cudaPointer;
+      variantWords->localItembytes = words.local.itembytes;
+      for (size_t i : indices(ranks)) {
+        variantWords->remote.push_back(words.remote[i].base);
+        variantWords->remoteItembytes.push_back(words.remote[i].itembytes);
+        variantWords->remoteIndex.push_back((uint32_t)myPeerIndex[i]);
+      }
+    } else if (nvlsSibling) {
+      CHECK(nvlsSibling->variantWords && nvlsSibling->variantWords->remote.size() == ranks.size());
+      variantWords = nvlsSibling->variantWords;
+    }
+    rv->variantWords = variantWords;
+
+    // Kernel profiling (debugging aid; MOODIST_COMPILE_OP_PROFILE=N): in the kernels of each op (not in the tuning
+    // candidates), every thread records a timestamp at each profiling.enter(), and the op's N-th launch of the kernel
+    // writes them as a Chrome trace (dumpProfiling in processgroup.cc). Needs Profiling::maxBytesPerThread of device
+    // memory per thread.
+    if (const char* env = std::getenv("MOODIST_COMPILE_OP_PROFILE"); env && !tuning) {
+      int launch = std::atoi(env);
+      REQUIRE(launch >= 1, "MOODIST_COMPILE_OP_PROFILE must be the number of the launch to trace (1 or more)");
+      KernelConfig profiled = config;
+      profiled.gridSize = numBlocks;
+      auto profilingBuffer = ctx.group->allocateDevice(profiling.dataSize(profiled));
+      profiling = Profiling();
+      profiling.start(profiled, profilingBuffer.cudaPointer);
+      rv->profilingData = std::move(profilingBuffer);
+      rv->profilingBytesPerThread = Profiling::maxBytesPerThread;
+      rv->profilingCountdown = launch - 1;
     }
 
     // A word of the address arrays (see paramBuffer above): array 1 (tensor addresses), 2 (the peers' mappings) or 3
@@ -1718,6 +1805,33 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       CHECK(nvlsChunksTotal == nvlsChunks);
     }
 
+    // The NVLS kernel: the tensors that NVLS addresses (see KernelHandle::nvlsTensors), those of the local nodes of the
+    // NVLS slots of every rank of the domain (each such node is at the same tensor index and offset on every rank of
+    // the domain, see nvlsDomainNodes; a rank may address the others' alone, e.g. the root of a reduce to one rank)
+    if (nvlsOp) {
+      Vector<uint32_t> mine;
+      for (const NodeSetup& s : pipeAddrSetups) {
+        if (s.slot & 2) {
+          CHECK(s.slot & 1);
+          mine.push_back(s.slot / sizeof(uint64_t));
+        }
+      }
+      for (uint32_t r : ranks) {
+        ctx.send(r, mine);
+      }
+      for (uint32_t r : ranks) {
+        Vector<uint32_t> theirs;
+        ctx.receive(r, theirs);
+        for (uint32_t t : theirs) {
+          if (std::ranges::find(rv->nvlsTensors, t) == rv->nvlsTensors.end()) {
+            CHECK(t < graph.tensors.size());
+            rv->nvlsTensors.push_back(t);
+          }
+        }
+      }
+      std::ranges::sort(rv->nvlsTensors);
+    }
+
     std::vector<uint8_t> tableData;
     auto appendTable = [&](const auto& table, size_t align) {
       size_t offset = (tableData.size() + align - 1) / align * align;
@@ -1734,6 +1848,23 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     size_t pipeWaitsOffset = appendTable(pipeWaits, 8);
     size_t pipeDoneFlagsOffset = appendTable(pipeDoneFlags, 8);
     size_t addrTableOffset = appendTable(addrTable, 8);
+    // An op with an NVLS kernel: where this rank's variant word goes in each peer's array (of concurrency slot 0), and
+    // the array's bytes per slot (see the variant words below)
+    struct VariantSetup {
+      uint64_t addr;
+      uint32_t itembytes;
+      uint32_t pad;
+    };
+    std::vector<VariantSetup> variantTable;
+    if (variantWords) {
+      for (size_t i : indices(ranks)) {
+        if (ranks[i] != rank) {
+          variantTable.push_back({variantWords->remote[i] + sizeof(uint32_t) * variantWords->remoteIndex[i],
+              variantWords->remoteItembytes[i], 0});
+        }
+      }
+    }
+    size_t variantTableOffset = appendTable(variantTable, 8);
     // The tables that the address table and the NVLS check below read (the node setups and the NVLS edge table), the
     // entry's tables, come last, together: a block copies them into shared memory at its start (see entryTablesStaged)
     const size_t entryTablesOffset = (tableData.size() + 15) / 16 * 16;
@@ -1887,6 +2018,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     const uint32_t pipeAddrSetupEntry = pipeAddrSetupOffset - entryTablesOffset;
     const uint32_t nvlsEdgeTableEntry = nvlsEdgeTableOffset - entryTablesOffset;
 
+    // An op with an NVLS kernel: block 0's threads load where their variant words go (see the variant words below), a
+    // peer each, at the start, so that the stores after the address exchange do not wait for the loads (nothing uses
+    // their values before then: an instruction that did would stall the warp, the threads issue in order)
+    Vector<std::pair<u64, u32>> variantLoads;
+    for (uint32_t first = 0; first < variantTable.size(); first += blockSize) {
+      u32 i = first + threadIndex;
+      Value pred = (blockIndex == 0) & (i < (uint32_t)variantTable.size());
+      u64 record = tables + variantTableOffset + widen(i * sizeof(VariantSetup));
+      u64 base = predicated(pred, ld_global_nc_u64)(record);
+      u32 itembytes = predicated(pred, ld_global_nc_u32)(record + offsetof(VariantSetup, itembytes));
+      variantLoads.emplace_back(base, itembytes);
+    }
+
     profiling.enter("parity setup");
 
     u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
@@ -1952,6 +2096,89 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
 
     u32 csyncaddr = addConst32(syncsetup, "syncsetup");
 
+    // ---- Errors ----
+    // The launch cannot go on (see Group::KernelError): the first thread to find out writes the record, marks this
+    // launch as failed in its variant word on every peer (Group::kernelFailedWord, see the variant words below: a peer
+    // that waits for this rank sees it, also one that checks nothing itself, e.g. a rank of a reduce to another rank),
+    // then every thread that finds out traps, once all that is written (the record, in host memory, has its ready word
+    // set after it and a fence; a trap ends the context at once, with the other threads' stores in flight)
+    auto reportError = [&](const u32& code, const u32& peer, const u32& tensor, const u64& local, const u64& remote) {
+      using KE = Group::KernelError;
+      u64 record = (int64_t)ctx.group->kernelError.cudaPointer;
+      u32 one = 1;
+      u32 old = atom_global_relaxed_sys_add_u32(record + offsetof(KE, claims), one);
+      IF_D(old == 0) {
+        u32 r = (int64_t)rank;
+        st_global_relaxed_sys_u32(record + offsetof(KE, code), code);
+        st_global_relaxed_sys_u32(record + offsetof(KE, rank), r);
+        st_global_relaxed_sys_u32(record + offsetof(KE, peer), peer);
+        st_global_relaxed_sys_u32(record + offsetof(KE, stepValue), stepValue);
+        st_global_relaxed_sys_u32(record + offsetof(KE, tensor), tensor);
+        st_global_relaxed_sys_u64(record + offsetof(KE, local), local);
+        st_global_relaxed_sys_u64(record + offsetof(KE, remote), remote);
+        if (!variantTable.empty()) {
+          u32 failed = (int64_t)Group::kernelFailedWord;
+          FOR(u32 i = 0, i < (uint32_t)variantTable.size(), i += 1) {
+            u64 entry = tables + variantTableOffset + widen(i * sizeof(VariantSetup));
+            u64 base = ld_global_nc_u64(entry);
+            u32 itembytes = ld_global_nc_u32(entry + offsetof(VariantSetup, itembytes));
+            st_global_relaxed_sys_u32(base + widen(itembytes * concurrencyIndex), failed);
+          }
+        }
+        membar_sys();
+        st_global_relaxed_sys_u32(record + offsetof(KE, ready), one);
+        membar_sys();
+      }
+      u32 ready = ld_global_relaxed_sys_u32(record + offsetof(KE, ready));
+      WHILE(ready == 0) {
+        nanosleep(100);
+        ready = ld_global_relaxed_sys_u32(record + offsetof(KE, ready));
+      }
+      trap();
+    };
+
+    // An op with an NVLS kernel: block 0 of every launch writes its variant word (its step value, with bit 31 for the
+    // NVLS kernel) to every peer (see KernelHandle::variantWords) after the address exchange below, and the waits for
+    // peers look at the peers' words every variantSpins spins (by then they have normally been written): a peer that
+    // launched the other kernel of the op never takes part in this launch's exchanges, so the launch reports it (and
+    // traps).
+    static constexpr uint32_t variantSpins = 256;
+    const uint32_t myVariant = nvlsKernel ? 0x80000000u : 0;
+    std::optional<u32> cpeerRanks; // the kernel's ranks (a const table, for the report)
+    u64 variantsLocal;
+    if (variantWords) {
+      std::vector<uint32_t> peerRanks(ranks.begin(), ranks.end());
+      cpeerRanks = addConst32(peerRanks, "peerranks");
+      variantsLocal = (int64_t)variantWords->local;
+      u32 localItembytes = (int64_t)variantWords->localItembytes;
+      variantsLocal = variantsLocal + widen(localItembytes * concurrencyIndex);
+    }
+    // Whether the peer's variant word at byte offset o (4 per index of the kernel's ranks) shows a launch of this op of
+    // the other kernel: then report it
+    // (or that its launch failed: Group::kernelFailedWord)
+    auto checkVariant = [&](const Value& valid, const u32& o) {
+      u32 w = predicated(valid, ld_global_relaxed_sys_u32)(variantsLocal + widen(o));
+      u32 variantBit = (int64_t)myVariant;
+      Value failed = valid & (w == (int64_t)Group::kernelFailedWord);
+      Value other = valid & !failed & ((w & 0x7fffffff) == stepValue) & ((w & 0x80000000) != variantBit);
+      IF_D(failed | other) {
+        u32 peer = ld_const_u32(*cpeerRanks + o);
+        u32 zero = 0;
+        u32 code = selp_u32(Group::kernelErrorPeerFailed, Group::kernelErrorVariant, failed);
+        reportError(code, peer, zero, widen(stepValue | variantBit), widen(w));
+      }
+    };
+    // The whole warp (converged): the words of all peers, a lane each
+    auto checkVariantsWarp = [&]() {
+      if (!variantWords) {
+        return;
+      }
+      for (uint32_t first = 0; first < ranks.size(); first += 32) {
+        u32 i = first + laneIndex;
+        checkVariant(i < (uint32_t)ranks.size(), i * 4);
+      }
+    };
+
     profiling.enter("syncsetup");
 
     // Address exchange: write the addresses at which the peers map this rank's tensors into their address tables (in
@@ -1980,6 +2207,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         })(idParamOffset) | parityTag);
       }
     }
+    // The variant words (see above), from the addresses loaded at the start
+    if (variantWords) {
+      u32 variantBit = (int64_t)myVariant;
+      u32 word = stepValue | variantBit;
+      for (size_t k : indices(variantLoads)) {
+        u32 i = (uint32_t)(k * blockSize) + threadIndex;
+        PRED((blockIndex == 0) & (i < (uint32_t)variantTable.size())) {
+          st_global_relaxed_sys_u32(variantLoads[k].first + widen(variantLoads[k].second * concurrencyIndex), word);
+        }
+      }
+    }
 
     profiling.leave();
 
@@ -2000,9 +2238,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       ELSE {
         u64 gaddr = addrAddrsLocalBase + widen(slot);
         r = ld_global_relaxed_sys_u64(gaddr);
+        u32 spins = 0;
         WHILE((r & parityTagMask) != parityTag) {
           nanosleep(10);
           r = ld_global_relaxed_sys_u64(gaddr);
+          if (variantWords) {
+            spins = spins + 1;
+            IF_D((spins & (variantSpins - 1)) == 0) {
+              checkVariantsWarp();
+            }
+          }
         }
         r &= ~parityTagMask;
       }
@@ -2024,11 +2269,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
       done |= (r & parityTagMask) == parityTag;
       profiling.enter("nodeaddr loop");
+      u32 spins = 0;
       WHILE(vote_sync_any(!done)) {
         nanosleep(10);
         fence_acquire_sys();
         r = selp(r, predicated(!done, ld_global_relaxed_sys_u64)(gaddr), done);
         done |= (r & parityTagMask) == parityTag;
+        if (variantWords) {
+          spins = spins + 1;
+          IF((spins & (variantSpins - 1)) == 0) {
+            checkVariantsWarp();
+          }
+        }
       }
       profiling.enter("nodeaddr post");
       r &= ~parityTagMask;
@@ -2235,15 +2487,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 base = (int64_t)rv->scratch.cudaPointer;
         table = base + widen(concurrencyIndex) * (blockBytes * numBlocks) + widen(blockIndex) * blockBytes;
       }
-      // NVLS: the flag the check below sets if an entry fails (thread 0 clears it before the resolve barrier)
       const Group::Nvls& groupNvls = ctx.group->nvls;
-      u32 nvlsFailedAddr;
-      if (nvlsChecks) {
-        nvlsFailedAddr = addShared32(4, 4, "nvlsfailed");
-        IF_D(isThreadZero) {
-          st_shared_u32(nvlsFailedAddr, 0);
-        }
-      }
       if (entryTablesStaged) {
         profiling.enter("entry tables wait");
         u32 phase = 0;
@@ -2260,7 +2504,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 addr = nodeaddrpred(valid, slot, offsetLow, offsetHigh);
         if (nvlsChecks) {
           // An NVLS slot (a local node's setup, slot = 8 * tensorIndex | 3): the node through the multicast address of
-          // its tensor, if it has one, else 0
+          // its tensor (0 if it has none: the check below reports that)
           Value isNvls = valid & ((slot & 2) != 0);
           u64 mcTensor = predicated(isNvls, [&](const u32& o) {
             return ldArrayWord(3, o);
@@ -2285,20 +2529,25 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       barrier_sync_unaligned();
       profiling.leave();
 
-      // NVLS check: an entry of the NVLS edge table (the destinations of copies; the sources of reductions, and their
-      // destinations with multicast stores; a run of the reduce loop) passes if every node of it has the identity of
-      // the local node of the entry's NVLS slot (the same tensor at the same place of the same multicast object; the
-      // node offset is the same on every rank): from the identities the peers publish (with the launch's parity, like
-      // the addresses). All of them before any multimem.ld_reduce, which fails (the context, with
-      // CUDA_ERROR_CONTAINED) at an offset where a member has no memory bound. Warp w checks the entries w, w +
-      // numWarps, ...; an entry that fails gets 0 in its NVLS slot and sets the flag. Copies and nvlsReduceLoop use
-      // NVLS only if no entry fails (nvlsMode), a run of the reduce loop if its own entry passes (see runSlotAddress).
-      // Every block decides the same: from the same identities.
-      Value nvlsMode(ValType::Pred);
+      // NVLS check (the NVLS kernel): every node of an entry of the NVLS edge table (the destinations of copies; the
+      // sources of reductions, and their destinations with multicast stores; a run of the reduce loop) must have the
+      // identity of the local node of the entry's NVLS slot (the same tensor at the same place of the communication
+      // pool; the node offset is the same on every rank): from the identities the peers publish (with the launch's
+      // parity, like the addresses). The launch has chosen the NVLS kernel because this rank's tensors are in the pool
+      // (see launchCustomOp in processgroup.cc), and so have the peers' launches, but the pool may hold them at
+      // different places: then the launch reports it and traps (see reportError), before any multicast store or
+      // multimem.ld_reduce (which fails, the context with CUDA_ERROR_CONTAINED, at an offset where a member has no
+      // memory bound). Warp w checks the entries w, w + numWarps, ...
       if (nvlsChecks) {
         profiling.enter("nvls check");
         const uint32_t numWarps = blockSize / 32;
         u64 idLocalBase = concurrency(nvlsIds->local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
+        // (the ranks of the peers' tensors that this rank maps, by the slots of their addresses: for the report)
+        std::vector<uint32_t> mappingRanks;
+        for (const auto& m : graph.localCudaTensorMappings) {
+          mappingRanks.push_back(m.rank);
+        }
+        u32 cmappingRanks = addConst32(mappingRanks, "mappingranks");
         static_assert(sizeof(nvlsEdgeTable[0]) == 16);
         FOR(u32 e = warpIndex, e < (uint32_t)nvlsEdgeTable.size(), e += numWarps) {
           u32 record = e * 16 + nvlsEdgeTableEntry;
@@ -2309,6 +2558,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 localSlot = ldEntry32(nvlsSlot * sizeof(NodeSetup) + pipeAddrSetupEntry);
           u64 identity = ldArrayWord(3, (localSlot & ~3u) * 2);
           Value ok = (nvlsAddr != 0) & (identity != 0);
+          // (a lane's first node at another place: its slot and published identity, for the report; the loop below
+          // does not branch on them: a branch on a load's value waits for the load)
+          Value anyBad(ValType::Pred);
+          anyBad = 0;
+          u32 badSlot = 0;
+          u64 badTheirs = 0;
           FOR(u32 d0 = 0, d0 < numNodes, d0 += 32) {
             u32 d = d0 + laneIndex;
             Value valid = d < numNodes;
@@ -2317,25 +2572,46 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             u64 idAddr = idLocalBase + widen(dslot);
             u64 published = predicated(remote, ld_global_relaxed_sys_u64)(idAddr);
             Value done = !remote | ((published & parityTagMask) == parityTag);
+            u32 spins = 0;
             WHILE(vote_sync_any(!done)) {
               nanosleep(10);
               published = selp(published, predicated(!done, ld_global_relaxed_sys_u64)(idAddr), done);
               done |= (published & parityTagMask) == parityTag;
+              spins = spins + 1;
+              IF((spins & (variantSpins - 1)) == 0) {
+                checkVariantsWarp();
+              }
             }
-            Value bad = remote & ((published & ~parityTagMask) != identity);
+            u64 theirs = published & ~parityTagMask;
+            Value bad = remote & (theirs != identity);
+            Value first = bad & !anyBad;
+            badSlot = selp_u32(dslot, badSlot, first);
+            badTheirs = selp_u64(theirs, badTheirs, first);
+            anyBad = anyBad | bad;
             ok = ok & !vote_sync_any(bad);
           }
-          IF_D(!ok & (laneIndex == 0)) {
-            st_u64(table + widen(nvlsSlot * 8), 0);
-            st_shared_u32(nvlsFailedAddr, 1);
+          IF_D(!ok) {
+            u32 tensor = localSlot / sizeof(uint64_t);
+            // This rank's tensor is not in the pool (lane 0 reports it), or a node is at another place (its lane)
+            IF_D(((nvlsAddr == 0) | (identity == 0)) & (laneIndex == 0)) {
+              u32 code = Group::kernelErrorIdentity;
+              u32 self = (int64_t)rank;
+              u64 none = 0;
+              reportError(code, self, tensor, identity, none);
+            }
+            IF_D(anyBad) {
+              // (a remote node's slot is 8 times the index of its mapping)
+              u32 code = Group::kernelErrorIdentity;
+              u32 peer = ld_const_u32(cmappingRanks + badSlot / 2);
+              reportError(code, peer, tensor, identity, badTheirs);
+            }
           }
         }
-        // (unaligned: after lane 0's branch above, see the reduce loop)
+        // No multicast store or multimem.ld_reduce before every warp has checked its entries (unaligned: after the
+        // branches above, see the reduce loop)
         barrier_sync_unaligned();
-        nvlsMode = ld_shared_u32(nvlsFailedAddr) == 0;
-        // Count the launch, if every entry passed (see Group::Nvls::launches), and if so, whether it runs
-        // nvlsReduceLoop (Group::Nvls::loopLaunches)
-        IF_D(nvlsMode & isThreadZero & (blockIndex == 0)) {
+        // Count the launch (see Group::Nvls::launches), and whether it runs nvlsReduceLoop (Group::Nvls::loopLaunches)
+        IF_D(isThreadZero & (blockIndex == 0)) {
           u64 launches = (int64_t)groupNvls.launches;
           u32 old;
           atom_global_relaxed_gpu_add_u32_into(old, launches, 1);
@@ -2391,10 +2667,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         }
       };
 
-      // Without NVLS: the pipelines of all blocks take items (see above). With NVLS edges, a launch that does not
-      // use NVLS adds the chunks to the op's step counter at the end, so that its value stays the same for every
-      // launch (ranks whose launch uses NVLS may wait for them).
+      // Without NVLS: the pipelines of all blocks take items (see above)
       auto unicastCopy = [&]() {
+        CHECK(!nvlsLocal);
         IF_D(isPipelineLane) {
           profiling.enter("copy");
           // The loads below may read data whose readiness generic loads have observed
@@ -2410,12 +2685,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge));
           u32 loaded = 0;
           u32 stored = 0;
-          // With NVLS edges: the NVLS chunks (of nvlsChunkSize, see PipeEdge::nvlsFirst) of the edges whose first
-          // item this pipeline loaded
-          u32 nvlsLoaded;
-          if (nvlsLocal) {
-            nvlsLoaded = 0;
-          }
           // With relayItems: whether the edge of the item taken last waits for a relay signal that this pipeline has
           // not seen arrive yet (its items, and edges, only increase)
           const bool relayWaits = relayItems && !tuning;
@@ -2491,12 +2760,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
                 src, offset, n, table + widen((addrSlot + 1 + firstDestination) * 8), numGroupDestinations, tag, 0);
             item += 1;
             loaded += 1;
-            if (nvlsLocal) {
-              IF(index == 0) {
-                nvlsLoaded += ld_global_nc_u32(record + sizeof(PipeEdge) + offsetof(PipeEdge, nvlsFirst)) -
-                              ld_global_nc_u32(record + offsetof(PipeEdge, nvlsFirst));
-              }
-            }
           };
 
           if (relayItems) {
@@ -2504,7 +2767,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             // items it has loaded meanwhile, and waits for the signal only once it has none left. It loads an item
             // into a stage that no item has used, or, once the stores of all but the last storeLag items stored have
             // read their stages, while fewer than numStages - storeLag loads are ahead of the stores: one per store
-            // as below, more after a wait. (With NVLS edges, a launch that does not use NVLS: see nvlsLoaded.)
+            // as below, more after a wait.
             CHECK(!anySignals);
             WHILE(!exhausted & (loaded < numStages)) {
               IF(take()) {
@@ -2610,11 +2873,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           profiling.enter("drain");
           cp_async_bulk_wait_group(0);
           profiling.leave();
-          if (nvlsLocal) {
-            IF(nvlsLoaded != 0) {
-              multimem_red_relaxed_sys_add_u32(nvlsCounterMc, nvlsLoaded);
-            }
-          }
         }
       };
 
@@ -2811,12 +3069,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           partialDone = addGlobalVar(4, 4 * maxConcurrency * numEdges, "partialdone");
         }
 
-        // NVLS runs (see nvlsReductionRuns): an edge whose first nvlsRunNodes sources are a run loads them, if the
-        // launch can (the run's NVLS slot holds the multicast address of the local source, see the NVLS check), with
+        // NVLS runs (see nvlsReductionRuns; in the NVLS kernel): an edge whose first nvlsRunNodes sources are a run
+        // loads them (the run's NVLS slot holds the multicast address of the local source, see the NVLS check) with
         // multimem.ld_reduce, as one source: thread 0 loads nothing for it, its stage only completes a phase, and the
         // threads load their vectors of it from the multicast address when they get to it. An edge whose first
         // nvlsRunNodes destinations are a run stores to them with one bulk store to the multicast address of the local
-        // destination (its NVLS slot, after the source's if the edge has both runs), if the launch can.
+        // destination (its NVLS slot, after the source's if the edge has both runs).
         bool anyNvlsSources = false;
         bool anyNvlsDestinations = false;
         for (const PipeEdge& p : pipeEdges) {
@@ -2830,7 +3088,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           CHECK(runInst.has_value());
         }
         // The multicast address of the run of the edge at record (whose address slot and numbers of nodes are given) in
-        // the address table, and the nodes that the run replaces (0 if none, or the launch cannot use NVLS for it)
+        // the address table, and the nodes that the run replaces (0 if none)
         auto runSlotAddress = [&](const u64& record, uint32_t flag, const u32& addrSlot, const u32& numSources,
                                   const u32& numDestinations) {
           u32 flags = ld_global_nc_u32(record + offsetof(PipeEdge, flags));
@@ -2842,8 +3100,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           u64 mc = predicated(has, [&](const u64& a) {
             return ld_u64(a);
           })(table + widen(slot * 8));
-          Value use = has & (mc != 0);
-          return std::make_pair(selp_u64(mc, 0, use), selp_u32(nvlsRunNodes, 0, use));
+          return std::make_pair(selp_u64(mc, 0, has), selp_u32(nvlsRunNodes, 0, has));
         };
 
         // Thread 0's loads: the stage of the next load, the item being loaded (its edge, the first item of the edge
@@ -3750,23 +4007,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       if (reduceKernel) {
         CHECK(!nvlsLocal && !anySignals);
         if (nvlsReduceLocal || nvlsRunLoop) {
-          IF(nvlsMode) {
-            nvlsReduceLoop();
-          }
-          ELSE {
-            reduceLoop();
-          }
+          nvlsReduceLoop();
         } else {
           reduceLoop();
         }
       } else if (nvlsLocal) {
-        IF(nvlsMode) {
-          IF_D(isPipelineLane & (blockIndex == 0)) {
-            nvlsCopy();
-          }
-        }
-        ELSE {
-          unicastCopy();
+        IF_D(isPipelineLane & (blockIndex == 0)) {
+          nvlsCopy();
         }
       } else {
         unicastCopy();
@@ -3842,6 +4089,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           IF(found != selWait) {
             fence_acquire_sys();
           }
+          // (waiting: the peers' variant words every variantSpins rounds, see checkVariant)
+          if (variantWords) {
+            IF((found == selWait) & ((round & (variantSpins - 1)) == variantSpins - 1)) {
+              checkVariantsWarp();
+            }
+          }
           IF_D(laneIndex == 0) {
             u32 waitValue = selWait;
             u32 doneValue = selDone;
@@ -3872,23 +4125,26 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     auto execSync = [&](uint32_t stepOffset) {
       Vector<u64> ldaddrs;
       Vector<u64> staddrs;
+      Vector<u32> ldoffsets; // (the peer's index in the kernel's ranks, times 4)
       Vector<Value> preds;
       uint32_t numWarps = blockSize / 32;
       for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
         profiling.enter("sync setup");
         ldaddrs.emplace_back();
         staddrs.emplace_back();
+        ldoffsets.emplace_back();
         preds.emplace_back();
         u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
         u64& ldaddr = ldaddrs.back();
         u64& staddr = staddrs.back();
+        u32& ldoffset = ldoffsets.back();
         Value& pred = preds.back();
         pred = index < syncsetup.size();
         PRED(pred) {
           u32 addr = csyncaddr + index * sizeof(SyncSetup);
           u64 stbase = ld_const_u64(addr);
           u32 itembytes = ld_const_u32(addr + 8);
-          u32 ldoffset = ld_const_u32(addr + 12);
+          ldoffset = ld_const_u32(addr + 12);
           u32 stBlockStride = ld_const_u32(addr + 16);
           staddr = stbase + widen(itembytes * concurrencyIndex + stBlockStride * blockIndex);
           ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + sizeof(uint32_t) * ranks.size() * blockIndex);
@@ -3907,6 +4163,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         profiling.enter("sync ld");
         u64 ldaddr = ldaddrs[i];
         Value pred = preds[i];
+        u32 spins = 0;
         Label loop;
         Label done;
         GOTO_IF_NOT(pred, done);
@@ -3914,6 +4171,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         pred = ld_global_relaxed_sys_u32(ldaddr) < targetValue;
         GOTO_IF_NOT(pred, done);
         nanosleep(10);
+        if (variantWords) {
+          // (the variant word of the peer whose flag this thread waits for: see checkVariant)
+          spins = spins + 1;
+          Value check = (spins & (variantSpins - 1)) == 0;
+          IF_D(check) {
+            checkVariant(check, ldoffsets[i]);
+          }
+        }
         GOTO(loop);
         LABEL(done);
       }

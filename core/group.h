@@ -112,6 +112,35 @@ struct Group {
 
   AllocatedArray cpuOutBuffer;
   AllocatedArray cpuInBuffer;
+  // A compile_op kernel's report that its launch cannot go on (see generateKernel), in host memory (kernelError): the
+  // NVLS kernel found a tensor that NVLS addresses at another place of the communication pool on another rank, a peer
+  // launched the other kernel of the op (the ranks chose differently, see launchCustomOp in processgroup.cc), or a peer
+  // failed so. The first thread to find one claims the record (claims), writes it, marks this rank's launch as failed
+  // for the peers (in their variant words, see KernelHandle::variantWords), sets ready, and traps (as does every other
+  // thread that finds one, once ready is set): the context fails, and the CPU thread prints the record (see
+  // kernelErrorMessage).
+  struct KernelError {
+    uint32_t claims;
+    uint32_t ready;
+    uint32_t code; // kernelErrorIdentity, kernelErrorVariant or kernelErrorPeerFailed
+    uint32_t rank; // the rank that found it
+    uint32_t peer; // the other rank
+    uint32_t stepValue;
+    uint32_t tensor; // kernelErrorIdentity: the index of the tensor (of this rank's op), in its NVLS slot
+    uint32_t pad;
+    uint64_t local;  // kernelErrorIdentity: this rank's NVLS identity of the tensor; kernelErrorVariant: its launch's
+    uint64_t remote; // the peer's (kernelErrorVariant: the peer's variant word, see KernelHandle::variantWords)
+  };
+  static constexpr uint32_t kernelErrorIdentity = 1;
+  static constexpr uint32_t kernelErrorVariant = 2;
+  static constexpr uint32_t kernelErrorPeerFailed = 3;
+  // The variant word with which a failed launch marks itself for its peers (no launch's variant word: step values
+  // advance by 0x1000 per op and stay below 0x80000000)
+  static constexpr uint32_t kernelFailedWord = 0xffffffff;
+  AllocatedBuffer kernelError;
+  bool kernelErrorReported = false; // (by the CPU thread)
+  // The message of the kernel error, if any kernel has reported one (see KernelError), else empty
+  std::string kernelErrorMessage() const;
   // The signals of compile_op's RDMA transfers, which its kernels wait for (see CustomOpDescriptor::IbRead and
   // IbWrite): 16 bytes per signal index, a 32-bit word per NIC (maxDevices), all of which the CPU threads set to the
   // step value (+ a generation, see compile_op::Graph::Signal) once the data is there (see writeRdmaSignal in
@@ -167,21 +196,16 @@ struct Group {
 
   // NVLS (NVLink SHARP multicast) for compile_op (see generateKernel), set up by setupNvls when the first op that
   // can use it is compiled: two multicast objects per NVLink domain that can use them (of the group's ranks in it,
-  // fabricDomainRanks; a multicast object cannot span domains), of which a rank has its domain's. One over moodist's
-  // whole allocator pool, every allocator chunk bound at its offset in the pool (so offset o of the pool of every rank
-  // of the domain is at mcBase + o), followed by an area for the ops' step counters; one over the group's
+  // fabricDomainRanks; a multicast object cannot span domains), of which a rank has its domain's. One over the group's
   // communication pool (see commPool), every slab bound at its logical offset (so logical offset o of every rank of
-  // the domain is at commMcBase + o). The objects, and what is bound to them, outlive the group.
+  // the domain is at commMcBase + o): NVLS only stores to and loads from buffers of the communication pool. One over an
+  // area for the ops' step counters. The objects, and what is bound to them, outlive the group.
   struct Nvls {
-    // The pool object's size is the pool's (multicast objects of more than 1 TiB fail to bind): the counter area takes
-    // its last 2 MiB, so only pool offsets below poolBytes are bound (the allocator never maps that much)
     static constexpr size_t countersBytes = (size_t)2 << 20;
-    static constexpr size_t poolBytes = allocatorReserveSize - countersBytes;
     // The fewest ranks of a domain that any use of NVLS needs (see nvlsReduceMinRanks in ptx_codegen.cc, which checks
     // the thresholds against it): smaller domains get no multicast objects
     static constexpr size_t minDomainRanks = 8;
     int state = 0; // 0: not set up yet, 1: available, -1: unavailable (to this rank, i.e. to its domain)
-    uintptr_t mcBase = 0;
     uintptr_t commMcBase = 0;
     uintptr_t countersLocal = 0; // the counter area, through the local mapping
     uintptr_t countersMc = 0;    // the counter area, through the multicast mapping

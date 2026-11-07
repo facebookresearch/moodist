@@ -366,19 +366,28 @@ struct CustomOpDescriptor {
   bool requireMoodistMemory = true;
 
   // The tensor addresses of the op's last launch, the addresses at which the peers map them and their NVLS words: the
-  // next launch with the same tensor addresses takes these (see launchCustomOp in processgroup.cc)
+  // next launch with the same tensor addresses takes these (see launchCustomOp in processgroup.cc), the NVLS words only
+  // while the group's communication pool has added no slab since (commPoolSlabs, see allocatorCommPoolSlabCount: an
+  // address outside the pool can then be in it)
   struct LaunchCache {
     bool valid = false;
     std::vector<uintptr_t> tensorAddrs;
     std::vector<uintptr_t> mappedAddrs;
     std::vector<uint64_t> nvlsTensors;
+    uint64_t commPoolSlabs = 0;
   };
   LaunchCache launchCache;
 
   compile_op::Graph graph;
+  // The op's unicast kernel (see KernelVariant), and its NVLS kernel if it has one (with a grid of its own): a launch
+  // runs the NVLS kernel if the tensors that NVLS uses (KernelHandle::nvlsTensors) are in the communication pool (see
+  // launchCustomOp in processgroup.cc)
   std::shared_ptr<KernelHandle> kernelHandle;
   std::unique_ptr<CompiledKernel> kernel;
   KernelConfig config;
+  std::shared_ptr<KernelHandle> nvlsKernelHandle;
+  std::unique_ptr<CompiledKernel> nvlsKernel;
+  KernelConfig nvlsConfig;
 };
 
 struct QueueEntryCustom : QueueEntry {

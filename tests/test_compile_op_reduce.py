@@ -28,7 +28,7 @@ from framework import TestContext, test, create_process_group
 moodist.enable_cuda_allocator()
 
 # Set MOODIST_TEST_EXPECT_NVLS=1 when the group's NVLink domains support NVLS, to also check that the launches of the
-# NVLS tests (test_all_reduce_nvls, test_all_reduce_nvls_edges, test_reduce_nvls_mismatch) use it where it applies:
+# NVLS tests (test_all_reduce_nvls, test_all_reduce_nvls_edges, test_reduce_nvls_outside) use it where it applies:
 # all-reduces in a group that is one domain of 8 ranks or more, reductions with one destination (reduce-scatters,
 # reductions to one rank) and reductions across domains with 12 or more per domain (NVLS works within a domain;
 # reductions across domains use it for their parts within each)
@@ -761,23 +761,18 @@ def test_nvls_loop_same_bits(ctx: TestContext):
 
 
 @test
-def test_reduce_nvls_mismatch(ctx: TestContext):
-    """NVLS reductions fall back to the reduce loop when a rank's tensor is not where NVLS needs it: the last rank's
-    input outside the communication pool, its input at another offset of the pool, its output outside the pool (an
-    all-reduce's multicast stores would write elsewhere on it), and in a reduce-scatter its input outside the pool.
-    Every rank allocates the pool buffers all the same (so that the pools stay alike). The results are right, and no
-    launch of a rank of the last rank's NVLink domain counts as one that used NVLS (nvls_launches: a launch every NVLS
-    step of which could; a multimem.ld_reduce from a member without memory at the address ends the process, and the
-    other domains' NVLS does not involve its tensors), but with the output elsewhere across domains of fewer than 16
-    ranks: there no step stores to the outputs with multicast stores, and the partial results, which read only the
-    inputs, use NVLS as usual. Then with every tensor in place, NVLS where the group supports it
-    (MOODIST_TEST_EXPECT_NVLS=1)."""
+def test_reduce_nvls_outside(ctx: TestContext):
+    """NVLS reductions need the tensors in the communication pool, on every rank: every rank's input outside the pool,
+    and in a reduce-scatter too, run the ops' unicast kernels (no launch uses NVLS); every rank's output outside the
+    pool runs the unicast kernel where the all-reduce stores its results with multicast stores (in one domain, or in
+    domains of 16 ranks or more), else the NVLS kernel. The results are right. Then with every tensor in place, NVLS
+    where the group supports it (MOODIST_TEST_EXPECT_NVLS=1). (Tensors outside the pool on some ranks only, or at
+    different offsets, are an error: see test_nvls_errors.py.)"""
     pg = create_process_group(ctx)
     n = ctx.world_size
     domains = nvlink_domains(ctx, pg)
     dtype = torch.float32
     numel = 1 << 16
-    last = ctx.rank == n - 1
     region = [TensorRegion(offset=[0], shape=[numel], device="cuda")]
     ar = moodist.compile_op(pg, dtype=dtype, inputs=region, outputs=region, reduce="sum")
     rs = moodist.compile_op(pg, dtype=dtype, inputs=[TensorRegion(offset=[0], shape=[n * numel], device="cuda")],
@@ -789,21 +784,15 @@ def test_reduce_nvls_mismatch(ctx: TestContext):
         return ((torch.arange(count, device="cuda") * 3 + r * 7) % 11 - 5).to(dtype)
 
     errors = []
-    for case in ["input outside the pool", "input at another offset", "output outside the pool",
-                 "reduce-scatter input outside the pool", "all in place"]:
+    for case in ["inputs outside the pool", "outputs outside the pool", "reduce-scatter inputs outside the pool",
+                 "all in place"]:
         rs_case = case.startswith("reduce-scatter")
         in_numel = n * numel if rs_case else numel
-        # (the pool buffers stay allocated until the end of the case, on every rank)
-        comm_x = moodist.comm_empty(in_numel, dtype=dtype, group=pg)
-        comm_x2 = moodist.comm_empty(in_numel, dtype=dtype, group=pg)
-        comm_out = moodist.comm_empty(numel, dtype=dtype, group=pg)
-        x = comm_x
-        out = comm_out
-        if last and case.endswith("input outside the pool"):
+        x = moodist.comm_empty(in_numel, dtype=dtype, group=pg)
+        out = moodist.comm_empty(numel, dtype=dtype, group=pg)
+        if case.endswith("inputs outside the pool"):
             x = torch.empty(in_numel, dtype=dtype, device="cuda")
-        elif last and case == "input at another offset":
-            x = comm_x2
-        if last and case == "output outside the pool":
+        if case == "outputs outside the pool":
             out = torch.empty(numel, dtype=dtype, device="cuda")
         x.copy_(values(ctx.rank, in_numel))
         out.fill_(99)
@@ -817,14 +806,13 @@ def test_reduce_nvls_mismatch(ctx: TestContext):
             errors.append(f"{case}: wrong result, {(out != expected).sum().item()} elements")
         # (across domains, the multicast stores of an all-reduce's results, the only NVLS steps that need the outputs in
         # place, start at 16 ranks per domain)
-        outputs_checked = len(set(domains)) == 1 or domains.count(domains[n - 1]) >= 16
-        if (case != "all in place" and ("output" not in case or outputs_checked) and
-                any(c for c, d in zip(counts, domains) if d == domains[n - 1])):
-            errors.append(f"{case}: launches used NVLS (per rank {counts})")
-        if case == "all in place" and EXPECT_NVLS and smallest_domain(domains) >= nvls_min_ranks(domains, True) and \
-                not all(counts):
+        outputs_used = len(set(domains)) == 1 or smallest_domain(domains) >= 16
+        if case.endswith("inputs outside the pool") or (case == "outputs outside the pool" and outputs_used):
+            if any(counts):
+                errors.append(f"{case}: launches used NVLS (per rank {counts})")
+        elif EXPECT_NVLS and smallest_domain(domains) >= nvls_min_ranks(domains, True) and not all(counts):
             errors.append(f"{case}: launches that used NVLS per rank {counts}")
-        del x, out, comm_x, comm_x2, comm_out
+        del x, out
     raise_on_all_ranks(ctx, pg, errors)
 
 

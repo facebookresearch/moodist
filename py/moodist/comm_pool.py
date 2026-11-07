@@ -24,12 +24,14 @@ def comm_empty(*size, dtype=None, group=None):
 
     Each process group has its own pool. When every rank of the group allocates (and frees) its communication
     buffers in the same order, with the same sizes, each buffer gets the same offset in the pool on every rank,
-    whatever else the ranks allocate and whenever their GPUs finish with freed memory. compile_op ops whose outputs
-    are such buffers can then store to all ranks at once with NVLink multicast (NVLS) where the group supports it: an
-    all-gather, for example, then needs one SM instead of a dozen. Reductions whose inputs (and for an all-reduce,
-    outputs) are such buffers can have the NVLink switches combine them (an all-reduce then moves about half the
-    data), within each NVLink domain of the group. A launch whose buffers are not at the same offset on every rank
-    stores to each rank as usual (and reads each input), so a mismatch only costs speed.
+    whatever else the ranks allocate and whenever their GPUs finish with freed memory (out of device memory, an
+    allocation raises rather than take memory freed on other streams). compile_op ops whose outputs are such buffers
+    store to all ranks at once with NVLink multicast (NVLS) where the group supports it: an all-gather, for example,
+    then needs one SM instead of a dozen. Reductions whose inputs (and for an all-reduce, outputs) are such buffers
+    have the NVLink switches combine them (an all-reduce then moves about half the data), within each NVLink domain of
+    the group. Launches whose buffers are not in the pool store to each rank (and read each input) as usual. The
+    ranks must agree: a launch whose buffers are in the pool on some ranks only, or at different offsets on different
+    ranks, fails (its kernel reports the error and stops, which fails the CUDA context).
 
     The memory comes from moodist's CUDA allocator (in large slabs the pool keeps), and is usable on the current
     stream, like torch.empty's. The process group's allocate_tensor (which FSDP2 uses after

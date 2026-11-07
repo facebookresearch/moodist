@@ -40,15 +40,33 @@ struct KernelHandle {
   Vector<std::string> profilingNames;
   size_t profilingCountdown = 0;
 
-  // NVLS (see generateKernel): the op uses the multicast objects of this rank's NVLink domain (decided by every rank of
-  // the domain together; other domains decide for themselves), for copies (multicast stores) or for reductions
-  // (multimem.ld_reduce, multicast stores of results). launchCustomOp passes the NVLS identities and multicast
-  // addresses of the tensors (see nvlsIdentity in processgroup.cc) in a fourth kernel parameter, and the op's step
-  // counter (of the launch's concurrency slot) before the launch: every launch adds nvlsIncrement (the chunks all ranks
-  // store with NVLS; 0 for reductions, which have no step counter).
-  bool nvls = false;
+  // The grid the kernel was generated for (an NVLS kernel's is its own, see generateKernel)
+  uint32_t gridSize = 0;
+
+  // An NVLS kernel (see generateKernel): it uses the multicast objects of this rank's NVLink domain, for copies
+  // (multicast stores) or for reductions (multimem.ld_reduce, multicast stores of results). launchCustomOp passes the
+  // NVLS identities and multicast addresses of the tensors (see nvlsIdentity in processgroup.cc) in a fourth kernel
+  // parameter, and the op's step counter (of the launch's concurrency slot) before the launch: every launch adds
+  // nvlsIncrement (the chunks all ranks store with NVLS; 0 for reductions, which have no step counter).
+  // nvlsTensors: this rank's tensors (indices) that NVLS addresses on some rank of the domain, at the same place on
+  // every rank (the same tensor index on every rank too): the op's launches use the NVLS kernel if every one of them is
+  // in the communication pool.
   uint32_t nvlsIncrement = 0;
   std::array<uint32_t, 16> nvlsLaunches = {}; // per concurrency slot
+  Vector<uint32_t> nvlsTensors;
+
+  // An op with an NVLS kernel: the words with which the launches of its two kernels tell the peers' which kernel they
+  // are (allocated by the NVLS kernel's generateKernel, used by both): this rank's (a 32-bit word per peer, in the
+  // order of the kernel's ranks, per concurrency slot), and the peers' (where this rank writes its own, at its index
+  // there)
+  struct VariantWords {
+    uintptr_t local = 0;
+    uint32_t localItembytes = 0;
+    Vector<uintptr_t> remote;
+    Vector<uint32_t> remoteItembytes;
+    Vector<uint32_t> remoteIndex; // this rank's index in each peer's ranks
+  };
+  std::shared_ptr<VariantWords> variantWords;
 
   // The address arrays (tensor addresses, the addresses at which the peers map this rank's tensors, NVLS identities)
   // are in the module's parameter buffer instead of kernel parameters (see generateKernel and
@@ -75,10 +93,17 @@ void fillCompileOpParamBuffer(const KernelHandle& kh, const CompiledKernel& kern
     std::span<const uintptr_t> tensorAddrs, std::span<const uintptr_t> mappedAddrs,
     std::span<const uint64_t> nvlsTensors);
 
+// An op's kernels (see generateKernel): the unicast kernel stores to each destination and loads each source (every
+// tuning kernel is one); the NVLS kernel uses the multicast objects of the rank's NVLink domain where it can
+enum class KernelVariant { unicast, nvls };
+
 // The copy kernel of an op on this rank. With tuning, the kernel does not wait for the CPU thread's signals that
-// nodes have been filled over RDMA (tuning launches run without the CPU thread).
+// nodes have been filled over RDMA (tuning launches run without the CPU thread). The NVLS variant: nullptr if the ranks
+// of the NVLink domain decide that the op cannot use NVLS. nvlsSibling: for the unicast kernel of an op that has an
+// NVLS kernel, that kernel (whose launches the unicast kernel's must recognize, see KernelHandle::variantWords).
 std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelConfig& config, std::string target,
-    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning);
+    const compile_op::Graph& graph, compile_op::CompileContext& ctx, bool tuning,
+    KernelVariant variant = KernelVariant::unicast, const KernelHandle* nvlsSibling = nullptr);
 
 // Why the kernels of ranks that execute reductions cannot run with config, or empty if they can
 std::string reduceConfigError(const KernelConfig& config);
