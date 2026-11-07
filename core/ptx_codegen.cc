@@ -1081,8 +1081,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // 4M 208 vs 239, 256M 12.4 vs 12.7 ms). So can the edge of a proxy across domains (see proxyRemoteEdges in
     // compile_op.cc), from the proxy's node, which its relay edge fills, to every other rank of the domain: its
     // multicast store also rewrites that node, with the bytes it holds (all-gather across 2 domains of 32 GB300, per
-    // rank: 1M 117 vs 140 us, 16M 1.56 vs 1.63 ms, 256M 24.8 vs 25.3 ms; on 256 GB300 in 14 domains, 12 of 16 GPUs
-    // whose ranks proxy 15 pieces each: 1M 500 vs 536 us, 16M 6.20 vs 6.37 ms, 64M 24.9 vs 25.3 ms). NVLS needs the
+    // rank: 1M 117 vs 140 us, 16M 1.56 vs 1.63 ms, 256M 24.8 vs 25.3 ms; on 256 GB300 in 16 domains of 16, whose ranks
+    // proxy 15 pieces each, 1M 499 vs 533 us, but 16M 6.19 vs 6.10 ms and 64M 24.8 vs 24.3 ms: the switches' copy of
+    // each chunk back to its sender is 1/16 of what a GPU receives there, 1/32 in domains of 32). NVLS needs the
     // nodes at the same place of one of the domain's multicast objects on every rank (at the same offset of every
     // rank's pool, or of the group's communication pool), which every launch checks with the NVLS identities the peers
     // publish (see the address table below); otherwise the launch stores to each destination as usual. A rank uses
