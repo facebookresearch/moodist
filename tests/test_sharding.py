@@ -73,6 +73,16 @@ def _make_global_tensor(shape, dtype=torch.float32):
     return torch.arange(numel, dtype=dtype).reshape(shape)
 
 
+def _distribute(global_tensor, mesh, placements):
+    """distribute_tensor. Where its scatter fails (uneven _StridedShard: PyTorch 2.11 and 2.14
+    compute the padding but do not apply it, AssertionError on every rank), the same layout from
+    a local split (src_data_rank=None; every rank holds the whole global tensor)."""
+    try:
+        return distribute_tensor(global_tensor, mesh, placements)
+    except AssertionError:
+        return distribute_tensor(global_tensor, mesh, placements, src_data_rank=None)
+
+
 def _get_all_mesh_coords(mesh):
     """Get all valid coordinates for a mesh."""
     coords = []
@@ -113,7 +123,7 @@ def _verify_compute_shards_current_coord(
 
     # Create DTensor
     try:
-        dtensor = distribute_tensor(global_tensor, mesh, placements)
+        dtensor = _distribute(global_tensor, mesh, placements)
     except Exception as e:
         ctx.log(f"SKIP {description}: {e}")
         return True  # Skip, not a failure
@@ -164,7 +174,7 @@ def _verify_compute_shards_all_coords(
 
     # Create DTensor
     try:
-        dtensor = distribute_tensor(global_tensor, mesh, placements)
+        dtensor = _distribute(global_tensor, mesh, placements)
     except Exception as e:
         ctx.log(f"SKIP {description}: {e}")
         return True
@@ -789,10 +799,12 @@ def test_strided_shard_1d_mesh(ctx: TestContext, device: str):
             ((ctx.world_size * 4,), 0, 2),
             ((ctx.world_size * 4,), 0, 4),
             ((ctx.world_size * 4 + 1,), 0, 2),  # Uneven
+            ((ctx.world_size * 6 + 5,), 0, 3),  # Uneven
             ((ctx.world_size * 8,), 0, 2),
             # 2D tensors - shard different dimensions
             ((ctx.world_size * 2, 8), 0, 2),
             ((8, ctx.world_size * 2), 1, 2),
+            ((ctx.world_size * 2 + 3, 8), 0, 2),  # Uneven
             # 3D tensors
             ((ctx.world_size * 2, 4, 4), 0, 2),
         ]
@@ -888,6 +900,18 @@ def test_2d_mesh(ctx: TestContext, device: str):
                 [_StridedShard(0, split_factor=tp_size), Shard(0)],
                 (128,),
                 f"[StridedShard(0, sf={tp_size}), Shard(0)] on shape (128,)",
+                device=device,
+            )
+            if not success:
+                all_passed = False
+
+            # Same with an uneven size
+            shape = (dp_size * tp_size * 4 + 1,)
+            success = _test_configuration(
+                ctx, pg, mesh,
+                [_StridedShard(0, split_factor=tp_size), Shard(0)],
+                shape,
+                f"[StridedShard(0, sf={tp_size}), Shard(0)] on shape {shape}",
                 device=device,
             )
             if not success:
@@ -1005,14 +1029,14 @@ def _verify_local_reshard(
 
     # Create DTensor with current placements
     try:
-        dtensor_current = distribute_tensor(global_tensor, mesh, current_placements)
+        dtensor_current = _distribute(global_tensor, mesh, current_placements)
     except Exception as e:
         ctx.log(f"SKIP {description}: cannot create current DTensor: {e}")
         return True
 
     # Create DTensor with target placements
     try:
-        dtensor_target = distribute_tensor(global_tensor, mesh, target_placements)
+        dtensor_target = _distribute(global_tensor, mesh, target_placements)
     except Exception as e:
         ctx.log(f"SKIP {description}: cannot create target DTensor: {e}")
         return True

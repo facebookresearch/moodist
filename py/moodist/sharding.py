@@ -81,18 +81,16 @@ def _compose_ranges(existing_ranges, local_start, local_size):
 
 
 def _strided_shard_ranges(dim_size, split_factor, group_size, rank_index):
-    """Compute the ranges for _StridedShard (before composition)."""
-    virtual_size = split_factor * group_size
-    chunk_size = (dim_size + virtual_size - 1) // virtual_size
-    num_chunks = (dim_size + chunk_size - 1) // chunk_size
-
+    """Compute the ranges for _StridedShard (before composition), split as PyTorch 2.10+
+    does: torch.chunk into split_factor pieces, each piece into group_size chunks, and the
+    rank takes chunk rank_index of every piece. (Older PyTorch chunked into
+    split_factor * group_size pieces at once, which differs for uneven sizes.)"""
     ranges = []
-    chunk_idx = rank_index
-    while chunk_idx < num_chunks:
-        offset = chunk_idx * chunk_size
-        size = min(chunk_size, dim_size - offset)
-        ranges.append((offset, size))
-        chunk_idx += group_size
+    for piece in range(split_factor):
+        [(piece_offset, piece_size)] = _regular_shard_ranges(dim_size, split_factor, piece)
+        [(offset, size)] = _regular_shard_ranges(piece_size, group_size, rank_index)
+        if size > 0:
+            ranges.append((piece_offset + offset, size))
 
     # Always return at least one range to preserve shape info
     if not ranges:
