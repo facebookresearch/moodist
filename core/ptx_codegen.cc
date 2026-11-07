@@ -796,28 +796,9 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       };
     };
 
-    profiling.enter("parity setup");
-
-    u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
-                     widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
-    u32 parityBit = 0;
     auto isThreadZero = threadIndex == 0;
-    parityBit = predicated(isThreadZero, ld_global_u32)(parityAddr) ^ 1;
-    profiling.enter("parity setup bar");
-    auto parityPred = bar_red_or(0, blockSize, (parityBit != 0) & isThreadZero);
-    profiling.enter("parity setup post-bar");
-    predicated(isThreadZero, st_global_u32)(parityAddr, parityBit);
-    parityBit = selp_u32(1, 0, parityPred);
-
-    // The tag of the words that this launch publishes (the addresses of the address exchange below, and in NVLS ops the
-    // identities): bit 63 with parity 1, bit 62 with parity 0, so that a word of 0 never passes for a published one.
-    // The step value reset (resetStepValue: at every compile, and when the step values wrap) clears these tables, also
-    // those of ops that are still in use, whose parity goes on: with a tag of 0 for parity 0, a launch would take a
-    // cleared word for its peer's (an address of 0).
-    static constexpr uint64_t parityTagMask = 3ull << 62;
-    u64 parityTag = (widen(parityBit) << 63) | (widen(parityBit ^ 1) << 62);
-
-    profiling.leave();
+    // (the kernel's start, the launch parity and the copy of the entry's tables into shared memory, is generated after
+    // the tables below, which the copy needs: see "The kernel's start")
 
     auto concurrency = [&](const auto& v) {
       if constexpr (std::is_same_v<std::decay_t<decltype(v)>, PeerArrayRef>) {
@@ -1032,16 +1013,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       uint32_t pad;
     };
     // Where to write the address at which a peer maps one of this rank's tensors (in the peer's address table), and
-    // in NVLS ops the tensor's identity (in the peer's identity table, at the same slot)
+    // in NVLS ops the tensor's identity (in the peer's identity table, at the same slot). (The address is the word of
+    // the mapping in the kernel parameters, of its index in graph.remoteCudaTensorMappings: see the address exchange.)
     struct AddrSetup {
       uint64_t base;
       uint32_t itembytes;
-      uint32_t paramOffset;
       uint32_t stride;
       uint32_t slot;
+      uint32_t idParamOffset;
       uint64_t idBase;
       uint32_t idItembytes;
-      uint32_t idParamOffset;
+      uint32_t pad;
     };
     static_assert(sizeof(AddrSetup) == 40 && offsetof(AddrSetup, idBase) == 24);
     static constexpr uint32_t edgeRelay = 1;   // relay edge: waits for the CPU thread's signal, copies nothing
@@ -1475,7 +1457,6 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       AddrSetup s = {};
       s.base = r.base;
       s.itembytes = r.itembytes;
-      s.paramOffset = sizeof(uint64_t) * i;
       s.stride = sizeof(uint64_t) * v.stride;
       s.slot = sizeof(uint64_t) * v.destinationSlot;
       if (nvlsIds) {
@@ -1707,8 +1688,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     }
 
     std::vector<uint8_t> tableData;
-    auto appendTable = [&](const auto& table) {
-      size_t offset = (tableData.size() + 7) / 8 * 8;
+    auto appendTable = [&](const auto& table, size_t align) {
+      size_t offset = (tableData.size() + align - 1) / align * align;
       size_t bytes = sizeof(table[0]) * table.size();
       tableData.resize(offset + bytes);
       if (bytes) {
@@ -1716,14 +1697,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       return offset;
     };
-    size_t edgeTableOffset = appendTable(edgeTable);
-    size_t signalTableOffset = appendTable(signalTable);
-    size_t addrTableOffset = appendTable(addrTable);
-    size_t pipeEdgeTableOffset = appendTable(pipeEdges);
-    size_t pipeAddrSetupOffset = appendTable(pipeAddrSetups);
-    size_t nvlsEdgeTableOffset = appendTable(nvlsEdgeTable);
-    size_t pipeWaitsOffset = appendTable(pipeWaits);
-    size_t pipeDoneFlagsOffset = appendTable(pipeDoneFlags);
+    size_t edgeTableOffset = appendTable(edgeTable, 8);
+    size_t signalTableOffset = appendTable(signalTable, 8);
+    size_t pipeEdgeTableOffset = appendTable(pipeEdges, 8);
+    size_t pipeWaitsOffset = appendTable(pipeWaits, 8);
+    size_t pipeDoneFlagsOffset = appendTable(pipeDoneFlags, 8);
+    size_t addrTableOffset = appendTable(addrTable, 8);
+    // The tables that the address table and the NVLS check below read (the node setups and the NVLS edge table), the
+    // entry's tables, come last, together: a block copies them into shared memory at its start (see entryTablesStaged)
+    const size_t entryTablesOffset = (tableData.size() + 15) / 16 * 16;
+    size_t pipeAddrSetupOffset = appendTable(pipeAddrSetups, 16);
+    size_t nvlsEdgeTableOffset = appendTable(nvlsEdgeTable, 8);
+    CHECK(pipeAddrSetupOffset == entryTablesOffset);
+    // (a whole number of 16-byte units, for the bulk copy)
+    const size_t entryTablesBytes = (tableData.size() - entryTablesOffset + 15) / 16 * 16;
+    tableData.resize(entryTablesOffset + entryTablesBytes);
     u64 tables = addGlobalData(16, tableData.data(), tableData.size(), "tables");
 
     // Shared memory: with waits, the scan for ready edges keeps a done bit per edge and the selected edge, and the
@@ -1736,6 +1724,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     const size_t pipeTableBytes = 8 * pipeAddrSetups.size();
     bool pipeTableInShared = false;
     uint32_t numStages = 0;
+    size_t spareShared = 0;      // what the stages leave of config.sharedMemory
+    size_t stageMemoryBytes = 0; // the stage memory, of all stages (and pipelines)
     // The reduce loop (see below): stages of chunkSize with an mbarrier each (no records), reduceResults result
     // buffers, and a ring of reduceItemSlots claimed items (8 bytes each)
     uint32_t reduceItemSlots = 0;
@@ -1753,6 +1743,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       numStages = std::min<size_t>((config.sharedMemory - fixed) / perStage, reduceMaxStages);
       reduceItemSlots = numStages + 2;
+      spareShared = config.sharedMemory - fixed - numStages * perStage;
+      stageMemoryBytes = numStages * chunkSize;
       mod.topLevelComments.push_back(fmt::sprintf("reduce loop: chunk size %d, %d stages%s", chunkSize, numStages,
           pipeTableInShared ? "" : ", address table in global memory"));
     } else {
@@ -1769,14 +1761,35 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           "compile_op: %d bytes of shared memory are not enough for 4 stages of %d bytes per pipeline",
           config.sharedMemory, chunkSize);
       numStages = std::min<size_t>((config.sharedMemory - fixed) / (numPipelines * perStage), 16);
+      spareShared = config.sharedMemory - fixed - numStages * numPipelines * perStage;
+      stageMemoryBytes = numPipelines * numStages * chunkSize;
       mod.topLevelComments.push_back(fmt::sprintf("chunk size %d, %d pipelines of %d stages per block%s", chunkSize,
           numPipelines, numStages, itemPath && !pipeTableInShared ? ", address table in global memory" : ""));
     }
+    // The entry's tables in shared memory (see entryTablesOffset): the address table and the NVLS check below load
+    // their words in loops after barriers, where the loads cannot start early, and from global memory, each took a
+    // round trip to L2 more (the NVLS check two: its entry, then the node setups that the entry names), on the way of
+    // every rank to its copies once the last peer has published its addresses. A block copies them at its start with
+    // one bulk copy (cp.async.bulk) into the start of its stage memory, which the copy loops first load into after the
+    // entry (after the barrier that ends it), so they take no shared memory of their own: the copy's mbarrier only (8
+    // bytes, from what the stages leave; a buffer of their own would take a stage of 32 KiB from the default
+    // configurations, which leave about 1 KiB). If they fit in entryTablesStageLimit and in the stage memory, and the
+    // stages leave room for the mbarrier (else the threads load them from global memory). On 32 GB300 (one NVLink
+    // domain, the kernel of the rank that waits least, bfloat16): all-reduce of 4 KiB 11.38 -> 11.17 us, 1 MiB 14.16
+    // -> 13.84, reduce-scatter of 4 KiB per rank 9.36 -> 8.79, 256 KiB 20.76 -> 20.21, all-gather of 4 KiB per rank
+    // 9.81 -> 9.47 (with the address exchange's parameter load below); on 4 GPUs (no NVLS check), within 0.1 us. (The
+    // address exchange loads its own table from global memory: the compiler issues those loads at the kernel's start,
+    // with the launch parity's, and the bulk copy takes longer than both, about 0.6 us: staged, it delayed the
+    // exchange, and the kernel was up to 0.25 us slower on 4 GPUs.)
+    static constexpr size_t entryTablesStageLimit = 16 * 1024;
+    const bool entryTablesStaged = entryTablesBytes > 0 && entryTablesBytes <= entryTablesStageLimit &&
+                                   entryTablesBytes <= stageMemoryBytes && spareShared >= 16;
 
     // Each pipeline's stage ring (the warps beyond the pipelines alias the first ring, and never use it); with the
     // reduce loop, its stages, barriers, result buffers and item ring
     std::optional<PipeRing> ring;
     Value isPipelineLane = (laneIndex == 0) & (warpIndex < numPipelines);
+    u32 stageMemory; // the stage memory (of all pipelines)
     u32 reduceStages;
     u32 reduceBarriers;
     u32 reduceResultBuffers;
@@ -1786,12 +1799,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       reduceResultBuffers = addShared32(128, reduceResults * chunkSize, "reduceresults");
       reduceBarriers = addShared32(8, numStages * 8, "reducebarriers");
       reduceItemRing = addShared32(8, reduceItemSlots * 8, "reduceitems");
-      IF_D(isThreadZero) {
-        for (uint32_t s : range(numStages)) {
-          mbarrier_init(reduceBarriers + 8 * s, 1);
-        }
-        fence_mbarrier_init();
-      }
+      stageMemory = reduceStages;
     } else {
       u32 buffers = addShared32(128, numPipelines * numStages * chunkSize, "stages");
       u32 barriers = addShared32(8, numPipelines * numStages * 8, "stagebarriers");
@@ -1799,9 +1807,7 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u32 w = selp_u32(warpIndex, 0, warpIndex < numPipelines);
       ring.emplace(chunkSize, numStages, buffers + w * (numStages * chunkSize), barriers + w * (numStages * 8),
           records + w * (numStages * PipeRing::recordSize));
-      IF_D(isPipelineLane) {
-        ring->init();
-      }
+      stageMemory = buffers;
     }
     // With NVLS, each pipeline's ring of nvlsChunkSize stages over the same stage memory (a launch uses one of them)
     std::optional<PipeRing> nvlsRing;
@@ -1814,6 +1820,79 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u32 w = selp_u32(warpIndex, 0, warpIndex < numPipelines);
       nvlsRing.emplace(nvlsChunkSize, nvlsStages, ring->buffers, barriers + w * (nvlsStages * 8),
           records + w * (nvlsStages * PipeRing::recordSize));
+    }
+
+    // ---- The kernel's start ----
+    // The first thread of the last warp starts the bulk copy of the entry's tables (see entryTablesStaged) first, so
+    // that it overlaps the launch parity below (not thread 0, whose load of the parity it would delay, and with it the
+    // address exchange); the threads wait for it before the address table.
+    u32 entryTables;  // the staged tables (at the start of the stage memory)
+    u32 entryBarrier; // the copy's mbarrier
+    if (entryTablesStaged) {
+      entryTables = stageMemory;
+      entryBarrier = addShared32(8, 8, "entrybarrier");
+      IF_D(threadIndex == blockSize - 32) {
+        mbarrier_init(entryBarrier, 1);
+        fence_mbarrier_init();
+        u32 bytes = (int64_t)entryTablesBytes;
+        mbarrier_arrive_expect_tx(entryBarrier, bytes);
+        cp_async_bulk_shared_global(entryTables, tables + entryTablesOffset, bytes, entryBarrier);
+      }
+      // The last warp reconverges before the launch parity's block barrier (bar.red, aligned): the ptxas of CUDA 13.0
+      // can fail to reconverge a warp after a branch of one thread (see the reduce loop)
+      warp_sync();
+    }
+    // A word of the entry's tables, at a byte offset into them: from shared memory if staged, else from global memory.
+    // Only in the entry (the address table and the NVLS check): the copy loops load into the stage memory after the
+    // barrier that ends it, over the staged copy, so code after that reads these tables from global memory (tables +
+    // pipeAddrSetupOffset, tables + nvlsEdgeTableOffset).
+    auto ldEntry32 = [&](const u32& offset) -> u32 {
+      if (entryTablesStaged) {
+        return ld_shared_u32(entryTables + offset);
+      }
+      return ld_global_nc_u32(tables + entryTablesOffset + widen(offset));
+    };
+    // (the offsets of the entry's tables in them)
+    const uint32_t pipeAddrSetupEntry = pipeAddrSetupOffset - entryTablesOffset;
+    const uint32_t nvlsEdgeTableEntry = nvlsEdgeTableOffset - entryTablesOffset;
+
+    profiling.enter("parity setup");
+
+    u64 parityAddr = addGlobalVar(4, maxConcurrency * numBlocks * 4, "parity") +
+                     widen(4 * numBlocks * concurrencyIndex + 4 * blockIndex);
+    u32 parityBit = 0;
+    parityBit = predicated(isThreadZero, ld_global_u32)(parityAddr) ^ 1;
+    profiling.enter("parity setup bar");
+    // (also makes the mbarrier_init above visible to the other threads, which wait on the mbarrier below)
+    auto parityPred = bar_red_or(0, blockSize, (parityBit != 0) & isThreadZero);
+    profiling.enter("parity setup post-bar");
+    predicated(isThreadZero, st_global_u32)(parityAddr, parityBit);
+    parityBit = selp_u32(1, 0, parityPred);
+
+    // The tag of the words that this launch publishes (the addresses of the address exchange below, and in NVLS ops the
+    // identities): bit 63 with parity 1, bit 62 with parity 0, so that a word of 0 never passes for a published one.
+    // The step value reset (resetStepValue: at every compile, and when the step values wrap) clears these tables, also
+    // those of ops that are still in use, whose parity goes on: with a tag of 0 for parity 0, a launch would take a
+    // cleared word for its peer's (an address of 0).
+    static constexpr uint64_t parityTagMask = 3ull << 62;
+    u64 parityTag = (widen(parityBit) << 63) | (widen(parityBit ^ 1) << 62);
+
+    profiling.leave();
+
+    // The stage rings' mbarriers
+    if (reduceKernel) {
+      IF_D(isThreadZero) {
+        for (uint32_t s : range(numStages)) {
+          mbarrier_init(reduceBarriers + 8 * s, 1);
+        }
+        fence_mbarrier_init();
+      }
+    } else {
+      IF_D(isPipelineLane) {
+        ring->init();
+      }
+    }
+    if (nvlsLocal) {
       IF_D(isPipelineLane) {
         nvlsRing->init();
       }
@@ -1850,19 +1929,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       u32 index = blockSize * i + threadIndex;
       auto pred = index < graph.remoteCudaTensorMappings.size();
       u64 caddr = tables + addrTableOffset + widen(index * sizeof(AddrSetup));
-      u64 base = predicated(pred, ld_global_nc_u64)(caddr);
-      u32 itembytes = predicated(pred, ld_global_nc_u32)(caddr + 8);
-      u32 paramOffset = predicated(pred, ld_global_nc_u32)(caddr + 12);
-      u32 stride = predicated(pred, ld_global_nc_u32)(caddr + 16);
-      u32 slot = predicated(pred, ld_global_nc_u32)(caddr + 20);
+      u64 base = predicated(pred, ld_global_nc_u64)(caddr + offsetof(AddrSetup, base));
+      u32 itembytes = predicated(pred, ld_global_nc_u32)(caddr + offsetof(AddrSetup, itembytes));
+      u32 stride = predicated(pred, ld_global_nc_u32)(caddr + offsetof(AddrSetup, stride));
+      u32 slot = predicated(pred, ld_global_nc_u32)(caddr + offsetof(AddrSetup, slot));
       u64 addr = base + widen(itembytes * concurrencyIndex + slot + stride * blockIndex);
+      // (the word of the mapping: from its index, not from the table, so that the load of the kernel parameter, whose
+      // latency is on the way to the store as the table's is, does not wait for the table's)
       predicated(pred, st_global_relaxed_sys_u64)(addr, predicated(pred, [&](const u32& o) {
         return ldArrayWord(2, o);
-      })(paramOffset) | parityTag);
+      })(index * sizeof(uint64_t)) | parityTag);
       if (nvlsIds) {
-        u64 idBase = predicated(pred, ld_global_nc_u64)(caddr + 24);
-        u32 idItembytes = predicated(pred, ld_global_nc_u32)(caddr + 32);
-        u32 idParamOffset = predicated(pred, ld_global_nc_u32)(caddr + 36);
+        u64 idBase = predicated(pred, ld_global_nc_u64)(caddr + offsetof(AddrSetup, idBase));
+        u32 idItembytes = predicated(pred, ld_global_nc_u32)(caddr + offsetof(AddrSetup, idItembytes));
+        u32 idParamOffset = predicated(pred, ld_global_nc_u32)(caddr + offsetof(AddrSetup, idParamOffset));
         u64 idAddr = idBase + widen(idItembytes * concurrencyIndex + slot + stride * blockIndex);
         predicated(pred, st_global_relaxed_sys_u64)(idAddr, predicated(pred, [&](const u32& o) {
           return ldArrayWord(3, o);
@@ -2133,14 +2213,19 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           st_shared_u32(nvlsFailedAddr, 0);
         }
       }
+      if (entryTablesStaged) {
+        profiling.enter("entry tables wait");
+        u32 phase = 0;
+        mbarrier_wait_parity_spin(entryBarrier, phase);
+      }
       profiling.enter("resolve addresses");
       FOR(u32 first = 0, first < numSlots, first += blockSize) {
         u32 i = first + threadIndex;
         Value valid = i < numSlots;
-        u64 setup = tables + pipeAddrSetupOffset + widen(i * sizeof(NodeSetup));
-        u32 slot = predicated(valid, ld_global_nc_u32)(setup);
-        u32 offsetLow = predicated(valid, ld_global_nc_u32)(setup + 4);
-        u32 offsetHigh = predicated(valid, ld_global_nc_u32)(setup + 8);
+        u32 setup = i * sizeof(NodeSetup) + pipeAddrSetupEntry;
+        u32 slot = predicated(valid, ldEntry32)(setup);
+        u32 offsetLow = predicated(valid, ldEntry32)(setup + 4);
+        u32 offsetHigh = predicated(valid, ldEntry32)(setup + 8);
         u64 addr = nodeaddrpred(valid, slot, offsetLow, offsetHigh);
         if (nvlsChecks) {
           // An NVLS slot (a local node's setup, slot = 8 * tensorIndex | 3): the node through the multicast address of
@@ -2185,19 +2270,18 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 idLocalBase = concurrency(nvlsIds->local) + widen(sizeof(uint64_t) * addrAddrsBlockStride * blockIndex);
         static_assert(sizeof(nvlsEdgeTable[0]) == 16);
         FOR(u32 e = warpIndex, e < (uint32_t)nvlsEdgeTable.size(), e += numWarps) {
-          u64 record = tables + nvlsEdgeTableOffset + widen(e * 16);
-          u32 firstSlot = ld_global_nc_u32(record);
-          u32 numNodes = ld_global_nc_u32(record + 4);
-          u32 nvlsSlot = ld_global_nc_u32(record + 8);
+          u32 record = e * 16 + nvlsEdgeTableEntry;
+          u32 firstSlot = ldEntry32(record);
+          u32 numNodes = ldEntry32(record + 4);
+          u32 nvlsSlot = ldEntry32(record + 8);
           u64 nvlsAddr = ld_u64(table + widen(nvlsSlot * 8));
-          u32 localSlot = ld_global_nc_u32(tables + pipeAddrSetupOffset + widen(nvlsSlot * sizeof(NodeSetup)));
+          u32 localSlot = ldEntry32(nvlsSlot * sizeof(NodeSetup) + pipeAddrSetupEntry);
           u64 identity = ldArrayWord(3, (localSlot & ~3u) * 2);
           Value ok = (nvlsAddr != 0) & (identity != 0);
           FOR(u32 d0 = 0, d0 < numNodes, d0 += 32) {
             u32 d = d0 + laneIndex;
             Value valid = d < numNodes;
-            u32 dslot = predicated(valid, ld_global_nc_u32)(
-                tables + pipeAddrSetupOffset + widen((firstSlot + d) * sizeof(NodeSetup)));
+            u32 dslot = predicated(valid, ldEntry32)((firstSlot + d) * sizeof(NodeSetup) + pipeAddrSetupEntry);
             Value remote = valid & ((dslot & 1) == 0);
             u64 idAddr = idLocalBase + widen(dslot);
             u64 published = predicated(remote, ld_global_relaxed_sys_u64)(idAddr);

@@ -400,7 +400,12 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   edge setups (flags, source, bytes, destinations, signals), node setups (tensor slot and offset), signal setups
   (`depFilled` slots to write when an edge is done) and the address exchange setups. The kernel loops over them at
   runtime, so its code size does not depend on the number of edges (they hold 32-bit sizes: compile_op makes no
-  edge larger than 1 GiB, see Phase 5).
+  edge larger than 1 GiB, see Phase 5). In kernels whose edges go through the item sequence (no waits, or waits for
+  relay edges only, see Scheduling), each block copies the node setups and the NVLS check's entries into shared
+  memory at its start (one TMA bulk copy, up to 16 KiB, into the start of its stage memory, which the copies only
+  load into after the entry), so that resolving the addresses and the NVLS check do not each wait for loads from L2
+  once the last peer has published its addresses: on 32 GB300, 0.2-0.6 us less per op (all-reduce, reduce-scatter
+  and all-gather of 4 KiB to 1 MiB).
 - **Scheduling**: a rank executes the edges whose executor it is. If no edge waits (all sources filled, no relay
   edges), every block first resolves the addresses of all edges into a table in shared memory (in global memory if
   it exceeds 32 KiB), and the pipelines of all blocks then take items from one sequence: an item is a chunk of an
@@ -458,7 +463,8 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   stores, warp 0 synchronizes (`bar.warp.sync`) before the next item, and the loop's block barriers are unaligned
   (`barrier.cta.sync`, which a diverged warp may reach, unlike `bar.sync`), as are those that follow a branch of
   thread 0 at the start and the end of every kernel: the ptxas of CUDA 13.0 can fail to reconverge a warp after a
-  branch of one thread (see Known issues).
+  branch of one thread (see Known issues). (At the start, the launch parity's barrier, a `bar.red`, follows the
+  branch of one thread that starts the copy of the entry's tables, see Tables, with a `bar.warp.sync` in between.)
 
   The blocks take the edges in the order of the graph: across domains, the key order of compile phase step 7, in
   which the items that other ranks wait for come ahead of the edges that use them, and in two phases the pieces
