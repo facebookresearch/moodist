@@ -1127,15 +1127,18 @@ Large sizes are bound by the GPUs' NVLink ingress, of which the switches' copy o
 1/32 in domains of 32 and 1/16 in domains of 16: there NVLS is 0.6-2.3% slower than unicast stores from 16 MiB on (as
 in domains emulated within one NVL72 domain with `MOODIST_FABRIC_CLIQUE`, and in a group that is one domain of 16, see
 above), where across domains of 32 it was faster at every size. (In the 14 domains, the unicast stores were slower
-than in the 16, 6.37 against 6.10 ms at 16 MiB and 25.3 against 24.3 ms at 64 MiB; the NVLS stores were not.) Under
-load it can gain more than alone, as it leaves the other SMs to the computation: in
-torchtitan (`llama3_8b`, FSDP2) on the 64 GPUs, a step took 510 ms instead of 521 with every rank reading the same
-data (NCCL with symmetric memory 515; two runs each); the all-gathers of the backward pass took 1.9 ms instead of 2.55
-on rank 0 (median), and its backward GEMMs 2-4 ms less in 3 of 4 profiled steps. With each rank's own data, where the
-ranks wait for the slowest, no difference beyond the noise (4 runs each, in two sessions on the same nodes: 577 and
-578 ms); moodist's FSDP2 step benchmark (`fsdp_step`), 22.6 instead of 23.0 ms with linear layers, 379.5 instead of 381.2
-with Llama-style ones. On the 256 GPUs (the same data), 504 ms instead of 507 (NCCL 513), rank 0's backward GEMMs 5
-ms less.
+than in the 16, 6.37 against 6.10 ms at 16 MiB and 25.3 against 24.3 ms at 64 MiB; the NVLS stores were not.) In
+groups that are one domain of 16 and one of 32, NVLS reaches the same rate, about 694 GB/s of what a GPU receives,
+echo included (all-gather of 256 MiB: 651 GB/s of data on 16 GPUs, 673 on 32), where unicast stores reach about 657
+on either; the window, the blocks and the chunk size of the NVLS kernel did not change that (16 GB300, November 2026),
+and the echo cannot be avoided (see NVLS under Known issues and TODO, Performance). Under load it can gain more than
+alone, as it leaves the other SMs to the computation: in torchtitan (`llama3_8b`, FSDP2) on the 64 GPUs, a step took
+510 ms instead of 521 with every rank reading the same data (NCCL with symmetric memory 515; two runs each); the
+all-gathers of the backward pass took 1.9 ms instead of 2.55 on rank 0 (median), and its backward GEMMs 2-4 ms less in
+3 of 4 profiled steps. With each rank's own data, where the ranks wait for the slowest, no difference beyond the noise
+(4 runs each, in two sessions on the same nodes: 577 and 578 ms); moodist's FSDP2 step benchmark (`fsdp_step`), 22.6
+instead of 23.0 ms with linear layers, 379.5 instead of 381.2 with Llama-style ones. On the 256 GPUs (the same data),
+504 ms instead of 507 (NCCL 513), rank 0's backward GEMMs 5 ms less.
 
 Reductions (`reduce="sum"`, `bfloat16`) on 32 GPUs in one NVL72 domain, against NCCL and moodist's process group
 collectives (which reach the other nodes over RDMA). Reduce-scatter: the size is each rank's output (its input is 32
@@ -1559,12 +1562,18 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   4 GPUs lost from 4M on, 8 and 12 are not measured; 16 ranks lose 1-2% from 64 MiB on, in domains of 16 across
   domains 0.6-2.3% from 16 MiB on) could be decided by timing the NVLS kernel against the unicast kernel (`tuneKernels`
   times the unicast kernel only), which needs tuning buffers from the communication pool. The switch delivers each
-  multicast chunk to its sender too: a multicast store reaches exactly the members of the object that have memory
-  bound at its offset (a member without, sender or receiver, is skipped, without an error; GB300, October 2026), so
-  one object per sender, bound by every rank but the sender, would skip it, the local copy then done by another block.
-  Further: destination sets smaller than the domain (which ranks bind a range decides who receives it), and ranks that
-  store different numbers of chunks (the window assumes the same: across domains, a domain whose ranks proxy
-  different numbers of pieces stores to each rank).
+  multicast chunk to its sender too, which no object can avoid: only a member of the object can map it and store to
+  it (a GPU not added gets CUDA_ERROR_ILLEGAL_STATE from `cuMemSetAccess`), and every member receives every store. A
+  member with no memory bound at the offset does not get the data, but it is not skipped silently either: each write
+  there raises a non-fatal NVLink error on that GPU (dmesg: Xid 145 "RLW_RXPIPE Nonfatal" and Xid 137 "RLW_RXPIPE
+  interrupt ... PRIV Error", tens of thousands per node), and the stores slow down. CUDA returns no error, so a probe
+  of October 2026 that checked only CUDA's took the skip for silent. An object per sender, bound by every rank but the
+  sender, was 29% slower than one object for all (all-gather on 16 GB300 in one domain, 256 MiB per rank: 7.98 ms
+  instead of 6.18), where an object per sender bound by every rank, or one in which the sender bound a scratch buffer
+  (the echo still delivered), took the same 6.18 ms as one object. Further: destination sets smaller than the domain,
+  which need objects whose members are exactly the destinations and the sender (binding only some members' memory
+  raises the errors above for the others), and ranks that store different numbers of chunks (the window assumes the
+  same: across domains, a domain whose ranks proxy different numbers of pieces stores to each rank).
 - NVLS reductions (see the kernel and the tables under Performance notes). Open: a reduce to one rank combines
   everything on the root, whose rate depends on its loads in flight, which its blocks limit (measured when they were
   at most the tuned grid: on 16 GPUs, 256 MiB took 1.82 ms with the tuned grid, 3.46 ms with 8 blocks, 1.30 ms with

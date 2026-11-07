@@ -598,7 +598,10 @@ void fence_release_gpu();
 void st_global_relaxed_sys_u32(const Value& addr, const Value& val);
 // The multimem instructions below: never under PRED. The ptxas of CUDA 13.0 (the JIT of driver 580) drops the
 // predicate of a predicated multimem.st or multimem.red (the instruction then always executes); under a branch (IF_D),
-// which it turns into a predicated instruction itself, they work.
+// which it turns into a predicated instruction itself, they work. Every member must have memory bound at the address
+// of a multimem write (and of a bulk store to a multicast address), the writer included, which receives its own
+// write too: at a member without, each write raises a non-fatal NVLink error on that GPU (dmesg Xid 137 / 145; CUDA
+// reports nothing), and the writes slow down; a multimem.ld_reduce there makes the reader's context fail.
 // addr is a multicast address: the add reaches every member's memory
 void multimem_red_relaxed_sys_add_u32(const Value& addr, const Value& val);
 // multimem.ld_reduce.relaxed.sys.global.<opType> at a multicast address: the values of every member's memory there,

@@ -1635,7 +1635,8 @@ struct NvlsBinder {
   size_t limit = 0; // the object's offsets that may be bound are below this
 };
 // The communication pool's slab listener: binds a piece of a slab at its logical offset. A failure is fatal: a slab
-// that is not bound would silently miss the multicast stores to it, and the ranks launch an op's NVLS kernel when its
+// that is not bound would miss the multicast stores to it (each raising a non-fatal NVLink error on that GPU, dmesg
+// Xid 137 / 145, and slowing the stores down; CUDA reports nothing), and the ranks launch an op's NVLS kernel when its
 // tensors are in the pool (see launchCustomOp in processgroup.cc), so a slab that some rank did not count as in the
 // pool (see allocatorCommPoolOffset) would have the ranks launch different kernels.
 bool nvlsBindSlab(void* ctx, size_t logicalOffset, unsigned long long handle, size_t memOffset, size_t size) {
