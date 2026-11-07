@@ -201,6 +201,14 @@ bool nvlsMulticastRuns(const Group* group, DType dtype, ReduceOp reduce, bool co
 // its ranks' NVLS reductions and of their edges with NVLS runs of sources, together) for it to use NVLS there (more
 // use the reduce loop alone)
 uint64_t nvlsReductionMaxBytes(DType dtype);
+// NVLS copies (multicast stores, see generateKernel in ptx_codegen.cc), within the NVLink domain of the edge's executor
+// rank (domain as above). Whether a copy edge has their shape: one source, and nodes one on each rank of the domain, at
+// the same tensor and offset on each: its destinations (e.g. an all-gather's edge from the executor's input), or its
+// source, on the executor, and its destinations (the edge of a proxy across domains, from the node that its relay edge
+// fills, see proxyRemoteEdges in compile_op.cc). And whether an op's copies could use them on this rank: its domain
+// (enough ranks, multicast support), not the edges.
+bool nvlsCopyShape(const Graph::Edge& e, std::span<const size_t> domain, size_t rank);
+bool nvlsCopiesPossible(const Group* group, bool collectiveOp);
 
 // The name of a reduce op, as compile_op takes it
 inline const char* reduceName(ReduceOp reduce) {

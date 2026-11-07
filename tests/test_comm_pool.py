@@ -1,11 +1,12 @@
 """
 Tests for moodist's communication pools (moodist.comm_empty, the process group's allocate_tensor): a buffer gets the
 same offset in the group's pool on every rank when all ranks allocate and free in the same order, whatever else they
-allocate; compile_op ops store to such buffers with NVLink multicast (NVLS) where the group supports it (at least 16
-ranks in one NVLink domain), and to each rank otherwise.
+allocate; compile_op ops store to such buffers with NVLink multicast (NVLS) where the group supports it (NVLink domains
+of at least 16 ranks; an all-gather across domains stores to each domain with multicast stores too), and to each rank
+otherwise.
 
 Set MOODIST_TEST_EXPECT_NVLS=1 when the group's NVLink domains support NVLS, to also check that the launches use it
-(copies with 16 ranks or more, in a group that is one domain).
+(copies in domains of 16 ranks or more, all of the same size).
 """
 
 import os
@@ -20,12 +21,20 @@ moodist.enable_cuda_allocator()
 EXPECT_NVLS = os.environ.get("MOODIST_TEST_EXPECT_NVLS") == "1"
 
 
-def expect_nvls(ctx, pg):
-    """Whether the all-gathers must use NVLS (copies use it from 16 ranks on, in a group that is one NVLink domain)."""
+def nvlink_domains(pg, ctx):
+    """Every rank's NVLink domain (its first rank), as a list per rank. (A collective: the process group's all-gather,
+    which may use NVLS too, so not between two reads of nvls_launches.)"""
+    return [row[0] for row in gather_ints(pg, ctx, [pg._get_option("nvlink_domain")])]
+
+
+def expect_nvls(ctx, pg, domains=None):
+    """Whether the all-gathers must use NVLS: copies use it in NVLink domains of 16 ranks or more, across domains too
+    if every rank of a domain stores as many chunks (domains of the same size, whose proxies each read the same)."""
     if not EXPECT_NVLS or ctx.world_size < 16:
         return False
-    domains = [row[0] for row in gather_ints(pg, ctx, [pg._get_option("nvlink_domain")])]
-    return len(set(domains)) == 1
+    domains = domains if domains is not None else nvlink_domains(pg, ctx)
+    sizes = [domains.count(d) for d in set(domains)]
+    return min(sizes) >= 16 and len(set(sizes)) == 1
 
 
 def gather_ints(pg, ctx, values):
@@ -147,12 +156,15 @@ def test_comm_pool_allgather(ctx: TestContext):
 
 @test
 def test_comm_pool_allgather_mismatch(ctx: TestContext):
-    """One rank's output is not in the pool: every rank stores to each destination (no NVLS), correctly; then all
-    ranks in the pool again: NVLS (where supported)."""
+    """One rank's output is not in the pool: every rank of its NVLink domain stores to each destination (no NVLS),
+    correctly, while the other domains still use NVLS (where supported); then all ranks in the pool again: NVLS."""
     if ctx.world_size < 2:
         return
     torch.cuda.set_device(ctx.local_rank)
     pg = create_process_group(ctx)
+    domains = nvlink_domains(pg, ctx)
+    # (the ranks that share the NVLink domain of the rank whose output is elsewhere)
+    mismatched = domains[ctx.rank] == domains[ctx.world_size - 1]
     numel = 1 << 18
     op = allgather_op(pg, ctx, numel)
     inp = torch.empty(numel, device="cuda", dtype=torch.float32)
@@ -169,7 +181,12 @@ def test_comm_pool_allgather_mismatch(ctx: TestContext):
         ctx.assert_true(bool((out == expected_allgather(ctx, numel, it)).all()), f"mismatch iteration {it}")
         del out, comm
     torch.cuda.synchronize()
-    ctx.assert_true(pg._get_option("nvls_launches") == launches0, "a launch used NVLS with one output not in the pool")
+    used = pg._get_option("nvls_launches") - launches0
+    if mismatched:
+        ctx.assert_true(used == 0, f"{used} launches used NVLS with one output of the NVLink domain not in the pool")
+    elif expect_nvls(ctx, pg, domains):
+        ctx.assert_true(used == 4, f"{used} of 4 launches used NVLS in a domain whose outputs are all in the pool")
+    launches0 = pg._get_option("nvls_launches")
     for it in range(4):
         out = moodist.comm_empty(numel * ctx.world_size, dtype=torch.float32, group=pg)
         inp.fill_(ctx.rank * 1000 + 10 + it)
@@ -177,9 +194,74 @@ def test_comm_pool_allgather_mismatch(ctx: TestContext):
         ctx.assert_true(bool((out == expected_allgather(ctx, numel, 10 + it)).all()), f"iteration {it}")
         del out
     torch.cuda.synchronize()
-    if expect_nvls(ctx, pg):
-        used = pg._get_option("nvls_launches") - launches0
+    used = pg._get_option("nvls_launches") - launches0
+    if expect_nvls(ctx, pg, domains):
         ctx.assert_true(used == 4, f"{used} of 4 launches used NVLS")
+
+
+@test
+def test_comm_pool_allgather_sizes(ctx: TestContext):
+    """All-gathers into comm buffers, out of place and in place (the input a view of the output): of 9 MiB per rank,
+    whose transfers across NVLink domains are split into chunks (from 8 MiB, see proxyRemoteEdges in compile_op.cc),
+    and of 1 MiB + 16 bytes per rank (a last NVLS chunk of 16 bytes); with NVLS where the group supports it."""
+    if ctx.world_size < 2:
+        return
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    for numel in [(9 << 20) // 4, (1 << 18) + 4]:
+        op = allgather_op(pg, ctx, numel)
+        inp = torch.empty(numel, device="cuda", dtype=torch.float32)
+        launches0 = pg._get_option("nvls_launches")
+        iterations = 4
+        for it in range(iterations):
+            out = moodist.comm_empty(numel * ctx.world_size, dtype=torch.float32, group=pg)
+            out.fill_(-1)
+            in_place = it % 2 == 1
+            src = out[ctx.rank * numel : (ctx.rank + 1) * numel] if in_place else inp
+            src.fill_(ctx.rank * 1000 + it)
+            op([src], [out]).wait()
+            ok = bool((out == expected_allgather(ctx, numel, it)).all())
+            ctx.assert_true(ok, f"numel {numel} iteration {it} (in place: {in_place}): wrong result")
+            del out, src
+        torch.cuda.synchronize()
+        used = pg._get_option("nvls_launches") - launches0
+        if expect_nvls(ctx, pg):
+            ctx.assert_true(used == iterations, f"numel {numel}: {used} of {iterations} launches used NVLS")
+
+
+@test
+def test_comm_pool_broadcast(ctx: TestContext):
+    """The process group's broadcast of comm buffers, from the first and the last rank: correct; across NVLink domains,
+    the proxy that reads the tensor in each domain but the root's stores it to the other ranks of its domain with NVLS
+    (where supported; the ranks with nothing to store do not count launches, so per domain, the most launches of one of
+    its ranks)."""
+    if ctx.world_size < 2:
+        return
+    torch.cuda.set_device(ctx.local_rank)
+    pg = create_process_group(ctx)
+    domains = nvlink_domains(pg, ctx)
+    check_nvls = expect_nvls(ctx, pg, domains) and len(set(domains)) > 1
+    for root in sorted({0, ctx.world_size - 1}):
+        for numel in [1 << 14, (9 << 20) // 4]:
+            t = moodist.comm_empty(numel, dtype=torch.float32, group=pg)
+            launches0 = pg._get_option("nvls_launches")
+            iterations = 4
+            for it in range(iterations):
+                t.fill_(root * 1000 + it if ctx.rank == root else -1)
+                pg.broadcast(t, root).wait()
+                ok = bool((t == root * 1000 + it).all())
+                ctx.assert_true(ok, f"root {root} numel {numel} iteration {it}: wrong result")
+            torch.cuda.synchronize()
+            used = pg._get_option("nvls_launches") - launches0
+            del t
+            if check_nvls:
+                rows = gather_ints(pg, ctx, [used])
+                for d in sorted(set(domains) - {domains[root]}):
+                    most = max(rows[r][0] for r in range(ctx.world_size) if domains[r] == d)
+                    ctx.assert_true(
+                        most == iterations,
+                        f"root {root} numel {numel}: {most} of {iterations} launches used NVLS in the domain of rank {d}",
+                    )
 
 
 @test

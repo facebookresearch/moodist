@@ -4596,6 +4596,33 @@ struct CompileOpConstructor {
             name);
       }
     }
+    // Copies across NVLink domains: the multicast objects of every domain (Group::setupNvls, as for reductions above),
+    // if an edge that some rank executes in one of the graphs could store with NVLS (nvlsCopyShape: in the multicast
+    // graph, an all-gather's edge from a rank's input to its domain, and its proxies' edges). (In a group that is one
+    // domain, generateKernel sets them up, where all ranks decide together.)
+    if (!isReduction(reduce) && !ctx.collectiveOp && group->fabricDomainRanks.size() != size) {
+      const std::span<const size_t> domain(group->fabricDomainRanks.data(), group->fabricDomainRanks.size());
+      bool nvlsAny = false;
+      if (nvlsCopiesPossible(group, ctx.collectiveOp)) {
+        for (const Graph& g : graphs) {
+          for (const Edge& e : g.cudaEdges) {
+            nvlsAny |= e.executorRank == rank && nvlsCopyShape(e, domain, rank);
+          }
+        }
+      }
+      for (size_t i : range(size)) {
+        ctx.send(i, nvlsAny);
+      }
+      bool nvlsAnywhere = false;
+      for (size_t i : range(size)) {
+        bool a;
+        ctx.receive(i, a);
+        nvlsAnywhere |= a;
+      }
+      if (nvlsAnywhere) {
+        ctx.group->setupNvls();
+      }
+    }
 
     // Final barrier
     ctx.barrier();

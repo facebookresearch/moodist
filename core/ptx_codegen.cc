@@ -92,6 +92,8 @@ bool nvlsDomainNodes(std::span<const compile_op::Graph::Node> nodes, std::span<c
   }
   return true;
 }
+// NVLS copies (multicast stores, see generateKernel) from this many ranks of a domain
+static constexpr size_t nvlsMinRanks = 16;
 // NVLS reductions (see generateKernel) from this many ranks of a domain, those with a destination on every rank of it
 // (multicast stores, an all-reduce's) from nvlsReduceMinRanks, those with one destination (a reduce-scatter's, a
 // reduce to one rank's) from nvlsReduceLocalMinRanks: with one destination, each GPU sends its whole input into the
@@ -103,12 +105,12 @@ static constexpr size_t nvlsReduceMinRanks = 8;
 static constexpr size_t nvlsReduceLocalMinRanks = 12;
 // NVLS runs of destinations alone (see nvlsReductionRuns: the multicast stores of an edge whose sources are not a run,
 // e.g. an all-reduce's results across NVLink domains) from this many ranks, as copies with multicast stores (see
-// nvlsMinRanks in generateKernel): across 2 domains of 8 GB300, an all-reduce of 256 MiB took 874 us with them, 772
+// nvlsMinRanks above): across 2 domains of 8 GB300, an all-reduce of 256 MiB took 874 us with them, 772
 // us without (the switches also send each chunk back to its sender, 1/8 of a GPU's ingress)
 static constexpr size_t nvlsStoreMinRanks = 16;
 // (smaller domains get no multicast objects, see Group::setupNvls)
-static_assert(nvlsReduceMinRanks >= Group::Nvls::minDomainRanks && nvlsReduceLocalMinRanks >= nvlsReduceMinRanks &&
-              nvlsStoreMinRanks >= nvlsReduceMinRanks);
+static_assert(nvlsMinRanks >= Group::Nvls::minDomainRanks && nvlsReduceMinRanks >= Group::Nvls::minDomainRanks &&
+              nvlsReduceLocalMinRanks >= nvlsReduceMinRanks && nvlsStoreMinRanks >= nvlsReduceMinRanks);
 // The multimem.ld_reduce of a 16-byte vector of a dtype for a reduce op: perVector instructions of op (the forms of the
 // integers and of float64 have no vectors: 4 or 8 bytes each, into 64-bit registers if wide), or none. No min / max of
 // floating point types: multimem.ld_reduce has none for float32 and float64, and those of float16 and bfloat16 return
@@ -265,6 +267,26 @@ std::span<const compile_op::Graph::Node> firstNodes(const Vector<compile_op::Gra
   return std::span<const compile_op::Graph::Node>(nodes.data(), std::min(n, nodes.size()));
 }
 } // namespace
+
+bool compile_op::nvlsCopyShape(const Graph::Edge& e, std::span<const size_t> domain, size_t rank) {
+  if (e.sources.size() != 1 || e.hasSignals()) {
+    return false;
+  }
+  if (nvlsDomainNodes(firstNodes(e.destinations, e.destinations.size()), domain)) {
+    return true;
+  }
+  // (a proxy's edge: its source and its destinations)
+  if (e.sources[0].rank != rank || e.destinations.size() + 1 != domain.size()) {
+    return false;
+  }
+  Vector<Graph::Node> nodes = e.destinations;
+  nodes.push_back(e.sources[0]);
+  return nvlsDomainNodes(firstNodes(nodes, nodes.size()), domain);
+}
+
+bool compile_op::nvlsCopiesPossible(const Group* group, bool collectiveOp) {
+  return nvlsDomainCapable(group, collectiveOp, nvlsMinRanks);
+}
 
 bool compile_op::nvlsReductionShape(const Graph::Edge& e, std::span<const size_t> domain) {
   if (domain.size() < 2 || e.hasSignals() || e.partialSources != 0 ||
@@ -1062,28 +1084,31 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     };
 
     // ---- NVLS (NVLink SHARP multicast) ----
-    // An edge to every rank of the group, at the same tensor and offset on each (an all-gather's), can store each
-    // chunk once, to the group's multicast mapping of that offset (see Group::Nvls), which the NVLink switches copy
-    // to every GPU, instead of once per destination. One SM then reaches the GPUs' NVLink ingress, where unicast
-    // stores need 12-16 (all-gather on 32 GB300: 1M 62 vs 73 us, 4M 208 vs 239, 256M 12.4 vs 12.7 ms). It needs the
-    // destination tensors at the same place of one of the group's multicast objects on every rank (at the same
-    // offset of every rank's pool, or of the group's communication pool), which every launch checks with the NVLS
-    // identities the peers publish (see the address table below); otherwise the launch stores to each destination as
-    // usual. A rank uses NVLS if every edge it executes is such an edge, every rank
-    // that does stores the same number of chunks (see the step counter below), and the group has at least
-    // nvlsMinRanks ranks, all in one NVLink domain: within one node (4 GPUs), multicast stores were slower from 4M
-    // on (the switch also sends each chunk back to the sender, 1/4 of a GPU's ingress; 1/32 on 32 GPUs).
+    // An edge to every rank of this rank's NVLink domain (the group's ranks in it), at the same tensor and offset on
+    // each (an all-gather's), can store each chunk once, to the domain's multicast mapping of that offset (see
+    // Group::Nvls), which the NVLink switches copy to every GPU of the domain, instead of once per destination. One SM
+    // then reaches the GPUs' NVLink ingress, where unicast stores need 12-16 (all-gather on 32 GB300: 1M 62 vs 73 us,
+    // 4M 208 vs 239, 256M 12.4 vs 12.7 ms). So can the edge of a proxy across domains (see proxyRemoteEdges in
+    // compile_op.cc), from the proxy's node, which its relay edge fills, to every other rank of the domain: its
+    // multicast store also rewrites that node, with the bytes it holds (all-gather across 2 domains of 32 GB300, per
+    // rank: 1M 117 vs 140 us, 16M 1.56 vs 1.63 ms, 256M 24.8 vs 25.3 ms; on 256 GB300 in 14 domains, 12 of 16 GPUs
+    // whose ranks proxy 15 pieces each: 1M 500 vs 536 us, 16M 6.20 vs 6.37 ms, 64M 24.9 vs 25.3 ms). NVLS needs the
+    // nodes at the same place of one of the domain's multicast objects on every rank (at the same offset of every
+    // rank's pool, or of the group's communication pool), which every launch checks with the NVLS identities the peers
+    // publish (see the address table below); otherwise the launch stores to each destination as usual. A rank uses
+    // NVLS if every edge it executes is such an edge (see nvlsStoreNode; relay edges aside), every rank of the domain
+    // that does stores the same number of chunks (see the step counter below), and the domain has at least
+    // nvlsMinRanks ranks: within one node (4 GPUs), multicast stores were slower from 4M on (the switch also sends each
+    // chunk back to the sender, 1/4 of a GPU's ingress; 1/32 on 32 GPUs).
     //
     // Step counter: multicast stores from all ranks at full speed overload the switches' links to the GPUs (more
     // than their ingress arrives), which then deliver about 2/3 of their bandwidth (all-gather of 256M on 32 GPUs:
-    // 17-19 ms instead of 12.3). So the ranks advance in step: once the stores of a chunk have completed, a rank adds
-    // 1 to the op's step counter through its multicast address (one multimem.red reaches every GPU), and it stores
-    // its chunk c only once its local copy of the counter shows that every rank has completed its chunks up to
-    // c - nvlsWindow. This bounds the data in flight to what the links deliver, without a clock (pacing the stores
-    // by time worked too, but needs the rate). The counter of each concurrency slot only grows: launchCustomOp passes
-    // its value before the launch (launches times nvlsIncrement).
-    static constexpr size_t nvlsMinRanks = 16;
-    static_assert(nvlsMinRanks >= Group::Nvls::minDomainRanks);
+    // 17-19 ms instead of 12.3). So the ranks of a domain advance in step: once the stores of a chunk have completed, a
+    // rank adds 1 to the op's step counter through its multicast address (one multimem.red reaches every GPU of the
+    // domain), and it stores its chunk c only once its local copy of the counter shows that every rank has completed
+    // its chunks up to c - nvlsWindow. This bounds the data in flight to what the links deliver, without a clock
+    // (pacing the stores by time worked too, but needs the rate). The counter of each concurrency slot only grows:
+    // launchCustomOp passes its value before the launch (launches times nvlsIncrement).
     static constexpr uint32_t nvlsSignalLag = 1; // a chunk is signaled once the stores of the one after it are issued
     static constexpr size_t nvlsCountersStride = 64; // bytes per counter (one per concurrency slot)
     // With NVLS, a pipeline stores chunks of nvlsChunkSize through its own ring over the same stage memory (up to
@@ -1095,26 +1120,21 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     static constexpr uint32_t nvlsStoreLag = 1;
     static_assert(std::tuple_size_v<decltype(KernelHandle::nvlsLaunches)> == maxConcurrency);
 
-    // The local destination of an edge that can store with NVLS (if every rank's pool holds its destination at the
-    // same offset), else nullptr
-    auto nvlsLocalDestination = [&](const Edge& e) -> const Node* {
-      if (e.sources.size() != 1 || !e.sources[0].filled || e.destinations.size() != group->size || hasDependents(e)) {
+    // The node through whose multicast address an edge can store with NVLS (if every rank's pool holds its nodes at
+    // the same offset), else nullptr: with nodes one on each rank of the domain (nvlsCopyShape), its local destination,
+    // or, for a proxy's edge, its source. The source is filled: an input, or this rank's node that a relay edge of
+    // this rank fills (relayItems; the copy waits for its signal); no other edge reads a destination.
+    const std::span<const size_t> domain(ctx.group->fabricDomainRanks.data(), ctx.group->fabricDomainRanks.size());
+    auto nvlsStoreNode = [&](const Edge& e) -> const Node* {
+      if (!compile_op::nvlsCopyShape(e, domain, rank) || hasDependents(e)) {
         return nullptr;
       }
-      Vector<uint8_t> seen(group->size);
-      const Node* local = nullptr;
-      for (const Node& n : e.destinations) {
-        const Node& first = e.destinations[0];
-        if (n.rank >= group->size || seen[n.rank] || n.tensorIndex != first.tensorIndex || n.offset != first.offset ||
-            n.device != DeviceType::CUDA) {
-          return nullptr;
-        }
-        seen[n.rank] = 1;
-        if (n.rank == rank) {
-          local = &n;
-        }
+      const Node& source = e.sources[0];
+      if (!source.filled && !(relayItems && relaySignal.contains(source.id))) {
+        return nullptr;
       }
-      return local;
+      auto it = std::ranges::find(e.destinations, (uint32_t)rank, &Node::rank);
+      return it != e.destinations.end() ? &*it : &source;
     };
 
     // NVLS reductions: a reduction with a source on every rank of the executor's NVLink domain (the group's ranks in
@@ -1165,24 +1185,29 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     uint32_t nvlsReduceBlocks = 0;
     bool nvlsRunsLocal = false;
     bool nvlsRunLoop = false;
-    const std::span<const size_t> domain(ctx.group->fabricDomainRanks.data(), ctx.group->fabricDomainRanks.size());
     if (!tuning) {
       Group* g = ctx.group;
       const bool reduction = compile_op::isReduction(graph.reduce);
       // The ranks of an op's kernels that exchange with each other decide together (see the exchange below): those of
       // one domain, if each has exactly the domain's ranks as its peers (ranks), as it does in reductions where a run
-      // (or a reduction of nvlsReduceLoop) touches every rank of the domain. Copies use NVLS only in a group that is
-      // one domain.
+      // (or a reduction of nvlsReduceLoop) touches every rank of the domain, and in copies where an edge does (an
+      // all-gather's, across domains too: its proxies' edges, while the RDMA reads are not the kernel's).
       const bool peersAreDomain = std::ranges::equal(ranks, domain);
+      // (a group of several domains has the multicast objects only once compile has set them up, see below)
+      const bool oneDomain = domain.size() == g->size;
       const bool capable =
           peersAreDomain &&
           (reduction ? !graph.tensors.empty() &&
                            compile_op::nvlsReductionsPossible(g, graph.tensors[0].dtype, graph.reduce, ctx.collectiveOp)
-                     : nvlsDomainCapable(g, ctx.collectiveOp, nvlsMinRanks) && domain.size() == g->size);
+                     : compile_op::nvlsCopiesPossible(g, ctx.collectiveOp) && (oneDomain || g->nvls.state == 1));
       uint64_t chunks = 0;
-      bool all = capable && !reduction && nowaits && !localCopies.empty();
+      bool all = capable && !reduction && (nowaits || relayItems) && !localCopies.empty();
       for (const Edge& e : localCopies) {
-        all &= nvlsLocalDestination(e) != nullptr;
+        if (e.sources.empty()) {
+          // (a relay edge: copies nothing)
+          continue;
+        }
+        all &= nvlsStoreNode(e) != nullptr;
         chunks += (e.bytes + nvlsChunkSize - 1) / nvlsChunkSize;
       }
       uint32_t myChunks = all && chunks < (1u << 30) ? (uint32_t)chunks : 0;
@@ -1245,13 +1270,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
       // A rank whose peers are not its domain's ranks says so (capable is false): every rank that has it among its
       // peers hears it, and so does every other rank of the domain (whose peers are the domain's ranks, if capable),
-      // so they all agree. setupNvls is collective over the group: copies call it here (the group is one domain, all
-      // of ranks), reductions in compile (compile_op.cc, where every rank takes part), and use its result here.
+      // so they all agree. setupNvls is collective over the group: copies in a group that is one domain call it here
+      // (all of ranks), reductions and copies in groups of several domains in compile (compile_op.cc, where every rank
+      // takes part), and use its result here.
       nvlsOp = allCapable && (copies || reduceBytesTotal > 0 || runBytesTotal > 0) &&
-               (reduction ? g->nvls.state == 1 : g->setupNvls());
+               (reduction || !oneDomain ? g->nvls.state == 1 : g->setupNvls());
       if (nvlsOp && copies && g->nvls.nextCounters + nvlsCountersStride * maxConcurrency > Group::Nvls::countersBytes) {
-        if (rank == 0) {
-          log.error("moodist: compile_op: no NVLS step counters left for more ops; this op does not use NVLS\n");
+        if (rank == domain[0]) {
+          log.error(
+              "moodist: compile_op: no NVLS step counters left for more ops in the NVLink domain of rank %d; this "
+              "op does not use NVLS there\n",
+              rank);
         }
         nvlsOp = false;
       }
@@ -1306,9 +1335,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         // window must be larger than all of them (8: see the results above)
         nvlsWindow = std::max<uint32_t>(8, config.pipelines * nvlsSignalLag + 1);
         rv->nvlsIncrement = nvlsSenders * sendersChunks;
-        if (rank == 0) {
-          log.info("compile_op: NVLS: %d ranks store %d chunks of %d bytes each with multicast stores\n", nvlsSenders,
-              sendersChunks, nvlsChunkSize);
+        if (rank == domain[0]) {
+          log.info("compile_op: NVLS: %d ranks of the NVLink domain of rank %d store %d chunks of %d bytes each with "
+                   "multicast stores\n",
+              nvlsSenders, rank, sendersChunks, nvlsChunkSize);
         }
       }
     }
@@ -1475,12 +1505,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     // are cheap). Per edge: the index of its first item in the sequence, the destination groups (item i of the edge
     // covers chunk i / groups and destination group i % groups), and the slots of its addresses in the address table
     // that every block resolves at the start (its sources (one, except in reductions), then its destinations, then with
-    // NVLS the NVLS slot: the multicast address of the local destination, or 0 if the launch stores to each
-    // destination; with NVLS reductions, the NVLS slots of the local source and, with multicast stores, of the local
-    // destination). A last record (firstItem = the number of items) ends the sequence. With NVLS, the chunks of all
-    // edges also form one sequence (nvlsFirst: the index of an edge's first chunk), which a launch that uses NVLS
-    // stores instead; with NVLS reductions, and edges with NVLS runs in nvlsReduceLoop (nvlsRunLoop), so do their
-    // items of nvlsReduceItemBytes. The reduce loop takes whole chunks (one destination group).
+    // NVLS the NVLS slot: the multicast address of the local destination (of a proxy's edge: its source), or 0 if the
+    // launch stores to each destination; with NVLS reductions, the NVLS slots of the local source and, with multicast
+    // stores, of the local destination). A last record (firstItem = the number of items) ends the sequence. With NVLS,
+    // the chunks of all edges also form one sequence (nvlsFirst: the index of an edge's first chunk), which a launch
+    // that uses NVLS stores instead; with NVLS reductions, and edges with NVLS runs in nvlsReduceLoop (nvlsRunLoop), so
+    // do their items of nvlsReduceItemBytes. The reduce loop takes whole chunks (one destination group).
     const uint32_t chunkSize = config.chunkSize;
     const uint32_t numPipelines = config.pipelines;
     const uint32_t numClaimers = numBlocks * numPipelines;
@@ -1521,8 +1551,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     uint32_t pipeNumItems = 0;
     uint32_t pipeNoWaitItems = 0; // (with relayItems: the items of the edges that wait for no relay, which come first)
     // The nodes that the check of every launch compares with an NVLS slot (see below): the first node's address slot,
-    // the number of nodes and the NVLS slot (a destination's for the destinations of copies, the source's for the
-    // sources of reductions, the destination's for their destinations with multicast stores)
+    // the number of nodes and the NVLS slot (that of nvlsStoreNode for the destinations of copies, the source's for
+    // the sources of reductions, the destination's for their destinations with multicast stores)
     std::vector<std::array<uint32_t, 4>> nvlsEdgeTable;
     uint32_t nvlsChunksTotal = 0;
     uint32_t nvlsReduceItems = 0;
@@ -1557,14 +1587,14 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         const uint64_t groups = reduceKernel ? 1 : std::min<uint64_t>(groupsWanted, numDestinations);
         p.groupSize = (numDestinations + groups - 1) / groups;
         p.groups = (numDestinations + p.groupSize - 1) / p.groupSize;
-        const Node* nvlsDestination = nvlsLocal ? nvlsLocalDestination(e) : nullptr;
-        CHECK(nvlsDestination || !nvlsLocal);
+        const Node* nvlsNode = nvlsLocal ? nvlsStoreNode(e) : nullptr;
+        CHECK(nvlsNode || !nvlsLocal);
         p.firstItem = pipeNumItems;
         p.numItems = numChunks * p.groups;
         p.bytes = e.bytes;
         p.addrSlot = pipeAddrSetups.size();
         p.numDestinations = numDestinations;
-        p.flags = s.flags | (nvlsDestination ? edgeNvls : 0);
+        p.flags = s.flags | (nvlsNode ? edgeNvls : 0);
         p.signals = s.signals;
         p.numSignals = s.numSignals;
         p.nvlsFirst = nvlsChunksTotal;
@@ -1612,9 +1642,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         for (const Node& n : e.destinations) {
           pipeAddrSetups.push_back(nodeSetup(n));
         }
-        if (nvlsDestination) {
-          // The NVLS slot: the local destination's setup, marked by bit 1 (see the address table below)
-          NodeSetup m = nodeSetup(*nvlsDestination);
+        if (nvlsNode) {
+          // The NVLS slot: the setup of the local node that NVLS stores through (the local destination; a proxy's
+          // source), marked by bit 1 (see the address table below). The check compares the destinations with it.
+          NodeSetup m = nodeSetup(*nvlsNode);
           m.slot |= 2;
           pipeAddrSetups.push_back(m);
           nvlsEdgeTable.push_back({p.addrSlot + 1, numDestinations, p.addrSlot + 1 + numDestinations, 0});
@@ -2330,6 +2361,36 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         nvlsCounterLocal = slotOffset + (int64_t)(groupNvls.countersLocal + nvlsCountersOffset);
       }
 
+      // With relayItems: whether the relay signal of the edge at `record` (with edgeRelayWait, PipeEdge::waits) has
+      // arrived, into r: a word per NIC, all of which get the step value (see writeRdmaSignal in cputhread.cc).
+      // Blocking: wait for it. Once it has, the fences after which bulk loads can read the relayed data.
+      auto relayArrived = [&](const u64& record, bool blocking, Value& r) {
+        u32 signal = ld_global_nc_u32(record + offsetof(PipeEdge, waits));
+        u64 flag = concurrency(group->rdmaSignalBuffer) + widen(signal * Group::rdmaSignalBytes);
+        static_assert(Group::rdmaSignalBytes == 16 && maxDevices == 4);
+        auto load = [&]() {
+          std::array<Value, 4> words;
+          ld_global_relaxed_sys_v4_u32(words, flag);
+          return min_u32(min_u32(words[0], words[1]), min_u32(words[2], words[3]));
+        };
+        u32 value = load();
+        if (blocking) {
+          IF(value < stepValue) {
+            profiling.enter("relay wait");
+            WHILE(value < stepValue) {
+              value = load();
+            }
+            profiling.leave();
+          }
+        }
+        r = value >= stepValue;
+        IF(r) {
+          // The data arrived before the signal; the loads are bulk copies
+          fence_acquire_sys();
+          fence_proxy_async_global();
+        }
+      };
+
       // Without NVLS: the pipelines of all blocks take items (see above). With NVLS edges, a launch that does not
       // use NVLS adds the chunks to the op's step counter at the end, so that its value stays the same for every
       // launch (ranks whose launch uses NVLS may wait for them).
@@ -2391,39 +2452,16 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             }
           };
           // With relayItems: whether `item` (taken, not loaded) can be loaded: unless its edge's source is filled by a
-          // relay edge's RDMA read, whose signal has not arrived yet (a word per NIC, all of which get the step value,
-          // see writeRdmaSignal in cputhread.cc). Blocking: wait for it. (The tuning launches run without the CPU
-          // thread, and do not wait.)
+          // relay edge's RDMA read, whose signal has not arrived yet (see relayArrived). Blocking: wait for it. (The
+          // tuning launches run without the CPU thread, and do not wait.)
           auto ready = [&](bool blocking) {
             Value r(ValType::Pred);
             r = 1;
             if (relayWaits) {
               advance();
               IF(waitPending) {
-                u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
-                u32 signal = ld_global_nc_u32(record + offsetof(PipeEdge, waits));
-                u64 flag = concurrency(group->rdmaSignalBuffer) + widen(signal * Group::rdmaSignalBytes);
-                static_assert(Group::rdmaSignalBytes == 16 && maxDevices == 4);
-                auto load = [&]() {
-                  std::array<Value, 4> words;
-                  ld_global_relaxed_sys_v4_u32(words, flag);
-                  return min_u32(min_u32(words[0], words[1]), min_u32(words[2], words[3]));
-                };
-                u32 value = load();
-                if (blocking) {
-                  IF(value < stepValue) {
-                    profiling.enter("relay wait");
-                    WHILE(value < stepValue) {
-                      value = load();
-                    }
-                    profiling.leave();
-                  }
-                }
-                r = value >= stepValue;
+                relayArrived(pipeEdgeTable + widen(edge * sizeof(PipeEdge)), blocking, r);
                 IF(r) {
-                  // The data arrived before the signal; the loads are bulk copies
-                  fence_acquire_sys();
-                  fence_proxy_async_global();
                   waitPending = 0;
                 }
               }
@@ -2466,8 +2504,8 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             // items it has loaded meanwhile, and waits for the signal only once it has none left. It loads an item
             // into a stage that no item has used, or, once the stores of all but the last storeLag items stored have
             // read their stages, while fewer than numStages - storeLag loads are ahead of the stores: one per store
-            // as below, more after a wait.
-            CHECK(!anySignals && !nvlsLocal);
+            // as below, more after a wait. (With NVLS edges, a launch that does not use NVLS: see nvlsLoaded.)
+            CHECK(!anySignals);
             WHILE(!exhausted & (loaded < numStages)) {
               IF(take()) {
                 IF(!ready(false)) {
@@ -2583,7 +2621,12 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       // With NVLS: the pipelines of block 0 store the chunks of the NVLS sequence (see PipeEdge), pipeline p chunks
       // p, p + numPipelines, ..., one store each, to the NVLS slot of the chunk's edge, in step with the other ranks
       // (see the step counter above: before storing chunk c, wait until the counter is at least its value before the
-      // launch plus nvlsSenders * (c + 1 - nvlsWindow); once a chunk's stores have completed, add 1 to it).
+      // launch plus nvlsSenders * (c + 1 - nvlsWindow); once a chunk's stores have completed, add 1 to it). With
+      // relayItems, a chunk of an edge whose source a relay edge fills (a proxy's edge across NVLink domains, see
+      // proxyRemoteEdges in compile_op.cc) is loaded once the relay's signal has arrived, as in the copy loop: the
+      // pipeline stores the chunks it has loaded meanwhile, and waits for the signal once it has none left. The edges
+      // without waits come first (the NVLS sequence is in the order of localCopies), and the CPU thread issues the
+      // reads at the start of the op, in signal order: they have normally arrived by then.
       auto nvlsCopy = [&]() {
         profiling.enter("nvls copy");
         // The loads below may read data whose readiness generic loads have observed
@@ -2591,19 +2634,36 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
         u64 pipeEdgeTable = tables + pipeEdgeTableOffset;
         u32 counterBase = loadParamField(params, 8, ValType::U32);
         u32 chunk = warpIndex; // the next chunk this pipeline loads
-        // The edge of the last chunk loaded, and the first chunk of the edge after it
+        // The edge of the last chunk loaded (or of the next one, once ready has advanced to it), and the first chunk
+        // of the edge after it
         u32 edge = 0;
         u32 nextFirst = ld_global_nc_u32(pipeEdgeTable + sizeof(PipeEdge) + offsetof(PipeEdge, nvlsFirst));
         u32 loaded = 0;
         u32 stored = 0;
         u32 signaled = 0;
-        auto loadChunk = [&]() {
-          // Chunks only increase: advance to the chunk's edge
+        // With relayItems: whether edge `edge` waits for a relay signal that this pipeline has not seen arrive yet (as
+        // in the copy loop; NVLS kernels are not tuning kernels)
+        Value waitPending(ValType::Pred);
+        auto edgeWaits = [&]() {
+          u32 flags = ld_global_nc_u32(pipeEdgeTable + widen(edge * sizeof(PipeEdge)) + offsetof(PipeEdge, flags));
+          return (flags & edgeRelayWait) != 0;
+        };
+        if (relayItems) {
+          waitPending = edgeWaits();
+        }
+        // Chunks only increase: advance to the edge of `chunk` (< nvlsChunks)
+        auto advance = [&]() {
           WHILE(chunk >= nextFirst) {
             edge += 1;
             nextFirst =
                 ld_global_nc_u32(pipeEdgeTable + widen((edge + 1) * sizeof(PipeEdge)) + offsetof(PipeEdge, nvlsFirst));
+            if (relayItems) {
+              waitPending = edgeWaits();
+            }
           }
+        };
+        auto loadChunk = [&]() {
+          advance();
           u64 record = pipeEdgeTable + widen(edge * sizeof(PipeEdge));
           u32 edgeBytes = ld_global_nc_u32(record + 8);
           u32 addrSlot = ld_global_nc_u32(record + 12);
@@ -2616,10 +2676,20 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           chunk += numPipelines;
           loaded += 1;
         };
-        WHILE((chunk < nvlsChunks) & (loaded < nvlsStages)) {
-          loadChunk();
-        }
-        WHILE(stored < loaded) {
+        // With relayItems: whether `chunk` (< nvlsChunks) can be loaded, as ready in the copy loop. Blocking: wait.
+        auto ready = [&](bool blocking) {
+          Value r(ValType::Pred);
+          r = 1;
+          advance();
+          IF(waitPending) {
+            relayArrived(pipeEdgeTable + widen(edge * sizeof(PipeEdge)), blocking, r);
+            IF(r) {
+              waitPending = 0;
+            }
+          }
+          return r;
+        };
+        auto storeChunk = [&]() {
           // The window. A wait gives up after a second: the counter only paces the stores, and a launch must not
           // hang on it (the kernels of a launch start together: each waits for all peers' addresses)
           u32 c = nvlsRing->nextStoreAux();
@@ -2646,9 +2716,49 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
             multimem_red_relaxed_sys_add_u32(nvlsCounterMc, stored - nvlsSignalLag - signaled);
             signaled = stored - nvlsSignalLag;
           }
-          IF((chunk < nvlsChunks) & (stored >= nvlsStoreLag + 1)) {
-            cp_async_bulk_wait_group_read(nvlsStoreLag);
+        };
+        if (relayItems) {
+          // As the copy loop with relayItems: a chunk is loaded into a stage that no chunk has used, or, once the
+          // stores of all but the last nvlsStoreLag chunks stored have read their stages, while fewer than nvlsStages
+          // - nvlsStoreLag loads are ahead of the stores
+          WHILE((chunk < nvlsChunks) & (loaded < nvlsStages)) {
+            IF(!ready(false)) {
+              BREAK;
+            }
             loadChunk();
+          }
+          WHILE(true) {
+            IF(stored < loaded) {
+              storeChunk();
+              IF((chunk < nvlsChunks) & (stored >= nvlsStoreLag + 1)) {
+                cp_async_bulk_wait_group_read(nvlsStoreLag);
+                WHILE((chunk < nvlsChunks) & (loaded - stored < nvlsStages - nvlsStoreLag)) {
+                  IF(!ready(false)) {
+                    BREAK;
+                  }
+                  loadChunk();
+                }
+              }
+            }
+            ELSE {
+              IF(chunk >= nvlsChunks) {
+                BREAK;
+              }
+              cp_async_bulk_wait_group_read(nvlsStoreLag);
+              ready(true);
+              loadChunk();
+            }
+          }
+        } else {
+          WHILE((chunk < nvlsChunks) & (loaded < nvlsStages)) {
+            loadChunk();
+          }
+          WHILE(stored < loaded) {
+            storeChunk();
+            IF((chunk < nvlsChunks) & (stored >= nvlsStoreLag + 1)) {
+              cp_async_bulk_wait_group_read(nvlsStoreLag);
+              loadChunk();
+            }
           }
         }
         profiling.enter("drain");
