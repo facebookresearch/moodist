@@ -648,10 +648,12 @@ def test_nvls_loop_same_bits(ctx: TestContext):
     not), from one 16-byte vector to 13 MiB per rank (parts), edges of at most 4 KiB (MOODIST_COMPILE_OP_MAX_EDGE_BYTES:
     many per rank, ending part way through items), one slot of 4 KiB per ring of the scratch tensors (every part waits
     for its slot's previous use, many times per launch), writes instead of reads (MOODIST_COMPILE_OP_TRANSFER=write);
-    the same bits in every launch, nothing stored past the outputs. With MOODIST_TEST_EXPECT_NVLS=1 and domains of 12
-    ranks or more, every launch of a rank that executes reductions used NVLS (but those of float16 averages, and of
-    int32 inputs of more than 4 MiB), with domains of 16 or more in the warp loop (nvls_loop_launches), and those of
-    the reference never did."""
+    across domains, the all-reduces again in two rounds (MOODIST_COMPILE_OP_ROUNDS=2, which they otherwise take from
+    sizes that grow as the domains get fewer, never with two: an owner stores its share to its domain's outputs, a run,
+    and to a slot of its scratch tensor); the same bits in every launch, nothing stored past the outputs. With
+    MOODIST_TEST_EXPECT_NVLS=1 and domains of 12 ranks or more, every launch of a rank that executes reductions used
+    NVLS (but those of float16 averages, and of int32 inputs of more than 4 MiB), with domains of 16 or more in the warp
+    loop (nvls_loop_launches), and those of the reference never did."""
     pg = create_process_group(ctx)
     n = ctx.world_size
     domains = nvlink_domains(ctx, pg)
@@ -683,6 +685,9 @@ def test_nvls_loop_same_bits(ctx: TestContext):
         ("reduce_one", torch.bfloat16, "sum", 1 << 18, []),
         ("reduce_one", torch.float32, "avg", 1 << 20, []),
     ]
+    if len(set(domains)) > 1:
+        cases += [(kind, dtype, op_name, numel, env + [("MOODIST_COMPILE_OP_ROUNDS", "2")])
+                  for kind, dtype, op_name, numel, env in list(cases) if kind.startswith("all_reduce")]
     errors = []
     for kind, dtype, op_name, numel, env in cases:
         in_place = kind == "all_reduce_in_place"

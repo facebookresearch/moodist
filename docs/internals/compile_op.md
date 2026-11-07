@@ -309,7 +309,11 @@ Every step is collective: all ranks of the group take part (through per-rank que
 11. **Graph variants** (`MOODIST_COMPILE_OP_GRAPHS`, default `multicast`), each a `GraphBuilder` pass over the
    kernel edges:
    - `multicast`: the edges that read the same source node are merged into one edge with several destinations,
-     executed by the source rank: it reads each chunk once and writes it to all its destinations.
+     executed by the source rank: it reads each chunk once and writes it to all its destinations (in rank order,
+     rotated to start at the source rank). The other edges keep their destinations' order, e.g. an all-reduce's share
+     in two rounds (step 7), which lists its domain's outputs, an NVLS run, before the slot that the other owners read:
+     sorted by rank, the owner's slot would follow its own output, inside the run, and the share would lose its
+     multicast store and its kernel `nvlsReduceLoop`.
    - `read` (`buildNothing`): every edge stays with its destination rank, which reads from the source.
    - `ring_read`, `ring_write`: the destinations of a cell form a chain, starting at the source rank, and each
      rank copies the cell from the previous rank's output (read: the receiver executes the copy, write: the
@@ -635,10 +639,10 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   bits as in the reduce loop (`test_nvls_loop_same_bits`). It stores the result with one multicast store to the run of
   destinations and with plain stores to the other destinations. Done flags: a warp counts its items of an edge, and adds
   its count to the edge's counter (lane 0, after the warp's barrier and a release fence) when it goes on to another
-  edge, before that edge's waits, and at the end; the warp whose add completes the count sets the flags. The blocks are
-  the rank's share of 4 MiB in flight per domain, by its bytes of edges with runs among the domain's (4 blocks with 32
-  GPUs per domain, 8 with 16; see NVLS reductions), three times that with runs of destinations (an all-reduce's, whose
-  items of partial results and plans with multicast stores each run with every warp, one after the other), where the
+  edge, before that edge's waits, and at the end; the warp whose add completes the count sets the flags. The blocks:
+  the rank's share of the bytes in flight, by its bytes of edges with runs among the domain's (see NVLS reductions), one
+  and a half times that with runs of destinations (an all-reduce's, whose items of partial results and plans with
+  multicast stores each run with every warp, one after the other: 12 blocks with 16 and 32 GPUs per domain), where the
   reduce loop takes the whole tuned grid: its blocks take 32 KiB chunks, for which all threads wait for the block's
   slowest vector, and thread 0 waits for the completion of its bulk stores before it counts an item with done flags,
   which the block's next chunk then waits for (across 2 domains of 32 GB300, a reduce-scatter's partial results for the
@@ -648,8 +652,11 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   grid; 6 blocks: 1201 and 2851 us), of `bfloat16` 64 KiB 60 / 61 us, 256 KiB 77 / 80 us, 1 MiB 160 / 159 us, 16 MiB
   1474 / 1468 us and 64 MiB 5839 / 5806 us; all-reduce of `bfloat16` (12 blocks; two passes in reverse order) 16 MiB 112
   / 115 us, 64 MiB 237 / 263 us, 256 MiB 687 / 719 us and 1 GiB 2357 / 2353 us (with 4 blocks: 111, 216, 779 and 3055
-  us; 8: 222, 713 and 2595 us; 24: 262, 666 and 2430 us; across 4 domains of 16, in two rounds, which RDMA limits, the
-  same with any); reduce to one rank 16 MiB 251 / 260 us, 64 MiB 775 / 956 us.
+  us; 8: 222, 713 and 2595 us; 24: 262, 666 and 2430 us); reduce to one rank 16 MiB 251 / 260 us, 64 MiB 775 / 956 us.
+  All-reduces in two rounds (`bfloat16`, two passes, `nvlsReduceLoop` / the reduce loop): across 8 domains of 16 GB300,
+  8 MiB 115.5 / 120.6 us, 16 MiB 149.9 / 155.6 us, 64 MiB 268.1 / 278.4 us and 256 MiB 799 / 832 us (12 blocks; 8 to 32
+  blocks: 267-293 us at 64 MiB, 797-869 us at 256 MiB); across 16 domains of 16, 16 MiB 193.8 / 199.1 us, 64 MiB 342 /
+  307 us (see Known issues) and 256 MiB 851 / 877 us.
 
 ## Runtime (`customOp`, `launchCustomOp`, `WorkCustom`)
 
@@ -1593,7 +1600,14 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   than more blocks: the items' multimem.ld_reduce slowed down while the plans' multicast stores ran (the switches share
   their throughput), so an all-reduce across domains cannot get below one within a domain (256 MiB on 32 GB300: 551 us).
   Open: why 4 blocks were faster than 12 at 64 MiB (216 / 237 us; 12-block runs varied from 217 to 270 us between
-  processes, and a profiled launch was not longer with 12), and the rule on 16 domains of 16 GPUs. Blocks beyond the
+  processes, and a profiled launch was not longer with 12), and the rule on 16 domains of 16 GPUs. Until November 2026,
+  all-reduces in two rounds (from about 6 MiB across 8 domains of 16 GPUs, 2.4 MiB across 16) never ran in
+  `nvlsReduceLoop`, and their owners stored their shares without multicast stores: the multicast graph sorted a share's
+  destinations by rank, which put the owner's slot inside the run (see compile phase step 11). Now, across 8 domains of
+  16 GB300 they are 5-10% faster from 8 MiB on, and across 16 domains of 16 at 16 and 256 MiB (194 against 206 us, 851
+  against 915 us), but at 64 MiB they take 342 us against 323, their launches spread from 313 to 400 us (p10-p90),
+  while the reduce loop with runs takes 307 us: open (at 64 MiB a piece has two parts of 2 MiB, of 16 shares each).
+  Blocks beyond the
   share leave `nvlsReduceLoop` at once, but stay on their SMs in the kernel's entry and exit syncs while peers are
   behind, so the other kernels do not get the SMs back: torchtitan `llama3_8b` (FSDP2, every rank with the same data,
   rank 0's backward GEMM time) across 2 domains of 32 GB300 took 160 ms with the warp loop in the tuned grid, 158 with

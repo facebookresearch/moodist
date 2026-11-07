@@ -1316,9 +1316,10 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
           // With runs of destinations (an all-reduce's: the items of partial results with multimem.ld_reduce, then the
           // plans with multicast stores, each phase with every warp), one and a half times the share: across 2 domains
           // of 32 GB300 (bfloat16, 64 MiB / 256 MiB / 1 GiB), 4 blocks took 215 / 779 / 3055 us, 8 222 / 713 / 2595,
-          // 12 237 / 687 / 2357, 24 262 / 666 / 2430, the reduce loop 263 / 719 / 2353 (across 4 domains of 16, two
-          // rounds, the same with any); in November 2026, at 64 MiB, 8 blocks 196 us, 12 197, and at 1 MiB, 2 to 8
-          // blocks 0.5 us faster than 12 (the items' bound takes those)
+          // 12 237 / 687 / 2357, 24 262 / 666 / 2430, the reduce loop 263 / 719 / 2353; in November 2026, at 64 MiB, 8
+          // blocks 196 us, 12 197, and at 1 MiB, 2 to 8 blocks 0.5 us faster than 12 (the items' bound takes those); in
+          // two rounds across 8 domains of 16, 12 blocks took 267 / 797 us at 64 / 256 MiB, 8, 16, 24 and 32 blocks
+          // 267-293 / 824-869 us
           nvlsReduceBlocks = nvlsBlocks(myRunBytes, runBytesTotal, destinationRuns ? 1.5 : 1, 2);
         }
         if (rank == domain[0]) {

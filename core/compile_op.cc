@@ -573,7 +573,10 @@ struct GraphBuilder {
         }
       }
     }
-    for (auto& e : edges) {
+    // (only the edges merged here: the others keep their order, e.g. an all-reduce's share in two rounds, whose
+    // destinations are its domain's outputs, a run, then a region of the scratch tensor, see crossDomainReductions)
+    for (const auto& [sourceNode, index] : nodeEdgeIndex) {
+      Edge& e = edges[index];
       auto proj = [](auto& n) {
         return n.rank;
       };
