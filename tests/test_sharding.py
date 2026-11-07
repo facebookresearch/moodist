@@ -985,6 +985,7 @@ def _verify_local_reshard(
     target_placements: list,
     shape: tuple,
     description: str,
+    expect_error: bool = False,
 ):
     """
     Verify compute_local_reshard and apply_local_reshard by comparing against PyTorch DTensor.
@@ -993,6 +994,10 @@ def _verify_local_reshard(
     2. Distribute to DTensor with current_placements, get local, apply reshard
     3. Distribute to DTensor with target_placements, get local directly
     4. Compare: they should be equal
+
+    With expect_error, the conversion needs communication: some rank's target local holds
+    elements its current local lacks (checked against DTensor, all ranks), and
+    compute_local_reshard must raise ValueError.
     """
     from moodist import compute_local_reshard, apply_local_reshard
 
@@ -1020,6 +1025,19 @@ def _verify_local_reshard(
     # Get local tensor from current placement
     local_current = dtensor_current.to_local()
 
+    # Get expected local from target placement
+    expected_local = dtensor_target.to_local()
+
+    if expect_error:
+        # Elements are unique (arange), so value containment is index containment
+        contained = set(expected_local.flatten().tolist()) <= set(local_current.flatten().tolist())
+        all_contained = [None] * ctx.world_size
+        dist.all_gather_object(all_contained, contained)
+        if all(all_contained):
+            ctx.log(f"FAIL {description}: expected a conversion that needs communication, "
+                    f"but every rank holds its target data")
+            return False
+
     # Compute reshard chunks
     indices_and_sizes = [(coord[i], mesh.size(i)) for i in range(mesh.ndim)]
     try:
@@ -1030,14 +1048,17 @@ def _verify_local_reshard(
             indices_and_sizes,
         )
     except ValueError as e:
-        ctx.log(f"SKIP {description}: {e}")
-        return True
+        if expect_error and "requires communication" in str(e):
+            return True
+        ctx.log(f"FAIL {description}: {e}")
+        return False
+
+    if expect_error:
+        ctx.log(f"FAIL {description}: expected ValueError, got chunks {reshard_chunks}")
+        return False
 
     # Apply reshard to get resharded local
     resharded_local = apply_local_reshard(local_current, reshard_chunks)
-
-    # Get expected local from target placement
-    expected_local = dtensor_target.to_local()
 
     # Compare
     if not torch.equal(resharded_local, expected_local):
@@ -1288,19 +1309,35 @@ def test_local_reshard_strided_shard(ctx: TestContext, device: str):
         elif ctx.rank == 0:
             ctx.log("PASS [StridedShard, Replicate] -> [StridedShard, Shard(1)]")
 
+        # [Replicate(), _StridedShard(0, sf=dp_size)] -> [Shard(1), _StridedShard(0, sf=dp_size)]
+        shape = (dp_size * tp_size * 2, dp_size * 4)
+        success = _verify_local_reshard(
+            ctx, mesh,
+            [Replicate(), _StridedShard(0, split_factor=dp_size)],
+            [Shard(1), _StridedShard(0, split_factor=dp_size)],
+            shape,
+            f"[Replicate, StridedShard] -> [Shard(1), StridedShard] shape={shape}",
+        )
+        if not success:
+            all_passed = False
+        elif ctx.rank == 0:
+            ctx.log("PASS [Replicate, StridedShard] -> [Shard(1), StridedShard]")
+
         # [Replicate(), _StridedShard(0, sf=dp_size)] -> [Shard(0), _StridedShard(0, sf=dp_size)]
-        shape = (dp_size * 4, dp_size * tp_size * 4)
+        # needs communication: DTensor applies Shard(0) on "dp" before the strided split on "tp"
+        shape = (dp_size * dp_size * tp_size * 2, 8)
         success = _verify_local_reshard(
             ctx, mesh,
             [Replicate(), _StridedShard(0, split_factor=dp_size)],
             [Shard(0), _StridedShard(0, split_factor=dp_size)],
             shape,
             f"[Replicate, StridedShard] -> [Shard(0), StridedShard] shape={shape}",
+            expect_error=True,
         )
         if not success:
             all_passed = False
         elif ctx.rank == 0:
-            ctx.log("PASS [Replicate, StridedShard] -> [Shard(0), StridedShard]")
+            ctx.log("PASS [Replicate, StridedShard] -> [Shard(0), StridedShard] raises")
 
         ctx.assert_true(all_passed, "Some StridedShard reshard tests failed")
 
@@ -1330,4 +1367,21 @@ def test_local_reshard_error_on_invalid_conversion(ctx: TestContext):
     except ValueError as e:
         ctx.assert_true("requires communication" in str(e))
         ctx.log(f"PASS: correctly rejected Shard -> Replicate: {e}")
+
+    # Placements apply left to right, so splitting tensor dim 0 on mesh dim 0 must happen before
+    # mesh dim 1's existing split of it: requires communication
+    try:
+        compute_local_reshard(
+            (50,), [Replicate(), Shard(0)], [Shard(0), Shard(0)], [(0, 2), (1, 2)]
+        )
+        ctx.assert_true(False, "Should have raised ValueError")
+    except ValueError as e:
+        ctx.assert_true("requires communication" in str(e))
+        ctx.log(f"PASS: correctly rejected [Replicate, Shard(0)] -> [Shard(0), Shard(0)]: {e}")
+
+    # A later mesh dim of size 1 splits nothing: local
+    chunks = compute_local_reshard(
+        local_shape, [Replicate(), Shard(0)], [Shard(0), Shard(0)], [(1, 2), (0, 1)]
+    )
+    ctx.assert_equal([(c.global_offset, c.shape) for c in chunks], [([50], [50])])
 

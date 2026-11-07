@@ -223,6 +223,15 @@ def compute_local_reshard(
     It will raise an error if the resharding would require communication
     (e.g., Shard -> different Shard).
 
+    Placements apply left to right (mesh dim 0 first), as in DTensor. Slicing the
+    local tensor adds the new splits after the existing ones, so a Replicate -> Shard
+    conversion is local only if no later mesh dim already shards the same tensor dim:
+    [Shard(0), Replicate()] -> [Shard(0), Shard(0)] is local, while
+    [Replicate(), Shard(0)] -> [Shard(0), Shard(0)] raises. The check is conservative:
+    it also rejects the few such conversions that are local for evenly divisible sizes
+    (e.g. [Replicate(), Shard(0)] -> [_StridedShard(0, split_factor=2), Shard(0)] on a
+    2x2 mesh), because whether they are local depends on the global shape.
+
     Args:
         local_shape: Shape of the local tensor to reshard.
         current_placements: Current placement objects (Shard, Replicate, etc.).
@@ -288,6 +297,24 @@ def compute_local_reshard(
             f"Cannot locally reshard {type(curr).__name__} -> {type(tgt).__name__}, "
             f"requires communication"
         )
+
+    # A new split must come after every existing split of its tensor dim (see the
+    # docstring). Mesh dims of size 1 split nothing. Only placements and mesh sizes are
+    # used, so all ranks decide alike.
+    for mesh_dim, (curr, tgt) in enumerate(zip(current_placements, target_placements)):
+        if not (isinstance(curr, Replicate) and is_shard_like(tgt)):
+            continue
+        if indices_and_sizes[mesh_dim][1] == 1:
+            continue
+        for later_dim in range(mesh_dim + 1, len(current_placements)):
+            later = current_placements[later_dim]
+            if (is_shard_like(later) and later.dim == tgt.dim
+                    and indices_and_sizes[later_dim][1] > 1):
+                raise ValueError(
+                    f"Cannot locally reshard Replicate -> {tgt} on mesh dim {mesh_dim}: "
+                    f"mesh dim {later_dim} ({later}) already shards tensor dim {tgt.dim}, "
+                    f"requires communication"
+                )
 
     # If no Replicate -> Shard conversions, return single chunk covering full tensor
     if not reshard_placements:
