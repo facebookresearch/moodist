@@ -3197,7 +3197,11 @@ struct CompileOpConstructor {
     // GPUs: 43.5 ms; 45.6 with 4; 42.9 with 16, and twice the scratch).
     std::string ringMode = "auto";
     size_t ringGroup = 8;
+    // Whether reductionPieces may size the parts of all-reduces for NVLS (unless MOODIST_COMPILE_OP_NVLS=0, which
+    // must then be set on every rank: the ranks must agree on the parts)
+    bool nvlsPieces = false;
     if (isReduction(reduce)) {
+      nvlsPieces = agreedEnv("MOODIST_COMPILE_OP_NVLS", "1") != "0";
       rounds = agreedEnv("MOODIST_COMPILE_OP_ROUNDS", "auto");
       REQUIRE(rounds == "auto" || rounds == "1" || rounds == "2",
           "compile_op: MOODIST_COMPILE_OP_ROUNDS must be auto, 1 or 2 (not '%s')", rounds);
@@ -3428,6 +3432,15 @@ struct CompileOpConstructor {
     // (Reduce-scatter on 2 domains of 32 took the same time with 1, 2 and 4 MiB parts. With 16 domains of 4,
     // all-reduces of 64 and 256 MiB took 3-11% less time with 8 MiB parts, but there the reads of the partial results
     // of all domains dominate, which a reduce-scatter and an all-gather across domains would cut.)
+    // In one round, where the domains' NVLS runs can take the all-reduce (domains of at least nvlsStoreMinRanks with
+    // destinations, a dtype and reduce op of multimem.ld_reduce, see nvlsAllReduceRuns), 16 MiB / m instead: the
+    // NVLS kernel loads the partial results with multimem.ld_reduce (the GPUs' NVLink egress) and stores the results
+    // with multicast stores (their ingress), and smaller parts let a domain store the results of a part while it loads
+    // the next. Across 2 domains of 16 GB300 (bfloat16, with the NVLS kernel, two pairs of racks): 32 / 64 / 128 / 256
+    // MiB 145 / 217 / 363 / 668 us with 1 MiB parts, 164-167 / 226-234 / 387 / 721 us with 2 MiB (and the op's
+    // domains no longer take turns being late, see the all-reduce notes in compile_op.md); the unicast kernel, which
+    // the same op runs on tensors outside the communication pool (the parts are the op's), 162 / 263 / 475 / 877 us
+    // against 180 / 252 / 428 / 889 us. Two rounds keep 32 MiB / m: their parts go in k shares again.
     auto reductionPieces = [&](const std::string& tensorId, const Coord& cellOffset, const Coord& cellShape,
                                uint32_t cellIndex, const Vector<size_t>& sourceInputs) {
       Vector<uint32_t> destinationRanks;
@@ -3474,8 +3487,6 @@ struct CompileOpConstructor {
       const size_t m = allReduce ? maxDomainDestinations : destinationRanks.size();
       // (a size that is not a multiple of 16 bytes is an error for kernel edges, raised below)
       const size_t numPieces = bytes % 16 == 0 ? std::clamp<size_t>(units, 1, m) : 1;
-      const size_t minPartBytes =
-          allReduce ? std::clamp<size_t>((32 << 20) / maxDomainDestinations, 1 << 20, 4 << 20) : 4 << 20;
       static constexpr size_t maxParts = 32;
       // An all-reduce in two rounds (see crossDomainReductions): with k domains with destinations and n with sources,
       // an executor reads (n - 1) B for a part of B bytes in one round (the contributions of the other domains), and
@@ -3495,6 +3506,12 @@ struct CompileOpConstructor {
         const size_t savedBytes = sourceDomains < 2 ? 0 : bytes / m * (k - 1) * (sourceDomains - 2) / k;
         twoRounds = rounds == "2" || savedBytes >= twoRoundsMinSavedBytes;
       }
+      // (see above: NVLS all-reduces in one round take smaller parts)
+      const size_t partBudget =
+          allReduce && !twoRounds && nvlsPieces && nvlsAllReduceRuns(dtype, reduce, maxDomainDestinations) ? 16 << 20
+                                                                                                         : 32 << 20;
+      const size_t minPartBytes =
+          allReduce ? std::clamp<size_t>(partBudget / maxDomainDestinations, 1 << 20, 4 << 20) : 4 << 20;
       Vector<ReducedPiece> pieces;
       for (size_t p : range(numPieces)) {
         size_t begin = numPieces == 1 ? 0 : units * p / numPieces * 16;

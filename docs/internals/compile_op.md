@@ -73,7 +73,13 @@ Every step is collective: all ranks of the group take part (through per-rank que
    (step 7) arrive in parts: pieces of 8 MiB or more into parts of at least 4 MiB, and with destinations in several
    domains, into parts of at least 32 MiB / m (from 1 to 4 MiB; m: the most destination ranks of a domain), since
    such an executor writes each part to the m destinations of its domain, which with many of them takes longer than
-   reading the part, and smaller parts then overlap the two better (see the measurements in `reductionPieces`). With
+   reading the part, and smaller parts then overlap the two better (see the measurements in `reductionPieces`). In
+   one round, where NVLS runs can take the all-reduce (domains of at least 16 ranks with destinations, a dtype and
+   reduce op of `multimem.ld_reduce`: `nvlsAllReduceRuns`, by rule, the same on every rank), 16 MiB / m instead: the
+   NVLS kernel's loads and multicast stores use the two directions of the GPUs' NVLink, and smaller parts let them
+   overlap (across 2 domains of 16 GB300: 6-14% faster from 32 to 256 MiB, and the domains rarely take turns being
+   late, see NVLS across NVLink domains under Known issues, Performance); the op's unicast kernel, which takes the same
+   parts, was 10% faster at 32 MiB, 4% and 11% slower at 64 and 128 MiB, about the same at 256. With
    reads (the default, see step 7), what a part sends across domains (the part, or in two rounds a share of it) must
    fit in a slot of the rings of the scratch tensors, 2 MiB (`MOODIST_COMPILE_OP_SLOT_BYTES`): a reduce-scatter of
    256 MiB per rank has 128 parts of 2 MiB instead of 32 of 8 MiB. (In two rounds, the last share of a smaller last
@@ -1611,14 +1617,23 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   (1 GiB 3055 us, the reduce loop 2353). Running the items and the plans at once (half of the warps each) was not faster
   than more blocks: the items' multimem.ld_reduce slowed down while the plans' multicast stores ran (the switches share
   their throughput), so an all-reduce across domains cannot get below one within a domain (256 MiB on 32 GB300: 551 us).
-  Open: why 4 blocks were faster than 12 at 64 MiB (216 / 237 us; 12-block runs varied from 217 to 270 us between
-  processes, and a profiled launch was not longer with 12), and the rule on 16 domains of 16 GPUs. Until November 2026,
-  all-reduces in two rounds (from about 6 MiB across 8 domains of 16 GPUs, 2.4 MiB across 16) never ran in
-  `nvlsReduceLoop`, and their owners stored their shares without multicast stores: the multicast graph sorted a share's
-  destinations by rank, which put the owner's slot inside the run (see compile phase step 11). Now, across 8 domains of
-  16 GB300 they are 5-10% faster from 8 MiB on, and across 16 domains of 16 at 16 and 256 MiB (194 against 206 us, 851
-  against 915 us), but at 64 MiB they take 342 us against 323, their launches spread from 313 to 400 us (p10-p90),
-  while the reduce loop with runs takes 307 us: open (at 64 MiB a piece has two parts of 2 MiB, of 16 shares each).
+  Back-to-back all-reduces across domains take turns being late (in both loops, and the unicast kernel's too): when
+  one domain starts an op some 25 us after the other, it finishes first, since the early domain's partial results are
+  there to read while it computes its own, whereas the early domain waits for the late one's to be computed, notified
+  and read (the read of the last part); it then starts the next op late, and so on, the lag flipping sign every op
+  without decaying. Across 2 domains of 16 GB300 at 64 MiB (2 MiB parts), rank 0's time per op then alternated between
+  205 and 262 us, and the time per op of the pair was 239 us against 227 in step (the unicast kernel: 254-260). So the
+  median of one rank's times over back-to-back ops lands on either side, and the kernel time of the fastest rank (the
+  last to start), the late domain's in such launches, comes out about 17 us short: record every rank's time per
+  launch, take the mean over the ranks, then the median over the launches. With 1 MiB parts (see reductionPieces) the
+  ops took 217 us and rarely alternated. This may explain the 12-block runs that varied from 217 to 270 us between
+  processes and the 64 MiB numbers across 16 domains below (fastest rank; their launches spread from 313 to 400 us),
+  which need measuring again so. Until November 2026, all-reduces in two rounds (from about 6 MiB across 8 domains of 16 GPUs, 2.4 MiB
+  across 16) never ran in `nvlsReduceLoop`, and their owners stored their shares without multicast stores: the
+  multicast graph sorted a share's destinations by rank, which put the owner's slot inside the run (see compile phase
+  step 11). Now, across 8 domains of 16 GB300 they are 5-10% faster from 8 MiB on, and across 16 domains of 16 at 16
+  and 256 MiB (194 against 206 us, 851 against 915 us), but at 64 MiB they took 342 us against 323, while the reduce
+  loop with runs took 307 us (fastest rank, see above).
   Blocks beyond the
   share leave `nvlsReduceLoop` at once, but stay on their SMs in the kernel's entry and exit syncs while peers are
   behind, so the other kernels do not get the SMs back: torchtitan `llama3_8b` (FSDP2, every rank with the same data,

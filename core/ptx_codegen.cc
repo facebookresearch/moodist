@@ -352,6 +352,10 @@ bool compile_op::nvlsReductionsPossible(const Group* group, DType dtype, ReduceO
   return nvlsDomainCapable(group, collectiveOp, nvlsReduceMinRanks) && nvlsReduceInst(dtype, reduce).has_value();
 }
 
+bool compile_op::nvlsAllReduceRuns(DType dtype, ReduceOp reduce, size_t domainRanks) {
+  return domainRanks >= nvlsStoreMinRanks && nvlsReduceInst(dtype, reduce).has_value();
+}
+
 uint64_t compile_op::nvlsReductionMaxBytes(DType dtype) {
   // int32 takes four 4-byte multimem.ld_reduce per vector, where the vector forms take one: all-reduce on 32 GB300,
   // NVLS against the reduce loop: 1 MiB 29 / 46 us, 4 MiB 45 / 50 us, 8 MiB 69 / 53 us, 256 MiB 1554 / 894 us (bfloat16

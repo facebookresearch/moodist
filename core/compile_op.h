@@ -197,6 +197,10 @@ bool nvlsReductionsPossible(const Group* group, DType dtype, ReduceOp reduce, bo
 // Whether this rank's domain can also have NVLS runs of destinations alone (multicast stores of results computed from
 // other sources, e.g. an all-reduce's across domains), see nvlsReductionRuns
 bool nvlsMulticastRuns(const Group* group, DType dtype, ReduceOp reduce, bool collectiveOp);
+// Whether an all-reduce across domains of up to domainRanks ranks with destinations can have NVLS runs of sources and
+// destinations, by rule: from the domain size, the dtype and the reduce op alone (the same on every rank, unlike the
+// domain's own capability; see reductionPieces in compile_op.cc)
+bool nvlsAllReduceRuns(DType dtype, ReduceOp reduce, size_t domainRanks);
 // The most bytes that the switches may combine for an op within an NVLink domain (with multimem.ld_reduce: the bytes of
 // its ranks' NVLS reductions and of their edges with NVLS runs of sources, together) for it to use NVLS there (more
 // use the reduce loop alone)
