@@ -77,13 +77,13 @@ Every step is collective: all ranks of the group take part (through per-rank que
    one round, where NVLS runs can take the all-reduce (domains of at least 16 ranks with destinations, a dtype and
    reduce op of `multimem.ld_reduce`: `nvlsAllReduceRuns`, by rule, the same on every rank), 16 MiB / m instead: the
    NVLS kernel's loads and multicast stores use the two directions of the GPUs' NVLink, and smaller parts let them
-   overlap (across 2 domains of 16 GB300: 6-14% faster from 32 to 256 MiB, and the domains rarely take turns being
-   late, see NVLS across NVLink domains under Known issues, Performance); the op's unicast kernel, which takes the same
-   parts, was 10% faster at 32 MiB, 4% and 11% slower at 64 and 128 MiB, about the same at 256. With
-   reads (the default, see step 7), what a part sends across domains (the part, or in two rounds a share of it) must
-   fit in a slot of the rings of the scratch tensors, 2 MiB (`MOODIST_COMPILE_OP_SLOT_BYTES`): a reduce-scatter of
-   256 MiB per rank has 128 parts of 2 MiB instead of 32 of 8 MiB. (In two rounds, the last share of a smaller last
-   part can be up to a page larger: the slots of its rings are then that much larger.)
+   overlap (across 2 domains of 16 GB300: 6-14% faster from 32 to 256 MiB; at 64 MiB the domains rarely take turns being
+   late any more, at 32 MiB they still do, see NVLS across NVLink domains under Known issues, Performance); the op's
+   unicast kernel, which takes the same parts, was 10% faster at 32 MiB, 4% and 11% slower at 64 and 128 MiB, about the
+   same at 256. With reads (the default, see step 7), what a part sends across domains (the part, or in two rounds a
+   share of it) must fit in a slot of the rings of the scratch tensors, 2 MiB (`MOODIST_COMPILE_OP_SLOT_BYTES`): a
+   reduce-scatter of 256 MiB per rank has 128 parts of 2 MiB instead of 32 of 8 MiB. (In two rounds, the last share of a
+   smaller last part can be up to a page larger: the slots of its rings are then that much larger.)
 4. **Phase 3**: one read request per cell and source, to the rank that owns the input.
 5. **Phase 4**: that rank resolves the offset. A piece that is not contiguous in the input becomes an input copy
    (deduplicated).
