@@ -2079,28 +2079,54 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
 
+    // The exit sync's table: per peer, where this rank stores its flag (written into the PTX byte by byte, so without
+    // padding, which would hold whatever was on the stack)
     struct SyncSetup {
       uint64_t stbase;
       uint32_t itembytes;
-      uint32_t ldoffset;
       uint32_t stBlockStride; // bytes per block row in the peer's sync buffer
     };
+    static_assert(sizeof(SyncSetup) == 16);
 
     std::vector<SyncSetup> syncsetup;
     for (size_t i : indices(ranks)) {
       if (ranks[i] == rank) {
         continue;
       }
+      // (execSync computes a peer's index in ranks from its index here)
+      CHECK(syncsetup.size() + (i > myIndex) == i);
       auto& r = syncAddrs.remote[i];
       SyncSetup s;
       s.stbase = r.base + sizeof(uint32_t) * myPeerIndex[i];
       s.itembytes = r.itembytes;
-      s.ldoffset = sizeof(uint32_t) * i;
       s.stBlockStride = sizeof(uint32_t) * peerRanksSize[i];
       syncsetup.push_back(s);
     }
 
-    u32 csyncaddr = addConst32(syncsetup, "syncsetup");
+    // The flags of the exit sync of a kernel with remote writes (see execSync below): warp 0 stores all of them, each
+    // lane after its own release fence (the PTX release pattern: a flag that a thread stores without having fenced
+    // itself does not order the data stored before it, though thread 0's fence and a block barrier did in practice),
+    // from addresses that its lanes load here, at the start, from syncsetup in global memory (coalesced, a few
+    // registers: at most 71 peers in a domain of 72, 3 per lane). Loaded at the exit instead, after the copies, the
+    // loads delayed the fence: all-reduce of 4 KiB to 1 MiB on 32 GB300 up to 1.3 us slower. Loaded here, and with no
+    // block barrier before the stores (the other warps store no flags), the exit is mostly faster than thread 0's
+    // fence with every warp storing its share of the flags: all-gathers of 4 KiB to 1 MiB on 32 GB300 by 0.15-0.5 us
+    // at the same grid (November 2026).
+    Vector<u64> exitFlagAddrs;
+    if (hasRemoteWrites && !syncsetup.empty()) {
+      u64 gsyncaddr = addGlobalData(16, syncsetup.data(), syncsetup.size() * sizeof(SyncSetup), "gsyncsetup");
+      for (uint32_t i : range((syncsetup.size() + 31) / 32)) {
+        exitFlagAddrs.emplace_back();
+        u32 index = laneIndex + 32 * i;
+        PRED((warpIndex == 0) & (index < syncsetup.size())) {
+          u64 g = gsyncaddr + widen(index * sizeof(SyncSetup));
+          u64 stbase = ld_global_nc_u64(g + offsetof(SyncSetup, stbase));
+          u32 itembytes = ld_global_nc_u32(g + offsetof(SyncSetup, itembytes));
+          u32 stBlockStride = ld_global_nc_u32(g + offsetof(SyncSetup, stBlockStride));
+          exitFlagAddrs.back() = stbase + widen(itembytes * concurrencyIndex + stBlockStride * blockIndex);
+        }
+      }
+    }
 
     // ---- Errors ----
     // The launch cannot go on (see Group::KernelError): the first thread to find out writes the record, marks this
@@ -4128,7 +4154,17 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       }
     }
 
+    // The exit sync: every rank stores its flag (the op's step value) to each peer, then waits for each peer's. With
+    // remote writes, warp 0 stores all the flags after its release fence (see exitFlagAddrs above); without, the flags
+    // need no fence, and the threads store them as they wait for them (a flag and a wait each, in the same order)
     auto execSync = [&](uint32_t stepOffset) {
+      const bool warpZeroStores = !exitFlagAddrs.empty();
+      // (without warp 0's stores, the threads load the addresses of the flags they store from syncsetup in constant
+      // memory)
+      std::optional<u32> csyncaddr;
+      if (!warpZeroStores) {
+        csyncaddr = addConst32(syncsetup, "syncsetup");
+      }
       Vector<u64> ldaddrs;
       Vector<u64> staddrs;
       Vector<u32> ldoffsets; // (the peer's index in the kernel's ranks, times 4)
@@ -4137,33 +4173,48 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
       for (uint32_t i : range((syncsetup.size() + blockSize - 1) / blockSize)) {
         profiling.enter("sync setup");
         ldaddrs.emplace_back();
-        staddrs.emplace_back();
         ldoffsets.emplace_back();
         preds.emplace_back();
         u32 index = blockSize * i + (warpIndex + numWarps - 1) % numWarps + laneIndex * (blockSize / 32);
         u64& ldaddr = ldaddrs.back();
-        u64& staddr = staddrs.back();
         u32& ldoffset = ldoffsets.back();
         Value& pred = preds.back();
         pred = index < syncsetup.size();
+        if (!warpZeroStores) {
+          staddrs.emplace_back();
+          PRED(pred) {
+            u32 addr = *csyncaddr + index * sizeof(SyncSetup);
+            u64 stbase = ld_const_u64(addr + offsetof(SyncSetup, stbase));
+            u32 itembytes = ld_const_u32(addr + offsetof(SyncSetup, itembytes));
+            u32 stBlockStride = ld_const_u32(addr + offsetof(SyncSetup, stBlockStride));
+            staddrs.back() = stbase + widen(itembytes * concurrencyIndex + stBlockStride * blockIndex);
+          }
+        }
         PRED(pred) {
-          u32 addr = csyncaddr + index * sizeof(SyncSetup);
-          u64 stbase = ld_const_u64(addr);
-          u32 itembytes = ld_const_u32(addr + 8);
-          ldoffset = ld_const_u32(addr + 12);
-          u32 stBlockStride = ld_const_u32(addr + 16);
-          staddr = stbase + widen(itembytes * concurrencyIndex + stBlockStride * blockIndex);
+          // The peer's index in ranks (syncsetup skips this rank), computed: loaded, the load and its use came before
+          // warp 0's fence in ptxas's schedule, and the fence waited for the load (with 31 peers, warp 0's lanes read
+          // 7 entries of 128-thread blocks, 3 of 256-thread ones, which constant loads serialize)
+          ldoffset = (index + selp_u32(1, 0, index >= (uint32_t)myIndex)) * (uint32_t)sizeof(uint32_t);
           ldaddr = concurrency(syncAddrs.local) + widen(ldoffset + sizeof(uint32_t) * ranks.size() * blockIndex);
         }
       }
       u32 targetValue = stepValue + stepOffset;
-      profiling.enter("exit sync barrier");
-      // (unaligned: after thread 0's release fence, see the reduce loop)
-      barrier_sync_unaligned();
-      profiling.enter("exit sync barrier wait");
-      for (size_t i : indices(staddrs)) {
+      if (warpZeroStores) {
+        // (warp 0 alone, after its fence: no barrier orders anything here)
         profiling.enter("sync st");
-        PRED(preds[i]) st_global_relaxed_sys_u32(staddrs[i], targetValue);
+        for (size_t i : indices(exitFlagAddrs)) {
+          u32 index = laneIndex + 32 * (uint32_t)i;
+          PRED((warpIndex == 0) & (index < syncsetup.size())) st_global_relaxed_sys_u32(exitFlagAddrs[i], targetValue);
+        }
+      } else {
+        profiling.enter("exit sync barrier");
+        // (unaligned: after the copies' branches of single threads, see the reduce loop)
+        barrier_sync_unaligned();
+        profiling.enter("exit sync barrier wait");
+        for (size_t i : indices(staddrs)) {
+          profiling.enter("sync st");
+          PRED(preds[i]) st_global_relaxed_sys_u32(staddrs[i], targetValue);
+        }
       }
       for (size_t i : indices(ldaddrs)) {
         profiling.enter("sync ld");
@@ -4191,8 +4242,13 @@ std::shared_ptr<KernelHandle> generateKernel(const Group* group, const KernelCon
     };
 
     profiling.enter("exit sync entry");
-    if (hasRemoteWrites) {
-      IF_D(threadIndex == 0) {
+    if (!exitFlagAddrs.empty()) {
+      // Warp 0's lanes fence, each before the flags it stores (see exitFlagAddrs). The block barrier after the copies
+      // orders the other warps' stores before it. Warp 0 reconverges first: its lanes may have diverged in the copy
+      // loops, whose barriers are unaligned, and a split warp would fence once per part (an all-gather of 4 KiB on 4
+      // GB300 took 1.1-3.4 us longer); every warp fencing instead cost 0.35-1 us at 32 ranks.
+      IF_D(warpIndex == 0) {
+        warp_sync();
         profiling.enter("fence.release.sys");
         fence_release_sys();
       }

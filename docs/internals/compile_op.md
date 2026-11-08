@@ -503,8 +503,16 @@ every launch, on the same stream (`launchCompileOpKernel`). The ops of a slot ru
   every stage loaded before (at the start of a stage). Its earlier items are then complete, and every wait is for an
   edge that comes earlier in its rank's order, or for a transfer that waits only for such edges (see compile phase
   step 7), so the blocks of all ranks make progress.
-- **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while
-  peers may still read or write its tensors.
+- **Exit**: an all-to-all step value exchange among the kernel peers (`execSync`), so that no rank finishes while peers
+  may still read or write its tensors. A kernel with remote writes (stores to other ranks' tensors) releases them with
+  its flags: after the block barrier that ends the copies, warp 0 reconverges and its lanes each run
+  `fence.release.sys`, then store every flag (the PTX release pattern: each flag stored by a thread that has fenced
+  itself), from addresses that its lanes loaded at the kernel's start from the sync table in global memory (loaded at
+  the exit, they delayed the fence by up to 1.3 us at 32 ranks); the other warps go straight to the waits (every warp
+  fencing before its share of the flags cost 0.35-1 us at 32 ranks). Until November 2026, thread 0 fenced and every warp
+  stored its share of the flags after a second block barrier, which in practice ordered them as well; the exit is now
+  mostly faster (all-gathers of 4 KiB to 1 MiB on 32 GB300 by 0.15-0.5 us at the same grid). Without remote writes, no
+  fence: after a block barrier, every warp stores its share of the flags.
 - **NVLS** (NVLink SHARP multicast; copies in NVLink domains of at least 16 ranks, within a domain and across domains,
   ops without `collectiveOp`): an edge to every rank of its executor's NVLink domain (the group's ranks in it), at the
   same tensor and offset on each (an all-gather's), can store each chunk once to the domain's multicast mapping, which
@@ -1652,11 +1660,16 @@ The root bounds broadcasts and reduces of large tensors (see Known issues, Perfo
   copies one edge at a time and drains its pipelines at the end of each edge, and a dependency is per block and
   edge. Per-chunk ready flags would let the pipelines take chunks across edges as without waits (as the copies that
   wait only for relay edges do, see Scheduling).
-- The fixed cost of a launch is about 6 us on 4 GPUs (64 KiB shift): of it, `fence.release.sys` before the exit
-  step value exchange takes 2-3 us (any system-scope fence takes about 1.8 us on GB300 even with nothing
-  outstanding, a GPU-scope one 0.3 us; under load it waits for the copies of the other blocks), the address
-  exchange and resolution about 1.5 us, reading the launch parity 0.5 us. Back-to-back launches of an empty kernel
-  take 2 us each.
+- The fixed cost of a launch is about 6 us on 4 GPUs (64 KiB shift): of it, `fence.release.sys` before the exit step
+  value exchange takes 2-3 us (a system-scope fence takes about 0.75 us on GB300 with nothing outstanding and about 1.8
+  us after a single store to a peer, a GPU-scope one 0.1-0.5 us; under load it waits for the copies of the other
+  blocks), the address exchange and resolution about 1.5 us, reading the launch parity 0.5 us. Back-to-back launches of
+  an empty kernel take 2 us each, and back-to-back launches start on a grid of 2.048 us (their start-to-start times are
+  multiples of it, also for plain PyTorch kernels). So in a benchmark of back-to-back launches, an op that ends near a
+  step of that grid takes one of two times per launch, and a small change in the kernel can move its launches from one
+  to the other: compare both (p10 and p90 of the launches) and the period between launches, not only the median
+  (all-gathers of 64 KiB in general memory on 32 GB300 take 13.3 or 15.5 us, and the median of one build was in the
+  first, of the next in the second, November 2026).
 - Edges the proxy pass leaves alone (CPU destinations, unaligned pieces, one destination per domain) are read by
   each destination rank.
 - Regions of different sizes in one index space fragment the op: phase 2 cuts each dimension at the boundaries of
