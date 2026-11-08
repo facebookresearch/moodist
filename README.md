@@ -69,7 +69,9 @@ raise an error, before queuing anything on the stream (the capture stays valid, 
 rank checks its own stream: ranks that do not capture run the collective and wait for the others. Waiting during a
 capture for the future of such a `compile_op` op, launched before the capture, raises an error too (dropping the
 future logs one): wait for it before the capture. Collectives and ops of CPU tensors run at once during a capture,
-outside the graph. The CUDA operations of `moodist.Queue` are not checked.
+outside the graph. The CUDA operations of `moodist.Queue` are not checked. Buffers of a communication pool
+(`moodist.comm_empty`, the process group's `allocate_tensor`) can be allocated during a capture: they are the capture's,
+for good (see `comm_empty`).
 
 ## Documentation
 

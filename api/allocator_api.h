@@ -173,7 +173,9 @@ constexpr size_t commPoolLogicalSize = (size_t)1 << 40;
 CommPool* allocatorCommPoolCreate();
 
 // Allocate from the pool (bytes are rounded up to 4 KiB; the memory is 4 KiB aligned) for use on stream. The
-// cleanupCtx is freed with cudaAllocatorImplFree, like those of cudaAllocatorImplAllocate.
+// cleanupCtx is freed with cudaAllocatorImplFree, like those of cudaAllocatorImplAllocate. On a stream that is
+// capturing a CUDA graph, the memory is the capture's own (see "CUDA graphs" in allocator.cc): what the capture's
+// allocations from the pool freed, or new slabs, kept for good.
 CudaAllocation allocatorCommPoolAllocate(CommPool* pool, size_t bytes, CUstream stream, int deviceIndex);
 
 // Call fn(ctx, logicalOffset, handle, memOffset, size) for every piece of every slab of the pool (the part of a slab

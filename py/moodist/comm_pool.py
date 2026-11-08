@@ -40,6 +40,11 @@ def comm_empty(*size, dtype=None, group=None):
     (other ranks reach moodist's memory only: the collectives copy every tensor of another allocator, e.g. PyTorch's,
     through such buffers, which the pool keeps the memory of).
 
+    During a CUDA graph capture (on the current stream), the buffers come from memory of the capture's own: what its
+    buffers freed during the capture, or new slabs. The capture keeps that memory for good, since its graph uses it at
+    every replay: no eager buffer and no other capture gets it. Each capture that allocates from a pool thus holds at
+    least one slab (256 MiB) of its own. Ranks that capture the same get the same offsets.
+
     Args:
         size: The shape (ints, or one tuple / list / torch.Size).
         dtype: The element type (default: torch.get_default_dtype()).
