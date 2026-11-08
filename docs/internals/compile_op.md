@@ -98,8 +98,11 @@ Every step is collective: all ranks of the group take part (through per-rank que
    domain over RDMA: the input, if the domain has one source, otherwise the domain's partial result, which a rank of
    that domain computes. A piece with one executor (its destinations are in one domain: a reduce-scatter, a reduce to
    one rank) gets its partial results from ranks with the executor's local rank (NICs on the same rail), the one at
-   the executor's position among the ranks of its domain with that local rank, so that with domains of the same shape
-   every rank computes as many partial results. The executors send their requests to the partial ranks
+   the executor's position among the ranks of its domain with that local rank, scaled to the other domain's ranks with
+   it, so that every rank computes as many partial results (`pickPartialRank`; unscaled, with domains of 16 and 32
+   GPUs, the ranks of a domain of 32 computed from 4 to 20 partial results of a reduce-scatter, 12 on average, and in
+   torchtitan's backward pass on 128 GB300 the busiest node reached every reduce-scatter up to 6 ms after the others,
+   which all waited for it). The executors send their requests to the partial ranks
    (`PartialRequest`), which add an edge per partial result (an item), from the domain's sources (in rank order from
    their own) to a slot of a ring of their scratch tensor (see Rings below), with a done flag (see the kernel and
    Runtime), and answer with the slot, its notification slot, the generation of its use and its credit signal. The

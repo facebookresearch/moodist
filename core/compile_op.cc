@@ -1339,8 +1339,12 @@ struct CompileOpConstructor {
     };
     // The rank of `domain` that computes the k-th partial result of that domain for this rank, as the only executor
     // of pieces: one with this rank's local rank (NICs on the same rail), the one at this rank's position among the
-    // ranks of its domain with that local rank, plus k (so that with domains of the same shape, every rank computes
-    // as many partial results)
+    // ranks of its domain with that local rank, scaled to that domain's ranks with it, plus k (so that every rank
+    // computes as many partial results: with domains of the same shape, position p asks the ranks at p, p + 1, ...;
+    // with domains of 16 and 32 GPUs, unscaled, the 8 ranks of a rail of a domain of 32 computed 8, 12, 16, 20, 16,
+    // 12, 8 and 4 of a reduce-scatter's parts (4 per executor and domain: the executors of the domains of 16, at
+    // positions 0 to 3, asked positions 0 to 6), and the ranks with the most were the last to reach each
+    // reduce-scatter of torchtitan's backward pass, by up to 6 ms on 128 GB300, every other rank waiting for them)
     auto pickPartialRank = [&](size_t domain, size_t k) {
       const size_t localRank = group->rankLocalRank.at(rank);
       Vector<uint32_t> all = domainRanks(domain);
@@ -1350,17 +1354,20 @@ struct CompileOpConstructor {
           candidates.push_back(r);
         }
       }
-      if (candidates.empty()) {
+      const bool onRail = !candidates.empty();
+      if (!onRail) {
         candidates = all;
       }
       size_t railPosition = 0;
+      size_t railRanks = 0; // (this rank among them)
       for (uint32_t r : domainRanks(myDomain)) {
         if (r == rank) {
-          break;
+          railPosition = railRanks;
         }
-        railPosition += group->rankLocalRank.at(r) == localRank;
+        railRanks += group->rankLocalRank.at(r) == localRank;
       }
-      return candidates.at((railPosition + k) % candidates.size());
+      const size_t start = onRail ? railPosition * candidates.size() / railRanks : railPosition;
+      return candidates.at((start + k) % candidates.size());
     };
     // The order in which this rank serves the ranks that ask it for items whose keys tie (see Key): itself, then the
     // ranks of the domain after its own, starting at its own position, then those of the next domain, ..., so that at
